@@ -17,7 +17,7 @@ use crate::bounded_exec;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_RESPONSE_BYTES: usize = 512 * 1024;
-const MAX_MUTATION_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_MUTATION_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 4096;
 const MAX_EVIDENCE_ITEMS: usize = 20;
 const MAX_CRITERIA: usize = 100;
@@ -26,10 +26,13 @@ const MAX_EVIDENCE_TOTAL: usize = 1_000_000;
 const MAX_ID_BYTES: usize = 256;
 const MAX_SHORT_TEXT_BYTES: usize = 512;
 const MAX_EVIDENCE_TEXT_BYTES: usize = 4096;
+const MAX_OPERATION_ID_BYTES: usize = 128;
+const MAX_OPERATION_FAILURE_BYTES: usize = 512;
+const MAX_WORK_LOG_ATTRIBUTION_BYTES: usize = 256;
 pub const MAX_WORK_LOG_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_COMPLETION_PROOF_BYTES: usize = 4096;
-pub const MAX_COMPLETION_CRITERION_PROOFS: usize = 100;
-pub const MAX_PROOF_URL_BYTES: usize = 2048;
+pub const MAX_COMPLETION_CRITERION_PROOFS: usize = 128;
+pub const MAX_PROOF_URL_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,13 +78,27 @@ pub struct WorkLogAttribution {
     pub model: Option<String>,
     pub reasoning: Option<String>,
     pub harness: Option<String>,
-    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBoundWorkLog {
+    pub expected_run_id: String,
+    pub operation_id: String,
+    pub attribution: WorkLogAttribution,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkLogEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "id")]
+    pub entry_id: Option<String>,
     pub card_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     pub agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -93,10 +110,14 @@ pub struct WorkLogEntry {
     pub run_id: Option<String>,
     pub body: String,
     pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletionProof {
+pub struct RunBoundCompletion {
+    pub expected_run_id: String,
+    pub operation_id: String,
     pub proof: String,
     pub criterion_proofs: Vec<CriterionProof>,
 }
@@ -194,10 +215,60 @@ pub struct RunEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionReceipt {
+    pub schema_version: String,
     pub card_id: String,
+    pub run_id: String,
+    pub operation_id: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    pub criterion_proofs: Vec<CriterionProof>,
     pub updated_at: i64,
-    pub criteria: Vec<CriterionEvidence>,
+    pub audit_event_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Unknown,
+    Pending,
+    Succeeded,
+    Rejected,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationFailure {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationOutcome<T> {
+    pub operation_id: String,
+    pub state: OperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_card_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<OperationFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -600,39 +671,75 @@ impl Client {
         parse_claim(value)
     }
 
-    /// Append one Crew-attributed entry to Powder's work log.
+    /// Atomically append one Crew-attributed entry to an exact current run.
     ///
-    /// T-Hub supplies the exact Crew and run identity from its durable binding.
-    /// Input is rejected before any request when it would exceed the bounded
-    /// control contract, and the response must echo the authoritative binding.
-    pub fn append_work_log(
+    /// `card_id`, `expected_run_id`, and `operation_id` come from T-Hub's
+    /// durable Crew binding. Powder derives the actor from the protected API
+    /// key, so no caller-controlled actor is sent. The returned operation
+    /// outcome preserves pending, rejected, failed, and replayed states.
+    pub fn append_run_work_log(
         &self,
         card_id: &str,
-        attribution: &WorkLogAttribution,
-        body: &str,
-    ) -> Result<WorkLogEntry, PowderError> {
+        append: &RunBoundWorkLog,
+    ) -> Result<OperationOutcome<WorkLogEntry>, PowderError> {
         validate_id("card id", card_id)?;
-        validate_short_text("work-log agent", &attribution.agent)?;
-        validate_optional_short_text("work-log model", attribution.model.as_deref())?;
-        validate_optional_short_text("work-log reasoning", attribution.reasoning.as_deref())?;
-        validate_optional_short_text("work-log harness", attribution.harness.as_deref())?;
-        validate_id("work-log run id", &attribution.run_id)?;
-        validate_required_bounded_text("work-log body", body, MAX_WORK_LOG_BODY_BYTES)?;
+        validate_id("expected run id", &append.expected_run_id)?;
+        validate_operation_id(&append.operation_id)?;
+        validate_required_bounded_text(
+            "work-log agent",
+            &append.attribution.agent,
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?;
+        validate_optional_bounded_text(
+            "work-log model",
+            append.attribution.model.as_deref(),
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?;
+        validate_optional_bounded_text(
+            "work-log reasoning",
+            append.attribution.reasoning.as_deref(),
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?;
+        validate_optional_bounded_text(
+            "work-log harness",
+            append.attribution.harness.as_deref(),
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?;
+        validate_required_bounded_text("work-log body", &append.body, MAX_WORK_LOG_BODY_BYTES)?;
 
         let value = self.request_typed_with_limit(
             "POST",
-            &format!("/api/v1/cards/{}/work-log", encode_path(card_id)),
+            &format!(
+                "/api/v1/cards/{}/runs/{}/work-log",
+                encode_path(card_id),
+                encode_path(&append.expected_run_id)
+            ),
             Some(json!({
-                "agent": attribution.agent,
-                "model": attribution.model,
-                "reasoning": attribution.reasoning,
-                "harness": attribution.harness,
-                "run_id": attribution.run_id,
-                "body": body,
+                "operation_id": append.operation_id,
+                "agent": append.attribution.agent,
+                "model": append.attribution.model,
+                "reasoning": append.attribution.reasoning,
+                "harness": append.attribution.harness,
+                "body": append.body,
             })),
             MAX_MUTATION_RESPONSE_BYTES,
         )?;
-        parse_work_log_entry(value, card_id, Some(attribution))
+        parse_operation_outcome(
+            value,
+            "work_log_append",
+            card_id,
+            &append.expected_run_id,
+            &append.operation_id,
+            false,
+            |result| {
+                parse_run_bound_work_log_entry(
+                    result,
+                    card_id,
+                    &append.expected_run_id,
+                    Some(&append.attribution),
+                )
+            },
+        )
     }
 
     /// Read only the concise, server-bounded evidence needed to supervise one card.
@@ -659,13 +766,15 @@ impl Client {
         parse_run_evidence(value, run_id)
     }
 
-    /// Complete a card with a required bounded proof and optional criterion links.
-    pub fn complete_with_proof(
+    /// Atomically complete a card only through its exact current run.
+    pub fn complete_run_with_proof(
         &self,
         card_id: &str,
-        completion: &CompletionProof,
-    ) -> Result<CompletionReceipt, PowderError> {
+        completion: &RunBoundCompletion,
+    ) -> Result<OperationOutcome<CompletionReceipt>, PowderError> {
         validate_id("card id", card_id)?;
+        validate_id("expected run id", &completion.expected_run_id)?;
+        validate_operation_id(&completion.operation_id)?;
         validate_required_bounded_text(
             "completion proof",
             &completion.proof,
@@ -681,14 +790,94 @@ impl Client {
         }
         let value = self.request_typed_with_limit(
             "POST",
-            &format!("/api/v1/cards/{}/complete", encode_path(card_id)),
+            &format!(
+                "/api/v1/cards/{}/runs/{}/complete",
+                encode_path(card_id),
+                encode_path(&completion.expected_run_id)
+            ),
             Some(json!({
+                "operation_id": completion.operation_id,
                 "proof": completion.proof,
                 "criterion_proofs": completion.criterion_proofs,
             })),
             MAX_MUTATION_RESPONSE_BYTES,
         )?;
-        parse_completion_receipt(value, card_id)
+        parse_operation_outcome(
+            value,
+            "completion",
+            card_id,
+            &completion.expected_run_id,
+            &completion.operation_id,
+            false,
+            |result| {
+                parse_completion_receipt(
+                    result,
+                    card_id,
+                    &completion.expected_run_id,
+                    &completion.operation_id,
+                )
+            },
+        )
+    }
+
+    /// Recover one bounded work-log operation after an ambiguous response.
+    pub fn recover_work_log_operation(
+        &self,
+        card_id: &str,
+        expected_run_id: &str,
+        operation_id: &str,
+    ) -> Result<OperationOutcome<WorkLogEntry>, PowderError> {
+        self.recover_operation(
+            "work_log_append",
+            card_id,
+            expected_run_id,
+            operation_id,
+            |result| parse_run_bound_work_log_entry(result, card_id, expected_run_id, None),
+        )
+    }
+
+    /// Recover one bounded completion operation after an ambiguous response.
+    pub fn recover_completion_operation(
+        &self,
+        card_id: &str,
+        expected_run_id: &str,
+        operation_id: &str,
+    ) -> Result<OperationOutcome<CompletionReceipt>, PowderError> {
+        self.recover_operation(
+            "completion",
+            card_id,
+            expected_run_id,
+            operation_id,
+            |result| parse_completion_receipt(result, card_id, expected_run_id, operation_id),
+        )
+    }
+
+    fn recover_operation<T: Serialize>(
+        &self,
+        kind: &str,
+        card_id: &str,
+        expected_run_id: &str,
+        operation_id: &str,
+        parse_result: impl FnOnce(Value) -> Result<T, PowderError>,
+    ) -> Result<OperationOutcome<T>, PowderError> {
+        validate_id("card id", card_id)?;
+        validate_id("expected run id", expected_run_id)?;
+        validate_operation_id(operation_id)?;
+        let value = self.request_typed_with_limit(
+            "GET",
+            &format!("/api/v1/operations/{}", encode_path(operation_id)),
+            None,
+            MAX_MUTATION_RESPONSE_BYTES,
+        )?;
+        parse_operation_outcome(
+            value,
+            kind,
+            card_id,
+            expected_run_id,
+            operation_id,
+            true,
+            parse_result,
+        )
     }
 
     pub fn tail_events(&self, after: i64, limit: usize) -> Result<Vec<CardEvent>, String> {
@@ -825,36 +1014,107 @@ fn parse_work_log_entry(
         ));
     }
     let entry = WorkLogEntry {
+        schema_version: optional_bounded_string(
+            &value,
+            "schema_version",
+            "work-log schema version",
+            MAX_SHORT_TEXT_BYTES,
+        )?,
+        entry_id: optional_bounded_string(&value, "id", "work-log entry id", MAX_ID_BYTES)?,
         card_id,
-        agent: bounded_string(&value, "agent", "work-log agent", MAX_SHORT_TEXT_BYTES)?,
-        model: optional_bounded_string(&value, "model", "work-log model", MAX_SHORT_TEXT_BYTES)?,
+        actor: optional_bounded_string(
+            &value,
+            "actor",
+            "work-log actor",
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?,
+        agent: bounded_string(
+            &value,
+            "agent",
+            "work-log agent",
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?,
+        model: optional_bounded_string(
+            &value,
+            "model",
+            "work-log model",
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
+        )?,
         reasoning: optional_bounded_string(
             &value,
             "reasoning",
             "work-log reasoning",
-            MAX_SHORT_TEXT_BYTES,
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
         )?,
         harness: optional_bounded_string(
             &value,
             "harness",
             "work-log harness",
-            MAX_SHORT_TEXT_BYTES,
+            MAX_WORK_LOG_ATTRIBUTION_BYTES,
         )?,
         run_id: optional_bounded_string(&value, "run_id", "work-log run id", MAX_ID_BYTES)?,
         body: bounded_string(&value, "body", "work-log body", MAX_WORK_LOG_BODY_BYTES)?,
         created_at: required_i64(&value, "created_at", "work-log created_at")?,
+        updated_at: optional_i64(&value, "updated_at", "work-log updated_at")?,
     };
     if let Some(expected) = expected_attribution {
         if entry.agent != expected.agent
             || entry.model != expected.model
             || entry.reasoning != expected.reasoning
             || entry.harness != expected.harness
-            || entry.run_id.as_deref() != Some(expected.run_id.as_str())
         {
             return Err(invalid_response(
                 "work-log entry attribution does not match the request",
             ));
         }
+    }
+    Ok(entry)
+}
+
+fn parse_run_bound_work_log_entry(
+    value: Value,
+    expected_card_id: &str,
+    expected_run_id: &str,
+    expected_attribution: Option<&WorkLogAttribution>,
+) -> Result<WorkLogEntry, PowderError> {
+    let entry = parse_work_log_entry(value, expected_card_id, expected_attribution)?;
+    if entry.schema_version.as_deref() != Some("powder.work_log_entry.v1") {
+        return Err(invalid_response(
+            "work-log operation returned an unsupported result schema",
+        ));
+    }
+    if entry
+        .entry_id
+        .as_deref()
+        .is_none_or(|entry_id| !entry_id.starts_with("work-log-"))
+    {
+        return Err(invalid_response(
+            "work-log operation returned an invalid entry id",
+        ));
+    }
+    if entry
+        .actor
+        .as_deref()
+        .is_none_or(|actor| actor.trim().is_empty())
+    {
+        return Err(invalid_response(
+            "work-log operation did not return authenticated actor attribution",
+        ));
+    }
+    if entry.run_id.as_deref() != Some(expected_run_id) {
+        return Err(invalid_response(
+            "work-log operation returned a different run id",
+        ));
+    }
+    if entry.agent.trim().is_empty() || entry.body.trim().is_empty() {
+        return Err(invalid_response(
+            "work-log operation returned empty required evidence",
+        ));
+    }
+    if entry.updated_at != Some(entry.created_at) {
+        return Err(invalid_response(
+            "work-log operation returned inconsistent append timestamps",
+        ));
     }
     Ok(entry)
 }
@@ -937,11 +1197,41 @@ fn parse_run_evidence(value: Value, expected_run_id: &str) -> Result<RunEvidence
 fn parse_completion_receipt(
     value: Value,
     expected_card_id: &str,
+    expected_run_id: &str,
+    expected_operation_id: &str,
 ) -> Result<CompletionReceipt, PowderError> {
-    let card_id = bounded_string(&value, "id", "completed card id", MAX_ID_BYTES)?;
+    let schema_version = bounded_string(
+        &value,
+        "schema_version",
+        "completion result schema version",
+        MAX_SHORT_TEXT_BYTES,
+    )?;
+    if schema_version != "powder.run_bound_completion.v1" {
+        return Err(invalid_response(
+            "completion operation returned an unsupported result schema",
+        ));
+    }
+    let card_id = bounded_string(&value, "card_id", "completed card id", MAX_ID_BYTES)?;
     if card_id != expected_card_id {
         return Err(invalid_response(
             "completion response returned a different card id",
+        ));
+    }
+    let run_id = bounded_string(&value, "run_id", "completed run id", MAX_ID_BYTES)?;
+    if run_id != expected_run_id {
+        return Err(invalid_response(
+            "completion response returned a different run id",
+        ));
+    }
+    let operation_id = bounded_string(
+        &value,
+        "operation_id",
+        "completion operation id",
+        MAX_OPERATION_ID_BYTES,
+    )?;
+    if operation_id != expected_operation_id {
+        return Err(invalid_response(
+            "completion response returned a different operation id",
         ));
     }
     let status = card_status(&value)?;
@@ -950,16 +1240,240 @@ fn parse_completion_receipt(
             "completion response did not confirm done status",
         ));
     }
-    if value.get("claim").is_some_and(|claim| !claim.is_null()) {
+    let criterion_proofs = bounded_array(
+        &value,
+        "criterion_proofs",
+        MAX_COMPLETION_CRITERION_PROOFS,
+        "completion criterion proofs",
+    )?
+    .iter()
+    .map(|proof| {
+        let criterion = proof
+            .get("criterion")
+            .and_then(Value::as_u64)
+            .and_then(|criterion| usize::try_from(criterion).ok())
+            .ok_or_else(|| invalid_response("completion criterion index is invalid"))?;
+        Ok(CriterionProof {
+            criterion,
+            url: bounded_string(proof, "url", "criterion proof URL", MAX_PROOF_URL_BYTES)?,
+        })
+    })
+    .collect::<Result<Vec<_>, PowderError>>()?;
+    let proof = optional_bounded_string(
+        &value,
+        "proof",
+        "completion proof",
+        MAX_COMPLETION_PROOF_BYTES,
+    )?;
+    if proof.as_deref().is_none_or(|proof| proof.trim().is_empty()) {
         return Err(invalid_response(
-            "completion response retained an active claim",
+            "completion operation did not return required proof",
         ));
     }
     Ok(CompletionReceipt {
+        schema_version,
         card_id,
+        run_id,
+        operation_id,
         status,
+        proof,
+        criterion_proofs,
         updated_at: required_i64(&value, "updated_at", "completed card updated_at")?,
-        criteria: parse_criteria(&value)?,
+        audit_event_id: bounded_string(
+            &value,
+            "audit_event_id",
+            "completion audit event id",
+            MAX_ID_BYTES,
+        )?,
+    })
+}
+
+fn parse_operation_outcome<T: Serialize>(
+    value: Value,
+    expected_kind: &str,
+    expected_card_id: &str,
+    expected_run_id: &str,
+    expected_operation_id: &str,
+    allow_unknown: bool,
+    parse_result: impl FnOnce(Value) -> Result<T, PowderError>,
+) -> Result<OperationOutcome<T>, PowderError> {
+    let schema_version = bounded_string(
+        &value,
+        "schema_version",
+        "operation status schema version",
+        MAX_SHORT_TEXT_BYTES,
+    )?;
+    if schema_version != "powder.operation_status.v1" {
+        return Err(invalid_response(
+            "operation response returned an unsupported status schema",
+        ));
+    }
+    let operation_id = bounded_string(
+        &value,
+        "operation_id",
+        "operation id",
+        MAX_OPERATION_ID_BYTES,
+    )?;
+    if operation_id != expected_operation_id {
+        return Err(invalid_response(
+            "operation response returned a different operation id",
+        ));
+    }
+    let state =
+        match bounded_string(&value, "state", "operation state", MAX_SHORT_TEXT_BYTES)?.as_str() {
+            "unknown" => OperationState::Unknown,
+            "pending" => OperationState::Pending,
+            "succeeded" => OperationState::Succeeded,
+            "rejected" => OperationState::Rejected,
+            "failed" => OperationState::Failed,
+            _ => return Err(invalid_response("operation response has an unknown state")),
+        };
+    if state == OperationState::Unknown {
+        if !allow_unknown {
+            return Err(invalid_response(
+                "mutation response cannot have unknown operation state",
+            ));
+        }
+        for field in [
+            "request_digest",
+            "kind",
+            "target_card_id",
+            "expected_run_id",
+            "result",
+            "failure",
+            "audit_event_id",
+            "created_at",
+            "updated_at",
+            "expires_at",
+        ] {
+            if value.get(field).is_some_and(|value| !value.is_null()) {
+                return Err(invalid_response(
+                    "unknown operation response contains authoritative outcome fields",
+                ));
+            }
+        }
+        return Ok(OperationOutcome {
+            operation_id,
+            state,
+            request_digest: None,
+            kind: None,
+            target_card_id: None,
+            expected_run_id: None,
+            result: None,
+            failure: None,
+            audit_event_id: None,
+            created_at: None,
+            updated_at: None,
+            expires_at: None,
+        });
+    }
+
+    let request_digest = operation_request_digest(&value)?;
+    let kind = bounded_string(&value, "kind", "operation kind", MAX_SHORT_TEXT_BYTES)?;
+    if kind != expected_kind {
+        return Err(invalid_response(
+            "operation response returned a different mutation kind",
+        ));
+    }
+    let target_card_id = bounded_string(
+        &value,
+        "target_card_id",
+        "operation target card id",
+        MAX_ID_BYTES,
+    )?;
+    if target_card_id != expected_card_id {
+        return Err(invalid_response(
+            "operation response returned a different target card id",
+        ));
+    }
+    let returned_run_id = bounded_string(
+        &value,
+        "expected_run_id",
+        "operation expected run id",
+        MAX_ID_BYTES,
+    )?;
+    if returned_run_id != expected_run_id {
+        return Err(invalid_response(
+            "operation response returned a different expected run id",
+        ));
+    }
+    let failure = match value.get("failure") {
+        None | Some(Value::Null) => None,
+        Some(failure) if failure.is_object() => Some(OperationFailure {
+            code: bounded_string(
+                failure,
+                "code",
+                "operation failure code",
+                MAX_SHORT_TEXT_BYTES,
+            )?,
+            message: bounded_string(
+                failure,
+                "message",
+                "operation failure message",
+                MAX_OPERATION_FAILURE_BYTES,
+            )?,
+        }),
+        Some(_) => return Err(invalid_response("operation failure is not an object")),
+    };
+    let result_value = value
+        .get("result")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let audit_event_id = optional_bounded_string(
+        &value,
+        "audit_event_id",
+        "operation audit event id",
+        MAX_ID_BYTES,
+    )?;
+    match state {
+        OperationState::Succeeded => {
+            if result_value.is_none() || failure.is_some() || audit_event_id.is_none() {
+                return Err(invalid_response(
+                    "succeeded operation response has inconsistent outcome fields",
+                ));
+            }
+        }
+        OperationState::Rejected | OperationState::Failed => {
+            if result_value.is_some() || failure.is_none() || audit_event_id.is_some() {
+                return Err(invalid_response(
+                    "unsuccessful operation response has inconsistent outcome fields",
+                ));
+            }
+        }
+        OperationState::Pending => {
+            if result_value.is_some() || failure.is_some() || audit_event_id.is_some() {
+                return Err(invalid_response(
+                    "pending operation response contains terminal outcome fields",
+                ));
+            }
+        }
+        OperationState::Unknown => unreachable!(),
+    }
+    let result = result_value.map(parse_result).transpose()?;
+    if let (Some(envelope_audit), Some(result)) = (audit_event_id.as_deref(), result.as_ref()) {
+        let result_value = serde_json::to_value(result)
+            .map_err(|_| invalid_response("operation result could not be validated"))?;
+        if expected_kind == "completion"
+            && result_value.get("auditEventId").and_then(Value::as_str) != Some(envelope_audit)
+        {
+            return Err(invalid_response(
+                "completion result audit event does not match operation status",
+            ));
+        }
+    }
+    Ok(OperationOutcome {
+        operation_id,
+        state,
+        request_digest: Some(request_digest),
+        kind: Some(kind),
+        target_card_id: Some(target_card_id),
+        expected_run_id: Some(returned_run_id),
+        result,
+        failure,
+        audit_event_id,
+        created_at: Some(required_i64(&value, "created_at", "operation created_at")?),
+        updated_at: Some(required_i64(&value, "updated_at", "operation updated_at")?),
+        expires_at: Some(required_i64(&value, "expires_at", "operation expires_at")?),
     })
 }
 
@@ -1219,12 +1733,49 @@ fn validate_id(label: &str, value: &str) -> Result<(), PowderError> {
     validate_required_bounded_text(label, value, MAX_ID_BYTES)
 }
 
-fn validate_short_text(label: &str, value: &str) -> Result<(), PowderError> {
-    validate_required_bounded_text(label, value, MAX_SHORT_TEXT_BYTES)
+fn validate_operation_id(value: &str) -> Result<(), PowderError> {
+    validate_required_bounded_text("operation id", value, MAX_OPERATION_ID_BYTES)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(invalid_request(
+            "operation id must use only ASCII letters, digits, '-', '_', '.', or ':'",
+        ));
+    }
+    Ok(())
 }
 
-fn validate_optional_short_text(label: &str, value: Option<&str>) -> Result<(), PowderError> {
-    value.map_or(Ok(()), |value| validate_short_text(label, value))
+fn operation_request_digest(value: &Value) -> Result<String, PowderError> {
+    const PREFIX: &str = "sha256:";
+    const HEX_BYTES: usize = 64;
+    let digest = bounded_string(
+        value,
+        "request_digest",
+        "operation request digest",
+        PREFIX.len() + HEX_BYTES,
+    )?;
+    let Some(hex) = digest.strip_prefix(PREFIX) else {
+        return Err(invalid_response(
+            "operation request digest is not canonical sha256",
+        ));
+    };
+    if hex.len() != HEX_BYTES || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_response(
+            "operation request digest is not canonical sha256",
+        ));
+    }
+    Ok(digest)
+}
+
+fn validate_optional_bounded_text(
+    label: &str,
+    value: Option<&str>,
+    limit: usize,
+) -> Result<(), PowderError> {
+    value.map_or(Ok(()), |value| {
+        validate_required_bounded_text(label, value, limit)
+    })
 }
 
 fn validate_required_bounded_text(
@@ -1749,6 +2300,32 @@ mod tests {
         .unwrap();
     }
 
+    fn operation_status(
+        operation_id: &str,
+        kind: &str,
+        card_id: &str,
+        run_id: &str,
+        state: &str,
+        result: Option<Value>,
+        failure: Option<Value>,
+    ) -> Value {
+        json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": operation_id,
+            "state": state,
+            "request_digest": format!("sha256:{}", "aB".repeat(32)),
+            "kind": kind,
+            "target_card_id": card_id,
+            "expected_run_id": run_id,
+            "result": result,
+            "failure": failure,
+            "audit_event_id": (state == "succeeded").then_some("event-1"),
+            "created_at": 10,
+            "updated_at": 11,
+            "expires_at": 9010
+        })
+    }
+
     #[test]
     fn profile_file_resolves_a_command_backed_key() {
         let path = std::env::temp_dir().join(format!(
@@ -1829,15 +2406,15 @@ mod tests {
     }
 
     #[test]
-    fn evidence_client_round_trips_bounded_paths_payloads_and_attribution() {
+    fn run_bound_client_round_trips_paths_payloads_attribution_and_receipts() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for expected_path in [
                 "/api/v1/cards/card%2Fone",
                 "/api/v1/runs/run%2Fone",
-                "/api/v1/cards/card%2Fone/work-log",
-                "/api/v1/cards/card%2Fone/complete",
+                "/api/v1/cards/card%2Fone/runs/run%2Fone/work-log",
+                "/api/v1/cards/card%2Fone/runs/run%2Fone/complete",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
@@ -1853,41 +2430,70 @@ mod tests {
                     assert_eq!(request_body["model"], "gpt-5");
                     assert_eq!(request_body["reasoning"], "high");
                     assert_eq!(request_body["harness"], "codex");
-                    assert_eq!(request_body["run_id"], "run/one");
+                    assert_eq!(request_body["operation_id"], "work-log:one");
                     assert_eq!(request_body["body"], "focused tests are passing");
-                    json!({
-                        "card_id": "card/one",
-                        "agent": "crew-87ea2ca1",
-                        "model": "gpt-5",
-                        "reasoning": "high",
-                        "harness": "codex",
-                        "run_id": "run/one",
-                        "body": "focused tests are passing",
-                        "created_at": 15
-                    })
+                    assert!(request_body.get("actor").is_none());
+                    assert!(request_body.get("run_id").is_none());
+                    operation_status(
+                        "work-log:one",
+                        "work_log_append",
+                        "card/one",
+                        "run/one",
+                        "succeeded",
+                        Some(json!({
+                            "schema_version": "powder.work_log_entry.v1",
+                            "id": "work-log-one",
+                            "card_id": "card/one",
+                            "actor": "crew-87ea2ca1",
+                            "agent": "crew-87ea2ca1",
+                            "model": "gpt-5",
+                            "reasoning": "high",
+                            "harness": "codex",
+                            "run_id": "run/one",
+                            "body": "focused tests are passing",
+                            "created_at": 15,
+                            "updated_at": 15
+                        })),
+                        None,
+                    )
                 } else if expected_path.ends_with("complete") {
                     let request_body: Value =
                         serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    assert_eq!(request_body["operation_id"], "completion:one");
                     assert_eq!(request_body["proof"], "commit abc; tests passed");
+                    assert_eq!(
+                        request_body["criterion_proofs"].as_array().unwrap().len(),
+                        MAX_COMPLETION_CRITERION_PROOFS
+                    );
                     assert_eq!(request_body["criterion_proofs"][0]["criterion"], 0);
                     assert_eq!(
-                        request_body["criterion_proofs"][0]["url"],
-                        "https://example.test/proof"
+                        request_body["criterion_proofs"][0]["url"]
+                            .as_str()
+                            .unwrap()
+                            .len(),
+                        MAX_PROOF_URL_BYTES
                     );
-                    json!({
-                        "id": "card/one",
-                        "status": "done",
-                        "claim": null,
-                        "updated_at": 20,
-                        "criteria": [{
-                            "text": "tests pass",
-                            "proof_links": [{
-                                "url": "https://example.test/proof",
-                                "actor": "t-hub",
-                                "created_at": 20
-                            }]
-                        }]
-                    })
+                    assert!(request_body.get("actor").is_none());
+                    assert!(request_body.get("run_id").is_none());
+                    operation_status(
+                        "completion:one",
+                        "completion",
+                        "card/one",
+                        "run/one",
+                        "succeeded",
+                        Some(json!({
+                            "schema_version": "powder.run_bound_completion.v1",
+                            "card_id": "card/one",
+                            "run_id": "run/one",
+                            "operation_id": "completion:one",
+                            "status": "done",
+                            "proof": "commit abc; tests passed",
+                            "criterion_proofs": request_body["criterion_proofs"].clone(),
+                            "updated_at": 20,
+                            "audit_event_id": "event-1"
+                        })),
+                        None,
+                    )
                 } else if expected_path.contains("/runs/") {
                     json!({
                         "run": {
@@ -1987,28 +2593,51 @@ mod tests {
             model: Some("gpt-5".into()),
             reasoning: Some("high".into()),
             harness: Some("codex".into()),
-            run_id: "run/one".into(),
         };
-        let entry = client
-            .append_work_log("card/one", &attribution, "focused tests are passing")
-            .unwrap();
-        assert_eq!(entry.agent, "crew-87ea2ca1");
-        assert_eq!(entry.run_id.as_deref(), Some("run/one"));
-
-        let receipt = client
-            .complete_with_proof(
+        let appended = client
+            .append_run_work_log(
                 "card/one",
-                &CompletionProof {
-                    proof: "commit abc; tests passed".into(),
-                    criterion_proofs: vec![CriterionProof {
-                        criterion: 0,
-                        url: "https://example.test/proof".into(),
-                    }],
+                &RunBoundWorkLog {
+                    expected_run_id: "run/one".into(),
+                    operation_id: "work-log:one".into(),
+                    attribution,
+                    body: "focused tests are passing".into(),
                 },
             )
             .unwrap();
+        assert_eq!(appended.state, OperationState::Succeeded);
+        let entry = appended.result.unwrap();
+        assert_eq!(entry.agent, "crew-87ea2ca1");
+        assert_eq!(entry.run_id.as_deref(), Some("run/one"));
+
+        let completed = client
+            .complete_run_with_proof(
+                "card/one",
+                &RunBoundCompletion {
+                    expected_run_id: "run/one".into(),
+                    operation_id: "completion:one".into(),
+                    proof: "commit abc; tests passed".into(),
+                    criterion_proofs: (0..MAX_COMPLETION_CRITERION_PROOFS)
+                        .map(|criterion| CriterionProof {
+                            criterion,
+                            url: "u".repeat(MAX_PROOF_URL_BYTES),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        assert_eq!(completed.state, OperationState::Succeeded);
+        let receipt = completed.result.unwrap();
         assert_eq!(receipt.status, "done");
-        assert_eq!(receipt.criteria[0].proof_links.len(), 1);
+        assert_eq!(receipt.run_id, "run/one");
+        assert_eq!(
+            receipt.criterion_proofs.len(),
+            MAX_COMPLETION_CRITERION_PROOFS
+        );
+        assert!(receipt
+            .criterion_proofs
+            .iter()
+            .all(|proof| proof.url.len() == MAX_PROOF_URL_BYTES));
         server.join().unwrap();
     }
 
@@ -2022,27 +2651,49 @@ mod tests {
             api_key_command: None,
         })
         .unwrap();
-        let attribution = WorkLogAttribution {
-            agent: "crew".into(),
-            model: None,
-            reasoning: None,
-            harness: Some("codex".into()),
-            run_id: "run-1".into(),
-        };
         let error = client
-            .append_work_log(
+            .append_run_work_log(
                 "card-1",
-                &attribution,
-                &"x".repeat(MAX_WORK_LOG_BODY_BYTES + 1),
+                &RunBoundWorkLog {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "work-log:bounds".into(),
+                    attribution: WorkLogAttribution {
+                        agent: "crew".into(),
+                        model: None,
+                        reasoning: None,
+                        harness: Some("codex".into()),
+                    },
+                    body: "x".repeat(MAX_WORK_LOG_BODY_BYTES + 1),
+                },
             )
             .unwrap_err();
         assert_eq!(error.kind, PowderErrorKind::InvalidResponse);
         assert!(error.message.contains("16384-byte limit"));
 
         let error = client
-            .complete_with_proof(
+            .append_run_work_log(
                 "card-1",
-                &CompletionProof {
+                &RunBoundWorkLog {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "work-log:attribution-bounds".into(),
+                    attribution: WorkLogAttribution {
+                        agent: "x".repeat(MAX_WORK_LOG_ATTRIBUTION_BYTES + 1),
+                        model: None,
+                        reasoning: None,
+                        harness: None,
+                    },
+                    body: "bounded".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("256-byte limit"));
+
+        let error = client
+            .complete_run_with_proof(
+                "card-1",
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "completion:bounds".into(),
                     proof: "proof".into(),
                     criterion_proofs: (0..=MAX_COMPLETION_CRITERION_PROOFS)
                         .map(|criterion| CriterionProof {
@@ -2053,7 +2704,34 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.message.contains("proof count exceeds 100"));
+        assert!(error.message.contains("proof count exceeds 128"));
+        let error = client
+            .complete_run_with_proof(
+                "card-1",
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "completion:url-bounds".into(),
+                    proof: "proof".into(),
+                    criterion_proofs: vec![CriterionProof {
+                        criterion: 0,
+                        url: "u".repeat(MAX_PROOF_URL_BYTES + 1),
+                    }],
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("4096-byte limit"));
+        let error = client
+            .recover_completion_operation("card-1", "run-1", "contains/slash")
+            .unwrap_err();
+        assert!(error.message.contains("ASCII letters"));
+        let error = client
+            .recover_completion_operation(
+                "card-1",
+                "run-1",
+                &"x".repeat(MAX_OPERATION_ID_BYTES + 1),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("128-byte limit"));
         assert!(client
             .card_evidence(" ")
             .unwrap_err()
@@ -2062,42 +2740,334 @@ mod tests {
     }
 
     #[test]
-    fn evidence_client_fails_closed_on_malformed_unbounded_and_server_responses() {
+    fn run_bound_mutations_preserve_stale_released_expired_and_reclaimed_rejections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (operation_id, failure_code) in [
+                ("stale-op", "conflict"),
+                ("released-op", "conflict"),
+                ("expired-op", "claim_expired"),
+                ("reclaimed-op", "conflict"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("/api/v1/cards/card-1/runs/run-1/work-log"));
+                let request_body: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(request_body["operation_id"], operation_id);
+                let response = operation_status(
+                    operation_id,
+                    "work_log_append",
+                    "card-1",
+                    "run-1",
+                    "rejected",
+                    None,
+                    Some(json!({"code": failure_code, "message": "run is not current"})),
+                );
+                write_json_response(&mut stream, "200 OK", &response.to_string());
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request
+                .lines()
+                .next()
+                .unwrap()
+                .contains("/api/v1/cards/card-1/runs/run-1/complete"));
+            let response = operation_status(
+                "completion-stale-op",
+                "completion",
+                "card-1",
+                "run-1",
+                "rejected",
+                None,
+                Some(json!({"code": "conflict", "message": "run was reclaimed"})),
+            );
+            write_json_response(&mut stream, "200 OK", &response.to_string());
+        });
+
+        let client = test_client(addr);
+        for (operation_id, failure_code) in [
+            ("stale-op", "conflict"),
+            ("released-op", "conflict"),
+            ("expired-op", "claim_expired"),
+            ("reclaimed-op", "conflict"),
+        ] {
+            let outcome = client
+                .append_run_work_log(
+                    "card-1",
+                    &RunBoundWorkLog {
+                        expected_run_id: "run-1".into(),
+                        operation_id: operation_id.into(),
+                        attribution: WorkLogAttribution {
+                            agent: "crew".into(),
+                            model: None,
+                            reasoning: None,
+                            harness: Some("codex".into()),
+                        },
+                        body: "entry".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(outcome.state, OperationState::Rejected);
+            assert_eq!(outcome.failure.unwrap().code, failure_code);
+            assert!(outcome.result.is_none());
+        }
+        let completion = client
+            .complete_run_with_proof(
+                "card-1",
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "completion-stale-op".into(),
+                    proof: "proof".into(),
+                    criterion_proofs: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(completion.state, OperationState::Rejected);
+        assert_eq!(completion.failure.unwrap().code, "conflict");
+        assert!(completion.result.is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn operation_recovery_distinguishes_exact_replay_pending_and_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for operation_id in [
+                "work-log-replay",
+                "completion-replay",
+                "completion-rejected",
+                "completion-pending",
+                "completion-unknown",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains(&format!("/api/v1/operations/{operation_id}")));
+                let response = match operation_id {
+                    "work-log-replay" => operation_status(
+                        operation_id,
+                        "work_log_append",
+                        "card-1",
+                        "run-1",
+                        "succeeded",
+                        Some(json!({
+                            "schema_version": "powder.work_log_entry.v1",
+                            "id": "work-log-replayed",
+                            "card_id": "card-1",
+                            "actor": "crew",
+                            "agent": "crew",
+                            "run_id": "run-1",
+                            "body": "durable evidence",
+                            "created_at": 11,
+                            "updated_at": 11
+                        })),
+                        None,
+                    ),
+                    "completion-replay" => operation_status(
+                        operation_id,
+                        "completion",
+                        "card-1",
+                        "run-1",
+                        "succeeded",
+                        Some(json!({
+                            "schema_version": "powder.run_bound_completion.v1",
+                            "card_id": "card-1",
+                            "run_id": "run-1",
+                            "operation_id": operation_id,
+                            "status": "done",
+                            "proof": "verified",
+                            "criterion_proofs": [],
+                            "updated_at": 11,
+                            "audit_event_id": "event-1"
+                        })),
+                        None,
+                    ),
+                    "completion-rejected" => operation_status(
+                        operation_id,
+                        "completion",
+                        "card-1",
+                        "run-1",
+                        "rejected",
+                        None,
+                        Some(json!({"code": "conflict", "message": "run was released"})),
+                    ),
+                    "completion-pending" => operation_status(
+                        operation_id,
+                        "completion",
+                        "card-1",
+                        "run-1",
+                        "pending",
+                        None,
+                        None,
+                    ),
+                    _ => json!({
+                        "schema_version": "powder.operation_status.v1",
+                        "operation_id": operation_id,
+                        "state": "unknown"
+                    }),
+                };
+                write_json_response(&mut stream, "200 OK", &response.to_string());
+            }
+        });
+
+        let client = test_client(addr);
+        let work_log_replay = client
+            .recover_work_log_operation("card-1", "run-1", "work-log-replay")
+            .unwrap();
+        assert_eq!(work_log_replay.state, OperationState::Succeeded);
+        assert_eq!(work_log_replay.result.unwrap().body, "durable evidence");
+        let replay = client
+            .recover_completion_operation("card-1", "run-1", "completion-replay")
+            .unwrap();
+        assert_eq!(replay.state, OperationState::Succeeded);
+        assert_eq!(replay.result.unwrap().proof.as_deref(), Some("verified"));
+        let rejected = client
+            .recover_completion_operation("card-1", "run-1", "completion-rejected")
+            .unwrap();
+        assert_eq!(rejected.state, OperationState::Rejected);
+        assert_eq!(rejected.failure.unwrap().code, "conflict");
+        assert!(rejected.result.is_none());
+        let pending = client
+            .recover_completion_operation("card-1", "run-1", "completion-pending")
+            .unwrap();
+        assert_eq!(pending.state, OperationState::Pending);
+        assert!(pending.result.is_none());
+        let unknown = client
+            .recover_completion_operation("card-1", "run-1", "completion-unknown")
+            .unwrap();
+        assert_eq!(unknown.state, OperationState::Unknown);
+        assert!(unknown.target_card_id.is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn operation_response_requires_canonical_sha256_request_digest() {
+        let valid = operation_status(
+            "digest-op",
+            "completion",
+            "card-1",
+            "run-1",
+            "pending",
+            None,
+            None,
+        );
+        assert!(parse_operation_outcome::<Value>(
+            valid.clone(),
+            "completion",
+            "card-1",
+            "run-1",
+            "digest-op",
+            false,
+            Ok,
+        )
+        .is_ok());
+
+        let mut uppercase = valid.clone();
+        uppercase["request_digest"] = json!(format!("sha256:{}", "AB".repeat(32)));
+        assert!(parse_operation_outcome::<Value>(
+            uppercase,
+            "completion",
+            "card-1",
+            "run-1",
+            "digest-op",
+            false,
+            Ok,
+        )
+        .is_ok());
+
+        for invalid_digest in [
+            "a".repeat(64),
+            format!("SHA256:{}", "a".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["request_digest"] = json!(invalid_digest);
+            assert!(parse_operation_outcome::<Value>(
+                invalid,
+                "completion",
+                "card-1",
+                "run-1",
+                "digest-op",
+                false,
+                Ok,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn evidence_proof_urls_accept_4096_bytes_and_reject_larger_values() {
+        let at_limit = json!({
+            "criteria": [{
+                "text": "bounded evidence",
+                "proof_links": [{
+                    "url": "u".repeat(MAX_PROOF_URL_BYTES),
+                    "actor": "reviewer",
+                    "created_at": 1
+                }]
+            }]
+        });
+        let criteria = parse_criteria(&at_limit).unwrap();
+        assert_eq!(criteria[0].proof_links[0].url.len(), MAX_PROOF_URL_BYTES);
+
+        let over_limit = json!({
+            "criteria": [{
+                "text": "bounded evidence",
+                "proof_links": [{
+                    "url": "u".repeat(MAX_PROOF_URL_BYTES + 1),
+                    "actor": "reviewer",
+                    "created_at": 1
+                }]
+            }]
+        });
+        let error = parse_criteria(&over_limit).unwrap_err();
+        assert!(error.message.contains("4096-byte limit"));
+    }
+
+    #[test]
+    fn run_bound_client_fails_closed_on_substitution_malformed_and_server_responses() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for expected_path in [
-                "/api/v1/cards/card-1/work-log",
+                "/api/v1/cards/card-1/runs/run-1/work-log",
                 "/api/v1/cards/card-1",
                 "/api/v1/runs/run-1",
-                "/api/v1/cards/card-1/complete",
+                "/api/v1/cards/card-1/runs/run-1/complete",
                 "/api/v1/cards/oversized",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 assert!(request.lines().next().unwrap().contains(expected_path));
                 if expected_path.ends_with("work-log") {
-                    write_json_response(
-                        &mut stream,
-                        "200 OK",
-                        &json!({
-                            "card_id": "card-1",
-                            "agent": "different-crew",
-                            "run_id": "run-1",
-                            "body": "entry",
-                            "created_at": 1
-                        })
-                        .to_string(),
+                    let response = operation_status(
+                        "work-log:bad",
+                        "work_log_append",
+                        "another-card",
+                        "run-1",
+                        "rejected",
+                        None,
+                        Some(json!({"code": "conflict", "message": "stale"})),
                     );
+                    write_json_response(&mut stream, "200 OK", &response.to_string());
                 } else if expected_path == "/api/v1/cards/card-1" {
                     let entries = (0..=MAX_EVIDENCE_ITEMS)
                         .map(|index| {
                             json!({
-                                "card_id": "card-1",
-                                "agent": "crew",
-                                "run_id": "run-1",
-                                "body": format!("entry-{index}"),
-                                "created_at": index
+                                "card_id": "card-1", "agent": "crew", "run_id": "run-1",
+                                "body": format!("entry-{index}"), "created_at": index
                             })
                         })
                         .collect::<Vec<_>>();
@@ -2105,17 +3075,12 @@ mod tests {
                         &mut stream,
                         "200 OK",
                         &json!({
-                            "card": {
-                                "id": "card-1",
-                                "title": "card",
-                                "status": "running"
-                            },
-                            "work_log": entries,
-                            "work_log_total": entries.len()
+                            "card": {"id": "card-1", "title": "card", "status": "running"},
+                            "work_log": entries, "work_log_total": entries.len()
                         })
                         .to_string(),
                     );
-                } else if expected_path.contains("/runs/") {
+                } else if expected_path.contains("/runs/") && !expected_path.ends_with("complete") {
                     write_json_response(&mut stream, "200 OK", "{not-json");
                 } else if expected_path.ends_with("complete") {
                     write_json_response(
@@ -2135,18 +3100,23 @@ mod tests {
         });
 
         let client = test_client(addr);
-        let attribution = WorkLogAttribution {
-            agent: "crew".into(),
-            model: None,
-            reasoning: None,
-            harness: Some("codex".into()),
-            run_id: "run-1".into(),
-        };
-        assert!(client
-            .append_work_log("card-1", &attribution, "entry")
-            .unwrap_err()
-            .message
-            .contains("attribution does not match"));
+        let error = client
+            .append_run_work_log(
+                "card-1",
+                &RunBoundWorkLog {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "work-log:bad".into(),
+                    attribution: WorkLogAttribution {
+                        agent: "crew".into(),
+                        model: None,
+                        reasoning: None,
+                        harness: Some("codex".into()),
+                    },
+                    body: "entry".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("different target card id"));
         assert!(client
             .card_evidence("card-1")
             .unwrap_err()
@@ -2158,9 +3128,11 @@ mod tests {
             .message
             .contains("not valid JSON"));
         let error = client
-            .complete_with_proof(
+            .complete_run_with_proof(
                 "card-1",
-                &CompletionProof {
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "completion:server-error".into(),
                     proof: "proof".into(),
                     criterion_proofs: Vec::new(),
                 },
@@ -2179,32 +3151,55 @@ mod tests {
     }
 
     #[test]
-    fn completion_receipt_requires_matching_done_card_and_criterion_evidence() {
-        let wrong_card = parse_completion_receipt(
-            json!({"id": "card-2", "status": "done", "updated_at": 1}),
-            "card-1",
-        )
-        .unwrap_err();
+    fn completion_receipt_requires_matching_run_operation_and_done_card() {
+        let base = json!({
+            "schema_version": "powder.run_bound_completion.v1",
+            "card_id": "card-1",
+            "run_id": "run-1",
+            "operation_id": "completion:one",
+            "status": "done",
+            "proof": "proof",
+            "criterion_proofs": [],
+            "updated_at": 1,
+            "audit_event_id": "event-1"
+        });
+        let mut wrong_card_value = base.clone();
+        wrong_card_value["card_id"] = json!("card-2");
+        let wrong_card =
+            parse_completion_receipt(wrong_card_value, "card-1", "run-1", "completion:one")
+                .unwrap_err();
         assert!(wrong_card.message.contains("different card id"));
 
-        let not_done = parse_completion_receipt(
-            json!({"id": "card-1", "status": "running", "updated_at": 1}),
-            "card-1",
-        )
-        .unwrap_err();
+        let mut not_done_value = base.clone();
+        not_done_value["status"] = json!("running");
+        let not_done =
+            parse_completion_receipt(not_done_value, "card-1", "run-1", "completion:one")
+                .unwrap_err();
         assert!(not_done.message.contains("did not confirm done"));
 
-        let active_claim = parse_completion_receipt(
-            json!({
-                "id": "card-1",
-                "status": "done",
-                "updated_at": 1,
-                "claim": {"run_id": "run-1"}
-            }),
-            "card-1",
-        )
-        .unwrap_err();
-        assert!(active_claim.message.contains("retained an active claim"));
+        let mut wrong_run_value = base.clone();
+        wrong_run_value["run_id"] = json!("run-2");
+        let wrong_run =
+            parse_completion_receipt(wrong_run_value, "card-1", "run-1", "completion:one")
+                .unwrap_err();
+        assert!(wrong_run.message.contains("different run id"));
+
+        let mut too_many_proofs = base.clone();
+        too_many_proofs["criterion_proofs"] = json!((0..=MAX_COMPLETION_CRITERION_PROOFS)
+            .map(|criterion| json!({"criterion": criterion, "url": "proof"}))
+            .collect::<Vec<_>>());
+        let error = parse_completion_receipt(too_many_proofs, "card-1", "run-1", "completion:one")
+            .unwrap_err();
+        assert!(error.message.contains("128-item limit"));
+
+        let mut oversized_url = base;
+        oversized_url["criterion_proofs"] = json!([{
+            "criterion": 0,
+            "url": "u".repeat(MAX_PROOF_URL_BYTES + 1)
+        }]);
+        let error = parse_completion_receipt(oversized_url, "card-1", "run-1", "completion:one")
+            .unwrap_err();
+        assert!(error.message.contains("4096-byte limit"));
     }
 
     #[test]
