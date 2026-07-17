@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::bounded_exec;
 
@@ -29,6 +30,7 @@ const MAX_EVIDENCE_TEXT_BYTES: usize = 4096;
 const MAX_OPERATION_ID_BYTES: usize = 128;
 const MAX_OPERATION_FAILURE_BYTES: usize = 512;
 const MAX_WORK_LOG_ATTRIBUTION_BYTES: usize = 256;
+const MAX_CRITERION_REVIEWER_BYTES: usize = 256;
 pub const MAX_WORK_LOG_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_COMPLETION_PROOF_BYTES: usize = 4096;
 pub const MAX_COMPLETION_CRITERION_PROOFS: usize = 128;
@@ -149,6 +151,52 @@ pub struct CriterionEvidence {
     pub proof_links: Vec<EvidenceProofLink>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionReviewDecision {
+    Approved,
+    Rejected,
+    Cleared,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCriterionReview {
+    pub review_id: String,
+    pub operation_id: String,
+    pub card_id: String,
+    pub run_id: String,
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    pub decision: CriterionReviewDecision,
+    pub reviewer: String,
+    pub reviewer_identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes_review_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCriterionEvidence {
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<RunCriterionReview>,
+}
+
+impl RunCriterionEvidence {
+    pub fn is_approved(&self) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.decision == CriterionReviewDecision::Approved)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {
@@ -189,11 +237,50 @@ pub struct CardEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<EvidenceClaim>,
     pub criteria: Vec<CriterionEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_run_criteria: Option<Vec<RunCriterionEvidence>>,
     pub runs: Vec<RunSummary>,
     pub runs_total: usize,
     pub work_log: Vec<WorkLogEntry>,
     pub work_log_total: usize,
     pub truncated: bool,
+}
+
+impl CardEvidence {
+    /// Return authoritative criteria only when the card still has the exact
+    /// expected run as its current claim. Legacy checked fields are ignored.
+    pub fn completion_criteria_for_run(
+        &self,
+        expected_run_id: &str,
+    ) -> Result<&[RunCriterionEvidence], PowderError> {
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            invalid_request("card has no current run-scoped criterion projection")
+        })?;
+        if claim.run_id != expected_run_id {
+            return Err(invalid_request(
+                "card current claim does not match the expected completion run",
+            ));
+        }
+        self.current_run_criteria
+            .as_deref()
+            .ok_or_else(|| invalid_request("card has no current run-scoped criterion projection"))
+    }
+
+    /// Fail closed unless every current criterion has a latest authoritative
+    /// review whose decision is exactly `approved` for the expected run.
+    pub fn require_completion_criteria_approved(
+        &self,
+        expected_run_id: &str,
+    ) -> Result<(), PowderError> {
+        let criteria = self.completion_criteria_for_run(expected_run_id)?;
+        if let Some(criterion) = criteria.iter().find(|criterion| !criterion.is_approved()) {
+            return Err(invalid_request(format!(
+                "criterion {} is not approved for the expected run",
+                criterion.criterion_index
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -204,7 +291,8 @@ pub struct RunEvidence {
     pub card_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    pub criteria: Vec<CriterionEvidence>,
+    pub card_criteria: Vec<CriterionEvidence>,
+    pub criteria: Vec<RunCriterionEvidence>,
     pub activities: Vec<EvidenceActivity>,
     pub activities_total: usize,
     pub links: Vec<EvidenceLink>,
@@ -1138,13 +1226,40 @@ fn parse_card_evidence(value: Value, expected_card_id: &str) -> Result<CardEvide
         .collect::<Result<Vec<_>, _>>()?;
     let runs_total = bounded_total(&value, "runs_total", runs.len(), "card runs")?;
     let work_log_total = bounded_total(&value, "work_log_total", work_log.len(), "card work log")?;
+    let criteria = parse_criteria(card)?;
+    let claim = parse_evidence_claim(card.get("claim"))?;
+    let current_run_criteria = match claim.as_ref() {
+        Some(claim) => Some(parse_run_criteria_projection(
+            &value,
+            "current_run_criteria",
+            &criteria,
+            expected_card_id,
+            &claim.run_id,
+        )?),
+        None => {
+            if !bounded_array(
+                &value,
+                "current_run_criteria",
+                MAX_CRITERIA,
+                "current run criteria",
+            )?
+            .is_empty()
+            {
+                return Err(invalid_response(
+                    "released card evidence retained current run criteria",
+                ));
+            }
+            None
+        }
+    };
     Ok(CardEvidence {
         card_id,
         title: bounded_string(card, "title", "card title", MAX_EVIDENCE_TEXT_BYTES)?,
         status: card_status(card)?,
         repository: optional_bounded_string(card, "repo", "card repository", MAX_ID_BYTES)?,
-        claim: parse_evidence_claim(card.get("claim"))?,
-        criteria: parse_criteria(card)?,
+        claim,
+        criteria,
+        current_run_criteria,
         runs,
         runs_total,
         work_log,
@@ -1179,12 +1294,21 @@ fn parse_run_evidence(value: Value, expected_run_id: &str) -> Result<RunEvidence
         "run activities",
     )?;
     let links_total = bounded_total(&value, "links_total", links.len(), "run links")?;
+    let card_criteria = parse_criteria(card)?;
+    let criteria = parse_run_criteria_projection(
+        &value,
+        "criteria",
+        &card_criteria,
+        &card_id,
+        expected_run_id,
+    )?;
     Ok(RunEvidence {
         run,
         card_title: bounded_string(card, "title", "card title", MAX_EVIDENCE_TEXT_BYTES)?,
         card_status: card_status(card)?,
         repository: optional_bounded_string(card, "repo", "card repository", MAX_ID_BYTES)?,
-        criteria: parse_criteria(card)?,
+        card_criteria,
+        criteria,
         activities,
         activities_total,
         links,
@@ -1552,6 +1676,230 @@ fn parse_criteria(card: &Value) -> Result<Vec<CriterionEvidence>, PowderError> {
         .collect()
 }
 
+fn parse_run_criteria_projection(
+    envelope: &Value,
+    key: &str,
+    card_criteria: &[CriterionEvidence],
+    expected_card_id: &str,
+    expected_run_id: &str,
+) -> Result<Vec<RunCriterionEvidence>, PowderError> {
+    if envelope.get(key).is_none() && !card_criteria.is_empty() {
+        return Err(invalid_response(format!(
+            "run-scoped criterion projection is missing {key}"
+        )));
+    }
+    let values = bounded_array(envelope, key, MAX_CRITERIA, "run-scoped criteria")?;
+    if values.len() != card_criteria.len() {
+        return Err(invalid_response(
+            "run-scoped criterion projection does not match current card criteria",
+        ));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(expected_index, value)| {
+            let criterion_index = value
+                .get("criterion_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| invalid_response("run criterion index is invalid"))?;
+            if criterion_index != expected_index {
+                return Err(invalid_response(
+                    "run criterion index does not match its current position",
+                ));
+            }
+            let criterion_text = bounded_string(
+                value,
+                "criterion_text",
+                "run criterion text",
+                MAX_EVIDENCE_TEXT_BYTES,
+            )?;
+            if criterion_text != card_criteria[expected_index].text {
+                return Err(invalid_response(
+                    "run criterion text does not match the current card criterion",
+                ));
+            }
+            let criterion_id =
+                bounded_string(value, "criterion_id", "run criterion id", MAX_ID_BYTES)?;
+            let expected_criterion_id = criterion_identity(card_criteria, expected_index);
+            if criterion_id != expected_criterion_id {
+                return Err(invalid_response(
+                    "run criterion identity does not match its exact text and occurrence",
+                ));
+            }
+            let review = match value.get("review") {
+                None | Some(Value::Null) => None,
+                Some(review) if review.is_object() => Some(parse_run_criterion_review(
+                    review,
+                    expected_card_id,
+                    expected_run_id,
+                    criterion_index,
+                    &criterion_id,
+                    &criterion_text,
+                )?),
+                Some(_) => return Err(invalid_response("run criterion review is not an object")),
+            };
+            Ok(RunCriterionEvidence {
+                criterion_index,
+                criterion_id,
+                criterion_text,
+                review,
+            })
+        })
+        .collect()
+}
+
+fn parse_run_criterion_review(
+    value: &Value,
+    expected_card_id: &str,
+    expected_run_id: &str,
+    expected_criterion_index: usize,
+    expected_criterion_id: &str,
+    expected_criterion_text: &str,
+) -> Result<RunCriterionReview, PowderError> {
+    let review_id = bounded_string(value, "id", "criterion review id", MAX_ID_BYTES)?;
+    if !review_id.starts_with("review-") {
+        return Err(invalid_response("criterion review id is invalid"));
+    }
+    let operation_id = bounded_string(
+        value,
+        "operation_id",
+        "criterion review operation id",
+        MAX_OPERATION_ID_BYTES,
+    )?;
+    if !valid_operation_id(&operation_id) {
+        return Err(invalid_response("criterion review operation id is invalid"));
+    }
+    let card_id = bounded_string(value, "card_id", "criterion review card id", MAX_ID_BYTES)?;
+    if card_id != expected_card_id {
+        return Err(invalid_response(
+            "criterion review returned a different card id",
+        ));
+    }
+    let run_id = bounded_string(value, "run_id", "criterion review run id", MAX_ID_BYTES)?;
+    if run_id != expected_run_id {
+        return Err(invalid_response(
+            "criterion review returned a different run id",
+        ));
+    }
+    let criterion_index = value
+        .get("criterion_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| invalid_response("criterion review index is invalid"))?;
+    if criterion_index != expected_criterion_index {
+        return Err(invalid_response(
+            "criterion review returned a different criterion index",
+        ));
+    }
+    let criterion_id = bounded_string(
+        value,
+        "criterion_id",
+        "criterion review criterion id",
+        MAX_ID_BYTES,
+    )?;
+    if criterion_id != expected_criterion_id {
+        return Err(invalid_response(
+            "criterion review returned a different criterion identity",
+        ));
+    }
+    let criterion_text = bounded_string(
+        value,
+        "criterion_text",
+        "criterion review criterion text",
+        MAX_EVIDENCE_TEXT_BYTES,
+    )?;
+    if criterion_text != expected_criterion_text {
+        return Err(invalid_response(
+            "criterion review returned different criterion text",
+        ));
+    }
+    let decision = match bounded_string(
+        value,
+        "decision",
+        "criterion review decision",
+        MAX_SHORT_TEXT_BYTES,
+    )?
+    .as_str()
+    {
+        "approved" => CriterionReviewDecision::Approved,
+        "rejected" => CriterionReviewDecision::Rejected,
+        "cleared" => CriterionReviewDecision::Cleared,
+        _ => return Err(invalid_response("criterion review decision is invalid")),
+    };
+    let reviewer = bounded_string(
+        value,
+        "reviewer",
+        "criterion reviewer",
+        MAX_CRITERION_REVIEWER_BYTES,
+    )?;
+    let reviewer_identity = bounded_string(
+        value,
+        "reviewer_identity",
+        "criterion reviewer identity",
+        MAX_CRITERION_REVIEWER_BYTES,
+    )?;
+    if reviewer.trim().is_empty()
+        || reviewer_identity.trim().is_empty()
+        || reviewer_identity == "legacy:unverified"
+    {
+        return Err(invalid_response(
+            "criterion review has no authoritative reviewer identity",
+        ));
+    }
+    let proof = optional_bounded_string(
+        value,
+        "proof",
+        "criterion review proof",
+        MAX_COMPLETION_PROOF_BYTES,
+    )?;
+    if proof
+        .as_deref()
+        .is_some_and(|proof| proof.trim().is_empty())
+    {
+        return Err(invalid_response("criterion review proof is empty"));
+    }
+    let supersedes_review_id = optional_bounded_string(
+        value,
+        "supersedes_review_id",
+        "superseded criterion review id",
+        MAX_ID_BYTES,
+    )?;
+    if supersedes_review_id
+        .as_deref()
+        .is_some_and(|review_id| !review_id.starts_with("review-"))
+    {
+        return Err(invalid_response(
+            "superseded criterion review id is invalid",
+        ));
+    }
+    Ok(RunCriterionReview {
+        review_id,
+        operation_id,
+        card_id,
+        run_id,
+        criterion_index,
+        criterion_id,
+        criterion_text,
+        decision,
+        reviewer,
+        reviewer_identity,
+        proof,
+        supersedes_review_id,
+        created_at: required_i64(value, "created_at", "criterion review created_at")?,
+    })
+}
+
+fn criterion_identity(criteria: &[CriterionEvidence], index: usize) -> String {
+    let criterion = &criteria[index];
+    let occurrence = criteria[..index]
+        .iter()
+        .filter(|candidate| candidate.text == criterion.text)
+        .count();
+    let digest = Sha256::digest(criterion.text.as_bytes());
+    format!("powder.criterion.v1:sha256:{digest:x}:{occurrence}")
+}
+
 fn parse_evidence_claim(value: Option<&Value>) -> Result<Option<EvidenceClaim>, PowderError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -1735,15 +2083,20 @@ fn validate_id(label: &str, value: &str) -> Result<(), PowderError> {
 
 fn validate_operation_id(value: &str) -> Result<(), PowderError> {
     validate_required_bounded_text("operation id", value, MAX_OPERATION_ID_BYTES)?;
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
+    if !valid_operation_id(value) {
         return Err(invalid_request(
             "operation id must use only ASCII letters, digits, '-', '_', '.', or ':'",
         ));
     }
     Ok(())
+}
+
+fn valid_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_OPERATION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn operation_request_digest(value: &Value) -> Result<String, PowderError> {
@@ -2326,6 +2679,75 @@ mod tests {
         })
     }
 
+    fn test_criterion_id(text: &str, occurrence: usize) -> String {
+        let digest = Sha256::digest(text.as_bytes());
+        format!("powder.criterion.v1:sha256:{digest:x}:{occurrence}")
+    }
+
+    fn run_criterion_fixture(
+        card_id: &str,
+        run_id: &str,
+        criterion_index: usize,
+        criterion_text: &str,
+        decision: Option<&str>,
+    ) -> Value {
+        let criterion_id = test_criterion_id(criterion_text, 0);
+        let review = decision.map(|decision| {
+            json!({
+                "id": format!("review-{criterion_index}"),
+                "operation_id": format!("review:{criterion_index}"),
+                "card_id": card_id,
+                "run_id": run_id,
+                "criterion_index": criterion_index,
+                "criterion_id": criterion_id,
+                "criterion_text": criterion_text,
+                "decision": decision,
+                "reviewer": "crew-reviewer",
+                "reviewer_identity": "actor-crew-reviewer",
+                "proof": "bounded review proof",
+                "created_at": 14
+            })
+        });
+        json!({
+            "criterion_index": criterion_index,
+            "criterion_id": criterion_id,
+            "criterion_text": criterion_text,
+            "review": review
+        })
+    }
+
+    fn card_criteria_fixture(decision: Option<&str>, claimed: bool, legacy_checked: bool) -> Value {
+        let mut criterion = json!({"text": "ship it", "proof_links": []});
+        if legacy_checked {
+            criterion["checked_by"] = json!("legacy-operator");
+            criterion["checked_at"] = json!(9);
+        }
+        let mut card = json!({
+            "id": "card-criteria",
+            "title": "Authoritative criteria",
+            "status": if claimed { "running" } else { "ready" },
+            "criteria": [criterion]
+        });
+        if claimed {
+            card["claim"] = json!({
+                "agent": "crew-reviewer",
+                "run_id": "run-criteria",
+                "expires_at": 99
+            });
+        }
+        let mut envelope = json!({"card": card});
+        if claimed {
+            envelope["current_run_criteria"] = json!([run_criterion_fixture(
+                "card-criteria",
+                "run-criteria",
+                0,
+                "ship it",
+                decision
+            )]);
+        }
+        envelope
+    }
+
     #[test]
     fn profile_file_resolves_a_command_backed_key() {
         let path = std::env::temp_dir().join(format!(
@@ -2518,6 +2940,13 @@ mod tests {
                                 "proof_links": []
                             }]
                         },
+                        "criteria": [run_criterion_fixture(
+                            "card/one",
+                            "run/one",
+                            0,
+                            "tests pass",
+                            Some("approved")
+                        )],
                         "activities": [{
                             "id": "activity-1",
                             "run_id": "run/one",
@@ -2559,6 +2988,13 @@ mod tests {
                             "updated_at": 11
                         }],
                         "runs_total": 2,
+                        "current_run_criteria": [run_criterion_fixture(
+                            "card/one",
+                            "run/one",
+                            0,
+                            "tests pass",
+                            Some("approved")
+                        )],
                         "work_log": [{
                             "card_id": "card/one",
                             "agent": "crew-87ea2ca1",
@@ -2577,7 +3013,17 @@ mod tests {
         let card = client.card_evidence("card/one").unwrap();
         assert_eq!(card.card_id, "card/one");
         assert_eq!(card.repository.as_deref(), Some("t-hub"));
-        assert_eq!(card.claim.unwrap().run_id, "run/one");
+        assert_eq!(card.claim.as_ref().unwrap().run_id, "run/one");
+        card.require_completion_criteria_approved("run/one")
+            .unwrap();
+        assert_eq!(
+            card.current_run_criteria.as_ref().unwrap()[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .decision,
+            CriterionReviewDecision::Approved
+        );
         assert_eq!(card.runs_total, 2);
         assert_eq!(card.work_log_total, 3);
         assert!(card.truncated);
@@ -2585,6 +3031,11 @@ mod tests {
         let run = client.run_evidence("run/one").unwrap();
         assert_eq!(run.run.run_id, "run/one");
         assert_eq!(run.run.proof.as_deref(), Some("commit abc; tests passed"));
+        assert!(run.criteria[0].is_approved());
+        assert_eq!(
+            run.card_criteria[0].checked_by.as_deref(),
+            Some("crew-87ea2ca1")
+        );
         assert_eq!(run.activities_total, 2);
         assert!(run.truncated);
 
@@ -2639,6 +3090,144 @@ mod tests {
             .iter()
             .all(|proof| proof.url.len() == MAX_PROOF_URL_BYTES));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn authoritative_card_criteria_gate_completion_and_ignore_legacy_checks() {
+        let approved = parse_card_evidence(
+            card_criteria_fixture(Some("approved"), true, false),
+            "card-criteria",
+        )
+        .unwrap();
+        approved
+            .require_completion_criteria_approved("run-criteria")
+            .unwrap();
+        assert_eq!(
+            approved.current_run_criteria.as_ref().unwrap()[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .decision,
+            CriterionReviewDecision::Approved
+        );
+
+        let rejected = parse_card_evidence(
+            card_criteria_fixture(Some("rejected"), true, false),
+            "card-criteria",
+        )
+        .unwrap();
+        assert_eq!(
+            rejected.current_run_criteria.as_ref().unwrap()[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .decision,
+            CriterionReviewDecision::Rejected
+        );
+        assert!(rejected
+            .require_completion_criteria_approved("run-criteria")
+            .is_err());
+
+        let cleared = parse_card_evidence(
+            card_criteria_fixture(Some("cleared"), true, false),
+            "card-criteria",
+        )
+        .unwrap();
+        assert_eq!(
+            cleared.current_run_criteria.as_ref().unwrap()[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .decision,
+            CriterionReviewDecision::Cleared
+        );
+        assert!(cleared
+            .require_completion_criteria_approved("run-criteria")
+            .is_err());
+
+        let legacy_only =
+            parse_card_evidence(card_criteria_fixture(None, true, true), "card-criteria").unwrap();
+        assert_eq!(
+            legacy_only.criteria[0].checked_by.as_deref(),
+            Some("legacy-operator")
+        );
+        assert!(legacy_only.current_run_criteria.as_ref().unwrap()[0]
+            .review
+            .is_none());
+        assert!(legacy_only
+            .require_completion_criteria_approved("run-criteria")
+            .is_err());
+
+        let released =
+            parse_card_evidence(card_criteria_fixture(None, false, true), "card-criteria").unwrap();
+        assert!(released.claim.is_none());
+        assert!(released.current_run_criteria.is_none());
+        assert!(released
+            .require_completion_criteria_approved("run-criteria")
+            .is_err());
+    }
+
+    #[test]
+    fn released_run_criteria_preserve_history_and_reject_identity_substitution() {
+        let base = json!({
+            "run": {
+                "id": "run-criteria",
+                "card_id": "card-criteria",
+                "state": "released",
+                "agent": "crew-reviewer",
+                "claim_expires_at": 99,
+                "created_at": 1,
+                "updated_at": 10
+            },
+            "card": {
+                "id": "card-criteria",
+                "title": "Authoritative criteria",
+                "status": "ready",
+                "criteria": [{
+                    "text": "ship it",
+                    "checked_by": "legacy-operator",
+                    "checked_at": 9,
+                    "proof_links": []
+                }]
+            },
+            "criteria": [run_criterion_fixture(
+                "card-criteria",
+                "run-criteria",
+                0,
+                "ship it",
+                Some("approved")
+            )]
+        });
+        let released = parse_run_evidence(base.clone(), "run-criteria").unwrap();
+        assert_eq!(released.criteria.len(), 1);
+        assert!(released.criteria[0].is_approved());
+        assert_eq!(
+            released.criteria[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .reviewer_identity,
+            "actor-crew-reviewer"
+        );
+
+        for (field, replacement) in [
+            ("card_id", json!("foreign-card")),
+            ("run_id", json!("foreign-run")),
+            ("reviewer_identity", json!("legacy:unverified")),
+            (
+                "reviewer",
+                json!("x".repeat(MAX_CRITERION_REVIEWER_BYTES + 1)),
+            ),
+            ("proof", json!("x".repeat(MAX_COMPLETION_PROOF_BYTES + 1))),
+        ] {
+            let mut invalid = base.clone();
+            invalid["criteria"][0]["review"][field] = replacement;
+            assert!(parse_run_evidence(invalid, "run-criteria").is_err());
+        }
+
+        let mut wrong_identity = base;
+        wrong_identity["criteria"][0]["criterion_id"] = json!(test_criterion_id("other", 0));
+        assert!(parse_run_evidence(wrong_identity, "run-criteria").is_err());
     }
 
     #[test]

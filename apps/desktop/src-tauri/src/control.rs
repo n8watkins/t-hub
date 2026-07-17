@@ -9908,10 +9908,29 @@ fn validate_bound_evidence(
             scope.work.card_id, scope.work.run_id
         ));
     }
-    if card.criteria != run.criteria {
+    if card.criteria != run.card_criteria {
         return Err(format!(
-            "Powder card '{}' and run '{}' report inconsistent acceptance criteria",
+            "Powder card '{}' and run '{}' report inconsistent card criteria",
             scope.work.card_id, scope.work.run_id
+        ));
+    }
+    if let Some(claim) = card.claim.as_ref() {
+        let current = card.current_run_criteria.as_ref().ok_or_else(|| {
+            format!(
+                "Powder card '{}' omits current-run criteria for claimed run '{}'",
+                scope.work.card_id, claim.run_id
+            )
+        })?;
+        if claim.run_id == scope.work.run_id && current != &run.criteria {
+            return Err(format!(
+                "Powder card '{}' and run '{}' report inconsistent run-scoped criteria",
+                scope.work.card_id, scope.work.run_id
+            ));
+        }
+    } else if card.current_run_criteria.is_some() {
+        return Err(format!(
+            "Powder card '{}' reports current-run criteria without a current claim",
+            scope.work.card_id
         ));
     }
     let matching_runs = card
@@ -10001,30 +10020,24 @@ fn observed_completion_digest(scope: &CrewPowderScope) -> String {
 }
 
 fn validate_completion_criteria(
-    criteria: &[powder::CriterionEvidence],
+    criteria: &[powder::RunCriterionEvidence],
     proof: &CrewCompletionProof,
 ) -> Result<(), String> {
     if criteria.is_empty() {
         return Err("Powder card has no acceptance criteria".into());
     }
     for criterion in criteria {
-        let checked_by = criterion
-            .checked_by
-            .as_deref()
-            .map(str::trim)
-            .filter(|actor| !actor.is_empty());
-        let checked_at = criterion.checked_at;
-        if checked_by.is_none() || checked_at.is_none_or(|timestamp| timestamp <= 0) {
+        if !criterion.is_approved() {
             return Err(format!(
-                "Powder acceptance criterion {} is not checked; refusing completion",
-                criterion.criterion
+                "Powder acceptance criterion {} is not approved for this run; refusing completion",
+                criterion.criterion_index
             ));
         }
     }
     for criterion_proof in &proof.criterion_proofs {
         if !criteria
             .iter()
-            .any(|criterion| criterion.criterion == criterion_proof.criterion)
+            .any(|criterion| criterion.criterion_index == criterion_proof.criterion)
         {
             return Err(format!(
                 "completion proof references missing acceptance criterion {}",
@@ -10326,10 +10339,14 @@ fn bounded_crew_evidence(
     truncated |= truncate_evidence_items(&mut card.runs, limit);
     truncated |= truncate_evidence_items(&mut card.work_log, limit);
     truncated |= truncate_evidence_items(&mut card.criteria, limit);
+    if let Some(criteria) = card.current_run_criteria.as_mut() {
+        truncated |= truncate_evidence_items(criteria, limit);
+    }
     truncated |= truncate_evidence_items(&mut run.activities, limit);
     truncated |= truncate_evidence_items(&mut run.links, limit);
+    truncated |= truncate_evidence_items(&mut run.card_criteria, limit);
     truncated |= truncate_evidence_items(&mut run.criteria, limit);
-    for criterion in card.criteria.iter_mut().chain(run.criteria.iter_mut()) {
+    for criterion in card.criteria.iter_mut().chain(run.card_criteria.iter_mut()) {
         truncated |= truncate_evidence_items(&mut criterion.proof_links, limit);
     }
     card.truncated |= truncated;
@@ -10584,7 +10601,7 @@ fn complete_crew_powder(
                     .begin_crew_powder_completion(&crew_session_id, &digest)?;
                 return completion_success(ctx, &scope, &digest, &card, &run, "recovered");
             }
-            BoundPowderReality::Active => validate_completion_criteria(&card.criteria, &proof)?,
+            BoundPowderReality::Active => validate_completion_criteria(&run.criteria, &proof)?,
         }
         ctx.captains
             .begin_crew_powder_completion(&crew_session_id, &digest)?;
@@ -22593,6 +22610,35 @@ mod tests {
         }
     }
 
+    fn powder_run_criterion(
+        card_id: &str,
+        run_id: &str,
+        index: usize,
+        approved: bool,
+    ) -> powder::RunCriterionEvidence {
+        let criterion_id = format!("powder.criterion.v1:sha256:test:{index}");
+        powder::RunCriterionEvidence {
+            criterion_index: index,
+            criterion_id: criterion_id.clone(),
+            criterion_text: format!("Criterion {index}"),
+            review: approved.then(|| powder::RunCriterionReview {
+                review_id: format!("review-{index}"),
+                operation_id: format!("review-operation-{index}"),
+                card_id: card_id.into(),
+                run_id: run_id.into(),
+                criterion_index: index,
+                criterion_id,
+                criterion_text: format!("Criterion {index}"),
+                decision: powder::CriterionReviewDecision::Approved,
+                reviewer: "captain-powder".into(),
+                reviewer_identity: "actor-captain-powder".into(),
+                proof: Some("review proof".into()),
+                supersedes_review_id: None,
+                created_at: 123,
+            }),
+        }
+    }
+
     fn powder_lifecycle_evidence(
         card_id: &str,
         run_id: &str,
@@ -22611,18 +22657,21 @@ mod tests {
             updated_at: 2,
         };
         let criteria = vec![powder_criterion(0, true)];
+        let run_criteria = vec![powder_run_criterion(card_id, run_id, 0, true)];
+        let has_claim = card_status != "done";
         (
             powder::CardEvidence {
                 card_id: card_id.into(),
                 title: "Powder lifecycle".into(),
                 status: card_status.into(),
                 repository: Some(repository.into()),
-                claim: (card_status != "done").then(|| powder::EvidenceClaim {
+                claim: has_claim.then(|| powder::EvidenceClaim {
                     run_id: run_id.into(),
                     agent: "t-hub".into(),
                     expires_at: 100,
                 }),
                 criteria: criteria.clone(),
+                current_run_criteria: has_claim.then(|| run_criteria.clone()),
                 runs: vec![run_summary.clone()],
                 runs_total: 1,
                 work_log: vec![],
@@ -22634,7 +22683,8 @@ mod tests {
                 card_title: "Powder lifecycle".into(),
                 card_status: card_status.into(),
                 repository: Some(repository.into()),
-                criteria,
+                card_criteria: criteria,
+                criteria: run_criteria,
                 activities: vec![],
                 activities_total: 0,
                 links: vec![],
@@ -23549,6 +23599,32 @@ mod tests {
         })
     }
 
+    fn loopback_run_criterion(run_id: &str) -> Value {
+        let criterion_text = "Criterion 0";
+        let digest = Sha256::digest(criterion_text.as_bytes());
+        let criterion_id = format!("powder.criterion.v1:sha256:{digest:x}:0");
+        json!({
+            "criterion_index": 0,
+            "criterion_id": criterion_id,
+            "criterion_text": criterion_text,
+            "review": {
+                "id": "review-0",
+                "operation_id": "review-operation-0",
+                "card_id": "thub-powder-control-lifecycle",
+                "run_id": run_id,
+                "criterion_index": 0,
+                "criterion_id": criterion_id,
+                "criterion_text": criterion_text,
+                "decision": "approved",
+                "reviewer": "captain-powder",
+                "reviewer_identity": "actor-captain-powder",
+                "proof": "review proof",
+                "supersedes_review_id": null,
+                "created_at": 123
+            }
+        })
+    }
+
     fn loopback_run(state: &LoopbackPowderState) -> Value {
         let run_id = state
             .evidence_run_id
@@ -23617,6 +23693,16 @@ mod tests {
         };
         json!({
             "card": loopback_card(state),
+            "current_run_criteria": if state.completed || state.released {
+                Vec::<Value>::new()
+            } else {
+                vec![loopback_run_criterion(
+                    state
+                        .evidence_run_id
+                        .as_deref()
+                        .unwrap_or("run-authoritative")
+                )]
+            },
             "runs_total": runs.len(),
             "runs": runs,
             "work_log": [],
@@ -23632,6 +23718,7 @@ mod tests {
         json!({
             "run": loopback_run(state),
             "card": card,
+            "criteria": [loopback_run_criterion("run-authoritative")],
             "activities": [],
             "activities_total": 0,
             "links": [],
@@ -27760,7 +27847,9 @@ mod tests {
         completed_a_card.criteria[0]
             .proof_links
             .push(proof_link.clone());
-        completed_a_run.criteria[0].proof_links.push(proof_link);
+        completed_a_run.card_criteria[0]
+            .proof_links
+            .push(proof_link);
         completion_matches_evidence(&scope, &completed_a_card, &completed_a_run, &proof_a).unwrap();
         registry
             .finish_crew_powder_completion("crew-powder", &digest)
@@ -27810,7 +27899,7 @@ mod tests {
     }
 
     #[test]
-    fn powder_completion_requires_checked_criteria_and_valid_proof_indexes() {
+    fn powder_completion_requires_approved_run_criteria_and_valid_proof_indexes() {
         let proof = parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [{
@@ -27819,24 +27908,23 @@ mod tests {
             }]
         }))
         .unwrap();
-        let checked = vec![powder_criterion(0, true)];
-        validate_completion_criteria(&checked, &proof).unwrap();
+        let approved = vec![powder_run_criterion(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            0,
+            true,
+        )];
+        validate_completion_criteria(&approved, &proof).unwrap();
 
-        for checked_at in [None, Some(0), Some(-1)] {
-            let mut criterion = powder_criterion(0, true);
-            criterion.checked_at = checked_at;
-            assert!(validate_completion_criteria(&[criterion], &proof)
-                .unwrap_err()
-                .contains("not checked"));
-        }
-        let mut positive_timestamp = powder_criterion(0, true);
-        positive_timestamp.checked_at = Some(1);
-        validate_completion_criteria(&[positive_timestamp], &proof).unwrap();
-
-        let unchecked = vec![powder_criterion(0, false)];
-        assert!(validate_completion_criteria(&unchecked, &proof)
+        let unapproved = vec![powder_run_criterion(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            0,
+            false,
+        )];
+        assert!(validate_completion_criteria(&unapproved, &proof)
             .unwrap_err()
-            .contains("not checked"));
+            .contains("not approved"));
 
         let missing_index = parse_completion_proof(&json!({
             "proof": "commit abc123",
@@ -27846,7 +27934,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert!(validate_completion_criteria(&checked, &missing_index)
+        assert!(validate_completion_criteria(&approved, &missing_index)
             .unwrap_err()
             .contains("missing acceptance criterion"));
     }
@@ -27878,7 +27966,7 @@ mod tests {
             created_at: 124,
         };
         card.criteria[0].proof_links.push(link.clone());
-        run.criteria[0].proof_links.push(link);
+        run.card_criteria[0].proof_links.push(link);
         completion_matches_evidence(&scope, &card, &run, &proof).unwrap();
 
         run.run.proof = Some("different proof".into());
@@ -27948,7 +28036,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         card.criteria = criteria.clone();
-        run.criteria = criteria;
+        run.card_criteria = criteria;
+        let run_criteria = (0..9)
+            .map(|criterion| {
+                powder_run_criterion(
+                    "thub-powder-control-lifecycle",
+                    "run-authoritative",
+                    criterion,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        card.current_run_criteria = Some(run_criteria.clone());
+        run.criteria = run_criteria;
         run.activities = (0..25)
             .map(|index| powder::EvidenceActivity {
                 activity_type: "work".into(),
@@ -27980,7 +28080,7 @@ mod tests {
         assert_eq!(run.links.len(), 7);
         assert_eq!(run.criteria.len(), 7);
         assert!(run
-            .criteria
+            .card_criteria
             .iter()
             .all(|criterion| criterion.proof_links.len() == 7));
         assert_eq!(card.work_log_total, 25);
