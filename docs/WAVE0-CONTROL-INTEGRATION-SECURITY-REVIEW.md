@@ -368,6 +368,9 @@ The serialized control Powder filter passed 63 tests, the Powder client filter p
 The agent suite passed 55 unit tests, 3 Codex TAP E2E tests, and 1 unobserved E2E test.
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
 No post-remediation workspace-wide test result is claimed.
+The standalone CLI suite passed 47 unit tests and 10 Powder contract tests.
+One immediately chained MCP command was started from the standalone CLI manifest, where Cargo rejected `-p t-hub-mcp` before MCP test execution because that package is outside that manifest's package set.
+The MCP suite was then run from the desktop workspace and passed 16 library tests and 75 binary tests.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
