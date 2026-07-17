@@ -8216,6 +8216,12 @@ fn board_powder_error(
             "The bound Powder board no longer exists or is not visible.",
             false,
         ),
+        powder::PowderErrorKind::Conflict => (
+            "error",
+            "powder_conflict",
+            "Powder rejected the request because its authoritative state changed.",
+            false,
+        ),
         powder::PowderErrorKind::Unreachable => (
             "unreachable",
             "powder_unreachable",
@@ -10718,7 +10724,7 @@ fn append_crew_powder_work_log(
     let outcome = match client.append_run_work_log(&scope.work.card_id, &append) {
         Ok(outcome) => outcome,
         Err(_) => client
-            .recover_work_log_operation(&scope.work.card_id, &scope.work.run_id, &operation_id)
+            .recover_work_log_operation(&scope.work.card_id, &append)
             .map_err(|_| {
                 "Powder work-log outcome is unavailable; retry the exact same message".to_string()
             })?,
@@ -11284,11 +11290,7 @@ fn complete_crew_powder(
     };
 
     let recovered = if was_pending {
-        match client.recover_completion_operation(
-            &scope.work.card_id,
-            &scope.work.run_id,
-            &operation_id,
-        ) {
+        match client.recover_completion_operation(&scope.work.card_id, &completion) {
             Ok(outcome) if outcome.state != powder::OperationState::Unknown => Some(outcome),
             Ok(_) => {
                 return Err(
@@ -11312,11 +11314,7 @@ fn complete_crew_powder(
         None => match client.complete_run_with_proof(&scope.work.card_id, &completion) {
             Ok(outcome) => outcome,
             Err(_) => client
-                .recover_completion_operation(
-                    &scope.work.card_id,
-                    &scope.work.run_id,
-                    &operation_id,
-                )
+                .recover_completion_operation(&scope.work.card_id, &completion)
                 .map_err(|_| {
                     "Powder completion outcome is unavailable; completion remains pending and the same-ship Captain may retry only with the same proof"
                         .to_string()
@@ -11526,6 +11524,7 @@ fn historical_powder_read_error(
         }
         powder::PowderErrorKind::Unauthorized
         | powder::PowderErrorKind::NotFound
+        | powder::PowderErrorKind::Conflict
         | powder::PowderErrorKind::InvalidResponse => message,
     }
 }
@@ -23733,6 +23732,7 @@ mod tests {
                         (profile): {
                             "baseUrl": format!("http://{addr}"),
                             "agentName": "t-hub",
+                            "operationIdentity": "actor-t-hub",
                             "apiKey": "test-key"
                         }
                     }
@@ -24198,6 +24198,8 @@ mod tests {
                 normalized_body["proof"] = json!(proof);
                 normalized_body["criterion_proofs"][0]["url"] = json!(proof_url);
                 let mut outcome = loopback_completion_outcome(&normalized_body);
+                outcome["request_digest"] =
+                    json!(loopback_operation_request_digest("completion", &body));
                 if let Some(response_run_id) = response_run_id {
                     outcome["expected_run_id"] = json!(response_run_id);
                 }
@@ -24500,12 +24502,71 @@ mod tests {
         })
     }
 
-    fn loopback_operation_outcome(kind: &str, operation_id: &str, result: Value) -> Value {
+    fn loopback_operation_request_digest(kind: &str, body: &Value) -> String {
+        match kind {
+            "work_log_append" => powder::work_log_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundWorkLog {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    attribution: powder::WorkLogAttribution {
+                        agent: body["agent"].as_str().unwrap().into(),
+                        model: body["model"].as_str().map(str::to_string),
+                        reasoning: body["reasoning"].as_str().map(str::to_string),
+                        harness: body["harness"].as_str().map(str::to_string),
+                    },
+                    body: body["body"].as_str().unwrap().into(),
+                },
+            ),
+            "criterion_review" => powder::criterion_review_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundCriterionReview {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    criterion_index: body["criterion"].as_u64().unwrap() as usize,
+                    criterion_id: body["criterion_id"].as_str().unwrap().into(),
+                    criterion_text: "Criterion 0".into(),
+                    decision: match body["decision"].as_str().unwrap() {
+                        "approved" => powder::CriterionReviewDecision::Approved,
+                        "rejected" => powder::CriterionReviewDecision::Rejected,
+                        "cleared" => powder::CriterionReviewDecision::Cleared,
+                        _ => panic!("unsupported loopback criterion decision"),
+                    },
+                    proof: body["proof"].as_str().map(str::to_string),
+                    expected_reviewer_identity: "actor-captain-powder".into(),
+                },
+            ),
+            "completion" => powder::completion_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundCompletion {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    proof: body["proof"].as_str().unwrap().into(),
+                    criterion_proofs: body["criterion_proofs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|proof| powder::CriterionProof {
+                            criterion: proof["criterion"].as_u64().unwrap() as usize,
+                            url: proof["url"].as_str().unwrap().into(),
+                        })
+                        .collect(),
+                },
+            ),
+            _ => panic!("unsupported loopback operation kind"),
+        }
+        .unwrap()
+    }
+
+    fn loopback_operation_outcome(kind: &str, body: &Value, result: Value) -> Value {
         json!({
             "schema_version": "powder.operation_status.v1",
-            "operation_id": operation_id,
+            "operation_id": body["operation_id"],
             "state": "succeeded",
-            "request_digest": format!("sha256:{}", "a".repeat(64)),
+            "request_digest": loopback_operation_request_digest(kind, body),
             "kind": kind,
             "target_card_id": "thub-powder-control-lifecycle",
             "expected_run_id": "run-authoritative",
@@ -24523,7 +24584,7 @@ mod tests {
             "schema_version": "powder.operation_status.v1",
             "operation_id": body["operation_id"],
             "state": "rejected",
-            "request_digest": format!("sha256:{}", "b".repeat(64)),
+            "request_digest": loopback_operation_request_digest(kind, body),
             "kind": kind,
             "target_card_id": "thub-powder-control-lifecycle",
             "expected_run_id": "run-authoritative",
@@ -24543,7 +24604,7 @@ mod tests {
         let operation_id = body["operation_id"].as_str().unwrap();
         loopback_operation_outcome(
             "completion",
-            operation_id,
+            body,
             json!({
                 "schema_version": "powder.run_bound_completion.v1",
                 "card_id": "thub-powder-control-lifecycle",
@@ -24559,10 +24620,9 @@ mod tests {
     }
 
     fn loopback_work_log_outcome(body: &Value) -> Value {
-        let operation_id = body["operation_id"].as_str().unwrap();
         loopback_operation_outcome(
             "work_log_append",
-            operation_id,
+            body,
             json!({
                 "schema_version": "powder.work_log_entry.v1",
                 "id": "work-log-1",
@@ -24585,7 +24645,7 @@ mod tests {
         let criterion_id = body["criterion_id"].as_str().unwrap();
         loopback_operation_outcome(
             "criterion_review",
-            operation_id,
+            body,
             json!({
                 "id": "review-authoritative",
                 "operation_id": operation_id,

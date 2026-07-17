@@ -29,6 +29,8 @@ const MAX_ID_BYTES: usize = 256;
 const MAX_SHORT_TEXT_BYTES: usize = 512;
 const MAX_EVIDENCE_TEXT_BYTES: usize = 4096;
 const MAX_OPERATION_ID_BYTES: usize = 128;
+const MAX_OPERATION_AUTHORITY_BYTES: usize = 256;
+const MAX_OPERATION_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_OPERATION_FAILURE_BYTES: usize = 512;
 const MAX_WORK_LOG_ATTRIBUTION_BYTES: usize = 256;
 const MAX_CRITERION_REVIEWER_BYTES: usize = 256;
@@ -51,6 +53,8 @@ struct ProfileFile {
 struct ProfileConfig {
     base_url: String,
     agent_name: String,
+    #[serde(default)]
+    operation_identity: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
     #[serde(default)]
@@ -428,6 +432,7 @@ pub struct PowderBoard {
 pub enum PowderErrorKind {
     Unauthorized,
     NotFound,
+    Conflict,
     Unreachable,
     Upstream,
     InvalidResponse,
@@ -492,6 +497,7 @@ struct PowderRepositorySummary {
 pub struct Client {
     base_url: String,
     agent_name: String,
+    operation_identity: Option<String>,
     api_key: Option<String>,
     agent: ureq::Agent,
 }
@@ -626,6 +632,7 @@ impl Client {
                         "Powder default profile requires POWDER_AGENT_NAME to match its agent-scoped API key"
                             .to_string()
                     })?,
+                    operation_identity: std::env::var("POWDER_OPERATION_IDENTITY").ok(),
                     api_key: std::env::var("POWDER_API_KEY").ok(),
                     api_key_env: None,
                     api_key_command: std::env::var("POWDER_API_KEY_CMD").ok(),
@@ -648,6 +655,18 @@ impl Client {
         if agent_name.is_empty() {
             return Err("Powder agentName must not be empty".into());
         }
+        let operation_identity = config
+            .operation_identity
+            .map(|identity| identity.trim().to_string())
+            .filter(|identity| !identity.is_empty());
+        if operation_identity
+            .as_ref()
+            .is_some_and(|identity| identity.len() > MAX_OPERATION_AUTHORITY_BYTES)
+        {
+            return Err(format!(
+                "Powder operationIdentity exceeds the {MAX_OPERATION_AUTHORITY_BYTES}-byte limit"
+            ));
+        }
         let api_key = if let Some(command) = config.api_key_command.as_deref() {
             Some(resolve_key_command(command)?)
         } else if let Some(env_name) = config.api_key_env.as_deref() {
@@ -665,6 +684,7 @@ impl Client {
         Ok(Self {
             base_url,
             agent_name,
+            operation_identity,
             api_key,
             agent,
         })
@@ -787,6 +807,7 @@ impl Client {
     pub fn require_run_bound_mutation_capabilities(
         &self,
     ) -> Result<RunBoundMutationCapabilities, PowderError> {
+        self.require_operation_identity()?;
         let ready =
             self.request_typed_with_limit("GET", "/readyz", None, MAX_CAPABILITY_RESPONSE_BYTES)?;
         if ready.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -890,6 +911,7 @@ impl Client {
         )?;
         validate_required_bounded_text("work-log body", &append.body, MAX_WORK_LOG_BODY_BYTES)?;
 
+        let request_digest = self.work_log_request_digest(card_id, append)?;
         let value = self.request_typed_with_limit(
             "POST",
             &format!(
@@ -913,6 +935,7 @@ impl Client {
             card_id,
             &append.expected_run_id,
             &append.operation_id,
+            Some(&request_digest),
             false,
             |result| {
                 parse_run_bound_work_log_entry(
@@ -950,6 +973,7 @@ impl Client {
             review.proof.as_deref(),
             MAX_COMPLETION_PROOF_BYTES,
         )?;
+        let request_digest = self.criterion_review_request_digest(card_id, review)?;
         let value = self.request_typed_with_limit(
             "POST",
             &format!(
@@ -972,6 +996,7 @@ impl Client {
             card_id,
             &review.expected_run_id,
             &review.operation_id,
+            Some(&request_digest),
             false,
             |result| parse_exact_run_criterion_review(result, card_id, review),
         )
@@ -1023,6 +1048,7 @@ impl Client {
         for proof in &completion.criterion_proofs {
             validate_required_bounded_text("criterion proof URL", &proof.url, MAX_PROOF_URL_BYTES)?;
         }
+        let request_digest = self.completion_request_digest(card_id, completion)?;
         let value = self.request_typed_with_limit(
             "POST",
             &format!(
@@ -1043,6 +1069,7 @@ impl Client {
             card_id,
             &completion.expected_run_id,
             &completion.operation_id,
+            Some(&request_digest),
             false,
             |result| {
                 parse_completion_receipt(
@@ -1059,15 +1086,23 @@ impl Client {
     pub fn recover_work_log_operation(
         &self,
         card_id: &str,
-        expected_run_id: &str,
-        operation_id: &str,
+        append: &RunBoundWorkLog,
     ) -> Result<OperationOutcome<WorkLogEntry>, PowderError> {
+        let request_digest = self.work_log_request_digest(card_id, append)?;
         self.recover_operation(
             "work_log_append",
             card_id,
-            expected_run_id,
-            operation_id,
-            |result| parse_run_bound_work_log_entry(result, card_id, expected_run_id, None),
+            &append.expected_run_id,
+            &append.operation_id,
+            &request_digest,
+            |result| {
+                parse_run_bound_work_log_entry(
+                    result,
+                    card_id,
+                    &append.expected_run_id,
+                    Some(&append.attribution),
+                )
+            },
         )
     }
 
@@ -1076,11 +1111,13 @@ impl Client {
         card_id: &str,
         review: &RunBoundCriterionReview,
     ) -> Result<OperationOutcome<RunCriterionReview>, PowderError> {
+        let request_digest = self.criterion_review_request_digest(card_id, review)?;
         self.recover_operation(
             "criterion_review",
             card_id,
             &review.expected_run_id,
             &review.operation_id,
+            &request_digest,
             |result| parse_exact_run_criterion_review(result, card_id, review),
         )
     }
@@ -1089,15 +1126,23 @@ impl Client {
     pub fn recover_completion_operation(
         &self,
         card_id: &str,
-        expected_run_id: &str,
-        operation_id: &str,
+        completion: &RunBoundCompletion,
     ) -> Result<OperationOutcome<CompletionReceipt>, PowderError> {
+        let request_digest = self.completion_request_digest(card_id, completion)?;
         self.recover_operation(
             "completion",
             card_id,
-            expected_run_id,
-            operation_id,
-            |result| parse_completion_receipt(result, card_id, expected_run_id, operation_id),
+            &completion.expected_run_id,
+            &completion.operation_id,
+            &request_digest,
+            |result| {
+                parse_completion_receipt(
+                    result,
+                    card_id,
+                    &completion.expected_run_id,
+                    &completion.operation_id,
+                )
+            },
         )
     }
 
@@ -1107,6 +1152,7 @@ impl Client {
         card_id: &str,
         expected_run_id: &str,
         operation_id: &str,
+        expected_request_digest: &str,
         parse_result: impl FnOnce(Value) -> Result<T, PowderError>,
     ) -> Result<OperationOutcome<T>, PowderError> {
         validate_id("card id", card_id)?;
@@ -1124,9 +1170,46 @@ impl Client {
             card_id,
             expected_run_id,
             operation_id,
+            Some(expected_request_digest),
             true,
             parse_result,
         )
+    }
+
+    pub fn work_log_request_digest(
+        &self,
+        card_id: &str,
+        append: &RunBoundWorkLog,
+    ) -> Result<String, PowderError> {
+        work_log_operation_request_digest(self.require_operation_identity()?, card_id, append)
+    }
+
+    pub fn criterion_review_request_digest(
+        &self,
+        card_id: &str,
+        review: &RunBoundCriterionReview,
+    ) -> Result<String, PowderError> {
+        criterion_review_operation_request_digest(
+            self.require_operation_identity()?,
+            card_id,
+            review,
+        )
+    }
+
+    pub fn completion_request_digest(
+        &self,
+        card_id: &str,
+        completion: &RunBoundCompletion,
+    ) -> Result<String, PowderError> {
+        completion_operation_request_digest(self.require_operation_identity()?, card_id, completion)
+    }
+
+    fn require_operation_identity(&self) -> Result<&str, PowderError> {
+        self.operation_identity.as_deref().ok_or_else(|| {
+            invalid_request(
+                "Powder connection profile has no stable operationIdentity for run-bound mutations",
+            )
+        })
     }
 
     pub fn tail_events(&self, after: i64, limit: usize) -> Result<Vec<CardEvent>, String> {
@@ -1222,6 +1305,70 @@ impl Client {
         };
         response.map_err(|error| typed_response_error(error, self.api_key.as_deref()))
     }
+}
+
+pub(crate) fn work_log_operation_request_digest(
+    authority: &str,
+    card_id: &str,
+    append: &RunBoundWorkLog,
+) -> Result<String, PowderError> {
+    canonical_operation_request_digest(
+        authority,
+        "work_log_append",
+        card_id,
+        &append.expected_run_id,
+        &[
+            ("agent", Some(append.attribution.agent.as_str())),
+            ("model", append.attribution.model.as_deref()),
+            ("reasoning", append.attribution.reasoning.as_deref()),
+            ("harness", append.attribution.harness.as_deref()),
+            ("body", Some(append.body.as_str())),
+        ],
+    )
+}
+
+pub(crate) fn criterion_review_operation_request_digest(
+    authority: &str,
+    card_id: &str,
+    review: &RunBoundCriterionReview,
+) -> Result<String, PowderError> {
+    let criterion_index = review.criterion_index.to_string();
+    let decision = match review.decision {
+        CriterionReviewDecision::Approved => "approved",
+        CriterionReviewDecision::Rejected => "rejected",
+        CriterionReviewDecision::Cleared => "cleared",
+    };
+    canonical_operation_request_digest(
+        authority,
+        "criterion_review",
+        card_id,
+        &review.expected_run_id,
+        &[
+            ("criterion_index", Some(criterion_index.as_str())),
+            ("criterion_id", Some(review.criterion_id.as_str())),
+            ("decision", Some(decision)),
+            ("proof", review.proof.as_deref()),
+        ],
+    )
+}
+
+pub(crate) fn completion_operation_request_digest(
+    authority: &str,
+    card_id: &str,
+    completion: &RunBoundCompletion,
+) -> Result<String, PowderError> {
+    let criterion_proofs = serde_json::to_string(&completion.criterion_proofs)
+        .map_err(|_| invalid_request("completion criterion proofs cannot be serialized"))?;
+    canonical_operation_request_digest(
+        authority,
+        "completion",
+        card_id,
+        &completion.expected_run_id,
+        &[
+            ("proof", Some(completion.proof.as_str())),
+            ("criterion_proofs", Some(criterion_proofs.as_str())),
+        ],
+    )
 }
 
 fn parse_bounded_json_response(
@@ -1579,6 +1726,7 @@ fn parse_operation_outcome<T: Serialize>(
     expected_card_id: &str,
     expected_run_id: &str,
     expected_operation_id: &str,
+    expected_request_digest: Option<&str>,
     allow_unknown: bool,
     parse_result: impl FnOnce(Value) -> Result<T, PowderError>,
 ) -> Result<OperationOutcome<T>, PowderError> {
@@ -1654,6 +1802,11 @@ fn parse_operation_outcome<T: Serialize>(
     }
 
     let request_digest = operation_request_digest(&value)?;
+    if expected_request_digest.is_some_and(|expected| request_digest != expected) {
+        return Err(invalid_response(
+            "operation response request digest does not match the submitted mutation",
+        ));
+    }
     let kind = bounded_string(&value, "kind", "operation kind", MAX_SHORT_TEXT_BYTES)?;
     if kind != expected_kind {
         return Err(invalid_response(
@@ -2315,12 +2468,83 @@ fn operation_request_digest(value: &Value) -> Result<String, PowderError> {
             "operation request digest is not canonical sha256",
         ));
     };
-    if hex.len() != HEX_BYTES || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if hex.len() != HEX_BYTES
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
         return Err(invalid_response(
             "operation request digest is not canonical sha256",
         ));
     }
     Ok(digest)
+}
+
+fn canonical_operation_request_digest(
+    authority: &str,
+    kind: &str,
+    card_id: &str,
+    expected_run_id: &str,
+    payload: &[(&str, Option<&str>)],
+) -> Result<String, PowderError> {
+    validate_required_bounded_text(
+        "operation authority",
+        authority,
+        MAX_OPERATION_AUTHORITY_BYTES,
+    )?;
+    validate_id("card id", card_id)?;
+    validate_id("expected run id", expected_run_id)?;
+    let mut canonical_bytes = 0usize;
+    let mut hasher = Sha256::new();
+    for (name, value) in [
+        ("schema", Some("powder.operation_request.v1")),
+        ("kind", Some(kind)),
+        ("target_type", Some("card")),
+        ("target", Some(card_id)),
+        ("authority", Some(authority)),
+        ("expected_run", Some(expected_run_id)),
+    ]
+    .into_iter()
+    .chain(payload.iter().copied())
+    {
+        hash_operation_component(&mut hasher, &mut canonical_bytes, name, value)?;
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn hash_operation_component(
+    hasher: &mut Sha256,
+    canonical_bytes: &mut usize,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), PowderError> {
+    let value_len = value.map_or(0, str::len);
+    let added = 8usize
+        .checked_add(name.len())
+        .and_then(|count| count.checked_add(value_len))
+        .ok_or_else(|| invalid_request("Powder operation request size overflow"))?;
+    *canonical_bytes = canonical_bytes
+        .checked_add(added)
+        .ok_or_else(|| invalid_request("Powder operation request size overflow"))?;
+    if *canonical_bytes > MAX_OPERATION_REQUEST_BYTES {
+        return Err(invalid_request(format!(
+            "Powder operation request exceeds the {MAX_OPERATION_REQUEST_BYTES}-byte canonical limit"
+        )));
+    }
+    let name_len = u32::try_from(name.len())
+        .map_err(|_| invalid_request("Powder operation component name is too large"))?;
+    hasher.update(name_len.to_be_bytes());
+    hasher.update(name.as_bytes());
+    match value {
+        Some(value) => {
+            let value_len = u32::try_from(value.len())
+                .map_err(|_| invalid_request("Powder operation component value is too large"))?;
+            hasher.update(value_len.to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update(u32::MAX.to_be_bytes()),
+    }
+    Ok(())
 }
 
 fn validate_optional_bounded_text(
@@ -2579,6 +2803,7 @@ fn typed_response_error(error: ureq::Error, credential: Option<&str>) -> PowderE
                 kind: match status {
                     401 | 403 => PowderErrorKind::Unauthorized,
                     404 => PowderErrorKind::NotFound,
+                    409 => PowderErrorKind::Conflict,
                     _ => PowderErrorKind::Upstream,
                 },
                 message: format!("Powder HTTP {status}: {detail}"),
@@ -2799,6 +3024,7 @@ mod tests {
         Client::new(ProfileConfig {
             base_url: format!("http://{addr}"),
             agent_name: "t-hub".into(),
+            operation_identity: Some("actor-t-hub".into()),
             api_key: Some("test-key".into()),
             api_key_env: None,
             api_key_command: None,
@@ -2868,7 +3094,7 @@ mod tests {
             "schema_version": "powder.operation_status.v1",
             "operation_id": operation_id,
             "state": state,
-            "request_digest": format!("sha256:{}", "aB".repeat(32)),
+            "request_digest": format!("sha256:{}", "ab".repeat(32)),
             "kind": kind,
             "target_card_id": card_id,
             "expected_run_id": run_id,
@@ -2879,6 +3105,43 @@ mod tests {
             "updated_at": 11,
             "expires_at": 9010
         })
+    }
+
+    fn with_request_digest(mut status: Value, request_digest: String) -> Value {
+        status["request_digest"] = json!(request_digest);
+        status
+    }
+
+    fn test_request_digest(kind: &str, card_id: &str, run_id: &str, body: &Value) -> String {
+        let criterion_index;
+        let criterion_proofs;
+        let fields = match kind {
+            "work_log_append" => vec![
+                ("agent", body["agent"].as_str()),
+                ("model", body["model"].as_str()),
+                ("reasoning", body["reasoning"].as_str()),
+                ("harness", body["harness"].as_str()),
+                ("body", body["body"].as_str()),
+            ],
+            "criterion_review" => {
+                criterion_index = body["criterion"].as_u64().unwrap().to_string();
+                vec![
+                    ("criterion_index", Some(criterion_index.as_str())),
+                    ("criterion_id", body["criterion_id"].as_str()),
+                    ("decision", body["decision"].as_str()),
+                    ("proof", body["proof"].as_str()),
+                ]
+            }
+            "completion" => {
+                criterion_proofs = serde_json::to_string(&body["criterion_proofs"]).unwrap();
+                vec![
+                    ("proof", body["proof"].as_str()),
+                    ("criterion_proofs", Some(criterion_proofs.as_str())),
+                ]
+            }
+            _ => panic!("unsupported test operation kind"),
+        };
+        canonical_operation_request_digest("actor-t-hub", kind, card_id, run_id, &fields).unwrap()
     }
 
     fn test_criterion_id(text: &str, occurrence: usize) -> String {
@@ -3095,6 +3358,26 @@ mod tests {
     }
 
     #[test]
+    fn run_bound_mutations_require_a_stable_profile_operation_identity_before_network() {
+        let client = Client::new(ProfileConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            agent_name: "t-hub".into(),
+            operation_identity: None,
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+
+        let error = client
+            .require_run_bound_mutation_capabilities()
+            .unwrap_err();
+
+        assert_eq!(error.kind, PowderErrorKind::InvalidResponse);
+        assert!(error.message.contains("stable operationIdentity"));
+    }
+
+    #[test]
     fn run_bound_client_round_trips_paths_payloads_attribution_and_receipts() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3124,13 +3407,14 @@ mod tests {
                     assert_eq!(request_body["body"], "focused tests are passing");
                     assert!(request_body.get("actor").is_none());
                     assert!(request_body.get("run_id").is_none());
-                    operation_status(
-                        "work-log:one",
-                        "work_log_append",
-                        "card/one",
-                        "run/one",
-                        "succeeded",
-                        Some(json!({
+                    with_request_digest(
+                        operation_status(
+                            "work-log:one",
+                            "work_log_append",
+                            "card/one",
+                            "run/one",
+                            "succeeded",
+                            Some(json!({
                             "schema_version": "powder.work_log_entry.v1",
                             "id": "work-log-one",
                             "card_id": "card/one",
@@ -3143,8 +3427,15 @@ mod tests {
                             "body": "focused tests are passing",
                             "created_at": 15,
                             "updated_at": 15
-                        })),
-                        None,
+                            })),
+                            None,
+                        ),
+                        test_request_digest(
+                            "work_log_append",
+                            "card/one",
+                            "run/one",
+                            &request_body,
+                        ),
                     )
                 } else if expected_path.ends_with("criteria/review") {
                     let request_body: Value =
@@ -3157,13 +3448,14 @@ mod tests {
                     assert_eq!(request_body["proof"], "raw secret-shaped review proof");
                     assert!(request_body.get("reviewer").is_none());
                     assert!(request_body.get("reviewer_identity").is_none());
-                    operation_status(
-                        "criterion:one",
-                        "criterion_review",
-                        "card/one",
-                        "run/one",
-                        "succeeded",
-                        Some(json!({
+                    with_request_digest(
+                        operation_status(
+                            "criterion:one",
+                            "criterion_review",
+                            "card/one",
+                            "run/one",
+                            "succeeded",
+                            Some(json!({
                             "id": "review-one",
                             "operation_id": "criterion:one",
                             "card_id": "card/one",
@@ -3176,8 +3468,15 @@ mod tests {
                             "reviewer_identity": "actor-captain-powder",
                             "proof": "[scrubbed review proof]",
                             "created_at": 19
-                        })),
-                        None,
+                            })),
+                            None,
+                        ),
+                        test_request_digest(
+                            "criterion_review",
+                            "card/one",
+                            "run/one",
+                            &request_body,
+                        ),
                     )
                 } else if expected_path.ends_with("complete") {
                     let request_body: Value =
@@ -3194,17 +3493,18 @@ mod tests {
                             .as_str()
                             .unwrap()
                             .len(),
-                        MAX_PROOF_URL_BYTES
+                        "https://example.test/proof".len()
                     );
                     assert!(request_body.get("actor").is_none());
                     assert!(request_body.get("run_id").is_none());
-                    operation_status(
-                        "completion:one",
-                        "completion",
-                        "card/one",
-                        "run/one",
-                        "succeeded",
-                        Some(json!({
+                    with_request_digest(
+                        operation_status(
+                            "completion:one",
+                            "completion",
+                            "card/one",
+                            "run/one",
+                            "succeeded",
+                            Some(json!({
                             "schema_version": "powder.run_bound_completion.v1",
                             "card_id": "card/one",
                             "run_id": "run/one",
@@ -3214,8 +3514,10 @@ mod tests {
                             "criterion_proofs": request_body["criterion_proofs"].clone(),
                             "updated_at": 20,
                             "audit_event_id": "event-1"
-                        })),
-                        None,
+                            })),
+                            None,
+                        ),
+                        test_request_digest("completion", "card/one", "run/one", &request_body),
                     )
                 } else if expected_path.contains("/runs/") {
                     json!({
@@ -3392,7 +3694,7 @@ mod tests {
                     criterion_proofs: (0..MAX_COMPLETION_CRITERION_PROOFS)
                         .map(|criterion| CriterionProof {
                             criterion,
-                            url: "u".repeat(MAX_PROOF_URL_BYTES),
+                            url: "https://example.test/proof".into(),
                         })
                         .collect(),
                 },
@@ -3409,7 +3711,7 @@ mod tests {
         assert!(receipt
             .criterion_proofs
             .iter()
-            .all(|proof| proof.url.len() == MAX_PROOF_URL_BYTES));
+            .all(|proof| proof.url == "https://example.test/proof"));
         server.join().unwrap();
     }
 
@@ -3556,6 +3858,7 @@ mod tests {
         let client = Client::new(ProfileConfig {
             base_url: "http://127.0.0.1:9".into(),
             agent_name: "t-hub".into(),
+            operation_identity: Some("actor-t-hub".into()),
             api_key: Some("test-key".into()),
             api_key_env: None,
             api_key_command: None,
@@ -3631,14 +3934,26 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("4096-byte limit"));
         let error = client
-            .recover_completion_operation("card-1", "run-1", "contains/slash")
+            .recover_completion_operation(
+                "card-1",
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "contains/slash".into(),
+                    proof: "proof".into(),
+                    criterion_proofs: Vec::new(),
+                },
+            )
             .unwrap_err();
         assert!(error.message.contains("ASCII letters"));
         let error = client
             .recover_completion_operation(
                 "card-1",
-                "run-1",
-                &"x".repeat(MAX_OPERATION_ID_BYTES + 1),
+                &RunBoundCompletion {
+                    expected_run_id: "run-1".into(),
+                    operation_id: "x".repeat(MAX_OPERATION_ID_BYTES + 1),
+                    proof: "proof".into(),
+                    criterion_proofs: Vec::new(),
+                },
             )
             .unwrap_err();
         assert!(error.message.contains("128-byte limit"));
@@ -3670,14 +3985,17 @@ mod tests {
                 let request_body: Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
                 assert_eq!(request_body["operation_id"], operation_id);
-                let response = operation_status(
-                    operation_id,
-                    "work_log_append",
-                    "card-1",
-                    "run-1",
-                    "rejected",
-                    None,
-                    Some(json!({"code": failure_code, "message": "run is not current"})),
+                let response = with_request_digest(
+                    operation_status(
+                        operation_id,
+                        "work_log_append",
+                        "card-1",
+                        "run-1",
+                        "rejected",
+                        None,
+                        Some(json!({"code": failure_code, "message": "run is not current"})),
+                    ),
+                    test_request_digest("work_log_append", "card-1", "run-1", &request_body),
                 );
                 write_json_response(&mut stream, "200 OK", &response.to_string());
             }
@@ -3688,14 +4006,19 @@ mod tests {
                 .next()
                 .unwrap()
                 .contains("/api/v1/cards/card-1/runs/run-1/complete"));
-            let response = operation_status(
-                "completion-stale-op",
-                "completion",
-                "card-1",
-                "run-1",
-                "rejected",
-                None,
-                Some(json!({"code": "conflict", "message": "run was reclaimed"})),
+            let request_body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let response = with_request_digest(
+                operation_status(
+                    "completion-stale-op",
+                    "completion",
+                    "card-1",
+                    "run-1",
+                    "rejected",
+                    None,
+                    Some(json!({"code": "conflict", "message": "run was reclaimed"})),
+                ),
+                test_request_digest("completion", "card-1", "run-1", &request_body),
             );
             write_json_response(&mut stream, "200 OK", &response.to_string());
         });
@@ -3826,34 +4149,81 @@ mod tests {
                         "state": "unknown"
                     }),
                 };
+                let response = match operation_id {
+                    "work-log-replay" => with_request_digest(
+                        response,
+                        test_request_digest(
+                            "work_log_append",
+                            "card-1",
+                            "run-1",
+                            &json!({
+                                "agent": "crew",
+                                "model": Value::Null,
+                                "reasoning": Value::Null,
+                                "harness": Value::Null,
+                                "body": "durable evidence",
+                            }),
+                        ),
+                    ),
+                    "completion-unknown" => response,
+                    _ => with_request_digest(
+                        response,
+                        test_request_digest(
+                            "completion",
+                            "card-1",
+                            "run-1",
+                            &json!({
+                                "proof": "verified",
+                                "criterion_proofs": [],
+                            }),
+                        ),
+                    ),
+                };
                 write_json_response(&mut stream, "200 OK", &response.to_string());
             }
         });
 
         let client = test_client(addr);
+        let work_log_request = RunBoundWorkLog {
+            expected_run_id: "run-1".into(),
+            operation_id: "work-log-replay".into(),
+            attribution: WorkLogAttribution {
+                agent: "crew".into(),
+                model: None,
+                reasoning: None,
+                harness: None,
+            },
+            body: "durable evidence".into(),
+        };
         let work_log_replay = client
-            .recover_work_log_operation("card-1", "run-1", "work-log-replay")
+            .recover_work_log_operation("card-1", &work_log_request)
             .unwrap();
         assert_eq!(work_log_replay.state, OperationState::Succeeded);
         assert_eq!(work_log_replay.result.unwrap().body, "durable evidence");
+        let completion_request = |operation_id: &str| RunBoundCompletion {
+            expected_run_id: "run-1".into(),
+            operation_id: operation_id.into(),
+            proof: "verified".into(),
+            criterion_proofs: Vec::new(),
+        };
         let replay = client
-            .recover_completion_operation("card-1", "run-1", "completion-replay")
+            .recover_completion_operation("card-1", &completion_request("completion-replay"))
             .unwrap();
         assert_eq!(replay.state, OperationState::Succeeded);
         assert_eq!(replay.result.unwrap().proof.as_deref(), Some("verified"));
         let rejected = client
-            .recover_completion_operation("card-1", "run-1", "completion-rejected")
+            .recover_completion_operation("card-1", &completion_request("completion-rejected"))
             .unwrap();
         assert_eq!(rejected.state, OperationState::Rejected);
         assert_eq!(rejected.failure.unwrap().code, "conflict");
         assert!(rejected.result.is_none());
         let pending = client
-            .recover_completion_operation("card-1", "run-1", "completion-pending")
+            .recover_completion_operation("card-1", &completion_request("completion-pending"))
             .unwrap();
         assert_eq!(pending.state, OperationState::Pending);
         assert!(pending.result.is_none());
         let unknown = client
-            .recover_completion_operation("card-1", "run-1", "completion-unknown")
+            .recover_completion_operation("card-1", &completion_request("completion-unknown"))
             .unwrap();
         assert_eq!(unknown.state, OperationState::Unknown);
         assert!(unknown.target_card_id.is_none());
@@ -3877,6 +4247,7 @@ mod tests {
             "card-1",
             "run-1",
             "digest-op",
+            None,
             false,
             Ok,
         )
@@ -3890,10 +4261,11 @@ mod tests {
             "card-1",
             "run-1",
             "digest-op",
+            None,
             false,
             Ok,
         )
-        .is_ok());
+        .is_err());
 
         for invalid_digest in [
             "a".repeat(64),
@@ -3910,6 +4282,7 @@ mod tests {
                 "card-1",
                 "run-1",
                 "digest-op",
+                None,
                 false,
                 Ok,
             )
@@ -3962,14 +4335,19 @@ mod tests {
                 let request = read_http_request(&mut stream);
                 assert!(request.lines().next().unwrap().contains(expected_path));
                 if expected_path.ends_with("work-log") {
-                    let response = operation_status(
-                        "work-log:bad",
-                        "work_log_append",
-                        "another-card",
-                        "run-1",
-                        "rejected",
-                        None,
-                        Some(json!({"code": "conflict", "message": "stale"})),
+                    let request_body: Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    let response = with_request_digest(
+                        operation_status(
+                            "work-log:bad",
+                            "work_log_append",
+                            "another-card",
+                            "run-1",
+                            "rejected",
+                            None,
+                            Some(json!({"code": "conflict", "message": "stale"})),
+                        ),
+                        test_request_digest("work_log_append", "card-1", "run-1", &request_body),
                     );
                     write_json_response(&mut stream, "200 OK", &response.to_string());
                 } else if expected_path == "/api/v1/cards/card-1" {
@@ -4167,6 +4545,7 @@ mod tests {
         let client = Client::new(ProfileConfig {
             base_url: "https://powder.example.test/".into(),
             agent_name: "t-hub".into(),
+            operation_identity: None,
             api_key: Some("secret-key".into()),
             api_key_env: None,
             api_key_command: None,
@@ -4202,6 +4581,7 @@ mod tests {
         let client = Client::new(ProfileConfig {
             base_url: format!("http://{addr}"),
             agent_name: "t-hub".into(),
+            operation_identity: None,
             api_key: Some("test-key".into()),
             api_key_env: None,
             api_key_command: None,
@@ -4229,6 +4609,7 @@ mod tests {
             let error = Client::new(ProfileConfig {
                 base_url: base_url.into(),
                 agent_name: "t-hub".into(),
+                operation_identity: None,
                 api_key: Some("secret".into()),
                 api_key_env: None,
                 api_key_command: None,
@@ -4250,6 +4631,7 @@ mod tests {
             Client::new(ProfileConfig {
                 base_url: base_url.into(),
                 agent_name: "t-hub".into(),
+                operation_identity: None,
                 api_key: Some("secret".into()),
                 api_key_env: None,
                 api_key_command: None,
@@ -4403,6 +4785,7 @@ mod tests {
         let client = Client::new(ProfileConfig {
             base_url: format!("http://{addr}"),
             agent_name: "t-hub".into(),
+            operation_identity: None,
             api_key: Some("test-key".into()),
             api_key_env: None,
             api_key_command: None,
