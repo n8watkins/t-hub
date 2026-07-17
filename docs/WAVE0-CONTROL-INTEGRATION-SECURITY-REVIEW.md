@@ -34,6 +34,7 @@ That commit authorizes the target Crew or current Captain from a registry snapsh
 The lifecycle-guard heartbeat reauthorization finding was remediated by commit `8bfa0fcd6bcde133a35abcbd58976cde0992ffd6`.
 The removed-Crew close authorization finding was remediated by commit `17c8ed5e7b7f1b31c295631dccd1435a178dccf6`.
 The initial Powder claim receipt identity finding was remediated by commit `a712df7a1d7222272f3c128d20e06ad074ff797c`.
+The initial-claim transactionality finding was remediated by commit `bf3c3ca2f4fafecb40a9a9efea7a1ba7fe3d5f4c`.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -84,6 +85,8 @@ The existing full-scope checks, Harness liveness checks, operation guard, and po
 Heartbeat repeats the same minimal ownership authorization after acquiring the renewal guard and before any repeated scope resolution.
 Terminal close performs minimal lifecycle ownership authorization before checking Removed Crew history or starting Project and Powder reconciliation.
 Initial claim receipts must match both the requested card and the protected profile's configured agent before dispatch can persist a Crew binding.
+Before the initial claim POST, dispatch now persists a trusted pending intent containing the Project, protected profile, repository, card, configured agent, and stable operation identity.
+Malformed, substituted, or response-lost initial receipts retain that intent, remove only the local terminal, never issue a release, and block redispatch until authoritative card reconciliation.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -138,6 +141,11 @@ A substituted card or agent could therefore become a durable Crew binding.
 The Powder client now validates the requested card and configured profile agent before returning the initial claim.
 Client regressions cover card and agent substitution, and the dispatch regression proves rollback removes the spawned terminal without a foreign binding or release request.
 
+Fresh rereview found that a malformed, substituted, or lost initial-claim response could still represent a committed remote claim.
+Dispatch previously removed the local terminal and reported all side effects rolled back despite having no trusted release identity.
+The new pending-dispatch claim state survives restart and is keyed by trusted protected profile, repository, card, configured agent, and stable operation identity.
+Response loss and substituted receipts retain recovery-pending state, issue no release, and block an identical retry after authoritative active-claim reconciliation.
+
 ## Focused Verification
 
 `cargo test -p t-hub-agent` passed 56 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test before duplicate compatibility code was removed.
@@ -181,6 +189,10 @@ After the fresh M1, M2, and M3 remediation, the focused control Powder suite pas
 The explicit cross-ship removed-Crew close regression passed.
 The dispatch suite passed 10 tests with the existing real-agent integration gate intentionally ignored, and the Powder client suite passed all 27 tests.
 Formatting, targeted all-target clippy, and `git diff --check` passed at code head `a712df7a1d7222272f3c128d20e06ad074ff797c`.
+
+After initial-claim transactionality remediation, the focused Powder client suite passed all 27 tests, the dispatch suite passed 11 tests with the existing real-agent gate intentionally ignored, and the focused control Powder suite passed all 63 tests.
+The response-loss restart and identical-retry regression, substituted-receipt regression, and foreign removed-Crew close regression passed.
+Formatting, targeted all-target clippy, and `git diff --check` passed at code head `bf3c3ca2f4fafecb40a9a9efea7a1ba7fe3d5f4c`.
 
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
@@ -257,3 +269,4 @@ No independent reviewer has approved this integration yet.
 20. Verify heartbeat repeats minimal target ownership authorization after acquiring its lifecycle guard and rejects removed former-Captain scopes without a renewal.
 21. Verify close terminal authorizes foreign removed-Crew targets before historical Project or Powder resolution and leaves no local or remote side effect on denial.
 22. Verify initial Powder claim receipts match the requested card and configured profile agent before dispatch persists any Crew binding.
+23. Verify any ambiguous initial claim retains a trusted durable recovery intent, attempts no untrusted release, survives restart, and blocks duplicate redispatch until authoritative reconciliation.
