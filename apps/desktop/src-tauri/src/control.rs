@@ -19444,6 +19444,11 @@ fn close_terminal_with_policy(
         // retired too, so its secret stops resolving and the identity store does not
         // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
         ctx.identity.retire_tile(tile_id)?;
+    } else if crew_binding_retained {
+        // Preparation already made CleanupPending durable together with both
+        // recovery records. Publish that honest lifecycle state while retaining
+        // Workspace placement and identity until the exact release converges.
+        let _ = captains_sync_apply(ctx);
     }
     Ok(json!({
         "accepted": "close_terminal",
@@ -28478,6 +28483,98 @@ mod tests {
         ));
         assert!(finalized.captains[0].crew[0].powder_work.is_none());
         assert_ne!(operation_id, recovery_id);
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+    }
+
+    #[test]
+    fn ambiguous_terminal_close_publishes_cleanup_pending_without_retiring_tile_or_identity() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "ambiguous_terminal_close_publishes_cleanup_pending_without_retiring_tile_or_identity: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
+        let profile_name = format!("close-pending-sync-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Publish pending close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        registry
+            .create_workspace("work-close", "Close Work", None)
+            .unwrap();
+        registry
+            .move_workspace_tile(&crew_id, "work-close")
+            .unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity_secret = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            &crew_id,
+        );
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx(&profile_name)
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities))
+            .with_apply_sink(sink.clone());
+
+        let closed =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+
+        assert_eq!(closed["powderRelease"]["outcome"], "recovery_pending");
+        let pending = registry.snapshot();
+        assert!(matches!(
+            pending.captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        assert!(pending
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-close")
+            .unwrap()
+            .tile_ids
+            .contains(&crew_id));
+        assert!(!pending.retired_fleet_tile_ids.contains(&crew_id));
+        assert!(identities.resolve(&identity_secret).is_some());
+        let calls = sink.calls.lock().unwrap();
+        assert!(calls.iter().any(|(command, args)| {
+            command == "sync_captains"
+                && args["sync"]["captains"][0]["crew"][0]["state"]["kind"] == "cleanupPending"
+        }));
+        assert!(calls.iter().all(|(command, _)| command != "sync_tabs"));
         let powder = server.finish().unwrap();
         assert_eq!(powder.release_posts, 1);
     }
