@@ -38,6 +38,27 @@ In particular, `59d4000` integrates reviewed Crew launch attestation and `08beab
 The assigned base also includes subsequent immutable operation identity, authority-generation, lifecycle serialization, reviewer reconciliation, and fail-closed control remediations.
 No prior feature-branch commit was transplanted over those later changes.
 
+## Independent Rereview Findings and Remediation
+
+Independent review rejected immutable head `ad957f618c0509ef89a8a8f07f7df275c4b6dcd1` with two HIGH findings.
+
+The first finding showed that a structured approval identity longer than 512 bytes was silently truncated.
+A valid 512-byte identity and a distinct 513-byte identity with the same prefix therefore became the same permission and deduplication identity, and an oversized resolution could be misinterpreted as the valid request's exact resolution.
+
+The producer now admits provider request identities only when the complete UTF-8 byte sequence is within the 512-byte bound.
+It does not fall through to a lower-priority identity field when a higher-priority identity field is present but invalid.
+An oversized request identity produces a credential-safe degraded permission observation with no fabricated or truncated provider identity.
+An oversized resolution identity produces degraded telemetry and cannot emit `permission_resolved`.
+Native hook approval identities use the same exact bounded admission rather than truncation.
+
+The second finding showed that a recognized approval callback with no `id`, `approvalId`, or `itemId` returned no permission event.
+The producer now emits `JournalEventType::PermissionRequest` with degraded structured telemetry and a bounded non-sensitive `permission_observation` envelope for every such recognized malformed callback.
+The supervisor therefore remains fail closed in `needsPermission` while withholding a typed request identity that it cannot prove.
+Only a new turn, terminal lifecycle event, or other existing safe boundary can clear that malformed observation.
+
+Commit `f38096e` contains the production correction and its unit, reducer, replay, and real-process regressions.
+It does not modify the unobserved exact-pane marker, Harness launch adapter, launch attestation, tmux implementation, control authorization, or Powder lifecycle code.
+
 ## End-User Reproduction
 
 The closest practical structured reproduction runs the real `t-hub-agent --codex-tap` process over the credential-sanitized Codex 0.144.4 app-server lifecycle fixture.
@@ -54,8 +75,10 @@ It proves that the exact owning Codex Crew receives its marker before provider e
 ## Required Behavior Evidence
 
 - The producer normalizes the recorded structured permission request into `JournalEventType::PermissionRequest` with schema `t-hub.permission-request.v1`.
-- Provider request, thread, turn, and item identities remain opaque and bounded.
-- Missing provider request identities use a versioned non-content-derived opaque identity, so prompts, commands, reasons, paths, and credentials cannot influence the durable id.
+- Provider request identities remain opaque, exact, and bounded without silent truncation.
+- Oversized provider request and resolution identities become degraded observations without a reusable identity, so same-prefix values cannot alias or cross-clear.
+- A recognized callback with an absent or invalid request identity remains an explicit degraded `needsPermission` pause.
+- Native hook callbacks that lack provider request identities use a versioned non-content-derived opaque identity, so prompts, commands, reasons, paths, and credentials cannot influence the durable id.
 - Duplicate structured callbacks are journaled once within the tap stream.
 - The agent bridge rejects duplicate and out-of-order journal sequence numbers before reduction, so a replay cannot clear newer permission state.
 - A permission request transitions the exact session to `needsPermission` and remains pending across degraded or disconnected telemetry.
@@ -99,6 +122,30 @@ The following checks passed on the exact assigned base before this packet was ad
 
 The initial MCP E2E precondition failure is retained here so the review record does not misrepresent the verification sequence as uniformly green.
 
+### HIGH Finding Remediation Verification
+
+Before production edits, all three new focused regressions failed on immutable rejected head `ad957f6` with exit code 101.
+The unit collision test reproduced the missing degraded observation and oversized-resolution alias.
+The unit missing-identity test reproduced the absent `PermissionRequest`.
+The real-process test reproduced both defects through `t-hub-agent --codex-tap`.
+
+After commit `f38096e`, the following checks passed:
+
+- Both new Codex producer unit regressions passed.
+- The new real-process malformed and oversized approval E2E passed.
+- The new agent-bridge regression proved malformed permission state remains `needsPermission`, reports degraded health, rejects replay, cannot cross-clear, and clears at a new-turn boundary.
+- `cargo test -p t-hub-agent`: 57 unit tests, 4 Codex tap E2E tests, and 1 exact unobserved-marker E2E test passed.
+- Focused typed permission, replay rejection, and exact-resolution reducer tests passed.
+- `cargo test -p t-hub --lib permission -- --test-threads=1`: 30 agent, supervision, Harness, attestation, and permission tests passed.
+- `scripts/captain/verify-codex-permission-integration.sh` passed the unchanged combined real-agent marker and launch-attestation gate.
+- `cargo fmt --all -- --check` passed from the desktop Rust workspace.
+- `cargo clippy -p t-hub-agent -p t-hub --all-targets -- -D warnings` passed.
+- `git diff --check` passed.
+
+One combined verification command invoked `cargo fmt` from the repository root after the combined real-agent gate passed.
+Cargo correctly stopped because that directory has no `Cargo.toml`.
+Formatting and Clippy were immediately rerun from `apps/desktop/src-tauri` and passed.
+
 ## Independent Reviewer Checklist
 
 1. Confirm `HEAD` descends from exact base `ed21f896f7e582519a02d9d6f32f386579008a8f` and that no prior feature-branch commit was replayed over it.
@@ -109,9 +156,11 @@ The initial MCP E2E precondition failure is retained here so the review record d
 6. Inspect the unobserved marker for exact tmux provenance, `AgentCommand` compatibility, bounded output, and fail-closed launch ordering.
 7. Confirm capacity automation remains out of scope and the residual dependency is reported without a false claim of complete interactive coverage.
 8. Re-run the focused tests, combined real-agent gate, formatting, warnings-denied Clippy, and relevant workspace tests.
+9. Confirm no persisted request or resolution identity is a truncated prefix and no malformed permission callback can disappear without a degraded pause.
 
 ## Residual Risk
 
 The checked-in permission lifecycle is credential-sanitized and schema-derived rather than a raw credential-bearing capture.
 The interactive Codex TUI remains explicitly degraded until a trusted app-server mirror or provider-native lifecycle producer covers it.
 Structured capacity signals exist, but the exact interactive capacity-pause flow remains unproven and intentionally unautomated under this card.
+Malformed permission observations intentionally withhold a typed approval identity and remain fail closed until a safe lifecycle boundary because no exact resolution can be correlated.
