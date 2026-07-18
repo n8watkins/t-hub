@@ -525,7 +525,8 @@ No production code was changed because the observed broad-gate failures were not
 The failed current-head workspace gate remains a release-blocking residual requiring diagnosis before any completion decision.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
-No independent reviewer has approved this integration yet.
+Three independent reviewers approved code head `ef3a893877ab7e84dbf0b0800e58f010e5befd18` with no remaining code findings before the final-gate execution documented above.
+The failed current-head workspace gate blocks completion and requires diagnosis despite that code-review approval.
 
 ## Independent Reviewer Checklist
 
