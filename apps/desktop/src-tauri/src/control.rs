@@ -59,8 +59,9 @@ use crate::governor::SpawnGovernor;
 use crate::harness::{
     attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
     confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
-    HarnessProcessEvidence, HarnessRuntimePolicyReceipt, HarnessTerminalGenerationReceipt,
-    LaunchAttestationError, PermMode, VerifiedHarnessRuntimeReceipt,
+    HarnessProcessEvidence, HarnessProviderLaunchReceipt, HarnessRuntimePolicyReceipt,
+    HarnessTerminalGenerationReceipt, LaunchAttestationError, PermMode,
+    VerifiedHarnessProviderLaunch, VerifiedHarnessRuntimeReceipt,
     VerifiedHarnessTerminalGeneration, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
@@ -1094,10 +1095,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 20;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 21;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 4;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 19 && CORTANA_RUNTIME_SCHEMA_VERSION > 3);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 5;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 20 && CORTANA_RUNTIME_SCHEMA_VERSION > 4);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1265,6 +1266,7 @@ pub struct CortanaRuntimeAttestation {
     pub observed_provider: String,
     pub observed_harness: String,
     pub runtime_policy_receipt: HarnessRuntimePolicyReceipt,
+    pub provider_session_receipt: CortanaProviderSessionReceipt,
     pub provider_session_id: String,
     pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1287,7 +1289,24 @@ pub struct CortanaCandidateRuntimeEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_generation: Option<HarnessTerminalGenerationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_provider: Option<HarnessProviderLaunchReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_attestation: Option<CortanaRuntimeAttestation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaProviderSessionReceipt {
+    pub terminal: HarnessTerminalGenerationReceipt,
+    pub observed_provider: String,
+    pub provider_session_id: String,
+    pub conversation_id: String,
+    pub observed_at: u64,
+}
+
+struct VerifiedCortanaCandidateAttestation {
+    runtime: VerifiedHarnessRuntimeReceipt,
+    provider_session: CortanaProviderSessionReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1595,6 +1614,7 @@ fn validate_cortana_attestation(
         validate_cortana_optional_text(value, field)?;
     }
     let receipt = &attestation.runtime_policy_receipt;
+    let provider_session = &attestation.provider_session_receipt;
     validate_cortana_canonical_id(
         &receipt.terminal.tmux_target,
         "receiptTmuxTarget",
@@ -1603,6 +1623,14 @@ fn validate_cortana_attestation(
     validate_cortana_optional_text(
         Some(&receipt.resolved_provider_executable),
         "receiptResolvedProviderExecutable",
+    )?;
+    validate_cortana_optional_text(
+        Some(&provider_session.provider_session_id),
+        "receiptProviderSessionId",
+    )?;
+    validate_cortana_optional_text(
+        Some(&provider_session.conversation_id),
+        "receiptConversationId",
     )?;
     if attestation.session_identity_generation == 0
         || attestation.tmux_session_id != format!("th_{}", attestation.terminal_id)
@@ -1627,6 +1655,12 @@ fn validate_cortana_attestation(
         || !Path::new(&receipt.resolved_provider_executable).is_absolute()
         || receipt.resolved_provider_executable != attestation.installed_runtime.resolved_executable
         || receipt.executable_version != attestation.installed_runtime.executable_version
+        || provider_session.terminal != receipt.terminal
+        || provider_session.observed_provider != attestation.observed_provider
+        || provider_session.provider_session_id != attestation.provider_session_id
+        || provider_session.conversation_id != attestation.conversation_id
+        || provider_session.observed_at == 0
+        || provider_session.observed_at > attestation.attested_at
         || attestation.attested_at == 0
         || attestation.attested_at > enclosing_updated_at
         || attestation.attested_at < attestation.installed_runtime.observed_at
@@ -1666,6 +1700,7 @@ fn validate_cortana_candidate(
         || candidate.reserved_at == 0
         || candidate.reserved_at > enclosing_updated_at
         || candidate.spawned_at.is_some() != candidate.spawn_generation.is_some()
+        || candidate.spawned_at.is_some() != candidate.spawn_provider.is_some()
         || candidate.spawned_at.is_some_and(|spawned_at| {
             spawned_at < candidate.reserved_at || spawned_at > enclosing_updated_at
         })
@@ -1690,6 +1725,17 @@ fn validate_cortana_candidate(
             return Err("Cortana spawn evidence is not for the reserved tmux target".into());
         }
     }
+    if let Some(spawn_provider) = candidate.spawn_provider.as_ref() {
+        validate_cortana_optional_text(
+            Some(&spawn_provider.resolved_provider_executable),
+            "spawnProviderExecutable",
+        )?;
+        if !Path::new(&spawn_provider.resolved_provider_executable).is_absolute()
+            || spawn_provider.provider_executable_inode == 0
+        {
+            return Err("Cortana spawn provider evidence is malformed".into());
+        }
+    }
     if let Some(attestation) = candidate.runtime_attestation.as_ref() {
         validate_cortana_attestation(
             attestation,
@@ -1706,6 +1752,21 @@ fn validate_cortana_candidate(
                 .is_none_or(|spawned_at| attestation.attested_at < spawned_at)
             || candidate.spawn_generation.as_ref()
                 != Some(&attestation.runtime_policy_receipt.terminal)
+            || candidate
+                .spawn_provider
+                .as_ref()
+                .is_none_or(|spawn_provider| {
+                    spawn_provider.resolved_provider_executable
+                        != attestation
+                            .runtime_policy_receipt
+                            .resolved_provider_executable
+                        || spawn_provider.provider_executable_device
+                            != attestation
+                                .runtime_policy_receipt
+                                .provider_executable_device
+                        || spawn_provider.provider_executable_inode
+                            != attestation.runtime_policy_receipt.provider_executable_inode
+                })
         {
             return Err("Cortana candidate attestation does not match its spawned identity".into());
         }
@@ -1740,6 +1801,57 @@ pub fn validate_cortana_session_identity(
         );
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+fn observe_cortana_candidate_attestation(
+    status: &StatusBridge,
+    terminal_id: &str,
+    runtime: VerifiedHarnessRuntimeReceipt,
+) -> Result<VerifiedCortanaCandidateAttestation, String> {
+    let receipt = runtime.persisted();
+    let expected_target = format!("th_{terminal_id}");
+    if receipt.terminal.tmux_target != expected_target {
+        return Err("Cortana provider identity observation targets another terminal".into());
+    }
+    let provider_session_id = match receipt.observed_provider.as_str() {
+        "codex" => tmux::session_environment(&expected_target, "CODEX_THREAD_ID")
+            .map_err(|_| "Cortana Codex session identity is unreadable".to_string())?,
+        "claude" => status.session_for_terminal(terminal_id),
+        _ => None,
+    }
+    .filter(|identity| !identity.trim().is_empty())
+    .ok_or("Cortana provider session identity is unreadable")?;
+    validate_cortana_optional_text(Some(&provider_session_id), "providerSessionId")?;
+    Ok(VerifiedCortanaCandidateAttestation {
+        provider_session: CortanaProviderSessionReceipt {
+            terminal: receipt.terminal.clone(),
+            observed_provider: receipt.observed_provider.clone(),
+            conversation_id: provider_session_id.clone(),
+            provider_session_id,
+            observed_at: now_ms(),
+        },
+        runtime,
+    })
+}
+
+#[cfg(test)]
+fn test_verified_cortana_candidate_attestation(
+    runtime: VerifiedHarnessRuntimeReceipt,
+    provider_session_id: &str,
+    observed_at: u64,
+) -> VerifiedCortanaCandidateAttestation {
+    let receipt = runtime.persisted();
+    VerifiedCortanaCandidateAttestation {
+        provider_session: CortanaProviderSessionReceipt {
+            terminal: receipt.terminal.clone(),
+            observed_provider: receipt.observed_provider.clone(),
+            provider_session_id: provider_session_id.to_string(),
+            conversation_id: provider_session_id.to_string(),
+            observed_at,
+        },
+        runtime,
+    }
 }
 
 fn validate_cortana_runtime(
@@ -2616,6 +2728,75 @@ fn migrate_cortana_runtime_v3_document(document: &mut Value) -> Result<(), Strin
             intent.insert("requestDigest".to_string(), Value::from(v4_digest));
         }
         runtime.insert("schemaVersion".to_string(), Value::from(4));
+    }
+    Ok(())
+}
+
+/// Lift schema-20/runtime-4 only when no observation would require inventing
+/// launch-file or provider-session evidence added by runtime schema 5.
+fn migrate_cortana_runtime_v4_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-20 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-20 Cortana runtime is not an object")?;
+        if runtime.get("schemaVersion").and_then(Value::as_u64) != Some(4) {
+            return Err("schema-20 Cortana runtime has an unsupported nested version".into());
+        }
+        if runtime
+            .get("runtimeAttestation")
+            .is_some_and(|attestation| !attestation.is_null())
+        {
+            return Err("schema-20 Ready evidence lacks verified provider session state".into());
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        {
+            let intent = intent
+                .as_object_mut()
+                .ok_or("schema-20 Cortana ensure intent is not an object")?;
+            if intent.get("schemaVersion").and_then(Value::as_u64) != Some(4) {
+                return Err("schema-20 Cortana ensure intent has an unsupported version".into());
+            }
+            let operation_id = intent
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or("schema-20 Cortana ensure intent lacks operationId")?;
+            let request = intent
+                .get("request")
+                .ok_or("schema-20 Cortana ensure intent lacks request")?;
+            let stored_digest = intent
+                .get("requestDigest")
+                .and_then(Value::as_str)
+                .ok_or("schema-20 Cortana ensure intent lacks requestDigest")?;
+            if stored_digest != cortana_ensure_request_digest_parts(4, operation_id, request)? {
+                return Err(
+                    "schema-20 Cortana ensure request digest does not match schema 4".into(),
+                );
+            }
+            if intent
+                .get("candidate")
+                .and_then(Value::as_object)
+                .and_then(|candidate| candidate.get("spawnedAt"))
+                .is_some_and(|spawned_at| !spawned_at.is_null())
+            {
+                return Err("schema-20 spawned evidence lacks provider launch identity".into());
+            }
+            let digest = cortana_ensure_request_digest_parts(5, operation_id, request)?;
+            intent.insert("schemaVersion".into(), Value::from(5));
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        runtime.insert("schemaVersion".into(), Value::from(5));
     }
     Ok(())
 }
@@ -4376,7 +4557,7 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_prior_cortana_recovery = matches!(schema_version, 18 | 19)
+        let has_prior_cortana_recovery = matches!(schema_version, 18..=20)
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -4396,6 +4577,13 @@ impl CaptainsRegistry {
         }
         if matches!(schema_version, 18 | 19) {
             migrate_cortana_runtime_v3_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        if matches!(schema_version, 18..=20) {
+            migrate_cortana_runtime_v4_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -6466,6 +6654,7 @@ impl CaptainsRegistry {
         if intent.phase != CortanaEnsurePhase::Prepared
             || candidate.spawned_at.is_some()
             || candidate.spawn_generation.is_some()
+            || candidate.spawn_provider.is_some()
             || candidate.runtime_attestation.is_some()
         {
             return Err("Cortana ensure is not prepared for candidate reservation".into());
@@ -6490,9 +6679,11 @@ impl CaptainsRegistry {
         terminal_id: &str,
         spawned_at: u64,
         spawn_generation: VerifiedHarnessTerminalGeneration,
+        spawn_provider: VerifiedHarnessProviderLaunch,
         observed_at: u64,
     ) -> Result<CaptainRecord, String> {
         let spawn_generation = spawn_generation.into_persisted();
+        let spawn_provider = spawn_provider.into_persisted();
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
@@ -6522,6 +6713,7 @@ impl CaptainsRegistry {
         if intent.phase == CortanaEnsurePhase::CandidateSpawned {
             if candidate.spawned_at == Some(spawned_at)
                 && candidate.spawn_generation.as_ref() == Some(&spawn_generation)
+                && candidate.spawn_provider.as_ref() == Some(&spawn_provider)
             {
                 return Ok(captain.clone());
             }
@@ -6536,6 +6728,7 @@ impl CaptainsRegistry {
         let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
         candidate.spawned_at = Some(spawned_at);
         candidate.spawn_generation = Some(spawn_generation);
+        candidate.spawn_provider = Some(spawn_provider);
         intent.phase = CortanaEnsurePhase::CandidateSpawned;
         intent.updated_at = timestamp;
         runtime.updated_at = timestamp;
@@ -6552,15 +6745,13 @@ impl CaptainsRegistry {
         &self,
         operation_id: &str,
         request_digest: &str,
-        verified_runtime: VerifiedHarnessRuntimeReceipt,
+        verified_attestation: VerifiedCortanaCandidateAttestation,
         identity: &crate::identity::SessionIdentity,
         observed_authority_generation: u64,
-        provider_session_id: &str,
-        conversation_id: &str,
-        checkpoint: Option<&str>,
         observed_at: u64,
     ) -> Result<CaptainRecord, String> {
-        let runtime_receipt = verified_runtime.into_persisted();
+        let provider_session_receipt = verified_attestation.provider_session;
+        let runtime_receipt = verified_attestation.runtime.into_persisted();
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
@@ -6573,6 +6764,7 @@ impl CaptainsRegistry {
             .cortana_runtime
             .as_mut()
             .ok_or("Cortana durable runtime is missing")?;
+        let durable_checkpoint = runtime.checkpoint.clone();
         let intent = runtime
             .ensure_intent
             .as_mut()
@@ -6587,9 +6779,7 @@ impl CaptainsRegistry {
                 .and_then(|candidate| candidate.runtime_attestation.as_ref())
                 .is_some_and(|attestation| {
                     attestation.runtime_policy_receipt == runtime_receipt
-                        && attestation.provider_session_id == provider_session_id
-                        && attestation.conversation_id == conversation_id
-                        && attestation.checkpoint.as_deref() == checkpoint
+                        && attestation.provider_session_receipt == provider_session_receipt
                 });
             if replay {
                 return Ok(captain.clone());
@@ -6635,9 +6825,10 @@ impl CaptainsRegistry {
             observed_provider: runtime_receipt.observed_provider.clone(),
             observed_harness: runtime_receipt.observed_harness.clone(),
             runtime_policy_receipt: runtime_receipt,
-            provider_session_id: provider_session_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-            checkpoint: checkpoint.map(str::to_string),
+            provider_session_id: provider_session_receipt.provider_session_id.clone(),
+            conversation_id: provider_session_receipt.conversation_id.clone(),
+            checkpoint: durable_checkpoint,
+            provider_session_receipt,
             installed_runtime,
             attested_at: observed_at,
         };
@@ -21874,6 +22065,18 @@ mod tests {
         cortana_verified_runtime_receipt_for("th_cor-candidate-2")
     }
 
+    fn cortana_verified_provider_launch() -> VerifiedHarnessProviderLaunch {
+        crate::harness::test_verified_provider_launch("/opt/t-hub/bin/codex", 42, 900)
+    }
+
+    fn cortana_verified_candidate_attestation() -> VerifiedCortanaCandidateAttestation {
+        test_verified_cortana_candidate_attestation(
+            cortana_verified_runtime_receipt(),
+            "provider-session-2",
+            104,
+        )
+    }
+
     fn cortana_runtime_policy_receipt_for(tmux_target: &str) -> HarnessRuntimePolicyReceipt {
         crate::harness::test_verified_runtime_receipt(
             tmux_target,
@@ -21905,6 +22108,7 @@ mod tests {
             ),
             observed_at: 80,
         };
+        let runtime_policy_receipt = cortana_runtime_policy_receipt_for("th_cor-runtime-1");
         let attestation = CortanaRuntimeAttestation {
             terminal_id: terminal_id.clone(),
             tmux_session_id: format!("th_{terminal_id}"),
@@ -21913,7 +22117,14 @@ mod tests {
             authority_generation: 1,
             observed_provider: policy.provider.clone(),
             observed_harness: policy.harness.clone(),
-            runtime_policy_receipt: cortana_runtime_policy_receipt_for("th_cor-runtime-1"),
+            runtime_policy_receipt: runtime_policy_receipt.clone(),
+            provider_session_receipt: CortanaProviderSessionReceipt {
+                terminal: runtime_policy_receipt.terminal,
+                observed_provider: policy.provider.clone(),
+                provider_session_id: "provider-session-1".into(),
+                conversation_id: "conversation-1".into(),
+                observed_at: 84,
+            },
             provider_session_id: "provider-session-1".to_string(),
             conversation_id: "conversation-1".to_string(),
             checkpoint: Some("checkpoint-1".to_string()),
@@ -22011,15 +22222,23 @@ mod tests {
             reserved_at: 94,
             spawned_at: Some(95),
             spawn_generation: Some(cortana_terminal_generation_receipt()),
+            spawn_provider: Some(cortana_verified_provider_launch().into_persisted()),
             runtime_attestation: with_attestation.then(|| CortanaRuntimeAttestation {
                 terminal_id: "cor-candidate-2".to_string(),
                 tmux_session_id: "th_cor-candidate-2".to_string(),
                 control_identity_id: "22222222222222222222222222222222".to_string(),
                 session_identity_generation: 8,
                 authority_generation,
-                observed_provider: policy.provider,
-                observed_harness: policy.harness,
+                observed_provider: policy.provider.clone(),
+                observed_harness: policy.harness.clone(),
                 runtime_policy_receipt: cortana_runtime_policy_receipt_for("th_cor-candidate-2"),
+                provider_session_receipt: CortanaProviderSessionReceipt {
+                    terminal: cortana_terminal_generation_receipt(),
+                    observed_provider: policy.provider.clone(),
+                    provider_session_id: "provider-session-2".into(),
+                    conversation_id: "conversation-2".into(),
+                    observed_at: 97,
+                },
                 provider_session_id: "provider-session-2".to_string(),
                 conversation_id: "conversation-2".to_string(),
                 checkpoint: Some("checkpoint-1".to_string()),
@@ -22068,6 +22287,18 @@ mod tests {
             reserved_at: 74,
             spawned_at: Some(75),
             spawn_generation: Some(attestation.runtime_policy_receipt.terminal.clone()),
+            spawn_provider: Some(HarnessProviderLaunchReceipt {
+                resolved_provider_executable: attestation
+                    .runtime_policy_receipt
+                    .resolved_provider_executable
+                    .clone(),
+                provider_executable_device: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_device,
+                provider_executable_inode: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_inode,
+            }),
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -22174,6 +22405,54 @@ mod tests {
             }
             let digest = cortana_ensure_request_digest_parts(
                 3,
+                intent["operationId"].as_str().unwrap(),
+                &intent["request"],
+            )
+            .unwrap();
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        document
+    }
+
+    fn schema_20_runtime_4_document(captain: CaptainRecord) -> Value {
+        let mut document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 20,
+            seq: 20,
+            captains: vec![captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let runtime = document["captains"][0]["cortanaRuntime"]
+            .as_object_mut()
+            .unwrap();
+        runtime.insert("schemaVersion".into(), Value::from(4));
+        if let Some(attestation) = runtime
+            .get_mut("runtimeAttestation")
+            .and_then(Value::as_object_mut)
+        {
+            attestation.remove("providerSessionReceipt");
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .and_then(Value::as_object_mut)
+        {
+            intent.insert("schemaVersion".into(), Value::from(4));
+            if let Some(candidate) = intent.get_mut("candidate").and_then(Value::as_object_mut) {
+                candidate.remove("spawnProvider");
+                if let Some(attestation) = candidate
+                    .get_mut("runtimeAttestation")
+                    .and_then(Value::as_object_mut)
+                {
+                    attestation.remove("providerSessionReceipt");
+                }
+            }
+            let digest = cortana_ensure_request_digest_parts(
+                4,
                 intent["operationId"].as_str().unwrap(),
                 &intent["request"],
             )
@@ -22298,6 +22577,7 @@ mod tests {
             reserved_at: 111,
             spawned_at: None,
             spawn_generation: None,
+            spawn_provider: None,
             runtime_attestation: None,
         };
         registry
@@ -22315,6 +22595,7 @@ mod tests {
                 &candidate.terminal_id,
                 112,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 112,
             )
             .unwrap();
@@ -22322,12 +22603,9 @@ mod tests {
             .attest_cortana_candidate(
                 &intent.operation_id,
                 &intent.request_digest,
-                cortana_verified_runtime_receipt(),
+                cortana_verified_candidate_attestation(),
                 &identities.get(&identity.id).unwrap(),
                 2,
-                "provider-session-2",
-                "conversation-2",
-                Some("checkpoint-1"),
                 115,
             )
             .unwrap();
@@ -22404,6 +22682,7 @@ mod tests {
         candidate.reserved_at = 111;
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
         registry
             .reserve_cortana_candidate(
                 &intent.operation_id,
@@ -22419,6 +22698,7 @@ mod tests {
                 &candidate.terminal_id,
                 112,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 112,
             )
             .unwrap();
@@ -22426,12 +22706,9 @@ mod tests {
             .attest_cortana_candidate(
                 &intent.operation_id,
                 &intent.request_digest,
-                cortana_verified_runtime_receipt(),
+                cortana_verified_candidate_attestation(),
                 &identities.get(&identity.id).unwrap(),
                 1,
-                "provider-session-2",
-                "conversation-2",
-                Some("checkpoint-1"),
                 114,
             )
             .unwrap_err();
@@ -22491,6 +22768,7 @@ mod tests {
         candidate.reserved_at = 111;
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
         registry
             .reserve_cortana_candidate(
                 &intent.operation_id,
@@ -22506,6 +22784,7 @@ mod tests {
                 &candidate.terminal_id,
                 112,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 112,
             )
             .unwrap();
@@ -22576,6 +22855,7 @@ mod tests {
         candidate.reserved_at = 101;
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
 
         let assert_rollback = |registry: &CaptainsRegistry, before: &Value, bytes: &[u8]| {
             assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), *before);
@@ -22624,6 +22904,7 @@ mod tests {
                 &candidate.terminal_id,
                 102,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 102,
             )
             .is_err());
@@ -22635,6 +22916,7 @@ mod tests {
                 &candidate.terminal_id,
                 102,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 102,
             )
             .unwrap();
@@ -22647,6 +22929,7 @@ mod tests {
                     &candidate.terminal_id,
                     102,
                     cortana_verified_terminal_generation(),
+                    cortana_verified_provider_launch(),
                     999,
                 )
                 .unwrap(),
@@ -22660,12 +22943,9 @@ mod tests {
             .attest_cortana_candidate(
                 &intent.operation_id,
                 &intent.request_digest,
-                cortana_verified_runtime_receipt(),
+                cortana_verified_candidate_attestation(),
                 &identities.get(&identity.id).unwrap(),
                 1,
-                "provider-session-2",
-                "conversation-2",
-                Some("checkpoint-1"),
                 105,
             )
             .is_err());
@@ -22674,12 +22954,9 @@ mod tests {
             .attest_cortana_candidate(
                 &intent.operation_id,
                 &intent.request_digest,
-                cortana_verified_runtime_receipt(),
+                cortana_verified_candidate_attestation(),
                 &identities.get(&identity.id).unwrap(),
                 1,
-                "provider-session-2",
-                "conversation-2",
-                Some("checkpoint-1"),
                 105,
             )
             .unwrap();
@@ -22708,12 +22985,9 @@ mod tests {
                 .attest_cortana_candidate(
                     &intent.operation_id,
                     &intent.request_digest,
-                    cortana_verified_runtime_receipt(),
+                    cortana_verified_candidate_attestation(),
                     &identities.get(&identity.id).unwrap(),
                     1,
-                    "provider-session-2",
-                    "conversation-2",
-                    Some("checkpoint-1"),
                     999,
                 )
                 .unwrap(),
@@ -22787,6 +23061,7 @@ mod tests {
         cleanup_candidate.reserved_at = 201;
         cleanup_candidate.spawned_at = None;
         cleanup_candidate.spawn_generation = None;
+        cleanup_candidate.spawn_provider = None;
         cleanup_registry
             .reserve_cortana_candidate(
                 &cleanup_intent.operation_id,
@@ -22802,6 +23077,7 @@ mod tests {
                 &cleanup_candidate.terminal_id,
                 202,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 202,
             )
             .unwrap();
@@ -22867,6 +23143,7 @@ mod tests {
             if phase == CortanaEnsurePhase::CandidateReserved {
                 candidate.spawned_at = None;
                 candidate.spawn_generation = None;
+                candidate.spawn_provider = None;
             }
             intent.candidate = Some(candidate);
             let operation_id = intent.operation_id.clone();
@@ -22950,6 +23227,7 @@ mod tests {
         candidate.reserved_at = 101;
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
         for mutation in 0_u8..4 {
             let mut mismatched = candidate.clone();
             match mutation {
@@ -23026,6 +23304,7 @@ mod tests {
                     terminal_id,
                     spawned_at,
                     cortana_verified_terminal_generation(),
+                    cortana_verified_provider_launch(),
                     observed_at,
                 )
                 .is_err());
@@ -23039,6 +23318,7 @@ mod tests {
                 &candidate.terminal_id,
                 102,
                 cortana_verified_terminal_generation_for("th_foreign-candidate"),
+                cortana_verified_provider_launch(),
                 102,
             )
             .is_err());
@@ -23050,6 +23330,7 @@ mod tests {
                 &candidate.terminal_id,
                 102,
                 cortana_verified_terminal_generation(),
+                cortana_verified_provider_launch(),
                 102,
             )
             .unwrap();
@@ -23058,12 +23339,13 @@ mod tests {
             .attest_cortana_candidate(
                 &intent.operation_id,
                 &intent.request_digest,
-                cortana_verified_runtime_receipt_for("th_foreign-candidate"),
+                test_verified_cortana_candidate_attestation(
+                    cortana_verified_runtime_receipt_for("th_foreign-candidate"),
+                    "provider-session-2",
+                    104,
+                ),
                 &identities.get(&identity.id).unwrap(),
                 1,
-                "provider-session-2",
-                "conversation-2",
-                Some("checkpoint-1"),
                 105,
             )
             .is_err());
@@ -23131,6 +23413,133 @@ mod tests {
             )
             .is_err());
         assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+    }
+
+    #[test]
+    fn cortana_node_script_atomic_replacement_cannot_reach_attested() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("codex");
+        std::fs::write(&provider, "provider-v1").unwrap();
+        let launch =
+            crate::harness::observe_provider_launch_receipt(&provider, Harness::Codex).unwrap();
+        let provider_path = provider.to_str().unwrap();
+        let evidence = crate::harness::HarnessProcessEvidence::test(
+            42,
+            900,
+            &[
+                "/usr/bin/node",
+                provider_path,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+            ],
+        );
+        let registry = CaptainsRegistry::new();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-node-script-replacement",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let identities = crate::identity::IdentityStore::ephemeral();
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities
+            .bind_tile(&identity.id, "cor-candidate-2")
+            .unwrap();
+        let mut candidate = cortana_candidate_fixture(1, false);
+        candidate.control_identity_id = identity.id.clone();
+        candidate.session_identity_generation = identity.generation;
+        candidate.reserved_at = 101;
+        candidate.spawned_at = None;
+        candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
+        registry
+            .reserve_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                candidate.clone(),
+                101,
+            )
+            .unwrap();
+        registry
+            .record_cortana_candidate_spawn(
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.terminal_id,
+                102,
+                crate::harness::test_verified_terminal_generation("th_cor-candidate-2", &evidence),
+                launch,
+                102,
+            )
+            .unwrap();
+
+        let replacement = temp.path().join("codex-v2");
+        std::fs::write(&replacement, "provider-v2").unwrap();
+        std::fs::rename(&replacement, &provider).unwrap();
+        let runtime = crate::harness::test_verified_runtime_receipt_from_observed_file(
+            "th_cor-candidate-2",
+            &evidence,
+            Harness::Codex,
+            "gpt-5.6-terra",
+            "medium",
+            PermMode::BypassPermissions,
+            "codex-cli 2.0.0",
+        )
+        .unwrap();
+        let verified =
+            test_verified_cortana_candidate_attestation(runtime, "provider-session-2", 104);
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        assert!(registry
+            .attest_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                verified,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                105,
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::CandidateSpawned
+        );
+    }
+
+    #[test]
+    fn missing_provider_session_cannot_issue_cortana_attestation_receipt() {
+        let status = StatusBridge::new();
+        let error = observe_cortana_candidate_attestation(
+            &status,
+            "cor-candidate-2",
+            cortana_verified_runtime_receipt(),
+        )
+        .err()
+        .expect("missing provider state must not issue a receipt");
+        assert!(error.contains("unreadable"));
     }
 
     fn cortana_prepared_fixture(generation: u64) -> CaptainRecord {
@@ -27715,6 +28124,7 @@ mod tests {
         let mut candidate = cortana_candidate_fixture(2, false);
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
+        candidate.spawn_provider = None;
         intent.candidate = Some(candidate);
         intent.updated_at = 100;
         assert_eq!(intent.request_digest, immutable_digest);
@@ -27736,6 +28146,8 @@ mod tests {
         intent.candidate.as_mut().unwrap().spawned_at = Some(95);
         intent.candidate.as_mut().unwrap().spawn_generation =
             Some(cortana_terminal_generation_receipt());
+        intent.candidate.as_mut().unwrap().spawn_provider =
+            Some(cortana_verified_provider_launch().into_persisted());
         validate_cortana_runtime(&spawned, spawned.cortana_runtime.as_ref().unwrap()).unwrap();
 
         let mut attested = spawned.clone();
@@ -27835,6 +28247,18 @@ mod tests {
             reserved_at: 74,
             spawned_at: Some(75),
             spawn_generation: Some(attestation.runtime_policy_receipt.terminal.clone()),
+            spawn_provider: Some(HarnessProviderLaunchReceipt {
+                resolved_provider_executable: attestation
+                    .runtime_policy_receipt
+                    .resolved_provider_executable
+                    .clone(),
+                provider_executable_device: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_device,
+                provider_executable_inode: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_inode,
+            }),
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -28028,6 +28452,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .runtime_policy_receipt
+            .observed_provider = "claude".into();
+        runtime
+            .runtime_attestation
+            .as_mut()
+            .unwrap()
+            .provider_session_receipt
             .observed_provider = "claude".into();
         runtime.provenance.source = CortanaRuntimeProvenanceSource::RuntimeAttested;
         runtime.provenance.identity = cortana_runtime_attestation_identity(
@@ -28638,6 +29068,18 @@ mod tests {
             reserved_at: 74,
             spawned_at: Some(75),
             spawn_generation: Some(attestation.runtime_policy_receipt.terminal.clone()),
+            spawn_provider: Some(HarnessProviderLaunchReceipt {
+                resolved_provider_executable: attestation
+                    .runtime_policy_receipt
+                    .resolved_provider_executable
+                    .clone(),
+                provider_executable_device: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_device,
+                provider_executable_inode: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_inode,
+            }),
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -28862,6 +29304,79 @@ mod tests {
             assert!(registry.snapshot().captains.is_empty());
             assert_eq!(std::fs::read(&path).unwrap(), source);
             assert_eq!(std::fs::read(&backup).unwrap(), supported_backup);
+        }
+    }
+
+    #[test]
+    fn schema_20_runtime_4_requires_launch_and_provider_session_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prepared.json");
+        let legacy = schema_20_runtime_4_document(cortana_prepared_fixture(1));
+        let old_digest = legacy["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let registry = CaptainsRegistry::load(path);
+        assert!(registry.write_blocked.is_none());
+        let runtime = registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        let intent = runtime.ensure_intent.unwrap();
+        assert_eq!(runtime.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_eq!(intent.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_ne!(intent.request_digest, old_digest);
+        assert_eq!(
+            intent.request_digest,
+            cortana_ensure_request_digest(&intent).unwrap()
+        );
+
+        let backup_bytes = serde_json::to_vec_pretty(&CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 99,
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        for (label, legacy) in [
+            (
+                "ready-without-provider-session-receipt",
+                schema_20_runtime_4_document(cortana_ready_fixture()),
+            ),
+            ("spawned-without-launch-receipt", {
+                let mut captain = cortana_prepared_fixture(1);
+                let intent = captain
+                    .cortana_runtime
+                    .as_mut()
+                    .unwrap()
+                    .ensure_intent
+                    .as_mut()
+                    .unwrap();
+                intent.phase = CortanaEnsurePhase::CandidateSpawned;
+                intent.candidate = Some(cortana_candidate_fixture(2, false));
+                schema_20_runtime_4_document(captain)
+            }),
+        ] {
+            let path = temp.path().join(format!("{label}.json"));
+            let backup = path.with_extension("json.bak");
+            let source = serde_json::to_vec_pretty(&legacy).unwrap();
+            std::fs::write(&path, &source).unwrap();
+            std::fs::write(&backup, &backup_bytes).unwrap();
+            assert!(matches!(
+                CaptainsRegistry::read_snapshot(&path),
+                Err(SnapshotReadError::IncompatibleRecovery { .. })
+            ));
+            let registry = CaptainsRegistry::load(path.clone());
+            assert!(registry.write_blocked.is_some(), "{label} was promoted");
+            assert!(registry.snapshot().captains.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
         }
     }
 

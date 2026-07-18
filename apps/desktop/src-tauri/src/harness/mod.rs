@@ -136,8 +136,9 @@ impl std::fmt::Display for PermMode {
 /// terminal at one instant. The raw argv is used only for in-process provider
 /// verification and is never included in a response or error because the
 /// initial Harness prompt may contain sensitive task context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TerminalGeneration {
+    session_name: String,
     session_id: u64,
     session_created: u64,
     window_id: u64,
@@ -176,6 +177,16 @@ pub struct HarnessTerminalGenerationReceipt {
     pub pane_pid: u32,
 }
 
+/// Exact provider file selected before launch. For a node-style provider this
+/// is the script inode, distinct from the node process executable inode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProviderLaunchReceipt {
+    pub resolved_provider_executable: String,
+    pub provider_executable_device: u64,
+    pub provider_executable_inode: u64,
+}
+
 /// Adapter-produced receipt for the effective provider runtime. Callers cannot
 /// obtain this from desired policy alone: construction runs provider-native
 /// permission, model, reasoning, executable, and process-generation checks.
@@ -206,11 +217,23 @@ impl VerifiedHarnessTerminalGeneration {
     }
 }
 
+pub(crate) struct VerifiedHarnessProviderLaunch(HarnessProviderLaunchReceipt);
+
+impl VerifiedHarnessProviderLaunch {
+    pub(crate) fn into_persisted(self) -> HarnessProviderLaunchReceipt {
+        self.0
+    }
+}
+
 pub(crate) struct VerifiedHarnessRuntimeReceipt(HarnessRuntimePolicyReceipt);
 
 impl VerifiedHarnessRuntimeReceipt {
     pub(crate) fn into_persisted(self) -> HarnessRuntimePolicyReceipt {
         self.0
+    }
+
+    pub(crate) fn persisted(&self) -> &HarnessRuntimePolicyReceipt {
+        &self.0
     }
 }
 
@@ -262,6 +285,7 @@ impl HarnessProcessEvidence {
     ) -> Self {
         Self {
             terminal: TerminalGeneration {
+                session_name: "th_cor-candidate-2".to_string(),
                 session_id: 17,
                 session_created,
                 window_id: 9,
@@ -306,11 +330,11 @@ impl HarnessProcessEvidence {
 }
 
 pub fn terminal_generation_receipt(
-    tmux_target: &str,
+    _requested_target: &str,
     evidence: &HarnessProcessEvidence,
 ) -> HarnessTerminalGenerationReceipt {
     HarnessTerminalGenerationReceipt {
-        tmux_target: tmux_target.to_string(),
+        tmux_target: evidence.terminal.session_name.clone(),
         session_id: evidence.terminal.session_id,
         session_created: evidence.terminal.session_created,
         window_id: evidence.terminal.window_id,
@@ -332,7 +356,9 @@ pub(crate) fn test_verified_terminal_generation(
     tmux_target: &str,
     evidence: &HarnessProcessEvidence,
 ) -> VerifiedHarnessTerminalGeneration {
-    VerifiedHarnessTerminalGeneration(terminal_generation_receipt(tmux_target, evidence))
+    let mut evidence = evidence.clone();
+    evidence.terminal.session_name = tmux_target.to_string();
+    VerifiedHarnessTerminalGeneration(terminal_generation_receipt(tmux_target, &evidence))
 }
 
 /// Credential-safe failure classes for fail-closed launch attestation.
@@ -563,14 +589,16 @@ pub fn observe_harness_process(
 set -eu
 tmux_socket=$1
 tmux_target=$2
-pane=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+pane=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_name} #{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
 set -- $pane
-[ "$#" -eq 5 ]
-session_id=$1
-session_created=$2
-window_id=$3
-pane_id=$4
-pane_pid=$5
+ [ "$#" -eq 6 ]
+session_name=$1
+[ "$session_name" = "$tmux_target" ]
+session_id=$2
+session_created=$3
+window_id=$4
+pane_id=$5
+pane_pid=$6
 case "$session_created:$pane_pid" in *[!0-9:]*) exit 21;; esac
 foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
 case "$foreground_pid" in ''|*[!0-9]*|0) exit 22;; esac
@@ -614,7 +642,7 @@ cmdline="/proc/$foreground_pid/cmdline"
 size=$(wc -c < "$cmdline" | tr -d ' ')
 case "$size" in ''|*[!0-9]*|0) exit 23;; esac
 [ "$size" -le 65536 ]
-pane_after=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+pane_after=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_name} #{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
 [ "$pane_after" = "$pane" ]
 foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
 [ "$foreground_after" = "$foreground_pid" ]
@@ -627,8 +655,8 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 [ "$#" -eq 2 ]
 [ "$1" = "$executable_device" ]
 [ "$2" = "$executable_inode" ]
-printf 'THPA4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-    "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
+printf 'THPA5\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$session_name" "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
     "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" \
     "$resolved_process_executable" "$ancestry"
 cat "$cmdline"
@@ -672,11 +700,26 @@ cat "$cmdline"
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let mut fields = bytes.splitn(13, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THPA4".as_slice()) {
+    let mut fields = bytes.splitn(14, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA5".as_slice()) {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     let terminal = TerminalGeneration {
+        session_name: std::str::from_utf8(
+            fields
+                .next()
+                .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+        )
+        .ok()
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 128
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                })
+        })
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?
+        .to_string(),
         session_id: parse_prefixed_ascii_number(fields.next(), b'$')?,
         session_created: parse_ascii_number(fields.next())?,
         window_id: parse_prefixed_ascii_number(fields.next(), b'@')?,
@@ -877,6 +920,43 @@ fn provider_file_identity(
     })
 }
 
+pub(crate) fn observe_provider_launch_receipt(
+    provider_executable: &std::path::Path,
+    expected: Harness,
+) -> Result<VerifiedHarnessProviderLaunch, LaunchAttestationError> {
+    let executable = std::fs::canonicalize(provider_executable)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(executable_name)
+        != Some(expected.as_provider())
+    {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    let identity = provider_file_identity(&executable)?;
+    Ok(VerifiedHarnessProviderLaunch(
+        HarnessProviderLaunchReceipt {
+            resolved_provider_executable: executable.to_string_lossy().into_owned(),
+            provider_executable_device: identity.device,
+            provider_executable_inode: identity.inode,
+        },
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_provider_launch(
+    resolved_provider_executable: &str,
+    provider_executable_device: u64,
+    provider_executable_inode: u64,
+) -> VerifiedHarnessProviderLaunch {
+    VerifiedHarnessProviderLaunch(HarnessProviderLaunchReceipt {
+        resolved_provider_executable: resolved_provider_executable.to_string(),
+        provider_executable_device,
+        provider_executable_inode,
+    })
+}
+
 #[cfg(not(unix))]
 fn provider_file_identity(
     _path: &std::path::Path,
@@ -978,6 +1058,9 @@ fn seal_runtime_policy_receipt(
     provider_file: ProviderFileIdentity,
     executable_version: &str,
 ) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    if evidence.terminal.session_name != tmux_target {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
     expected
         .adapter()
         .attest_permissions(evidence, expected_permission)?;
@@ -1109,9 +1192,11 @@ pub(crate) fn test_verified_runtime_receipt(
     expected_permission: PermMode,
     executable_version: &str,
 ) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    let mut evidence = evidence.clone();
+    evidence.terminal.session_name = tmux_target.to_string();
     seal_runtime_policy_receipt(
         tmux_target,
-        evidence,
+        &evidence,
         expected,
         expected_model,
         expected_reasoning_effort,
@@ -1120,6 +1205,32 @@ pub(crate) fn test_verified_runtime_receipt(
             device: evidence.executable_device,
             inode: evidence.executable_inode,
         },
+        executable_version,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_runtime_receipt_from_observed_file(
+    tmux_target: &str,
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+    executable_version: &str,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    let mut evidence = evidence.clone();
+    evidence.terminal.session_name = tmux_target.to_string();
+    let executable = resolved_provider_executable_path(&evidence, expected)?;
+    let provider_file = provider_file_identity(&executable)?;
+    seal_runtime_policy_receipt(
+        tmux_target,
+        &evidence,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+        expected_permission,
+        provider_file,
         executable_version,
     )
 }
@@ -1850,7 +1961,7 @@ mod tests {
     #[test]
     fn process_evidence_parser_is_bounded_and_strict() {
         let parsed = parse_process_evidence(
-            b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex\0--sandbox\0read-only\0",
+            b"THPA5\nth_cor-candidate-2\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex\0--sandbox\0read-only\0",
         )
         .unwrap();
         assert_eq!(parsed.identity(), (42, 900));
@@ -1859,13 +1970,13 @@ mod tests {
 
         assert_eq!(
             parse_process_evidence(
-                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex",
+                b"THPA5\nth_cor-candidate-2\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
         assert_eq!(
             parse_process_evidence(
-                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900,7:100\ncodex\0",
+                b"THPA5\nth_cor-candidate-2\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900,7:100\ncodex\0",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
@@ -2224,6 +2335,37 @@ mod tests {
         let (version, observed_identity) = probe_provider_version(&provider).unwrap();
         assert_eq!(version, "codex-cli 1.2.3");
         assert_eq!(observed_identity, expected_identity);
+    }
+
+    #[test]
+    fn process_observation_rejects_real_tmux_unique_prefix_resolution() {
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("tmux is unavailable - skipping prefix-collision fixture");
+            return;
+        }
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::kill_session(&self.0);
+            }
+        }
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let requested = format!("th_prefix_{}", &suffix[..8]);
+        let actual = format!("{requested}_foreign");
+        crate::tmux::new_session_with_env(&actual, "", Some("sleep 30"), &[]).unwrap();
+        let guard = SessionGuard(actual.clone());
+        assert_eq!(
+            observe_harness_process(&requested),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+        assert!(crate::tmux::has_session(&actual));
+        drop(guard);
+        assert!(!crate::tmux::has_session(&actual));
     }
 
     #[test]
