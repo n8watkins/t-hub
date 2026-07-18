@@ -20714,9 +20714,16 @@ mod tests {
     }
 
     fn create_test_tmux_session(target: &str) -> Result<(), String> {
+        create_test_tmux_session_with_command(target, None)
+    }
+
+    fn create_test_tmux_session_with_command(
+        target: &str,
+        command: Option<&str>,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match tmux::new_session_with_env(target, "/tmp", None, &[]) {
+            match tmux::new_session_with_env(target, "/tmp", command, &[]) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.message == "server exited unexpectedly" => {
                     match tmux::session_liveness(target) {
@@ -20774,11 +20781,19 @@ mod tests {
         executable_name: &str,
         flags: &str,
     ) -> Option<Result<HarnessPermissionAttestation, crate::harness::LaunchAttestationError>> {
+        let Some(node_executable) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("node"))
+                .find(|candidate| candidate.is_file())
+        }) else {
+            eprintln!("process_permission_attestation: node not on PATH - skipping");
+            return None;
+        };
         if !std::process::Command::new("tmux")
             .arg("-V")
             .output()
             .is_ok_and(|output| output.status.success())
-            || !std::process::Command::new("node")
+            || !std::process::Command::new(&node_executable)
                 .arg("--version")
                 .output()
                 .is_ok_and(|output| output.status.success())
@@ -20796,7 +20811,10 @@ mod tests {
         let executable = fixture_dir.join(executable_name);
         std::fs::write(
             &executable,
-            "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+            format!(
+                "#!{}\nsetInterval(() => {{}}, 1000);\n",
+                node_executable.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -20807,7 +20825,7 @@ mod tests {
 
         let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let target = tmux_target(&session_id);
-        create_test_tmux_session(&target).unwrap();
+        create_test_tmux_session_with_command(&target, Some("/bin/sh")).unwrap();
         let before = observe_harness_process(&target).unwrap();
         let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
         tmux::send_text(&target, &command, true).unwrap();
