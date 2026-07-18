@@ -26,6 +26,7 @@
 //!   "which session, in what role" - never "may it do X".
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -219,6 +220,16 @@ struct IdentityGenerationWatermark {
     format_identity: String,
     identities_schema_version: u32,
     generation_high_water: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration: Option<IdentitySchemaMigrationReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentitySchemaMigrationReceipt {
+    from_schema_version: u32,
+    to_schema_version: u32,
+    source_sha256: String,
 }
 
 impl IdentityGenerationWatermark {
@@ -228,6 +239,18 @@ impl IdentityGenerationWatermark {
             format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.to_string(),
             identities_schema_version: IDENTITIES_SCHEMA_VERSION,
             generation_high_water,
+            migration: None,
+        }
+    }
+
+    fn migrating_v1(generation_high_water: u64, source_sha256: String) -> Self {
+        Self {
+            migration: Some(IdentitySchemaMigrationReceipt {
+                from_schema_version: LEGACY_IDENTITIES_SCHEMA_VERSION,
+                to_schema_version: IDENTITIES_SCHEMA_VERSION,
+                source_sha256,
+            }),
+            ..Self::current(generation_high_water)
         }
     }
 
@@ -239,8 +262,28 @@ impl IdentityGenerationWatermark {
         {
             return Err("identity generation watermark is malformed or unsupported".into());
         }
+        if let Some(migration) = &self.migration {
+            if migration.from_schema_version != LEGACY_IDENTITIES_SCHEMA_VERSION
+                || migration.to_schema_version != IDENTITIES_SCHEMA_VERSION
+                || !is_canonical_sha256(&migration.source_sha256)
+                || self.identities_schema_version != IDENTITIES_SCHEMA_VERSION
+            {
+                return Err("identity generation watermark migration receipt is malformed".into());
+            }
+        }
         Ok(())
     }
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn generation_watermark_path(identity_path: &Path) -> PathBuf {
@@ -360,13 +403,14 @@ fn reject_legacy_allocation_fields(
 
 fn read_identities_snapshot(
     path: &PathBuf,
-) -> Result<(IdentitiesSnapshot, IdentitySnapshotSource), String> {
+) -> Result<(IdentitiesSnapshot, IdentitySnapshotSource, String), String> {
     let source = std::fs::read(path).map_err(|error| {
         format!(
             "identity store '{}' could not be read: {error}",
             path.display()
         )
     })?;
+    let source_sha256 = sha256_hex(&source);
     let mut document: serde_json::Value = serde_json::from_slice(&source).map_err(|error| {
         format!(
             "identity store '{}' is invalid JSON: {error}",
@@ -411,7 +455,7 @@ fn read_identities_snapshot(
         };
         snapshot.schema_version = IDENTITIES_SCHEMA_VERSION;
         validate_identities_snapshot(&snapshot)?;
-        return Ok((snapshot, source));
+        return Ok((snapshot, source, source_sha256));
     }
 
     reject_legacy_allocation_fields(object, path)?;
@@ -464,7 +508,11 @@ fn read_identities_snapshot(
         }
     }
     validate_identities_snapshot(&snapshot)?;
-    Ok((snapshot, IdentitySnapshotSource::UnversionedLegacy))
+    Ok((
+        snapshot,
+        IdentitySnapshotSource::UnversionedLegacy,
+        source_sha256,
+    ))
 }
 
 /// Identity-secret TTL in ms, from `T_HUB_IDENTITY_TTL_SECS` (seconds). `0` (the
@@ -501,6 +549,13 @@ pub(crate) enum OperationAllocationDisposition {
     Unowned,
 }
 
+enum IdentityLoadPersistAction {
+    None,
+    OrdinaryUpgrade,
+    UpgradeSchemaV1 { source_sha256: String },
+    FinalizeSchemaV1,
+}
+
 impl IdentityStore {
     /// Load (or start empty) from `path`. A missing file starts empty. Malformed or
     /// unsupported persisted state remains byte-preserved and blocks every write.
@@ -524,17 +579,17 @@ impl IdentityStore {
         } else {
             Ok(None)
         };
-        let (mut inner, schema_upgraded, write_blocked, watermark) =
+        let (mut inner, persist_action, write_blocked, watermark) =
             match (identity_read, watermark_read) {
                 (Err(error), _) | (_, Err(error)) => (
                     IdentitiesSnapshot::default(),
-                    false,
+                    IdentityLoadPersistAction::None,
                     Some(error),
                     IdentityGenerationWatermark::current(0),
                 ),
                 (Ok(None), Ok(Some(watermark))) => (
                     IdentitiesSnapshot::default(),
-                    false,
+                    IdentityLoadPersistAction::None,
                     Some(
                         "identity generation watermark exists but identities.json is missing"
                             .to_string(),
@@ -542,11 +597,15 @@ impl IdentityStore {
                     watermark,
                 ),
                 (
-                    Ok(Some((_snapshot, IdentitySnapshotSource::UnversionedLegacy))),
+                    Ok(Some((
+                        _snapshot,
+                        IdentitySnapshotSource::UnversionedLegacy,
+                        _source_sha256,
+                    ))),
                     Ok(Some(watermark)),
                 ) => (
                     IdentitiesSnapshot::default(),
-                    false,
+                    IdentityLoadPersistAction::None,
                     Some(
                         "identity generation watermark proves identities.json was downgraded to an unversioned shape"
                             .to_string(),
@@ -554,23 +613,42 @@ impl IdentityStore {
                     watermark,
                 ),
                 (
-                    Ok(Some((_snapshot, IdentitySnapshotSource::VersionedLegacy))),
+                    Ok(Some((
+                        snapshot,
+                        IdentitySnapshotSource::VersionedLegacy,
+                        source_sha256,
+                    ))),
                     Ok(Some(watermark)),
-                ) if watermark.identities_schema_version == IDENTITIES_SCHEMA_VERSION => (
-                    IdentitiesSnapshot::default(),
-                    false,
-                    Some(
-                        "identity generation watermark proves identities.json was downgraded to schema v1 and may have erased operation allocation ownership"
-                            .to_string(),
-                    ),
-                    watermark,
-                ),
-                (Ok(Some((snapshot, _source))), Ok(Some(watermark)))
+                ) if watermark.identities_schema_version == IDENTITIES_SCHEMA_VERSION => {
+                    let matching_migration = watermark.migration.as_ref().is_some_and(|receipt| {
+                        receipt.source_sha256 == source_sha256
+                            && snapshot.generation == watermark.generation_high_water
+                    });
+                    if matching_migration {
+                        (
+                            snapshot,
+                            IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 },
+                            None,
+                            watermark,
+                        )
+                    } else {
+                        (
+                            IdentitiesSnapshot::default(),
+                            IdentityLoadPersistAction::None,
+                            Some(
+                                "identity generation watermark proves identities.json was downgraded to schema v1 and may have erased operation allocation ownership"
+                                    .to_string(),
+                            ),
+                            watermark,
+                        )
+                    }
+                }
+                (Ok(Some((snapshot, _source, _source_sha256))), Ok(Some(watermark)))
                     if snapshot.generation != watermark.generation_high_water =>
                 {
                     (
                         IdentitiesSnapshot::default(),
-                        false,
+                        IdentityLoadPersistAction::None,
                         Some(
                             "identity generation watermark does not match identities.json"
                                 .to_string(),
@@ -579,14 +657,18 @@ impl IdentityStore {
                     )
                 }
                 (
-                    Ok(Some((_snapshot, IdentitySnapshotSource::Current))),
+                    Ok(Some((
+                        _snapshot,
+                        IdentitySnapshotSource::Current,
+                        _source_sha256,
+                    ))),
                     Ok(Some(watermark)),
                 )
                     if watermark.identities_schema_version != IDENTITIES_SCHEMA_VERSION =>
                 {
                     (
                         IdentitiesSnapshot::default(),
-                        false,
+                        IdentityLoadPersistAction::None,
                         Some(
                             "identity generation watermark schema does not match identities.json"
                                 .to_string(),
@@ -594,26 +676,51 @@ impl IdentityStore {
                         watermark,
                     )
                 }
-                (Ok(Some((snapshot, source))), Ok(Some(watermark))) => {
-                    (
-                        snapshot,
-                        source != IdentitySnapshotSource::Current,
-                        None,
-                        watermark,
-                    )
+                (
+                    Ok(Some((snapshot, IdentitySnapshotSource::Current, _source_sha256))),
+                    Ok(Some(watermark)),
+                ) => {
+                    let action = if watermark.migration.is_some() {
+                        IdentityLoadPersistAction::FinalizeSchemaV1
+                    } else {
+                        IdentityLoadPersistAction::None
+                    };
+                    (snapshot, action, None, watermark)
                 }
-                (Ok(Some((snapshot, source))), Ok(None)) => {
+                (
+                    Ok(Some((
+                        snapshot,
+                        IdentitySnapshotSource::VersionedLegacy,
+                        source_sha256,
+                    ))),
+                    Ok(Some(watermark)),
+                ) => (
+                    snapshot,
+                    IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 },
+                    None,
+                    watermark,
+                ),
+                (Ok(Some((snapshot, source, source_sha256))), Ok(None)) => {
                     let generation = snapshot.generation;
+                    let action = match source {
+                        IdentitySnapshotSource::Current => IdentityLoadPersistAction::None,
+                        IdentitySnapshotSource::VersionedLegacy => {
+                            IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 }
+                        }
+                        IdentitySnapshotSource::UnversionedLegacy => {
+                            IdentityLoadPersistAction::OrdinaryUpgrade
+                        }
+                    };
                     (
                         snapshot,
-                        source != IdentitySnapshotSource::Current,
+                        action,
                         None,
                         IdentityGenerationWatermark::current(generation),
                     )
                 }
                 (Ok(None), Ok(None)) => (
                     IdentitiesSnapshot::default(),
-                    false,
+                    IdentityLoadPersistAction::None,
                     None,
                     IdentityGenerationWatermark::current(0),
                 ),
@@ -640,12 +747,21 @@ impl IdentityStore {
             fail_identity_write_after_watermark: Mutex::new(false),
         };
         let watermark_missing = !watermark_source_exists;
-        if (schema_upgraded || (identity_source_exists && watermark_missing))
-            && store.write_blocked.is_none()
-        {
+        let should_persist = !matches!(persist_action, IdentityLoadPersistAction::None)
+            || (identity_source_exists && watermark_missing);
+        if should_persist && store.write_blocked.is_none() {
             let persist_result = {
                 let snapshot = store.lock();
-                store.persist(&snapshot)
+                match persist_action {
+                    IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 } => {
+                        store.persist_schema_v1_migration(&snapshot, source_sha256)
+                    }
+                    IdentityLoadPersistAction::FinalizeSchemaV1 => {
+                        store.finalize_schema_v1_migration(&snapshot)
+                    }
+                    IdentityLoadPersistAction::None
+                    | IdentityLoadPersistAction::OrdinaryUpgrade => store.persist(&snapshot),
+                }
             };
             if let Err(error) = persist_result {
                 store.write_blocked = Some(format!(
@@ -679,6 +795,75 @@ impl IdentityStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, IdentitiesSnapshot> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn persist_schema_v1_migration(
+        &self,
+        snapshot: &IdentitiesSnapshot,
+        source_sha256: String,
+    ) -> Result<(), String> {
+        validate_identities_snapshot(snapshot)?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or("identity store migration path is unavailable")?;
+        let watermark_path = self
+            .watermark_path
+            .as_ref()
+            .ok_or("identity generation watermark path is unavailable")?;
+        let migration =
+            IdentityGenerationWatermark::migrating_v1(snapshot.generation, source_sha256);
+        write_generation_watermark(watermark_path, &migration).map_err(|error| {
+            format!(
+                "identity migration receipt persist to '{}' failed: {error}",
+                watermark_path.display()
+            )
+        })?;
+        *self
+            .generation_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = migration;
+        #[cfg(test)]
+        {
+            let mut fail = self
+                .fail_identity_write_after_watermark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *fail {
+                *fail = false;
+                return Err(
+                    "identity store failure after migration receipt persistence injected by test"
+                        .into(),
+                );
+            }
+        }
+        write_atomic(path, snapshot).map_err(|error| {
+            format!(
+                "identity schema v1 migration persist to '{}' failed: {error}",
+                path.display()
+            )
+        })?;
+        self.finalize_schema_v1_migration(snapshot)
+    }
+
+    fn finalize_schema_v1_migration(&self, snapshot: &IdentitiesSnapshot) -> Result<(), String> {
+        validate_identities_snapshot(snapshot)?;
+        let watermark_path = self
+            .watermark_path
+            .as_ref()
+            .ok_or("identity generation watermark path is unavailable")?;
+        let final_watermark = IdentityGenerationWatermark::current(snapshot.generation);
+        write_generation_watermark(watermark_path, &final_watermark).map_err(|error| {
+            format!(
+                "identity migration completion persist to '{}' failed: {error}",
+                watermark_path.display()
+            )
+        })?;
+        *self
+            .generation_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = final_watermark;
+        Ok(())
     }
 
     fn persist(&self, snap: &IdentitiesSnapshot) -> Result<(), String> {
@@ -1508,6 +1693,7 @@ mod tests {
             format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.into(),
             identities_schema_version: LEGACY_IDENTITIES_SCHEMA_VERSION,
             generation_high_water: 4,
+            migration: None,
         };
         std::fs::write(
             &watermark_path,
@@ -1529,6 +1715,93 @@ mod tests {
                 .identities_schema_version,
             IDENTITIES_SCHEMA_VERSION
         );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn schema_v1_anchor_first_migration_receipt_recovers_every_durable_phase() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let v1 = serde_json::json!({
+            "schemaVersion": LEGACY_IDENTITIES_SCHEMA_VERSION,
+            "generation": 4,
+            "identities": {
+                "identity-four": {
+                    "id": "identity-four",
+                    "generation": 4,
+                    "secret": "secret-four",
+                    "role": "cortana",
+                    "sessionTile": "cor-old",
+                    "shipSlug": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
+        let migration = IdentityGenerationWatermark::migrating_v1(4, sha256_hex(&v1_bytes));
+
+        std::fs::write(&path, &v1_bytes).unwrap();
+        write_generation_watermark(&watermark_path, &migration).unwrap();
+        let after_receipt = IdentityStore::load(path.clone());
+        assert!(after_receipt.write_blocked.is_none());
+        assert_eq!(after_receipt.get("identity-four").unwrap().generation, 4);
+        let v2_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&v2_bytes).unwrap()["schemaVersion"],
+            IDENTITIES_SCHEMA_VERSION
+        );
+        assert!(read_generation_watermark(&watermark_path)
+            .unwrap()
+            .migration
+            .is_none());
+
+        write_generation_watermark(&watermark_path, &migration).unwrap();
+        let after_identity = IdentityStore::load(path.clone());
+        assert!(after_identity.write_blocked.is_none());
+        assert_eq!(after_identity.get("identity-four").unwrap().generation, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), v2_bytes);
+        assert!(read_generation_watermark(&watermark_path)
+            .unwrap()
+            .migration
+            .is_none());
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn mismatched_schema_v1_migration_receipt_is_byte_preserving_and_blocked() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let v1 = serde_json::json!({
+            "schemaVersion": LEGACY_IDENTITIES_SCHEMA_VERSION,
+            "generation": 4,
+            "identities": {
+                "identity-four": {
+                    "id": "identity-four",
+                    "generation": 4,
+                    "secret": "secret-four",
+                    "role": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
+        let migration = IdentityGenerationWatermark::migrating_v1(4, "0".repeat(64));
+        let watermark_bytes = serde_json::to_vec_pretty(&migration).unwrap();
+        std::fs::write(&path, &v1_bytes).unwrap();
+        std::fs::write(&watermark_path, &watermark_bytes).unwrap();
+
+        let blocked = IdentityStore::load(path.clone());
+        assert!(blocked.write_blocked.as_deref().is_some_and(|reason| {
+            reason.contains("downgraded to schema v1")
+                && reason.contains("operation allocation ownership")
+        }));
+        assert!(blocked.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), v1_bytes);
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(watermark_path);
     }
