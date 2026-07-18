@@ -6324,6 +6324,130 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    /// Downgrade an incumbent after a fresh probe cannot prove the exact Ready
+    /// contract. The terminal pointer and lineage remain published so no caller
+    /// can mistake uncertainty for permission to seize or retire it.
+    pub fn block_cortana_incumbent(
+        &self,
+        expected_generation: u64,
+        expected_terminal_id: &str,
+        reason: CortanaRecoveryReason,
+        guidance: &str,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        if matches!(
+            reason,
+            CortanaRecoveryReason::RuntimeStartFailed
+                | CortanaRecoveryReason::CandidateCleanupPending
+        ) {
+            return Err("Cortana incumbent downgrade used a candidate-only reason".into());
+        }
+        let guidance = guidance.trim();
+        if guidance.is_empty()
+            || guidance.len() > MAX_CORTANA_GUIDANCE_BYTES
+            || guidance.chars().any(char::is_control)
+        {
+            return Err("Cortana incumbent guidance is empty or unsafe".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        if runtime.generation != expected_generation
+            || captain.terminal_id.as_deref() != Some(expected_terminal_id)
+        {
+            return Err("Cortana incumbent changed while its probe was in flight".into());
+        }
+        if runtime.lifecycle == CortanaRuntimeLifecycle::NeedsAttention
+            && runtime.reason_code == Some(reason)
+            && runtime.guidance.as_deref() == Some(guidance)
+        {
+            return Ok(captain.clone());
+        }
+        if runtime.lifecycle != CortanaRuntimeLifecycle::Ready {
+            return Err("Cortana incumbent is no longer Ready".into());
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
+        runtime.reason_code = Some(reason);
+        runtime.guidance = Some(guidance.to_string());
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    /// Persist the exact failure disposition for a spawned candidate.
+    /// Unresolved cleanup retains the candidate and blocks all later spawning.
+    pub fn fail_cortana_candidate(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        cleanup_confirmed_gone: bool,
+        guidance: &str,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let guidance = guidance.trim();
+        if guidance.is_empty()
+            || guidance.len() > MAX_CORTANA_GUIDANCE_BYTES
+            || guidance.chars().any(char::is_control)
+        {
+            return Err("Cortana candidate failure guidance is empty or unsafe".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id || intent.request_digest != request_digest {
+            return Err("Cortana candidate failure does not match the immutable request".into());
+        }
+        if !matches!(
+            intent.phase,
+            CortanaEnsurePhase::CandidateSpawned | CortanaEnsurePhase::CleanupPending
+        ) {
+            return Err("Cortana ensure has no candidate failure to record".into());
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        if cleanup_confirmed_gone {
+            intent.phase = CortanaEnsurePhase::Failed;
+            intent.candidate = None;
+            runtime.lifecycle = CortanaRuntimeLifecycle::Failed;
+            runtime.reason_code = Some(CortanaRecoveryReason::RuntimeStartFailed);
+        } else {
+            intent.phase = CortanaEnsurePhase::CleanupPending;
+            runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
+            runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
+        }
+        intent.updated_at = timestamp;
+        runtime.guidance = Some(guidance.to_string());
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     /// Return the durable project registry without exposing the registry lock.
     pub fn projects(&self) -> Vec<ProjectRecord> {
         self.lock().projects.clone()
@@ -21621,6 +21745,87 @@ mod tests {
             runtime.ensure_intent.unwrap().phase,
             CortanaEnsurePhase::CandidateSpawned
         );
+    }
+
+    #[test]
+    fn cortana_incumbent_ambiguity_downgrades_without_seizing_identity() {
+        let incumbent = cortana_ready_fixture();
+        let registry = seed_cortana_registry(incumbent.clone());
+        let blocked = registry
+            .block_cortana_incumbent(
+                1,
+                incumbent.terminal_id.as_deref().unwrap(),
+                CortanaRecoveryReason::AmbiguousLiveness,
+                "Cortana terminal liveness is ambiguous. Retry after reconciliation recovers.",
+                110,
+            )
+            .unwrap();
+        assert_eq!(blocked.terminal_id, incumbent.terminal_id);
+        assert_eq!(blocked.state, ClaimState::Active);
+        let runtime = blocked.cortana_runtime.unwrap();
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(runtime.generation, 1);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
+    }
+
+    #[test]
+    fn cortana_candidate_cleanup_ambiguity_blocks_spawn_until_exact_gone() {
+        let incumbent = cortana_ready_fixture();
+        let registry = seed_cortana_registry(incumbent.clone());
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-cleanup-1",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut candidate = cortana_candidate_fixture(2, false);
+        candidate.spawned_at = 111;
+        registry
+            .record_cortana_candidate(&intent.operation_id, &intent.request_digest, candidate, 111)
+            .unwrap();
+        let blocked = registry
+            .fail_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                false,
+                "Candidate cleanup is unresolved. Do not retry startup until it is confirmed gone.",
+                112,
+            )
+            .unwrap();
+        assert_eq!(
+            blocked.cortana_runtime.as_ref().unwrap().lifecycle,
+            CortanaRuntimeLifecycle::NeedsAttention
+        );
+        let error = registry
+            .prepare_cortana_ensure(
+                "ensure-cleanup-contender",
+                cortana_ensure_request(Some(&incumbent)),
+                113,
+            )
+            .unwrap_err();
+        assert!(error.contains("already in progress"));
+
+        let failed = registry
+            .fail_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                true,
+                "Candidate was confirmed gone. A new operation may be reviewed and retried.",
+                114,
+            )
+            .unwrap();
+        let runtime = failed.cortana_runtime.unwrap();
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::Failed);
+        assert!(runtime.ensure_intent.unwrap().candidate.is_none());
     }
 
     fn cortana_prepared_fixture(generation: u64) -> CaptainRecord {
