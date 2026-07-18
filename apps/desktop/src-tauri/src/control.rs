@@ -16299,8 +16299,8 @@ fn rename_captain(
 /// session is refused), then the authoritative captains snapshot is forwarded via
 /// `sync_captains` so every client renders from it. Args: `captainSessionId` (or
 /// `sessionId`) required; `shipSlug` optional (slugified; defaults to
-/// `ship-<sessionId>`); `workspaceTabIds` optional (defaults to the tab currently
-/// holding the captain's tile, when the tab registry knows one).
+/// `ship-<sessionId>`); `workspaceTabIds` optional and always explicit (an omitted
+/// list owns no Work Workspace).
 ///
 /// LIVENESS: the session must be a LIVE terminal (`th_<id>` exists in tmux) - a
 /// claim for a dead/unknown session would persist and linger forever (nothing
@@ -16409,6 +16409,7 @@ fn claim_captain(
         .unwrap_or_default();
     let _identity_transaction = ctx.tabs.identity_transaction();
     let previous_workspace = ctx.tabs.workspace_for_tile(&captain_session_id);
+    let captain_workspace_existed = ctx.tabs.has_tab(CAPTAIN_WORKSPACE_ID);
     let requested_slug = match role {
         FleetRole::Cortana => CORTANA_SLUG.to_string(),
         FleetRole::Captain => ship_slug
@@ -16486,6 +16487,8 @@ fn claim_captain(
         &is_terminal_dead,
         &crew_liveness,
     )?;
+    ctx.tabs
+        .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
     if let Err(error) = ctx
         .tabs
         .move_tile(&captain_session_id, CAPTAIN_WORKSPACE_ID)
@@ -16495,11 +16498,18 @@ fn claim_captain(
             &outcome.record,
             previous_claim.clone(),
         );
+        let workspace_rollback = (!captain_workspace_existed)
+            .then(|| ctx.tabs.rollback_owned_empty_tab(CAPTAIN_WORKSPACE_ID))
+            .transpose();
         return Err(format!(
-            "claim_captain: Captain Workspace relocation failed: {error}{}",
+            "claim_captain: Captain Workspace relocation failed: {error}{}{}",
             rollback
                 .err()
                 .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            workspace_rollback
+                .err()
+                .map(|rollback| format!("; Workspace rollback failed: {rollback}"))
                 .unwrap_or_default()
         ));
     }
@@ -16517,8 +16527,11 @@ fn claim_captain(
             &outcome.record,
             previous_claim,
         );
+        let workspace_rollback = (!captain_workspace_existed)
+            .then(|| ctx.tabs.rollback_owned_empty_tab(CAPTAIN_WORKSPACE_ID))
+            .transpose();
         return Err(format!(
-            "claim_captain: Captain Workspace synchronization failed: {error}{}{}",
+            "claim_captain: Captain Workspace synchronization failed: {error}{}{}{}",
             placement_rollback
                 .err()
                 .map(|rollback| format!("; placement rollback failed: {rollback}"))
@@ -16526,6 +16539,10 @@ fn claim_captain(
             registry_rollback
                 .err()
                 .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            workspace_rollback
+                .err()
+                .map(|rollback| format!("; Workspace rollback failed: {rollback}"))
                 .unwrap_or_default()
         ));
     }
@@ -24671,6 +24688,13 @@ mod tests {
         assert!(value["captain"].get("providerSessionId").is_none());
         assert!(value["captain"].get("conversationId").is_none());
         assert!(value["captain"].get("claudeUuid").is_none());
+        let tabs = ctx.tab_registry().snapshot();
+        let captain_workspace = tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .expect("claim creates the durable Captain Workspace when boot starts headless");
+        assert_eq!(captain_workspace.name, CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(captain_workspace.tile_ids, vec![terminal_id.clone()]);
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
