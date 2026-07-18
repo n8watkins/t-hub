@@ -651,6 +651,13 @@ impl TabRegistry {
         let mut g = self.lock();
         g.tabs = Self::normalize_tabs(tabs)
             .expect("internal tab fixtures must contain valid Workspace records");
+        if !g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|active| g.tabs.iter().any(|tab| &tab.id == active))
+        {
+            g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
+        }
         g.seq += 1;
     }
 
@@ -2388,6 +2395,12 @@ pub struct PendingFleetOperation {
     pub payload: PendingFleetOperationPayload,
 }
 
+#[derive(Debug)]
+struct CloseWorkspaceResult {
+    removed_tile_ids: Vec<String>,
+    captains_changed: bool,
+}
+
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
 /// what every `sync_captains` forward carries down to the UI (the UI renders FROM
 /// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
@@ -3779,6 +3792,37 @@ impl CaptainsRegistry {
         Ok(workspace)
     }
 
+    fn adopt_unowned_workspace_projection(&self, tabs: &[TabRecord]) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let mut changed = false;
+        for tab in tabs {
+            if tab.kind() != WorkspaceKind::Work
+                || current
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == tab.id)
+            {
+                continue;
+            }
+            current.workspaces.push(FleetWorkspaceRecord {
+                id: tab.id.clone(),
+                name: tab.name.clone(),
+                kind: WorkspaceKind::Work,
+                owner: None,
+                tile_ids: tab.tile_ids.clone(),
+            });
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(true)
+    }
+
     fn rename_workspace(&self, id: &str, name: &str) -> Result<(), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
@@ -3853,6 +3897,130 @@ impl CaptainsRegistry {
         }
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)
+    }
+
+    fn retire_workspace_tile(&self, tile_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let mut changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace.tile_ids.retain(|candidate| candidate != tile_id);
+            changed |= workspace.tile_ids.len() != before;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(true)
+    }
+
+    fn close_workspace(
+        &self,
+        workspace_id: &str,
+        force: bool,
+        expected_owner: Option<&FleetWorkspaceOwner>,
+    ) -> Result<CloseWorkspaceResult, String> {
+        if workspace_id == CAPTAIN_WORKSPACE_ID {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let workspace_index = current
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| format!("close_tab: unknown durable Workspace '{workspace_id}'"))?;
+        let workspace = current.workspaces[workspace_index].clone();
+        if workspace.kind != WorkspaceKind::Work {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
+        if current
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.kind == WorkspaceKind::Work)
+            .count()
+            <= 1
+        {
+            return Err(
+                "close_tab: refusing to close the last tab (the final Work Workspace)".into(),
+            );
+        }
+        if workspace.owner.as_ref() != expected_owner && expected_owner.is_some() {
+            return Err("acl: close_tab Workspace owner changed before durable commit".into());
+        }
+        if !workspace.tile_ids.is_empty() && !force {
+            return Err(format!(
+                "close_tab: tab '{workspace_id}' still holds {} tile(s); close its terminals first (close_terminal) or pass force: true",
+                workspace.tile_ids.len()
+            ));
+        }
+
+        let previous = current.clone();
+        let owner = workspace.owner.clone();
+        let owner_candidate_ids = current
+            .workspaces
+            .iter()
+            .filter(|candidate| {
+                candidate.id != workspace_id
+                    && candidate.kind == WorkspaceKind::Work
+                    && candidate.owner.as_ref() == owner.as_ref()
+            })
+            .map(|candidate| candidate.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut captains_changed = false;
+        for captain in &mut current.captains {
+            let owns_target = owner.as_ref().map_or_else(
+                || captain.workspace_tab_ids.contains(&workspace.id),
+                |owner| {
+                    captain.ship_slug == owner.ship_slug
+                        && captain.assignment_id == owner.assignment_id
+                        && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                },
+            );
+            if !owns_target {
+                continue;
+            }
+            let before = captain.workspace_tab_ids.len();
+            captain
+                .workspace_tab_ids
+                .retain(|candidate| candidate != workspace_id);
+            captains_changed |= captain.workspace_tab_ids.len() != before;
+            let candidates = captain
+                .workspace_tab_ids
+                .iter()
+                .filter(|candidate| owner_candidate_ids.contains(candidate.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for crew in &mut captain.crew {
+                if crew.workspace_tab_id.as_deref() != Some(workspace_id) {
+                    continue;
+                }
+                let live_assignable = matches!(
+                    crew.state,
+                    CrewState::Active | CrewState::NeedsAssignment { .. }
+                );
+                if live_assignable && candidates.len() == 1 {
+                    crew.workspace_tab_id = Some(candidates[0].clone());
+                    crew.state = CrewState::Active;
+                } else {
+                    crew.workspace_tab_id = None;
+                    if live_assignable {
+                        crew.state = CrewState::NeedsAssignment { since: now_ms() };
+                    }
+                }
+                captains_changed = true;
+            }
+        }
+        current.workspaces.remove(workspace_index);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(CloseWorkspaceResult {
+            removed_tile_ids: workspace.tile_ids,
+            captains_changed,
+        })
     }
 
     /// Fallible write-through of a snapshot to disk, WITHOUT the `inner` lock
@@ -16987,21 +17155,33 @@ fn close_tab(
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "close_tab")?;
-    enforce_workspace_owner(ctx, &authority, &tab_id, "close_tab")?;
-    let _identity_transaction = ctx.tabs.identity_transaction();
-    let planned_orphans = ctx.tabs.validate_remove_tab(&tab_id, force)?;
-    // Captains must never advertise ownership of a tab that no longer exists
-    // (the claim itself survives - a captain can control zero tabs).
-    let captains_changed = ctx.captains.prune_tab(&tab_id)?;
-    let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
-    debug_assert_eq!(orphaned, planned_orphans);
-    if captains_changed {
-        let _ = captains_sync_apply(ctx);
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        ctx.captains
+            .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
     }
+    enforce_workspace_owner(ctx, &authority, &tab_id, "close_tab")?;
+    let expected_owner = match &authority {
+        WorkspaceMutationAuthority::Apex => None,
+        WorkspaceMutationAuthority::Assignment(owner) => Some(owner),
+    };
+    let closed = ctx
+        .captains
+        .close_workspace(&tab_id, force, expected_owner)?;
+    #[cfg(test)]
+    if args
+        .get("testCrashAfterFleetCommit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("injected crash after durable Fleet Workspace close commit".into());
+    }
+    ctx.tabs.replace(ctx.captains.workspace_projection());
+    let _ = captains_sync_apply(ctx);
     let mut res =
         organization_sync_apply(ctx, "close_tab", json!({ "tabId": tab_id, "force": force }))?;
     res["tabId"] = json!(tab_id);
-    res["orphanedTileIds"] = json!(orphaned);
+    res["orphanedTileIds"] = json!(closed.removed_tile_ids);
+    res["captainsChanged"] = json!(closed.captains_changed);
     Ok(res)
 }
 
@@ -17023,6 +17203,10 @@ fn rename_tab(
         .filter(|s| !s.is_empty())
         .ok_or("rename_tab requires a non-empty 'name' argument")?;
     let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "rename_tab")?;
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        ctx.captains
+            .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
+    }
     enforce_workspace_owner(ctx, &authority, &tab_id, "rename_tab")?;
     ctx.captains.rename_workspace(&tab_id, &name)?;
     ctx.tabs.rename_tab(&tab_id, &name)?;
@@ -17611,6 +17795,10 @@ fn move_tile(
         (Some(tile), Some(tab)) => {
             let authority =
                 workspace_mutation_authority(ctx, caller, trusted_internal, "move_tile")?;
+            if matches!(authority, WorkspaceMutationAuthority::Apex) {
+                ctx.captains
+                    .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
+            }
             enforce_workspace_owner(ctx, &authority, &tab, "move_tile")?;
             if let Some(source) = ctx
                 .captains
@@ -18373,7 +18561,7 @@ fn close_terminal_with_policy(
     // kill so a failed kill can never leave a live worker without its lease.
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
-    let (powder_release, crew_binding_retained, captain_state_changed) =
+    let (powder_release, crew_binding_retained, mut captain_state_changed) =
         finalize_crew_powder_cleanup_guarded(ctx, tile_id, preserve_crew_on_powder_failure)?;
     let outcome = if forced {
         "force_reaped"
@@ -18384,7 +18572,10 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    if ctx.tabs.retire_tile_locked(tile_id) {
+    let workspace_changed = ctx.captains.retire_workspace_tile(tile_id)?;
+    captain_state_changed |= workspace_changed;
+    ctx.tabs.replace(ctx.captains.workspace_projection());
+    if workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
     // Captain-chat phase 2: a dead session leaves the captains registry too -
@@ -23989,6 +24180,168 @@ mod tests {
         assert_eq!(owner.assignment_id, "assignment:project-a:alpha");
         assert_eq!(owner.ship_slug, "alpha");
         assert!(durable.pending_fleet_operations.is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn durable_close_workspace_fixture(
+        tag: &str,
+        workspace_ids: &[&str],
+    ) -> (
+        PathBuf,
+        Arc<CaptainsRegistry>,
+        Arc<TabRegistry>,
+        ControlContext,
+    ) {
+        let path = captains_tmp(tag);
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-a".into(),
+                name: "Project A".into(),
+                repo_root: "/tmp/project-a".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        captains
+            .claim_test(
+                "captain-a",
+                Some("alpha"),
+                workspace_ids.iter().map(|id| (*id).to_string()).collect(),
+            )
+            .unwrap();
+        captains
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        captains.record_crew("captain-a", "crew-a").unwrap();
+        captains
+            .bind_crew_context_exact(
+                "captain-a",
+                "crew-a",
+                "close Workspace recovery",
+                "codex",
+                None,
+                None,
+                Some("work-a"),
+                PowderWorkBinding {
+                    card_id: "card-a".into(),
+                    run_id: "run-a".into(),
+                    agent: Some("agent-a".into()),
+                    claim_expires_at: Some(1),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let context = test_ctx(tag)
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        (path, captains, tabs, context)
+    }
+
+    #[test]
+    fn force_close_atomically_rehomes_crew_and_restart_projects_the_committed_state() {
+        let (path, captains, tabs, context) =
+            durable_close_workspace_fixture("force-close-rehome", &["work-a", "work-b"]);
+        let before_projection = tabs.snapshot_full();
+
+        let error = dispatch(
+            &context,
+            "close_tab",
+            &json!({
+                "tabId": "work-a",
+                "force": true,
+                "testCrashAfterFleetCommit": true,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected crash"));
+        assert_eq!(tabs.snapshot_full().seq, before_projection.seq);
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .any(|workspace| workspace.id == "work-a"));
+
+        let committed = captains.snapshot();
+        assert!(committed
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != "work-a"));
+        let crew = &committed.captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id.as_deref(), Some("work-b"));
+        assert!(matches!(crew.state, CrewState::Active));
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        let restarted = CaptainsRegistry::load(path.clone());
+        let restarted_tabs = TabRegistry::new();
+        restarted_tabs.replace(restarted.workspace_projection());
+        let projected = restarted_tabs.snapshot();
+        assert!(projected.iter().all(|workspace| workspace.id != "work-a"));
+        let work_b = projected
+            .iter()
+            .find(|workspace| workspace.id == "work-b")
+            .unwrap();
+        assert_eq!(work_b.tile_ids, vec!["crew-a"]);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn force_close_with_ambiguous_rehome_persists_needs_assignment_and_rolls_back_on_failure() {
+        let (path, captains, tabs, context) = durable_close_workspace_fixture(
+            "force-close-ambiguous",
+            &["work-a", "work-b", "work-c"],
+        );
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        captains.fail_next_persist("force close persistence failure");
+        let error = dispatch(
+            &context,
+            "close_tab",
+            &json!({"tabId": "work-a", "force": true}),
+        )
+        .unwrap_err();
+        assert!(error.contains("force close persistence failure"));
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().workspaces, before_captains.workspaces);
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+
+        dispatch(
+            &context,
+            "close_tab",
+            &json!({"tabId": "work-a", "force": true}),
+        )
+        .unwrap();
+        let committed = captains.snapshot();
+        let crew = &committed.captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id, None);
+        assert!(matches!(crew.state, CrewState::NeedsAssignment { .. }));
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .all(|workspace| !workspace.tile_ids.contains(&"crew-a".to_string())));
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        let restarted = CaptainsRegistry::load(path.clone());
+        let crew = &restarted.snapshot().captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id, None);
+        assert!(matches!(crew.state, CrewState::NeedsAssignment { .. }));
 
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
