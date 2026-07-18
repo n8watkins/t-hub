@@ -566,6 +566,10 @@ pub enum ReportOutcome {
 #[derive(Clone, Default)]
 struct RegistryInner {
     tabs: Vec<TabRecord>,
+    /// Process-local terminal death tombstones. A cleanup commit records the
+    /// tombstone under the same identity transaction that removes the tile, so
+    /// a queued move/report cannot resurrect a killed or recovery-retired id.
+    retired_tile_ids: std::collections::HashSet<String>,
     /// The UI's active (visible) tab, mirrored from its reports and from
     /// `focus_tab`. Used as the default placement target for un-named spawns and
     /// exposed via `list_tabs` so a socket caller can prove focus did NOT move.
@@ -752,7 +756,7 @@ impl TabRegistry {
             .map(|tab| tab.id.clone())
     }
 
-    fn restore_tile_placement(
+    fn restore_tile_placement_locked(
         &self,
         tile_id: &str,
         workspace_id: Option<&str>,
@@ -760,7 +764,7 @@ impl TabRegistry {
         match workspace_id {
             Some(workspace_id) => self.move_tile(tile_id, workspace_id),
             None => {
-                self.remove_tile(tile_id);
+                self.remove_tile_locked(tile_id);
                 Ok(())
             }
         }
@@ -813,6 +817,11 @@ impl TabRegistry {
     /// is still placed (it may be a live session the UI has not adopted yet).
     fn move_tile(&self, tile_id: &str, tab_id: &str) -> Result<(), String> {
         let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return Err(format!(
+                "move_tile: terminal '{tile_id}' was retired and cannot be reinserted"
+            ));
+        }
         if !g.tabs.iter().any(|t| t.id == tab_id) {
             return Err(format!(
                 "move_tile: unknown tabId '{tab_id}' (list_tabs shows valid ids; new_tab creates one)"
@@ -838,6 +847,9 @@ impl TabRegistry {
     /// reports back).
     fn place_tile_with_fallback(&self, tile_id: &str, tab_id: Option<&str>) -> Option<String> {
         let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return None;
+        }
         let target = tab_id
             .filter(|id| {
                 g.tabs
@@ -873,6 +885,11 @@ impl TabRegistry {
     /// change ownership after authority was validated.
     fn place_tile_exact(&self, tile_id: &str, tab_id: &str) -> Result<String, String> {
         let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return Err(format!(
+                "terminal '{tile_id}' was retired and cannot be placed"
+            ));
+        }
         if !g.tabs.iter().any(|tab| tab.id == tab_id) {
             return Err(format!(
                 "Workspace '{tab_id}' closed before exact terminal placement"
@@ -893,7 +910,7 @@ impl TabRegistry {
 
     /// Drop a tile from every tab (a terminal was closed). Returns true (and bumps
     /// the revision) only if the tile was actually placed somewhere.
-    fn remove_tile(&self, tile_id: &str) -> bool {
+    fn remove_tile_locked(&self, tile_id: &str) -> bool {
         let mut g = self.lock();
         let mut removed = false;
         for t in g.tabs.iter_mut() {
@@ -905,6 +922,22 @@ impl TabRegistry {
             g.seq += 1;
         }
         removed
+    }
+
+    fn retire_tile_locked(&self, tile_id: &str) -> bool {
+        let mut g = self.lock();
+        let newly_retired = g.retired_tile_ids.insert(tile_id.to_string());
+        let mut removed = false;
+        for tab in &mut g.tabs {
+            let before = tab.tile_ids.len();
+            tab.tile_ids.retain(|candidate| candidate != tile_id);
+            removed |= tab.tile_ids.len() != before;
+        }
+        let changed = newly_retired || removed;
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+        }
+        changed
     }
 
     /// Rename a tab. Errors when the tab is unknown.
@@ -1863,6 +1896,15 @@ fn validate_workspace_occupant_records(
     workspace_id: &str,
     kind: WorkspaceKind,
 ) -> Result<(), String> {
+    if captains.iter().any(|captain| {
+        captain.crew.iter().any(|crew| {
+            crew.terminal_id == terminal_id && matches!(crew.state, CrewState::Removed { .. })
+        })
+    }) {
+        return Err(format!(
+            "Workspace placement denied: removed Crew terminal '{terminal_id}' cannot be reinserted"
+        ));
+    }
     let membership = captains.iter().find_map(|captain| {
         if captain.terminal_id.as_deref() == Some(terminal_id)
             && captain.state == ClaimState::Active
@@ -2137,6 +2179,15 @@ pub fn apply_workspace_report(
             }),
             false,
             false,
+        ));
+    }
+    if let Some(retired) = tabs
+        .iter()
+        .flat_map(|tab| &tab.tile_ids)
+        .find(|tile| current_tabs.retired_tile_ids.contains(tile.as_str()))
+    {
+        return Err(format!(
+            "Workspace report attempted to reinsert retired terminal '{retired}'"
         ));
     }
 
@@ -11084,7 +11135,7 @@ fn attach_captain(
                     .rollback_provisioned_claim(&terminal_id, &captain, previous_claim);
             let placement_rollback = ctx
                 .tabs
-                .restore_tile_placement(&terminal_id, previous_workspace.as_deref());
+                .restore_tile_placement_locked(&terminal_id, previous_workspace.as_deref());
             return Err(format!(
                 "attach_captain: target bootstrap delivery failed: {error}{}{}",
                 rollback
@@ -11670,9 +11721,25 @@ fn rollback_trusted_dispatch_guarded(
             claim.card_id, claim.run_id
         ));
     }
+    commit_trusted_dispatch_cleanup(ctx, crew_session_id, release_recovery)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+/// Commit the local half of trusted dispatch teardown under the fleet identity
+/// transaction. Remote release and tmux teardown have already completed before
+/// entry, so this lock covers only durable Crew state, tab retirement, and the
+/// local session identity. Both producer rollback and restart recovery use this
+/// exact boundary, preventing either path from racing a move/restore.
+fn commit_trusted_dispatch_cleanup(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    release_recovery: Option<&PendingDispatchRelease>,
+) -> Result<(), String> {
+    let _identity_transaction = ctx.tabs.identity_transaction();
     if let Some(recovery) = release_recovery {
-        let (cleared, _) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-        if !cleared {
+        let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+        if !cleared || !crew_removed {
             return Err(format!(
                 "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned release recovery could not be cleared"
             ));
@@ -11684,9 +11751,8 @@ fn rollback_trusted_dispatch_guarded(
             )
         })?;
     }
-    ctx.tabs.remove_tile(crew_session_id);
+    ctx.tabs.retire_tile_locked(crew_session_id);
     ctx.identity.retire_tile(crew_session_id)?;
-    let _ = captains_sync_apply(ctx);
     Ok(())
 }
 
@@ -14982,12 +15048,13 @@ fn clear_confirmed_dispatch_release_and_retire(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
 ) -> Result<(), String> {
-    let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-    if !cleared || !crew_removed {
-        return Err("the exact durable release recovery could not remove its transaction-owned Crew binding".into());
-    }
-    ctx.tabs.remove_tile(&recovery.crew_session_id);
-    ctx.identity.retire_tile(&recovery.crew_session_id)?;
+    commit_trusted_dispatch_cleanup(ctx, &recovery.crew_session_id, Some(recovery)).map_err(
+        |error| {
+            format!(
+                "the exact durable release recovery could not remove its transaction-owned Crew binding: {error}"
+            )
+        },
+    )?;
     let _ = captains_sync_apply(ctx);
     Ok(())
 }
@@ -16713,7 +16780,7 @@ fn claim_captain_locked(
     if let Err(error) = projection {
         let placement_rollback = ctx
             .tabs
-            .restore_tile_placement(&captain_session_id, previous_workspace.as_deref());
+            .restore_tile_placement_locked(&captain_session_id, previous_workspace.as_deref());
         let registry_rollback = ctx.captains.rollback_provisioned_claim(
             &captain_session_id,
             &outcome.record,
@@ -17147,7 +17214,7 @@ fn spawn_terminal_with_private_pane_command(
             Ok(recorded) => recorded,
             Err(error) => {
                 let _ = tmux::kill_session_tree(&tmux_session);
-                ctx.tabs.remove_tile(&id);
+                ctx.tabs.retire_tile_locked(&id);
                 if let Some(identity) = &minted_identity {
                     if let Err(rollback) = ctx.identity.retire(&identity.id) {
                         return Err(format!(
@@ -17697,7 +17764,7 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    if ctx.tabs.remove_tile(tile_id) {
+    if ctx.tabs.retire_tile_locked(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
     // Captain-chat phase 2: a dead session leaves the captains registry too -
@@ -19719,7 +19786,7 @@ mod tests {
             .unwrap();
         });
         assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
-        tabs.restore_tile_placement("ordinary", Some("work-a"))
+        tabs.restore_tile_placement_locked("ordinary", Some("work-a"))
             .unwrap();
         drop(transaction);
         received
@@ -19742,6 +19809,165 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn trusted_dispatch_rollback_and_recovery_cleanup_cannot_reinsert_retired_tiles() {
+        for recovery_mode in [false, true] {
+            let tag = if recovery_mode {
+                "recovery"
+            } else {
+                "rollback"
+            };
+            let captains = Arc::new(CaptainsRegistry::new());
+            captains
+                .upsert_project(ProjectRecord {
+                    project_id: "project-a".into(),
+                    name: "Project A".into(),
+                    repo_root: "/tmp/project-a".into(),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+            captains
+                .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+                .unwrap();
+            captains
+                .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+                .unwrap();
+            captains.record_crew("captain-a", "crew-a").unwrap();
+            captains
+                .bind_crew_context_exact(
+                    "captain-a",
+                    "crew-a",
+                    "transaction cleanup",
+                    "codex",
+                    None,
+                    None,
+                    Some("work-a"),
+                    PowderWorkBinding {
+                        card_id: "card-a".into(),
+                        run_id: "run-a".into(),
+                        agent: Some("agent-a".into()),
+                        claim_expires_at: Some(1),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap();
+            let recovery = recovery_mode.then(|| PendingDispatchRelease {
+                crew_session_id: "crew-a".into(),
+                project_id: "project-a".into(),
+                connection_profile: "profile-a".into(),
+                connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+                repository: "repo-a".into(),
+                card_id: "card-a".into(),
+                run_id: "run-a".into(),
+                agent: "agent-a".into(),
+                operation_id: format!("cleanup:{tag}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::Prepared,
+            });
+            if let Some(recovery) = &recovery {
+                captains.prepare_dispatch_release(recovery.clone()).unwrap();
+            }
+            let tabs = Arc::new(TabRegistry::new());
+            tabs.replace(vec![
+                TabRecord {
+                    id: "work-a".into(),
+                    name: "Work A".into(),
+                    tile_ids: vec!["crew-a".into()],
+                },
+                TabRecord {
+                    id: "work-b".into(),
+                    name: "Work B".into(),
+                    tile_ids: Vec::new(),
+                },
+            ]);
+            let context = Arc::new(
+                test_ctx(&format!("trusted-cleanup-{tag}"))
+                    .with_captains_registry(Arc::clone(&captains))
+                    .with_tab_registry(Arc::clone(&tabs)),
+            );
+            let transaction = tabs.identity_transaction();
+            let (cleanup_sent, cleanup_received) = std::sync::mpsc::channel();
+            let cleanup_context = Arc::clone(&context);
+            let cleanup_recovery = recovery.clone();
+            let cleanup = std::thread::spawn(move || {
+                cleanup_sent
+                    .send(commit_trusted_dispatch_cleanup(
+                        &cleanup_context,
+                        "crew-a",
+                        cleanup_recovery.as_ref(),
+                    ))
+                    .unwrap();
+            });
+            assert!(cleanup_received
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+            assert!(captains.snapshot().captains[0]
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == "crew-a"));
+            assert!(tabs.snapshot()[0].tile_ids.contains(&"crew-a".to_string()));
+
+            let (move_sent, move_received) = std::sync::mpsc::channel();
+            let move_context = Arc::clone(&context);
+            let moving = std::thread::spawn(move || {
+                move_sent
+                    .send(dispatch(
+                        &move_context,
+                        "move_tile",
+                        &json!({"terminalId": "crew-a", "tabId": "work-b"}),
+                    ))
+                    .unwrap();
+            });
+            assert!(move_received
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+            drop(transaction);
+            cleanup_received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            let _ = move_received.recv_timeout(Duration::from_secs(2)).unwrap();
+            cleanup.join().unwrap();
+            moving.join().unwrap();
+
+            assert!(!tabs
+                .snapshot()
+                .iter()
+                .any(|tab| tab.tile_ids.contains(&"crew-a".to_string())));
+            assert!(captains.snapshot().captains[0]
+                .crew
+                .iter()
+                .all(|crew| crew.terminal_id != "crew-a"));
+            let current = tabs.snapshot_full();
+            let mut replay = current.tabs.clone();
+            replay
+                .iter_mut()
+                .find(|tab| tab.id == "work-a")
+                .unwrap()
+                .tile_ids
+                .push("crew-a".into());
+            let error = match apply_workspace_report(
+                &tabs,
+                &captains,
+                replay,
+                current.active_tab_id,
+                Some(current.seq),
+            ) {
+                Ok(_) => panic!("retired Crew report unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error.contains("retired terminal 'crew-a'"), "got: {error}");
+        }
     }
 
     #[test]
