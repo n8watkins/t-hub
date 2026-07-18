@@ -460,6 +460,10 @@ An authenticated `th send` report for the matching-endpoint transport remediatio
 The installed control plane again rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+An authenticated `th send` report for the keyed endpoint identity remediation was attempted from evidence head `4ec3d44c714f19b1cc8db801107336f6d1ea1cb3`.
+The installed control plane again rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
