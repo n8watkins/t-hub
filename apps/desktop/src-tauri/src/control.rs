@@ -1098,10 +1098,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 15;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 16;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
+const MAX_RETIRED_FLEET_TILES: usize = 4096;
 
 fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
     format!(
@@ -2247,6 +2248,15 @@ pub fn apply_workspace_report(
     }
 
     let current_captains = captains_registry.lock();
+    if let Some(retired) = tabs
+        .iter()
+        .flat_map(|tab| &tab.tile_ids)
+        .find(|tile| current_captains.retired_fleet_tile_ids.contains(tile))
+    {
+        return Err(format!(
+            "Workspace report attempted to reinsert retired terminal '{retired}'"
+        ));
+    }
     let previous_captains = current_captains.clone();
     let mut candidate_captains = current_captains.clone();
     let supervisor_reconciled =
@@ -2439,6 +2449,10 @@ pub struct CaptainsSnapshot {
     /// tmux, IdentityStore, or Powder boundaries.
     #[serde(default)]
     pub pending_fleet_operations: Vec<PendingFleetOperation>,
+    /// Bounded durable tombstones for terminal identities retired by cleanup.
+    /// These prevent a stale projection or racing move from resurrecting a tile.
+    #[serde(default)]
+    pub retired_fleet_tile_ids: Vec<String>,
     /// Initial claim attempts whose remote outcome remains unresolved.
     #[serde(default)]
     pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
@@ -2679,6 +2693,7 @@ struct CaptainsInner {
     projects: Vec<ProjectRecord>,
     workspaces: Vec<FleetWorkspaceRecord>,
     pending_fleet_operations: Vec<PendingFleetOperation>,
+    retired_fleet_tile_ids: Vec<String>,
     pending_dispatch_claims: Vec<PendingDispatchClaim>,
     pending_dispatch_releases: Vec<PendingDispatchRelease>,
     /// Monotonic revision, bumped on every accepted mutation - the same
@@ -2699,6 +2714,7 @@ impl Default for CaptainsInner {
             projects: Vec::new(),
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
             pending_dispatch_claims: Vec::new(),
             pending_dispatch_releases: Vec::new(),
             seq: 0,
@@ -2942,6 +2958,7 @@ impl CaptainsRegistry {
                 projects: Vec::new(),
                 workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
                 pending_fleet_operations: Vec::new(),
+                retired_fleet_tile_ids: Vec::new(),
                 pending_dispatch_claims: Vec::new(),
                 pending_dispatch_releases: Vec::new(),
             })
@@ -3041,6 +3058,7 @@ impl CaptainsRegistry {
                     projects: snap.projects,
                     workspaces,
                     pending_fleet_operations: snap.pending_fleet_operations,
+                    retired_fleet_tile_ids: snap.retired_fleet_tile_ids,
                     pending_dispatch_claims: snap.pending_dispatch_claims,
                     pending_dispatch_releases: snap.pending_dispatch_releases,
                     seq: snap.seq,
@@ -3477,6 +3495,28 @@ impl CaptainsRegistry {
                 return Err("captains registry must contain exactly one Captain Workspace".into());
             }
         }
+        if snapshot.schema_version >= 16 {
+            if snapshot.retired_fleet_tile_ids.len() > MAX_RETIRED_FLEET_TILES {
+                return Err("captains registry contains too many retired Fleet terminals".into());
+            }
+            let mut retired = std::collections::HashSet::new();
+            for terminal_id in &snapshot.retired_fleet_tile_ids {
+                if terminal_id.trim().is_empty() || !retired.insert(terminal_id.as_str()) {
+                    return Err(
+                        "captains registry contains an invalid retired Fleet terminal".into(),
+                    );
+                }
+                if snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.tile_ids.contains(terminal_id))
+                {
+                    return Err(format!(
+                        "retired Fleet terminal '{terminal_id}' remains placed in a Workspace"
+                    ));
+                }
+            }
+        }
         if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
             && !snapshot.pending_dispatch_releases.is_empty()
         {
@@ -3593,6 +3633,7 @@ impl CaptainsRegistry {
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
+            retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -3852,6 +3893,13 @@ impl CaptainsRegistry {
     fn move_workspace_tile(&self, tile_id: &str, workspace_id: &str) -> Result<(), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
+        if current
+            .retired_fleet_tile_ids
+            .iter()
+            .any(|retired| retired == tile_id)
+        {
+            return Err(format!("retired terminal '{tile_id}' cannot be moved"));
+        }
         if !current
             .workspaces
             .iter()
@@ -4039,6 +4087,12 @@ impl CaptainsRegistry {
         current
             .pending_fleet_operations
             .retain(|pending| pending.operation_id != operation.operation_id);
+        if !current.retired_fleet_tile_ids.contains(terminal_id) {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current.retired_fleet_tile_ids.push(terminal_id.clone());
+        }
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
         Ok(CloseTerminalCommitResult {
@@ -4313,6 +4367,7 @@ impl CaptainsRegistry {
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
+            retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -4477,7 +4532,7 @@ impl CaptainsRegistry {
     fn clear_confirmed_dispatch_release(
         &self,
         recovery: &PendingDispatchRelease,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool, bool), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let Some(position) = current
@@ -4496,7 +4551,7 @@ impl CaptainsRegistry {
                     && existing.operation_id == recovery.operation_id
             })
         else {
-            return Ok((false, false));
+            return Ok((false, false, false));
         };
         let owned_crew_count = current
             .captains
@@ -4542,9 +4597,66 @@ impl CaptainsRegistry {
             crew_removed |= captain.crew.len() != before;
         }
         debug_assert!(crew_removed, "validated transaction Crew must be removed");
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace
+                .tile_ids
+                .retain(|tile| tile != &recovery.crew_session_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        if !current
+            .retired_fleet_tile_ids
+            .contains(&recovery.crew_session_id)
+        {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current
+                .retired_fleet_tile_ids
+                .push(recovery.crew_session_id.clone());
+        }
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
-        Ok((true, crew_removed))
+        Ok((true, crew_removed, workspace_changed))
+    }
+
+    fn rollback_crew_and_workspace(&self, crew_session_id: &str) -> Result<(bool, bool), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let mut crew_removed = false;
+        for captain in &mut current.captains {
+            let before = captain.crew.len();
+            captain
+                .crew
+                .retain(|crew| crew.terminal_id != crew_session_id);
+            crew_removed |= captain.crew.len() != before;
+        }
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace.tile_ids.retain(|tile| tile != crew_session_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        if !current
+            .retired_fleet_tile_ids
+            .iter()
+            .any(|retired| retired == crew_session_id)
+        {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current
+                .retired_fleet_tile_ids
+                .push(crew_session_id.to_string());
+        }
+        if !crew_removed && !workspace_changed {
+            return Ok((false, false));
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok((crew_removed, workspace_changed))
     }
 
     /// Capture durable registry values and their internal authority versions under
@@ -4560,6 +4672,7 @@ impl CaptainsRegistry {
                 projects: g.projects.clone(),
                 workspaces: g.workspaces.clone(),
                 pending_fleet_operations: g.pending_fleet_operations.clone(),
+                retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
                 pending_dispatch_claims: g.pending_dispatch_claims.clone(),
                 pending_dispatch_releases: g.pending_dispatch_releases.clone(),
             },
@@ -12585,22 +12698,35 @@ fn commit_trusted_dispatch_cleanup(
     crew_session_id: &str,
     release_recovery: Option<&PendingDispatchRelease>,
 ) -> Result<(), String> {
-    let _identity_transaction = ctx.tabs.identity_transaction();
-    if let Some(recovery) = release_recovery {
-        let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+    let workspace_changed = if let Some(recovery) = release_recovery {
+        let (cleared, crew_removed, workspace_changed) =
+            ctx.captains.clear_confirmed_dispatch_release(recovery)?;
         if !cleared || !crew_removed {
             return Err(format!(
                 "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned release recovery could not be cleared"
             ));
         }
+        workspace_changed
     } else {
-        ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
+        let (crew_removed, workspace_changed) = ctx
+            .captains
+            .rollback_crew_and_workspace(crew_session_id)
+            .map_err(|error| {
             format!(
                 "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record could not be removed: {error}"
             )
         })?;
+        if !crew_removed {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record was absent"
+            ));
+        }
+        workspace_changed
+    };
+    ctx.tabs.replace(ctx.captains.workspace_projection());
+    if workspace_changed || ctx.tabs.retire_tile_locked(crew_session_id) {
+        let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
-    ctx.tabs.retire_tile_locked(crew_session_id);
     ctx.identity.retire_tile(crew_session_id)?;
     Ok(())
 }
@@ -20874,7 +21000,11 @@ mod tests {
                 })
                 .unwrap();
             captains
-                .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+                .claim_test(
+                    "captain-a",
+                    Some("alpha"),
+                    vec!["work-a".into(), "work-b".into()],
+                )
                 .unwrap();
             captains
                 .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
@@ -20949,14 +21079,18 @@ mod tests {
                     ))
                     .unwrap();
             });
-            assert!(cleanup_received
-                .recv_timeout(Duration::from_millis(100))
-                .is_err());
+            cleanup_received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
             assert!(captains.snapshot().captains[0]
                 .crew
                 .iter()
-                .any(|crew| crew.terminal_id == "crew-a"));
-            assert!(tabs.snapshot()[0].tile_ids.contains(&"crew-a".to_string()));
+                .all(|crew| crew.terminal_id != "crew-a"));
+            assert!(!tabs
+                .snapshot()
+                .iter()
+                .any(|tab| tab.tile_ids.contains(&"crew-a".to_string())));
 
             let (move_sent, move_received) = std::sync::mpsc::channel();
             let move_context = Arc::clone(&context);
@@ -20969,15 +21103,12 @@ mod tests {
                     ))
                     .unwrap();
             });
-            assert!(move_received
-                .recv_timeout(Duration::from_millis(100))
-                .is_err());
-            drop(transaction);
-            cleanup_received
+            let move_error = move_received
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap()
-                .unwrap();
-            let _ = move_received.recv_timeout(Duration::from_secs(2)).unwrap();
+                .unwrap_err();
+            assert!(move_error.contains("retired terminal"), "got: {move_error}");
+            drop(transaction);
             cleanup.join().unwrap();
             moving.join().unwrap();
 
@@ -24929,6 +25060,7 @@ mod tests {
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -25324,6 +25456,7 @@ mod tests {
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -25420,6 +25553,7 @@ mod tests {
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -29890,6 +30024,7 @@ mod tests {
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         })
