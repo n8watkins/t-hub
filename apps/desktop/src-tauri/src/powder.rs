@@ -3708,7 +3708,7 @@ mod tests {
                             "criterion_text": "tests pass",
                             "decision": "approved",
                             "reviewer": "captain-powder",
-                            "reviewer_identity": "actor-captain-powder",
+                            "reviewer_identity": "actor-t-hub",
                             "proof": "[scrubbed review proof]",
                             "created_at": 19
                             })),
@@ -3918,13 +3918,13 @@ mod tests {
                     criterion_text: "tests pass".into(),
                     decision: CriterionReviewDecision::Approved,
                     proof: Some("raw secret-shaped review proof".into()),
-                    expected_reviewer_identity: "actor-captain-powder".into(),
+                    expected_reviewer_identity: "t-hub".into(),
                 },
             )
             .unwrap();
         let review = reviewed.result.unwrap();
         assert_eq!(review.operation_id, "criterion:one");
-        assert_eq!(review.reviewer_identity, "actor-captain-powder");
+        assert_eq!(review.reviewer_identity, "actor-t-hub");
         assert_eq!(review.proof.as_deref(), Some("[scrubbed review proof]"));
 
         let completed = client

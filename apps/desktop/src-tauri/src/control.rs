@@ -27725,7 +27725,7 @@ mod tests {
                 "criterion_text": criterion_text,
                 "decision": "approved",
                 "reviewer": "captain-powder",
-                "reviewer_identity": "actor-captain-powder",
+                "reviewer_identity": "actor-t-hub",
                 "proof": "review proof",
                 "supersedes_review_id": null,
                 "created_at": 123
@@ -28072,7 +28072,7 @@ mod tests {
                 "criterion_text": "Criterion 0",
                 "decision": body["decision"],
                 "reviewer": "captain-powder",
-                "reviewer_identity": "actor-captain-powder",
+                "reviewer_identity": "actor-t-hub",
                 "proof": body["proof"].as_str().map(|_| "[scrubbed review proof]"),
                 "supersedes_review_id": "review-0",
                 "created_at": 126,
@@ -31859,14 +31859,14 @@ mod tests {
                     "criterionId": criterion_id,
                     "decision": "approved",
                     "proof": "raw secret-shaped review proof",
-                    "expectedReviewerIdentity": "actor-captain-powder",
+                    "expectedReviewerIdentity": "t-hub",
                 }),
             ),
         );
         assert!(response.ok, "{:?}", response.error);
         let result = response.result.unwrap();
         assert_eq!(result["operationId"], "criterion:authoritative");
-        assert_eq!(result["review"]["reviewerIdentity"], "actor-captain-powder");
+        assert_eq!(result["review"]["reviewerIdentity"], "actor-t-hub");
         assert_eq!(result["review"]["proof"], "[scrubbed review proof]");
         assert!(registry.snapshot().captains[0].crew[0]
             .powder_work
