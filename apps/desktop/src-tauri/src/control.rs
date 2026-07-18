@@ -3738,6 +3738,123 @@ impl CaptainsRegistry {
             .collect()
     }
 
+    fn create_workspace(
+        &self,
+        id: &str,
+        name: &str,
+        owner: Option<&FleetWorkspaceOwner>,
+    ) -> Result<FleetWorkspaceRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == id)
+        {
+            return Err(format!("Workspace '{id}' already exists"));
+        }
+        let previous = current.clone();
+        if let Some(owner) = owner {
+            let captain = current
+                .captains
+                .iter_mut()
+                .find(|captain| {
+                    captain.ship_slug == owner.ship_slug
+                        && captain.assignment_id == owner.assignment_id
+                        && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                })
+                .ok_or("Workspace owner no longer resolves to one Captain Assignment")?;
+            captain.workspace_tab_ids.push(id.to_string());
+        }
+        let workspace = FleetWorkspaceRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: WorkspaceKind::Work,
+            owner: owner.cloned(),
+            tile_ids: Vec::new(),
+        };
+        current.workspaces.push(workspace.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(workspace)
+    }
+
+    fn rename_workspace(&self, id: &str, name: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let workspace = current
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+            .ok_or_else(|| format!("rename_tab: unknown durable Workspace '{id}'"))?;
+        if workspace.kind == WorkspaceKind::Captain {
+            return Err("rename_tab: Captain Workspace cannot be renamed".into());
+        }
+        if workspace.name == name {
+            return Ok(());
+        }
+        workspace.name = name.to_string();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn move_workspace_tile(&self, tile_id: &str, workspace_id: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if !current
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return Err(format!(
+                "move_tile: unknown durable Workspace '{workspace_id}'"
+            ));
+        }
+        if current.captains.iter().any(|captain| {
+            captain.terminal_id.as_deref() == Some(tile_id) && workspace_id != CAPTAIN_WORKSPACE_ID
+        }) {
+            return Err(format!(
+                "Captain terminal '{tile_id}' belongs to Captain Workspace"
+            ));
+        }
+        if current.captains.iter().any(|captain| {
+            captain.crew.iter().any(|crew| {
+                crew.terminal_id == tile_id && matches!(crew.state, CrewState::Removed { .. })
+            })
+        }) {
+            return Err(format!("removed Crew terminal '{tile_id}' cannot be moved"));
+        }
+        let previous = current.clone();
+        for workspace in &mut current.workspaces {
+            workspace.tile_ids.retain(|tile| tile != tile_id);
+        }
+        current
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("target checked under the same lock")
+            .tile_ids
+            .push(tile_id.to_string());
+        for captain in &mut current.captains {
+            if let Some(crew) = captain
+                .crew
+                .iter_mut()
+                .find(|crew| crew.terminal_id == tile_id)
+            {
+                crew.workspace_tab_id =
+                    (workspace_id != CAPTAIN_WORKSPACE_ID).then(|| workspace_id.to_string());
+                if crew.workspace_tab_id.is_some()
+                    && matches!(crew.state, CrewState::NeedsAssignment { .. })
+                {
+                    crew.state = CrewState::Active;
+                }
+            }
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
     /// Fallible write-through of a snapshot to disk, WITHOUT the `inner` lock
     /// held (Incident D). Serialized by the dedicated `persist` mutex - never
     /// taken together with `inner` - so a stalled state write can't wedge a
@@ -8633,6 +8750,101 @@ fn enforce_project_authority(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceMutationAuthority {
+    Apex,
+    Assignment(FleetWorkspaceOwner),
+}
+
+fn workspace_mutation_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<WorkspaceMutationAuthority, String> {
+    if trusted_internal {
+        return Ok(WorkspaceMutationAuthority::Apex);
+    }
+    let caller = caller
+        .ok_or_else(|| format!("acl: '{command}' requires a terminal-bound Fleet identity"))?;
+    if matches!(caller.fleet_role, Some(FleetRole::Cortana))
+        || matches!(
+            caller.mint_role,
+            crate::identity::Role::General | crate::identity::Role::Cortana
+        )
+    {
+        return Ok(WorkspaceMutationAuthority::Apex);
+    }
+    if caller.fleet_role != Some(FleetRole::Captain) {
+        return Err(format!(
+            "acl: '{command}' requires General/Cortana or a durable Captain Assignment"
+        ));
+    }
+    let terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or_else(|| format!("acl: '{command}' Captain caller has no terminal binding"))?;
+    let snapshot = ctx.captains.snapshot();
+    let matches = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain.state == ClaimState::Active
+                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "acl: '{command}' caller does not resolve to exactly one active Captain"
+        ));
+    }
+    let captain = matches[0];
+    let project_id = captain
+        .project_id
+        .clone()
+        .ok_or_else(|| format!("acl: '{command}' Captain has no durable Project binding"))?;
+    Ok(WorkspaceMutationAuthority::Assignment(
+        FleetWorkspaceOwner {
+            project_id,
+            assignment_id: captain.assignment_id.clone(),
+            ship_slug: captain.ship_slug.clone(),
+        },
+    ))
+}
+
+fn enforce_workspace_owner(
+    ctx: &ControlContext,
+    authority: &WorkspaceMutationAuthority,
+    workspace_id: &str,
+    command: &str,
+) -> Result<(), String> {
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        return Ok(());
+    }
+    let WorkspaceMutationAuthority::Assignment(caller_owner) = authority else {
+        unreachable!();
+    };
+    let snapshot = ctx.captains.snapshot();
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("{command}: unknown durable Workspace '{workspace_id}'"))?;
+    if workspace.kind == WorkspaceKind::Captain {
+        return Err(format!(
+            "acl: '{command}' Captain Workspace mutation requires General/Cortana"
+        ));
+    }
+    if workspace.owner.as_ref() == Some(caller_owner) {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' cannot mutate Workspace '{workspace_id}' outside caller Project/Assignment"
+        ))
+    }
+}
+
 /// Whether the pre-item-3 fail-OPEN spawn default is restored (instant rollback,
 /// §3.3). With `T_HUB_SPAWN_LEGACY_FULL=1`/`true` a spawn defaults to the FULL
 /// control token unless it explicitly asks for `capability:"read"` - the behavior
@@ -9475,12 +9687,12 @@ fn dispatch_with_caller(
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
         // forward the registry snapshot for the UI to render from.
-        "move_tile" => move_tile(ctx, args),
-        "rename_tab" => rename_tab(ctx, args),
+        "move_tile" => move_tile(ctx, args, caller, trusted_internal),
+        "rename_tab" => rename_tab(ctx, args, caller, trusted_internal),
         // new_tab mints the tab id CORE-side so it can return it (TASK C:
         // addressable tabs) and forwards that id for the frontend to adopt.
-        "new_tab" => new_tab(ctx, args),
-        "close_tab" | "remove_tab" => close_tab(ctx, args),
+        "new_tab" => new_tab(ctx, args, caller, trusted_internal),
+        "close_tab" | "remove_tab" => close_tab(ctx, args, caller, trusted_internal),
         "focus_tab" => focus_tab(ctx, args),
         "open_file" => open_file(ctx, args),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
@@ -9501,7 +9713,7 @@ fn dispatch_with_caller(
         // UI's pin action and an MCP captain's self-registration both land here,
         // and every mutation forwards the authoritative captains snapshot.
         "claim_captain" => claim_captain(ctx, args, caller, trusted_internal),
-        "report_workspace_tabs" => report_workspace_tabs(ctx, args),
+        "report_workspace_tabs" => report_workspace_tabs(ctx, args, caller, trusted_internal),
         "release_captain" => release_captain(ctx, args, caller, trusted_internal),
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
@@ -15749,7 +15961,21 @@ fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, e
 /// applied yet. A report WITHOUT `baseSeq` (legacy reporter) is accepted
 /// unconditionally. Args: `tabs`: `[{id, name, tileIds}]`; `activeTabId`
 /// (optional); `baseSeq` (optional).
-fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn report_workspace_tabs(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    if !matches!(
+        workspace_mutation_authority(ctx, caller, trusted_internal, "report_workspace_tabs")?,
+        WorkspaceMutationAuthority::Apex
+    ) {
+        return Err(
+            "acl: report_workspace_tabs is a full-layout mutation restricted to General/Cortana or the trusted host"
+                .into(),
+        );
+    }
     let tabs: Vec<TabRecord> = serde_json::from_value(
         args.get("tabs")
             .cloned()
@@ -16698,7 +16924,13 @@ fn organization_sync_apply(
 /// caller never learns). The id is recorded in the registry optimistically so
 /// `list_tabs` sees it before the frontend reports back. Args: `name` (optional;
 /// auto-named "Workspace N" when omitted).
-fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn new_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "new_tab")?;
     let name = arg_str(args, "name")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -16707,6 +16939,22 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         return Err("new_tab: Captain Workspace is reserved and already exists".into());
     }
     let id = uuid::Uuid::new_v4().to_string();
+    let owner = match &authority {
+        WorkspaceMutationAuthority::Apex => None,
+        WorkspaceMutationAuthority::Assignment(owner) => {
+            if arg_str(args, "projectId")
+                .or_else(|| arg_str(args, "project_id"))
+                .is_some_and(|project_id| project_id != owner.project_id)
+                || arg_str(args, "shipSlug")
+                    .or_else(|| arg_str(args, "ship_slug"))
+                    .is_some_and(|ship_slug| ship_slug != owner.ship_slug)
+            {
+                return Err("acl: new_tab requested a foreign Project or Captain ship".into());
+            }
+            Some(owner)
+        }
+    };
+    ctx.captains.create_workspace(&id, &name, owner)?;
     ctx.tabs.insert_tab(&id, &name);
     let mut res = organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
     res["tabId"] = json!(id);
@@ -16723,7 +16971,12 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// Auto-created empty tabs are NOT reaped implicitly - an agent staging a
 /// workspace may empty and refill a tab, so closing is always an explicit call.
 /// Args: `tabId` (or `tabName` to resolve by exact name); `force` (optional).
-fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn close_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .or_else(|| {
@@ -16733,6 +16986,8 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         })
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "close_tab")?;
+    enforce_workspace_owner(ctx, &authority, &tab_id, "close_tab")?;
     let _identity_transaction = ctx.tabs.identity_transaction();
     let planned_orphans = ctx.tabs.validate_remove_tab(&tab_id, force)?;
     // Captains must never advertise ownership of a tab that no longer exists
@@ -16754,7 +17009,12 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// first + strict (unknown tab is an error), then forwards the snapshot so the
 /// rename applies even when the tab is hidden or the window is unfocused.
 /// Args: `tabId` (or `id`), `name`.
-fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn rename_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .ok_or("rename_tab requires a 'tabId' argument")?;
@@ -16762,6 +17022,9 @@ fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or("rename_tab requires a non-empty 'name' argument")?;
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "rename_tab")?;
+    enforce_workspace_owner(ctx, &authority, &tab_id, "rename_tab")?;
+    ctx.captains.rename_workspace(&tab_id, &name)?;
     ctx.tabs.rename_tab(&tab_id, &name)?;
     organization_sync_apply(ctx, "rename_tab", json!({ "tabId": tab_id, "name": name }))
 }
@@ -17336,18 +17599,36 @@ fn focus_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// UI applies it even when the target tab is hidden. A `targetId`-only call is
 /// the legacy within-tab reorder: forwarded for the UI to apply and report back
 /// (visual order is a UI concern).
-fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn move_tile(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tile = arg_str(args, "terminalId").or_else(|| arg_str(args, "id"));
     let tab = arg_str(args, "tabId");
     match (tile, tab) {
         (Some(tile), Some(tab)) => {
-            let _identity_transaction = ctx.tabs.identity_transaction();
+            let authority =
+                workspace_mutation_authority(ctx, caller, trusted_internal, "move_tile")?;
+            enforce_workspace_owner(ctx, &authority, &tab, "move_tile")?;
+            if let Some(source) = ctx
+                .captains
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.tile_ids.contains(&tile))
+                .map(|workspace| workspace.id.clone())
+            {
+                enforce_workspace_owner(ctx, &authority, &source, "move_tile")?;
+            }
             let kind = ctx
                 .tabs
                 .kind_for_id(&tab)
                 .ok_or_else(|| format!("move_tile: unknown tabId '{tab}'"))?;
             validate_workspace_occupant(&ctx.captains, &tile, &tab, kind)?;
-            ctx.tabs.move_tile(&tile, &tab)?;
+            ctx.captains.move_workspace_tile(&tile, &tab)?;
+            ctx.tabs.replace(ctx.captains.workspace_projection());
             organization_sync_apply(
                 ctx,
                 "move_tile",
@@ -20051,8 +20332,16 @@ mod tests {
     }
 
     #[test]
-    fn move_tile_waits_for_the_shared_identity_transaction() {
+    fn move_tile_uses_durable_fleet_authority_without_waiting_for_projection_lock() {
         let context = Arc::new(test_ctx("move-identity-transaction"));
+        context
+            .captains
+            .create_workspace("work-a", "Work A", None)
+            .unwrap();
+        context
+            .captains
+            .create_workspace("work-b", "Work B", None)
+            .unwrap();
         context.tab_registry().replace(vec![
             TabRecord {
                 id: "work-a".into(),
@@ -20077,15 +20366,20 @@ mod tests {
             );
             sent.send(result).unwrap();
         });
-        assert!(
-            received.recv_timeout(Duration::from_millis(100)).is_err(),
-            "move_tile escaped the shared identity transaction"
-        );
-        drop(transaction);
         received
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
+        assert!(context
+            .captains
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+        drop(transaction);
         moving.join().unwrap();
         assert!(tabs
             .snapshot()
@@ -23220,6 +23514,128 @@ mod tests {
             serde_json::to_value(&before_tabs.tabs).unwrap()
         );
         assert_eq!(registry.snapshot().seq, before_captains.seq);
+    }
+
+    #[test]
+    fn authenticated_workspace_mutations_are_scoped_to_exact_caller_assignment() {
+        let captains = Arc::new(CaptainsRegistry::new());
+        for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
+            captains
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.into(),
+                    name: name.into(),
+                    repo_root: format!("/tmp/{project_id}"),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        for (terminal, ship, project, workspace) in [
+            ("captain-a", "alpha", "project-a", "work-a"),
+            ("captain-b", "beta", "project-b", "work-b"),
+        ] {
+            captains
+                .claim_test(terminal, Some(ship), vec![workspace.into()])
+                .unwrap();
+            captains
+                .bind_ship_context(ship, project, &format!("Assignment {ship}"), "codex")
+                .unwrap();
+        }
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain_a = mint_session(
+            &identities,
+            crate::identity::Role::Captain,
+            "alpha",
+            "captain-a",
+        );
+        let context = test_ctx("workspace-project-auth")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_identity_store(identities);
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+
+        for (command, args) in [
+            (
+                "move_tile",
+                json!({"terminalId": "ordinary-b", "tabId": "work-b"}),
+            ),
+            ("rename_tab", json!({"tabId": "work-b", "name": "Stolen"})),
+            ("close_tab", json!({"tabId": "work-b"})),
+            (
+                "new_tab",
+                json!({"name": "Foreign", "projectId": "project-b", "shipSlug": "beta"}),
+            ),
+            (
+                "report_workspace_tabs",
+                json!({"baseSeq": before_tabs.seq, "tabs": before_tabs.tabs}),
+            ),
+        ] {
+            let response = dispatch_authenticated(
+                &context,
+                req_session("workspace-project-auth", &captain_a, command, args),
+            );
+            assert!(!response.ok, "{command} unexpectedly crossed Project scope");
+            assert!(response.error.unwrap_or_default().contains("acl:"));
+        }
+        for (command, args) in [
+            (
+                "rename_tab",
+                json!({"tabId": "work-b", "name": "No Session"}),
+            ),
+            ("close_tab", json!({"tabId": "work-b"})),
+        ] {
+            let response = dispatch_authenticated(
+                &context,
+                req_untrusted("workspace-project-auth", "", command, args),
+            );
+            assert!(
+                !response.ok,
+                "unattributed {command} unexpectedly succeeded"
+            );
+            assert!(response
+                .error
+                .unwrap_or_default()
+                .contains("terminal-bound"));
+        }
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().workspaces, before_captains.workspaces);
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+
+        let created = dispatch_authenticated(
+            &context,
+            req_session(
+                "workspace-project-auth",
+                &captain_a,
+                "new_tab",
+                json!({"name": "Owned A"}),
+            ),
+        );
+        assert!(created.ok, "{:?}", created.error);
+        let tab_id = created.result.unwrap()["tabId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let durable = captains.snapshot();
+        let workspace = durable
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == tab_id)
+            .unwrap();
+        assert_eq!(
+            workspace.owner.as_ref().unwrap(),
+            &FleetWorkspaceOwner {
+                project_id: "project-a".into(),
+                assignment_id: "assignment:project-a:alpha".into(),
+                ship_slug: "alpha".into(),
+            }
+        );
     }
 
     fn report_reconciliation_fixture(
