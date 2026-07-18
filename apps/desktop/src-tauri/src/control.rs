@@ -16911,6 +16911,7 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tab = arg_str(args, "tabId");
     match (tile, tab) {
         (Some(tile), Some(tab)) => {
+            let _identity_transaction = ctx.tabs.identity_transaction();
             let kind = ctx
                 .tabs
                 .kind_for_id(&tab)
@@ -17605,6 +17606,7 @@ fn close_terminal_with_policy(
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
+    let _identity_transaction = ctx.tabs.identity_transaction();
     // Serialize the entire terminal-close transaction with completion,
     // renewal, and cleanup for this Crew. The guard must precede liveness and
     // tmux teardown so a close queued behind completion cannot kill the worker
@@ -19615,6 +19617,252 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(tiles, vec!["term-xyz"]);
+    }
+
+    #[test]
+    fn move_tile_waits_for_the_shared_identity_transaction() {
+        let context = Arc::new(test_ctx("move-identity-transaction"));
+        context.tab_registry().replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["ordinary".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let tabs = context.tab_registry();
+        let transaction = tabs.identity_transaction();
+        let (sent, received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving = std::thread::spawn(move || {
+            let result = dispatch(
+                &moving_context,
+                "move_tile",
+                &json!({"terminalId": "ordinary", "tabId": "work-b"}),
+            );
+            sent.send(result).unwrap();
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "move_tile escaped the shared identity transaction"
+        );
+        drop(transaction);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        moving.join().unwrap();
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+    }
+
+    #[test]
+    fn rollback_restore_cannot_clobber_a_concurrent_valid_move() {
+        let context = Arc::new(test_ctx("rollback-move-transaction"));
+        context.tab_registry().replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["ordinary".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let tabs = context.tab_registry();
+        let transaction = tabs.identity_transaction();
+        tabs.move_tile("ordinary", CAPTAIN_WORKSPACE_ID).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving = std::thread::spawn(move || {
+            sent.send(dispatch(
+                &moving_context,
+                "move_tile",
+                &json!({"terminalId": "ordinary", "tabId": "work-b"}),
+            ))
+            .unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        tabs.restore_tile_placement("ordinary", Some("work-a"))
+            .unwrap();
+        drop(transaction);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        moving.join().unwrap();
+        let snapshot = tabs.snapshot();
+        assert!(snapshot
+            .iter()
+            .find(|tab| tab.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+        assert_eq!(
+            snapshot
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| tile.as_str() == "ordinary")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn close_terminal_waits_for_claim_or_attach_identity_transaction() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let terminal_id = format!(
+            "close-race-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        create_test_tmux_session(&tmux_target(&terminal_id)).unwrap();
+        let context = Arc::new(test_ctx("close-identity-transaction"));
+        context.tab_registry().replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: vec![terminal_id.clone()],
+        }]);
+        let tabs = context.tab_registry();
+        let transaction = tabs.identity_transaction();
+        let (sent, received) = std::sync::mpsc::channel();
+        let closing_context = Arc::clone(&context);
+        let closing_id = terminal_id.clone();
+        let closing = std::thread::spawn(move || {
+            sent.send(close_terminal(
+                &closing_context,
+                &json!({"sessionId": closing_id}),
+            ))
+            .unwrap();
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "close_terminal escaped a concurrent claim or attach transaction"
+        );
+        drop(transaction);
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        closing.join().unwrap();
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert!(!tabs
+            .snapshot()
+            .iter()
+            .any(|tab| tab.tile_ids.contains(&terminal_id)));
+    }
+
+    #[test]
+    fn move_racing_claim_cannot_leave_an_active_captain_in_work() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("move-vs-claim-transaction");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = format!(
+            "claim-race-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        tmux::new_session_with_env(
+            &tmux_target(&captain_id),
+            "/tmp",
+            Some(&harness_command),
+            &[],
+        )
+        .unwrap();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec![captain_id.clone()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let context = Arc::new(
+            test_ctx("move-vs-claim-transaction")
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs))
+                .with_apply_sink(Arc::new(RecordingSink {
+                    calls: StdMutex::new(Vec::new()),
+                })),
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        captains.set_persist_hook(Box::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+        let claiming_context = Arc::clone(&context);
+        let claiming_id = captain_id.clone();
+        let claiming = std::thread::spawn(move || {
+            dispatch(
+                &claiming_context,
+                "claim_captain",
+                &json!({
+                    "captainSessionId": claiming_id,
+                    "shipSlug": "claim-race",
+                    "provider": "codex"
+                }),
+            )
+        });
+        entered.wait();
+        let (move_sent, move_received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving_id = captain_id.clone();
+        let moving = std::thread::spawn(move || {
+            move_sent
+                .send(dispatch(
+                    &moving_context,
+                    "move_tile",
+                    &json!({"terminalId": moving_id, "tabId": "work-b"}),
+                ))
+                .unwrap();
+        });
+        assert!(move_received
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release.wait();
+        claiming.join().unwrap().unwrap();
+        let move_error = move_received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(move_error.contains("belongs to Captain Workspace"));
+        moving.join().unwrap();
+        let snapshot = tabs.snapshot();
+        assert!(snapshot
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(!snapshot
+            .iter()
+            .filter(|tab| tab.kind() == WorkspaceKind::Work)
+            .any(|tab| tab.tile_ids.contains(&captain_id)));
+
+        captains.set_persist_hook(Box::new(|| {}));
+        close_terminal(&context, &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
