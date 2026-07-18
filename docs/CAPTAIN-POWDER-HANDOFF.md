@@ -21,6 +21,50 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-17 Wave 0 Installed Activation Boundary
+
+The General authorized the protected Wave 0 integration, local installation, application restart, and installed-runtime verification needed to unblock the active T-Hub chain.
+The canonical branch `fix/captain-control-runtime` now contains merge commit `e2ab7e3781a95db37269c4f61916f2ba8c0a498e` with coordinator parent `1956424801c8cc1bd065bef9cf27bbd7d2adbe11` and exact reviewed Wave 0 parent `d10de00ca6a4c02e0ec5a2d4b721f58cfc090842`.
+An independent read-only landing audit approved that merge after verifying a common base at `a3b136a4005afea05b2d72f21f5742d4ad0f08fe`, no changed-path overlap, exact parent order, exact tree overlay, no conflict resolution, clean diff checks, and untouched protected artifacts.
+
+The source and frontend gates passed formatting, strict workspace Clippy, 480 frontend tests, TypeScript checking, and the production frontend build.
+The required real-agent integration gate passed its exact ignored workspace case separately.
+The one permitted fresh serial Rust workspace probe reported 887 passed, 2 intentional ignores, and 1 known last-session tmux teardown residual in `get_request_status_command_resolves_a_completed_spawn` with `server exited unexpectedly`.
+That fixture residual was not retried, and production `tmux.rs` was not changed.
+The exact reviewed Wave 0 source at `d10de00` retains its separately recorded green aggregate evidence.
+
+The Windows production artifacts were built from a clean detached worktree at exact commit `e2ab7e3`.
+The local build produced NSIS installer SHA-256 `E32281BA16BE817914EE2517436629EB90B3F7BA425602E59AE863F93873CEFF` and MSI SHA-256 `396D71CA0D135EE6DF6B0B55C8AEC8E7C251A261112261371E60A5C87C11BCAF`.
+The build command returned nonzero only after producing both bundles because the repository contains a public updater key but the local environment has no private signing key.
+No signing credential was accessed or bypassed.
+The exact NSIS installer completed silently with exit code zero, and the application restarted once from PID `3872` to PID `24052`.
+The installed executable is version `0.3.104` at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` with SHA-256 `4E90AC9B36ABD9AC0DD57F744E16D634B371137C70AD64B807E74FE608B246C9`.
+The prior installed executable remains available for rollback with SHA-256 `1ADBC5D0F9D9A4F386FC36173ABADC4772EDC87A9521CCC4506F4B3B9132F814`.
+
+The WSL runtime was updated from the same source boundary.
+Installed `t-hub-agent` SHA-256 is `F188BEC319E899F90E2C6255E7341A8E8235D947D2EDEE99275A086EAF23AA11`.
+Installed `t-hub-mcp` SHA-256 is `F13F0765223BC63AAD8F45AE1F0B54FEB9260EAFC0D19F4E06F2DE264B753555`.
+Installed `th` SHA-256 is `DAE508A985F5FF8333BBF07D659B10559B3254B5BF2FFD322DAA78F2A35F6F58`.
+Rollback copies of the previous WSL agent and CLI were retained.
+
+All nine pre-install tmux terminal identities and pane PIDs survived the restart.
+All four Captain ships, the active Wave 0 and T2 Crew bindings, their exact Powder cards and runs, the control capability, the fleet roster, and the registered Project survived the restart.
+The authoritative Project remains bound to Powder profile `n8desktop-wsl` and repository `t-hub`.
+Protected Powder health and repository authorization pass, and the board remains readable and ready.
+
+The installed Wave 0 runtime now reaches the exact fail-closed Powder capability boundary, but the authoritative Powder deployment does not advertise the complete schema-18 run-bound mutation contract.
+The first exact Wave 0 criterion review therefore returned `Powder mutation state 'unsupported': deployed run-bound capability verification failed` without recording a mutation.
+The first post-install dispatch of ready card `thub-codex-permission-observability` failed before claim or terminal creation because the protected profile has no stable `operationIdentity` for replay-safe initial claims.
+The card remains ready and unclaimed, and no duplicate Crew, run, terminal, or binding was created.
+
+Cross-Project isolation correctly prevents the T-Hub Captain from operating or reading the Powder Captain session directly.
+The T-Hub Captain sent a durable standard-priority status request through Cortana for the authoritative Powder Captain to verify the live schema and route catalog against Powder main `8217c29c47b6d55a7ce9e788be2ba69a0b252fe8`, reconcile any stale Powder deployment, and restore a stable protected profile operation identity without exposing credentials.
+Wave 0 Crew `f1717de9` and T2 Crew `84ec361c` remain preserved with their exact active claims until that Powder-owned gate is resolved.
+The previously completed T1 Crew `1e7eef7d` and launch-attestation Crew `e0b697e9` were safely closed only after their authoritative cards and runs were confirmed complete, their reviewed heads were confirmed landed in `e2ab7e3`, and their worktrees were confirmed clean except protected `CLAUDE.md`.
+
+The next ordered action is to receive the Powder-owned deployment and profile reconciliation evidence through Cortana, repeat the exact Wave 0 criterion review, complete Wave 0 and T2 with run-bound proof, and dispatch `thub-codex-permission-observability` from its clean `e2ab7e3` worktree.
+No push, protected-branch merge, public deployment, publication, or product release occurred.
+
 ### Verified 2026-07-16 Combined Codex Permission Integration Boundary
 
 The General authorized an isolated combined-tree integration and real-agent verification, with an explicit stop before merge or installation.
