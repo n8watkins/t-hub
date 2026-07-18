@@ -729,10 +729,11 @@ pub(crate) fn attest_runtime_policy(
     let reasoning = match expected {
         Harness::Codex => unique_config_value(args, "model_reasoning_effort")?,
         Harness::Claude => unique_option_value(args, &["--effort"])
-            .map_err(|_| LaunchAttestationError::WrongReasoningEffort)?,
+            .map_err(|_| LaunchAttestationError::WrongReasoningEffort)?
+            .map(str::to_string),
     }
     .ok_or(LaunchAttestationError::WrongReasoningEffort)?;
-    if reasoning.trim_matches('"') != expected_reasoning_effort {
+    if reasoning != expected_reasoning_effort {
         return Err(LaunchAttestationError::WrongReasoningEffort);
     }
     Ok(())
@@ -783,10 +784,10 @@ fn unique_option_value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<
     Ok(found)
 }
 
-fn unique_config_value<'a>(
-    args: &'a [String],
+fn unique_config_value(
+    args: &[String],
     key: &str,
-) -> Result<Option<&'a str>, LaunchAttestationError> {
+) -> Result<Option<String>, LaunchAttestationError> {
     let mut found = None;
     let mut index = 0;
     while let Some(argument) = args.get(index) {
@@ -806,8 +807,8 @@ fn unique_config_value<'a>(
                 .or_else(|| argument.strip_prefix("-c="))
         };
         if let Some(config) = config {
-            if let Some(value) = config.strip_prefix(&format!("{key}=")) {
-                if value.is_empty() || found.replace(value).is_some() {
+            if let Some(value) = protected_toml_override(config, key)? {
+                if found.replace(value).is_some() {
                     return Err(LaunchAttestationError::WrongReasoningEffort);
                 }
             }
@@ -823,6 +824,63 @@ fn unique_config_value<'a>(
         index += 1;
     }
     Ok(found)
+}
+
+/// Parse the provider-equivalent TOML assignment accepted by Codex `-c`.
+/// The protected key may be bare or simply quoted and whitespace around `=` is
+/// insignificant. Escapes, dotted/compound keys, malformed quoting, and any
+/// other mention of the protected key fail closed rather than being ignored.
+fn protected_toml_override(
+    config: &str,
+    protected_key: &str,
+) -> Result<Option<String>, LaunchAttestationError> {
+    let config = config.trim();
+    let Some((raw_key, raw_value)) = config.split_once('=') else {
+        return if config.contains(protected_key) {
+            Err(LaunchAttestationError::WrongReasoningEffort)
+        } else {
+            Ok(None)
+        };
+    };
+    let raw_key = raw_key.trim();
+    let parsed_key = parse_simple_toml_token(raw_key)?;
+    if parsed_key != protected_key {
+        return if raw_key.contains(protected_key) {
+            Err(LaunchAttestationError::WrongReasoningEffort)
+        } else {
+            Ok(None)
+        };
+    }
+    let value = parse_simple_toml_token(raw_value.trim())?;
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(LaunchAttestationError::WrongReasoningEffort);
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_simple_toml_token(value: &str) -> Result<&str, LaunchAttestationError> {
+    if value.is_empty() {
+        return Err(LaunchAttestationError::WrongReasoningEffort);
+    }
+    let first = value.as_bytes()[0];
+    if matches!(first, b'\'' | b'"') {
+        if value.len() < 2
+            || value.as_bytes()[value.len() - 1] != first
+            || value[1..value.len() - 1].contains(['\\', '\'', '"'])
+        {
+            return Err(LaunchAttestationError::WrongReasoningEffort);
+        }
+        return Ok(&value[1..value.len() - 1]);
+    }
+    if value.contains(['\'', '"']) {
+        return Err(LaunchAttestationError::WrongReasoningEffort);
+    }
+    Ok(value)
 }
 
 fn process_provider(argv: &[String]) -> Option<(Harness, usize)> {
@@ -1540,6 +1598,89 @@ mod tests {
             assert_eq!(
                 attest_runtime_policy(&evidence, Harness::Codex, "gpt-5.6-terra", "medium"),
                 Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_reasoning_attestation_matches_toml_whitespace_quotes_and_rejects_overrides() {
+        for config in [
+            "model_reasoning_effort=medium",
+            "model_reasoning_effort = medium",
+            "model_reasoning_effort = \"medium\"",
+            "'model_reasoning_effort' = 'medium'",
+        ] {
+            let evidence = HarnessProcessEvidence::test(
+                42,
+                900,
+                &["codex", "--model", "gpt-5.6-terra", "-c", config],
+            );
+            attest_runtime_policy(&evidence, Harness::Codex, "gpt-5.6-terra", "medium").unwrap();
+        }
+
+        let rejected = [
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+                "-c",
+                "model_reasoning_effort = \"high\"",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=high",
+                "-c",
+                "model_reasoning_effort = medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+                "-c",
+                "model_reasoning_effort=medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort = \"medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort.extra = medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "\"model_reasoning_effort\" = \"med\\ium\"",
+            ],
+        ];
+        for argv in rejected {
+            let evidence = HarnessProcessEvidence::test(42, 900, &argv);
+            assert_eq!(
+                attest_runtime_policy(&evidence, Harness::Codex, "gpt-5.6-terra", "medium"),
+                Err(LaunchAttestationError::WrongReasoningEffort),
+                "argv was falsely approved: {argv:?}"
             );
         }
     }
