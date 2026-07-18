@@ -14049,8 +14049,22 @@ fn recover_pending_dispatch_release_guarded(
     if client.configured_agent() != recovery.agent {
         return Err("the frozen profile agent changed".into());
     }
-    if client.endpoint_identity()? != recovery.connection_endpoint_identity {
-        return Err("the frozen profile endpoint changed before release recovery".into());
+    match client.verify_endpoint_identity(&recovery.connection_endpoint_identity) {
+        Ok(()) => {}
+        Err(powder::EndpointIdentityVerificationError::Mismatch) => {
+            return Err("the frozen profile endpoint changed before release recovery".into());
+        }
+        Err(powder::EndpointIdentityVerificationError::MalformedIdentity) => {
+            return Err(
+                "the frozen profile endpoint identity is malformed before release recovery".into(),
+            );
+        }
+        Err(powder::EndpointIdentityVerificationError::MissingCredential) => {
+            return Err(
+                "the frozen profile endpoint identity cannot be verified before release recovery"
+                    .into(),
+            );
+        }
     }
     let repository = client
         .get_repository(&recovery.repository)
@@ -29098,7 +29112,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_release_recovery_endpoint_digest_never_persists_or_syncs_gateway_secrets() {
+    fn dispatch_release_recovery_endpoint_identity_never_persists_or_syncs_gateway_secrets() {
         let original = LoopbackPowderServer::start(0);
         let replacement = LoopbackPowderServer::start(0);
         let profile = format!("release-endpoint-secret-{}", uuid::Uuid::new_v4().simple());
@@ -29453,8 +29467,17 @@ mod tests {
             state: PendingDispatchReleaseState::InFlight,
         };
         registry.prepare_dispatch_release(recovery.clone()).unwrap();
-        profiles.set_profile_api_key(&profile, "rotated-test-key");
         let (ctx, _) = dispatch_test_context(registry.clone());
+
+        let mut malformed = recovery.clone();
+        malformed.connection_endpoint_identity = "hmac-sha256:not-a-tag".into();
+        let malformed_error =
+            recover_pending_dispatch_release_guarded(&ctx, &malformed).unwrap_err();
+        assert_eq!(
+            malformed_error,
+            "the frozen profile endpoint identity is malformed before release recovery"
+        );
+        profiles.set_profile_api_key(&profile, "rotated-test-key");
 
         let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
         assert_eq!(

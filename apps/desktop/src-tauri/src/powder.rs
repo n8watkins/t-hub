@@ -73,6 +73,33 @@ pub struct Claim {
     pub expires_at: i64,
 }
 
+/// Fail-closed outcomes for a persisted protected endpoint identity.
+///
+/// The tag is derived from protected profile material and must never be
+/// accepted through ordinary string comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointIdentityVerificationError {
+    MissingCredential,
+    MalformedIdentity,
+    Mismatch,
+}
+
+impl std::fmt::Display for EndpointIdentityVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCredential => formatter.write_str(
+                "Powder protected endpoint identity cannot be verified without an API credential",
+            ),
+            Self::MalformedIdentity => {
+                formatter.write_str("Powder protected endpoint identity is malformed")
+            }
+            Self::Mismatch => {
+                formatter.write_str("Powder protected endpoint identity does not match")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceClaim {
@@ -787,17 +814,38 @@ impl Client {
     /// protected API credential.  The key and URL remain client-local, and only
     /// the resulting identity is safe to persist for exact remap detection.
     pub fn endpoint_identity(&self) -> Result<String, String> {
+        let mac = self.endpoint_identity_mac().map_err(|error| match error {
+            EndpointIdentityVerificationError::MissingCredential => {
+                "Powder protected endpoint identity cannot be derived without an API credential"
+                    .into()
+            }
+            _ => error.to_string(),
+        })?;
+        Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
+    }
+
+    /// Verifies a persisted HMAC-SHA-256 endpoint identity without exposing or
+    /// comparing the protected endpoint as a formatted string.
+    pub fn verify_endpoint_identity(
+        &self,
+        identity: &str,
+    ) -> Result<(), EndpointIdentityVerificationError> {
+        let tag = decode_endpoint_identity_tag(identity)?;
+        self.endpoint_identity_mac()?
+            .verify_slice(&tag)
+            .map_err(|_| EndpointIdentityVerificationError::Mismatch)
+    }
+
+    fn endpoint_identity_mac(&self) -> Result<Hmac<Sha256>, EndpointIdentityVerificationError> {
         let credential = self
             .api_key
             .as_deref()
             .filter(|key| !key.is_empty())
-            .ok_or(
-                "Powder protected endpoint identity cannot be derived without an API credential",
-            )?;
+            .ok_or(EndpointIdentityVerificationError::MissingCredential)?;
         let mut mac = Hmac::<Sha256>::new_from_slice(credential.as_bytes())
-            .map_err(|_| "Powder protected endpoint identity could not be initialized")?;
+            .map_err(|_| EndpointIdentityVerificationError::MissingCredential)?;
         mac.update(self.base_url.as_bytes());
-        Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
+        Ok(mac)
     }
 
     pub fn initial_claim_operation_id(&self, card_id: &str) -> Result<String, PowderError> {
@@ -2878,6 +2926,34 @@ fn public_endpoint_origin(base_url: &str) -> String {
     format!("{scheme}://{authority}")
 }
 
+fn decode_endpoint_identity_tag(
+    identity: &str,
+) -> Result<[u8; 32], EndpointIdentityVerificationError> {
+    let encoded = identity
+        .strip_prefix("hmac-sha256:")
+        .ok_or(EndpointIdentityVerificationError::MalformedIdentity)?;
+    if encoded.len() != 64 {
+        return Err(EndpointIdentityVerificationError::MalformedIdentity);
+    }
+    let mut tag = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = endpoint_identity_hex_digit(pair[0])
+            .ok_or(EndpointIdentityVerificationError::MalformedIdentity)?;
+        let low = endpoint_identity_hex_digit(pair[1])
+            .ok_or(EndpointIdentityVerificationError::MalformedIdentity)?;
+        tag[index] = (high << 4) | low;
+    }
+    Ok(tag)
+}
+
+fn endpoint_identity_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn resolve_key_command(command: &str) -> Result<String, String> {
     #[cfg(windows)]
     let child = {
@@ -4844,6 +4920,52 @@ mod tests {
         assert_ne!(first_identity, rotated.endpoint_identity().unwrap());
         assert!(first_identity.starts_with("hmac-sha256:"));
         assert!(!first_identity.contains("test-key"));
+    }
+
+    #[test]
+    fn endpoint_identity_verification_rejects_malformed_and_changed_protected_inputs() {
+        let client = |base_url: &str, api_key: Option<&str>| {
+            Client::new(ProfileConfig {
+                base_url: base_url.into(),
+                agent_name: "t-hub".into(),
+                operation_identity: None,
+                api_key: api_key.map(str::to_owned),
+                api_key_env: None,
+                api_key_command: None,
+            })
+            .unwrap()
+        };
+        let original = client("https://powder.example.test/gateway", Some("test-key-one"));
+        let identity = original.endpoint_identity().unwrap();
+
+        assert_eq!(original.verify_endpoint_identity(&identity), Ok(()));
+        assert_eq!(
+            original.verify_endpoint_identity("hmac-sha256:not-a-tag"),
+            Err(EndpointIdentityVerificationError::MalformedIdentity)
+        );
+        assert_eq!(
+            original.verify_endpoint_identity(&format!("hmac-sha256:{}", "A".repeat(64))),
+            Err(EndpointIdentityVerificationError::MalformedIdentity)
+        );
+        assert_eq!(
+            client(
+                "https://powder.example.test/other-gateway",
+                Some("test-key-one")
+            )
+            .verify_endpoint_identity(&identity),
+            Err(EndpointIdentityVerificationError::Mismatch),
+            "endpoint changes must fail verification"
+        );
+        assert_eq!(
+            client("https://powder.example.test/gateway", Some("test-key-two"))
+                .verify_endpoint_identity(&identity),
+            Err(EndpointIdentityVerificationError::Mismatch),
+            "credential rotation must fail verification"
+        );
+        assert_eq!(
+            client("https://powder.example.test/gateway", None).verify_endpoint_identity(&identity),
+            Err(EndpointIdentityVerificationError::MissingCredential)
+        );
     }
 
     #[test]
