@@ -823,9 +823,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// dispatch rollback, preventing an older registry shape from dropping a frozen
 /// Powder scope after an ambiguous release. v11 pins the canonical protected
 /// endpoint as well, preventing a remapped profile name from selecting a new
-/// Powder instance during recovery.
+/// Powder instance during recovery. v12 replaces that persisted endpoint with
+/// its credential-free SHA-256 identity, so a protected profile URL can never
+/// be copied into the registry or a captain sync payload.
 /// All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 11;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 12;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
@@ -1026,7 +1028,11 @@ pub struct PendingDispatchRelease {
     pub crew_session_id: String,
     pub project_id: String,
     pub connection_profile: String,
-    pub connection_endpoint: String,
+    /// SHA-256 identity of the normalized protected profile base URL.
+    ///
+    /// The URL itself can carry gateway credentials in its path, query, or
+    /// fragment, so it must never be durable registry or sync state.
+    pub connection_endpoint_digest: String,
     pub repository: String,
     pub card_id: String,
     pub run_id: String,
@@ -1058,11 +1064,14 @@ fn is_canonical_dispatch_recovery_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-fn is_canonical_dispatch_recovery_endpoint(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 2048
-        && !value.chars().any(char::is_control)
-        && (value.starts_with("https://") || value.starts_with("http://"))
+fn is_canonical_dispatch_recovery_endpoint_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2240,7 +2249,9 @@ impl CaptainsRegistry {
             if !is_canonical_dispatch_recovery_identity(&recovery.crew_session_id)
                 || !is_canonical_dispatch_recovery_identity(&recovery.project_id)
                 || !is_canonical_dispatch_recovery_identity(&recovery.connection_profile)
-                || !is_canonical_dispatch_recovery_endpoint(&recovery.connection_endpoint)
+                || !is_canonical_dispatch_recovery_endpoint_digest(
+                    &recovery.connection_endpoint_digest,
+                )
                 || !is_canonical_dispatch_recovery_identity(&recovery.repository)
                 || !is_canonical_dispatch_recovery_identity(&recovery.card_id)
                 || !is_canonical_dispatch_recovery_identity(&recovery.run_id)
@@ -2429,7 +2440,7 @@ impl CaptainsRegistry {
             && !snapshot.pending_dispatch_releases.is_empty()
         {
             return Err(
-                "captains registry release recovery requires schema version 11 or newer".into(),
+                "captains registry release recovery requires schema version 12 or newer".into(),
             );
         }
         for recovery in &snapshot.pending_dispatch_releases {
@@ -2871,7 +2882,7 @@ impl CaptainsRegistry {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
                     && existing.connection_profile == recovery.connection_profile
-                    && existing.connection_endpoint == recovery.connection_endpoint
+                    && existing.connection_endpoint_digest == recovery.connection_endpoint_digest
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
                     && existing.run_id == recovery.run_id
@@ -2910,7 +2921,7 @@ impl CaptainsRegistry {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
                     && existing.connection_profile == recovery.connection_profile
-                    && existing.connection_endpoint == recovery.connection_endpoint
+                    && existing.connection_endpoint_digest == recovery.connection_endpoint_digest
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
                     && existing.run_id == recovery.run_id
@@ -10988,7 +10999,7 @@ fn dispatch_crew_with_observer_inner(
         crew_session_id: crew_session_id.clone(),
         project_id: project.project_id.clone(),
         connection_profile: binding.connection_profile.clone(),
-        connection_endpoint: client.base_url().to_string(),
+        connection_endpoint_digest: client.endpoint_identity(),
         repository: binding.repository.clone(),
         card_id: claim.card_id.clone(),
         run_id: claim.run_id.clone(),
@@ -13936,7 +13947,7 @@ fn recover_pending_dispatch_release_guarded(
     if client.configured_agent() != recovery.agent {
         return Err("the frozen profile agent changed".into());
     }
-    if client.base_url() != recovery.connection_endpoint {
+    if client.endpoint_identity() != recovery.connection_endpoint_digest {
         return Err("the frozen profile endpoint changed before release recovery".into());
     }
     let repository = client
@@ -20963,11 +20974,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_without_release_recovery_upgrades_to_v11_on_the_next_write() {
-        let path = captains_tmp("schema-v10-upgrade");
+    fn schema_v11_without_release_recovery_upgrades_to_v12_on_the_next_write() {
+        let path = captains_tmp("schema-v11-upgrade");
         let _ = std::fs::remove_file(&path);
         let legacy = CaptainsSnapshot {
-            schema_version: 10,
+            schema_version: 11,
             seq: 1,
             captains: vec![],
             projects: vec![],
@@ -20980,11 +20991,11 @@ mod tests {
             CaptainsRegistry::read_snapshot(&path)
                 .unwrap()
                 .schema_version,
-            10
+            11
         );
         let registry = CaptainsRegistry::load(path.clone());
         registry
-            .claim_test("captain-v11", Some("schema-v11"), vec![])
+            .claim_test("captain-v12", Some("schema-v12"), vec![])
             .unwrap();
         let persisted: CaptainsSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -20994,8 +21005,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_v11_release_recovery_is_rejected_before_any_recovery_can_run() {
-        let path = captains_tmp("schema-v10-release-recovery");
+    fn pre_v12_release_recovery_is_rejected_before_any_recovery_can_run() {
+        let path = captains_tmp("schema-v11-release-recovery");
         let _ = std::fs::remove_file(&path);
         let registry = powder_lifecycle_registry_with_profile_and_crew(
             None,
@@ -21013,7 +21024,7 @@ mod tests {
                 crew_session_id: crew.terminal_id.clone(),
                 project_id: "project-powder-lifecycle".into(),
                 connection_profile: "legacy-release-profile".into(),
-                connection_endpoint: "http://127.0.0.1:1".into(),
+                connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
                 repository: "t-hub".into(),
                 card_id: work.card_id.clone(),
                 run_id: work.run_id.clone(),
@@ -21022,13 +21033,56 @@ mod tests {
                 created_at: 1,
                 state: PendingDispatchReleaseState::InFlight,
             });
-        snapshot.schema_version = 10;
+        snapshot.schema_version = 11;
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
         let error = CaptainsRegistry::read_snapshot(&path).unwrap_err();
         assert!(error
             .to_string()
-            .contains("release recovery requires schema version 11 or newer"));
+            .contains("release recovery requires schema version 12 or newer"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_v11_raw_endpoint_release_recovery_fails_closed_before_network() {
+        let path = captains_tmp("schema-v11-raw-release-endpoint");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "legacy-raw-release-profile",
+            "legacy-raw-release-crew",
+        );
+        let mut snapshot = registry.snapshot();
+        let crew = &mut snapshot.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        snapshot
+            .pending_dispatch_releases
+            .push(PendingDispatchRelease {
+                crew_session_id: crew.terminal_id.clone(),
+                project_id: "project-powder-lifecycle".into(),
+                connection_profile: "legacy-raw-release-profile".into(),
+                connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
+                repository: "t-hub".into(),
+                card_id: work.card_id.clone(),
+                run_id: work.run_id.clone(),
+                agent: work.agent.clone().unwrap(),
+                operation_id: "initial-claim:actor-t-hub:legacy-raw".into(),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            });
+        snapshot.schema_version = 11;
+        let mut raw = serde_json::to_value(&snapshot).unwrap();
+        let release = raw["pendingDispatchReleases"][0].as_object_mut().unwrap();
+        release.remove("connectionEndpointDigest");
+        release.insert(
+            "connectionEndpoint".into(),
+            json!("https://gateway.example/api?access_token=legacy-secret"),
+        );
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        assert!(CaptainsRegistry::read_snapshot(&path).is_err());
         let _ = std::fs::remove_file(path);
     }
 
@@ -21047,7 +21101,7 @@ mod tests {
             crew_session_id: crew.terminal_id.clone(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: "pair-profile".into(),
-            connection_endpoint: "http://127.0.0.1:1".into(),
+            connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
             repository: "t-hub".into(),
             card_id: work.card_id.clone(),
             run_id: work.run_id.clone(),
@@ -26343,9 +26397,13 @@ mod tests {
         }
 
         fn remap_profile_endpoint(&self, profile: &str, addr: SocketAddr) {
+            self.set_profile_base_url(profile, &format!("http://{addr}"));
+        }
+
+        fn set_profile_base_url(&self, profile: &str, base_url: &str) {
             let mut document: Value =
                 serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
-            document["profiles"][profile]["baseUrl"] = json!(format!("http://{addr}"));
+            document["profiles"][profile]["baseUrl"] = json!(base_url);
             std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
         }
     }
@@ -28678,6 +28736,124 @@ mod tests {
         run_post_bind_ambiguous_release_recovery("before_launch", false, true);
     }
 
+    #[test]
+    fn dispatch_release_recovery_endpoint_digest_never_persists_or_syncs_gateway_secrets() {
+        let original = LoopbackPowderServer::start(0);
+        let replacement = LoopbackPowderServer::start(0);
+        let profile = format!("release-endpoint-secret-{}", uuid::Uuid::new_v4().simple());
+        let profiles = PowderProfileEnv::install(&profile, original.addr);
+        let original_secret = "original-path-secret";
+        let original_base_url = format!(
+            "http://{}/gateway/{original_secret}?access_token=original-query-secret#original-fragment-secret",
+            original.addr
+        );
+        profiles.set_profile_base_url(&profile, &original_base_url);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let endpoint_digest = client.endpoint_identity();
+        let path = captains_tmp("release-endpoint-digest-secret");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "digest-captain");
+        let crew_session_id = "digest-crew";
+        registry
+            .record_crew("digest-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "digest-captain",
+                crew_session_id,
+                "Keep recovery endpoint credentials private",
+                "codex",
+                Some("/tmp/digest-crew"),
+                Some("digest-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_digest: endpoint_digest.clone(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:endpoint-digest".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let persisted_json: Value = serde_json::from_str(&persisted).unwrap();
+        let persisted_recovery = &persisted_json["pendingDispatchReleases"][0];
+        assert_eq!(
+            persisted_recovery["connectionEndpointDigest"],
+            endpoint_digest
+        );
+        assert!(persisted_recovery.get("connectionEndpoint").is_none());
+
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        assert!(captains_sync_apply(&ctx));
+        let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+        let debug_output = format!("{recovery:?}");
+        for secret in [
+            original_secret,
+            "original-query-secret",
+            "original-fragment-secret",
+            &original_base_url,
+        ] {
+            assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+            assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+            assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+        }
+
+        let replacement_base_url = format!(
+            "http://{}/gateway/replacement-path-secret?access_token=replacement-query-secret#replacement-fragment-secret",
+            replacement.addr
+        );
+        profiles.set_profile_base_url(&profile, &replacement_base_url);
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen profile endpoint changed before release recovery"
+        );
+        for secret in [
+            original_secret,
+            "original-query-secret",
+            "original-fragment-secret",
+            "replacement-path-secret",
+            "replacement-query-secret",
+            "replacement-fragment-secret",
+            &original_base_url,
+            &replacement_base_url,
+        ] {
+            assert!(!error.contains(secret), "error leaked {secret:?}");
+        }
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery],
+            "endpoint remap must retain the original-scope recovery"
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 0);
+        assert_eq!(original_state.run_evidence_gets, 0);
+        assert_eq!(original_state.release_posts, 0);
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.card_evidence_gets, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn run_dispatch_release_producer_serialization(
         rollback_boundary: &'static str,
         periodic_consumer: bool,
@@ -28929,7 +29105,9 @@ mod tests {
             crew_session_id: crew_session_id.clone(),
             project_id: "project-dispatch-attestation".into(),
             connection_profile: original_profile.clone(),
-            connection_endpoint: format!("http://{}", original.addr),
+            connection_endpoint_digest: powder::Client::from_profile(&original_profile)
+                .unwrap()
+                .endpoint_identity(),
             repository: "t-hub".into(),
             card_id: "thub-powder-control-lifecycle".into(),
             run_id: "run-authoritative".into(),
@@ -29214,7 +29392,9 @@ mod tests {
             crew_session_id: crew_session_id.clone(),
             project_id: "project-dispatch-attestation".into(),
             connection_profile: original_profile.clone(),
-            connection_endpoint: format!("http://{}", original.addr),
+            connection_endpoint_digest: powder::Client::from_profile(&original_profile)
+                .unwrap()
+                .endpoint_identity(),
             repository: "t-hub".into(),
             card_id: "thub-powder-control-lifecycle".into(),
             run_id: "run-authoritative".into(),
@@ -29349,7 +29529,9 @@ mod tests {
                 crew_session_id,
                 project_id: "project-dispatch-attestation".into(),
                 connection_profile: original_profile.clone(),
-                connection_endpoint: format!("http://{}", original.addr),
+                connection_endpoint_digest: powder::Client::from_profile(&original_profile)
+                    .unwrap()
+                    .endpoint_identity(),
                 repository: "t-hub".into(),
                 card_id: "thub-powder-control-lifecycle".into(),
                 run_id: "run-authoritative".into(),
@@ -29413,7 +29595,7 @@ mod tests {
             crew_session_id: "prepare-failure-crew".into(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: "prepare-failure-profile".into(),
-            connection_endpoint: "http://127.0.0.1:1".into(),
+            connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
             repository: "t-hub".into(),
             card_id: work.card_id,
             run_id: work.run_id,
@@ -29456,7 +29638,7 @@ mod tests {
             crew_session_id: "clear-reuse-crew".into(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: "clear-reuse-profile".into(),
-            connection_endpoint: "http://127.0.0.1:1".into(),
+            connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
             repository: "t-hub".into(),
             card_id: work.card_id,
             run_id: work.run_id,

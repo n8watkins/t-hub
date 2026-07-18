@@ -781,10 +781,12 @@ impl Client {
         &self.agent_name
     }
 
-    /// Canonical endpoint selected by the protected profile after validation.
-    /// Durable recovery compares this value before using a profile name again.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// Credential-free stable identity for a validated protected endpoint.
+    ///
+    /// The endpoint itself remains private to this client because path, query,
+    /// and fragment components may contain gateway credentials.
+    pub fn endpoint_identity(&self) -> String {
+        format!("sha256:{:x}", Sha256::digest(self.base_url.as_bytes()))
     }
 
     pub fn initial_claim_operation_id(&self, card_id: &str) -> Result<String, PowderError> {
