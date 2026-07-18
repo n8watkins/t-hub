@@ -234,6 +234,35 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
     }
 }
 
+fn parse_pane_generation(line: &str) -> Option<PaneGeneration> {
+    let mut fields = line.trim().split('|');
+    let parse_prefixed = |value: Option<&str>, prefix: char| {
+        value
+            .and_then(|value| value.strip_prefix(prefix))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let parse_positive_number = |value: Option<&str>| {
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    };
+    let session_id = parse_prefixed(fields.next(), '$')?;
+    let session_created = parse_positive_number(fields.next())?;
+    let window_id = parse_prefixed(fields.next(), '@')?;
+    let pane_id = parse_prefixed(fields.next(), '%')?;
+    let pane_pid = u32::try_from(parse_positive_number(fields.next())?).ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(PaneGeneration {
+        session_id,
+        session_created,
+        window_id,
+        pane_id,
+        pane_pid,
+    })
+}
+
 fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
     let output = run(
         "list-panes",
@@ -259,42 +288,10 @@ fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
             message: "target resolved to more than one pane".into(),
         });
     }
-    let mut fields = line.trim().split('|');
-    let parse_prefixed = |value: Option<&str>, prefix: char| {
-        value
-            .and_then(|value| value.strip_prefix(prefix))
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-    };
-    let parse_number = |value: Option<&str>| {
-        value
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-    };
-    let session_id = parse_prefixed(fields.next(), '$');
-    let session_created = parse_number(fields.next());
-    let window_id = parse_prefixed(fields.next(), '@');
-    let pane_id = parse_prefixed(fields.next(), '%');
-    let pane_pid = parse_number(fields.next()).and_then(|value| u32::try_from(value).ok());
-    if fields.next().is_some()
-        || session_id.is_none()
-        || session_created.is_none()
-        || window_id.is_none()
-        || pane_id.is_none()
-        || pane_pid.is_none()
-    {
-        return Err(TmuxError {
-            op: "list-panes",
-            code: None,
-            message: "target pane generation is malformed".into(),
-        });
-    }
-    Ok(PaneGeneration {
-        session_id: session_id.unwrap(),
-        session_created: session_created.unwrap(),
-        window_id: window_id.unwrap(),
-        pane_id: pane_id.unwrap(),
-        pane_pid: pane_pid.unwrap(),
+    parse_pane_generation(line).ok_or_else(|| TmuxError {
+        op: "list-panes",
+        code: None,
+        message: "target pane generation is malformed".into(),
     })
 }
 
@@ -1112,6 +1109,40 @@ mod tests {
         format!("th_test_{ts}")
     }
 
+    struct TestSession {
+        name: String,
+    }
+
+    impl TestSession {
+        fn new() -> Self {
+            let name = unique_name();
+            let _ = kill_session(&name);
+            Self { name }
+        }
+    }
+
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.name);
+        }
+    }
+
+    #[test]
+    fn pane_generation_parser_accepts_fresh_tmux_zero_ids() {
+        assert_eq!(
+            parse_pane_generation("$0|123|@0|%0|456"),
+            Some(PaneGeneration {
+                session_id: 0,
+                session_created: 123,
+                window_id: 0,
+                pane_id: 0,
+                pane_pid: 456,
+            })
+        );
+        assert!(parse_pane_generation("$0|0|@0|%0|456").is_none());
+        assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
+    }
+
     // NB: the generic `output_with_timeout` bound (kill-a-hung-child, fast
     // pass-through, no-serialization, large dual-pipe drain) is exercised in
     // `bounded_exec.rs`, which now OWNS that shared helper. The tests below cover
@@ -1159,10 +1190,9 @@ mod tests {
             );
             return;
         }
-        let name = unique_name();
-        let _ = kill_session(&name);
+        let session = TestSession::new();
         new_session_with_env(
-            &name,
+            &session.name,
             "/tmp",
             Some("exec sleep 2147483647"),
             &[("T_HUB_RESPAWN_ENV".into(), "preserved".into())],
@@ -1173,7 +1203,7 @@ mod tests {
             Some("printf 'T_HUB_RESPAWN_OK\\n'; exec sleep 2147483647"),
         )
         .unwrap();
-        let transition = respawn_pane_exact(&name, "/tmp", &command).unwrap();
+        let transition = respawn_pane_exact(&session.name, "/tmp", &command).unwrap();
         assert_eq!(transition.before.session_id, transition.after.session_id);
         assert_eq!(
             transition.before.session_created,
@@ -1183,11 +1213,10 @@ mod tests {
         assert_eq!(transition.before.pane_id, transition.after.pane_id);
         assert_ne!(transition.before.pane_pid, transition.after.pane_pid);
         assert_eq!(
-            session_environment(&name, "T_HUB_RESPAWN_ENV").unwrap(),
+            session_environment(&session.name, "T_HUB_RESPAWN_ENV").unwrap(),
             Some("preserved".into())
         );
-        assert!(has_session(&name));
-        kill_session(&name).unwrap();
+        assert!(has_session(&session.name));
     }
 
     #[test]
@@ -1198,15 +1227,11 @@ mod tests {
             );
             return;
         }
-        let fixture = std::env::temp_dir().join(format!(
-            "t-hub-respawn-hostile-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&fixture).unwrap();
-        let ready = fixture.join("ready");
-        let injected = fixture.join("injected");
-        let respawned = fixture.join("respawned");
-        let hostile = fixture.join("hostile-shell");
+        let fixture = tempfile::tempdir().unwrap();
+        let ready = fixture.path().join("ready");
+        let injected = fixture.path().join("injected");
+        let respawned = fixture.path().join("respawned");
+        let hostile = fixture.path().join("hostile-shell");
         std::fs::write(
             &hostile,
             format!(
@@ -1220,9 +1245,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&hostile, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let name = unique_name();
-        let _ = kill_session(&name);
-        new_session_with_env(&name, "/tmp", Some(hostile.to_str().unwrap()), &[]).unwrap();
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", Some(hostile.to_str().unwrap()), &[]).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !ready.exists() {
             assert!(
@@ -1232,7 +1256,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         send_text(
-            &name,
+            &session.name,
             &format!("printf injected > {}", injected.display()),
             true,
         )
@@ -1249,7 +1273,7 @@ mod tests {
             )),
         )
         .unwrap();
-        respawn_pane_exact(&name, "/tmp", &command).unwrap();
+        respawn_pane_exact(&session.name, "/tmp", &command).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !respawned.exists() {
             assert!(
@@ -1258,8 +1282,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        kill_session(&name).unwrap();
-        let _ = std::fs::remove_dir_all(fixture);
     }
 
     /// The MCP read/write helpers round-trip through a real session: send a
