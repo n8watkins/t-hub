@@ -1091,9 +1091,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 14;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 15;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
+const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
 
 fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
     format!(
@@ -2155,6 +2156,53 @@ fn reconcile_crew_workspace_candidates(
     Ok(changed)
 }
 
+fn durable_workspaces_from_report(
+    captains: &[CaptainRecord],
+    tabs: &[TabRecord],
+) -> Result<Vec<FleetWorkspaceRecord>, String> {
+    let mut durable = Vec::with_capacity(tabs.len());
+    for tab in tabs {
+        if tab.kind() == WorkspaceKind::Captain {
+            durable.push(FleetWorkspaceRecord {
+                id: CAPTAIN_WORKSPACE_ID.to_string(),
+                name: CAPTAIN_WORKSPACE_NAME.to_string(),
+                kind: WorkspaceKind::Captain,
+                owner: None,
+                tile_ids: tab.tile_ids.clone(),
+            });
+            continue;
+        }
+        let owners = captains
+            .iter()
+            .filter(|captain| captain.workspace_tab_ids.contains(&tab.id))
+            .filter_map(|captain| {
+                captain
+                    .project_id
+                    .as_ref()
+                    .map(|project_id| FleetWorkspaceOwner {
+                        project_id: project_id.clone(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if owners.len() > 1 {
+            return Err(format!(
+                "Workspace report found ambiguous durable Project/Assignment ownership for Work Workspace '{}'",
+                tab.id
+            ));
+        }
+        durable.push(FleetWorkspaceRecord {
+            id: tab.id.clone(),
+            name: tab.name.clone(),
+            kind: WorkspaceKind::Work,
+            owner: owners.into_iter().next(),
+            tile_ids: tab.tile_ids.clone(),
+        });
+    }
+    Ok(durable)
+}
+
 pub fn apply_workspace_report(
     tabs_registry: &TabRegistry,
     captains_registry: &CaptainsRegistry,
@@ -2219,7 +2267,10 @@ pub fn apply_workspace_report(
             .retain(|id| !removed_tab_ids.contains(id));
         pruned |= captain.workspace_tab_ids.len() != before;
     }
-    let captains_changed = crew_reconciled || pruned;
+    candidate_captains.workspaces =
+        durable_workspaces_from_report(&candidate_captains.captains, &tabs)?;
+    let workspaces_changed = candidate_captains.workspaces != previous_captains.workspaces;
+    let captains_changed = crew_reconciled || pruned || workspaces_changed;
     if captains_changed {
         candidate_captains.seq = candidate_captains.seq.saturating_add(1);
         let changes = AuthorityGenerationChanges::between(&previous_captains, &candidate_captains);
@@ -2261,6 +2312,82 @@ pub fn apply_workspace_report(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceOwner {
+    pub project_id: String,
+    pub assignment_id: String,
+    pub ship_slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: WorkspaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FleetWorkspaceOwner>,
+    #[serde(default)]
+    pub tile_ids: Vec<String>,
+}
+
+impl FleetWorkspaceRecord {
+    fn captain_workspace() -> Self {
+        Self {
+            id: CAPTAIN_WORKSPACE_ID.to_string(),
+            name: CAPTAIN_WORKSPACE_NAME.to_string(),
+            kind: WorkspaceKind::Captain,
+            owner: None,
+            tile_ids: Vec::new(),
+        }
+    }
+
+    fn as_tab_record(&self) -> TabRecord {
+        TabRecord {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            tile_ids: self.tile_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingFleetOperationPhase {
+    Prepared,
+    EffectApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum PendingFleetOperationPayload {
+    CloseTerminal {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        powder_release: Option<PendingDispatchRelease>,
+    },
+    CommissionCaptain {
+        terminal_id: String,
+        project_id: String,
+        assignment: String,
+        ship_slug: String,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingFleetOperation {
+    pub operation_id: String,
+    pub expected_seq: u64,
+    pub phase: PendingFleetOperationPhase,
+    pub created_at: u64,
+    pub payload: PendingFleetOperationPayload,
+}
+
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
 /// what every `sync_captains` forward carries down to the UI (the UI renders FROM
 /// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
@@ -2285,6 +2412,14 @@ pub struct CaptainsSnapshot {
     /// deserialize to an empty registry.
     #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    /// Durable Fleet Workspace authority. TabRegistry is only a projection cache
+    /// of these records and is seeded from them before any listener or UI report.
+    #[serde(default)]
+    pub workspaces: Vec<FleetWorkspaceRecord>,
+    /// Bounded prepare/effect/commit recovery records for operations that cross
+    /// tmux, IdentityStore, or Powder boundaries.
+    #[serde(default)]
+    pub pending_fleet_operations: Vec<PendingFleetOperation>,
     /// Initial claim attempts whose remote outcome remains unresolved.
     #[serde(default)]
     pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
@@ -2519,10 +2654,12 @@ impl AuthorityGenerations {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     projects: Vec<ProjectRecord>,
+    workspaces: Vec<FleetWorkspaceRecord>,
+    pending_fleet_operations: Vec<PendingFleetOperation>,
     pending_dispatch_claims: Vec<PendingDispatchClaim>,
     pending_dispatch_releases: Vec<PendingDispatchRelease>,
     /// Monotonic revision, bumped on every accepted mutation - the same
@@ -2534,6 +2671,21 @@ struct CaptainsInner {
     /// in-flight request, and the registry epoch makes tokens from another loaded
     /// instance invalid while new requests start from the loaded durable state.
     authority_generations: AuthorityGenerations,
+}
+
+impl Default for CaptainsInner {
+    fn default() -> Self {
+        Self {
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+            seq: 0,
+            authority_generations: AuthorityGenerations::default(),
+        }
+    }
 }
 
 static NEXT_AUTHORITY_REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -2769,6 +2921,8 @@ impl CaptainsRegistry {
                 seq: 0,
                 captains: Vec::new(),
                 projects: Vec::new(),
+                workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+                pending_fleet_operations: Vec::new(),
                 pending_dispatch_claims: Vec::new(),
                 pending_dispatch_releases: Vec::new(),
             })
@@ -2862,9 +3016,12 @@ impl CaptainsRegistry {
                 // then reconciles the Cortana singleton from the live incumbent.
                 let mut captains = snap.captains;
                 Self::reconcile_on_load(&mut captains);
+                let workspaces = Self::reconcile_durable_workspaces(&captains, snap.workspaces);
                 CaptainsInner {
                     captains,
                     projects: snap.projects,
+                    workspaces,
+                    pending_fleet_operations: snap.pending_fleet_operations,
                     pending_dispatch_claims: snap.pending_dispatch_claims,
                     pending_dispatch_releases: snap.pending_dispatch_releases,
                     seq: snap.seq,
@@ -3239,6 +3396,68 @@ impl CaptainsRegistry {
                 }
             }
         }
+        if snapshot.schema_version >= 15 {
+            if snapshot.pending_fleet_operations.len() > MAX_PENDING_FLEET_OPERATIONS {
+                return Err("captains registry contains too many pending Fleet operations".into());
+            }
+            let mut operation_ids = std::collections::HashSet::new();
+            for operation in &snapshot.pending_fleet_operations {
+                if operation.operation_id.trim().is_empty()
+                    || !operation_ids.insert(operation.operation_id.as_str())
+                    || operation.created_at == 0
+                {
+                    return Err(
+                        "captains registry contains an invalid pending Fleet operation".into(),
+                    );
+                }
+            }
+            let mut workspace_ids = std::collections::HashSet::new();
+            let mut placed_tiles = std::collections::HashSet::new();
+            let mut captain_workspace_count = 0;
+            for workspace in &snapshot.workspaces {
+                if workspace.id.trim().is_empty()
+                    || workspace.name.trim().is_empty()
+                    || !workspace_ids.insert(workspace.id.as_str())
+                {
+                    return Err("captains registry contains an empty or duplicate Workspace".into());
+                }
+                if workspace.kind == WorkspaceKind::Captain {
+                    captain_workspace_count += 1;
+                    if workspace.id != CAPTAIN_WORKSPACE_ID
+                        || workspace.name != CAPTAIN_WORKSPACE_NAME
+                        || workspace.owner.is_some()
+                    {
+                        return Err(
+                            "captains registry contains a non-canonical Captain Workspace".into(),
+                        );
+                    }
+                } else {
+                    if let Some(owner) = &workspace.owner {
+                        if !snapshot.captains.iter().any(|captain| {
+                            captain.ship_slug == owner.ship_slug
+                                && captain.assignment_id == owner.assignment_id
+                                && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                                && captain.workspace_tab_ids.contains(&workspace.id)
+                        }) {
+                            return Err(format!(
+                                "Work Workspace '{}' owner does not match one Captain Assignment",
+                                workspace.id
+                            ));
+                        }
+                    }
+                }
+                for tile in &workspace.tile_ids {
+                    if tile.trim().is_empty() || !placed_tiles.insert(tile.as_str()) {
+                        return Err(format!(
+                            "Fleet Workspace state places terminal '{tile}' more than once"
+                        ));
+                    }
+                }
+            }
+            if captain_workspace_count != 1 {
+                return Err("captains registry must contain exactly one Captain Workspace".into());
+            }
+        }
         if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
             && !snapshot.pending_dispatch_releases.is_empty()
         {
@@ -3353,6 +3572,8 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            workspaces: g.workspaces.clone(),
+            pending_fleet_operations: g.pending_fleet_operations.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -3403,6 +3624,118 @@ impl CaptainsRegistry {
                 }
             }
         }
+    }
+
+    fn reconcile_durable_workspaces(
+        captains: &[CaptainRecord],
+        mut workspaces: Vec<FleetWorkspaceRecord>,
+    ) -> Vec<FleetWorkspaceRecord> {
+        workspaces.retain(|workspace| workspace.id != CAPTAIN_WORKSPACE_ID);
+        for workspace in &mut workspaces {
+            if workspace.owner.is_none() {
+                if let Some(captain) = captains.iter().find(|captain| {
+                    captain.project_id.is_some()
+                        && captain.workspace_tab_ids.contains(&workspace.id)
+                }) {
+                    workspace.owner = Some(FleetWorkspaceOwner {
+                        project_id: captain.project_id.clone().unwrap(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    });
+                }
+            }
+        }
+        workspaces.retain(|workspace| {
+            workspace.kind == WorkspaceKind::Work
+                && workspace.owner.as_ref().is_none_or(|owner| {
+                    captains.iter().any(|captain| {
+                        captain.ship_slug == owner.ship_slug
+                            && captain.assignment_id == owner.assignment_id
+                            && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                            && captain.workspace_tab_ids.contains(&workspace.id)
+                    })
+                })
+        });
+        let known_fleet_tiles = captains
+            .iter()
+            .flat_map(|captain| {
+                captain
+                    .terminal_id
+                    .iter()
+                    .chain(captain.crew.iter().map(|crew| &crew.terminal_id))
+            })
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for workspace in &mut workspaces {
+            workspace
+                .tile_ids
+                .retain(|tile| !known_fleet_tiles.contains(tile));
+        }
+        let supervisors = captains
+            .iter()
+            .filter(|captain| captain.state == ClaimState::Active)
+            .filter_map(|captain| captain.terminal_id.clone())
+            .collect::<Vec<_>>();
+        workspaces.push(FleetWorkspaceRecord {
+            tile_ids: supervisors,
+            ..FleetWorkspaceRecord::captain_workspace()
+        });
+        for captain in captains {
+            let Some(project_id) = captain.project_id.as_ref() else {
+                continue;
+            };
+            for workspace_id in &captain.workspace_tab_ids {
+                if let Some(workspace) = workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == *workspace_id)
+                {
+                    if workspace.owner.is_none() {
+                        workspace.owner = Some(FleetWorkspaceOwner {
+                            project_id: project_id.clone(),
+                            assignment_id: captain.assignment_id.clone(),
+                            ship_slug: captain.ship_slug.clone(),
+                        });
+                    }
+                    continue;
+                }
+                workspaces.push(FleetWorkspaceRecord {
+                    id: workspace_id.clone(),
+                    name: workspace_id.clone(),
+                    kind: WorkspaceKind::Work,
+                    owner: Some(FleetWorkspaceOwner {
+                        project_id: project_id.clone(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    }),
+                    tile_ids: Vec::new(),
+                });
+            }
+        }
+        for captain in captains {
+            for crew in &captain.crew {
+                if matches!(crew.state, CrewState::Removed { .. }) {
+                    continue;
+                }
+                let Some(workspace_id) = crew.workspace_tab_id.as_ref() else {
+                    continue;
+                };
+                if let Some(workspace) = workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == *workspace_id)
+                {
+                    workspace.tile_ids.push(crew.terminal_id.clone());
+                }
+            }
+        }
+        workspaces
+    }
+
+    pub fn workspace_projection(&self) -> Vec<TabRecord> {
+        self.lock()
+            .workspaces
+            .iter()
+            .map(FleetWorkspaceRecord::as_tab_record)
+            .collect()
     }
 
     /// Fallible write-through of a snapshot to disk, WITHOUT the `inner` lock
@@ -3530,6 +3863,8 @@ impl CaptainsRegistry {
         previous: CaptainsInner,
     ) -> Result<(), String> {
         let mut candidate = current.clone();
+        candidate.workspaces =
+            Self::reconcile_durable_workspaces(&candidate.captains, candidate.workspaces);
         let generation_changes = AuthorityGenerationChanges::between(&previous, &candidate);
         let generation_result = candidate.authority_generations.advance(generation_changes);
         *current = previous;
@@ -3561,6 +3896,8 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            workspaces: g.workspaces.clone(),
+            pending_fleet_operations: g.pending_fleet_operations.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -3806,6 +4143,8 @@ impl CaptainsRegistry {
                 seq: g.seq,
                 captains: g.captains.clone(),
                 projects: g.projects.clone(),
+                workspaces: g.workspaces.clone(),
+                pending_fleet_operations: g.pending_fleet_operations.clone(),
                 pending_dispatch_claims: g.pending_dispatch_claims.clone(),
                 pending_dispatch_releases: g.pending_dispatch_releases.clone(),
             },
@@ -23092,7 +23431,14 @@ mod tests {
                 .tile_ids,
             vec!["captain-a".to_string()]
         );
-        assert!(sink.calls.lock().unwrap().is_empty());
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sync_captains");
+        assert!(calls[0].1["sync"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|workspace| workspace["id"] == "work-a"));
 
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
@@ -23150,6 +23496,86 @@ mod tests {
             let _ = std::fs::remove_file(path.with_extension("json.bak"));
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn durable_fleet_workspaces_seed_list_tabs_before_the_first_frontend_report() {
+        let path = captains_tmp("durable-workspace-projection");
+        let initial = CaptainsRegistry::load(path.clone());
+        initial
+            .upsert_project(ProjectRecord {
+                project_id: "project-a".into(),
+                name: "Project A".into(),
+                repo_root: "/tmp/project-a".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        initial
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        initial
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        initial.record_crew("captain-a", "crew-a").unwrap();
+        initial
+            .bind_crew_context_exact(
+                "captain-a",
+                "crew-a",
+                "durable placement",
+                "codex",
+                None,
+                None,
+                Some("work-a"),
+                PowderWorkBinding {
+                    card_id: "card-a".into(),
+                    run_id: "run-a".into(),
+                    agent: Some("agent-a".into()),
+                    claim_expires_at: Some(1),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        drop(initial);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let context = test_ctx("durable-workspace-projection")
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(Arc::clone(&tabs));
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().any(|workspace| {
+            workspace["id"] == "work-a" && workspace["tileIds"] == json!(["crew-a"])
+        }));
+        assert!(listed["tabs"].as_array().unwrap().iter().any(|workspace| {
+            workspace["id"] == CAPTAIN_WORKSPACE_ID
+                && workspace["name"] == CAPTAIN_WORKSPACE_NAME
+                && workspace["tileIds"] == json!(["captain-a"])
+        }));
+        let durable = restarted.snapshot();
+        let owner = durable
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap();
+        assert_eq!(owner.project_id, "project-a");
+        assert_eq!(owner.assignment_id, "assignment:project-a:alpha");
+        assert_eq!(owner.ship_slug, "alpha");
+        assert!(durable.pending_fleet_operations.is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -23502,6 +23928,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![],
+            pending_fleet_operations: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -23895,6 +24323,8 @@ mod tests {
             seq: 4,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -23989,6 +24419,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -24020,6 +24452,12 @@ mod tests {
             "seq": 1,
             "captains": [],
             "projects": [],
+            "workspaces": [{
+                "id": CAPTAIN_WORKSPACE_ID,
+                "name": CAPTAIN_WORKSPACE_NAME,
+                "kind": "captain",
+                "tileIds": []
+            }],
         });
         let cases = [
             (
@@ -28348,6 +28786,8 @@ mod tests {
             seq: 0,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![],
+            pending_fleet_operations: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         })

@@ -584,13 +584,17 @@ pub fn run() {
             // between the control listener (which reads it for list_tabs and updates
             // it on new_tab/move_tile/named placement) and the managed state the
             // `report_workspace_tabs` command writes the frontend's up-sync into.
-            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
-            app.manage(tab_registry.clone());
             // Captain-chat phase 2: the captains registry, loaded from its
-            // persistence file so claims survive app restarts (unlike tabs, whose
-            // layout the frontend re-seeds on boot).
+            // persistence file so claims and Fleet Workspace authority survive
+            // app restarts.
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Fleet Workspace identity is durable in the same registry as its
+            // Captain/Assignment owner. TabRegistry is only the live projection
+            // cache and is seeded before the listener or UI can call list_tabs.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
+            tab_registry.replace(captains_registry.workspace_projection());
+            app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
             // via that command, not the control socket, so without this a killed
