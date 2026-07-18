@@ -615,6 +615,25 @@ An authenticated `th send` report for this follow-up was attempted from evidence
 The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+## Dispatch Worker Fixture Safety Follow-Up
+
+Review rejected evidence head `d3831faa372e7ff4a8e7a2e3620eb7f5bb7f0bfe` only for a test-fixture cleanup race in the hostile dormant-pane dispatch regression.
+Production zero-ID parsing and private spawn behavior were approved by that review.
+The old fixture created a worker before it armed terminal cleanup, and an assertion panic could drop an unjoined worker while its dispatch continued across profile and loopback-server fixture teardown.
+
+Commit `bff37d7` replaces that local cleanup with a test-only RAII dispatch-worker fixture.
+It owns the barrier resume sender, join handle, and recording sink used to discover every spawned terminal.
+Its destructor queues resume when needed, joins the worker before outer fixtures unwind, and then reaps every terminal discovered from the sink.
+The normal hostile dormant-pane regression retains its launch, public-forward, provider, and result assertions.
+Two caught-unwind regressions intentionally panic before and after the private respawn barrier.
+Each proves bounded barrier handling, worker completion, and definitive removal of the single dispatched terminal after fixture destruction.
+
+From `apps/desktop/src-tauri`, the exact hostile dormant-pane dispatch test passed.
+The two dispatch-worker unwind cleanup tests passed.
+The exact empty-private-Claude rollback test and the retained harness-command rollback test passed.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+No aggregate test gate was run for this fixture-only follow-up.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
