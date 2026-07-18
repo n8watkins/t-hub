@@ -412,6 +412,17 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `698955e` closes the production-load fail-open for incompatible dispatch-release recovery state.
+`SnapshotReadError` now distinguishes incompatible recovery from generic corrupt state.
+Loading either a primary or backup with nonempty pre-v12 recovery, unknown release fields, or a release record that cannot deserialize or validate preserves both files byte-for-byte, starts with no actionable registry state, and blocks every write until explicit safe handling.
+It does not fall back to a stale backup and does not quarantine either file.
+`PendingDispatchRelease` now uses `deny_unknown_fields`, and the pre-deserialization classifier recognizes a schema-12 raw `connectionEndpoint` alongside a valid digest without including that raw value in the error.
+Production-load regressions cover a schema-11 release primary without a backup, the same primary beside an older clean backup, an incompatible release recovery in backup beside a current primary, and a schema-12 release record with a token-bearing raw endpoint field.
+Each proves registry writes and redispatch fail, reconciliation performs zero card evidence, run evidence, or release requests, no apply event is emitted, no fallback overwrite or quarantine occurs, and the primary and backup bytes remain unchanged.
+At `698955e`, the four production-load regressions, two schema regressions, ten dispatch-release regressions, the serial 63-test control Powder filter, 30-test Powder client filter, and 15-test Harness filter passed.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 An authenticated `th send` report to Captain session `0c7b7560` was attempted from final evidence head `001650a31d1088d24c370ad9d90882075fce5442`.
 The installed control plane rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
@@ -447,3 +458,5 @@ No independent reviewer has approved this integration yet.
 21. Verify close terminal authorizes foreign removed-Crew targets before historical Project or Powder resolution and leaves no local or remote side effect on denial.
 22. Verify initial Powder claim receipts match the requested card and configured profile agent before dispatch persists any Crew binding.
 23. Verify any ambiguous initial claim retains a trusted durable recovery intent, attempts no untrusted release, survives restart, and blocks duplicate redispatch until authoritative reconciliation.
+24. Verify incompatible pending-release recovery in either primary or backup blocks writes and redispatch, preserves both files without fallback or quarantine, and exposes no actionable cleanup state.
+25. Verify a schema-12 recovery rejects unknown or raw endpoint fields before client construction and cannot emit credential-bearing bytes through registry, sync, errors, or logs.
