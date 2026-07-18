@@ -295,6 +295,15 @@ fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
     })
 }
 
+/// Observe one pane only through tmux's exact-session target syntax.
+/// A similarly prefixed foreign session must never satisfy this lookup.
+pub(crate) fn pane_generation_exact(name: &str) -> Result<PaneGeneration, TmuxError> {
+    // list-panes accepts a target-pane, so include the trailing window separator;
+    // without it, `=name` may be interpreted as a pane/window target and still
+    // resolve a uniquely prefixed session.
+    pane_generation(&format!("={name}:"))
+}
+
 /// Replace one exact dormant pane with `command` without injecting keys into a
 /// shell line editor.
 ///
@@ -345,6 +354,14 @@ pub fn session_environment(name: &str, key: &str) -> Result<Option<String>, Tmux
         Err(error) if error.message.contains("unknown variable") => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Read a session environment value through tmux's exact-session target syntax.
+pub(crate) fn session_environment_exact(
+    name: &str,
+    key: &str,
+) -> Result<Option<String>, TmuxError> {
+    session_environment(&format!("={name}"), key)
 }
 
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional

@@ -1815,8 +1815,7 @@ fn observe_cortana_candidate_attestation(
         return Err("Cortana provider identity observation targets another terminal".into());
     }
     let provider_session_id = match receipt.observed_provider.as_str() {
-        "codex" => tmux::session_environment(&expected_target, "CODEX_THREAD_ID")
-            .map_err(|_| "Cortana Codex session identity is unreadable".to_string())?,
+        "codex" => observe_cortana_codex_provider_session(&receipt.terminal)?,
         "claude" => status.session_for_terminal(terminal_id),
         _ => None,
     }
@@ -1833,6 +1832,32 @@ fn observe_cortana_candidate_attestation(
         },
         runtime,
     })
+}
+
+fn observe_cortana_codex_provider_session(
+    expected: &HarnessTerminalGenerationReceipt,
+) -> Result<Option<String>, String> {
+    let matches_expected = |observed: &tmux::PaneGeneration| {
+        observed.session_id == expected.session_id
+            && observed.session_created == expected.session_created
+            && observed.window_id == expected.window_id
+            && observed.pane_id == expected.pane_id
+            && observed.pane_pid == expected.pane_pid
+    };
+    let before = tmux::pane_generation_exact(&expected.tmux_target)
+        .map_err(|_| "Cortana Codex session identity is unreadable".to_string())?;
+    if !matches_expected(&before) {
+        return Err("Cortana Codex session generation changed".into());
+    }
+    let provider_session_id =
+        tmux::session_environment_exact(&expected.tmux_target, "CODEX_THREAD_ID")
+            .map_err(|_| "Cortana Codex session identity is unreadable".to_string())?;
+    let after = tmux::pane_generation_exact(&expected.tmux_target)
+        .map_err(|_| "Cortana Codex session identity is unreadable".to_string())?;
+    if before != after || !matches_expected(&after) {
+        return Err("Cortana Codex session generation changed".into());
+    }
+    Ok(provider_session_id)
 }
 
 #[cfg(test)]
@@ -23540,6 +23565,76 @@ mod tests {
         .err()
         .expect("missing provider state must not issue a receipt");
         assert!(error.contains("unreadable"));
+    }
+
+    #[test]
+    fn dead_exact_codex_session_never_reads_a_prefixed_foreign_session() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("tmux is unavailable - skipping provider-session prefix fixture");
+            return;
+        }
+        struct SessionsGuard(Vec<String>);
+        impl Drop for SessionsGuard {
+            fn drop(&mut self) {
+                for session in &self.0 {
+                    let _ = tmux::kill_session(session);
+                }
+            }
+        }
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let exact = format!("th_psess_{}", &suffix[..8]);
+        let foreign = format!("{exact}_foreign");
+        tmux::new_session_with_env(
+            &exact,
+            "",
+            Some("sleep 30"),
+            &[("CODEX_THREAD_ID".into(), "exact-conversation".into())],
+        )
+        .unwrap();
+        let mut guard = SessionsGuard(vec![exact.clone(), foreign.clone()]);
+        let generation = tmux::pane_generation_exact(&exact).unwrap();
+        let expected = HarnessTerminalGenerationReceipt {
+            tmux_target: exact.clone(),
+            session_id: generation.session_id,
+            session_created: generation.session_created,
+            window_id: generation.window_id,
+            pane_id: generation.pane_id,
+            pane_pid: generation.pane_pid,
+        };
+        tmux::new_session_with_env(
+            &foreign,
+            "",
+            Some("sleep 30"),
+            &[("CODEX_THREAD_ID".into(), "foreign-conversation".into())],
+        )
+        .unwrap();
+        tmux::kill_session(&exact).unwrap();
+        guard.0.retain(|session| session != &exact);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tmux::pane_generation_exact(&exact).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "exact provider-session fixture survived teardown"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            tmux::session_environment(&exact, "CODEX_THREAD_ID").unwrap(),
+            Some("foreign-conversation".into()),
+            "fixture must reproduce tmux unique-prefix environment resolution"
+        );
+        assert!(observe_cortana_codex_provider_session(&expected).is_err());
+        assert_eq!(
+            tmux::session_environment_exact(&foreign, "CODEX_THREAD_ID").unwrap(),
+            Some("foreign-conversation".into())
+        );
+        drop(guard);
     }
 
     fn cortana_prepared_fixture(generation: u64) -> CaptainRecord {

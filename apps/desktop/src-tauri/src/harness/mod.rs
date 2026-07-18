@@ -924,9 +924,7 @@ pub(crate) fn observe_provider_launch_receipt(
     provider_executable: &std::path::Path,
     expected: Harness,
 ) -> Result<VerifiedHarnessProviderLaunch, LaunchAttestationError> {
-    let executable = std::fs::canonicalize(provider_executable)
-        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-    if executable
+    if provider_executable
         .file_name()
         .and_then(|name| name.to_str())
         .map(executable_name)
@@ -934,6 +932,8 @@ pub(crate) fn observe_provider_launch_receipt(
     {
         return Err(LaunchAttestationError::WrongProvider);
     }
+    let executable = std::fs::canonicalize(provider_executable)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     let identity = provider_file_identity(&executable)?;
     Ok(VerifiedHarnessProviderLaunch(
         HarnessProviderLaunchReceipt {
@@ -2320,6 +2320,40 @@ mod tests {
             ),
             (provider_file.device, provider_file.inode)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_symlinked_node_cli_launch_binds_the_canonical_script_inode() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let installed_script = temp.path().join("codex.js");
+        let launch_token = temp.path().join("codex");
+        std::fs::write(&installed_script, "#!/usr/bin/env node\n").unwrap();
+        symlink(&installed_script, &launch_token).unwrap();
+        let expected_identity = provider_file_identity(&installed_script).unwrap();
+
+        let receipt = observe_provider_launch_receipt(&launch_token, Harness::Codex)
+            .unwrap()
+            .into_persisted();
+        assert_eq!(
+            receipt.resolved_provider_executable,
+            std::fs::canonicalize(&installed_script)
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(
+            (
+                receipt.provider_executable_device,
+                receipt.provider_executable_inode,
+            ),
+            (expected_identity.device, expected_identity.inode)
+        );
+        assert!(matches!(
+            observe_provider_launch_receipt(&launch_token, Harness::Claude),
+            Err(LaunchAttestationError::WrongProvider)
+        ));
     }
 
     #[cfg(unix)]
