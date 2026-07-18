@@ -29144,6 +29144,91 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn dispatch_release_recovery_matching_endpoint_transport_failure_never_leaks_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let profile = format!("release-transport-secret-{}", uuid::Uuid::new_v4().simple());
+        let profiles = PowderProfileEnv::install(&profile, addr);
+        let endpoint =
+            format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+        profiles.set_profile_base_url(&profile, &endpoint);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let path = captains_tmp("release-transport-secret");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "transport-captain");
+        let crew_session_id = "transport-crew";
+        registry
+            .record_crew("transport-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "transport-captain",
+                crew_session_id,
+                "Keep matching-endpoint transport errors private",
+                "codex",
+                Some("/tmp/transport-crew"),
+                Some("transport-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_digest: client.endpoint_identity(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:transport-secret".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        assert!(captains_sync_apply(&ctx));
+        let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen repository cannot be reconciled: Powder transport failure"
+        );
+        // Periodic reconciliation logs this same endpoint-free error.  Invoke the
+        // production path as well; it must retain the exact pending recovery.
+        reconcile_powder_leases(&ctx);
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery.clone()]
+        );
+        let debug_output = format!("{recovery:?}");
+        for secret in [
+            "path-token",
+            "query-token",
+            "fragment-token",
+            "test-key",
+            endpoint.as_str(),
+        ] {
+            assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+            assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+            assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+            assert!(!error.contains(secret), "error leaked {secret:?}");
+        }
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
     fn run_dispatch_release_producer_serialization(
         rollback_boundary: &'static str,
         periodic_consumer: bool,

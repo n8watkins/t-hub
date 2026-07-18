@@ -762,7 +762,7 @@ impl Client {
     /// A credential-free URL for opening Powder's complete board externally.
     /// Powder does not currently support repository-filtered board URLs.
     pub fn external_board_url(&self) -> String {
-        format!("{}/board", self.base_url)
+        format!("{}/board", public_endpoint_origin(&self.base_url))
     }
 
     pub fn claim(&self, card_id: &str, ttl_seconds: u64) -> Result<Claim, String> {
@@ -2834,11 +2834,36 @@ fn typed_response_error(error: ureq::Error, credential: Option<&str>) -> PowderE
                 message: format!("Powder HTTP {status}: {detail}"),
             }
         }
-        ureq::Error::Transport(error) => PowderError {
+        ureq::Error::Transport(_) => PowderError {
             kind: PowderErrorKind::Unreachable,
-            message: format!("Powder is unreachable: {error}"),
+            // `ureq::Transport` renders the full request URL, including any
+            // protected path, query, or fragment material from a profile URL.
+            // Preserve the typed failure kind without retaining that endpoint.
+            message: "Powder transport failure".into(),
         },
     }
+}
+
+/// Return only the validated scheme and authority for externally visible links.
+///
+/// Protected profile paths, queries, and fragments can carry gateway credentials.
+/// They remain available to the private client transport but must never be sent to
+/// the UI or another caller as a board URL.
+fn public_endpoint_origin(base_url: &str) -> String {
+    let (scheme, rest) = if let Some(rest) = base_url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = base_url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        // `Client::new` validates the scheme before storing it.
+        return "about:blank".into();
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    format!("{scheme}://{authority}")
 }
 
 fn bounded_error_detail(response: ureq::Response) -> Option<String> {
@@ -4693,7 +4718,7 @@ mod tests {
     #[test]
     fn external_board_url_is_credential_free_and_not_falsely_filtered() {
         let client = Client::new(ProfileConfig {
-            base_url: "https://powder.example.test/".into(),
+            base_url: "https://powder.example.test/gateway/path-token?access_token=query-token#fragment-token".into(),
             agent_name: "t-hub".into(),
             operation_identity: None,
             api_key: Some("secret-key".into()),
@@ -4706,7 +4731,48 @@ mod tests {
             "https://powder.example.test/board"
         );
         assert!(!client.external_board_url().contains("secret-key"));
+        assert!(!client.external_board_url().contains("path-token"));
+        assert!(!client.external_board_url().contains("query-token"));
+        assert!(!client.external_board_url().contains("fragment-token"));
         assert!(!client.external_board_url().contains("repo="));
+    }
+
+    #[test]
+    fn transport_errors_are_endpoint_free_and_keep_unreachable_classification() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint =
+            format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+        let client = Client::new(ProfileConfig {
+            base_url: endpoint.clone(),
+            agent_name: "t-hub".into(),
+            operation_identity: None,
+            api_key: Some("secret-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+
+        let error = client.repository_for_board("t-hub").unwrap_err();
+        assert_eq!(error.kind, PowderErrorKind::Unreachable);
+        assert_eq!(error.message, "Powder transport failure");
+        for secret in [
+            "path-token",
+            "query-token",
+            "fragment-token",
+            "secret-key",
+            endpoint.as_str(),
+        ] {
+            assert!(
+                !error.to_string().contains(secret),
+                "transport leaked {secret:?}"
+            );
+            assert!(
+                !format!("{error:?}").contains(secret),
+                "debug leaked {secret:?}"
+            );
+        }
     }
 
     #[test]
