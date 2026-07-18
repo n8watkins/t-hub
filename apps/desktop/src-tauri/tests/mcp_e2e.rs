@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use t_hub_lib::control;
 use t_hub_protocol::JournalEventType;
 
@@ -27,10 +28,11 @@ const HELPER_LIFETIME: Duration = Duration::from_secs(60);
 const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
-const POWDER_TOOLS: [(&str, &str); 3] = [
+const POWDER_TOOLS: [(&str, &str); 4] = [
     ("append_crew_powder_work_log", "organization"),
     ("read_crew_powder_evidence", "read"),
-    ("complete_crew_powder", "organization"),
+    ("review_crew_powder_criterion", "organization"),
+    ("complete_crew_powder", "process-changing"),
 ];
 
 const FORBIDDEN_AUTHORITY_FIELDS: [&str; 22] = [
@@ -436,6 +438,7 @@ struct PowderFixtureState {
     completed: bool,
     proof: Option<String>,
     append_posts: Vec<Value>,
+    criterion_review_posts: Vec<Value>,
     completion_posts: Vec<Value>,
     request_paths: Vec<String>,
 }
@@ -570,29 +573,81 @@ fn handle_powder_fixture_request(
         let mut state = state.lock().unwrap();
         state.request_paths.push(format!("{method} {path}"));
         let result = match (method, path) {
+            ("GET", "/readyz") => (200, json!({"ok": true, "schema_version": 18})),
+            ("GET", "/api/v1/routes") => (200, powder_capability_routes()),
             ("GET", "/api/v1/cards/mcp-owned-card") => (200, powder_card_evidence(&state)),
             ("GET", "/api/v1/runs/mcp-owned-run") => (200, powder_run_evidence(&state)),
-            ("POST", "/api/v1/cards/mcp-owned-card/work-log") => {
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/work-log") => {
                 state.append_posts.push(body.clone());
                 (
                     200,
-                    json!({
-                        "card_id": "mcp-owned-card",
-                        "agent": body["agent"],
-                        "model": body["model"],
-                        "reasoning": body["reasoning"],
-                        "harness": body["harness"],
-                        "run_id": body["run_id"],
-                        "body": body["body"],
-                        "created_at": 11
-                    }),
+                    powder_operation_outcome(
+                        "work_log_append",
+                        &body,
+                        json!({
+                            "schema_version": "powder.work_log_entry.v1",
+                            "id": "work-log-mcp",
+                            "card_id": "mcp-owned-card",
+                            "actor": body["agent"],
+                            "agent": body["agent"],
+                            "model": body["model"],
+                            "reasoning": body["reasoning"],
+                            "harness": body["harness"],
+                            "run_id": "mcp-owned-run",
+                            "body": body["body"],
+                            "created_at": 11,
+                            "updated_at": 11
+                        }),
+                    ),
                 )
             }
-            ("POST", "/api/v1/cards/mcp-owned-card/complete") => {
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/criteria/review") => {
+                state.criterion_review_posts.push(body.clone());
+                (
+                    200,
+                    powder_operation_outcome(
+                        "criterion_review",
+                        &body,
+                        json!({
+                            "id": "review-mcp",
+                            "operation_id": body["operation_id"],
+                            "card_id": "mcp-owned-card",
+                            "run_id": "mcp-owned-run",
+                            "criterion_index": body["criterion"],
+                            "criterion_id": body["criterion_id"],
+                            "criterion_text": "MCP dispatcher criterion",
+                            "decision": body["decision"],
+                            "reviewer": "mcp-captain",
+                            "reviewer_identity": "actor-mcp-owned-captain",
+                            "proof": body["proof"],
+                            "supersedes_review_id": "review-initial",
+                            "created_at": 124
+                        }),
+                    ),
+                )
+            }
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/complete") => {
                 state.completion_posts.push(body.clone());
                 state.completed = true;
                 state.proof = body["proof"].as_str().map(str::to_string);
-                (200, powder_card(&state))
+                (
+                    200,
+                    powder_operation_outcome(
+                        "completion",
+                        &body,
+                        json!({
+                            "schema_version": "powder.run_bound_completion.v1",
+                            "card_id": "mcp-owned-card",
+                            "run_id": "mcp-owned-run",
+                            "operation_id": body["operation_id"],
+                            "status": "done",
+                            "proof": body["proof"],
+                            "criterion_proofs": body["criterion_proofs"],
+                            "updated_at": 126,
+                            "audit_event_id": "audit-mcp-operation"
+                        }),
+                    ),
+                )
             }
             _ => (404, json!({"error": "unexpected fixture route"})),
         };
@@ -611,12 +666,134 @@ fn handle_powder_fixture_request(
     stream.flush().expect("flush Powder fixture response");
 }
 
-fn powder_criterion() -> Value {
+fn powder_capability_routes() -> Value {
+    json!([
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/work-log",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"agent\":\"...\",\"body\":\"...\"}"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"criterion\":0,\"criterion_id\":\"...\",\"decision\":\"approved\"}"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/complete",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"proof\":null,\"criterion_proofs\":null}"
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/operations/{id}",
+            "body_shape": null
+        }
+    ])
+}
+
+fn powder_operation_outcome(kind: &str, body: &Value, result: Value) -> Value {
+    json!({
+        "schema_version": "powder.operation_status.v1",
+        "operation_id": body["operation_id"],
+        "state": "succeeded",
+        "request_digest": powder_operation_request_digest(kind, body),
+        "kind": kind,
+        "target_card_id": "mcp-owned-card",
+        "expected_run_id": "mcp-owned-run",
+        "result": result,
+        "failure": null,
+        "audit_event_id": "audit-mcp-operation",
+        "created_at": 125,
+        "updated_at": 126,
+        "expires_at": 600
+    })
+}
+
+fn powder_operation_request_digest(kind: &str, body: &Value) -> String {
+    let criterion_index = body["criterion"].as_u64().map(|value| value.to_string());
+    let criterion_proofs = body["criterion_proofs"].as_array().map(|proofs| {
+        serde_json::to_string(
+            &proofs
+                .iter()
+                .map(|proof| {
+                    json!({
+                        "criterion": proof["criterion"],
+                        "url": proof["url"],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    });
+    let payload = match kind {
+        "work_log_append" => vec![
+            ("agent", body["agent"].as_str()),
+            ("model", body["model"].as_str()),
+            ("reasoning", body["reasoning"].as_str()),
+            ("harness", body["harness"].as_str()),
+            ("body", body["body"].as_str()),
+        ],
+        "criterion_review" => vec![
+            ("criterion_index", criterion_index.as_deref()),
+            ("criterion_id", body["criterion_id"].as_str()),
+            ("decision", body["decision"].as_str()),
+            ("proof", body["proof"].as_str()),
+        ],
+        "completion" => vec![
+            ("proof", body["proof"].as_str()),
+            ("criterion_proofs", criterion_proofs.as_deref()),
+        ],
+        _ => panic!("unsupported Powder operation kind"),
+    };
+    let mut hasher = Sha256::new();
+    for (name, value) in [
+        ("schema", Some("powder.operation_request.v1")),
+        ("kind", Some(kind)),
+        ("target_type", Some("card")),
+        ("target", Some("mcp-owned-card")),
+        ("authority", Some("actor-t-hub")),
+        ("expected_run", Some("mcp-owned-run")),
+    ]
+    .into_iter()
+    .chain(payload)
+    {
+        hasher.update(u32::try_from(name.len()).unwrap().to_be_bytes());
+        hasher.update(name.as_bytes());
+        match value {
+            Some(value) => {
+                hasher.update(u32::try_from(value.len()).unwrap().to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update(u32::MAX.to_be_bytes()),
+        }
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+const MCP_CRITERION_ID: &str =
+    "powder.criterion.v1:sha256:1977e92d087253639c224379af040d1b1b59714c0062b8fe6ab134abee4eaf5c:0";
+
+fn powder_criterion(state: &PowderFixtureState) -> Value {
+    let proof_links = state
+        .completion_posts
+        .last()
+        .and_then(|post| post["criterion_proofs"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|proof| proof["url"].as_str())
+        .map(|url| {
+            json!({
+                "url": url,
+                "actor": "mcp-captain",
+                "created_at": 126
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "text": "MCP dispatcher criterion",
         "checked_by": "mcp-captain",
         "checked_at": 123,
-        "proof_links": []
+        "proof_links": proof_links
     })
 }
 
@@ -645,7 +822,7 @@ fn powder_card(state: &PowderFixtureState) -> Value {
             "agent": "powder-agent",
             "expires_at": 100
         }) },
-        "criteria": [powder_criterion()]
+        "criteria": [powder_criterion(state)]
     })
 }
 
@@ -661,7 +838,7 @@ fn powder_card_evidence(state: &PowderFixtureState) -> Value {
                 "model": post["model"],
                 "reasoning": post["reasoning"],
                 "harness": post["harness"],
-                "run_id": post["run_id"],
+                "run_id": "mcp-owned-run",
                 "body": post["body"],
                 "created_at": 11 + index as i64
             })
@@ -672,7 +849,12 @@ fn powder_card_evidence(state: &PowderFixtureState) -> Value {
         "runs": [powder_run(state)],
         "runs_total": 1,
         "work_log": work_log,
-        "work_log_total": state.append_posts.len()
+        "work_log_total": state.append_posts.len(),
+        "current_run_criteria": if state.completed {
+            Vec::<Value>::new()
+        } else {
+            vec![powder_run_criterion()]
+        }
     })
 }
 
@@ -683,7 +865,31 @@ fn powder_run_evidence(state: &PowderFixtureState) -> Value {
         "activities": [],
         "activities_total": 0,
         "links": [],
-        "links_total": 0
+        "links_total": 0,
+        "criteria": [powder_run_criterion()]
+    })
+}
+
+fn powder_run_criterion() -> Value {
+    json!({
+        "criterion_index": 0,
+        "criterion_id": MCP_CRITERION_ID,
+        "criterion_text": "MCP dispatcher criterion",
+        "review": {
+            "id": "review-initial",
+            "operation_id": "review-operation-initial",
+            "card_id": "mcp-owned-card",
+            "run_id": "mcp-owned-run",
+            "criterion_index": 0,
+            "criterion_id": MCP_CRITERION_ID,
+            "criterion_text": "MCP dispatcher criterion",
+            "decision": "approved",
+            "reviewer": "mcp-captain",
+            "reviewer_identity": "actor-mcp-owned-captain",
+            "proof": "initial review proof",
+            "supersedes_review_id": null,
+            "created_at": 123
+        }
     })
 }
 
@@ -799,6 +1005,7 @@ fn powder_server_profile_file(addr: SocketAddr) -> PathBuf {
                 "mcp-e2e-powder": {
                     "baseUrl": format!("http://{addr}"),
                     "agentName": "powder-agent",
+                    "operationIdentity": "actor-t-hub",
                     "apiKey": "mcp-e2e-key"
                 }
             }
@@ -865,6 +1072,7 @@ fn seed_powder_registry(registry: &control::CaptainsRegistry, seed: &Value) {
         let powder_work = serde_json::from_value(json!({
             "cardId": card_id,
             "runId": run_id,
+            "agent": "powder-agent",
             "claimExpiresAt": 100,
             "state": { "kind": "active" }
         }))
@@ -1010,7 +1218,10 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &anonymous,
         102,
         "append_crew_powder_work_log",
-        json!({"message": "anonymous must not append"}),
+        json!({
+            "operationId": "mcp-anonymous-work-log",
+            "message": "anonymous must not append"
+        }),
     );
     assert!(tool_error_text(&anonymous_append).contains(
         "unauthorized: 'append_crew_powder_work_log' requires the control capability (this token is read-only)"
@@ -1019,7 +1230,12 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &anonymous,
         103,
         "complete_crew_powder",
-        json!({"crewSessionId": "missing", "proof": "anonymous must not complete"}),
+        json!({
+            "crewSessionId": "missing",
+            "operationId": "mcp-anonymous-completion",
+            "proof": "anonymous must not complete",
+            "criterionProofs": []
+        }),
     );
     assert!(tool_error_text(&anonymous_complete).contains(
         "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)"
@@ -1073,14 +1289,19 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &owned_crew_mcp,
         121,
         "append_crew_powder_work_log",
-        json!({"message": "real MCP append sentinel"}),
+        json!({
+            "operationId": "mcp-work-log-operation",
+            "message": "real MCP append sentinel"
+        }),
     );
+    assert_eq!(append["result"]["isError"], false, "{append}");
     let append_data = tool_structured(&append);
     assert_eq!(append_data["accepted"], "append_crew_powder_work_log");
     assert_eq!(append_data["crewSessionId"], owned_crew);
     assert_eq!(append_data["cardId"], "mcp-owned-card");
     assert_eq!(append_data["runId"], "mcp-owned-run");
     assert_eq!(append_data["messageBytes"], 24);
+    assert_eq!(append_data["mutationState"], "committed");
     let crew_read = call_tool(
         &owned_crew_mcp,
         122,
@@ -1097,7 +1318,10 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         crew_read_data["card"]["workLog"][0]["body"],
         "real MCP append sentinel"
     );
-    assert_eq!(crew_read_data["card"]["workLog"][0]["agent"], owned_crew);
+    assert_eq!(
+        crew_read_data["card"]["workLog"][0]["agent"],
+        "powder-agent"
+    );
     let crew_foreign = call_tool(
         &owned_crew_mcp,
         123,
@@ -1136,7 +1360,12 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &read_only_captain,
         141,
         "complete_crew_powder",
-        json!({"crewSessionId": owned_crew, "proof": "read token must not complete"}),
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-read-only-completion",
+            "proof": "read token must not complete",
+            "criterionProofs": []
+        }),
     );
     assert!(tool_error_text(&read_only_completion).contains(
         "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)"
@@ -1157,7 +1386,12 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &foreign_captain_mcp,
         151,
         "complete_crew_powder",
-        json!({"crewSessionId": owned_crew, "proof": "foreign must not complete"}),
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-foreign-completion",
+            "proof": "foreign must not complete",
+            "criterionProofs": []
+        }),
     );
     assert!(tool_error_text(&foreign_completion).contains("requires the same-ship Captain"));
     foreign_captain_mcp
@@ -1190,15 +1424,55 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         &owned_captain_mcp,
         163,
         "complete_crew_powder",
-        json!({"crewSessionId": foreign_crew, "proof": "wrong ship"}),
+        json!({
+            "crewSessionId": foreign_crew,
+            "operationId": "mcp-wrong-ship-completion",
+            "proof": "wrong ship",
+            "criterionProofs": []
+        }),
     );
     assert!(tool_error_text(&captain_foreign_complete).contains("requires the same-ship Captain"));
-    let completion = call_tool(
+    let criterion_review = call_tool(
         &owned_captain_mcp,
         164,
-        "complete_crew_powder",
-        json!({"crewSessionId": owned_crew, "proof": "real MCP completion sentinel"}),
+        "review_crew_powder_criterion",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-criterion-operation",
+            "criterion": 0,
+            "criterionId": MCP_CRITERION_ID,
+            "decision": "approved",
+            "proof": "real MCP criterion sentinel",
+            "expectedReviewerIdentity": "actor-mcp-owned-captain"
+        }),
     );
+    let criterion_review_data = tool_structured(&criterion_review);
+    assert_eq!(
+        criterion_review_data["accepted"],
+        "review_crew_powder_criterion"
+    );
+    assert_eq!(criterion_review_data["runId"], "mcp-owned-run");
+    assert_eq!(criterion_review_data["mutationState"], "committed");
+    let completion = call_tool(
+        &owned_captain_mcp,
+        165,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-completion-operation",
+            "proof": "real MCP completion sentinel",
+            "criterionProofs": [{
+                "criterion": 0,
+                "criterionId": MCP_CRITERION_ID,
+                "url": "https://example.test/mcp-completion-proof"
+            }]
+        }),
+    );
+    if completion["result"]["isError"] != false {
+        let fixture = fs::read_to_string(&control.powder_state_file)
+            .unwrap_or_else(|error| format!("fixture state unavailable: {error}"));
+        panic!("completion failed: {completion}; Powder fixture: {fixture}");
+    }
     let completion_data = tool_structured(&completion);
     assert_eq!(completion_data["accepted"], "complete_crew_powder");
     assert_eq!(completion_data["crewSessionId"], owned_crew);
@@ -1206,6 +1480,7 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
     assert_eq!(completion_data["runId"], "mcp-owned-run");
     assert_eq!(completion_data["cardStatus"], "done");
     assert_eq!(completion_data["runState"], "complete");
+    assert_eq!(completion_data["mutationState"], "committed");
     owned_captain_mcp
         .shutdown()
         .expect("stop owned Captain MCP");
@@ -1215,16 +1490,29 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
     )
     .expect("parse Powder fixture sentinel");
     assert_eq!(fixture["appendPosts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture["criterionReviewPosts"].as_array().unwrap().len(), 1);
     assert_eq!(fixture["completionPosts"].as_array().unwrap().len(), 1);
-    assert_eq!(fixture["appendPosts"][0]["agent"], owned_crew);
-    assert_eq!(fixture["appendPosts"][0]["run_id"], "mcp-owned-run");
+    assert_eq!(fixture["appendPosts"][0]["agent"], "powder-agent");
+    assert_eq!(
+        fixture["appendPosts"][0]["operation_id"],
+        "mcp-work-log-operation"
+    );
+    assert!(fixture["appendPosts"][0].get("run_id").is_none());
     assert_eq!(
         fixture["appendPosts"][0]["body"],
         "real MCP append sentinel"
     );
     assert_eq!(
+        fixture["criterionReviewPosts"][0]["operation_id"],
+        "mcp-criterion-operation"
+    );
+    assert_eq!(
         fixture["completionPosts"][0]["proof"],
         "real MCP completion sentinel"
+    );
+    assert_eq!(
+        fixture["completionPosts"][0]["operation_id"],
+        "mcp-completion-operation"
     );
     assert_eq!(fixture["completed"], true);
     assert!(fixture["requestPaths"]
@@ -1233,6 +1521,8 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
         .iter()
         .all(|path| !path.as_str().unwrap().contains("mcp-foreign")));
     for required_get in [
+        "GET /readyz",
+        "GET /api/v1/routes",
         "GET /api/v1/cards/mcp-owned-card",
         "GET /api/v1/runs/mcp-owned-run",
     ] {
@@ -1302,7 +1592,11 @@ fn end_to_end_mcp_round_trip() {
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("tools/list missing {name}"));
         assert_eq!(tool["annotations"]["t-hubTier"], tier, "{name}");
-        assert_eq!(tool["annotations"]["confirmationRequired"], false, "{name}");
+        assert_eq!(
+            tool["annotations"]["confirmationRequired"],
+            name == "complete_crew_powder",
+            "{name}"
+        );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
         for field in FORBIDDEN_AUTHORITY_FIELDS {
             assert!(

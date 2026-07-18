@@ -1504,7 +1504,7 @@ mod tests {
             timestamp_ms: 10,
             source: JournalSource::Agent,
             entity_id: Some("codex-unobserved:th_crew0001".to_string()),
-            event_type: JournalEventType::CoreAction,
+            event_type: JournalEventType::AgentCommand,
             payload: serde_json::json!({
                 "provider": "codex",
                 "provider_version": "0.144.4",

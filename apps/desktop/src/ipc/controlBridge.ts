@@ -50,6 +50,16 @@ function harness(value: unknown): "codex" | "claude" | undefined {
   return value === "codex" || value === "claude" ? value : undefined;
 }
 
+function harnessPermission(value: unknown): CrewRef["harnessPermission"] {
+  return value === "bypassPermissions" || value === "acceptEdits" || value === "default"
+    ? value
+    : undefined;
+}
+
+function tHubCapability(value: unknown): CrewRef["tHubCapability"] {
+  return value === "read" || value === "control" ? value : undefined;
+}
+
 // The last authoritative registry revision this window applied (from an apply's
 // `sync` payload or a report response). Rides every report as `baseSeq`.
 let lastSeq = 0;
@@ -130,6 +140,8 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
                 provider: harness(raw.provider),
                 providerSessionId: str(raw, "providerSessionId"),
                 harness: harness(raw.harness),
+                harnessPermission: harnessPermission(raw.harnessPermission),
+                tHubCapability: tHubCapability(raw.tHubCapability),
                 conversationId: str(raw, "conversationId"),
                 resumePoint: str(raw, "resumePoint"),
                 state: raw.state as CrewRef["state"],

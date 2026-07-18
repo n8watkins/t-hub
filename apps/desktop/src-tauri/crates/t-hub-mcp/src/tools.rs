@@ -525,6 +525,13 @@ fn schema_append_crew_powder_work_log() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+                "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
+            },
             "message": {
                 "type": "string",
                 "minLength": 1,
@@ -532,7 +539,7 @@ fn schema_append_crew_powder_work_log() -> Value {
                 "description": "Work-log message up to 16 KiB UTF-8, attributed to the calling Crew session's bound card and run."
             }
         },
-        "required": ["message"],
+        "required": ["operationId", "message"],
         "additionalProperties": false
     })
 }
@@ -558,6 +565,46 @@ fn schema_read_crew_powder_evidence() -> Value {
     })
 }
 
+fn schema_review_crew_powder_criterion() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "crewSessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "criterion": { "type": "integer", "minimum": 0 },
+            "criterionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "decision": { "type": "string", "enum": ["approved", "rejected", "cleared"] },
+            "proof": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Review proof for approved or rejected decisions. Use null only when clearing a review."
+            },
+            "expectedReviewerIdentity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Exact authenticated Powder reviewer identity expected in the authoritative receipt."
+            }
+        },
+        "required": [
+            "crewSessionId",
+            "operationId",
+            "criterion",
+            "criterionId",
+            "decision",
+            "proof",
+            "expectedReviewerIdentity"
+        ],
+        "additionalProperties": false
+    })
+}
+
 fn schema_complete_crew_powder() -> Value {
     json!({
         "type": "object",
@@ -568,14 +615,35 @@ fn schema_complete_crew_powder() -> Value {
                 "maxLength": 256,
                 "description": "Crew session owned by the calling Captain. Its durable binding supplies the Powder card and run."
             },
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+                "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
+            },
             "proof": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 4096,
                 "description": "Completion proof up to 4096 UTF-8 bytes, recorded against the Crew-bound card and run."
+            },
+            "criterionProofs": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion": { "type": "integer", "minimum": 0 },
+                        "criterionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "url": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                    },
+                    "required": ["criterion", "criterionId", "url"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["crewSessionId", "proof"],
+        "required": ["crewSessionId", "operationId", "proof", "criterionProofs"],
         "additionalProperties": false
     })
 }
@@ -846,6 +914,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_read_crew_powder_evidence,
         },
         ToolDef {
+            name: "review_crew_powder_criterion",
+            tier: Tier::Organization,
+            summary: "Record one exact run-scoped criterion review and verify its authoritative reviewer and proof receipt.",
+            input_schema: schema_review_crew_powder_criterion,
+        },
+        ToolDef {
             name: "watch_fleet",
             tier: Tier::Organization,
             summary: "Arm an orchestrator wake: T-Hub re-invokes YOUR loop (injects a prompt into your terminal) when a watched session (default: any captain) goes idle / needs-input / completes. Ends the need to poll. Idempotent; re-arming replaces the prior watch.",
@@ -891,7 +965,7 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "complete_crew_powder",
-            tier: Tier::Organization,
+            tier: Tier::ProcessChanging,
             summary: "Complete a Crew-bound Powder card with proof; only the Crew session's owning Captain is authorized.",
             input_schema: schema_complete_crew_powder,
         },
@@ -989,6 +1063,7 @@ mod tests {
             "release_captain",
             "append_crew_powder_work_log",
             "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
             "complete_crew_powder",
             "get_theme",
             "set_theme",
@@ -1206,7 +1281,10 @@ mod tests {
     fn powder_evidence_tools_share_minimal_bound_authority_schemas() {
         let append = find("append_crew_powder_work_log").unwrap();
         assert_eq!(append.tier, Tier::Organization);
-        assert_eq!((append.input_schema)()["required"], json!(["message"]));
+        assert_eq!(
+            (append.input_schema)()["required"],
+            json!(["operationId", "message"])
+        );
 
         let evidence = find("read_crew_powder_evidence").unwrap();
         assert_eq!(evidence.tier, Tier::Read);
@@ -1216,10 +1294,14 @@ mod tests {
         );
 
         let complete = find("complete_crew_powder").unwrap();
-        assert_eq!(complete.tier, Tier::Organization);
+        assert_eq!(complete.tier, Tier::ProcessChanging);
         assert_eq!(
             (complete.input_schema)()["required"],
-            json!(["crewSessionId", "proof"])
+            json!(["crewSessionId", "operationId", "proof", "criterionProofs"])
+        );
+        assert_eq!(
+            (complete.input_schema)()["properties"]["criterionProofs"]["maxItems"],
+            128
         );
         assert_eq!(
             (append.input_schema)()["properties"]["message"]["maxLength"],
@@ -1231,15 +1313,31 @@ mod tests {
         );
         assert_eq!(
             complete.to_mcp()["annotations"]["confirmationRequired"],
-            false
+            true
         );
 
-        // Append and completion have the same Organization base tier as the
-        // combined control contract. Organization carries no generic process
-        // confirmation. The backend separately admits the narrow Crew-self
-        // work-log case through a read token, then rechecks exact Crew and ship
-        // ownership. Completion has no such read-token override.
-        for name in ["append_crew_powder_work_log", "complete_crew_powder"] {
+        let review = find("review_crew_powder_criterion").unwrap();
+        assert_eq!(review.tier, Tier::Organization);
+        assert_eq!(
+            (review.input_schema)()["required"],
+            json!([
+                "crewSessionId",
+                "operationId",
+                "criterion",
+                "criterionId",
+                "decision",
+                "proof",
+                "expectedReviewerIdentity"
+            ])
+        );
+
+        // Append and review remain Organization mutations. The backend
+        // separately admits the narrow Crew-self work-log case through a read
+        // token, then rechecks exact Crew and ship ownership.
+        for name in [
+            "append_crew_powder_work_log",
+            "review_crew_powder_criterion",
+        ] {
             let tool = find(name).unwrap().to_mcp();
             assert_eq!(tool["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(
@@ -1247,6 +1345,13 @@ mod tests {
                 "{name} must reach role-bound backend authorization"
             );
         }
+        let complete_mcp = complete.to_mcp();
+        assert_eq!(complete_mcp["annotations"]["t-hubTier"], "process-changing");
+        assert_eq!(complete_mcp["annotations"]["confirmationRequired"], true);
+        assert!(complete_mcp["description"]
+            .as_str()
+            .unwrap()
+            .contains("CONFIRMATION REQUIRED"));
         let read = evidence.to_mcp();
         assert_eq!(read["annotations"]["t-hubTier"], "read");
         assert_eq!(read["annotations"]["confirmationRequired"], false);
@@ -1270,6 +1375,7 @@ mod tests {
         for name in [
             "append_crew_powder_work_log",
             "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
             "complete_crew_powder",
         ] {
             let schema = (find(name).unwrap().input_schema)();

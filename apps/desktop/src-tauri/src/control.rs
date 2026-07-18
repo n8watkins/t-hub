@@ -57,8 +57,9 @@ use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
-    attest_launch_permissions, observe_harness_process, Harness, HarnessPermissionAttestation,
-    PermMode,
+    attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
+    confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
+    HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -813,9 +814,24 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// v0 used terminal-keyed captains and string crew; v1 introduced durable ship
 /// identities; v2 adds registered projects plus reset-safe Captain, Crew, and
 /// Powder bindings; v3 adds durable per-project Powder event cursors; v4 makes
-/// provider identity strict; v5 adds durable Powder completion recovery state.
-/// All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 5;
+/// provider identity strict; v5 adds durable Powder completion recovery state;
+/// v6 adds exact run-bound mutation intent recovery; v7 binds those intents to
+/// Powder's canonical request digest while preserving legacy v1 intents in a
+/// fail-closed state; v8 records bounded definitive terminal rejections so an
+/// exact replay stays stable without wedging replacement work or cleanup.
+/// v10 adds a durable pre-release recovery state machine for exact post-bind
+/// dispatch rollback, preventing an older registry shape from dropping a frozen
+/// Powder scope after an ambiguous release. v11 pins the canonical protected
+/// endpoint as well, preventing a remapped profile name from selecting a new
+/// Powder instance during recovery. v12 replaces that persisted endpoint with
+/// an endpoint digest. v13 replaces the unsalted URL-derived digest with a
+/// standard HMAC-SHA-256 identity keyed by the protected client credential, so
+/// a protected profile URL is never copied into the registry or a captain sync
+/// payload and the durable value is not a URL equality oracle.
+/// Snapshots older than a recovery shape load and upgrade only when they carry
+/// no such recovery state.  A recovery record requires its exact schema and
+/// fails closed rather than letting an older binary discard it.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 13;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
@@ -972,9 +988,268 @@ pub struct PowderWorkBinding {
     pub card_id: String,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_expires_at: Option<i64>,
+    /// Exact in-flight mutation identity persisted before a Powder write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_intent: Option<PowderMutationIntent>,
+    /// A post-bind dispatch rollback has durably pinned the original Powder
+    /// scope in a matching [`PendingDispatchRelease`].
+    ///
+    /// This marker makes the two records a validated pair, so restart cleanup
+    /// cannot rediscover a replacement Project binding.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dispatch_release_recovery: bool,
     #[serde(default)]
     pub state: PowderWorkState,
+}
+
+/// A claim POST whose remote outcome is not trusted enough to bind to a Crew.
+///
+/// This is deliberately separate from [`PowderWorkBinding`]: no untrusted run,
+/// receipt card, or receipt agent is allowed into a durable Crew binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDispatchClaim {
+    pub project_id: String,
+    pub connection_profile: String,
+    pub repository: String,
+    pub card_id: String,
+    pub configured_agent: String,
+    pub operation_id: String,
+    pub created_at: u64,
+}
+
+/// A trusted post-bind claim whose exact release response was ambiguous.
+///
+/// Unlike [`PendingDispatchClaim`], this record is not an unresolved initial
+/// claim attempt.  It is a transaction-owned release recovery record that pins
+/// the original protected Powder scope across Captain or Project replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingDispatchRelease {
+    pub crew_session_id: String,
+    pub project_id: String,
+    pub connection_profile: String,
+    /// HMAC-SHA-256 identity of the normalized protected profile base URL.
+    ///
+    /// The URL itself can carry gateway credentials in its path, query, or
+    /// fragment, so it must never be durable registry or sync state.
+    pub connection_endpoint_identity: String,
+    pub repository: String,
+    pub card_id: String,
+    pub run_id: String,
+    pub agent: String,
+    pub operation_id: String,
+    pub created_at: u64,
+    pub state: PendingDispatchReleaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingDispatchReleaseState {
+    /// Local cleanup is durable, but no release POST has been sent.
+    Prepared,
+    /// The exact release POST may have reached Powder but no trusted receipt exists.
+    InFlight,
+    /// A returned release error was recorded after an in-flight attempt.
+    Ambiguous,
+}
+
+/// Recovery records are loaded before any remote Powder call.
+/// Keep their identifiers as strict as the protected request identities they
+/// will later authorize, so malformed persistence cannot select a scope.
+fn is_canonical_dispatch_recovery_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn is_canonical_dispatch_recovery_endpoint_identity(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("hmac-sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Detect release-record fields an older or foreign writer could have added
+/// before serde deserializes the snapshot.  A raw endpoint must be treated as
+/// incompatible state, not as recoverable corruption, because it can identify
+/// an exact outstanding remote claim.
+fn releases_contain_unknown_fields(snapshot: &Value) -> bool {
+    const FIELDS: &[&str] = &[
+        "crewSessionId",
+        "projectId",
+        "connectionProfile",
+        "connectionEndpointIdentity",
+        "repository",
+        "cardId",
+        "runId",
+        "agent",
+        "operationId",
+        "createdAt",
+        "state",
+    ];
+    snapshot
+        .get("pendingDispatchReleases")
+        .and_then(Value::as_array)
+        .is_some_and(|releases| {
+            releases.iter().any(|release| {
+                release.as_object().is_none_or(|fields| {
+                    fields.keys().any(|field| !FIELDS.contains(&field.as_str()))
+                })
+            })
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowderMutationKind {
+    WorkLogAppend,
+    CriterionReview,
+    Completion,
+}
+
+impl PowderMutationKind {
+    fn command_label(self) -> &'static str {
+        match self {
+            Self::WorkLogAppend => "Powder work-log append",
+            Self::CriterionReview => "Powder criterion review",
+            Self::Completion => "Powder completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowderMutationTerminalState {
+    Conflict,
+    Expired,
+    Rejected,
+    Stale,
+}
+
+impl PowderMutationTerminalState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Expired => "expired",
+            Self::Rejected => "rejected",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn disposition(self) -> &'static str {
+        match self {
+            Self::Conflict => "the run is stale, released, or reclaimed",
+            Self::Expired => "the claim expired",
+            Self::Rejected => "the exact run-bound operation was rejected",
+            Self::Stale => "the exact run is no longer authoritative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderMutationTerminalRejection {
+    pub state: PowderMutationTerminalState,
+    pub recorded_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderMutationIntent {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub payload_digest: String,
+    /// Powder's exact canonical request digest for operation-status recovery.
+    ///
+    /// Schema-v1 intents remain readable for honest historical retention, but
+    /// cannot be mutated or reconciled without an exact caller replay upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powder_request_digest: Option<String>,
+    pub repository: String,
+    pub card_id: String,
+    pub expected_run_id: String,
+    pub mutation_kind: PowderMutationKind,
+    pub requested_by: String,
+    pub created_at: u64,
+    /// A definitive authoritative rejection recorded atomically with release of
+    /// the active mutation slot. Exact replay remains local and stable, while a
+    /// different operation may replace this bounded tombstone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_rejection: Option<PowderMutationTerminalRejection>,
+}
+
+const POWDER_MUTATION_INTENT_SCHEMA_VERSION: u32 = 3;
+const POWDER_OPERATION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+fn valid_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_powder_request_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(valid_lower_hex_digest)
+}
+
+fn validate_powder_mutation_intent(
+    crew_session_id: &str,
+    work: &PowderWorkBinding,
+    intent: &PowderMutationIntent,
+) -> Result<(), String> {
+    let request_digest_is_valid = match intent.schema_version {
+        1 => intent.powder_request_digest.is_none() && intent.terminal_rejection.is_none(),
+        2 => {
+            intent
+                .powder_request_digest
+                .as_deref()
+                .is_some_and(valid_powder_request_digest)
+                && intent.terminal_rejection.is_none()
+        }
+        POWDER_MUTATION_INTENT_SCHEMA_VERSION => intent
+            .powder_request_digest
+            .as_deref()
+            .is_some_and(valid_powder_request_digest),
+        _ => false,
+    };
+    let terminal_rejection_is_valid = intent.terminal_rejection.as_ref().is_none_or(|rejection| {
+        rejection.recorded_at > 0 && rejection.recorded_at >= intent.created_at
+    });
+    if !request_digest_is_valid
+        || !terminal_rejection_is_valid
+        || powder::validate_operation_id(&intent.operation_id).is_err()
+        || intent.repository.trim().is_empty()
+        || intent.card_id != work.card_id
+        || intent.expected_run_id != work.run_id
+        || intent.requested_by.trim().is_empty()
+        || intent.created_at == 0
+        || !valid_lower_hex_digest(&intent.payload_digest)
+    {
+        return Err(format!(
+            "Crew '{crew_session_id}' has an invalid Powder mutation intent"
+        ));
+    }
+    Ok(())
+}
+
+fn powder_mutation_request_digest(intent: &PowderMutationIntent) -> Result<&str, String> {
+    intent.powder_request_digest.as_deref().ok_or_else(|| {
+        format!(
+            "Powder operation '{}' uses a legacy mutation intent without Powder's canonical request digest; refusing mutation and cleanup until the exact operation is reconciled",
+            intent.operation_id
+        )
+    })
 }
 
 /// Durable T-Hub-side state for a Crew member's exact Powder run.
@@ -1007,10 +1282,7 @@ fn validate_completion_marker(
     timestamp: u64,
     state: &str,
 ) -> Result<(), String> {
-    let digest_is_valid = request_digest.len() == 64
-        && request_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    let digest_is_valid = valid_lower_hex_digest(request_digest);
     if !digest_is_valid || timestamp == 0 {
         return Err(format!(
             "Crew '{crew_session_id}' has an invalid Powder {state} completion marker"
@@ -1228,6 +1500,7 @@ pub type CaptainRecord = FleetIdentity;
 enum SnapshotReadError {
     Invalid(String),
     UnsupportedSchema { path: PathBuf, version: u32 },
+    IncompatibleRecovery { path: PathBuf },
 }
 
 impl std::fmt::Display for SnapshotReadError {
@@ -1237,6 +1510,11 @@ impl std::fmt::Display for SnapshotReadError {
             Self::UnsupportedSchema { path, version } => write!(
                 f,
                 "'{}' uses unsupported schemaVersion {version}",
+                path.display()
+            ),
+            Self::IncompatibleRecovery { path } => write!(
+                f,
+                "'{}' contains dispatch release recovery state incompatible with this T-Hub version",
                 path.display()
             ),
         }
@@ -1329,16 +1607,268 @@ pub struct CaptainsSnapshot {
     /// deserialize to an empty registry.
     #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    /// Initial claim attempts whose remote outcome remains unresolved.
+    #[serde(default)]
+    pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
+    /// Trusted post-bind release attempts whose remote outcome is ambiguous.
+    #[serde(default)]
+    pub pending_dispatch_releases: Vec<PendingDispatchRelease>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptainAuthorityProjection {
+    ship_slug: String,
+    role: FleetRole,
+    claude_uuid: Option<String>,
+    provider: Option<String>,
+    provider_session_id: Option<String>,
+    terminal_id: Option<String>,
+    project_id: Option<String>,
+    assignment: Option<String>,
+    harness: Option<String>,
+    conversation_id: Option<String>,
+    resume_point: Option<String>,
+    workspace_tab_ids: Vec<String>,
+    state: ClaimState,
+}
+
+impl From<&CaptainRecord> for CaptainAuthorityProjection {
+    fn from(captain: &CaptainRecord) -> Self {
+        Self {
+            ship_slug: captain.ship_slug.clone(),
+            role: captain.role,
+            claude_uuid: captain.claude_uuid.clone(),
+            provider: captain.provider.clone(),
+            provider_session_id: captain.provider_session_id.clone(),
+            terminal_id: captain.terminal_id.clone(),
+            project_id: captain.project_id.clone(),
+            assignment: captain.assignment.clone(),
+            harness: captain.harness.clone(),
+            conversation_id: captain.conversation_id.clone(),
+            resume_point: captain.resume_point.clone(),
+            workspace_tab_ids: captain.workspace_tab_ids.clone(),
+            state: captain.state.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrewAuthorityProjection {
+    ship_slug: String,
+    crew: CrewRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectAuthorityProjection {
+    project_id: String,
+    repo_root: String,
+    powder: Option<(String, String)>,
+}
+
+impl From<&ProjectRecord> for ProjectAuthorityProjection {
+    fn from(project: &ProjectRecord) -> Self {
+        Self {
+            project_id: project.project_id.clone(),
+            repo_root: project.repo_root.clone(),
+            powder: project.powder.as_ref().map(|binding| {
+                (
+                    binding.connection_profile.clone(),
+                    binding.repository.clone(),
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AuthorityGenerationChanges {
+    captains: Vec<String>,
+    crew: Vec<String>,
+    projects: Vec<String>,
+}
+
+impl AuthorityGenerationChanges {
+    fn between(previous: &CaptainsInner, candidate: &CaptainsInner) -> Self {
+        let captain_keys = previous
+            .captains
+            .iter()
+            .chain(candidate.captains.iter())
+            .map(|captain| captain.ship_slug.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let crew_keys = previous
+            .captains
+            .iter()
+            .chain(candidate.captains.iter())
+            .flat_map(|captain| captain.crew.iter())
+            .map(|crew| crew.terminal_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let project_keys = previous
+            .projects
+            .iter()
+            .chain(candidate.projects.iter())
+            .map(|project| project.project_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let captain_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .captains
+                .iter()
+                .find(|captain| captain.ship_slug == key)
+                .map(CaptainAuthorityProjection::from)
+        };
+        let crew_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .captains
+                .iter()
+                .flat_map(|captain| {
+                    captain
+                        .crew
+                        .iter()
+                        .filter(move |crew| crew.terminal_id == key)
+                        .map(move |crew| CrewAuthorityProjection {
+                            ship_slug: captain.ship_slug.clone(),
+                            crew: crew.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        let project_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .projects
+                .iter()
+                .find(|project| project.project_id == key)
+                .map(ProjectAuthorityProjection::from)
+        };
+
+        Self {
+            captains: captain_keys
+                .into_iter()
+                .filter(|key| {
+                    captain_projection(previous, key) != captain_projection(candidate, key)
+                })
+                .collect(),
+            crew: crew_keys
+                .into_iter()
+                .filter(|key| crew_projection(previous, key) != crew_projection(candidate, key))
+                .collect(),
+            projects: project_keys
+                .into_iter()
+                .filter(|key| {
+                    project_projection(previous, key) != project_projection(candidate, key)
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScopedAuthorityGeneration {
+    registry_epoch: u64,
+    captain: u64,
+    crew: u64,
+    project: u64,
+}
+
+/// The authority tuple captured before dispatch performs remote I/O.
+///
+/// This deliberately carries the original Captain and Project values instead of
+/// a later snapshot.  A Crew bind may add its own Crew generation, but it must
+/// never make a replacement Captain or Project become the expected authority.
+#[derive(Clone, Debug)]
+struct DispatchAuthority {
+    captain: CaptainRecord,
+    project: ProjectRecord,
+    generation: ScopedAuthorityGeneration,
+    caller: Option<ResolvedIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchBindAuthority {
+    crew_generation: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AuthorityGenerations {
+    clock: u64,
+    captains: std::collections::HashMap<String, u64>,
+    crew: std::collections::HashMap<String, u64>,
+    projects: std::collections::HashMap<String, u64>,
+}
+
+impl AuthorityGenerations {
+    fn advance(&mut self, changes: AuthorityGenerationChanges) -> Result<(), String> {
+        for key in changes.captains {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Captain authority generation exhausted")?;
+            self.captains.insert(key, self.clock);
+        }
+        for key in changes.crew {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Crew authority generation exhausted")?;
+            self.crew.insert(key, self.clock);
+        }
+        for key in changes.projects {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Project authority generation exhausted")?;
+            self.projects.insert(key, self.clock);
+        }
+        Ok(())
+    }
+
+    fn scoped(
+        &self,
+        registry_epoch: u64,
+        ship_slug: &str,
+        crew_session_id: &str,
+        project_id: &str,
+    ) -> ScopedAuthorityGeneration {
+        ScopedAuthorityGeneration {
+            registry_epoch,
+            captain: self.captains.get(ship_slug).copied().unwrap_or(0),
+            crew: self.crew.get(crew_session_id).copied().unwrap_or(0),
+            project: self.projects.get(project_id).copied().unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     projects: Vec<ProjectRecord>,
+    pending_dispatch_claims: Vec<PendingDispatchClaim>,
+    pending_dispatch_releases: Vec<PendingDispatchRelease>,
     /// Monotonic revision, bumped on every accepted mutation - the same
     /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
     /// monotonic across app restarts.
     seq: u64,
+    /// Internal non-ABA versions for exact historical Powder authority scopes.
+    /// These are intentionally not serialized: a process restart destroys every
+    /// in-flight request, and the registry epoch makes tokens from another loaded
+    /// instance invalid while new requests start from the loaded durable state.
+    authority_generations: AuthorityGenerations,
+}
+
+static NEXT_AUTHORITY_REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+struct DispatchBarrier {
+    boundary: &'static str,
+    reached: std::sync::mpsc::SyncSender<&'static str>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+fn next_authority_registry_epoch() -> u64 {
+    NEXT_AUTHORITY_REGISTRY_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("authority registry epoch exhausted")
 }
 
 /// The CORE's authoritative captains registry (captain-chat phase 2).
@@ -1356,6 +1886,9 @@ struct CaptainsInner {
 /// state-file write never wedges a reader on the registry lock.
 pub struct CaptainsRegistry {
     inner: Mutex<CaptainsInner>,
+    /// Unique in-process identity for this loaded registry instance. No request
+    /// can carry an authority token through replacement or restart of the store.
+    authority_epoch: u64,
     /// Serializes mutations so a candidate is published in memory only after its
     /// durable write succeeds, without racing another accepted mutation.
     mutation: Mutex<()>,
@@ -1371,6 +1904,10 @@ pub struct CaptainsRegistry {
     powder_operation_ready: Condvar,
     #[cfg(test)]
     powder_operation_wait_hook: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
+    #[cfg(test)]
+    historical_scope_capture_hook: Mutex<Option<HistoricalScopeCaptureHook>>,
+    #[cfg(test)]
+    dispatch_barrier: Mutex<Option<DispatchBarrier>>,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
     /// Set when a newer on-disk schema is encountered. The old binary may expose
@@ -1392,22 +1929,27 @@ pub struct CaptainsRegistry {
     /// blocked by it. `None` in every non-test path.
     #[cfg(test)]
     persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only deterministic failure after a complete previous snapshot is on
+    /// disk. This proves recovery keeps the last durable release state instead
+    /// of relying on an in-memory transition.
+    #[cfg(test)]
+    fail_next_persist: Mutex<Option<String>>,
 }
 
 struct CrewPowderOperationGuard<'a> {
     registry: &'a CaptainsRegistry,
     crew_session_id: String,
-    waited_for_completion: bool,
 }
 
-impl CrewPowderOperationGuard<'_> {
-    fn waited_for_completion(&self) -> bool {
-        self.waited_for_completion
-    }
+#[cfg(test)]
+struct HistoricalScopeCaptureHook {
+    authenticated: std::sync::mpsc::SyncSender<String>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrewPowderOperationKind {
+    Mutation,
     Completion,
     Cleanup,
     Renewal,
@@ -1447,6 +1989,30 @@ fn slugify_ship(name: &str) -> String {
 }
 
 impl CaptainsRegistry {
+    #[cfg(test)]
+    fn pause_dispatch(&self, boundary: &'static str) -> bool {
+        let mut configured = self.dispatch_barrier.lock().unwrap();
+        let barrier = configured.take();
+        if barrier
+            .as_ref()
+            .is_some_and(|configured_barrier| configured_barrier.boundary != boundary)
+        {
+            *configured = barrier;
+            return true;
+        }
+        drop(configured);
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached.send(boundary);
+            barrier.resume.recv().is_ok()
+        } else {
+            true
+        }
+    }
+
+    #[cfg(test)]
+    fn set_dispatch_barrier(&self, barrier: Option<DispatchBarrier>) {
+        *self.dispatch_barrier.lock().unwrap() = barrier;
+    }
     fn serialize_crew_powder_operation(
         &self,
         crew_session_id: &str,
@@ -1456,11 +2022,9 @@ impl CaptainsRegistry {
             .powder_operations_inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut waited_for_completion = false;
         #[cfg(test)]
         let mut wait_hook_notified = false;
-        while let Some(inflight_operation) = inflight.get(crew_session_id).copied() {
-            waited_for_completion |= inflight_operation == CrewPowderOperationKind::Completion;
+        while inflight.contains_key(crew_session_id) {
             #[cfg(test)]
             if !wait_hook_notified {
                 if let Some(hook) = self
@@ -1482,7 +2046,6 @@ impl CaptainsRegistry {
         CrewPowderOperationGuard {
             registry: self,
             crew_session_id: crew_session_id.to_string(),
-            waited_for_completion,
         }
     }
 
@@ -1490,23 +2053,32 @@ impl CaptainsRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CaptainsInner::default()),
+            authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
             #[cfg(test)]
             powder_operation_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            historical_scope_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_barrier: Mutex::new(None),
             path: None,
             write_blocked: None,
             persist: Mutex::new(0),
             #[cfg(test)]
             persist_hook: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_persist: Mutex::new(None),
         }
     }
 
     /// Load the registry from `path`, falling back to the last validated backup
     /// and quarantining a corrupt primary. A first run with no files starts empty;
-    /// an unrecoverable corrupt file is reported before starting empty.
+    /// an unrecoverable corrupt file is reported before starting empty. An
+    /// incompatible dispatch-release recovery is different from corruption: both
+    /// primary and backup bytes are preserved and every mutation is blocked.
     pub fn load(path: PathBuf) -> Self {
         let backup = path.with_extension("json.bak");
         let primary = if !path.exists() && !backup.exists() {
@@ -1515,6 +2087,8 @@ impl CaptainsRegistry {
                 seq: 0,
                 captains: Vec::new(),
                 projects: Vec::new(),
+                pending_dispatch_claims: Vec::new(),
+                pending_dispatch_releases: Vec::new(),
             })
         } else {
             Self::read_snapshot(&path)
@@ -1522,6 +2096,15 @@ impl CaptainsRegistry {
         let backup_probe = backup.exists().then(|| Self::read_snapshot(&backup));
         let mut recovered_from_backup = false;
         let mut write_blocked = None;
+        let incompatible_recovery = match (&primary, &backup_probe) {
+            (Err(error @ SnapshotReadError::IncompatibleRecovery { .. }), _) => {
+                Some(error.to_string())
+            }
+            (_, Some(Err(error @ SnapshotReadError::IncompatibleRecovery { .. }))) => {
+                Some(error.to_string())
+            }
+            _ => None,
+        };
         let future_schema = match (&primary, &backup_probe) {
             (Err(error @ SnapshotReadError::UnsupportedSchema { .. }), _) => {
                 Some(error.to_string())
@@ -1531,7 +2114,14 @@ impl CaptainsRegistry {
             }
             _ => None,
         };
-        let loaded = if let Some(reason) = future_schema {
+        let loaded = if let Some(reason) = incompatible_recovery {
+            // A legacy or unknown recovery record can name an exact remote claim.
+            // Never use an older backup, quarantine either copy, or expose a
+            // partially loaded registry that could redispatch it.  Explicit safe
+            // handling is required before any local or remote action resumes.
+            write_blocked = Some(reason.clone());
+            Err(SnapshotReadError::IncompatibleRecovery { path: path.clone() })
+        } else if let Some(reason) = future_schema {
             // Either file may be the last copy written by a newer T-Hub. Preserve
             // both byte-for-byte and block every write. A supported primary remains
             // readable, but an unsupported primary is never replaced by an older
@@ -1593,7 +2183,10 @@ impl CaptainsRegistry {
                 CaptainsInner {
                     captains,
                     projects: snap.projects,
+                    pending_dispatch_claims: snap.pending_dispatch_claims,
+                    pending_dispatch_releases: snap.pending_dispatch_releases,
                     seq: snap.seq,
+                    authority_generations: AuthorityGenerations::default(),
                 }
             })
             .unwrap_or_default();
@@ -1604,17 +2197,24 @@ impl CaptainsRegistry {
         let loaded_seq = inner.seq;
         Self {
             inner: Mutex::new(inner),
+            authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
             #[cfg(test)]
             powder_operation_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            historical_scope_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_barrier: Mutex::new(None),
             path: Some(path),
             write_blocked,
             persist: Mutex::new(loaded_seq),
             #[cfg(test)]
             persist_hook: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_persist: Mutex::new(None),
         }
     }
 
@@ -1622,8 +2222,39 @@ impl CaptainsRegistry {
         let body = std::fs::read_to_string(path).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' could not be read: {error}", path.display()))
         })?;
-        let snapshot: CaptainsSnapshot = serde_json::from_str(&body).map_err(|error| {
+        let document: Value = serde_json::from_str(&body).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
+        })?;
+        let schema_version = document
+            .get("schemaVersion")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if schema_version > CAPTAINS_SCHEMA_VERSION as u64 {
+            return Err(SnapshotReadError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                version: schema_version as u32,
+            });
+        }
+        let has_release_recovery = document
+            .get("pendingDispatchReleases")
+            .and_then(Value::as_array)
+            .is_some_and(|releases| !releases.is_empty());
+        if has_release_recovery
+            && (schema_version < CAPTAINS_SCHEMA_VERSION as u64
+                || releases_contain_unknown_fields(&document))
+        {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        let snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
+            if has_release_recovery {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
+            }
         })?;
         if snapshot.schema_version > CAPTAINS_SCHEMA_VERSION {
             return Err(SnapshotReadError::UnsupportedSchema {
@@ -1631,7 +2262,15 @@ impl CaptainsRegistry {
                 version: snapshot.schema_version,
             });
         }
-        Self::validate_snapshot(&snapshot).map_err(SnapshotReadError::Invalid)?;
+        Self::validate_snapshot(&snapshot).map_err(|error| {
+            if has_release_recovery {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SnapshotReadError::Invalid(error)
+            }
+        })?;
         Ok(snapshot)
     }
 
@@ -1676,6 +2315,62 @@ impl CaptainsRegistry {
                         project.project_id
                     ));
                 }
+            }
+        }
+        let mut pending_claim_scopes = std::collections::HashSet::new();
+        for intent in &snapshot.pending_dispatch_claims {
+            if intent.project_id.trim().is_empty()
+                || intent.connection_profile.trim().is_empty()
+                || intent.repository.trim().is_empty()
+                || intent.card_id.trim().is_empty()
+                || intent.configured_agent.trim().is_empty()
+                || intent.operation_id.trim().is_empty()
+            {
+                return Err(
+                    "captains registry contains an incomplete pending dispatch claim".into(),
+                );
+            }
+            if !pending_claim_scopes.insert((
+                intent.connection_profile.as_str(),
+                intent.repository.as_str(),
+                intent.card_id.as_str(),
+            )) {
+                return Err(
+                    "captains registry contains duplicate pending dispatch claim scope".into(),
+                );
+            }
+        }
+        let mut pending_release_crews = std::collections::HashSet::new();
+        let mut pending_release_claims = std::collections::HashSet::new();
+        for recovery in &snapshot.pending_dispatch_releases {
+            if !is_canonical_dispatch_recovery_identity(&recovery.crew_session_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.project_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.connection_profile)
+                || !is_canonical_dispatch_recovery_endpoint_identity(
+                    &recovery.connection_endpoint_identity,
+                )
+                || !is_canonical_dispatch_recovery_identity(&recovery.repository)
+                || !is_canonical_dispatch_recovery_identity(&recovery.card_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.run_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.agent)
+                || !is_canonical_dispatch_recovery_identity(&recovery.operation_id)
+            {
+                return Err(
+                    "captains registry contains an incomplete pending dispatch release".into(),
+                );
+            }
+            if !pending_release_crews.insert(recovery.crew_session_id.as_str())
+                || !pending_release_claims.insert((
+                    recovery.connection_profile.as_str(),
+                    recovery.repository.as_str(),
+                    recovery.card_id.as_str(),
+                    recovery.run_id.as_str(),
+                    recovery.agent.as_str(),
+                ))
+            {
+                return Err(
+                    "captains registry contains duplicate pending dispatch release recovery".into(),
+                );
             }
         }
         let mut ships = std::collections::HashSet::new();
@@ -1797,6 +2492,19 @@ impl CaptainsRegistry {
                             crew.terminal_id
                         ));
                     }
+                    if work
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| agent.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "Crew '{}' has an empty Powder agent identity",
+                            crew.terminal_id
+                        ));
+                    }
+                    if let Some(intent) = &work.mutation_intent {
+                        validate_powder_mutation_intent(&crew.terminal_id, work, intent)?;
+                    }
                     match &work.state {
                         PowderWorkState::Active => {}
                         PowderWorkState::CompletionPending {
@@ -1822,6 +2530,70 @@ impl CaptainsRegistry {
                             )?;
                         }
                     }
+                }
+            }
+        }
+        if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
+            && !snapshot.pending_dispatch_releases.is_empty()
+        {
+            return Err(
+                "captains registry release recovery requires schema version 13 or newer".into(),
+            );
+        }
+        for recovery in &snapshot.pending_dispatch_releases {
+            let matches = snapshot
+                .captains
+                .iter()
+                .filter(|captain| {
+                    captain.project_id.as_deref() == Some(recovery.project_id.as_str())
+                })
+                .flat_map(|captain| {
+                    captain
+                        .crew
+                        .iter()
+                        .filter(move |crew| crew.terminal_id == recovery.crew_session_id)
+                })
+                .filter(|crew| {
+                    matches!(crew.state, CrewState::CleanupPending { .. })
+                        && crew.powder_work.as_ref().is_some_and(|work| {
+                            work.card_id == recovery.card_id
+                                && work.run_id == recovery.run_id
+                                && work.agent.as_deref() == Some(recovery.agent.as_str())
+                                && work.dispatch_release_recovery
+                        })
+                })
+                .count();
+            if matches != 1 {
+                return Err(format!(
+                    "pending dispatch release for Crew '{}' lacks exactly one matching CleanupPending Crew binding",
+                    recovery.crew_session_id
+                ));
+            }
+        }
+        for captain in &snapshot.captains {
+            for crew in &captain.crew {
+                let Some(work) = &crew.powder_work else {
+                    continue;
+                };
+                if !work.dispatch_release_recovery {
+                    continue;
+                }
+                let matches = snapshot
+                    .pending_dispatch_releases
+                    .iter()
+                    .filter(|recovery| {
+                        captain.project_id.as_deref() == Some(recovery.project_id.as_str())
+                            && recovery.crew_session_id == crew.terminal_id
+                            && recovery.card_id == work.card_id
+                            && recovery.run_id == work.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                    })
+                    .count();
+                if !matches!(crew.state, CrewState::CleanupPending { .. }) || matches != 1 {
+                    return Err(format!(
+                        "Crew '{}' has an orphaned frozen-scope dispatch release recovery",
+                        crew.terminal_id
+                    ));
                 }
             }
         }
@@ -1875,6 +2647,8 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            pending_dispatch_claims: g.pending_dispatch_claims.clone(),
+            pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
     }
 
@@ -1951,6 +2725,10 @@ impl CaptainsRegistry {
         #[cfg(test)]
         if let Some(hook) = self.persist_hook.lock().unwrap().as_ref() {
             hook();
+        }
+        #[cfg(test)]
+        if let Some(reason) = self.fail_next_persist.lock().unwrap().take() {
+            return Err(reason);
         }
         let body = serde_json::to_vec_pretty(&snap)
             .map_err(|error| format!("captains registry serialize failed: {error}"))?;
@@ -2035,10 +2813,13 @@ impl CaptainsRegistry {
         mut current: std::sync::MutexGuard<'_, CaptainsInner>,
         previous: CaptainsInner,
     ) -> Result<(), String> {
-        let candidate = current.clone();
-        let snap = Self::snapshot_for_persist(&candidate);
+        let mut candidate = current.clone();
+        let generation_changes = AuthorityGenerationChanges::between(&previous, &candidate);
+        let generation_result = candidate.authority_generations.advance(generation_changes);
         *current = previous;
         drop(current);
+        generation_result?;
+        let snap = Self::snapshot_for_persist(&candidate);
         Self::validate_snapshot(&snap)?;
         self.persist(snap)?;
         *self.lock() = candidate;
@@ -2051,6 +2832,11 @@ impl CaptainsRegistry {
         *self.persist_hook.lock().unwrap() = Some(hook);
     }
 
+    #[cfg(test)]
+    fn fail_next_persist(&self, reason: impl Into<String>) {
+        *self.fail_next_persist.lock().unwrap() = Some(reason.into());
+    }
+
     /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
     pub fn snapshot(&self) -> CaptainsSnapshot {
         let g = self.lock();
@@ -2059,7 +2845,257 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            pending_dispatch_claims: g.pending_dispatch_claims.clone(),
+            pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
+    }
+
+    fn pending_dispatch_claim(
+        &self,
+        connection_profile: &str,
+        repository: &str,
+        card_id: &str,
+    ) -> Option<PendingDispatchClaim> {
+        self.lock()
+            .pending_dispatch_claims
+            .iter()
+            .find(|intent| {
+                intent.connection_profile == connection_profile
+                    && intent.repository == repository
+                    && intent.card_id == card_id
+            })
+            .cloned()
+    }
+
+    fn begin_pending_dispatch_claim(&self, intent: PendingDispatchClaim) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current.pending_dispatch_claims.iter().find(|existing| {
+            existing.connection_profile == intent.connection_profile
+                && existing.repository == intent.repository
+                && existing.card_id == intent.card_id
+        }) {
+            if existing == &intent {
+                return Ok(());
+            }
+            return Err(format!(
+                "dispatch_crew: Powder card '{}' already has an unresolved initial claim attempt; reconcile it before redispatching",
+                intent.card_id
+            ));
+        }
+        let previous = current.clone();
+        current.pending_dispatch_claims.push(intent);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn clear_pending_dispatch_claim(&self, intent: &PendingDispatchClaim) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let Some(position) = current
+            .pending_dispatch_claims
+            .iter()
+            .position(|existing| existing == intent)
+        else {
+            return Ok(false);
+        };
+        let previous = current.clone();
+        current.pending_dispatch_claims.remove(position);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(true)
+    }
+
+    /// Persist a trusted release-recovery record and retain only the exact Crew
+    /// binding that owns it.  This deliberately does not inspect the Captain's
+    /// current Project or Powder binding: both may have been replaced after the
+    /// dispatch captured its authority.
+    fn prepare_dispatch_release(&self, recovery: PendingDispatchRelease) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current
+            .pending_dispatch_releases
+            .iter()
+            .find(|existing| existing.crew_session_id == recovery.crew_session_id)
+        {
+            if existing == &recovery && existing.state == PendingDispatchReleaseState::Prepared {
+                return Ok(());
+            }
+            return Err(format!(
+                "Crew session '{}' already has a different pending dispatch release recovery",
+                recovery.crew_session_id
+            ));
+        }
+        let previous = current.clone();
+        let crew = current
+            .captains
+            .iter_mut()
+            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
+            .flat_map(|captain| captain.crew.iter_mut())
+            .find(|crew| crew.terminal_id == recovery.crew_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "trusted release recovery refused because Crew session '{}' is no longer durable",
+                    recovery.crew_session_id
+                )
+            })?;
+        let work = crew.powder_work.as_mut().ok_or_else(|| {
+            format!(
+                "trusted release recovery refused because Crew session '{}' has no Powder binding",
+                recovery.crew_session_id
+            )
+        })?;
+        if work.card_id != recovery.card_id
+            || work.run_id != recovery.run_id
+            || work.agent.as_deref() != Some(recovery.agent.as_str())
+        {
+            return Err(format!(
+                "trusted release recovery refused because Crew session '{}' no longer owns the exact claim",
+                recovery.crew_session_id
+            ));
+        }
+        if !matches!(crew.state, CrewState::CleanupPending { .. }) {
+            crew.state = CrewState::CleanupPending { since: now_ms() };
+        }
+        work.dispatch_release_recovery = true;
+        current.pending_dispatch_releases.push(recovery);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn transition_dispatch_release(
+        &self,
+        recovery: &PendingDispatchRelease,
+        expected: PendingDispatchReleaseState,
+        next: PendingDispatchReleaseState,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let record = current
+            .pending_dispatch_releases
+            .iter_mut()
+            .find(|existing| {
+                existing.crew_session_id == recovery.crew_session_id
+                    && existing.project_id == recovery.project_id
+                    && existing.connection_profile == recovery.connection_profile
+                    && existing.connection_endpoint_identity
+                        == recovery.connection_endpoint_identity
+                    && existing.repository == recovery.repository
+                    && existing.card_id == recovery.card_id
+                    && existing.run_id == recovery.run_id
+                    && existing.agent == recovery.agent
+                    && existing.operation_id == recovery.operation_id
+            })
+            .ok_or("trusted dispatch release recovery is no longer durable")?;
+        if record.state != expected {
+            return Err("trusted dispatch release recovery is in an unexpected state".into());
+        }
+        record.state = next;
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn pending_dispatch_release(&self, crew_session_id: &str) -> Option<PendingDispatchRelease> {
+        self.lock()
+            .pending_dispatch_releases
+            .iter()
+            .find(|recovery| recovery.crew_session_id == crew_session_id)
+            .cloned()
+    }
+
+    /// Clear a confirmed release recovery and only its transaction-owned Crew
+    /// binding.  A replacement Captain or Crew is never removed by this path.
+    fn clear_confirmed_dispatch_release(
+        &self,
+        recovery: &PendingDispatchRelease,
+    ) -> Result<(bool, bool), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let Some(position) = current
+            .pending_dispatch_releases
+            .iter()
+            .position(|existing| {
+                existing.crew_session_id == recovery.crew_session_id
+                    && existing.project_id == recovery.project_id
+                    && existing.connection_profile == recovery.connection_profile
+                    && existing.connection_endpoint_identity
+                        == recovery.connection_endpoint_identity
+                    && existing.repository == recovery.repository
+                    && existing.card_id == recovery.card_id
+                    && existing.run_id == recovery.run_id
+                    && existing.agent == recovery.agent
+                    && existing.operation_id == recovery.operation_id
+            })
+        else {
+            return Ok((false, false));
+        };
+        let owned_crew_count = current
+            .captains
+            .iter()
+            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
+            .flat_map(|captain| captain.crew.iter())
+            .filter(|crew| {
+                crew.terminal_id == recovery.crew_session_id
+                    && matches!(crew.state, CrewState::CleanupPending { .. })
+                    && crew.powder_work.as_ref().is_some_and(|work| {
+                        work.card_id == recovery.card_id
+                            && work.run_id == recovery.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                            && work.dispatch_release_recovery
+                    })
+            })
+            .count();
+        if owned_crew_count != 1 {
+            return Err(format!(
+                "exact release recovery for Crew '{}' no longer has one transaction-owned CleanupPending binding",
+                recovery.crew_session_id
+            ));
+        }
+        let previous = current.clone();
+        current.pending_dispatch_releases.remove(position);
+        let mut crew_removed = false;
+        for captain in &mut current.captains {
+            if captain.project_id.as_deref() != Some(recovery.project_id.as_str()) {
+                continue;
+            }
+            let before = captain.crew.len();
+            captain.crew.retain(|crew| {
+                let transaction_owned = crew.terminal_id == recovery.crew_session_id
+                    && matches!(crew.state, CrewState::CleanupPending { .. })
+                    && crew.powder_work.as_ref().is_some_and(|work| {
+                        work.card_id == recovery.card_id
+                            && work.run_id == recovery.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                            && work.dispatch_release_recovery
+                    });
+                !transaction_owned
+            });
+            crew_removed |= captain.crew.len() != before;
+        }
+        debug_assert!(crew_removed, "validated transaction Crew must be removed");
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok((true, crew_removed))
+    }
+
+    /// Capture durable registry values and their internal authority versions under
+    /// one lock. The returned copies are safe to carry across remote I/O without
+    /// holding either the registry lock or the mutation serializer.
+    fn snapshot_with_authority_generations(&self) -> (CaptainsSnapshot, AuthorityGenerations, u64) {
+        let g = self.lock();
+        (
+            CaptainsSnapshot {
+                schema_version: CAPTAINS_SCHEMA_VERSION,
+                seq: g.seq,
+                captains: g.captains.clone(),
+                projects: g.projects.clone(),
+                pending_dispatch_claims: g.pending_dispatch_claims.clone(),
+                pending_dispatch_releases: g.pending_dispatch_releases.clone(),
+            },
+            g.authority_generations.clone(),
+            self.authority_epoch,
+        )
     }
 
     /// Return the durable project registry without exposing the registry lock.
@@ -2246,6 +3282,31 @@ impl CaptainsRegistry {
         branch: Option<&str>,
         powder_work: PowderWorkBinding,
     ) -> Result<CrewRef, String> {
+        self.bind_crew_context_exact(
+            captain_session_id,
+            crew_session_id,
+            task,
+            harness,
+            worktree_path,
+            branch,
+            powder_work,
+            None,
+            None,
+        )
+    }
+
+    fn bind_crew_context_exact(
+        &self,
+        captain_session_id: &str,
+        crew_session_id: &str,
+        task: &str,
+        harness: &str,
+        worktree_path: Option<&str>,
+        branch: Option<&str>,
+        powder_work: PowderWorkBinding,
+        expected_dispatch: Option<&DispatchAuthority>,
+        expected_bind: Option<DispatchBindAuthority>,
+    ) -> Result<CrewRef, String> {
         if task.trim().is_empty() {
             return Err("crew task must not be empty".into());
         }
@@ -2253,6 +3314,39 @@ impl CaptainsRegistry {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
+        if let (Some(expected_dispatch), Some(expected_bind)) = (expected_dispatch, expected_bind) {
+            if captain_session_id
+                != expected_dispatch
+                    .captain
+                    .terminal_id
+                    .as_deref()
+                    .unwrap_or("")
+            {
+                return Err("acl: dispatch authority changed; refusing Crew bind".into());
+            }
+            let captain = g
+                .captains
+                .iter()
+                .find(|captain| captain.terminal_id.as_deref() == Some(captain_session_id))
+                .ok_or_else(|| format!("unknown Captain session '{captain_session_id}'"))?;
+            let current = g.authority_generations.scoped(
+                self.authority_epoch,
+                &expected_dispatch.captain.ship_slug,
+                crew_session_id,
+                &expected_dispatch.project.project_id,
+            );
+            if current.captain != expected_dispatch.generation.captain
+                || current.project != expected_dispatch.generation.project
+                || current.registry_epoch != expected_dispatch.generation.registry_epoch
+                || current.crew != expected_bind.crew_generation
+                || CaptainAuthorityProjection::from(captain)
+                    != CaptainAuthorityProjection::from(&expected_dispatch.captain)
+                || captain.project_id.as_deref()
+                    != Some(expected_dispatch.project.project_id.as_str())
+            {
+                return Err("acl: dispatch authority changed; refusing Crew bind".into());
+            }
+        }
         let captain = g
             .captains
             .iter_mut()
@@ -2295,6 +3389,12 @@ impl CaptainsRegistry {
     ) -> Result<CrewRef, String> {
         if !matches!(t_hub_capability, "read" | "control") {
             return Err("Crew T-Hub capability is invalid".into());
+        }
+        if attestation.permission != CREW_DEFAULT_PERMISSION {
+            return Err(format!(
+                "Crew Harness permission '{}' conflicts with the fleet default '{}'",
+                attestation.permission, CREW_DEFAULT_PERMISSION
+            ));
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
@@ -2371,6 +3471,382 @@ impl CaptainsRegistry {
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
         Ok(result)
+    }
+
+    fn compare_and_update_crew_claim_expiry(
+        &self,
+        expected: &CrewPowderScope,
+        expires_at: i64,
+    ) -> Result<CrewRef, String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        if !matches!(binding.state, PowderWorkState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder work is not active; refusing to renew completed work"
+            ));
+        }
+        if binding.claim_expires_at == Some(expires_at) {
+            return Ok(crew.clone());
+        }
+        binding.claim_expires_at = Some(expires_at);
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
+    /// Persist an exact Powder mutation intent before any remote write.
+    ///
+    /// Identical replay is idempotent. Reusing an operation id with any changed
+    /// identity or payload is a local conflict and cannot reach Powder.
+    fn begin_crew_powder_mutation(
+        &self,
+        expected: &CrewPowderScope,
+        mut intent: PowderMutationIntent,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        validate_powder_mutation_intent(crew_session_id, binding, &intent)?;
+        if intent.schema_version != POWDER_MUTATION_INTENT_SCHEMA_VERSION {
+            return Err("refusing to create a legacy Powder mutation intent".into());
+        }
+        let _ = powder_mutation_request_digest(&intent)?;
+        let requester_matches = match intent.mutation_kind {
+            PowderMutationKind::WorkLogAppend => intent.requested_by == crew_session_id,
+            PowderMutationKind::CriterionReview | PowderMutationKind::Completion => expected
+                .captain_terminal_id
+                .as_deref()
+                .is_some_and(|captain| intent.requested_by == captain),
+        };
+        if intent.repository != expected.binding.repository || !requester_matches {
+            return Err(format!(
+                "Crew '{crew_session_id}' Powder mutation intent conflicts with its authoritative repository or requester"
+            ));
+        }
+        if matches!(binding.state, PowderWorkState::Completed { .. }) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder work is already completed"
+            ));
+        }
+        let mut created = false;
+        let changed = match &binding.mutation_intent {
+            None => {
+                binding.mutation_intent = Some(intent);
+                created = true;
+                true
+            }
+            Some(existing) if existing.terminal_rejection.is_some() => {
+                if existing.operation_id == intent.operation_id {
+                    if existing.schema_version == intent.schema_version
+                        && existing.payload_digest == intent.payload_digest
+                        && existing.powder_request_digest == intent.powder_request_digest
+                        && existing.repository == intent.repository
+                        && existing.card_id == intent.card_id
+                        && existing.expected_run_id == intent.expected_run_id
+                        && existing.mutation_kind == intent.mutation_kind
+                        && existing.requested_by == intent.requested_by
+                    {
+                        return Err(powder_terminal_rejection_message(
+                            existing.mutation_kind,
+                            existing.terminal_rejection.as_ref().unwrap().state,
+                        ));
+                    }
+                    return Err(format!(
+                        "Powder operation '{}' conflicts with its durable terminal payload or identity",
+                        intent.operation_id
+                    ));
+                }
+                binding.mutation_intent = Some(intent);
+                created = true;
+                true
+            }
+            Some(existing) if existing.schema_version < POWDER_MUTATION_INTENT_SCHEMA_VERSION => {
+                if existing.operation_id == intent.operation_id
+                    && existing.payload_digest == intent.payload_digest
+                    && existing.repository == intent.repository
+                    && existing.card_id == intent.card_id
+                    && existing.expected_run_id == intent.expected_run_id
+                    && existing.mutation_kind == intent.mutation_kind
+                    && existing.requested_by == intent.requested_by
+                {
+                    intent.created_at = existing.created_at;
+                    binding.mutation_intent = Some(intent);
+                    true
+                } else if existing.operation_id == intent.operation_id {
+                    return Err(format!(
+                        "Powder operation '{}' conflicts with its durable payload or identity",
+                        intent.operation_id
+                    ));
+                } else {
+                    return Err(format!(
+                        "Crew session '{crew_session_id}' already has legacy Powder operation '{}' pending",
+                        existing.operation_id
+                    ));
+                }
+            }
+            Some(existing)
+                if existing.schema_version == intent.schema_version
+                    && existing.operation_id == intent.operation_id
+                    && existing.payload_digest == intent.payload_digest
+                    && existing.powder_request_digest == intent.powder_request_digest
+                    && existing.repository == intent.repository
+                    && existing.card_id == intent.card_id
+                    && existing.expected_run_id == intent.expected_run_id
+                    && existing.mutation_kind == intent.mutation_kind
+                    && existing.requested_by == intent.requested_by =>
+            {
+                false
+            }
+            Some(existing) if existing.operation_id == intent.operation_id => {
+                return Err(format!(
+                    "Powder operation '{}' conflicts with its durable payload or identity",
+                    intent.operation_id
+                ));
+            }
+            Some(existing) => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' already has Powder operation '{}' pending",
+                    existing.operation_id
+                ));
+            }
+        };
+        let result = crew.clone();
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok((result, created))
+    }
+
+    /// Clear only the exact authoritative mutation intent after convergence.
+    fn finish_crew_powder_mutation(
+        &self,
+        expected: &CrewPowderScope,
+        operation_id: &str,
+        payload_digest: &str,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        let changed = match &binding.mutation_intent {
+            Some(intent)
+                if intent.operation_id == operation_id
+                    && intent.payload_digest == payload_digest =>
+            {
+                binding.mutation_intent = None;
+                true
+            }
+            Some(_) => {
+                return Err(format!(
+                    "Powder operation '{operation_id}' does not match the durable mutation intent"
+                ));
+            }
+            None => false,
+        };
+        let result = crew.clone();
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok((result, changed))
+    }
+
+    /// Record one exact authoritative rejected or failed mutation.
+    ///
+    /// A rejected completion also restores Active in the same commit so a
+    /// corrected operation cannot remain stranded behind an obsolete marker.
+    fn record_crew_powder_terminal_rejection(
+        &self,
+        expected: &CrewPowderScope,
+        operation_id: &str,
+        payload_digest: &str,
+        state: PowderMutationTerminalState,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        let intent = binding.mutation_intent.as_ref().ok_or_else(|| {
+            format!("Powder operation '{operation_id}' has no durable mutation intent")
+        })?;
+        if intent.operation_id != operation_id || intent.payload_digest != payload_digest {
+            return Err(format!(
+                "Powder operation '{operation_id}' does not match the durable mutation intent"
+            ));
+        }
+        if let Some(rejection) = intent.terminal_rejection.as_ref() {
+            if rejection.state == state {
+                return Ok((crew.clone(), false));
+            }
+            return Err(format!(
+                "Powder operation '{operation_id}' already has a different durable terminal rejection"
+            ));
+        }
+        let mutation_kind = intent.mutation_kind;
+        if mutation_kind == PowderMutationKind::Completion {
+            match binding.state {
+                PowderWorkState::CompletionPending { .. } => {
+                    binding.state = PowderWorkState::Active;
+                }
+                PowderWorkState::Active => {}
+                PowderWorkState::Completed { .. } => {
+                    return Err(format!(
+                        "Crew session '{crew_session_id}' is already completed"
+                    ));
+                }
+            }
+        }
+        binding.mutation_intent.as_mut().unwrap().terminal_rejection =
+            Some(PowderMutationTerminalRejection {
+                state,
+                recorded_at: now_ms(),
+            });
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok((result, true))
+    }
+
+    fn begin_crew_powder_completion_for_scope(
+        &self,
+        expected: &CrewPowderScope,
+        request_digest: &str,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        validate_completion_marker(crew_session_id, request_digest, 1, "pending")?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        let changed = match &binding.state {
+            PowderWorkState::Active => {
+                binding.state = PowderWorkState::CompletionPending {
+                    request_digest: request_digest.to_string(),
+                    since: now_ms(),
+                };
+                true
+            }
+            PowderWorkState::CompletionPending {
+                request_digest: pending,
+                ..
+            } if pending == request_digest => false,
+            PowderWorkState::Completed {
+                request_digest: completed,
+                ..
+            } if completed == request_digest => false,
+            PowderWorkState::CompletionPending { .. } => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' has a different completion request pending"
+                ));
+            }
+            PowderWorkState::Completed { .. } => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' is already completed with different proof"
+                ));
+            }
+        };
+        let result = crew.clone();
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok((result, changed))
+    }
+
+    fn finish_crew_powder_completion_for_scope(
+        &self,
+        expected: &CrewPowderScope,
+        request_digest: &str,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        validate_completion_marker(crew_session_id, request_digest, 1, "completed")?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        let changed = match &binding.state {
+            PowderWorkState::CompletionPending {
+                request_digest: pending,
+                ..
+            } if pending == request_digest => {
+                binding.state = PowderWorkState::Completed {
+                    request_digest: request_digest.to_string(),
+                    completed_at: now_ms(),
+                };
+                binding.claim_expires_at = None;
+                true
+            }
+            PowderWorkState::Completed {
+                request_digest: completed,
+                ..
+            } if completed == request_digest => false,
+            PowderWorkState::Active => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' has no pending completion"
+                ));
+            }
+            PowderWorkState::CompletionPending { .. } => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' completion proof does not match the pending request"
+                ));
+            }
+            PowderWorkState::Completed { .. } => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' is already completed with different proof"
+                ));
+            }
+        };
+        let result = crew.clone();
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok((result, changed))
     }
 
     pub fn begin_crew_powder_completion(
@@ -2986,10 +4462,11 @@ impl CaptainsRegistry {
 
     /// Release a captaincy, addressed by terminal id OR ship slug (or the Cortana
     /// reserved slug). Unknown target is an error (strict - a silent no-op is how
-    /// state drifts). If crew REMAIN, the claim transitions to `Vacant` (re-claimable
-    /// by a new captain of the same ship, crew preserved) rather than hard-removing;
-    /// a childless claim is removed outright (§3.1 release row). Returns the record
-    /// as it stands after release.
+    /// state drifts). If live Crew or unresolved Powder work remain, the claim
+    /// transitions to `Vacant` (re-claimable by a new captain of the same ship,
+    /// complete Crew history preserved) rather than hard-removing. A claim whose
+    /// Crew are all Removed and carry no unresolved Powder obligation is removed
+    /// outright (§3.1 release row). Returns the record as it stands after release.
     pub fn release(&self, target: &str) -> Result<CaptainRecord, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
@@ -3004,14 +4481,22 @@ impl CaptainsRegistry {
                  terminalId + shipSlug of every claim)"
             ));
         };
-        let has_live_crew = g.captains[idx]
-            .crew
-            .iter()
-            .any(|cr| !matches!(cr.state, CrewState::Removed { .. }));
-        let released = if has_live_crew {
+        let requires_retention = g.captains[idx].crew.iter().any(|crew| {
+            !matches!(crew.state, CrewState::Removed { .. })
+                || crew.powder_work.as_ref().is_some_and(|work| {
+                    matches!(
+                        work.state,
+                        PowderWorkState::Active | PowderWorkState::CompletionPending { .. }
+                    )
+                })
+        });
+        let released = if requires_retention {
             let c = &mut g.captains[idx];
             c.state = ClaimState::Vacant;
             c.terminal_id = None;
+            c.provider_session_id = None;
+            c.conversation_id = None;
+            c.claude_uuid = None;
             c.clone()
         } else {
             g.captains.remove(idx)
@@ -3180,6 +4665,225 @@ impl CaptainsRegistry {
         None
     }
 
+    /// Resolve historical ownership only for cleanup of a stopped Crew terminal
+    /// that still has durable Powder work. Removed Crew intentionally remain
+    /// excluded from [`Self::ship_of`] so this cannot restore ordinary membership
+    /// or authorize any lifecycle operation other than exact Powder cleanup.
+    fn removed_crew_powder_ship(&self, tile: &str) -> Result<Option<String>, String> {
+        let g = self.lock();
+        let matches = g
+            .captains
+            .iter()
+            .flat_map(|captain| {
+                captain
+                    .crew
+                    .iter()
+                    .filter(|crew| {
+                        crew.terminal_id == tile
+                            && matches!(crew.state, CrewState::Removed { .. })
+                            && crew.powder_work.is_some()
+                    })
+                    .map(|_| captain.ship_slug.clone())
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [ship_slug] => Ok(Some(ship_slug.clone())),
+            _ => Err(format!(
+                "Crew session '{tile}' has ambiguous historical Powder ownership"
+            )),
+        }
+    }
+
+    /// Clear only an exact Active binding after Powder authoritatively confirms
+    /// its release. Pending/completed proof state and live Crew are never erased.
+    fn clear_released_crew_powder_binding(
+        &self,
+        crew_session_id: &str,
+        expected_card_id: &str,
+        expected_run_id: &str,
+    ) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let mut matches = g
+            .captains
+            .iter_mut()
+            .flat_map(|captain| captain.crew.iter_mut())
+            .filter(|crew| crew.terminal_id == crew_session_id)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(format!("unknown Crew session '{crew_session_id}'"));
+        }
+        if matches.len() > 1 {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+            ));
+        }
+        let crew = matches.pop().expect("one Crew match was checked");
+        if !matches!(crew.state, CrewState::Removed { .. }) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is not removed; refusing to clear its Powder binding"
+            ));
+        }
+        let Some(work) = crew.powder_work.as_ref() else {
+            return Ok(false);
+        };
+        if work.card_id != expected_card_id || work.run_id != expected_run_id {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder binding changed before released cleanup could be saved"
+            ));
+        }
+        if !matches!(work.state, PowderWorkState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder work is not active; refusing to erase completion recovery state"
+            ));
+        }
+        crew.powder_work = None;
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(true)
+    }
+
+    /// Compare and clear one historical binding only while every authority-bearing
+    /// part of the scope used for remote evidence is still exact. Remote reads stay
+    /// outside registry locks; this final durable mutation fails closed if ownership,
+    /// Project identity, Project Powder authority, or the Removed Crew row changed.
+    fn compare_and_clear_released_removed_crew_powder_binding(
+        &self,
+        expected: &CrewPowderScope,
+    ) -> Result<bool, String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let authenticated_captain_terminal_id = expected
+            .authenticated_captain_terminal_id
+            .as_deref()
+            .ok_or_else(|| {
+                format!(
+                    "Crew session '{crew_session_id}' historical scope has no authenticated Captain identity"
+                )
+            })?;
+        let expected_generation = expected.authority_generation.ok_or_else(|| {
+            format!("Crew session '{crew_session_id}' historical scope has no authority generation")
+        })?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let current_generation = g.authority_generations.scoped(
+            self.authority_epoch,
+            &expected.ship_slug,
+            crew_session_id,
+            &expected.project_id,
+        );
+        if current_generation != expected_generation {
+            return Err(format!(
+                "Crew session '{crew_session_id}' scoped authority generation changed while Powder release evidence was being read"
+            ));
+        }
+        let crew_matches = g
+            .captains
+            .iter()
+            .enumerate()
+            .flat_map(|(captain_index, captain)| {
+                captain
+                    .crew
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, crew)| crew.terminal_id == crew_session_id)
+                    .map(move |(crew_index, _)| (captain_index, crew_index))
+            })
+            .collect::<Vec<_>>();
+        let (captain_index, crew_index) = match crew_matches.as_slice() {
+            [] => return Err(format!("unknown Crew session '{crew_session_id}'")),
+            [entry] => *entry,
+            _ => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+                ));
+            }
+        };
+        let captain = &g.captains[captain_index];
+        let owner_matches = g
+            .captains
+            .iter()
+            .filter(|candidate| candidate.ship_slug == expected.ship_slug)
+            .count();
+        if owner_matches != 1
+            || captain.ship_slug != expected.ship_slug
+            || captain.role != expected.captain_role
+            || captain.terminal_id != expected.captain_terminal_id
+            || captain.terminal_id.as_deref() != Some(authenticated_captain_terminal_id)
+            || captain.state != ClaimState::Active
+            || expected.captain_state != ClaimState::Active
+            || captain.project_id.as_deref() != Some(expected.project_id.as_str())
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' historical Captain or Project ownership changed while Powder release evidence was being read"
+            ));
+        }
+        let project_matches = g
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, project)| project.project_id == expected.project_id)
+            .collect::<Vec<_>>();
+        let project_index = match project_matches.as_slice() {
+            [] => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' Project was removed while Powder release evidence was being read"
+                ));
+            }
+            [(project_index, _)] => *project_index,
+            _ => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' Project became ambiguous while Powder release evidence was being read"
+                ));
+            }
+        };
+        let project = &g.projects[project_index];
+        let project_root_matches = g
+            .projects
+            .iter()
+            .filter(|candidate| candidate.repo_root == expected.project_repo_root)
+            .count();
+        let binding = project.powder.as_ref().ok_or_else(|| {
+            format!(
+                "Crew session '{crew_session_id}' Project Powder binding was removed while release evidence was being read"
+            )
+        })?;
+        if project_root_matches != 1
+            || project.repo_root != expected.project_repo_root
+            || binding.connection_profile != expected.binding.connection_profile
+            || binding.repository != expected.binding.repository
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Project identity or Powder profile/repository changed while release evidence was being read"
+            ));
+        }
+        let crew = &g.captains[captain_index].crew[crew_index];
+        if crew != &expected.crew {
+            return Err(format!(
+                "Crew session '{crew_session_id}' historical row, state, or Powder binding changed while release evidence was being read"
+            ));
+        }
+        if !matches!(crew.state, CrewState::Removed { .. }) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is not removed; refusing to clear its Powder binding"
+            ));
+        }
+        let Some(work) = crew.powder_work.as_ref() else {
+            return Ok(false);
+        };
+        if work != &expected.work || !matches!(work.state, PowderWorkState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder card, run, or recovery state changed while release evidence was being read"
+            ));
+        }
+        g.captains[captain_index].crew[crew_index].powder_work = None;
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(true)
+    }
+
     /// Lifecycle transition for a closed/killed session (item-2 §2.4: death MARKS,
     /// it does not scrub - retiring the old `remove_session` C4 silent-leak). Two
     /// cases, both idempotent:
@@ -3281,6 +4985,97 @@ impl CaptainsRegistry {
             .powder_operation_wait_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    fn set_historical_scope_capture_hook(
+        &self,
+        authenticated: std::sync::mpsc::SyncSender<String>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .historical_scope_capture_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HistoricalScopeCaptureHook {
+            authenticated,
+            resume,
+        });
+    }
+
+    fn test_scoped_authority_generation(
+        &self,
+        ship_slug: &str,
+        crew_session_id: &str,
+        project_id: &str,
+    ) -> ScopedAuthorityGeneration {
+        self.lock().authority_generations.scoped(
+            self.authority_epoch,
+            ship_slug,
+            crew_session_id,
+            project_id,
+        )
+    }
+
+    fn test_remove_captain_and_project(
+        &self,
+        ship_slug: &str,
+        project_id: &str,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain_index = g
+            .captains
+            .iter()
+            .position(|captain| captain.ship_slug == ship_slug)
+            .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
+        let project_index = g
+            .projects
+            .iter()
+            .position(|project| project.project_id == project_id)
+            .ok_or_else(|| format!("unknown projectId '{project_id}'"))?;
+        g.captains.remove(captain_index);
+        g.projects.remove(project_index);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
+    }
+
+    fn test_restore_captain_and_project(
+        &self,
+        captain: CaptainRecord,
+        project: ProjectRecord,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        if g.captains
+            .iter()
+            .any(|candidate| candidate.ship_slug == captain.ship_slug)
+            || g.projects
+                .iter()
+                .any(|candidate| candidate.project_id == project.project_id)
+        {
+            return Err("test authority scope already exists".into());
+        }
+        g.projects.push(project);
+        g.captains.push(captain);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
+    }
+
+    fn pause_before_historical_scope_capture(&self, crew_session_id: &str) {
+        let mut hook = self
+            .historical_scope_capture_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(hook) = hook.take() else {
+            return;
+        };
+        hook.authenticated
+            .send(crew_session_id.to_string())
+            .expect("historical scope observer must still be available");
+        hook.resume
+            .recv_timeout(Duration::from_secs(4))
+            .expect("historical scope capture must be resumed before its deadline");
     }
 }
 
@@ -5069,7 +6864,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -5081,7 +6876,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
-        | "unwatch_fleet" | "append_crew_powder_work_log" | "complete_crew_powder"
+        | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
@@ -5415,32 +7210,206 @@ fn require_socket_identity(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetLifecycleAuthority {
+    terminal_id: String,
+    captain_terminal_id: String,
+    ship_slug: String,
+    project_id: Option<String>,
+    generation: ScopedAuthorityGeneration,
+}
+
 fn enforce_target_lifecycle_authority(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     target_terminal: &str,
-) -> Result<(), String> {
+) -> Result<Option<TargetLifecycleAuthority>, String> {
     if caller_is_apex(caller, trusted_internal) {
-        return Ok(());
+        return Ok(None);
     }
     let caller = caller.ok_or("acl: lifecycle mutation requires a session identity")?;
+    let target_terminal = target_terminal
+        .strip_prefix("th_")
+        .unwrap_or(target_terminal);
     if caller.tile.as_deref() == Some(target_terminal) {
-        return Ok(());
+        return Ok(None);
     }
-    let target_ship = ctx.captains.ship_of(target_terminal);
-    if caller.fleet_role == Some(FleetRole::Captain)
-        && target_ship
-            .as_ref()
-            .is_some_and(|target| caller.ship_slug.as_deref() == Some(target.ship_slug()))
-        && matches!(target_ship, Some(ShipMembership::Crew { .. }))
+    let caller_terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no terminal identity")?;
+    let caller_ship = caller
+        .ship_slug
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no ship identity")?;
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == target_terminal)
+        })
+        .collect::<Vec<_>>();
+    let owner = match owners.as_slice() {
+        [owner] => *owner,
+        _ => {
+            return Err(
+                "acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle"
+                    .into(),
+            );
+        }
+    };
+    let project_id = owner.project_id.clone();
+    if caller.fleet_role != Some(FleetRole::Captain)
+        || owner.role != FleetRole::Captain
+        || owner.state != ClaimState::Active
+        || owner.terminal_id.as_deref() != Some(caller_terminal_id)
+        || owner.ship_slug != caller_ship
     {
-        return Ok(());
+        return Err(
+            "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+                .into(),
+        );
     }
-    Err(
-        "acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle"
-            .into(),
-    )
+    Ok(Some(TargetLifecycleAuthority {
+        terminal_id: target_terminal.to_string(),
+        captain_terminal_id: caller_terminal_id.to_string(),
+        ship_slug: owner.ship_slug.clone(),
+        project_id: project_id.clone(),
+        generation: generations.scoped(
+            registry_epoch,
+            &owner.ship_slug,
+            target_terminal,
+            project_id.as_deref().unwrap_or(""),
+        ),
+    }))
+}
+
+fn revalidate_target_lifecycle_authority(
+    ctx: &ControlContext,
+    expected: &TargetLifecycleAuthority,
+) -> Result<(), String> {
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &expected.ship_slug,
+        &expected.terminal_id,
+        expected.project_id.as_deref().unwrap_or(""),
+    );
+    let owner = snapshot.captains.iter().find(|captain| {
+        captain
+            .crew
+            .iter()
+            .any(|crew| crew.terminal_id == expected.terminal_id)
+    });
+    if current_generation != expected.generation
+        || owner.is_none_or(|owner| {
+            owner.role != FleetRole::Captain
+                || owner.state != ClaimState::Active
+                || owner.terminal_id.as_deref() != Some(expected.captain_terminal_id.as_str())
+                || owner.ship_slug != expected.ship_slug
+                || owner.project_id != expected.project_id
+        })
+    {
+        return Err(format!(
+            "acl: Crew session '{}' lifecycle authority changed while the operation waited; retry from the current owning Captain",
+            expected.terminal_id
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedCaptainAuthority {
+    terminal_id: String,
+    ship_slug: String,
+    project_id: String,
+    generation: ScopedAuthorityGeneration,
+}
+
+fn enforce_removed_crew_powder_cleanup_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    target_terminal: &str,
+) -> Result<AuthenticatedCaptainAuthority, String> {
+    let caller = caller.ok_or("acl: Powder cleanup requires a session identity")?;
+    let caller_terminal = caller
+        .tile
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no terminal identity")?;
+    let caller_ship = caller
+        .ship_slug
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no ship identity")?;
+    if caller.fleet_role != Some(FleetRole::Captain) {
+        return Err(
+            "acl: only the owning Captain may reconcile this removed Crew Powder binding".into(),
+        );
+    }
+
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain.crew.iter().any(|crew| {
+                crew.terminal_id == target_terminal
+                    && matches!(crew.state, CrewState::Removed { .. })
+                    && crew.powder_work.is_some()
+            })
+        })
+        .collect::<Vec<_>>();
+    let owner = match owners.as_slice() {
+        [] => {
+            return Err(
+                "acl: target has no removed Crew Powder binding eligible for historical cleanup"
+                    .into(),
+            );
+        }
+        [owner] => *owner,
+        _ => {
+            return Err(format!(
+                "Crew session '{target_terminal}' has ambiguous historical Powder ownership"
+            ));
+        }
+    };
+    let project_id = owner
+        .project_id
+        .as_deref()
+        .ok_or_else(|| format!("Crew session '{target_terminal}' ship has no Project binding"))?;
+    let project_matches = snapshot
+        .projects
+        .iter()
+        .filter(|project| project.project_id == project_id)
+        .count();
+    if owner.role != FleetRole::Captain
+        || owner.state != ClaimState::Active
+        || owner.terminal_id.as_deref() != Some(caller_terminal)
+        || owner.ship_slug != caller_ship
+        || project_matches != 1
+    {
+        return Err(
+            "acl: only the owning Captain may reconcile this removed Crew Powder binding".into(),
+        );
+    }
+    Ok(AuthenticatedCaptainAuthority {
+        terminal_id: caller_terminal.to_string(),
+        ship_slug: caller_ship.to_string(),
+        project_id: project_id.to_string(),
+        generation: generations.scoped(
+            registry_epoch,
+            &owner.ship_slug,
+            target_terminal,
+            project_id,
+        ),
+    })
 }
 
 fn enforce_project_authority(
@@ -6345,6 +8314,9 @@ fn dispatch_with_caller(
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
+        }
+        "review_crew_powder_criterion" => {
+            review_crew_powder_criterion(ctx, args, caller, trusted_internal)
         }
         "complete_crew_powder" => complete_crew_powder(ctx, args, caller, trusted_internal),
         // Orchestrator wake: arm/disarm a server-side push that re-invokes the
@@ -7262,6 +9234,12 @@ fn board_powder_error(
             "repositoryMissing",
             "repository_missing",
             "The bound Powder board no longer exists or is not visible.",
+            false,
+        ),
+        powder::PowderErrorKind::Conflict => (
+            "error",
+            "powder_conflict",
+            "Powder rejected the request because its authoritative state changed.",
             false,
         ),
         powder::PowderErrorKind::Unreachable => (
@@ -8426,6 +10404,37 @@ fn captain_and_project_for_dispatch(
     Ok((captain, project))
 }
 
+fn revalidate_dispatch_authority(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    expected: &DispatchAuthority,
+) -> Result<(), String> {
+    let (captain, project) = captain_and_project_for_dispatch(ctx, args).map_err(|_| {
+        "acl: dispatch authority changed; retry from the current Captain".to_string()
+    })?;
+    let (_, generations, registry_epoch) = ctx.captains.snapshot_with_authority_generations();
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &expected.captain.ship_slug,
+        "",
+        &expected.project.project_id,
+    );
+    if current_generation != expected.generation
+        || CaptainAuthorityProjection::from(&captain)
+            != CaptainAuthorityProjection::from(&expected.captain)
+        || project != expected.project
+        || caller.cloned() != expected.caller
+    {
+        return Err("acl: dispatch authority changed; retry from the current Captain".into());
+    }
+    enforce_ship_authority(caller, trusted_internal, &expected.captain.ship_slug).map_err(
+        |_| "acl: dispatch authority changed; retry from the current Captain".to_string(),
+    )?;
+    Ok(())
+}
+
 fn validate_crew_checkout(
     project: &ProjectRecord,
     requested: Option<String>,
@@ -8512,6 +10521,7 @@ fn rollback_crew_dispatch(
         ctx,
         &json!({ "sessionId": crew_session_id }),
         true,
+        None,
     )
     .map_err(|error| {
         format!(
@@ -8619,6 +10629,7 @@ fn ensure_dispatch_powder_binding_available(
 }
 
 const CODEX_UNOBSERVED_COMMAND: &str = "t-hub-agent --codex-unobserved";
+const CREW_DORMANT_PANE_COMMAND: &str = "exec /bin/sleep 2147483647";
 
 fn crew_interactive_launch(
     harness: Harness,
@@ -8638,8 +10649,33 @@ fn crew_interactive_launch(
 fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     let provider_launch = harness
         .adapter()
-        .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions);
+        .fresh_argv_with_permissions(prompt, CREW_DEFAULT_PERMISSION);
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
+}
+
+/// A newly created tmux pane can transiently yield unreadable foreground-process
+/// evidence while its login shell is still completing startup.  The observer
+/// intentionally collapses several lookup failures into that one safe error, so
+/// this does not assert a more specific failing subcase.  Wait for a bounded
+/// stable baseline before attempting the provider launch, then retain the exact
+/// normal attestation checks for every subsequent observation.
+fn observe_dispatch_baseline(
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+    target: &str,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    const MAX_STABLE_BASELINE_ATTEMPTS: usize = 8;
+    for _ in 0..MAX_STABLE_BASELINE_ATTEMPTS {
+        match observer(target) {
+            Ok(evidence) => match observer(target) {
+                Ok(confirm) => return confirm_stable_launch_baseline(&evidence, &confirm),
+                Err(LaunchAttestationError::UnreadableEvidence) => continue,
+                Err(error) => return Err(error),
+            },
+            Err(LaunchAttestationError::UnreadableEvidence) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(LaunchAttestationError::UnreadableEvidence)
 }
 
 fn rollback_crew_launch_failure(
@@ -8647,10 +10683,153 @@ fn rollback_crew_launch_failure(
     crew_session_id: &str,
     client: &powder::Client,
     claim: &powder::Claim,
+    release_recovery: Option<&PendingDispatchRelease>,
     primary: String,
 ) -> String {
-    let rollback = rollback_crew_dispatch(ctx, crew_session_id, Some(client), Some(claim));
+    let rollback = rollback_trusted_dispatch(ctx, crew_session_id, client, claim, release_recovery);
     dispatch_rollback_error(primary, rollback)
+}
+
+/// Roll back only the terminal and exact claim created by this dispatch.
+///
+/// This path deliberately does not rediscover Project or Powder scope.  Those
+/// values may have changed precisely because the dispatch authority was
+/// revoked.  The trusted receipt is the sole release identity.
+fn rollback_trusted_dispatch(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    release_recovery: Option<&PendingDispatchRelease>,
+) -> Result<(), String> {
+    // The originating transaction and every restart or ordinary cleanup
+    // recovery share one per-Crew guard.  Once Prepared is durable, no
+    // consumer may observe it and race the producer through teardown,
+    // transition, release, or exact clear.
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
+    rollback_trusted_dispatch_guarded(ctx, crew_session_id, client, claim, release_recovery)
+}
+
+/// Inner rollback transaction entered only while the exact Crew cleanup guard
+/// is held by the producer or a recovery consumer.
+fn rollback_trusted_dispatch_guarded(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    release_recovery: Option<&PendingDispatchRelease>,
+) -> Result<(), String> {
+    // Persist the frozen exact-release obligation before tearing down the
+    // terminal. A crash after this point can therefore never fall back to a
+    // replacement Captain's mutable Project binding.
+    if let Some(recovery) = release_recovery {
+        ctx.captains.prepare_dispatch_release(recovery.clone())?;
+        #[cfg(test)]
+        ctx.captains
+            .pause_dispatch("release_prepared_before_teardown");
+    }
+    tmux::kill_session_tree(&tmux_target(crew_session_id)).map_err(|error| {
+        format!("Crew terminal '{crew_session_id}' could not be stopped: {error}")
+    })?;
+    if let Some(recovery) = release_recovery {
+        #[cfg(test)]
+        ctx.captains.pause_dispatch("release_prepared_before_post");
+        ctx.captains.transition_dispatch_release(
+            recovery,
+            PendingDispatchReleaseState::Prepared,
+            PendingDispatchReleaseState::InFlight,
+        )?;
+        #[cfg(test)]
+        if !ctx.captains.pause_dispatch("release_inflight_before_post") {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' test crash occurred after durable release teardown before its release POST"
+            ));
+        }
+        let mut expected_recovery = recovery.clone();
+        expected_recovery.state = PendingDispatchReleaseState::InFlight;
+        if ctx
+            .captains
+            .pending_dispatch_release(crew_session_id)
+            .as_ref()
+            != Some(&expected_recovery)
+        {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' exact release recovery changed before its release POST"
+            ));
+        }
+    }
+    if let Err(error) = client.release(claim) {
+        let recovery_result = match release_recovery {
+            Some(recovery) => ctx.captains.transition_dispatch_release(
+                recovery,
+                PendingDispatchReleaseState::InFlight,
+                PendingDispatchReleaseState::Ambiguous,
+            ),
+            None => ctx
+                .captains
+                .mark_crew_cleanup_pending(crew_session_id)
+                .map(|_| ()),
+        };
+        if let Err(recovery_error) = recovery_result {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' stopped, but exact Powder card '{}' run '{}' release is ambiguous: {error}; durable release recovery remains in-flight because ambiguity persistence failed: {recovery_error}",
+                claim.card_id, claim.run_id
+            ));
+        }
+        return Err(format!(
+            "Crew terminal '{crew_session_id}' stopped, but exact Powder card '{}' run '{}' release is ambiguous: {error}",
+            claim.card_id, claim.run_id
+        ));
+    }
+    if let Some(recovery) = release_recovery {
+        let (cleared, _) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+        if !cleared {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned release recovery could not be cleared"
+            ));
+        }
+    } else {
+        ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
+            format!(
+                "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record could not be removed: {error}"
+            )
+        })?;
+    }
+    ctx.tabs.remove_tile(crew_session_id);
+    ctx.identity.retire_tile(crew_session_id)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+fn rollback_dispatch_authority_failure(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    pending_claim: &PendingDispatchClaim,
+    release_recovery: Option<&PendingDispatchRelease>,
+    phase: &str,
+    authority_error: String,
+) -> String {
+    let primary = format!("dispatch_crew: authority changed {phase}: {authority_error}");
+    match rollback_trusted_dispatch(ctx, crew_session_id, client, claim, release_recovery) {
+        Ok(()) => match ctx.captains.clear_pending_dispatch_claim(pending_claim) {
+            Ok(_) => format!("{primary} and all side effects were rolled back"),
+            Err(error) => format!(
+                "{primary}; exact transaction rollback succeeded, but initial-claim recovery intent could not be cleared: {error}; redispatch remains blocked"
+            ),
+        },
+        Err(error) => {
+            let recovery_status = if release_recovery.is_some() {
+                "trusted release recovery remains pending and redispatch is blocked"
+            } else {
+                "initial-claim recovery remains pending and redispatch is blocked"
+            };
+            format!("{primary}; rollback is incomplete: {error}; {recovery_status}")
+        }
+    }
 }
 
 fn dispatch_crew(
@@ -8659,8 +10838,45 @@ fn dispatch_crew(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    let mut observer = observe_harness_process;
+    dispatch_crew_with_observer_inner(ctx, args, caller, trusted_internal, &mut observer, true)
+}
+
+#[cfg(test)]
+fn dispatch_crew_with_observer(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+) -> Result<Value, String> {
+    dispatch_crew_with_observer_inner(ctx, args, caller, trusted_internal, observer, false)
+}
+
+fn dispatch_crew_with_observer_inner(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+    stabilize_baseline: bool,
+) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
+    let (_, authority_generations, authority_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let dispatch_generation = authority_generations.scoped(
+        authority_epoch,
+        &captain.ship_slug,
+        "",
+        captain.project_id.as_deref().unwrap_or(""),
+    );
+    let dispatch_authority = DispatchAuthority {
+        captain: captain.clone(),
+        project: project.clone(),
+        generation: dispatch_generation,
+        caller: caller.cloned(),
+    };
     enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
@@ -8703,6 +10919,9 @@ fn dispatch_crew(
         &card_id,
     )?;
     let client = powder::Client::from_profile(&binding.connection_profile)?;
+    let endpoint_identity = client
+        .endpoint_identity()
+        .map_err(|error| format!("dispatch_crew: {error}"))?;
     let canonical_repository = client
         .get_repository(&binding.repository)?
         .get("name")
@@ -8713,6 +10932,20 @@ fn dispatch_crew(
         .get_card(&card_id)
         .map_err(|error| format!("dispatch_crew: {error}"))?;
     validate_dispatch_card_repository(&card_id, card.repository(), &canonical_repository)?;
+    if let Some(pending) = ctx.captains.pending_dispatch_claim(
+        &binding.connection_profile,
+        &binding.repository,
+        &card_id,
+    ) {
+        let authoritative_claim = card.card_value().get("claim");
+        if authoritative_claim.is_none_or(Value::is_null) {
+            ctx.captains.clear_pending_dispatch_claim(&pending)?;
+        } else {
+            return Err(format!(
+                "dispatch_crew: initial Powder claim for card '{card_id}' is pending authoritative recovery; no redispatch or release was attempted"
+            ));
+        }
+    }
     let authoritative_run_id = card.card_value()["claim"]["run_id"].as_str();
     ensure_dispatch_powder_binding_available(
         ctx,
@@ -8721,6 +10954,10 @@ fn dispatch_crew(
         &card_id,
         authoritative_run_id,
     )?;
+    revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_preflight");
+    revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -8733,7 +10970,39 @@ fn dispatch_crew(
     } else if let Some(tab_name) = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name")) {
         spawn_args["tabName"] = json!(tab_name);
     }
-    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let pending_claim = PendingDispatchClaim {
+        project_id: project.project_id.clone(),
+        connection_profile: binding.connection_profile.clone(),
+        repository: binding.repository.clone(),
+        card_id: card_id.to_string(),
+        configured_agent: client.configured_agent().to_string(),
+        operation_id: client
+            .initial_claim_operation_id(&card_id)
+            .map_err(|error| format!("dispatch_crew: {error}"))?,
+        created_at: now_ms(),
+    };
+    ctx.captains
+        .begin_pending_dispatch_claim(pending_claim.clone())?;
+    #[cfg(not(test))]
+    let private_dormant_pane_command = CREW_DORMANT_PANE_COMMAND.to_string();
+    #[cfg(test)]
+    let private_dormant_pane_command = arg_str(args, "testDispatchDormantPaneCommand")
+        .unwrap_or_else(|| CREW_DORMANT_PANE_COMMAND.to_string());
+    let spawned = match spawn_terminal_with_private_pane_command(
+        ctx,
+        &spawn_args,
+        Some(&private_dormant_pane_command),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            return match ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
+                Ok(_) => Err(error),
+                Err(clear_error) => Err(format!(
+                    "{error}; initial-claim recovery intent could not be cleared after spawn failure: {clear_error}; redispatch remains blocked"
+                )),
+            };
+        }
+    };
     let crew_session_id = spawned["id"]
         .as_str()
         .ok_or("dispatch_crew: spawn returned no terminal id")?
@@ -8742,13 +11011,65 @@ fn dispatch_crew(
         Ok(claim) => claim,
         Err(error) => {
             let rollback = rollback_crew_dispatch(ctx, &crew_session_id, None, None);
-            return Err(dispatch_rollback_error(
-                format!("dispatch_crew: Powder claim failed before the harness started: {error}"),
-                rollback,
-            ));
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "dispatch_crew: initial Powder claim outcome is pending authoritative recovery after: {error}; the local terminal was removed, no Powder release was attempted, and redispatch is blocked"
+                ),
+                Err(rollback_error) => format!(
+                    "dispatch_crew: initial Powder claim outcome is pending authoritative recovery after: {error}; no Powder release was attempted and local terminal cleanup is incomplete: {rollback_error}"
+                ),
+            });
         }
     };
-    let _crew = match ctx.captains.bind_crew_context(
+    let mut release_recovery: Option<PendingDispatchRelease> = None;
+    macro_rules! revalidate_or_rollback {
+        ($phase:literal) => {
+            if let Err(error) = revalidate_dispatch_authority(
+                ctx,
+                args,
+                caller,
+                trusted_internal,
+                &dispatch_authority,
+            ) {
+                return Err(rollback_dispatch_authority_failure(
+                    ctx,
+                    &crew_session_id,
+                    &client,
+                    &claim,
+                    &pending_claim,
+                    release_recovery.as_ref(),
+                    $phase,
+                    error,
+                ));
+            }
+        };
+    }
+    macro_rules! rollback_launch_failure {
+        ($primary:expr) => {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                release_recovery.as_ref(),
+                $primary,
+            ));
+        };
+    }
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_claim");
+    revalidate_or_rollback!("after claim before durable Crew binding");
+    let (_, bind_generations, _) = ctx.captains.snapshot_with_authority_generations();
+    let bind_authority = DispatchBindAuthority {
+        crew_generation: bind_generations
+            .crew
+            .get(&crew_session_id)
+            .copied()
+            .unwrap_or(0),
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_bind");
+    let _crew = match ctx.captains.bind_crew_context_exact(
         &captain_session_id,
         &crew_session_id,
         &task,
@@ -8758,37 +11079,71 @@ fn dispatch_crew(
         PowderWorkBinding {
             card_id: claim.card_id.clone(),
             run_id: claim.run_id.clone(),
+            agent: Some(claim.agent.clone()),
             claim_expires_at: Some(claim.expires_at),
+            mutation_intent: None,
+            dispatch_release_recovery: false,
             state: PowderWorkState::Active,
         },
+        Some(&dispatch_authority),
+        Some(bind_authority),
     ) {
         Ok(crew) => crew,
         Err(error) => {
-            let rollback =
-                rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-            return Err(dispatch_rollback_error(
-                format!("dispatch_crew: durable Crew binding failed: {error}"),
-                rollback,
-            ));
-        }
-    };
-    let prompt = format!(
-        "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
-        captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
-    );
-    let tmux_target = tmux_target(&crew_session_id);
-    let before_launch = match observe_harness_process(&tmux_target) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return Err(rollback_crew_launch_failure(
+            return Err(rollback_dispatch_authority_failure(
                 ctx,
                 &crew_session_id,
                 &client,
                 &claim,
-                format!("dispatch_crew: launch attestation baseline failed: {error}"),
+                &pending_claim,
+                None,
+                "during durable Crew binding",
+                error,
             ));
         }
     };
+    if let Err(error) = ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
+        return Err(format!(
+            "dispatch_crew: Crew binding and exact Powder claim are durable, but initial-claim recovery intent could not be cleared: {error}; redispatch remains blocked"
+        ));
+    }
+    release_recovery = Some(PendingDispatchRelease {
+        crew_session_id: crew_session_id.clone(),
+        project_id: project.project_id.clone(),
+        connection_profile: binding.connection_profile.clone(),
+        connection_endpoint_identity: endpoint_identity.clone(),
+        repository: binding.repository.clone(),
+        card_id: claim.card_id.clone(),
+        run_id: claim.run_id.clone(),
+        agent: claim.agent.clone(),
+        operation_id: pending_claim.operation_id.clone(),
+        created_at: now_ms(),
+        state: PendingDispatchReleaseState::Prepared,
+    });
+    let prompt = format!(
+        "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
+        captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
+    );
+    revalidate_or_rollback!("before launch");
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_launch");
+    revalidate_or_rollback!("before launch");
+    let tmux_target = tmux_target(&crew_session_id);
+    let before_launch = match if stabilize_baseline {
+        observe_dispatch_baseline(observer, &tmux_target)
+    } else {
+        observer(&tmux_target)
+    } {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            rollback_launch_failure!(format!(
+                "dispatch_crew: launch attestation baseline failed: {error}"
+            ));
+        }
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_stable_baseline");
+    revalidate_or_rollback!("after stable baseline before provider send");
     #[cfg(not(test))]
     let launch = crew_launch_argv(harness, &prompt);
     #[cfg(test)]
@@ -8796,23 +11151,34 @@ fn dispatch_crew(
         let provider_launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| {
             harness
                 .adapter()
-                .fresh_argv_with_permissions(&prompt, PermMode::BypassPermissions)
+                .fresh_argv_with_permissions(&prompt, CREW_DEFAULT_PERMISSION)
         });
         let codex_unobserved_command = arg_str(args, "testCodexUnobservedCommand")
             .unwrap_or_else(|| CODEX_UNOBSERVED_COMMAND.to_string());
         crew_interactive_launch(harness, &provider_launch, &codex_unobserved_command)
     };
-    if let Err(error) =
-        send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
+    let respawn_command = if let Some(command) = crate::commands::pane_command(None, Some(&launch))
     {
-        return Err(rollback_crew_launch_failure(
-            ctx,
-            &crew_session_id,
-            &client,
-            &claim,
-            format!("dispatch_crew: harness launch failed: {error}"),
-        ));
-    }
+        command
+    } else {
+        rollback_launch_failure!(
+            "dispatch_crew: private provider respawn command is empty".to_string()
+        );
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_respawn");
+    revalidate_or_rollback!("immediately before provider send");
+    let respawn = match tmux::respawn_pane_exact(&tmux_target, &checkout, &respawn_command) {
+        Ok(transition) => transition,
+        Err(error) => {
+            rollback_launch_failure!(format!(
+                "dispatch_crew: private harness respawn failed: {error}"
+            ));
+        }
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_respawn");
+    revalidate_or_rollback!("immediately after provider respawn");
     #[cfg(test)]
     let skip_harness_liveness = args
         .get("testSkipHarnessLiveness")
@@ -8822,44 +11188,59 @@ fn dispatch_crew(
     let skip_harness_liveness = false;
     if !skip_harness_liveness {
         if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
-            return Err(rollback_crew_launch_failure(
-                ctx,
-                &crew_session_id,
-                &client,
-                &claim,
-                format!("dispatch_crew: harness startup failed: {error}"),
-            ));
+            rollback_launch_failure!(format!("dispatch_crew: harness startup failed: {error}"));
         }
     }
-    let after_launch = match observe_harness_process(&tmux_target) {
+    let after_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
         Err(error) => {
-            return Err(rollback_crew_launch_failure(
-                ctx,
-                &crew_session_id,
-                &client,
-                &claim,
-                format!("dispatch_crew: Harness permission attestation failed: {error}"),
+            rollback_launch_failure!(format!(
+                "dispatch_crew: Harness permission attestation failed: {error}"
             ));
         }
     };
-    let attestation = match attest_launch_permissions(
+    let launch_attestation = if stabilize_baseline {
+        attest_respawn_launch_permissions(
+            harness.adapter(),
+            &before_launch,
+            &respawn,
+            &after_launch,
+            CREW_DEFAULT_PERMISSION,
+        )
+    } else {
+        // Synthetic observer tests intentionally model provider process races
+        // without claiming a real tmux pane identity.  Production always takes
+        // the respawn-provenance branch above.
+        attest_launch_permissions(
+            harness.adapter(),
+            &before_launch,
+            &after_launch,
+            CREW_DEFAULT_PERMISSION,
+        )
+    };
+    if let Err(error) = launch_attestation {
+        rollback_launch_failure!(format!(
+            "dispatch_crew: Harness permission attestation failed: {error}"
+        ));
+    }
+    let (attestation, final_evidence) = match attest_final_launch_permissions(
         harness.adapter(),
-        &before_launch,
         &after_launch,
-        PermMode::BypassPermissions,
+        observer(&tmux_target),
+        CREW_DEFAULT_PERMISSION,
     ) {
-        Ok(attestation) => attestation,
+        Ok(accepted) => accepted,
         Err(error) => {
-            return Err(rollback_crew_launch_failure(
-                ctx,
-                &crew_session_id,
-                &client,
-                &claim,
-                format!("dispatch_crew: Harness permission attestation failed: {error}"),
+            rollback_launch_failure!(format!(
+                "dispatch_crew: final Harness permission attestation failed before durable acceptance: {error}"
             ));
         }
     };
+    revalidate_or_rollback!("before attestation persistence");
+    #[cfg(test)]
+    ctx.captains
+        .pause_dispatch("before_attestation_persistence");
+    revalidate_or_rollback!("before attestation persistence");
     let crew =
         match ctx
             .captains
@@ -8867,18 +11248,29 @@ fn dispatch_crew(
         {
             Ok(crew) => crew,
             Err(error) => {
-                return Err(rollback_crew_launch_failure(
-                    ctx,
-                    &crew_session_id,
-                    &client,
-                    &claim,
-                    format!(
-                        "dispatch_crew: durable Harness permission attestation failed: {error}"
-                    ),
+                rollback_launch_failure!(format!(
+                    "dispatch_crew: durable Harness permission attestation failed: {error}"
                 ));
             }
         };
+    let (attestation, _return_evidence) = match attest_final_launch_permissions(
+        harness.adapter(),
+        &final_evidence,
+        observer(&tmux_target),
+        CREW_DEFAULT_PERMISSION,
+    ) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            rollback_launch_failure!(format!(
+                "dispatch_crew: final Harness permission attestation failed after durable persistence: {error}"
+            ));
+        }
+    };
     let _ = captains_sync_apply(ctx);
+    revalidate_or_rollback!("before success");
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_success");
+    revalidate_or_rollback!("before success");
     Ok(json!({
         "accepted": "dispatch_crew",
         "audited": true,
@@ -8897,24 +11289,11 @@ fn dispatch_crew(
     }))
 }
 
-fn crew_powder_context(
-    ctx: &ControlContext,
-    crew_session_id: &str,
-) -> Result<(powder::Client, powder::Claim), String> {
-    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
-    if !matches!(scope.crew.state, CrewState::Active) {
-        return Err(format!(
-            "Crew session '{crew_session_id}' lifecycle is not active; refusing to renew its Powder claim"
-        ));
-    }
-    if !matches!(scope.work.state, PowderWorkState::Active) {
-        return Err(format!(
-            "Crew session '{crew_session_id}' Powder work is not active"
-        ));
-    }
+fn crew_powder_context(scope: &CrewPowderScope) -> Result<(powder::Client, powder::Claim), String> {
+    require_active_crew_powder_renewal(scope)?;
     let client = powder::Client::from_profile(&scope.binding.connection_profile)?;
     let card = client.get_card(&scope.work.card_id)?;
-    validate_bound_detailed_card(&scope, &card)?;
+    validate_bound_detailed_card(scope, &card)?;
     let claim = card.card_value()["claim"]
         .as_object()
         .ok_or_else(|| format!("Powder card '{}' has no active claim", scope.work.card_id))?;
@@ -8941,7 +11320,34 @@ fn crew_powder_context(
             scope.work.card_id, authoritative.run_id, scope.work.run_id
         ));
     }
+    let expected_agent = scope.work.agent.as_deref().ok_or_else(|| {
+        format!(
+            "Crew run '{}' has no durable Powder agent identity",
+            scope.work.run_id
+        )
+    })?;
+    if authoritative.agent != expected_agent {
+        return Err(format!(
+            "Powder card '{}' claim agent is not Crew Powder agent",
+            scope.work.card_id
+        ));
+    }
     Ok((client, authoritative))
+}
+
+fn require_active_crew_powder_renewal(scope: &CrewPowderScope) -> Result<(), String> {
+    let crew_session_id = &scope.crew.terminal_id;
+    if !matches!(scope.crew.state, CrewState::Active) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' lifecycle is not active; refusing to renew its Powder claim"
+        ));
+    }
+    if !matches!(scope.work.state, PowderWorkState::Active) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' Powder work is not active"
+        ));
+    }
+    Ok(())
 }
 
 const MAX_CREW_EVIDENCE_ITEMS: usize = 20;
@@ -8950,6 +11356,7 @@ const MAX_CREW_EVIDENCE_ITEMS: usize = 20;
 #[serde(rename_all = "camelCase")]
 struct CrewCriterionProof {
     criterion: usize,
+    criterion_id: String,
     url: String,
 }
 
@@ -9011,7 +11418,7 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
             .ok_or("complete_crew_powder criterion proof must be an object")?;
         if let Some(unexpected) = object
             .keys()
-            .find(|key| !matches!(key.as_str(), "criterion" | "url"))
+            .find(|key| !matches!(key.as_str(), "criterion" | "criterionId" | "url"))
         {
             return Err(format!(
                 "complete_crew_powder criterion proof has unexpected field '{unexpected}'"
@@ -9028,6 +11435,15 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
                 "complete_crew_powder criterion {criterion} appears more than once"
             ));
         }
+        let criterion_id = object
+            .get("criterionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("complete_crew_powder criterion proof requires a non-empty criterionId")?;
+        if criterion_id.len() > 256 {
+            return Err("complete_crew_powder criterion proof criterionId is too long".into());
+        }
         let url = object
             .get("url")
             .and_then(Value::as_str)
@@ -9042,6 +11458,7 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
         }
         criterion_proofs.push(CrewCriterionProof {
             criterion,
+            criterion_id: criterion_id.to_string(),
             url: url.to_string(),
         });
     }
@@ -9055,10 +11472,99 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
 #[derive(Debug, Clone)]
 struct CrewPowderScope {
     ship_slug: String,
+    captain_role: FleetRole,
+    captain_terminal_id: Option<String>,
+    captain_state: ClaimState,
+    authenticated_captain_terminal_id: Option<String>,
     project_id: String,
+    project_repo_root: String,
     crew: CrewRef,
     binding: PowderProjectBinding,
     work: PowderWorkBinding,
+    authority_generation: Option<ScopedAuthorityGeneration>,
+}
+
+/// A registry snapshot whose target Crew ownership was authorized before any
+/// Project or Powder binding is resolved.
+///
+/// Keeping this deliberately narrow makes a foreign heartbeat probe fail with
+/// the generic ACL denial instead of disclosing target-specific binding state.
+struct CrewHeartbeatAuthorizationSnapshot {
+    snapshot: CaptainsSnapshot,
+    generations: AuthorityGenerations,
+    registry_epoch: u64,
+}
+
+fn authorize_crew_heartbeat_target(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<CrewHeartbeatAuthorizationSnapshot, String> {
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(CrewHeartbeatAuthorizationSnapshot {
+            snapshot,
+            generations,
+            registry_epoch,
+        });
+    }
+
+    let caller = caller.ok_or_else(|| {
+        format!("acl: '{command}' requires the exact Crew session or its current owning Captain")
+    })?;
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == crew_session_id)
+        })
+        .collect::<Vec<_>>();
+    let authorized = match owners.as_slice() {
+        [owner] => {
+            let crew_self = caller.mint_role == crate::identity::Role::Crew
+                && caller.fleet_role.is_none()
+                && caller.tile.as_deref() == Some(crew_session_id)
+                && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str());
+            let owning_captain = caller.fleet_role == Some(FleetRole::Captain)
+                && caller.tile.as_deref() == owner.terminal_id.as_deref()
+                && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str())
+                && owner.role == FleetRole::Captain
+                && owner.state == ClaimState::Active;
+            crew_self || owning_captain
+        }
+        _ => false,
+    };
+    if !authorized {
+        return Err(format!(
+            "acl: '{command}' requires the exact Crew session or its current owning Captain"
+        ));
+    }
+    Ok(CrewHeartbeatAuthorizationSnapshot {
+        snapshot,
+        generations,
+        registry_epoch,
+    })
+}
+
+fn resolve_crew_powder_scope_from_heartbeat_authorization(
+    authorization: CrewHeartbeatAuthorizationSnapshot,
+    crew_session_id: &str,
+) -> Result<CrewPowderScope, String> {
+    let mut scope =
+        resolve_crew_powder_scope_from_snapshot(&authorization.snapshot, crew_session_id)?;
+    scope.authority_generation = Some(authorization.generations.scoped(
+        authorization.registry_epoch,
+        &scope.ship_slug,
+        crew_session_id,
+        &scope.project_id,
+    ));
+    Ok(scope)
 }
 
 fn resolve_crew_powder_scope(
@@ -9068,7 +11574,22 @@ fn resolve_crew_powder_scope(
     if crew_session_id.trim().is_empty() {
         return Err("Crew session id must not be empty".into());
     }
-    let snapshot = ctx.captains.snapshot();
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let mut scope = resolve_crew_powder_scope_from_snapshot(&snapshot, crew_session_id)?;
+    scope.authority_generation = Some(generations.scoped(
+        registry_epoch,
+        &scope.ship_slug,
+        crew_session_id,
+        &scope.project_id,
+    ));
+    Ok(scope)
+}
+
+fn resolve_crew_powder_scope_from_snapshot(
+    snapshot: &CaptainsSnapshot,
+    crew_session_id: &str,
+) -> Result<CrewPowderScope, String> {
     let matches = snapshot
         .captains
         .iter()
@@ -9118,11 +11639,126 @@ fn resolve_crew_powder_scope(
     }
     Ok(CrewPowderScope {
         ship_slug: captain.ship_slug.clone(),
+        captain_role: captain.role,
+        captain_terminal_id: captain.terminal_id.clone(),
+        captain_state: captain.state.clone(),
+        authenticated_captain_terminal_id: None,
         project_id,
+        project_repo_root: project.repo_root.clone(),
         crew: crew.clone(),
         binding,
         work,
+        authority_generation: None,
     })
+}
+
+fn exact_powder_scope_indices(
+    inner: &CaptainsInner,
+    registry_epoch: u64,
+    expected: &CrewPowderScope,
+) -> Result<(usize, usize), String> {
+    let crew_session_id = expected.crew.terminal_id.as_str();
+    let expected_generation = expected.authority_generation.ok_or_else(|| {
+        format!("Crew session '{crew_session_id}' scope has no authority generation")
+    })?;
+    let current_generation = inner.authority_generations.scoped(
+        registry_epoch,
+        &expected.ship_slug,
+        crew_session_id,
+        &expected.project_id,
+    );
+    if current_generation != expected_generation {
+        return Err(format!(
+            "Crew session '{crew_session_id}' scoped authority generation changed during the Powder mutation"
+        ));
+    }
+    let matches = inner
+        .captains
+        .iter()
+        .enumerate()
+        .flat_map(|(captain_index, captain)| {
+            captain
+                .crew
+                .iter()
+                .enumerate()
+                .filter(move |(_, crew)| crew.terminal_id == crew_session_id)
+                .map(move |(crew_index, _)| (captain_index, crew_index))
+        })
+        .collect::<Vec<_>>();
+    let (captain_index, crew_index) = match matches.as_slice() {
+        [indices] => *indices,
+        [] => return Err(format!("unknown Crew session '{crew_session_id}'")),
+        _ => {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+            ));
+        }
+    };
+    let captain = &inner.captains[captain_index];
+    let crew = &captain.crew[crew_index];
+    let project = inner
+        .projects
+        .iter()
+        .find(|project| project.project_id == expected.project_id)
+        .ok_or_else(|| format!("unknown projectId '{}'", expected.project_id))?;
+    let binding = project
+        .powder
+        .as_ref()
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' Project has no Powder binding"))?;
+    if captain.ship_slug != expected.ship_slug
+        || captain.project_id.as_deref() != Some(expected.project_id.as_str())
+        || crew != &expected.crew
+        || project.repo_root != expected.project_repo_root
+        || binding.connection_profile != expected.binding.connection_profile
+        || binding.repository != expected.binding.repository
+    {
+        return Err(format!(
+            "Crew session '{crew_session_id}' authoritative Powder scope changed during the mutation"
+        ));
+    }
+    Ok((captain_index, crew_index))
+}
+
+fn resolve_historical_removed_crew_powder_scope(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    authority: &AuthenticatedCaptainAuthority,
+) -> Result<CrewPowderScope, String> {
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let mut scope = resolve_crew_powder_scope_from_snapshot(&snapshot, crew_session_id)?;
+    let owning_ship_count = snapshot
+        .captains
+        .iter()
+        .filter(|captain| captain.ship_slug == scope.ship_slug)
+        .count();
+    let project_root_count = snapshot
+        .projects
+        .iter()
+        .filter(|project| project.repo_root == scope.project_repo_root)
+        .count();
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &scope.ship_slug,
+        crew_session_id,
+        &scope.project_id,
+    );
+    if current_generation != authority.generation
+        || owning_ship_count != 1
+        || project_root_count != 1
+        || scope.ship_slug != authority.ship_slug
+        || scope.captain_role != FleetRole::Captain
+        || scope.captain_state != ClaimState::Active
+        || scope.captain_terminal_id.as_deref() != Some(authority.terminal_id.as_str())
+        || scope.project_id != authority.project_id
+    {
+        return Err(format!(
+            "acl: Crew session '{crew_session_id}' is no longer owned by the exact authenticated Captain; retry from the current active Captain"
+        ));
+    }
+    scope.authenticated_captain_terminal_id = Some(authority.terminal_id.clone());
+    scope.authority_generation = Some(authority.generation);
+    Ok(scope)
 }
 
 fn validate_bound_detailed_card(
@@ -9188,16 +11824,57 @@ fn validate_bound_evidence(
             scope.binding.repository
         ));
     }
+    let expected_agent = scope.work.agent.as_deref().ok_or_else(|| {
+        format!(
+            "Crew run '{}' has no durable Powder agent identity",
+            scope.work.run_id
+        )
+    })?;
+    if run.run.agent != expected_agent {
+        return Err(format!(
+            "Powder run '{}' agent is not Crew Powder agent",
+            scope.work.run_id
+        ));
+    }
+    if card
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.agent != expected_agent)
+    {
+        return Err(format!(
+            "Powder card '{}' claim agent is not Crew Powder agent",
+            scope.work.card_id
+        ));
+    }
     if card.status != run.card_status {
         return Err(format!(
             "Powder card '{}' and run '{}' report inconsistent card status",
             scope.work.card_id, scope.work.run_id
         ));
     }
-    if card.criteria != run.criteria {
+    if card.criteria != run.card_criteria {
         return Err(format!(
-            "Powder card '{}' and run '{}' report inconsistent acceptance criteria",
+            "Powder card '{}' and run '{}' report inconsistent card criteria",
             scope.work.card_id, scope.work.run_id
+        ));
+    }
+    if let Some(claim) = card.claim.as_ref() {
+        let current = card.current_run_criteria.as_ref().ok_or_else(|| {
+            format!(
+                "Powder card '{}' omits current-run criteria for claimed run '{}'",
+                scope.work.card_id, claim.run_id
+            )
+        })?;
+        if claim.run_id == scope.work.run_id && current != &run.criteria {
+            return Err(format!(
+                "Powder card '{}' and run '{}' report inconsistent run-scoped criteria",
+                scope.work.card_id, scope.work.run_id
+            ));
+        }
+    } else if card.current_run_criteria.is_some() {
+        return Err(format!(
+            "Powder card '{}' reports current-run criteria without a current claim",
+            scope.work.card_id
         ));
     }
     let matching_runs = card
@@ -9287,33 +11964,33 @@ fn observed_completion_digest(scope: &CrewPowderScope) -> String {
 }
 
 fn validate_completion_criteria(
-    criteria: &[powder::CriterionEvidence],
+    criteria: &[powder::RunCriterionEvidence],
     proof: &CrewCompletionProof,
 ) -> Result<(), String> {
     if criteria.is_empty() {
         return Err("Powder card has no acceptance criteria".into());
     }
     for criterion in criteria {
-        let checked_by = criterion
-            .checked_by
-            .as_deref()
-            .map(str::trim)
-            .filter(|actor| !actor.is_empty());
-        let checked_at = criterion.checked_at;
-        if checked_by.is_none() || checked_at.is_none_or(|timestamp| timestamp <= 0) {
+        if !criterion.is_approved() {
             return Err(format!(
-                "Powder acceptance criterion {} is not checked; refusing completion",
-                criterion.criterion
+                "Powder acceptance criterion {} is not approved for this run; refusing completion",
+                criterion.criterion_index
             ));
         }
     }
     for criterion_proof in &proof.criterion_proofs {
-        if !criteria
+        let Some(criterion) = criteria
             .iter()
-            .any(|criterion| criterion.criterion == criterion_proof.criterion)
-        {
+            .find(|criterion| criterion.criterion_index == criterion_proof.criterion)
+        else {
             return Err(format!(
                 "completion proof references missing acceptance criterion {}",
+                criterion_proof.criterion
+            ));
+        };
+        if criterion.criterion_id != criterion_proof.criterion_id {
+            return Err(format!(
+                "completion proof criterion {} has a stale criterion identity",
                 criterion_proof.criterion
             ));
         }
@@ -9321,11 +11998,11 @@ fn validate_completion_criteria(
     Ok(())
 }
 
-fn completion_matches_evidence(
+fn completion_receipt_matches_evidence(
     scope: &CrewPowderScope,
     card: &powder::CardEvidence,
     run: &powder::RunEvidence,
-    proof: &CrewCompletionProof,
+    receipt: &powder::CompletionReceipt,
 ) -> Result<(), String> {
     if bound_powder_reality(scope, card, run)? != BoundPowderReality::Completed {
         return Err(format!(
@@ -9333,13 +12010,13 @@ fn completion_matches_evidence(
             scope.work.card_id, scope.work.run_id
         ));
     }
-    if run.run.proof.as_deref() != Some(proof.proof.as_str()) {
+    if run.run.proof.as_deref() != receipt.proof.as_deref() {
         return Err(format!(
             "Powder run '{}' completion proof does not match this request",
             scope.work.run_id
         ));
     }
-    for expected in &proof.criterion_proofs {
+    for expected in &receipt.criterion_proofs {
         let criterion = card
             .criteria
             .iter()
@@ -9356,7 +12033,7 @@ fn completion_matches_evidence(
             .any(|link| link.url == expected.url)
         {
             return Err(format!(
-                "Powder completion is missing the submitted proof for acceptance criterion {}",
+                "Powder completion evidence does not contain the authoritative proof for acceptance criterion {}",
                 expected.criterion
             ));
         }
@@ -9424,13 +12101,393 @@ fn require_same_ship_captain(
     Ok(())
 }
 
+fn parse_powder_operation_id(args: &Value, command: &str) -> Result<String, String> {
+    let operation_id = args
+        .get("operationId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{command} requires a non-empty 'operationId' argument"))?;
+    powder::validate_operation_id(operation_id)
+        .map_err(|_| format!("{command} operationId is invalid"))?;
+    Ok(operation_id.to_string())
+}
+
+fn powder_mutation_digest(
+    kind: PowderMutationKind,
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    requested_by: &str,
+    payload: &Value,
+) -> String {
+    let canonical = serde_json::to_vec(&json!({
+        "kind": kind,
+        "repository": scope.binding.repository,
+        "crewSessionId": scope.crew.terminal_id,
+        "cardId": scope.work.card_id,
+        "expectedRunId": scope.work.run_id,
+        "operationId": operation_id,
+        "requestedBy": requested_by,
+        "payload": payload,
+    }))
+    .expect("Powder mutation serialization cannot fail");
+    Sha256::digest(canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn powder_mutation_intent_with_request_digest(
+    kind: PowderMutationKind,
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    requested_by: &str,
+    payload: &Value,
+    powder_request_digest: String,
+) -> PowderMutationIntent {
+    PowderMutationIntent {
+        schema_version: POWDER_MUTATION_INTENT_SCHEMA_VERSION,
+        operation_id: operation_id.to_string(),
+        payload_digest: powder_mutation_digest(kind, scope, operation_id, requested_by, payload),
+        powder_request_digest: Some(powder_request_digest),
+        repository: scope.binding.repository.clone(),
+        card_id: scope.work.card_id.clone(),
+        expected_run_id: scope.work.run_id.clone(),
+        mutation_kind: kind,
+        requested_by: requested_by.to_string(),
+        created_at: now_ms(),
+        terminal_rejection: None,
+    }
+}
+
+#[cfg(test)]
+fn powder_mutation_intent(
+    kind: PowderMutationKind,
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    requested_by: &str,
+    payload: &Value,
+) -> PowderMutationIntent {
+    let powder_request_digest = match kind {
+        PowderMutationKind::WorkLogAppend => powder::work_log_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundWorkLog {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                attribution: powder::WorkLogAttribution {
+                    agent: payload["agent"].as_str().unwrap().into(),
+                    model: None,
+                    reasoning: None,
+                    harness: payload["harness"].as_str().map(str::to_string),
+                },
+                body: payload["message"].as_str().unwrap().into(),
+            },
+        ),
+        PowderMutationKind::CriterionReview => powder::criterion_review_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundCriterionReview {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                criterion_index: payload["criterion"].as_u64().unwrap() as usize,
+                criterion_id: payload["criterionId"].as_str().unwrap().into(),
+                criterion_text: payload["criterionText"].as_str().unwrap().into(),
+                decision: match payload["decision"].as_str().unwrap() {
+                    "approved" => powder::CriterionReviewDecision::Approved,
+                    "rejected" => powder::CriterionReviewDecision::Rejected,
+                    "cleared" => powder::CriterionReviewDecision::Cleared,
+                    _ => panic!("unsupported test criterion decision"),
+                },
+                proof: payload["proof"].as_str().map(str::to_string),
+                expected_reviewer_identity: payload["expectedReviewerIdentity"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            },
+        ),
+        PowderMutationKind::Completion => powder::completion_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundCompletion {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                proof: payload["proof"].as_str().unwrap().into(),
+                criterion_proofs: payload["criterionProofs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|proof| powder::CriterionProof {
+                        criterion: proof["criterion"].as_u64().unwrap() as usize,
+                        url: proof["url"].as_str().unwrap().into(),
+                    })
+                    .collect(),
+            },
+        ),
+    }
+    .unwrap();
+    powder_mutation_intent_with_request_digest(
+        kind,
+        scope,
+        operation_id,
+        requested_by,
+        payload,
+        powder_request_digest,
+    )
+}
+
+fn powder_operation_rejection(
+    command: &str,
+    state: powder::OperationState,
+    failure: Option<&powder::OperationFailure>,
+) -> String {
+    let (normalized, disposition) = match (state, failure.map(|failure| failure.code.as_str())) {
+        (powder::OperationState::Rejected, Some("claim_expired")) => {
+            ("expired", "the claim expired")
+        }
+        (powder::OperationState::Rejected, Some("conflict")) => {
+            ("conflict", "the run is stale, released, or reclaimed")
+        }
+        (powder::OperationState::Rejected, Some("not_found")) => {
+            ("stale", "the exact run is no longer authoritative")
+        }
+        (powder::OperationState::Rejected, _) => {
+            ("rejected", "the exact run-bound operation was rejected")
+        }
+        (powder::OperationState::Failed, _) => ("rejected", "the exact run-bound operation failed"),
+        (powder::OperationState::Pending, _) => {
+            ("pending", "the exact run-bound operation remains pending")
+        }
+        (powder::OperationState::Unknown, _) => {
+            ("pending", "the exact operation is not yet recorded")
+        }
+        (powder::OperationState::Succeeded, _) => {
+            ("malformed", "the operation response was incomplete")
+        }
+    };
+    let message = format!("{command}: Powder mutation state '{normalized}': {disposition}");
+    if matches!(
+        state,
+        powder::OperationState::Pending | powder::OperationState::Unknown
+    ) {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_operation_terminal_state(
+    state: powder::OperationState,
+    failure: Option<&powder::OperationFailure>,
+) -> Option<PowderMutationTerminalState> {
+    match (state, failure.map(|failure| failure.code.as_str())) {
+        (powder::OperationState::Rejected, Some("claim_expired")) => {
+            Some(PowderMutationTerminalState::Expired)
+        }
+        (powder::OperationState::Rejected, Some("conflict")) => {
+            Some(PowderMutationTerminalState::Conflict)
+        }
+        (powder::OperationState::Rejected, Some("not_found")) => {
+            Some(PowderMutationTerminalState::Stale)
+        }
+        (powder::OperationState::Rejected | powder::OperationState::Failed, _) => {
+            Some(PowderMutationTerminalState::Rejected)
+        }
+        _ => None,
+    }
+}
+
+fn powder_direct_terminal_state(
+    error: &powder::PowderError,
+) -> Option<PowderMutationTerminalState> {
+    match error.kind {
+        powder::PowderErrorKind::Conflict => Some(PowderMutationTerminalState::Conflict),
+        powder::PowderErrorKind::Unauthorized => Some(PowderMutationTerminalState::Rejected),
+        powder::PowderErrorKind::NotFound => Some(PowderMutationTerminalState::Stale),
+        powder::PowderErrorKind::Unreachable
+        | powder::PowderErrorKind::InvalidResponse
+        | powder::PowderErrorKind::Upstream => None,
+    }
+}
+
+fn powder_terminal_rejection_message(
+    kind: PowderMutationKind,
+    state: PowderMutationTerminalState,
+) -> String {
+    let base = format!(
+        "{}: Powder mutation state '{}': {}",
+        kind.command_label(),
+        state.label(),
+        state.disposition()
+    );
+    if kind == PowderMutationKind::Completion {
+        format!(
+            "{base}; the rejected attempt was recorded; the same-ship Captain may submit corrected proof with a new operation identity"
+        )
+    } else {
+        base
+    }
+}
+
+fn record_powder_terminal_rejection(
+    ctx: &ControlContext,
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    payload_digest: &str,
+    kind: PowderMutationKind,
+    state: PowderMutationTerminalState,
+) -> Result<String, String> {
+    let error = powder_terminal_rejection_message(kind, state);
+    ctx.captains
+        .record_crew_powder_terminal_rejection(scope, operation_id, payload_digest, state)
+        .map_err(|convergence_error| {
+            format!("{error}; durable terminal convergence failed: {convergence_error}")
+        })?;
+    Ok(error)
+}
+
+fn powder_recovery_unavailable(command: &str, error: &powder::PowderError) -> String {
+    let message = error.message.to_ascii_lowercase();
+    let state = match error.kind {
+        powder::PowderErrorKind::InvalidResponse => "malformed",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound => "stale",
+        powder::PowderErrorKind::Conflict => "conflict",
+        powder::PowderErrorKind::Unreachable
+            if message.contains("timed out") || message.contains("timeout") =>
+        {
+            "timeout"
+        }
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::Upstream => "pending",
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': authoritative operation recovery is unavailable"
+    );
+    if matches!(state, "pending" | "timeout") {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_mutation_error_is_ambiguous(error: &powder::PowderError) -> bool {
+    matches!(
+        error.kind,
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::InvalidResponse
+    )
+}
+
+fn powder_direct_mutation_error(command: &str, error: &powder::PowderError) -> String {
+    let state = match error.kind {
+        powder::PowderErrorKind::Conflict => "conflict",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound => "stale",
+        powder::PowderErrorKind::Upstream => "pending",
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::InvalidResponse => {
+            "pending"
+        }
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': the mutation response was not ambiguous and operation recovery was not attempted"
+    );
+    if state == "pending" {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_unknown_reissue_guard(command: &str, intent_created_at: u64) -> Result<(), String> {
+    let within_retention = now_ms()
+        .checked_sub(intent_created_at)
+        .is_some_and(|age| age < POWDER_OPERATION_RETENTION_MS);
+    if within_retention {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command}: Powder mutation state 'expired': the durable operation intent is outside Powder's seven-day recovery window; refusing to reissue"
+        ))
+    }
+}
+
+fn powder_intent_created_at(crew: &CrewRef, operation_id: &str) -> Result<u64, String> {
+    crew.powder_work
+        .as_ref()
+        .and_then(|work| work.mutation_intent.as_ref())
+        .filter(|intent| intent.operation_id == operation_id)
+        .map(|intent| intent.created_at)
+        .ok_or_else(|| {
+            format!(
+                "Powder operation '{operation_id}' has no matching durable mutation intent after persistence"
+            )
+        })
+}
+
+fn refresh_crew_powder_mutation_scope(
+    ctx: &ControlContext,
+    expected: &CrewPowderScope,
+    operation_id: &str,
+    payload_digest: &str,
+) -> Result<CrewPowderScope, String> {
+    let current = resolve_crew_powder_scope(ctx, &expected.crew.terminal_id)?;
+    let intent_matches = current.work.mutation_intent.as_ref().is_some_and(|intent| {
+        intent.operation_id == operation_id && intent.payload_digest == payload_digest
+    });
+    if current.ship_slug != expected.ship_slug
+        || current.captain_role != expected.captain_role
+        || current.captain_terminal_id != expected.captain_terminal_id
+        || current.project_id != expected.project_id
+        || current.project_repo_root != expected.project_repo_root
+        || current.binding != expected.binding
+        || current.crew.terminal_id != expected.crew.terminal_id
+        || current.crew.harness != expected.crew.harness
+        || current.work.card_id != expected.work.card_id
+        || current.work.run_id != expected.work.run_id
+        || current.work.agent != expected.work.agent
+        || !intent_matches
+    {
+        return Err(format!(
+            "Crew session '{}' authoritative Powder scope changed during mutation persistence",
+            expected.crew.terminal_id
+        ));
+    }
+    Ok(current)
+}
+
+fn powder_capability_unavailable(command: &str, error: &powder::PowderError) -> String {
+    let message = error.message.to_ascii_lowercase();
+    let state = match error.kind {
+        powder::PowderErrorKind::InvalidResponse => "unsupported",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound | powder::PowderErrorKind::Conflict => "unsupported",
+        powder::PowderErrorKind::Unreachable
+            if message.contains("timed out") || message.contains("timeout") =>
+        {
+            "timeout"
+        }
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::Upstream => "pending",
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': deployed run-bound capability verification failed"
+    );
+    if matches!(state, "pending" | "timeout") {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
 fn append_crew_powder_work_log(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
     _trusted_internal: bool,
 ) -> Result<Value, String> {
-    require_exact_args(args, "append_crew_powder_work_log", &["message"])?;
+    require_exact_args(
+        args,
+        "append_crew_powder_work_log",
+        &["message", "operationId"],
+    )?;
     let caller = caller
         .ok_or("acl: 'append_crew_powder_work_log' requires a valid Crew T_HUB_SESSION_TOKEN")?;
     if caller.mint_role != crate::identity::Role::Crew || caller.fleet_role.is_some() {
@@ -9443,6 +12500,15 @@ fn append_crew_powder_work_log(
         .tile
         .clone()
         .ok_or("acl: 'append_crew_powder_work_log' requires a terminal-bound Crew identity")?;
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_crew_self(
+        &authorization_scope,
+        Some(caller),
+        "append_crew_powder_work_log",
+    )?;
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Mutation);
     let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_crew_self(&scope, Some(caller), "append_crew_powder_work_log")?;
     if !matches!(scope.crew.state, CrewState::Active)
@@ -9463,44 +12529,429 @@ fn append_crew_powder_work_log(
             powder::MAX_WORK_LOG_BODY_BYTES
         ));
     }
+    let operation_id = parse_powder_operation_id(args, "append_crew_powder_work_log")?;
+    let powder_agent = scope
+        .work
+        .agent
+        .as_deref()
+        .ok_or("Powder run-bound mutations are unavailable for this legacy Crew binding")?;
     let client = powder::Client::from_profile(&scope.binding.connection_profile)
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    let (card, run) = read_bound_powder_evidence(&client, &scope)?;
-    if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
-        return Err(format!(
-            "append_crew_powder_work_log: Crew run '{}' is already completed",
-            scope.work.run_id
-        ));
-    }
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|error| powder_capability_unavailable("Powder work-log append", &error))?;
     let attribution = powder::WorkLogAttribution {
-        agent: scope.crew.terminal_id.clone(),
+        agent: powder_agent.to_string(),
         model: None,
         reasoning: None,
         harness: scope.crew.harness.clone(),
-        run_id: scope.work.run_id.clone(),
     };
-    let entry = client
-        .append_work_log(&scope.work.card_id, &attribution, message)
-        .map_err(|error| format!("Powder work-log append failed: {error}"))?;
+    let append = powder::RunBoundWorkLog {
+        expected_run_id: scope.work.run_id.clone(),
+        operation_id: operation_id.clone(),
+        attribution,
+        body: message.to_string(),
+    };
+    let powder_request_digest = client
+        .work_log_request_digest(&scope.work.card_id, &append)
+        .map_err(|error| powder_capability_unavailable("Powder work-log append", &error))?;
+    let payload = json!({
+        "agent": powder_agent,
+        "harness": scope.crew.harness.clone(),
+        "message": message,
+    });
+    let intent = powder_mutation_intent_with_request_digest(
+        PowderMutationKind::WorkLogAppend,
+        &scope,
+        &operation_id,
+        &crew_session_id,
+        &payload,
+        powder_request_digest,
+    );
+    let intent_digest = intent.payload_digest.clone();
+    let (intent_crew, intent_created) = ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+    let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+    let intent_scope =
+        refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+    let pre_mutation_evidence =
+        read_bound_powder_evidence(&client, &intent_scope).and_then(|(card, run)| {
+            if bound_powder_reality(&intent_scope, &card, &run)? != BoundPowderReality::Active {
+                return Err("Powder work-log append requires the exact active Crew run".into());
+            }
+            Ok((card, run))
+        });
+    if let Err(error) = pre_mutation_evidence {
+        if intent_created {
+            ctx.captains
+                .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+                .map_err(|rollback_error| {
+                    format!(
+                        "{error}; durable unsubmitted mutation rollback failed: {rollback_error}"
+                    )
+                })?;
+        }
+        return Err(error);
+    }
+    let recovered = if intent_created {
+        None
+    } else {
+        match client.recover_work_log_operation(&scope.work.card_id, &append) {
+            Ok(outcome) if outcome.state == powder::OperationState::Unknown => {
+                powder_unknown_reissue_guard("Powder work-log append", intent_created_at)?;
+                None
+            }
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                return Err(powder_recovery_unavailable(
+                    "Powder work-log append",
+                    &error,
+                ));
+            }
+        }
+    };
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
+        None => match client.append_run_work_log(&scope.work.card_id, &append) {
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
+                .recover_work_log_operation(&scope.work.card_id, &append)
+                .map_err(|error| powder_recovery_unavailable("Powder work-log append", &error))
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                if let Some(state) = powder_direct_terminal_state(&error) {
+                    return Err(record_powder_terminal_rejection(
+                        ctx,
+                        &intent_scope,
+                        &operation_id,
+                        &intent_digest,
+                        PowderMutationKind::WorkLogAppend,
+                        state,
+                    )?);
+                }
+                return Err(powder_direct_mutation_error(
+                    "Powder work-log append",
+                    &error,
+                ));
+            }
+        },
+    };
+    let entry = match outcome.state {
+        powder::OperationState::Succeeded => outcome
+            .result
+            .ok_or("Powder work-log response did not include the exact run-bound entry")?,
+        state => {
+            if let Some(terminal_state) =
+                powder_operation_terminal_state(state, outcome.failure.as_ref())
+            {
+                return Err(record_powder_terminal_rejection(
+                    ctx,
+                    &intent_scope,
+                    &operation_id,
+                    &intent_digest,
+                    PowderMutationKind::WorkLogAppend,
+                    terminal_state,
+                )?);
+            }
+            return Err(powder_operation_rejection(
+                "Powder work-log append",
+                state,
+                outcome.failure.as_ref(),
+            ));
+        }
+    };
     if entry.card_id != scope.work.card_id
-        || entry.agent != scope.crew.terminal_id
+        || entry.agent != powder_agent
         || entry.run_id.as_deref() != Some(scope.work.run_id.as_str())
-        || entry.body != message
     {
         return Err("Powder work-log response did not match the bound Crew run".into());
     }
+    let (authoritative_card, authoritative_run) =
+        read_bound_powder_evidence(&client, &intent_scope).map_err(|error| {
+            format!(
+                "Powder work-log was accepted, but authoritative scope verification failed: {error}; exact operation recovery is required"
+            )
+        })?;
+    if bound_powder_reality(&intent_scope, &authoritative_card, &authoritative_run)?
+        != BoundPowderReality::Active
+    {
+        return Err(
+            "Powder work-log was accepted, but the exact Crew run is no longer active; exact operation recovery is required"
+                .into(),
+        );
+    }
+    let authoritative_repository = authoritative_card.repository.clone().ok_or_else(|| {
+        "Powder work-log was accepted, but authoritative repository evidence is missing; exact operation recovery is required"
+            .to_string()
+    })?;
+    ctx.captains
+        .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+        .map_err(|error| {
+            format!(
+                "Powder work-log was accepted, but durable mutation convergence failed: {error}"
+            )
+        })?;
+    let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "append_crew_powder_work_log",
         "audited": true,
         "crewSessionId": scope.crew.terminal_id,
         "projectId": scope.project_id,
-        "repository": scope.binding.repository,
+        "repository": authoritative_repository,
         "cardId": entry.card_id,
         "runId": scope.work.run_id,
         "agent": entry.agent,
         "harness": entry.harness,
         "createdAt": entry.created_at,
         "messageBytes": message.len(),
+        "operationId": operation_id,
+        "mutationState": if recovered_outcome { "recovered" } else { "committed" },
+    }))
+}
+
+fn review_crew_powder_criterion(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    _trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "review_crew_powder_criterion",
+        &[
+            "crewSessionId",
+            "operationId",
+            "criterion",
+            "criterionId",
+            "decision",
+            "proof",
+            "expectedReviewerIdentity",
+        ],
+    )?;
+    let crew_session_id = arg_str(args, "crewSessionId")
+        .ok_or("review_crew_powder_criterion requires a 'crewSessionId' argument")?;
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&authorization_scope, caller, "review_crew_powder_criterion")?;
+    let requested_by = caller
+        .and_then(|identity| identity.tile.as_deref())
+        .ok_or("review_crew_powder_criterion requires a terminal-bound Captain identity")?;
+    let operation_id = parse_powder_operation_id(args, "review_crew_powder_criterion")?;
+    let criterion_index = args
+        .get("criterion")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or("review_crew_powder_criterion requires an integer 'criterion' argument")?;
+    let criterion_id = args
+        .get("criterionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("review_crew_powder_criterion requires a non-empty 'criterionId' argument")?;
+    if criterion_id.len() > 256 {
+        return Err("review_crew_powder_criterion criterionId is too long".into());
+    }
+    let decision = match args.get("decision").and_then(Value::as_str) {
+        Some("approved") => powder::CriterionReviewDecision::Approved,
+        Some("rejected") => powder::CriterionReviewDecision::Rejected,
+        Some("cleared") => powder::CriterionReviewDecision::Cleared,
+        _ => {
+            return Err(
+                "review_crew_powder_criterion decision must be approved, rejected, or cleared"
+                    .into(),
+            );
+        }
+    };
+    let proof = match args.get("proof") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            if value.trim().len() > powder::MAX_COMPLETION_PROOF_BYTES {
+                return Err(format!(
+                    "review_crew_powder_criterion proof must be at most {} bytes",
+                    powder::MAX_COMPLETION_PROOF_BYTES
+                ));
+            }
+            Some(value.trim().to_string())
+        }
+        Some(Value::String(_)) => {
+            return Err("review_crew_powder_criterion proof must not be empty".into());
+        }
+        Some(_) => return Err("review_crew_powder_criterion proof must be a string".into()),
+    };
+    if decision == powder::CriterionReviewDecision::Cleared && proof.is_some() {
+        return Err("review_crew_powder_criterion cleared decisions cannot carry proof".into());
+    }
+    if decision != powder::CriterionReviewDecision::Cleared && proof.is_none() {
+        return Err("review_crew_powder_criterion requires proof for a review decision".into());
+    }
+    let expected_reviewer_identity = args
+        .get("expectedReviewerIdentity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(
+            "review_crew_powder_criterion requires a non-empty 'expectedReviewerIdentity' argument",
+        )?;
+    if expected_reviewer_identity.len() > 256 {
+        return Err("review_crew_powder_criterion expectedReviewerIdentity is too long".into());
+    }
+
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Mutation);
+    let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&scope, caller, "review_crew_powder_criterion")?;
+    if !matches!(scope.crew.state, CrewState::Active)
+        || !matches!(scope.work.state, PowderWorkState::Active)
+    {
+        return Err(format!(
+            "review_crew_powder_criterion: Crew session '{crew_session_id}' is not active"
+        ));
+    }
+    if scope.work.agent.is_none() {
+        return Err(
+            "Powder run-bound mutations are unavailable for this legacy Crew binding".into(),
+        );
+    }
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|error| powder_capability_unavailable("Powder criterion review", &error))?;
+    let (card, run) = read_bound_powder_evidence(&client, &scope)?;
+    if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
+        return Err("Powder criterion review requires the exact active Crew run".into());
+    }
+    let criterion = run
+        .criteria
+        .iter()
+        .find(|criterion| criterion.criterion_index == criterion_index)
+        .ok_or_else(|| {
+            format!(
+                "review_crew_powder_criterion criterion {criterion_index} is not authoritative for the bound run"
+            )
+        })?;
+    if criterion.criterion_id != criterion_id {
+        return Err("review_crew_powder_criterion criterionId does not match the bound run".into());
+    }
+    let review = powder::RunBoundCriterionReview {
+        expected_run_id: scope.work.run_id.clone(),
+        operation_id: operation_id.clone(),
+        criterion_index,
+        criterion_id: criterion_id.to_string(),
+        criterion_text: criterion.criterion_text.clone(),
+        decision,
+        proof: proof.clone(),
+        expected_reviewer_identity: expected_reviewer_identity.to_string(),
+    };
+    let intent_payload = json!({
+        "criterion": criterion_index,
+        "criterionId": criterion_id,
+        "criterionText": criterion.criterion_text,
+        "decision": decision,
+        "proof": proof,
+        "expectedReviewerIdentity": expected_reviewer_identity,
+    });
+    let powder_request_digest = client
+        .criterion_review_request_digest(&scope.work.card_id, &review)
+        .map_err(|error| powder_capability_unavailable("Powder criterion review", &error))?;
+    let intent = powder_mutation_intent_with_request_digest(
+        PowderMutationKind::CriterionReview,
+        &scope,
+        &operation_id,
+        requested_by,
+        &intent_payload,
+        powder_request_digest,
+    );
+    let intent_digest = intent.payload_digest.clone();
+    let (intent_crew, intent_created) = ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+    let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+    let intent_scope =
+        refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+    let recovered = if intent_created {
+        None
+    } else {
+        match client.recover_criterion_review_operation(&scope.work.card_id, &review) {
+            Ok(outcome) if outcome.state == powder::OperationState::Unknown => {
+                powder_unknown_reissue_guard("Powder criterion review", intent_created_at)?;
+                None
+            }
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                return Err(powder_recovery_unavailable(
+                    "Powder criterion review",
+                    &error,
+                ));
+            }
+        }
+    };
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
+        None => match client.review_run_criterion(&scope.work.card_id, &review) {
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
+                .recover_criterion_review_operation(&scope.work.card_id, &review)
+                .map_err(|error| powder_recovery_unavailable("Powder criterion review", &error))
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                if let Some(state) = powder_direct_terminal_state(&error) {
+                    return Err(record_powder_terminal_rejection(
+                        ctx,
+                        &intent_scope,
+                        &operation_id,
+                        &intent_digest,
+                        PowderMutationKind::CriterionReview,
+                        state,
+                    )?);
+                }
+                return Err(powder_direct_mutation_error(
+                    "Powder criterion review",
+                    &error,
+                ));
+            }
+        },
+    };
+    let receipt = match outcome.state {
+        powder::OperationState::Succeeded => outcome
+            .result
+            .ok_or("Powder criterion-review response omitted its authoritative receipt")?,
+        state => {
+            if let Some(terminal_state) =
+                powder_operation_terminal_state(state, outcome.failure.as_ref())
+            {
+                return Err(record_powder_terminal_rejection(
+                    ctx,
+                    &intent_scope,
+                    &operation_id,
+                    &intent_digest,
+                    PowderMutationKind::CriterionReview,
+                    terminal_state,
+                )?);
+            }
+            return Err(powder_operation_rejection(
+                "Powder criterion review",
+                state,
+                outcome.failure.as_ref(),
+            ));
+        }
+    };
+    ctx.captains
+        .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+        .map_err(|error| {
+            format!(
+                "Powder criterion review was accepted, but durable mutation convergence failed: {error}"
+            )
+        })?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "review_crew_powder_criterion",
+        "audited": true,
+        "crewSessionId": scope.crew.terminal_id,
+        "projectId": scope.project_id,
+        "repository": scope.binding.repository,
+        "cardId": receipt.card_id,
+        "runId": receipt.run_id,
+        "operationId": receipt.operation_id,
+        "mutationState": if recovered_outcome { "recovered" } else { "committed" },
+        "review": receipt,
     }))
 }
 
@@ -9540,10 +12991,14 @@ fn bounded_crew_evidence(
     truncated |= truncate_evidence_items(&mut card.runs, limit);
     truncated |= truncate_evidence_items(&mut card.work_log, limit);
     truncated |= truncate_evidence_items(&mut card.criteria, limit);
+    if let Some(criteria) = card.current_run_criteria.as_mut() {
+        truncated |= truncate_evidence_items(criteria, limit);
+    }
     truncated |= truncate_evidence_items(&mut run.activities, limit);
     truncated |= truncate_evidence_items(&mut run.links, limit);
+    truncated |= truncate_evidence_items(&mut run.card_criteria, limit);
     truncated |= truncate_evidence_items(&mut run.criteria, limit);
-    for criterion in card.criteria.iter_mut().chain(run.criteria.iter_mut()) {
+    for criterion in card.criteria.iter_mut().chain(run.card_criteria.iter_mut()) {
         truncated |= truncate_evidence_items(&mut criterion.proof_links, limit);
     }
     card.truncated |= truncated;
@@ -9613,15 +13068,27 @@ fn completion_success(
     ctx: &ControlContext,
     scope: &CrewPowderScope,
     digest: &str,
+    operation_id: &str,
+    intent_digest: &str,
     card: &powder::CardEvidence,
     run: &powder::RunEvidence,
+    receipt: Option<&powder::CompletionReceipt>,
     outcome: &str,
+    mutation_state: &str,
 ) -> Result<Value, String> {
     ctx.captains
-        .finish_crew_powder_completion(&scope.crew.terminal_id, digest)
+        .finish_crew_powder_completion_for_scope(scope, digest)
         .map_err(|error| {
             format!(
                 "Powder completion was verified, but durable completion state could not be saved: {error}"
+            )
+        })?;
+    let completed_scope = resolve_crew_powder_scope(ctx, &scope.crew.terminal_id)?;
+    ctx.captains
+        .finish_crew_powder_mutation(&completed_scope, operation_id, intent_digest)
+        .map_err(|error| {
+            format!(
+                "Powder completion was verified, but durable mutation convergence failed: {error}"
             )
         })?;
     let _ = captains_sync_apply(ctx);
@@ -9629,6 +13096,7 @@ fn completion_success(
         "accepted": "complete_crew_powder",
         "audited": true,
         "outcome": outcome,
+        "mutationState": mutation_state,
         "crewSessionId": scope.crew.terminal_id,
         "projectId": scope.project_id,
         "repository": scope.binding.repository,
@@ -9636,8 +13104,42 @@ fn completion_success(
         "runId": run.run.run_id,
         "cardStatus": card.status,
         "runState": run.run.state,
+        "receipt": receipt,
         "criteria": card.criteria,
     }))
+}
+
+fn verify_completion_receipt(
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    receipt: &powder::CompletionReceipt,
+    proof: &CrewCompletionProof,
+) -> Result<(), String> {
+    if receipt.card_id != scope.work.card_id
+        || receipt.run_id != scope.work.run_id
+        || receipt.operation_id != operation_id
+        || receipt.status != "done"
+        || receipt.proof.as_deref().is_none_or(str::is_empty)
+        || receipt.criterion_proofs.len() != proof.criterion_proofs.len()
+    {
+        return Err(
+            "Powder completion response did not confirm the exact bound card, run, operation, and proof; completion remains pending"
+            .into(),
+        );
+    }
+    for expected in &proof.criterion_proofs {
+        if !receipt
+            .criterion_proofs
+            .iter()
+            .any(|actual| actual.criterion == expected.criterion && !actual.url.is_empty())
+        {
+            return Err(
+                "Powder completion response did not confirm every submitted criterion proof; completion remains pending"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn complete_crew_powder(
@@ -9649,19 +13151,55 @@ fn complete_crew_powder(
     require_exact_args(
         args,
         "complete_crew_powder",
-        &["crewSessionId", "proof", "criterionProofs"],
+        &["crewSessionId", "operationId", "proof", "criterionProofs"],
     )?;
     let crew_session_id = arg_str(args, "crewSessionId")
         .ok_or("complete_crew_powder requires a 'crewSessionId' argument")?;
     let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_same_ship_captain(&authorization_scope, caller, "complete_crew_powder")?;
+    let requested_by = caller
+        .and_then(|identity| identity.tile.as_deref())
+        .ok_or("complete_crew_powder requires a terminal-bound Captain identity")?;
+    let operation_id = parse_powder_operation_id(args, "complete_crew_powder")?;
     let proof = parse_completion_proof(args)?;
-    let completion_guard = ctx
+    let _completion_guard = ctx
         .captains
         .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Completion);
     let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_same_ship_captain(&scope, caller, "complete_crew_powder")?;
     let digest = proof.digest();
+    let completion = powder::RunBoundCompletion {
+        expected_run_id: scope.work.run_id.clone(),
+        operation_id: operation_id.clone(),
+        proof: proof.proof.clone(),
+        criterion_proofs: proof
+            .criterion_proofs
+            .iter()
+            .map(|proof| powder::CriterionProof {
+                criterion: proof.criterion,
+                url: proof.url.clone(),
+            })
+            .collect(),
+    };
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|error| powder_capability_unavailable("Powder completion", &error))?;
+    let intent_payload =
+        serde_json::to_value(&proof).expect("completion proof serialization cannot fail");
+    let powder_request_digest = client
+        .completion_request_digest(&scope.work.card_id, &completion)
+        .map_err(|error| powder_capability_unavailable("Powder completion", &error))?;
+    let intent = powder_mutation_intent_with_request_digest(
+        PowderMutationKind::Completion,
+        &scope,
+        &operation_id,
+        requested_by,
+        &intent_payload,
+        powder_request_digest,
+    );
+    let intent_digest = intent.payload_digest.clone();
     let was_pending = matches!(scope.work.state, PowderWorkState::CompletionPending { .. });
     let was_completed = matches!(scope.work.state, PowderWorkState::Completed { .. });
     match &scope.work.state {
@@ -9676,100 +13214,163 @@ fn complete_crew_powder(
         _ => {}
     }
 
-    let client = powder::Client::from_profile(&scope.binding.connection_profile)
-        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    let (card, run) = read_bound_powder_evidence(&client, &scope)?;
-    match bound_powder_reality(&scope, &card, &run)? {
-        BoundPowderReality::Completed => {
-            completion_matches_evidence(&scope, &card, &run, &proof)?;
-            ctx.captains
-                .begin_crew_powder_completion(&crew_session_id, &digest)?;
-            return completion_success(
-                ctx,
-                &scope,
-                &digest,
-                &card,
-                &run,
-                if was_completed {
-                    "already_completed"
-                } else {
-                    "recovered"
-                },
-            );
-        }
-        BoundPowderReality::Active if was_completed => {
+    if was_completed {
+        let (card, run) = read_bound_powder_evidence(&client, &scope)?;
+        if bound_powder_reality(&scope, &card, &run)? == BoundPowderReality::Active {
             return Err(format!(
                 "Crew session '{crew_session_id}' is durably completed but Powder reports its run active"
             ));
         }
-        BoundPowderReality::Active => {}
-    }
-    validate_completion_criteria(&card.criteria, &proof)?;
-    let (_, transitioned_to_pending) = ctx
-        .captains
-        .begin_crew_powder_completion(&crew_session_id, &digest)?;
-    if completion_guard.waited_for_completion() && !transitioned_to_pending {
-        return Err(format!(
-            "Crew session '{crew_session_id}' completion remains pending after a concurrent request; retry the same proof after reviewing fresh evidence"
-        ));
-    }
-    let completion = powder::CompletionProof {
-        proof: proof.proof.clone(),
-        criterion_proofs: proof
-            .criterion_proofs
-            .iter()
-            .map(|proof| powder::CriterionProof {
-                criterion: proof.criterion,
-                url: proof.url.clone(),
-            })
-            .collect(),
-    };
-    let receipt = match client.complete_with_proof(&scope.work.card_id, &completion) {
-        Ok(receipt) => receipt,
-        Err(completion_error) => {
-            return match read_bound_powder_evidence(&client, &scope) {
-                Ok((card, run))
-                    if completion_matches_evidence(&scope, &card, &run, &proof).is_ok() =>
-                {
-                    completion_success(ctx, &scope, &digest, &card, &run, "recovered")
-                }
-                Ok(_) => Err(format!(
-                    "Powder completion remains pending after a failed request: {completion_error}; the same-ship Captain may retry only with the same proof"
-                )),
-                Err(recovery_error) => Err(format!(
-                    "Powder completion outcome is pending after a failed request: {completion_error}; recovery evidence was unavailable: {recovery_error}; the same-ship Captain may retry only with the same proof"
-                )),
-            };
-        }
-    };
-    if receipt.card_id != scope.work.card_id || receipt.status != "done" {
-        return Err(
-            "Powder completion response did not confirm the exact bound card; completion remains pending"
-                .into(),
+        return completion_success(
+            ctx,
+            &scope,
+            &digest,
+            &operation_id,
+            &intent_digest,
+            &card,
+            &run,
+            None,
+            "already_completed",
+            "recovered",
         );
     }
+    let (scope, intent_created, intent_created_at) = if was_pending {
+        let (intent_crew, intent_created) =
+            ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+        let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+        let intent_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+        (intent_scope, intent_created, intent_created_at)
+    } else {
+        let (card, run) = read_bound_powder_evidence(&client, &scope)?;
+        match bound_powder_reality(&scope, &card, &run)? {
+            BoundPowderReality::Completed => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' was completed without a matching durable operation intent"
+                ));
+            }
+            BoundPowderReality::Active => {
+                card.require_completion_criteria_approved(&scope.work.run_id)
+                    .map_err(|error| {
+                        format!("Powder completion criteria are not authoritative: {error}")
+                    })?;
+                validate_completion_criteria(&run.criteria, &proof)?;
+            }
+        }
+        let (intent_crew, intent_created) =
+            ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+        let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+        let intent_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+        ctx.captains
+            .begin_crew_powder_completion_for_scope(&intent_scope, &digest)?;
+        let pending_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+        (pending_scope, intent_created, intent_created_at)
+    };
+
+    let recovered = if was_pending || !intent_created {
+        match client.recover_completion_operation(&scope.work.card_id, &completion) {
+            Ok(outcome) if outcome.state != powder::OperationState::Unknown => Some(outcome),
+            Ok(_) => {
+                powder_unknown_reissue_guard("Powder completion", intent_created_at)?;
+                None
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                    powder_recovery_unavailable("Powder completion", &error)
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
+        None => match client.complete_run_with_proof(&scope.work.card_id, &completion) {
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
+                .recover_completion_operation(&scope.work.card_id, &completion)
+                .map_err(|error| {
+                    format!(
+                        "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                        powder_recovery_unavailable("Powder completion", &error)
+                    )
+                })
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                if let Some(state) = powder_direct_terminal_state(&error) {
+                    return Err(record_powder_terminal_rejection(
+                        ctx,
+                        &scope,
+                        &operation_id,
+                        &intent_digest,
+                        PowderMutationKind::Completion,
+                        state,
+                    )?);
+                }
+                return Err(format!(
+                    "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                    powder_direct_mutation_error("Powder completion", &error)
+                ));
+            }
+        },
+    };
+    let receipt = match outcome.state {
+        powder::OperationState::Succeeded => outcome.result.ok_or_else(|| {
+            "Powder completion response omitted the exact run-bound receipt; completion remains pending"
+                .to_string()
+        })?,
+        state => {
+            if let Some(terminal_state) =
+                powder_operation_terminal_state(state, outcome.failure.as_ref())
+            {
+                return Err(record_powder_terminal_rejection(
+                    ctx,
+                    &scope,
+                    &operation_id,
+                    &intent_digest,
+                    PowderMutationKind::Completion,
+                    terminal_state,
+                )?);
+            }
+            return Err(format!(
+                "{}; the same-ship Captain may retry only with the same proof",
+                powder_operation_rejection(
+                    "Powder completion",
+                    state,
+                    outcome.failure.as_ref(),
+                )
+            ));
+        }
+    };
+    verify_completion_receipt(&scope, &operation_id, &receipt, &proof)?;
     let (card, run) = read_bound_powder_evidence(&client, &scope).map_err(|error| {
         format!(
             "Powder accepted completion, but verification evidence was unavailable: {error}; completion remains pending for same-proof recovery"
         )
     })?;
-    completion_matches_evidence(&scope, &card, &run, &proof)?;
-    if receipt.criteria != card.criteria {
-        return Err(
-            "Powder completion receipt did not match the verified criteria; completion remains pending"
-                .into(),
-        );
-    }
+    completion_receipt_matches_evidence(&scope, &card, &run, &receipt)?;
     completion_success(
         ctx,
         &scope,
         &digest,
+        &operation_id,
+        &intent_digest,
         &card,
         &run,
-        if was_pending {
+        Some(&receipt),
+        if recovered_outcome {
             "recovered"
         } else {
             "completed"
+        },
+        if recovered_outcome {
+            "recovered"
+        } else {
+            "committed"
         },
     )
 }
@@ -9785,40 +13386,52 @@ fn heartbeat_crew_powder(
         .or_else(|| arg_str(args, "crew_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
-    let (crew_harness, crew_ship) = ctx
+    let authorization = authorize_crew_heartbeat_target(
+        ctx,
+        &crew_session_id,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let authorization_scope =
+        resolve_crew_powder_scope_from_heartbeat_authorization(authorization, &crew_session_id)?;
+    require_crew_heartbeat_authority(
+        &authorization_scope,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    require_live_crew_harness(&authorization_scope, "heartbeat_crew_powder")?;
+    let _operation_guard = ctx
         .captains
-        .snapshot()
-        .captains
-        .into_iter()
-        .find_map(|captain| {
-            captain
-                .crew
-                .iter()
-                .find(|crew| crew.terminal_id == crew_session_id)
-                .and_then(|crew| {
-                    crew.harness
-                        .as_ref()
-                        .map(|harness| (harness.clone(), captain.ship_slug.clone()))
-                })
-        })
-        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
-    if caller.and_then(|identity| identity.tile.as_deref()) != Some(crew_session_id.as_str()) {
-        enforce_ship_authority(caller, trusted_internal, &crew_ship)?;
-    }
-    match tmux::harness_liveness(&tmux_target(&crew_session_id), &crew_harness) {
-        tmux::SessionLiveness::Alive => {}
-        tmux::SessionLiveness::Gone => {
-            return Err(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
-            ));
-        }
-        tmux::SessionLiveness::Unknown => {
-            return Err(retryable_error(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' liveness is unavailable"
-            )));
-        }
-    }
-    let (renewed, crew) = renew_crew_powder_binding(ctx, &crew_session_id, None)?;
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Renewal);
+    // The caller may have waited behind completion or cleanup. Re-authorize the
+    // minimal target ownership before any repeated scope resolution so a former
+    // Captain cannot use an unknown or removed Crew scope as an oracle.
+    let current_authorization = authorize_crew_heartbeat_target(
+        ctx,
+        &crew_session_id,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let current_scope = resolve_crew_powder_scope_from_heartbeat_authorization(
+        current_authorization,
+        &crew_session_id,
+    )?;
+    require_unchanged_powder_authority_generation(
+        &authorization_scope,
+        &current_scope,
+        "heartbeat_crew_powder",
+    )?;
+    require_crew_heartbeat_authority(
+        &current_scope,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let (renewed, crew) =
+        renew_crew_powder_binding_guarded(ctx, &current_scope, None, "heartbeat_crew_powder")?;
     Ok(json!({
         "accepted": "heartbeat_crew_powder",
         "audited": true,
@@ -9832,6 +13445,65 @@ fn heartbeat_crew_powder(
     }))
 }
 
+fn require_crew_heartbeat_authority(
+    scope: &CrewPowderScope,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a session identity"))?;
+    if caller.tile.as_deref() == Some(scope.crew.terminal_id.as_str()) {
+        return Ok(());
+    }
+    if caller.fleet_role == Some(FleetRole::Captain)
+        && caller.ship_slug.as_deref() == Some(scope.ship_slug.as_str())
+        && scope.captain_role == FleetRole::Captain
+        && scope.captain_state == ClaimState::Active
+        && scope.captain_terminal_id.as_deref() == caller.tile.as_deref()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "acl: '{command}' requires the exact Crew session or its current owning Captain"
+    ))
+}
+
+fn require_unchanged_powder_authority_generation(
+    expected: &CrewPowderScope,
+    current: &CrewPowderScope,
+    command: &str,
+) -> Result<(), String> {
+    if expected.authority_generation.is_none()
+        || expected.authority_generation != current.authority_generation
+    {
+        return Err(format!(
+            "acl: '{command}' Crew authority generation changed while the operation waited; retry from the current exact owner"
+        ));
+    }
+    Ok(())
+}
+
+fn require_live_crew_harness(scope: &CrewPowderScope, command: &str) -> Result<(), String> {
+    let crew_session_id = &scope.crew.terminal_id;
+    let harness = scope
+        .crew
+        .harness
+        .as_deref()
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
+    match tmux::harness_liveness(&tmux_target(crew_session_id), harness) {
+        tmux::SessionLiveness::Alive => Ok(()),
+        tmux::SessionLiveness::Gone => Err(format!(
+            "{command}: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
+        )),
+        tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
+            "{command}: Crew session '{crew_session_id}' liveness is unavailable"
+        ))),
+    }
+}
+
 fn renew_crew_powder_binding(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -9840,16 +13512,29 @@ fn renew_crew_powder_binding(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Renewal);
-    // Resolve again inside the operation guard. A reconciler snapshot may have
-    // observed Active before completion persisted pending or completed state.
-    let (client, claim) = crew_powder_context(ctx, crew_session_id)?;
+    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+    renew_crew_powder_binding_guarded(ctx, &scope, ttl_seconds, "Powder renewal")
+}
+
+fn renew_crew_powder_binding_guarded(
+    ctx: &ControlContext,
+    scope: &CrewPowderScope,
+    ttl_seconds: Option<u64>,
+    command: &str,
+) -> Result<(powder::Claim, CrewRef), String> {
+    // The scope and liveness are resolved inside the operation guard. A
+    // reconciler snapshot may have observed Active before completion persisted
+    // pending or completed state, or before the Harness process exited.
+    require_active_crew_powder_renewal(scope)?;
+    require_live_crew_harness(scope, command)?;
+    let (client, claim) = crew_powder_context(scope)?;
     let renewed = match ttl_seconds {
         Some(ttl_seconds) => client.renew(&claim, ttl_seconds)?,
         None => client.heartbeat(&claim)?,
     };
     let crew = ctx
         .captains
-        .update_crew_claim_expiry(crew_session_id, renewed.expires_at)?;
+        .compare_and_update_crew_claim_expiry(scope, renewed.expires_at)?;
     let _ = captains_sync_apply(ctx);
     Ok((renewed, crew))
 }
@@ -9857,24 +13542,124 @@ fn renew_crew_powder_binding(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowderCleanupDisposition {
     AlreadyCompleted,
+    AlreadyReleased,
     ObserveCompletion,
     AwaitCompletionRecovery,
     Release,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundPowderCleanupReality {
+    Active,
+    Completed,
+    Released,
+}
+
+fn bound_powder_cleanup_reality(
+    scope: &CrewPowderScope,
+    card: &powder::CardEvidence,
+    run: &powder::RunEvidence,
+) -> Result<BoundPowderCleanupReality, String> {
+    validate_bound_evidence(scope, card, run)?;
+    if card.status == "ready" && card.claim.is_none() && run.run.state == "released" {
+        return Ok(BoundPowderCleanupReality::Released);
+    }
+    match bound_powder_reality(scope, card, run)? {
+        BoundPowderReality::Active => Ok(BoundPowderCleanupReality::Active),
+        BoundPowderReality::Completed => Ok(BoundPowderCleanupReality::Completed),
+    }
+}
+
+fn validate_historical_powder_release(
+    scope: &CrewPowderScope,
+    card: &powder::CardEvidence,
+    run: &powder::RunEvidence,
+) -> Result<(), String> {
+    validate_bound_evidence(scope, card, run)?;
+    let matching_runs = card
+        .runs
+        .iter()
+        .filter(|candidate| candidate.run_id == scope.work.run_id)
+        .collect::<Vec<_>>();
+    match matching_runs.as_slice() {
+        [] => {
+            return Err(format!(
+                "Powder card '{}' is missing exact historical run '{}' evidence",
+                scope.work.card_id, scope.work.run_id
+            ));
+        }
+        [summary] if *summary == &run.run => {}
+        [_] => {
+            return Err(format!(
+                "Powder card '{}' and historical run '{}' report inconsistent run evidence",
+                scope.work.card_id, scope.work.run_id
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "Powder card '{}' has ambiguous evidence for historical run '{}'",
+                scope.work.card_id, scope.work.run_id
+            ));
+        }
+    }
+    if card.status != "ready" || run.card_status != "ready" {
+        return Err(format!(
+            "Powder card '{}' is not ready; historical release is not authoritative",
+            scope.work.card_id
+        ));
+    }
+    if let Some(claim) = card.claim.as_ref() {
+        return Err(format!(
+            "Powder card '{}' has current claim run '{}'; historical cleanup is refused",
+            scope.work.card_id, claim.run_id
+        ));
+    }
+    if run.run.state != "released" {
+        return Err(format!(
+            "Powder run '{}' has state '{}', not released",
+            scope.work.run_id, run.run.state
+        ));
+    }
+    Ok(())
+}
+
+fn historical_powder_read_error(
+    crew_session_id: &str,
+    evidence_kind: &str,
+    error: powder::PowderError,
+) -> String {
+    let message = format!(
+        "Historical Powder reconciliation could not read authoritative {evidence_kind} evidence; Crew session '{crew_session_id}' remains unchanged: {error}"
+    );
+    match error.kind {
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::Upstream => {
+            retryable_error(message)
+        }
+        powder::PowderErrorKind::Unauthorized
+        | powder::PowderErrorKind::NotFound
+        | powder::PowderErrorKind::Conflict
+        | powder::PowderErrorKind::InvalidResponse => message,
+    }
+}
+
 fn powder_cleanup_disposition(
     state: &PowderWorkState,
-    reality: BoundPowderReality,
+    reality: BoundPowderCleanupReality,
 ) -> PowderCleanupDisposition {
     match (state, reality) {
         (PowderWorkState::Completed { .. }, _) => PowderCleanupDisposition::AlreadyCompleted,
         (PowderWorkState::CompletionPending { .. }, _) => {
             PowderCleanupDisposition::AwaitCompletionRecovery
         }
-        (PowderWorkState::Active, BoundPowderReality::Completed) => {
+        (PowderWorkState::Active, BoundPowderCleanupReality::Completed) => {
             PowderCleanupDisposition::ObserveCompletion
         }
-        (PowderWorkState::Active, BoundPowderReality::Active) => PowderCleanupDisposition::Release,
+        (PowderWorkState::Active, BoundPowderCleanupReality::Released) => {
+            PowderCleanupDisposition::AlreadyReleased
+        }
+        (PowderWorkState::Active, BoundPowderCleanupReality::Active) => {
+            PowderCleanupDisposition::Release
+        }
     }
 }
 
@@ -9886,6 +13671,26 @@ fn release_crew_powder_binding_guarded(
         Ok(scope) => scope,
         Err(error) => return Some(json!({ "released": false, "error": error })),
     };
+    if let Some(intent) = scope
+        .work
+        .mutation_intent
+        .as_ref()
+        .filter(|intent| intent.terminal_rejection.is_none())
+    {
+        let error = if intent.powder_request_digest.is_none() {
+            "A legacy Powder mutation intent lacks its canonical request digest; refusing release and Crew cleanup"
+        } else {
+            "A Powder mutation intent remains unresolved; refusing release and Crew cleanup"
+        };
+        return Some(json!({
+            "released": false,
+            "outcome": "recovery_pending",
+            "projectId": scope.project_id,
+            "cardId": scope.work.card_id,
+            "runId": scope.work.run_id,
+            "error": error,
+        }));
+    }
     if matches!(scope.work.state, PowderWorkState::Completed { .. }) {
         return Some(json!({
             "released": true,
@@ -9915,7 +13720,7 @@ fn release_crew_powder_binding_guarded(
             }));
         }
     };
-    let reality = match bound_powder_reality(&scope, &card, &run) {
+    let reality = match bound_powder_cleanup_reality(&scope, &card, &run) {
         Ok(reality) => reality,
         Err(error) => {
             return Some(json!({
@@ -9931,6 +13736,15 @@ fn release_crew_powder_binding_guarded(
             return Some(json!({
                 "released": true,
                 "outcome": "already_completed",
+                "projectId": scope.project_id,
+                "cardId": scope.work.card_id,
+                "runId": scope.work.run_id,
+            }));
+        }
+        PowderCleanupDisposition::AlreadyReleased => {
+            return Some(json!({
+                "released": true,
+                "outcome": "already_released",
                 "projectId": scope.project_id,
                 "cardId": scope.work.card_id,
                 "runId": scope.work.run_id,
@@ -9967,18 +13781,43 @@ fn release_crew_powder_binding_guarded(
         }
         PowderCleanupDisposition::Release => {}
     }
+    // `bound_powder_reality` has just established that the fresh card claim and
+    // run evidence describe the same active owner. Use that authoritative owner
+    // in the expected receipt so a different agent can never retire this Crew's
+    // durable binding.
+    let authoritative_claim = match card.claim.as_ref() {
+        Some(claim) => claim,
+        None => {
+            return Some(json!({
+                "released": false,
+                "cardId": scope.work.card_id,
+                "runId": scope.work.run_id,
+                "error": "Powder release failed because fresh claim ownership was unavailable",
+            }));
+        }
+    };
     let claim = powder::Claim {
         card_id: scope.work.card_id.clone(),
         run_id: scope.work.run_id.clone(),
-        agent: String::new(),
-        expires_at: scope.work.claim_expires_at.unwrap_or_default(),
+        agent: authoritative_claim.agent.clone(),
+        expires_at: authoritative_claim.expires_at,
     };
     Some(match client.release(&claim) {
-        Ok(released) => json!({
-            "released": true,
-            "outcome": "released",
-            "cardId": released.card_id,
-            "runId": released.run_id,
+        Ok(released)
+            if released.card_id == scope.work.card_id && released.run_id == scope.work.run_id =>
+        {
+            json!({
+                "released": true,
+                "outcome": "released",
+                "cardId": released.card_id,
+                "runId": released.run_id,
+            })
+        }
+        Ok(_) => json!({
+            "released": false,
+            "cardId": scope.work.card_id,
+            "runId": scope.work.run_id,
+            "error": "Powder release response did not match the exact bound card and run",
         }),
         Err(_) => json!({
             "released": false,
@@ -10005,7 +13844,40 @@ fn finalize_crew_powder_cleanup(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
-    let (cleanup_was_pending, completion_recovery_required, has_powder_binding) = ctx
+    finalize_crew_powder_cleanup_guarded(ctx, crew_session_id, preserve_crew_on_powder_failure)
+}
+
+fn finalize_crew_powder_cleanup_guarded(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    preserve_crew_on_powder_failure: bool,
+) -> Result<(Option<Value>, bool, bool), String> {
+    if let Some(recovery) = ctx.captains.pending_dispatch_release(crew_session_id) {
+        return match recover_pending_dispatch_release_guarded(ctx, &recovery) {
+            Ok(()) => Ok((
+                Some(json!({
+                    "released": true,
+                    "outcome": "released",
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
+                })),
+                false,
+                true,
+            )),
+            Err(error) => Ok((
+                Some(json!({
+                    "released": false,
+                    "outcome": "recovery_pending",
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
+                    "error": format!("trusted dispatch release recovery remains pending: {error}"),
+                })),
+                true,
+                false,
+            )),
+        };
+    }
+    let (cleanup_was_pending, completion_recovery_required, has_powder_binding, is_removed) = ctx
         .captains
         .snapshot()
         .captains
@@ -10020,9 +13892,15 @@ fn finalize_crew_powder_cleanup(
                     matches!(work.state, PowderWorkState::CompletionPending { .. })
                 }),
                 has_powder_binding,
+                matches!(crew.state, CrewState::Removed { .. }),
             )
         })
-        .unwrap_or((false, false, false));
+        .unwrap_or((false, false, false, false));
+    if is_removed && has_powder_binding {
+        return Err(format!(
+            "Crew session '{crew_session_id}' is historically Removed; ordinary live Powder cleanup is refused"
+        ));
+    }
     let powder_release = release_crew_powder_binding_guarded(ctx, crew_session_id);
     let crew_binding_retained = retain_crew_binding_after_powder_failure(
         preserve_crew_on_powder_failure,
@@ -10031,14 +13909,32 @@ fn finalize_crew_powder_cleanup(
         has_powder_binding,
         powder_release.as_ref(),
     );
+    let released_binding = powder_release.as_ref().and_then(|release| {
+        matches!(
+            release.get("outcome").and_then(Value::as_str),
+            Some("released" | "already_released")
+        )
+        .then(|| {
+            (
+                release.get("cardId").and_then(Value::as_str),
+                release.get("runId").and_then(Value::as_str),
+            )
+        })
+        .and_then(|(card_id, run_id)| Some((card_id?.to_string(), run_id?.to_string())))
+    });
     // Keep the guard through the final registry mutation. No completion or
     // renewal can change the binding between the fresh state check, remote
     // release decision, and this retained/removal transition.
-    let captain_state_changed = if crew_binding_retained {
+    let mut captain_state_changed = if crew_binding_retained {
         ctx.captains.mark_crew_cleanup_pending(crew_session_id)?
     } else {
         ctx.captains.remove_session(crew_session_id)?
     };
+    if let Some((card_id, run_id)) = released_binding {
+        captain_state_changed |=
+            ctx.captains
+                .clear_released_crew_powder_binding(crew_session_id, &card_id, &run_id)?;
+    }
     Ok((powder_release, crew_binding_retained, captain_state_changed))
 }
 
@@ -10124,7 +14020,167 @@ fn powder_event_poll_interval() -> Duration {
     Duration::from_secs(seconds)
 }
 
+/// Reconcile trusted dispatch releases from their frozen original scope.
+///
+/// This intentionally never resolves a Crew Powder scope from the current
+/// Captain or Project.  A release-reclaim ABA can replace that binding while the
+/// original release response is ambiguous, and recovery must not touch the
+/// replacement's profile or repository.
+fn recover_pending_dispatch_release(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let _operation_guard = ctx.captains.serialize_crew_powder_operation(
+        &recovery.crew_session_id,
+        CrewPowderOperationKind::Cleanup,
+    );
+    let current = ctx
+        .captains
+        .pending_dispatch_release(&recovery.crew_session_id)
+        .ok_or("the exact durable release recovery no longer exists")?;
+    if current != *recovery {
+        return Err("the exact durable release recovery changed while waiting for cleanup".into());
+    }
+    recover_pending_dispatch_release_guarded(ctx, &current)
+}
+
+fn ensure_recovery_terminal_gone(crew_session_id: &str) -> Result<(), String> {
+    let target = tmux_target(crew_session_id);
+    match tmux::session_liveness(&target) {
+        tmux::SessionLiveness::Gone => Ok(()),
+        tmux::SessionLiveness::Alive => {
+            tmux::kill_session_tree(&target).map_err(|error| {
+                format!("trusted release recovery could not stop Crew terminal '{crew_session_id}': {error}")
+            })?;
+            match tmux::session_liveness(&target) {
+                tmux::SessionLiveness::Gone => Ok(()),
+                tmux::SessionLiveness::Alive => Err(format!(
+                    "trusted release recovery refuses Powder release while Crew terminal '{crew_session_id}' remains alive"
+                )),
+                tmux::SessionLiveness::Unknown => Err(format!(
+                    "trusted release recovery cannot verify Crew terminal '{crew_session_id}' is gone"
+                )),
+            }
+        }
+        tmux::SessionLiveness::Unknown => Err(format!(
+            "trusted release recovery cannot verify Crew terminal '{crew_session_id}' is gone"
+        )),
+    }
+}
+
+fn clear_confirmed_dispatch_release_and_retire(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+    if !cleared || !crew_removed {
+        return Err("the exact durable release recovery could not remove its transaction-owned Crew binding".into());
+    }
+    ctx.tabs.remove_tile(&recovery.crew_session_id);
+    ctx.identity.retire_tile(&recovery.crew_session_id)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+fn recover_pending_dispatch_release_guarded(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let client = powder::Client::from_profile(&recovery.connection_profile)?;
+    if client.configured_agent() != recovery.agent {
+        return Err("the frozen profile agent changed".into());
+    }
+    match client.verify_endpoint_identity(&recovery.connection_endpoint_identity) {
+        Ok(()) => {}
+        Err(powder::EndpointIdentityVerificationError::Mismatch) => {
+            return Err("the frozen profile endpoint changed before release recovery".into());
+        }
+        Err(powder::EndpointIdentityVerificationError::MalformedIdentity) => {
+            return Err(
+                "the frozen profile endpoint identity is malformed before release recovery".into(),
+            );
+        }
+        Err(powder::EndpointIdentityVerificationError::MissingCredential) => {
+            return Err(
+                "the frozen profile endpoint identity cannot be verified before release recovery"
+                    .into(),
+            );
+        }
+    }
+    let repository = client
+        .get_repository(&recovery.repository)
+        .map_err(|error| format!("the frozen repository cannot be reconciled: {error}"))?;
+    if repository.get("name").and_then(Value::as_str) != Some(recovery.repository.as_str()) {
+        return Err("the frozen repository identity changed before release recovery".into());
+    }
+    let card = client
+        .card_evidence(&recovery.card_id)
+        .map_err(|error| format!("the frozen card cannot be reconciled: {error}"))?;
+    if card.repository.as_deref() != Some(recovery.repository.as_str()) {
+        return Err("the frozen card repository changed before release recovery".into());
+    }
+    let evidence = client
+        .run_evidence(&recovery.run_id)
+        .map_err(|error| format!("the exact release cannot be reconciled: {error}"))?;
+    if evidence.repository.as_deref() != Some(recovery.repository.as_str())
+        || evidence.run.card_id != recovery.card_id
+        || evidence.run.agent != recovery.agent
+    {
+        return Err("the authoritative run identity changed before release recovery".into());
+    }
+    if evidence.run.state == "released" {
+        if card.status != "ready" || card.claim.is_some() {
+            return Err(
+                "the released run does not have an exact ready card with no current claim".into(),
+            );
+        }
+        ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
+        return clear_confirmed_dispatch_release_and_retire(ctx, recovery);
+    }
+    if evidence.run.state != "active" {
+        return Err(format!(
+            "the authoritative run is '{}' rather than active or released",
+            evidence.run.state
+        ));
+    }
+    if !card
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.run_id == recovery.run_id && claim.agent == recovery.agent)
+    {
+        return Err("the active card claim no longer matches the exact release ownership".into());
+    }
+    ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
+    if recovery.state == PendingDispatchReleaseState::Prepared {
+        ctx.captains.transition_dispatch_release(
+            recovery,
+            PendingDispatchReleaseState::Prepared,
+            PendingDispatchReleaseState::InFlight,
+        )?;
+    }
+    let claim = powder::Claim {
+        card_id: recovery.card_id.clone(),
+        run_id: recovery.run_id.clone(),
+        agent: recovery.agent.clone(),
+        expires_at: 0,
+    };
+    client.release(&claim)?;
+    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
+}
+
+fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
+    for recovery in ctx.captains.snapshot().pending_dispatch_releases {
+        if let Err(error) = recover_pending_dispatch_release(ctx, &recovery) {
+            eprintln!(
+                "t-hub-control: trusted dispatch release recovery for '{}' remains pending: {error}",
+                recovery.crew_session_id
+            );
+        }
+    }
+}
+
 fn reconcile_powder_leases(ctx: &ControlContext) {
+    reconcile_pending_dispatch_releases(ctx);
     let snapshot = ctx.captains.snapshot();
     let mut work = Vec::new();
     for captain in &snapshot.captains {
@@ -10140,6 +14196,13 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
             continue;
         };
         for crew in &captain.crew {
+            if snapshot
+                .pending_dispatch_releases
+                .iter()
+                .any(|recovery| recovery.crew_session_id == crew.terminal_id)
+            {
+                continue;
+            }
             if !matches!(
                 crew.state,
                 CrewState::Active | CrewState::CleanupPending { .. }
@@ -11426,7 +15489,7 @@ fn captain_checkpoint(
         .as_deref()
         .or(captain.terminal_id.as_deref())
         .ok_or("captain_checkpoint: Captain has no active terminal")?;
-    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, target)?;
+    let _ = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, target)?;
 
     let captain = ctx.captains.checkpoint(
         captain_session_id.as_deref(),
@@ -11845,6 +15908,18 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    spawn_terminal_with_private_pane_command(ctx, args, None)
+}
+
+/// Internal spawn variant for an already-formed private pane command.
+///
+/// The raw command is accepted only by in-process dispatch and is deliberately
+/// excluded from the public response, apply forward, and command arguments.
+fn spawn_terminal_with_private_pane_command(
+    ctx: &ControlContext,
+    args: &Value,
+    private_pane_command: Option<&str>,
+) -> Result<Value, String> {
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
     let shell = arg_str(args, "shell");
@@ -11915,7 +15990,8 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let tmux_cwd = files::posix_form(&cwd_effective);
-    let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+    let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+    let pane = private_pane_command.map(str::to_owned).or(public_pane);
     // item-3: grant this session its capability token via env (READ by default,
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
@@ -12330,12 +16406,96 @@ fn close_terminal_authorized(
     let target = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
-    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
-    close_terminal(ctx, args)
+    // Authorize the target from ownership-only registry state before checking
+    // historical Removed Crew state, which can lead to Project and Powder scope
+    // resolution. Foreign callers must not use close as a binding-state oracle.
+    let authority = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
+    if ctx.captains.removed_crew_powder_ship(&target)?.is_some() {
+        return reconcile_removed_crew_powder_binding(ctx, caller, &target);
+    }
+    close_terminal_with_policy(ctx, args, false, authority.as_ref())
+}
+
+fn reconcile_removed_crew_powder_binding(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    crew_session_id: &str,
+) -> Result<Value, String> {
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
+    let authority = enforce_removed_crew_powder_cleanup_authority(ctx, caller, crew_session_id)?;
+    #[cfg(test)]
+    ctx.captains
+        .pause_before_historical_scope_capture(crew_session_id);
+    let scope = resolve_historical_removed_crew_powder_scope(ctx, crew_session_id, &authority)?;
+    if !matches!(scope.crew.state, CrewState::Removed { .. }) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' is not removed; historical Powder reconciliation is refused"
+        ));
+    }
+    match scope.work.state {
+        PowderWorkState::Active => {}
+        PowderWorkState::CompletionPending { .. } => {
+            return Err(retryable_error(format!(
+                "Crew session '{crew_session_id}' has Powder completion pending; exact same-proof recovery is required before historical cleanup"
+            )));
+        }
+        PowderWorkState::Completed { .. } => {
+            return Err(format!(
+                "Crew session '{crew_session_id}' has completed Powder recovery state; refusing to erase it during historical cleanup"
+            ));
+        }
+    }
+    let client = powder::Client::from_profile(&scope.binding.connection_profile).map_err(|_| {
+        format!(
+            "Historical Powder reconciliation could not open the bound Project profile; Crew session '{crew_session_id}' remains unchanged"
+        )
+    })?;
+    let card = client
+        .card_evidence(&scope.work.card_id)
+        .map_err(|error| historical_powder_read_error(crew_session_id, "card", error))?;
+    let run = client
+        .run_evidence(&scope.work.run_id)
+        .map_err(|error| historical_powder_read_error(crew_session_id, "run", error))?;
+    validate_historical_powder_release(&scope, &card, &run).map_err(|error| {
+        format!(
+            "Historical Powder reconciliation refused for Crew session '{crew_session_id}'; its Removed state and binding were preserved: {error}"
+        )
+    })?;
+    let cleared = ctx
+        .captains
+        .compare_and_clear_released_removed_crew_powder_binding(&scope)
+        .map_err(|error| {
+            retryable_error(format!(
+                "Historical Powder release was verified, but the exact local binding could not be cleared; Crew session '{crew_session_id}' remains unchanged: {error}"
+            ))
+        })?;
+    if !cleared {
+        return Err(retryable_error(format!(
+            "Historical Powder release was verified, but Crew session '{crew_session_id}' no longer had the exact local binding; retry after refreshing state"
+        )));
+    }
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "close_terminal",
+        "sessionId": crew_session_id,
+        "target": tmux_target(crew_session_id),
+        "outcome": "already_gone",
+        "powderRelease": {
+            "released": true,
+            "outcome": "already_released",
+            "projectId": scope.project_id,
+            "cardId": scope.work.card_id,
+            "runId": scope.work.run_id,
+        },
+        "crewBindingRetained": false,
+        "audited": true,
+    }))
 }
 
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    close_terminal_with_policy(ctx, args, false)
+    close_terminal_with_policy(ctx, args, false, None)
 }
 
 fn retain_crew_binding_after_powder_failure(
@@ -12357,6 +16517,7 @@ fn close_terminal_with_policy(
     ctx: &ControlContext,
     args: &Value,
     preserve_crew_on_powder_failure: bool,
+    authority: Option<&TargetLifecycleAuthority>,
 ) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -12364,6 +16525,16 @@ fn close_terminal_with_policy(
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
+    // Serialize the entire terminal-close transaction with completion,
+    // renewal, and cleanup for this Crew. The guard must precede liveness and
+    // tmux teardown so a close queued behind completion cannot kill the worker
+    // before the authoritative Powder transition converges.
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(tile_id, CrewPowderOperationKind::Cleanup);
+    if let Some(authority) = authority {
+        revalidate_target_lifecycle_authority(ctx, authority)?;
+    }
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
     // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
@@ -12409,7 +16580,7 @@ fn close_terminal_with_policy(
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
     let (powder_release, crew_binding_retained, captain_state_changed) =
-        finalize_crew_powder_cleanup(ctx, tile_id, preserve_crew_on_powder_failure)?;
+        finalize_crew_powder_cleanup_guarded(ctx, tile_id, preserve_crew_on_powder_failure)?;
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -12795,6 +16966,93 @@ mod tests {
         (bin_dir, command)
     }
 
+    /// Tear down a real tmux fixture and prove the named session is absent.
+    ///
+    /// tmux can remove its final session successfully and then return
+    /// `server exited unexpectedly` while the server shuts down. Production
+    /// continues to surface that error. Tests tolerate only that exact teardown
+    /// race, and only after a separate liveness probe proves the fixture is gone.
+    fn reap_test_tmux_session(target: &str) -> Result<(), String> {
+        let teardown = tmux::kill_session_tree(target);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tmux::session_liveness(target) != tmux::SessionLiveness::Gone {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "tmux test fixture '{target}' survived teardown: {teardown:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Err(error) = teardown {
+            if error.message != "server exited unexpectedly" {
+                return Err(format!(
+                    "tmux test fixture '{target}' reported an unexpected teardown failure: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reap_test_tmux_session_and_assert_absent(target: &str) {
+        reap_test_tmux_session(target).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match tmux::new_session_with_env(target, "/tmp", None, &[]) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.message == "server exited unexpectedly" => {
+                    match tmux::session_liveness(target) {
+                        tmux::SessionLiveness::Alive => return Ok(()),
+                        tmux::SessionLiveness::Gone if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        liveness => {
+                            return Err(format!(
+                                "tmux test fixture '{target}' could not start after server teardown ({liveness:?}): {error}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    /// Serialize process-attestation fixtures and keep an anchor alive while a
+    /// case runs. This prevents one test's final-session shutdown from racing
+    /// another test's session creation. Dropping the guard reaps the anchor and
+    /// independently probes its absence, including after a successful final
+    /// removal that tmux reports as `server exited unexpectedly`.
+    struct ProcessAttestationTmuxGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        anchor: String,
+    }
+
+    impl ProcessAttestationTmuxGuard {
+        fn acquire() -> Self {
+            static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let anchor_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let anchor = tmux_target(&anchor_id);
+            create_test_tmux_session(&anchor).unwrap();
+            Self {
+                _lock: lock,
+                anchor,
+            }
+        }
+    }
+
+    impl Drop for ProcessAttestationTmuxGuard {
+        fn drop(&mut self) {
+            let _ = reap_test_tmux_session(&self.anchor);
+        }
+    }
+
     fn process_permission_attestation(
         expected: Harness,
         executable_name: &str,
@@ -12812,6 +17070,7 @@ mod tests {
             eprintln!("process_permission_attestation: tmux or node not on PATH - skipping");
             return None;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let fixture_dir = std::env::temp_dir().join(format!(
             "t-hub-permission-harness-{}-{}",
             std::process::id(),
@@ -12832,7 +17091,7 @@ mod tests {
 
         let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let target = tmux_target(&session_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
         let before = observe_harness_process(&target).unwrap();
         let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
         tmux::send_text(&target, &command, true).unwrap();
@@ -12857,7 +17116,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        tmux::kill_session_tree(&target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&target);
         let _ = std::fs::remove_dir_all(fixture_dir);
         Some(result)
     }
@@ -13173,6 +17432,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_with_sink_spawns_places_and_returns_id() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Headless-org: with a UI sink wired, the SERVER spawns the real session,
         // resolves `tabName` against the authoritative registry (minting a hidden
         // tab without switching the active one), places the tile there, returns
@@ -13235,6 +17495,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_terminal_converts_wsl_unc_for_tmux_but_preserves_the_public_cwd() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -13281,6 +17542,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_forwards_the_startup_command() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // T-B: the socket spawn carries the webview presets' `startupCommand`
         // (the resume flow's `claude --resume <id>` in production; a harmless
         // echo here - headless-org spawns the REAL session server-side now, so
@@ -14438,6 +18700,7 @@ mod tests {
 
     #[test]
     fn spawn_survives_a_concurrent_close_of_its_target_tab() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Dispatch-level tab-closed-during-spawn race: close_tab races the spawn's
         // resolve->tmux->place window. Whichever side wins, the invariant holds:
         // the spawned session ends up in EXACTLY ONE registry tab, and the
@@ -14602,6 +18865,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_default_placement_is_the_active_tab_without_switching() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // No tabName/tabId: the tile lands in the tab the USER has active (per the
         // registry mirror) - matching the "+" menu - and never switches it.
         let sink = Arc::new(RecordingSink {
@@ -14681,6 +18945,7 @@ mod tests {
     /// Needs a real tmux on PATH (WSL2 dev shell; not the Windows CI target).
     #[test]
     fn live_send_read_close_roundtrip() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // The id must honor the production invariant "the id IS the tmux session
         // suffix, capped at 8 chars" (`tmux::target_for_id`) — the previous long
         // `mcp3test<nanos>` id created `th_mcp3test<nanos>` but dispatched
@@ -15121,6 +19386,7 @@ mod tests {
 
     #[test]
     fn apply_forwards_are_broadcast_to_event_subscribers() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // T12: every accepted Organization forward ALSO reaches event
         // subscribers on `control://apply`, while the webview sink keeps
         // receiving exactly what it always did.
@@ -16885,6 +21151,399 @@ mod tests {
     }
 
     #[test]
+    fn schema_v12_without_release_recovery_upgrades_to_v13_on_the_next_write() {
+        let path = captains_tmp("schema-v12-upgrade");
+        let _ = std::fs::remove_file(&path);
+        let legacy = CaptainsSnapshot {
+            schema_version: 12,
+            seq: 1,
+            captains: vec![],
+            projects: vec![],
+            pending_dispatch_claims: vec![],
+            pending_dispatch_releases: vec![],
+        };
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(
+            CaptainsRegistry::read_snapshot(&path)
+                .unwrap()
+                .schema_version,
+            12
+        );
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .claim_test("captain-v13", Some("schema-v13"), vec![])
+            .unwrap();
+        let persisted: CaptainsSnapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, CAPTAINS_SCHEMA_VERSION);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn pending_release_snapshot_document(profile: &str, crew_session_id: &str) -> Value {
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile, crew_session_id);
+        let mut snapshot = registry.snapshot();
+        let crew = &mut snapshot.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        snapshot
+            .pending_dispatch_releases
+            .push(PendingDispatchRelease {
+                crew_session_id: crew.terminal_id.clone(),
+                project_id: "project-powder-lifecycle".into(),
+                connection_profile: profile.into(),
+                connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+                repository: "t-hub".into(),
+                card_id: work.card_id.clone(),
+                run_id: work.run_id.clone(),
+                agent: work.agent.clone().unwrap(),
+                operation_id: "initial-claim:actor-t-hub:incompatible-load".into(),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            });
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    fn assert_incompatible_release_load_blocks_actions(
+        path: &Path,
+        primary_body: &str,
+        backup_body: Option<&str>,
+        server: LoopbackPowderServer,
+    ) {
+        let backup = path.with_extension("json.bak");
+        let registry = Arc::new(CaptainsRegistry::load(path.to_path_buf()));
+        assert!(registry.write_blocked.is_some());
+        assert!(registry.snapshot().captains.is_empty());
+        assert!(registry.snapshot().pending_dispatch_releases.is_empty());
+        assert!(registry
+            .claim_test("blocked-captain", Some("blocked-ship"), vec![])
+            .unwrap_err()
+            .contains("read-only"));
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        reconcile_powder_leases(&ctx);
+        assert!(dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": "captain-powder",
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "must not redispatch incompatible recovery",
+                "harness": "codex",
+            }),
+            None,
+            true,
+        )
+        .is_err());
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), primary_body);
+        match backup_body {
+            Some(body) => assert_eq!(std::fs::read_to_string(&backup).unwrap(), body),
+            None => assert!(!backup.exists()),
+        }
+        let prefix = format!("{}.corrupt.", path.file_name().unwrap().to_string_lossy());
+        assert!(
+            !std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)),
+            "incompatible release state must never be quarantined"
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn production_load_blocks_v11_release_recovery_without_backup() {
+        let path = captains_tmp("incompatible-v11-release-primary");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-v11-primary-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document =
+            pending_release_snapshot_document(profile, "incompatible-v11-primary-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointIdentity");
+        let body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(&path, &body, None, server);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_load_blocks_v12_unsalted_endpoint_digest_recovery() {
+        let path = captains_tmp("incompatible-v12-unsalted-release-primary");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-v12-unsalted-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document =
+            pending_release_snapshot_document(profile, "incompatible-v12-unsalted-crew");
+        document["schemaVersion"] = json!(12);
+        let release = document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap();
+        release.remove("connectionEndpointIdentity");
+        release.insert(
+            "connectionEndpointDigest".into(),
+            json!(format!("sha256:{}", "0".repeat(64))),
+        );
+        let body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(&path, &body, None, server);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_load_preserves_v11_release_primary_over_clean_stale_backup() {
+        let path = captains_tmp("incompatible-v11-release-primary-backup");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-v11-backup-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document =
+            pending_release_snapshot_document(profile, "incompatible-v11-backup-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointIdentity");
+        let primary_body = serde_json::to_string(&document).unwrap();
+        let backup_body = json!({
+            "schemaVersion": 11,
+            "seq": 1,
+            "captains": [],
+            "projects": [],
+            "pendingDispatchClaims": [],
+            "pendingDispatchReleases": [],
+        })
+        .to_string();
+        std::fs::write(&path, &primary_body).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(
+            &path,
+            &primary_body,
+            Some(&backup_body),
+            server,
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn production_load_blocks_actions_when_backup_has_incompatible_release_recovery() {
+        let path = captains_tmp("incompatible-release-backup");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-backup-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let primary_body = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+            "seq": 9,
+            "captains": [],
+            "projects": [],
+            "pendingDispatchClaims": [],
+            "pendingDispatchReleases": [],
+        })
+        .to_string();
+        let mut document = pending_release_snapshot_document(profile, "incompatible-backup-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointIdentity");
+        let backup_body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &primary_body).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(
+            &path,
+            &primary_body,
+            Some(&backup_body),
+            server,
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn production_load_rejects_raw_endpoint_field_in_schema_v13_release_recovery() {
+        let path = captains_tmp("incompatible-raw-release-endpoint");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-raw-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document = pending_release_snapshot_document(profile, "incompatible-raw-crew");
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "connectionEndpoint".into(),
+                json!("http://gateway.invalid/path-token?access_token=query-token#fragment-token"),
+            );
+        let body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(&path, &body, None, server);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_v13_release_recovery_is_rejected_before_any_recovery_can_run() {
+        let path = captains_tmp("schema-v12-release-recovery");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "legacy-release-profile",
+            "legacy-release-crew",
+        );
+        let mut snapshot = registry.snapshot();
+        let crew = &mut snapshot.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        snapshot
+            .pending_dispatch_releases
+            .push(PendingDispatchRelease {
+                crew_session_id: crew.terminal_id.clone(),
+                project_id: "project-powder-lifecycle".into(),
+                connection_profile: "legacy-release-profile".into(),
+                connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+                repository: "t-hub".into(),
+                card_id: work.card_id.clone(),
+                run_id: work.run_id.clone(),
+                agent: work.agent.clone().unwrap(),
+                operation_id: "initial-claim:actor-t-hub:legacy".into(),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            });
+        snapshot.schema_version = 12;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let error = CaptainsRegistry::read_snapshot(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("dispatch release recovery state incompatible"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_v11_raw_endpoint_release_recovery_fails_closed_before_network() {
+        let path = captains_tmp("schema-v11-raw-release-endpoint");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "legacy-raw-release-profile",
+            "legacy-raw-release-crew",
+        );
+        let mut snapshot = registry.snapshot();
+        let crew = &mut snapshot.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        snapshot
+            .pending_dispatch_releases
+            .push(PendingDispatchRelease {
+                crew_session_id: crew.terminal_id.clone(),
+                project_id: "project-powder-lifecycle".into(),
+                connection_profile: "legacy-raw-release-profile".into(),
+                connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+                repository: "t-hub".into(),
+                card_id: work.card_id.clone(),
+                run_id: work.run_id.clone(),
+                agent: work.agent.clone().unwrap(),
+                operation_id: "initial-claim:actor-t-hub:legacy-raw".into(),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            });
+        snapshot.schema_version = 11;
+        let mut raw = serde_json::to_value(&snapshot).unwrap();
+        let release = raw["pendingDispatchReleases"][0].as_object_mut().unwrap();
+        release.remove("connectionEndpointIdentity");
+        release.insert(
+            "connectionEndpoint".into(),
+            json!("https://gateway.example/api?access_token=legacy-secret"),
+        );
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        assert!(CaptainsRegistry::read_snapshot(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn release_recovery_snapshot_pairs_are_required_and_fail_closed_before_network() {
+        let path = captains_tmp("release-recovery-pairs");
+        let _ = std::fs::remove_file(&path);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, "pair-profile", "pair-crew");
+        let mut paired = registry.snapshot();
+        let crew = &mut paired.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew.terminal_id.clone(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "pair-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: work.card_id.clone(),
+            run_id: work.run_id.clone(),
+            agent: work.agent.clone().unwrap(),
+            operation_id: "initial-claim:actor-t-hub:pair".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        paired.pending_dispatch_releases = vec![recovery.clone()];
+        assert!(CaptainsRegistry::validate_snapshot(&paired).is_ok());
+
+        let mut orphan = paired.clone();
+        orphan.pending_dispatch_releases[0].crew_session_id = "missing-crew".into();
+        assert!(CaptainsRegistry::validate_snapshot(&orphan).is_err());
+
+        let mut foreign = paired.clone();
+        foreign.pending_dispatch_releases[0].project_id = "foreign-project".into();
+        assert!(CaptainsRegistry::validate_snapshot(&foreign).is_err());
+
+        let mut mismatched = paired.clone();
+        mismatched.pending_dispatch_releases[0].agent = "foreign-agent".into();
+        assert!(CaptainsRegistry::validate_snapshot(&mismatched).is_err());
+
+        let mut missing_record = paired.clone();
+        missing_record.pending_dispatch_releases.clear();
+        assert!(CaptainsRegistry::validate_snapshot(&missing_record).is_err());
+
+        let mut active_crew = paired.clone();
+        active_crew.captains[0].crew[0].state = CrewState::Active;
+        assert!(CaptainsRegistry::validate_snapshot(&active_crew).is_err());
+
+        let mut malformed_identity = paired.clone();
+        malformed_identity.pending_dispatch_releases[0].card_id = "card\ncontrol".into();
+        assert!(CaptainsRegistry::validate_snapshot(&malformed_identity).is_err());
+
+        let mut oversized_identity = paired.clone();
+        oversized_identity.pending_dispatch_releases[0].operation_id = "x".repeat(513);
+        assert!(CaptainsRegistry::validate_snapshot(&oversized_identity).is_err());
+
+        std::fs::write(&path, serde_json::to_vec(&orphan).unwrap()).unwrap();
+        assert!(CaptainsRegistry::read_snapshot(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn future_backup_schema_is_preserved_and_blocks_writes() {
         let path = captains_tmp("future-backup-schema");
         let backup = path.with_extension("json.bak");
@@ -16893,6 +21552,8 @@ mod tests {
             seq: 4,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
+            pending_dispatch_releases: vec![],
         };
         let backup_body = json!({
             "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
@@ -16985,6 +21646,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
+            pending_dispatch_releases: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
         std::fs::write(&backup, serde_json::to_vec(&valid).unwrap()).unwrap();
@@ -17144,7 +21807,10 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "card-a".into(),
                     run_id: "run-a".into(),
+                    agent: None,
                     claim_expires_at: None,
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
                     state: PowderWorkState::Active,
                 },
             )
@@ -17224,6 +21890,7 @@ mod tests {
 
     #[test]
     fn commission_captain_spawns_binds_bootstraps_and_deduplicates() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -17410,6 +22077,7 @@ mod tests {
 
     #[test]
     fn attach_captain_refuses_read_only_and_preserves_existing_control_capability() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let mut ctx = test_ctx("control-secret").with_apply_sink(Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         }));
@@ -17537,9 +22205,10 @@ mod tests {
             );
             return;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = format!("rollback-{}", uuid::Uuid::new_v4().simple());
         let target = tmux_target(&crew_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
 
         let registry = Arc::new(CaptainsRegistry::new());
         registry
@@ -17581,7 +22250,10 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "card-1".into(),
                     run_id: "run-1".into(),
+                    agent: None,
                     claim_expires_at: Some(1),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
                     state: PowderWorkState::Active,
                 },
             )
@@ -17589,7 +22261,7 @@ mod tests {
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
         let closed =
-            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true).unwrap();
+            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None).unwrap();
 
         assert_eq!(closed["powderRelease"]["released"], false);
         assert_eq!(closed["crewBindingRetained"], true);
@@ -17983,6 +22655,38 @@ mod tests {
     }
 
     #[test]
+    fn project_board_snapshot_never_exposes_protected_endpoint_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let profile = format!("board-public-url-{}", uuid::Uuid::new_v4().simple());
+        let profiles = PowderProfileEnv::install(&profile, addr);
+        let endpoint =
+            format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+        profiles.set_profile_base_url(&profile, &endpoint);
+        let registry = dispatch_test_registry(None, &profile, "board-public-captain");
+        let (ctx, _) = dispatch_test_context(registry);
+
+        let snapshot = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({ "terminalId": "board-public-captain" }),
+        )
+        .unwrap();
+        assert_eq!(snapshot["status"], "unreachable");
+        assert_eq!(snapshot["external"]["url"], format!("http://{addr}/board"));
+        let payload = serde_json::to_string(&snapshot).unwrap();
+        for secret in [
+            "path-token",
+            "query-token",
+            "fragment-token",
+            endpoint.as_str(),
+        ] {
+            assert!(!payload.contains(secret), "board payload leaked {secret:?}");
+        }
+    }
+
+    #[test]
     fn scribe_status_dispatches_and_returns_a_listening_bool() {
         // The read-tier scribe voice-gate: dispatches to crate::scribe and
         // always returns an object with a boolean `listening` field, whatever
@@ -17997,6 +22701,7 @@ mod tests {
 
     #[test]
     fn claim_and_release_are_audited_and_forward_the_captains_snapshot() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -18063,6 +22768,7 @@ mod tests {
 
     #[test]
     fn codex_claim_never_inherits_a_stale_claude_session_id() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let terminal_id = format!("codex{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let status = Arc::new(StatusBridge::new());
         status.ingest(
@@ -18130,6 +22836,7 @@ mod tests {
 
     #[test]
     fn claim_conflicts_liveness_and_bad_release_are_dispatch_errors() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("t").with_apply_sink(Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         }));
@@ -18203,6 +22910,7 @@ mod tests {
 
     #[test]
     fn idempotent_reclaim_does_not_bump_seq_or_forward() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -18254,6 +22962,7 @@ mod tests {
 
     #[test]
     fn spawn_with_spawned_by_records_crew_and_close_terminal_removes_it() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -18329,6 +23038,7 @@ mod tests {
 
     #[test]
     fn spawn_with_an_unclaimed_spawned_by_still_spawns_without_a_crew_link() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -18659,6 +23369,10 @@ mod tests {
             CommandTier::ProcessChanging
         );
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
+        assert_eq!(
+            required_tier("complete_crew_powder"),
+            CommandTier::ProcessChanging
+        );
         assert_eq!(required_tier("new_tab"), CommandTier::Organization);
         assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
@@ -18766,6 +23480,7 @@ mod tests {
 
     #[test]
     fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // End-to-end through dispatch_authenticated (governor + audit) against a
         // REAL tmux session: a legitimate crew spawn -> send_text -> close must all
         // be ADMITTED and audited allowed. This is the "legit orchestration still
@@ -19925,7 +24640,10 @@ mod tests {
             PowderWorkBinding {
                 card_id: "card-b".into(),
                 run_id: "run-b".into(),
+                agent: None,
                 claim_expires_at: None,
+                mutation_intent: None,
+                dispatch_release_recovery: false,
                 state: PowderWorkState::Active,
             },
         )
@@ -19945,6 +24663,69 @@ mod tests {
             let error = response.error.unwrap_or_default();
             assert!(error.starts_with("acl:"), "got: {error}");
         }
+    }
+
+    #[test]
+    fn heartbeat_foreign_cross_ship_crew_is_generic_and_never_contacts_powder() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("foreign-heartbeat-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, &profile_name);
+        registry
+            .claim_test("captain-foreign", Some("foreign-ship"), vec![])
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-foreign", "crew-foreign")
+            .unwrap());
+        registry
+            .bind_crew_context(
+                "captain-foreign",
+                "crew-foreign",
+                "foreign task",
+                "codex",
+                None,
+                None,
+                PowderWorkBinding {
+                    card_id: "foreign-card".into(),
+                    run_id: "foreign-run".into(),
+                    agent: Some("foreign-agent".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let foreign_captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &profile_name,
+                &foreign_captain,
+                "heartbeat_crew_powder",
+                json!({"crewSessionId": "crew-foreign"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
     }
 
     #[test]
@@ -20568,6 +25349,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_retry_with_same_request_id_does_not_duplicate() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Repro of Incident A/B at the dispatch layer: a spawn that is RETRIED with
         // the same requestId (the client's recovery from an ambiguous response leg)
         // must apply exactly once - one tmux session, one tile, one UI forward - and
@@ -20698,6 +25480,7 @@ mod tests {
     fn close_terminal_reports_killed_for_a_live_session() {
         // A real session reports outcome=killed, so a caller can tell a genuine kill
         // from a phantom close.
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -20748,6 +25531,8 @@ mod tests {
             seq: 0,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
+            pending_dispatch_releases: vec![],
         })
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
@@ -21043,13 +25828,14 @@ mod tests {
             );
             return;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
 
         let observer = FakeCodexObserver::new(0);
         let codex =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
         let codex_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let codex_target = tmux_target(&codex_session);
-        tmux::new_session_with_env(&codex_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&codex_target).unwrap();
         let codex_before = observe_harness_process(&codex_target).unwrap();
         let expected_identity = tmux_pane_identity(&codex_target);
         let launch = crew_interactive_launch(Harness::Codex, &codex.command, &observer.command);
@@ -21074,14 +25860,14 @@ mod tests {
                 .permission,
             PermMode::BypassPermissions
         );
-        tmux::kill_session_tree(&codex_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&codex_target);
 
         let failed_observer = FakeCodexObserver::new(23);
         let blocked_codex =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
         let blocked_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let blocked_target = tmux_target(&blocked_session);
-        tmux::new_session_with_env(&blocked_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&blocked_target).unwrap();
         let blocked_launch = crew_interactive_launch(
             Harness::Codex,
             &blocked_codex.command,
@@ -21100,13 +25886,13 @@ mod tests {
             tmux::SessionLiveness::Alive,
             "the owning shell remains available for transactional rollback"
         );
-        tmux::kill_session_tree(&blocked_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&blocked_target);
 
         let claude_observer = FakeCodexObserver::new(23);
         let claude = FakeHarnessCommand::new(Harness::Claude, "--dangerously-skip-permissions");
         let claude_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let claude_target = tmux_target(&claude_session);
-        tmux::new_session_with_env(&claude_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&claude_target).unwrap();
         let claude_before = observe_harness_process(&claude_target).unwrap();
         let claude_launch =
             crew_interactive_launch(Harness::Claude, &claude.command, &claude_observer.command);
@@ -21126,7 +25912,7 @@ mod tests {
             .permission,
             PermMode::BypassPermissions
         );
-        tmux::kill_session_tree(&claude_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&claude_target);
     }
 
     #[test]
@@ -21150,6 +25936,17 @@ mod tests {
                 "crew-powder",
                 HarnessPermissionAttestation {
                     provider: Harness::Codex,
+                    permission: PermMode::Default,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("conflicts with the fleet default"));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
                     permission: PermMode::BypassPermissions,
                 },
                 "admin",
@@ -21168,6 +25965,29 @@ mod tests {
             .unwrap();
         assert_eq!(crew.harness_permission, Some(PermMode::BypassPermissions));
         assert_eq!(crew.t_hub_capability.as_deref(), Some("read"));
+
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::Default,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("conflicts with the fleet default"));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::BypassPermissions,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("already has launch permission evidence"));
 
         let restored = CaptainsRegistry::load(path.clone()).snapshot();
         let crew = &restored.captains[0].crew[0];
@@ -21337,6 +26157,48 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_blocks_active_and_recoverable_powder_bindings_in_exact_scope() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "protected-profile",
+            "crew-winner",
+        );
+        let ctx = test_ctx("dispatch-binding-scope").with_captains_registry(registry.clone());
+        let blocked = || {
+            ensure_dispatch_powder_binding_available(
+                &ctx,
+                "protected-profile",
+                "t-hub",
+                "thub-powder-control-lifecycle",
+                Some("run-authoritative"),
+            )
+            .unwrap_err()
+        };
+        assert!(blocked().contains("durable active or recoverable Crew binding"));
+
+        registry
+            .begin_crew_powder_completion("crew-winner", &"a".repeat(64))
+            .unwrap();
+        assert!(blocked().contains("durable active or recoverable Crew binding"));
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "different-profile",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "protected-profile",
+            "different-repository",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn crew_powder_context_and_heartbeat_expiry_survive_registry_reload() {
         let path = captains_tmp("crew-powder-context");
         let _ = std::fs::remove_file(&path);
@@ -21371,7 +26233,10 @@ mod tests {
             PowderWorkBinding {
                 card_id: "card-1".into(),
                 run_id: "run-1".into(),
+                agent: None,
                 claim_expires_at: Some(100),
+                mutation_intent: None,
+                dispatch_release_recovery: false,
                 state: PowderWorkState::Active,
             },
         )
@@ -21455,7 +26320,10 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "thub-powder-control-lifecycle".into(),
                     run_id: "run-authoritative".into(),
+                    agent: Some("powder-agent".into()),
                     claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
                     state: PowderWorkState::Active,
                 },
             )
@@ -21470,6 +26338,35 @@ mod tests {
             checked_by: checked.then(|| "captain-powder".into()),
             checked_at: checked.then_some(123),
             proof_links: vec![],
+        }
+    }
+
+    fn powder_run_criterion(
+        card_id: &str,
+        run_id: &str,
+        index: usize,
+        approved: bool,
+    ) -> powder::RunCriterionEvidence {
+        let criterion_id = format!("powder.criterion.v1:sha256:test:{index}");
+        powder::RunCriterionEvidence {
+            criterion_index: index,
+            criterion_id: criterion_id.clone(),
+            criterion_text: format!("Criterion {index}"),
+            review: approved.then(|| powder::RunCriterionReview {
+                review_id: format!("review-{index}"),
+                operation_id: format!("review-operation-{index}"),
+                card_id: card_id.into(),
+                run_id: run_id.into(),
+                criterion_index: index,
+                criterion_id,
+                criterion_text: format!("Criterion {index}"),
+                decision: powder::CriterionReviewDecision::Approved,
+                reviewer: "captain-powder".into(),
+                reviewer_identity: "actor-captain-powder".into(),
+                proof: Some("review proof".into()),
+                supersedes_review_id: None,
+                created_at: 123,
+            }),
         }
     }
 
@@ -21491,18 +26388,21 @@ mod tests {
             updated_at: 2,
         };
         let criteria = vec![powder_criterion(0, true)];
+        let run_criteria = vec![powder_run_criterion(card_id, run_id, 0, true)];
+        let has_claim = card_status != "done";
         (
             powder::CardEvidence {
                 card_id: card_id.into(),
                 title: "Powder lifecycle".into(),
                 status: card_status.into(),
                 repository: Some(repository.into()),
-                claim: (card_status != "done").then(|| powder::EvidenceClaim {
+                claim: has_claim.then(|| powder::EvidenceClaim {
                     run_id: run_id.into(),
                     agent: "powder-agent".into(),
                     expires_at: 100,
                 }),
                 criteria: criteria.clone(),
+                current_run_criteria: has_claim.then(|| run_criteria.clone()),
                 runs: vec![run_summary.clone()],
                 runs_total: 1,
                 work_log: vec![],
@@ -21514,7 +26414,8 @@ mod tests {
                 card_title: "Powder lifecycle".into(),
                 card_status: card_status.into(),
                 repository: Some(repository.into()),
-                criteria,
+                card_criteria: criteria,
+                criteria: run_criteria,
                 activities: vec![],
                 activities_total: 0,
                 links: vec![],
@@ -21531,12 +26432,56 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct LoopbackPowderState {
         completed: bool,
+        released: bool,
+        capability_requests: usize,
+        capability_schema_version: Option<i64>,
         proof: Option<String>,
         proof_url: Option<String>,
         completion_posts: Vec<Value>,
+        work_log_posts: Vec<Value>,
+        work_log_http_conflict: bool,
+        work_log_response_failure: Option<LoopbackPowderResponseFailure>,
+        criterion_review_posts: Vec<Value>,
+        mutation_failure_code: Option<String>,
+        response_run_id: Option<String>,
+        recovery_gets: usize,
+        recovery_outcome: Option<Value>,
+        recovery_succeeds: bool,
+        recovery_operation_id: Option<String>,
+        normalized_work_log_body: Option<String>,
+        normalized_completion_proof: Option<String>,
+        normalized_completion_url: Option<String>,
+        evidence_run_id: Option<String>,
+        evidence_card_id: Option<String>,
+        evidence_repository: Option<String>,
+        evidence_claim_agent: Option<String>,
+        evidence_run_agent: Option<String>,
+        rehome_repository_after_work_log: Option<String>,
+        force_claim: bool,
+        omit_card_runs: bool,
+        duplicate_card_run: bool,
+        malformed_card_evidence: bool,
+        run_card_status_override: Option<String>,
+        pause_run_evidence: bool,
+        card_evidence_gets: usize,
+        run_evidence_gets: usize,
+        release_response_run_id: Option<String>,
+        release_response_failure: Option<LoopbackPowderResponseFailure>,
         claim_posts: usize,
         release_posts: usize,
+        release_paths: Vec<String>,
         release_bodies: Vec<Value>,
+        release_receipt_card_id: Option<String>,
+        release_receipt_run_id: Option<String>,
+        release_receipt_agent: Option<String>,
+        renewal_receipt_card_id: Option<String>,
+        renewal_receipt_run_id: Option<String>,
+        renewal_receipt_agent: Option<String>,
+        claim_receipt_card_id: Option<String>,
+        claim_receipt_agent: Option<String>,
+        claim_response_body: Option<Value>,
+        claim_response_failure: Option<LoopbackPowderResponseFailure>,
+        issued_claim_agent: Option<String>,
         renew_posts: usize,
     }
 
@@ -21544,6 +26489,13 @@ mod tests {
     enum LoopbackPowderBlockedOperation {
         Completion,
         Release,
+        Renewal,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LoopbackPowderResponseFailure {
+        Eof,
+        Partial,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -21557,6 +26509,8 @@ mod tests {
         state: Arc<StdMutex<LoopbackPowderState>>,
         post_started: std::sync::mpsc::Receiver<Value>,
         release_post: std::sync::mpsc::SyncSender<()>,
+        run_evidence_started: std::sync::mpsc::Receiver<()>,
+        resume_run_evidence: std::sync::mpsc::SyncSender<()>,
         result: std::sync::mpsc::Receiver<Result<LoopbackPowderState, String>>,
         stop: std::sync::mpsc::SyncSender<()>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -21584,6 +26538,16 @@ mod tests {
             )
         }
 
+        fn start_with_blocked_renewal(expected_requests: usize) -> Self {
+            Self::start_with_behavior(
+                expected_requests,
+                LoopbackPowderBehavior {
+                    blocked_operation: Some(LoopbackPowderBlockedOperation::Renewal),
+                    fail_release: false,
+                },
+            )
+        }
+
         fn start_with_behavior(expected_requests: usize, behavior: LoopbackPowderBehavior) -> Self {
             use std::sync::mpsc;
 
@@ -21594,6 +26558,9 @@ mod tests {
             let (post_started_tx, post_started) = mpsc::sync_channel(1);
             let (release_post, release_post_rx) = mpsc::sync_channel(1);
             let release_post_rx = Arc::new(StdMutex::new(Some(release_post_rx)));
+            let (run_evidence_started_tx, run_evidence_started) = mpsc::sync_channel(1);
+            let (resume_run_evidence, resume_run_evidence_rx) = mpsc::sync_channel(1);
+            let resume_run_evidence_rx = Arc::new(StdMutex::new(Some(resume_run_evidence_rx)));
             let server_state = state.clone();
             let (result_tx, result) = mpsc::sync_channel(1);
             let (stop, stop_rx) = mpsc::sync_channel(1);
@@ -21624,6 +26591,8 @@ mod tests {
                         let state = server_state.clone();
                         let post_started_tx = post_started_tx.clone();
                         let release_post_rx = release_post_rx.clone();
+                        let run_evidence_started_tx = run_evidence_started_tx.clone();
+                        let resume_run_evidence_rx = resume_run_evidence_rx.clone();
                         let handler = std::thread::spawn(move || {
                             handle_loopback_powder_request(
                                 stream,
@@ -21631,6 +26600,8 @@ mod tests {
                                 &state,
                                 &post_started_tx,
                                 &release_post_rx,
+                                &run_evidence_started_tx,
+                                &resume_run_evidence_rx,
                                 behavior,
                             )
                         });
@@ -21641,18 +26612,20 @@ mod tests {
                 if let Err(error) = accept_result {
                     errors.push(error);
                 }
-                if handlers.len() != expected_requests {
-                    errors.push(format!(
-                        "loopback Powder request count mismatch: expected {expected_requests}, received {}",
-                        handlers.len()
-                    ));
-                }
+                let handler_count = handlers.len();
                 for handler in handlers {
                     match handler.join() {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => errors.push(error),
                         Err(_) => errors.push("loopback Powder request handler panicked".into()),
                     }
+                }
+                let capability_requests = server_state.lock().unwrap().capability_requests;
+                let counted_requests = handler_count.saturating_sub(capability_requests);
+                if counted_requests != expected_requests {
+                    errors.push(format!(
+                        "loopback Powder request count mismatch: expected {expected_requests}, received {counted_requests}"
+                    ));
                 }
                 let outcome = if errors.is_empty() {
                     Ok(server_state.lock().unwrap().clone())
@@ -21666,11 +26639,29 @@ mod tests {
                 state,
                 post_started,
                 release_post,
+                run_evidence_started,
+                resume_run_evidence,
                 result,
                 stop,
                 thread: Some(thread),
                 joined_outcome: None,
             }
+        }
+
+        fn start_with_release_receipt(
+            expected_requests: usize,
+            card_id: &str,
+            run_id: &str,
+            agent: &str,
+        ) -> Self {
+            let server = Self::start(expected_requests);
+            {
+                let mut state = server.state.lock().unwrap();
+                state.release_receipt_card_id = Some(card_id.into());
+                state.release_receipt_run_id = Some(run_id.into());
+                state.release_receipt_agent = Some(agent.into());
+            }
+            server
         }
 
         fn finish(mut self) -> Result<LoopbackPowderState, String> {
@@ -21755,6 +26746,38 @@ mod tests {
             .map_err(|error| format!("loopback Powder test response was invalid: {error}"))
     }
 
+    fn post_loopback_powder(addr: SocketAddr, path: &str, body: &Value) -> Result<Value, String> {
+        let mut stream = TcpStream::connect_timeout(&addr, LOOPBACK_POWDER_IO_TIMEOUT)
+            .map_err(|error| format!("loopback Powder test connect failed: {error}"))?;
+        stream
+            .set_read_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder test read timeout failed: {error}"))?;
+        stream
+            .set_write_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder test write timeout failed: {error}"))?;
+        let body = body.to_string();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .map_err(|error| format!("loopback Powder test write failed: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("loopback Powder test flush failed: {error}"))?;
+        let mut response = String::new();
+        stream
+            .take(64 * 1024)
+            .read_to_string(&mut response)
+            .map_err(|error| format!("loopback Powder test response failed: {error}"))?;
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .ok_or("loopback Powder test response had no body")?;
+        serde_json::from_str(body)
+            .map_err(|error| format!("loopback Powder test response was invalid: {error}"))
+    }
+
     struct PowderProfileEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
@@ -21763,6 +26786,10 @@ mod tests {
 
     impl PowderProfileEnv {
         fn install(profile: &str, addr: SocketAddr) -> Self {
+            Self::install_profiles(&[(profile, addr)])
+        }
+
+        fn install_profiles(profiles: &[(&str, SocketAddr)]) -> Self {
             static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
             let lock = LOCK
                 .get_or_init(|| StdMutex::new(()))
@@ -21773,17 +26800,23 @@ mod tests {
                 std::process::id(),
                 uuid::Uuid::new_v4().simple()
             ));
+            let mut configured_profiles = serde_json::Map::new();
+            for (profile, addr) in profiles {
+                configured_profiles.insert(
+                    (*profile).to_string(),
+                    json!({
+                        "baseUrl": format!("http://{addr}"),
+                        "agentName": "t-hub",
+                        "operationIdentity": "actor-t-hub",
+                        "apiKey": "test-key"
+                    }),
+                );
+            }
             std::fs::write(
                 &path,
                 serde_json::to_vec(&json!({
                     "schemaVersion": 1,
-                    "profiles": {
-                        (profile): {
-                            "baseUrl": format!("http://{addr}"),
-                            "agentName": "powder-agent",
-                            "apiKey": "test-key"
-                        }
-                    }
+                    "profiles": configured_profiles,
                 }))
                 .unwrap(),
             )
@@ -21801,6 +26834,24 @@ mod tests {
                 path,
             }
         }
+
+        fn remap_profile_endpoint(&self, profile: &str, addr: SocketAddr) {
+            self.set_profile_base_url(profile, &format!("http://{addr}"));
+        }
+
+        fn set_profile_base_url(&self, profile: &str, base_url: &str) {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
+            document["profiles"][profile]["baseUrl"] = json!(base_url);
+            std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
+        }
+
+        fn set_profile_api_key(&self, profile: &str, api_key: &str) {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
+            document["profiles"][profile]["apiKey"] = json!(api_key);
+            std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
+        }
     }
 
     impl Drop for PowderProfileEnv {
@@ -21816,6 +26867,7 @@ mod tests {
     struct FakeHarnessCommand {
         fixture_dir: PathBuf,
         command: String,
+        invocation_path: PathBuf,
     }
 
     impl FakeHarnessCommand {
@@ -21827,9 +26879,13 @@ mod tests {
             ));
             std::fs::create_dir_all(&fixture_dir).unwrap();
             let executable = fixture_dir.join(harness.as_provider());
+            let invocation_path = fixture_dir.join("invoked");
             std::fs::write(
                 &executable,
-                "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+                format!(
+                    "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, 'invoked\\n');\nsetInterval(() => {{}}, 1000);\n",
+                    serde_json::to_string(&invocation_path).unwrap()
+                ),
             )
             .unwrap();
             #[cfg(unix)]
@@ -21846,6 +26902,22 @@ mod tests {
             Self {
                 fixture_dir,
                 command,
+                invocation_path,
+            }
+        }
+
+        fn was_invoked(&self) -> bool {
+            self.invocation_path.exists()
+        }
+
+        fn wait_for_invocation(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.was_invoked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake Harness command was not invoked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -21935,10 +27007,12 @@ mod tests {
     struct FakeHarnessSession {
         session_id: String,
         _command: FakeHarnessCommand,
+        _tmux_guard: ProcessAttestationTmuxGuard,
     }
 
     impl FakeHarnessSession {
         fn start(harness: Harness) -> Self {
+            let tmux_guard = ProcessAttestationTmuxGuard::acquire();
             let flags = match harness {
                 Harness::Codex => "--dangerously-bypass-approvals-and-sandbox",
                 Harness::Claude => "--dangerously-skip-permissions",
@@ -21946,19 +27020,94 @@ mod tests {
             let command = FakeHarnessCommand::new(harness, flags);
             let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             let target = tmux_target(&session_id);
-            tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
-            tmux::send_text(&target, &command.command, true).unwrap();
+            // Start the hermetic Captain command as tmux's session command.
+            // Injecting it into a freshly created zsh pane races zsh startup and
+            // intermittently loses the input before liveness can observe Codex.
+            // Crew dispatch tests still exercise the real zsh launch path.
+            tmux::new_session_with_env(&target, "/tmp", Some(&command.command), &[]).unwrap();
             wait_for_harness_started(&session_id, harness.as_provider()).unwrap();
             Self {
                 session_id,
                 _command: command,
+                _tmux_guard: tmux_guard,
             }
         }
     }
 
     impl Drop for FakeHarnessSession {
         fn drop(&mut self) {
-            let _ = tmux::kill_session_tree(&tmux_target(&self.session_id));
+            let _ = reap_test_tmux_session(&tmux_target(&self.session_id));
+        }
+    }
+
+    struct DispatchWorkerCompletion(Arc<AtomicBool>);
+
+    impl Drop for DispatchWorkerCompletion {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct DispatchWorker {
+        sink: Arc<RecordingSink>,
+        resume: Option<mpsc::SyncSender<()>>,
+        worker: Option<std::thread::JoinHandle<Result<Value, String>>>,
+    }
+
+    impl DispatchWorker {
+        fn start(
+            ctx: ControlContext,
+            args: Value,
+            sink: Arc<RecordingSink>,
+            resume: mpsc::SyncSender<()>,
+            completion: Arc<AtomicBool>,
+        ) -> Self {
+            let worker = std::thread::spawn(move || {
+                let _completion = DispatchWorkerCompletion(completion);
+                dispatch_crew(&ctx, &args, None, true)
+            });
+            Self {
+                sink,
+                resume: Some(resume),
+                worker: Some(worker),
+            }
+        }
+
+        fn resume(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
+        fn join(&mut self) -> std::thread::Result<Result<Value, String>> {
+            self.resume();
+            self.worker
+                .take()
+                .expect("dispatch worker was already joined")
+                .join()
+        }
+
+        fn dispatched_terminal_ids(&self) -> Vec<String> {
+            self.sink
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(command, _)| command == "spawn_terminal")
+                .filter_map(|(_, args)| args["id"].as_str().map(str::to_string))
+                .collect()
+        }
+    }
+
+    impl Drop for DispatchWorker {
+        fn drop(&mut self) {
+            self.resume();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            for terminal_id in self.dispatched_terminal_ids() {
+                let _ = reap_test_tmux_session(&tmux_target(&terminal_id));
+            }
         }
     }
 
@@ -22103,31 +27252,114 @@ mod tests {
         state: &Arc<StdMutex<LoopbackPowderState>>,
         post_started: &std::sync::mpsc::SyncSender<Value>,
         release_post: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        run_evidence_started: &std::sync::mpsc::SyncSender<()>,
+        resume_run_evidence: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
         behavior: LoopbackPowderBehavior,
     ) -> Result<(), String> {
         let method = request.method.as_str();
         let path = request.path.as_str();
         let body = request.body;
         let response = match (method, path) {
+            ("GET", "/readyz") => {
+                let mut state = state.lock().unwrap();
+                state.capability_requests += 1;
+                json!({
+                    "ok": true,
+                    "auth_mode": "api_key",
+                    "schema_version": state.capability_schema_version.unwrap_or(18),
+                })
+            }
+            ("GET", "/api/v1/routes") => {
+                state.lock().unwrap().capability_requests += 1;
+                json!([
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/work-log",
+                        "body_shape": "{\"operation_id\":\"stable-id\",\"agent\":\"...\",\"body\":\"...\"}"
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+                        "body_shape": "{\"operation_id\":\"...\",\"criterion\":0,\"criterion_id\":\"...\",\"decision\":\"approved\"}"
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/complete",
+                        "body_shape": "{\"operation_id\":\"stable-id\",\"proof\":null,\"criterion_proofs\":null}"
+                    },
+                    {
+                        "method": "GET",
+                        "path": "/api/v1/operations/{id}",
+                        "body_shape": null
+                    }
+                ])
+            }
             ("GET", "/api/v1/repositories/t-hub") => json!({"name": "t-hub"}),
             ("GET", path)
                 if path
                     .starts_with("/api/v1/cards/thub-powder-control-lifecycle?detail=detailed") =>
             {
-                loopback_card_evidence(&state.lock().unwrap())
+                let mut state = state.lock().unwrap();
+                state.card_evidence_gets += 1;
+                if state.malformed_card_evidence {
+                    json!({ "card": {} })
+                } else {
+                    loopback_card_evidence(&state)
+                }
             }
             ("GET", "/api/v1/cards/thub-powder-control-lifecycle") => {
-                loopback_card_evidence(&state.lock().unwrap())
+                let mut state = state.lock().unwrap();
+                state.card_evidence_gets += 1;
+                if state.malformed_card_evidence {
+                    json!({ "card": {} })
+                } else {
+                    loopback_card_evidence(&state)
+                }
             }
             ("GET", "/api/v1/runs/run-authoritative") => {
+                let pause_run_evidence = {
+                    let mut state = state.lock().unwrap();
+                    state.run_evidence_gets += 1;
+                    state.pause_run_evidence
+                };
+                if pause_run_evidence {
+                    run_evidence_started.try_send(()).map_err(|_| {
+                        "loopback Powder run evidence observer unavailable".to_string()
+                    })?;
+                    let receiver = resume_run_evidence
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder run evidence resume was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder run evidence exceeded its resume deadline".to_string()
+                        })?;
+                }
                 loopback_run_evidence(&state.lock().unwrap())
             }
-            ("POST", "/api/v1/cards/thub-powder-control-lifecycle/complete") => {
-                let first_post = {
+            (
+                "POST",
+                "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/complete",
+            ) => {
+                let (first_post, failure_code, response_run_id, normalized_proof, normalized_url) = {
                     let mut state = state.lock().unwrap();
                     state.completion_posts.push(body.clone());
-                    state.completion_posts.len() == 1
+                    (
+                        state.completion_posts.len() == 1,
+                        state.mutation_failure_code.clone(),
+                        state.response_run_id.clone(),
+                        state.normalized_completion_proof.clone(),
+                        state.normalized_completion_url.clone(),
+                    )
                 };
+                if let Some(failure_code) = failure_code {
+                    return write_loopback_json(
+                        &mut stream,
+                        &loopback_rejected_outcome("completion", &body, &failure_code),
+                    );
+                }
                 if first_post
                     && behavior.blocked_operation
                         == Some(LoopbackPowderBlockedOperation::Completion)
@@ -22147,25 +27379,200 @@ mod tests {
                                 .to_string()
                         })?;
                 }
-                let proof = body["proof"].as_str().unwrap().to_string();
-                let proof_url = body["criterion_proofs"][0]["url"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
+                let proof =
+                    normalized_proof.unwrap_or_else(|| body["proof"].as_str().unwrap().to_string());
+                let proof_url = normalized_url.unwrap_or_else(|| {
+                    body["criterion_proofs"][0]["url"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
                 let mut state = state.lock().unwrap();
                 state.completed = true;
-                state.proof = Some(proof);
-                state.proof_url = Some(proof_url);
-                loopback_completed_card(&state)
+                state.proof = Some(proof.clone());
+                state.proof_url = Some(proof_url.clone());
+                let mut normalized_body = body.clone();
+                normalized_body["proof"] = json!(proof);
+                normalized_body["criterion_proofs"][0]["url"] = json!(proof_url);
+                let mut outcome = loopback_completion_outcome(&normalized_body);
+                outcome["request_digest"] =
+                    json!(loopback_operation_request_digest("completion", &body));
+                if let Some(response_run_id) = response_run_id {
+                    outcome["expected_run_id"] = json!(response_run_id);
+                }
+                outcome
+            }
+            (
+                "POST",
+                "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/work-log",
+            ) => {
+                let (
+                    failure_code,
+                    http_conflict,
+                    response_run_id,
+                    normalized_body,
+                    response_failure,
+                ) = {
+                    let mut state = state.lock().unwrap();
+                    state.work_log_posts.push(body.clone());
+                    (
+                        state.mutation_failure_code.clone(),
+                        state.work_log_http_conflict,
+                        state.response_run_id.clone(),
+                        state.normalized_work_log_body.clone(),
+                        state.work_log_response_failure.take(),
+                    )
+                };
+                if http_conflict {
+                    return write_loopback_json_status(
+                        &mut stream,
+                        409,
+                        "Conflict",
+                        &json!({"error": "operation identity already has another payload"}),
+                    );
+                }
+                match response_failure {
+                    Some(LoopbackPowderResponseFailure::Eof) => return Ok(()),
+                    Some(LoopbackPowderResponseFailure::Partial) => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{{\"schema_version\":"
+                        )
+                        .map_err(|error| {
+                            format!("loopback Powder partial response failed: {error}")
+                        })?;
+                        stream.flush().map_err(|error| {
+                            format!("loopback Powder partial response flush failed: {error}")
+                        })?;
+                        return Ok(());
+                    }
+                    None => {}
+                }
+                if let Some(failure_code) = failure_code {
+                    loopback_rejected_outcome("work_log_append", &body, &failure_code)
+                } else if body["agent"] != "powder-agent" {
+                    loopback_rejected_outcome("work_log_append", &body, "conflict")
+                } else {
+                    let mut outcome = loopback_work_log_outcome(&body);
+                    if let Some(normalized_body) = normalized_body {
+                        outcome["result"]["body"] = json!(normalized_body);
+                    }
+                    if let Some(response_run_id) = response_run_id {
+                        outcome["expected_run_id"] = json!(response_run_id);
+                    }
+                    let mut state = state.lock().unwrap();
+                    if let Some(repository) = state.rehome_repository_after_work_log.clone() {
+                        state.evidence_repository = Some(repository);
+                    }
+                    outcome
+                }
+            }
+            (
+                "POST",
+                "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/criteria/review",
+            ) => {
+                let failure_code = {
+                    let mut state = state.lock().unwrap();
+                    state.criterion_review_posts.push(body.clone());
+                    state.mutation_failure_code.clone()
+                };
+                if let Some(failure_code) = failure_code {
+                    loopback_rejected_outcome("criterion_review", &body, &failure_code)
+                } else {
+                    loopback_criterion_review_outcome(&body)
+                }
+            }
+            ("GET", path) if path.starts_with("/api/v1/operations/") => {
+                let (
+                    operation_id,
+                    recovery_outcome,
+                    recovery_succeeds,
+                    proof,
+                    proof_url,
+                ) = {
+                    let mut state = state.lock().unwrap();
+                    state.recovery_gets += 1;
+                    let operation_id = state
+                        .work_log_posts
+                        .last()
+                        .or_else(|| state.criterion_review_posts.last())
+                        .or_else(|| state.completion_posts.last())
+                        .and_then(|body| body["operation_id"].as_str())
+                        .map(str::to_string)
+                        .or_else(|| state.recovery_operation_id.clone())
+                        .ok_or("loopback Powder recovery had no operation identity")?;
+                    (
+                        operation_id,
+                        state.recovery_outcome.clone(),
+                        state.recovery_succeeds,
+                        state.proof.clone(),
+                        state.proof_url.clone(),
+                    )
+                };
+                if let Some(outcome) = recovery_outcome {
+                    outcome
+                } else if recovery_succeeds {
+                    loopback_completion_outcome(&json!({
+                        "operation_id": operation_id,
+                        "proof": proof.ok_or("loopback Powder recovery had no proof")?,
+                        "criterion_proofs": [{
+                            "criterion": 0,
+                            "url": proof_url.ok_or("loopback Powder recovery had no proof URL")?,
+                        }],
+                    }))
+                } else {
+                    json!({
+                        "schema_version": "powder.operation_status.v1",
+                        "operation_id": operation_id,
+                        "state": "unknown",
+                    })
+                }
             }
             ("POST", "/api/v1/cards/thub-powder-control-lifecycle/claim") => {
-                state.lock().unwrap().claim_posts += 1;
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
+                let mut state = state.lock().unwrap();
+                state.claim_posts += 1;
+                let response_card_id = state
+                    .claim_receipt_card_id
+                    .clone()
+                    .unwrap_or_else(|| "thub-powder-control-lifecycle".into());
+                let response_agent = state
+                    .claim_receipt_agent
+                    .clone()
+                    .unwrap_or_else(|| "t-hub".into());
+                state.issued_claim_agent = Some(response_agent.clone());
+                let response_body = state.claim_response_body.clone();
+                let response_failure = state.claim_response_failure;
+                drop(state);
+                if response_failure == Some(LoopbackPowderResponseFailure::Eof) {
+                    return Ok(());
+                }
+                response_body.unwrap_or_else(|| json!({"card_id": response_card_id, "run_id": "run-authoritative", "agent": response_agent, "expires_at": 100}))
             }
             ("POST", path) if path.ends_with("/release") => {
                 let mut state = state.lock().unwrap();
                 state.release_posts += 1;
+                state.release_paths.push(path.to_string());
                 state.release_bodies.push(body.clone());
+                let response_run_id = state
+                    .release_receipt_run_id
+                    .clone()
+                    .or_else(|| state.release_response_run_id.clone())
+                    .unwrap_or_else(|| "run-authoritative".into());
+                let response_card_id = state
+                    .release_receipt_card_id
+                    .clone()
+                    .unwrap_or_else(|| "thub-powder-control-lifecycle".into());
+                let response_agent = state
+                    .release_receipt_agent
+                    .clone()
+                    .or_else(|| state.issued_claim_agent.clone())
+                    .or_else(|| state.evidence_claim_agent.clone())
+                    .unwrap_or_else(|| "powder-agent".into());
+                let response_failure = state.release_response_failure.take();
+                // Powder commits the release before its response can be lost.
+                // Recovery tests use this to distinguish a retry-safe active run
+                // from a response-loss release that must not be posted again.
+                state.released = true;
                 drop(state);
                 if behavior.blocked_operation == Some(LoopbackPowderBlockedOperation::Release) {
                     post_started
@@ -22190,11 +27597,58 @@ mod tests {
                         &json!({"error": "injected release failure"}),
                     );
                 }
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
+                if response_failure == Some(LoopbackPowderResponseFailure::Eof) {
+                    return Ok(());
+                }
+                json!({
+                    "card_id": response_card_id,
+                    "run_id": response_run_id,
+                    "agent": response_agent,
+                    "expires_at": 100
+                })
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
-                state.lock().unwrap().renew_posts += 1;
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 200})
+                let (response_card_id, response_run_id, response_agent) = {
+                    let mut state = state.lock().unwrap();
+                    state.renew_posts += 1;
+                    (
+                        state
+                            .renewal_receipt_card_id
+                            .clone()
+                            .unwrap_or_else(|| "thub-powder-control-lifecycle".into()),
+                        state
+                            .renewal_receipt_run_id
+                            .clone()
+                            .unwrap_or_else(|| "run-authoritative".into()),
+                        state
+                            .renewal_receipt_agent
+                            .clone()
+                            .or_else(|| state.evidence_claim_agent.clone())
+                            .or_else(|| state.issued_claim_agent.clone())
+                            .unwrap_or_else(|| "powder-agent".into()),
+                    )
+                };
+                if behavior.blocked_operation == Some(LoopbackPowderBlockedOperation::Renewal) {
+                    post_started
+                        .try_send(body.clone())
+                        .map_err(|_| "loopback Powder renewal observer unavailable".to_string())?;
+                    let receiver = release_post
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder renewal signal was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder renewal exceeded its release deadline".to_string()
+                        })?;
+                }
+                json!({
+                    "card_id": response_card_id,
+                    "run_id": response_run_id,
+                    "agent": response_agent,
+                    "expires_at": 200
+                })
             }
             _ => return Err(format!("unexpected Powder test request: {method} {path}")),
         };
@@ -22237,29 +27691,99 @@ mod tests {
         })
     }
 
-    fn loopback_run(state: &LoopbackPowderState) -> Value {
+    fn loopback_run_criterion(run_id: &str) -> Value {
+        let criterion_text = "Criterion 0";
+        let digest = Sha256::digest(criterion_text.as_bytes());
+        let criterion_id = format!("powder.criterion.v1:sha256:{digest:x}:0");
         json!({
-            "id": "run-authoritative",
-            "card_id": "thub-powder-control-lifecycle",
-            "state": if state.completed { "complete" } else { "active" },
-            "agent": "powder-agent",
+            "criterion_index": 0,
+            "criterion_id": criterion_id,
+            "criterion_text": criterion_text,
+            "review": {
+                "id": "review-0",
+                "operation_id": "review-operation-0",
+                "card_id": "thub-powder-control-lifecycle",
+                "run_id": run_id,
+                "criterion_index": 0,
+                "criterion_id": criterion_id,
+                "criterion_text": criterion_text,
+                "decision": "approved",
+                "reviewer": "captain-powder",
+                "reviewer_identity": "actor-captain-powder",
+                "proof": "review proof",
+                "supersedes_review_id": null,
+                "created_at": 123
+            }
+        })
+    }
+
+    fn loopback_criterion_id() -> String {
+        loopback_run_criterion("run-authoritative")["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn loopback_run(state: &LoopbackPowderState) -> Value {
+        let run_id = state
+            .evidence_run_id
+            .as_deref()
+            .unwrap_or("run-authoritative");
+        let card_id = state
+            .evidence_card_id
+            .as_deref()
+            .unwrap_or("thub-powder-control-lifecycle");
+        json!({
+            "id": run_id,
+            "card_id": card_id,
+            "state": if state.completed {
+                "complete"
+            } else if state.released {
+                "released"
+            } else {
+                "active"
+            },
+            "agent": state
+                .evidence_run_agent
+                .as_deref()
+                .or(state.issued_claim_agent.as_deref())
+                .unwrap_or("powder-agent"),
             "proof": state.proof.as_deref(),
-            "claim_expires_at": if state.completed { 0 } else { 100 },
+            "claim_expires_at": if state.completed || state.released { 0 } else { 100 },
             "created_at": 1,
             "updated_at": 2
         })
     }
 
     fn loopback_card(state: &LoopbackPowderState) -> Value {
+        let run_id = state
+            .evidence_run_id
+            .as_deref()
+            .unwrap_or("run-authoritative");
+        let card_id = state
+            .evidence_card_id
+            .as_deref()
+            .unwrap_or("thub-powder-control-lifecycle");
+        let repository = state.evidence_repository.as_deref().unwrap_or("t-hub");
         json!({
-            "id": "thub-powder-control-lifecycle",
+            "id": card_id,
             "title": "Powder lifecycle",
-            "status": if state.completed { "done" } else { "running" },
-            "repo": "t-hub",
+            "status": if state.completed {
+                "done"
+            } else if state.released {
+                "ready"
+            } else {
+                "running"
+            },
+            "repo": repository,
             "updated_at": 2,
-            "claim": if state.completed { Value::Null } else { json!({
-                "run_id": "run-authoritative",
-                "agent": "powder-agent",
+            "claim": if (state.completed || state.released) && !state.force_claim { Value::Null } else { json!({
+                "run_id": run_id,
+                "agent": state
+                    .evidence_claim_agent
+                    .as_deref()
+                    .or(state.issued_claim_agent.as_deref())
+                    .unwrap_or("powder-agent"),
                 "expires_at": 100
             }) },
             "criteria": [loopback_criterion(state)]
@@ -22267,19 +27791,41 @@ mod tests {
     }
 
     fn loopback_card_evidence(state: &LoopbackPowderState) -> Value {
+        let runs = if state.omit_card_runs {
+            Vec::new()
+        } else if state.duplicate_card_run {
+            vec![loopback_run(state), loopback_run(state)]
+        } else {
+            vec![loopback_run(state)]
+        };
         json!({
             "card": loopback_card(state),
-            "runs": [loopback_run(state)],
-            "runs_total": 1,
+            "current_run_criteria": if (state.completed || state.released) && !state.force_claim {
+                Vec::<Value>::new()
+            } else {
+                vec![loopback_run_criterion(
+                    state
+                        .evidence_run_id
+                        .as_deref()
+                        .unwrap_or("run-authoritative")
+                )]
+            },
+            "runs_total": runs.len(),
+            "runs": runs,
             "work_log": [],
             "work_log_total": 0
         })
     }
 
     fn loopback_run_evidence(state: &LoopbackPowderState) -> Value {
+        let mut card = loopback_card(state);
+        if let Some(status) = state.run_card_status_override.as_deref() {
+            card["status"] = json!(status);
+        }
         json!({
             "run": loopback_run(state),
-            "card": loopback_card(state),
+            "card": card,
+            "criteria": [loopback_run_criterion("run-authoritative")],
             "activities": [],
             "activities_total": 0,
             "links": [],
@@ -22287,8 +27833,235 @@ mod tests {
         })
     }
 
-    fn loopback_completed_card(state: &LoopbackPowderState) -> Value {
-        loopback_card(state)
+    fn loopback_operation_request_digest(kind: &str, body: &Value) -> String {
+        match kind {
+            "work_log_append" => powder::work_log_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundWorkLog {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    attribution: powder::WorkLogAttribution {
+                        agent: body["agent"].as_str().unwrap().into(),
+                        model: body["model"].as_str().map(str::to_string),
+                        reasoning: body["reasoning"].as_str().map(str::to_string),
+                        harness: body["harness"].as_str().map(str::to_string),
+                    },
+                    body: body["body"].as_str().unwrap().into(),
+                },
+            ),
+            "criterion_review" => powder::criterion_review_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundCriterionReview {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    criterion_index: body["criterion"].as_u64().unwrap() as usize,
+                    criterion_id: body["criterion_id"].as_str().unwrap().into(),
+                    criterion_text: "Criterion 0".into(),
+                    decision: match body["decision"].as_str().unwrap() {
+                        "approved" => powder::CriterionReviewDecision::Approved,
+                        "rejected" => powder::CriterionReviewDecision::Rejected,
+                        "cleared" => powder::CriterionReviewDecision::Cleared,
+                        _ => panic!("unsupported loopback criterion decision"),
+                    },
+                    proof: body["proof"].as_str().map(str::to_string),
+                    expected_reviewer_identity: "actor-captain-powder".into(),
+                },
+            ),
+            "completion" => powder::completion_operation_request_digest(
+                "actor-t-hub",
+                "thub-powder-control-lifecycle",
+                &powder::RunBoundCompletion {
+                    expected_run_id: "run-authoritative".into(),
+                    operation_id: body["operation_id"].as_str().unwrap().into(),
+                    proof: body["proof"].as_str().unwrap().into(),
+                    criterion_proofs: body["criterion_proofs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|proof| powder::CriterionProof {
+                            criterion: proof["criterion"].as_u64().unwrap() as usize,
+                            url: proof["url"].as_str().unwrap().into(),
+                        })
+                        .collect(),
+                },
+            ),
+            _ => panic!("unsupported loopback operation kind"),
+        }
+        .unwrap()
+    }
+
+    fn loopback_operation_outcome(kind: &str, body: &Value, result: Value) -> Value {
+        json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": body["operation_id"],
+            "state": "succeeded",
+            "request_digest": loopback_operation_request_digest(kind, body),
+            "kind": kind,
+            "target_card_id": "thub-powder-control-lifecycle",
+            "expected_run_id": "run-authoritative",
+            "result": result,
+            "failure": Value::Null,
+            "audit_event_id": "audit-operation",
+            "created_at": 125,
+            "updated_at": 126,
+            "expires_at": 600,
+        })
+    }
+
+    fn loopback_rejected_outcome(kind: &str, body: &Value, failure_code: &str) -> Value {
+        json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": body["operation_id"],
+            "state": "rejected",
+            "request_digest": loopback_operation_request_digest(kind, body),
+            "kind": kind,
+            "target_card_id": "thub-powder-control-lifecycle",
+            "expected_run_id": "run-authoritative",
+            "result": Value::Null,
+            "failure": {
+                "code": failure_code,
+                "message": "sensitive upstream details must not escape",
+            },
+            "audit_event_id": Value::Null,
+            "created_at": 125,
+            "updated_at": 126,
+            "expires_at": 600,
+        })
+    }
+
+    fn loopback_pending_outcome(kind: &str, body: &Value) -> Value {
+        json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": body["operation_id"],
+            "state": "pending",
+            "request_digest": loopback_operation_request_digest(kind, body),
+            "kind": kind,
+            "target_card_id": "thub-powder-control-lifecycle",
+            "expected_run_id": "run-authoritative",
+            "result": Value::Null,
+            "failure": Value::Null,
+            "audit_event_id": Value::Null,
+            "created_at": 125,
+            "updated_at": 126,
+            "expires_at": 600,
+        })
+    }
+
+    fn loopback_completion_outcome(body: &Value) -> Value {
+        let operation_id = body["operation_id"].as_str().unwrap();
+        loopback_operation_outcome(
+            "completion",
+            body,
+            json!({
+                "schema_version": "powder.run_bound_completion.v1",
+                "card_id": "thub-powder-control-lifecycle",
+                "run_id": "run-authoritative",
+                "operation_id": operation_id,
+                "status": "done",
+                "proof": body["proof"],
+                "criterion_proofs": body["criterion_proofs"],
+                "updated_at": 126,
+                "audit_event_id": "audit-operation",
+            }),
+        )
+    }
+
+    fn loopback_work_log_outcome(body: &Value) -> Value {
+        loopback_operation_outcome(
+            "work_log_append",
+            body,
+            json!({
+                "schema_version": "powder.work_log_entry.v1",
+                "id": "work-log-1",
+                "card_id": "thub-powder-control-lifecycle",
+                "actor": "powder-agent",
+                "agent": body["agent"],
+                "model": body["model"],
+                "reasoning": body["reasoning"],
+                "harness": body["harness"],
+                "run_id": "run-authoritative",
+                "body": body["body"],
+                "created_at": 126,
+                "updated_at": 126,
+            }),
+        )
+    }
+
+    fn loopback_work_log_body(operation_id: &str, message: &str) -> Value {
+        json!({
+            "operation_id": operation_id,
+            "agent": "powder-agent",
+            "model": Value::Null,
+            "reasoning": Value::Null,
+            "harness": "codex",
+            "body": message,
+        })
+    }
+
+    fn seed_work_log_intent(
+        registry: &CaptainsRegistry,
+        ctx: &ControlContext,
+        operation_id: &str,
+        message: &str,
+        created_at: Option<u64>,
+    ) -> PowderMutationIntent {
+        let scope = resolve_crew_powder_scope(ctx, "crew-powder").unwrap();
+        let mut intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &scope,
+            operation_id,
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": message,
+            }),
+        );
+        if let Some(created_at) = created_at {
+            intent.created_at = created_at;
+        }
+        registry
+            .begin_crew_powder_mutation(&scope, intent.clone())
+            .unwrap();
+        intent
+    }
+
+    fn downgrade_persisted_mutation_intent_to_v1(path: &Path) {
+        let mut legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        legacy["schemaVersion"] = json!(6);
+        let intent = legacy["captains"][0]["crew"][0]["powderWork"]["mutationIntent"]
+            .as_object_mut()
+            .unwrap();
+        intent.insert("schemaVersion".into(), json!(1));
+        intent.remove("powderRequestDigest");
+        std::fs::write(path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    }
+
+    fn loopback_criterion_review_outcome(body: &Value) -> Value {
+        let operation_id = body["operation_id"].as_str().unwrap();
+        let criterion_id = body["criterion_id"].as_str().unwrap();
+        loopback_operation_outcome(
+            "criterion_review",
+            body,
+            json!({
+                "id": "review-authoritative",
+                "operation_id": operation_id,
+                "card_id": "thub-powder-control-lifecycle",
+                "run_id": "run-authoritative",
+                "criterion_index": body["criterion"],
+                "criterion_id": criterion_id,
+                "criterion_text": "Criterion 0",
+                "decision": body["decision"],
+                "reviewer": "captain-powder",
+                "reviewer_identity": "actor-captain-powder",
+                "proof": body["proof"].as_str().map(|_| "[scrubbed review proof]"),
+                "supersedes_review_id": "review-0",
+                "created_at": 126,
+            }),
+        )
     }
 
     #[test]
@@ -22333,11 +28106,12 @@ mod tests {
         let server = LoopbackPowderServer::start(3);
         let profile_name = format!("attestation-rollback-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let registry =
             powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
         let target = tmux_target(&crew_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
         rollback_crew_dispatch(&ctx, &crew_id, None, None).unwrap();
@@ -22357,7 +28131,7 @@ mod tests {
         skip_harness_liveness: bool,
         expected_error: &str,
     ) {
-        let server = LoopbackPowderServer::start(6);
+        let server = LoopbackPowderServer::start(4);
         let profile_name = format!("dispatch-failure-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let captain = FakeHarnessSession::start(Harness::Codex);
@@ -22394,6 +28168,2620 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_substituted_initial_claim_without_foreign_binding() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_rejects_substituted_initial_claim_without_foreign_binding: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        for (receipt_card, receipt_agent) in
+            [(Some("foreign-card"), None), (None, Some("foreign-agent"))]
+        {
+            let server = LoopbackPowderServer::start(3);
+            server.state.lock().unwrap().claim_receipt_card_id = receipt_card.map(str::to_string);
+            server.state.lock().unwrap().claim_receipt_agent = receipt_agent.map(str::to_string);
+            let profile_name = format!(
+                "dispatch-claim-substitution-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            let error = dispatch_crew(
+                &ctx,
+                &json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Reject substituted initial claim",
+                    "harness": "codex",
+                }),
+                None,
+                true,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains(
+                    "Powder claim response did not match the requested card and configured agent"
+                ),
+                "{error}"
+            );
+            assert!(error.contains("pending authoritative recovery"), "{error}");
+            let crew_session_id = dispatched_terminal_id(&sink);
+            assert_eq!(
+                tmux::session_liveness(&tmux_target(&crew_session_id)),
+                tmux::SessionLiveness::Gone
+            );
+            assert!(registry.snapshot().captains[0].crew.is_empty());
+            assert_eq!(registry.snapshot().pending_dispatch_claims.len(), 1);
+            let state = server.finish().unwrap();
+            assert_eq!(state.claim_posts, 1);
+            assert_eq!(state.release_posts, 0);
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_initial_claim_before_durable_binding_or_provider_launch() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_rejects_malformed_initial_claim_before_durable_binding_or_provider_launch: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(3);
+        server.state.lock().unwrap().claim_response_body = Some(json!({
+            "card_id": "thub-powder-control-lifecycle",
+            "run_id": "run-authoritative",
+            "agent": " \t ",
+            "expires_at": 100,
+        }));
+        let profile_name = format!("dispatch-malformed-claim-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let error = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Reject malformed initial claim before launch",
+                "harness": "codex",
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("Powder claim response has invalid agent"),
+            "{error}"
+        );
+        assert!(error.contains("pending authoritative recovery"), "{error}");
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert_eq!(snapshot.pending_dispatch_claims.len(), 1);
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_distinct_captain_replacement_after_preflight_denies_before_spawn_or_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_distinct_captain_replacement_after_preflight_denies_before_spawn_or_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(2);
+        let profile_name = format!(
+            "dispatch-preflight-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_preflight",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a distinct Captain replacement before spawn",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its preflight barrier"),
+            "after_preflight"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                "replacement-captain",
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            "acl: dispatch authority changed; retry from the current Captain"
+        );
+        assert!(
+            sink.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(command, _)| command != "spawn_terminal"),
+            "a rejected pre-spawn dispatch must not create a Crew terminal"
+        );
+        let replacement = registry
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some("replacement-captain")
+        );
+        assert!(replacement.crew.is_empty());
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 0);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_claim_fails_bind_cas_and_preserves_replacement() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_same_terminal_reclaim_after_claim_fails_bind_cas_and_preserves_replacement: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-bind-cas-reclaim-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_bind",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a same-terminal reclaim at bind CAS",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its bind barrier"),
+            "before_bind"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("acl: dispatch authority changed; refusing Crew bind"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            "replacement-powder-profile"
+        );
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+    }
+
+    #[test]
+    fn dispatch_ambiguous_release_after_claim_retains_initial_recovery_intent() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_ambiguous_release_after_claim_retains_initial_recovery_intent: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start_with_blocked_release_failure(4);
+        let profile_name = format!(
+            "dispatch-bind-cas-ambiguous-release-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_claim",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Preserve initial-claim recovery after an ambiguous release",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its after-claim barrier"),
+            "after_claim"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bind rollback did not attempt the exact trusted release");
+        server.release_post.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("authority changed after claim before durable Crew binding"),
+            "{error}"
+        );
+        assert!(error.contains("rollback is incomplete"), "{error}");
+        assert!(
+            error.contains("initial-claim recovery remains pending"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_claims.len(), 1);
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert!(replacement
+            .crew
+            .iter()
+            .all(|crew| crew.powder_work.is_none()));
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+    }
+
+    #[test]
+    fn dispatch_initial_claim_response_loss_survives_restart_and_blocks_identical_retry() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_initial_claim_response_loss_survives_restart_and_blocks_identical_retry: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(5);
+        server.state.lock().unwrap().claim_response_failure =
+            Some(LoopbackPowderResponseFailure::Eof);
+        let profile_name = format!(
+            "dispatch-claim-response-loss-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp(&profile_name);
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Recover initial claim response loss",
+            "harness": "codex",
+        });
+
+        let first = dispatch_crew(&ctx, &args, None, true).unwrap_err();
+        assert!(first.contains("pending authoritative recovery"), "{first}");
+        assert_eq!(registry.snapshot().pending_dispatch_claims.len(), 1);
+        assert_eq!(registry.snapshot().captains[0].crew.len(), 0);
+        assert_eq!(dispatched_terminal_id(&sink).len(), 8);
+
+        server.state.lock().unwrap().force_claim = true;
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, restarted_sink) = dispatch_test_context(restarted.clone());
+        let retry = dispatch_crew(&restarted_ctx, &args, None, true).unwrap_err();
+        assert!(retry.contains("pending authoritative recovery"), "{retry}");
+        assert!(restarted_sink.calls.lock().unwrap().is_empty());
+        assert_eq!(restarted.snapshot().pending_dispatch_claims.len(), 1);
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn dispatch_race_evidence(
+        argv: &[&str],
+        executable_inode: u64,
+        session_created: u64,
+        ancestry: &[(u32, u64)],
+    ) -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            8,
+            executable_inode,
+            argv,
+            session_created,
+            7,
+            ancestry,
+        )
+    }
+
+    #[test]
+    fn dispatch_stable_baseline_policy_is_bounded_and_identity_exact() {
+        let stable = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let mut transient = std::collections::VecDeque::from(vec![
+            Err(LaunchAttestationError::UnreadableEvidence),
+            Ok(stable.clone()),
+            Ok(stable.clone()),
+        ]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| transient.pop_front().unwrap(), "th-test").unwrap(),
+            stable
+        );
+
+        let terminal_changed =
+            dispatch_race_evidence(&["zsh"], 100, 123_457, &[(42, 900), (7, 100)]);
+        let mut terminal =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(terminal_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| terminal.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::TerminalChanged)
+        );
+
+        let process_changed = HarnessProcessEvidence::test_with_context(
+            43,
+            901,
+            8,
+            100,
+            &["zsh"],
+            123_456,
+            7,
+            &[(42, 900), (7, 100)],
+        );
+        let mut process =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(process_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| process.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+
+        let executable_changed = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            8,
+            101,
+            &["zsh"],
+            123_456,
+            7,
+            &[(42, 900), (7, 100)],
+        );
+        let mut executable =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(executable_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| executable.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+
+        let ancestry_changed =
+            dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (8, 101), (7, 100)]);
+        let mut ancestry =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(ancestry_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| ancestry.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::AncestryChanged)
+        );
+
+        let mut immediate =
+            std::collections::VecDeque::from(vec![Err(LaunchAttestationError::WrongProvider)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| immediate.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::WrongProvider)
+        );
+
+        let mut exhausted =
+            std::collections::VecDeque::from(vec![
+                Err(LaunchAttestationError::UnreadableEvidence);
+                8
+            ]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| exhausted.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+    }
+
+    #[test]
+    fn dispatch_replacement_after_stable_baseline_rolls_back_before_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_replacement_after_stable_baseline_rolls_back_before_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-stable-baseline-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_stable_baseline",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a replacement after stable zsh baseline",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the stable-baseline barrier"),
+            "after_stable_baseline"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                "replacement-captain",
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        resume.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("after stable baseline before provider send"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "authority revocation before provider send must not execute the provider command"
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some("replacement-captain")
+        );
+        assert!(replacement.crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_stable_baseline_rejects_before_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_same_terminal_reclaim_after_stable_baseline_rejects_before_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-stable-baseline-aba-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_stable_baseline",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject same-terminal Captain ABA after stable baseline",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the stable-baseline barrier"),
+            "after_stable_baseline"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("after stable baseline before provider send"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "same-terminal ABA must be rejected before the provider command executes"
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            "replacement-powder-profile"
+        );
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    fn run_dispatch_authority_replacement_at_respawn_boundary(
+        boundary: &'static str,
+        same_terminal_reclaim: bool,
+    ) {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "run_dispatch_authority_replacement_at_respawn_boundary: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-respawn-authority-{boundary}-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary,
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": format!("Reject authority replacement at {boundary}"),
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the private-respawn authority barrier"),
+            boundary
+        );
+        if boundary == "after_respawn" {
+            provider.wait_for_invocation();
+        }
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                if same_terminal_reclaim {
+                    &captain.session_id
+                } else {
+                    "replacement-captain"
+                },
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        if same_terminal_reclaim {
+            let mut replacement_project = registry
+                .projects()
+                .into_iter()
+                .find(|project| project.project_id == "project-dispatch-attestation")
+                .unwrap();
+            replacement_project
+                .powder
+                .as_mut()
+                .unwrap()
+                .connection_profile = "replacement-powder-profile".into();
+            registry.upsert_project(replacement_project).unwrap();
+        }
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        let expected_phase = if boundary == "before_respawn" {
+            "immediately before provider send"
+        } else {
+            "immediately after provider respawn"
+        };
+        assert!(error.contains(expected_phase), "{error}");
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        if boundary == "before_respawn" {
+            assert!(
+                !provider.was_invoked(),
+                "authority rejection before respawn must not execute the provider command"
+            );
+        } else {
+            assert!(
+                provider.was_invoked(),
+                "the post-respawn barrier must observe a real provider launch before rollback"
+            );
+        }
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(if same_terminal_reclaim {
+                captain.session_id.as_str()
+            } else {
+                "replacement-captain"
+            })
+        );
+        assert!(replacement.crew.is_empty());
+        if same_terminal_reclaim {
+            assert_eq!(
+                snapshot.projects[0]
+                    .powder
+                    .as_ref()
+                    .unwrap()
+                    .connection_profile,
+                "replacement-powder-profile"
+            );
+        }
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    #[test]
+    fn dispatch_replacement_before_private_respawn_never_starts_provider() {
+        run_dispatch_authority_replacement_at_respawn_boundary("before_respawn", false);
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_private_respawn_rolls_back_exact_claim() {
+        run_dispatch_authority_replacement_at_respawn_boundary("after_respawn", true);
+    }
+
+    #[test]
+    fn dispatch_exhausted_unreadable_baseline_releases_exact_claim_without_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_exhausted_unreadable_baseline_releases_exact_claim_without_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-unreadable-baseline-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Fail closed when the stable baseline remains unreadable",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let mut attempts = 0;
+        let error = dispatch_crew_with_observer_inner(
+            &ctx,
+            &args,
+            None,
+            true,
+            &mut |_| {
+                attempts += 1;
+                Err(LaunchAttestationError::UnreadableEvidence)
+            },
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 8);
+        assert!(
+            error.contains("launch attestation baseline failed: provider-native process evidence is unreadable"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "an exhausted baseline must not execute the provider command"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    fn run_post_bind_ambiguous_release_recovery(
+        phase: &'static str,
+        fail_ambiguity_persist: bool,
+        remap_frozen_profile: bool,
+    ) {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "run_post_bind_ambiguous_release_recovery: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(if remap_frozen_profile { 4 } else { 7 });
+        server.state.lock().unwrap().release_response_failure =
+            Some(LoopbackPowderResponseFailure::Eof);
+        let replacement_server = LoopbackPowderServer::start(0);
+        let profile_name = format!(
+            "dispatch-ambiguous-release-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "dispatch-ambiguous-release-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&profile_name, server.addr),
+            (&replacement_profile, replacement_server.addr),
+        ]);
+        let path = captains_tmp(&profile_name);
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: phase,
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": format!("Recover ambiguous trusted release at {phase}"),
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach its post-bind authority barrier"),
+            phase
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = replacement_profile.clone();
+        replacement_project.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(replacement_project).unwrap();
+        if fail_ambiguity_persist {
+            let (release_reached, wait_for_release) = std::sync::mpsc::sync_channel(1);
+            let (release_resume, continue_release) = std::sync::mpsc::sync_channel(1);
+            registry.set_dispatch_barrier(Some(DispatchBarrier {
+                boundary: "release_inflight_before_post",
+                reached: release_reached,
+                resume: continue_release,
+            }));
+            resume.send(()).unwrap();
+            assert_eq!(
+                wait_for_release
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("rollback did not durably enter the in-flight release state"),
+                "release_inflight_before_post"
+            );
+            registry.fail_next_persist("injected ambiguous release persistence failure");
+            release_resume.send(()).unwrap();
+        } else {
+            resume.send(()).unwrap();
+        }
+
+        let error = worker.join().unwrap().unwrap_err();
+        let phase_label = phase.replace('_', " ");
+        assert!(error.contains(&phase_label), "{error}");
+        assert!(error.contains("rollback is incomplete"), "{error}");
+        if fail_ambiguity_persist {
+            assert!(
+                error.contains("durable release recovery remains in-flight because ambiguity persistence failed"),
+                "{error}"
+            );
+        } else {
+            assert!(
+                error.contains("trusted release recovery remains pending"),
+                "{error}"
+            );
+        }
+        assert!(
+            !error.contains("initial-claim recovery remains pending"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
+        let recovery = &snapshot.pending_dispatch_releases[0];
+        assert_eq!(recovery.crew_session_id, crew_session_id);
+        assert_eq!(recovery.project_id, "project-dispatch-attestation");
+        assert_eq!(recovery.connection_profile, profile_name);
+        assert_eq!(recovery.repository, "t-hub");
+        assert_eq!(recovery.card_id, "thub-powder-control-lifecycle");
+        assert_eq!(recovery.run_id, "run-authoritative");
+        assert_eq!(recovery.agent, "t-hub");
+        assert_eq!(
+            recovery.state,
+            if fail_ambiguity_persist {
+                PendingDispatchReleaseState::InFlight
+            } else {
+                PendingDispatchReleaseState::Ambiguous
+            }
+        );
+        assert!(recovery
+            .operation_id
+            .starts_with("initial-claim:actor-t-hub:"));
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement.crew.iter().any(|crew| {
+            crew.terminal_id == crew_session_id
+                && matches!(crew.state, CrewState::CleanupPending { .. })
+                && crew
+                    .powder_work
+                    .as_ref()
+                    .is_some_and(|work| work.dispatch_release_recovery)
+        }));
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+
+        if remap_frozen_profile {
+            _profiles.remap_profile_endpoint(&profile_name, replacement_server.addr);
+        }
+        drop(ctx);
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, _) = dispatch_test_context(restarted.clone());
+        reconcile_powder_leases(&restarted_ctx);
+        let recovered = restarted.snapshot();
+        assert!(recovered.pending_dispatch_claims.is_empty());
+        assert_eq!(
+            recovered.pending_dispatch_releases.len(),
+            usize::from(remap_frozen_profile)
+        );
+        let replacement = recovered
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(replacement.crew.len(), usize::from(remap_frozen_profile));
+        assert_eq!(
+            recovered.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.card_evidence_gets,
+            1 + usize::from(!remap_frozen_profile)
+        );
+        assert_eq!(state.run_evidence_gets, usize::from(!remap_frozen_profile));
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+        let replacement_state = replacement_server.finish().unwrap();
+        assert_eq!(replacement_state.release_posts, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_ambiguous_release_before_launch_recovers_from_frozen_scope_after_restart() {
+        run_post_bind_ambiguous_release_recovery("before_launch", false, false);
+    }
+
+    #[test]
+    fn dispatch_ambiguous_release_before_attestation_persistence_recovers_from_frozen_scope_after_restart(
+    ) {
+        run_post_bind_ambiguous_release_recovery("before_attestation_persistence", false, false);
+    }
+
+    #[test]
+    fn dispatch_ambiguous_release_before_success_recovers_from_frozen_scope_after_restart() {
+        run_post_bind_ambiguous_release_recovery("before_success", false, false);
+    }
+
+    #[test]
+    fn dispatch_response_loss_with_ambiguous_persistence_failure_recovers_without_blind_repost() {
+        run_post_bind_ambiguous_release_recovery("before_launch", true, false);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_refuses_a_remapped_frozen_profile_without_wrong_scope_io() {
+        run_post_bind_ambiguous_release_recovery("before_launch", false, true);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_endpoint_identity_never_persists_or_syncs_gateway_secrets() {
+        let original = LoopbackPowderServer::start(0);
+        let replacement = LoopbackPowderServer::start(0);
+        let profile = format!("release-endpoint-secret-{}", uuid::Uuid::new_v4().simple());
+        let profiles = PowderProfileEnv::install(&profile, original.addr);
+        let original_secret = "original-path-secret";
+        let original_base_url = format!(
+            "http://{}/gateway/{original_secret}?access_token=original-query-secret#original-fragment-secret",
+            original.addr
+        );
+        profiles.set_profile_base_url(&profile, &original_base_url);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let endpoint_identity = client.endpoint_identity().unwrap();
+        let path = captains_tmp("release-endpoint-digest-secret");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "digest-captain");
+        let crew_session_id = "digest-crew";
+        registry
+            .record_crew("digest-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "digest-captain",
+                crew_session_id,
+                "Keep recovery endpoint credentials private",
+                "codex",
+                Some("/tmp/digest-crew"),
+                Some("digest-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_identity: endpoint_identity.clone(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:endpoint-digest".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let persisted_json: Value = serde_json::from_str(&persisted).unwrap();
+        let persisted_recovery = &persisted_json["pendingDispatchReleases"][0];
+        assert_eq!(
+            persisted_recovery["connectionEndpointIdentity"],
+            endpoint_identity
+        );
+        assert!(persisted_recovery.get("connectionEndpoint").is_none());
+
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        assert!(captains_sync_apply(&ctx));
+        let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+        let debug_output = format!("{recovery:?}");
+        for secret in [
+            original_secret,
+            "original-query-secret",
+            "original-fragment-secret",
+            &original_base_url,
+        ] {
+            assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+            assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+            assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+        }
+
+        let replacement_base_url = format!(
+            "http://{}/gateway/replacement-path-secret?access_token=replacement-query-secret#replacement-fragment-secret",
+            replacement.addr
+        );
+        profiles.set_profile_base_url(&profile, &replacement_base_url);
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen profile endpoint changed before release recovery"
+        );
+        for secret in [
+            original_secret,
+            "original-query-secret",
+            "original-fragment-secret",
+            "replacement-path-secret",
+            "replacement-query-secret",
+            "replacement-fragment-secret",
+            &original_base_url,
+            &replacement_base_url,
+        ] {
+            assert!(!error.contains(secret), "error leaked {secret:?}");
+        }
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery],
+            "endpoint remap must retain the original-scope recovery"
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 0);
+        assert_eq!(original_state.run_evidence_gets, 0);
+        assert_eq!(original_state.release_posts, 0);
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.card_evidence_gets, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_matching_endpoint_transport_failure_never_leaks_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let profile = format!("release-transport-secret-{}", uuid::Uuid::new_v4().simple());
+        let profiles = PowderProfileEnv::install(&profile, addr);
+        let endpoint =
+            format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+        profiles.set_profile_base_url(&profile, &endpoint);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let path = captains_tmp("release-transport-secret");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "transport-captain");
+        let crew_session_id = "transport-crew";
+        registry
+            .record_crew("transport-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "transport-captain",
+                crew_session_id,
+                "Keep matching-endpoint transport errors private",
+                "codex",
+                Some("/tmp/transport-crew"),
+                Some("transport-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_identity: client.endpoint_identity().unwrap(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:transport-secret".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        assert!(captains_sync_apply(&ctx));
+        let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen repository cannot be reconciled: Powder transport failure"
+        );
+        // Periodic reconciliation logs this same endpoint-free error.  Invoke the
+        // production path as well; it must retain the exact pending recovery.
+        reconcile_powder_leases(&ctx);
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery.clone()]
+        );
+        let debug_output = format!("{recovery:?}");
+        for secret in [
+            "path-token",
+            "query-token",
+            "fragment-token",
+            "test-key",
+            endpoint.as_str(),
+        ] {
+            assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+            assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+            assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+            assert!(!error.contains(secret), "error leaked {secret:?}");
+        }
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_status_errors_never_leak_gateway_echoes() {
+        for (status, reason, expected_message) in [
+            (403_u16, "Forbidden", "Powder HTTP status 403"),
+            (500_u16, "Internal Server Error", "Powder HTTP status 500"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = json!({
+                "error": "gateway echoed /gateway/path-token?access_token=query-token#fragment-token with test-key"
+            });
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let _ = read_loopback_powder_request(&mut stream).unwrap();
+                    write_loopback_json_status(&mut stream, status, reason, &body).unwrap();
+                }
+            });
+            let profile = format!(
+                "release-status-secret-{}-{}",
+                status,
+                uuid::Uuid::new_v4().simple()
+            );
+            let profiles = PowderProfileEnv::install(&profile, addr);
+            let endpoint =
+                format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+            profiles.set_profile_base_url(&profile, &endpoint);
+            let client = powder::Client::from_profile(&profile).unwrap();
+            let path = captains_tmp("release-status-secret");
+            let _ = std::fs::remove_file(&path);
+            let registry = dispatch_test_registry(Some(path.clone()), &profile, "status-captain");
+            let crew_session_id = "status-crew";
+            registry
+                .record_crew("status-captain", crew_session_id)
+                .unwrap();
+            registry
+                .bind_crew_context(
+                    "status-captain",
+                    crew_session_id,
+                    "Keep gateway status echoes private",
+                    "codex",
+                    Some("/tmp/status-crew"),
+                    Some("status-crew"),
+                    PowderWorkBinding {
+                        card_id: "thub-powder-control-lifecycle".into(),
+                        run_id: "run-authoritative".into(),
+                        agent: Some("t-hub".into()),
+                        claim_expires_at: Some(100),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                )
+                .unwrap();
+            let recovery = PendingDispatchRelease {
+                crew_session_id: crew_session_id.into(),
+                project_id: "project-dispatch-attestation".into(),
+                connection_profile: profile.clone(),
+                connection_endpoint_identity: client.endpoint_identity().unwrap(),
+                repository: "t-hub".into(),
+                card_id: "thub-powder-control-lifecycle".into(),
+                run_id: "run-authoritative".into(),
+                agent: "t-hub".into(),
+                operation_id: format!("initial-claim:actor-t-hub:status-{status}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            };
+            registry.prepare_dispatch_release(recovery.clone()).unwrap();
+            let persisted = std::fs::read_to_string(&path).unwrap();
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            assert!(captains_sync_apply(&ctx));
+            let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+
+            let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+            assert_eq!(
+                error,
+                format!("the frozen repository cannot be reconciled: {expected_message}")
+            );
+            // Periodic reconciliation emits this same endpoint-free error to its
+            // log-facing path and must retain the frozen recovery.
+            reconcile_powder_leases(&ctx);
+            assert_eq!(
+                registry.snapshot().pending_dispatch_releases,
+                vec![recovery.clone()]
+            );
+            let debug_output = format!("{recovery:?}");
+            for secret in [
+                "path-token",
+                "query-token",
+                "fragment-token",
+                "test-key",
+                endpoint.as_str(),
+            ] {
+                assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+                assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+                assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+                assert!(!error.contains(secret), "error leaked {secret:?}");
+            }
+            server.join().unwrap();
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn dispatch_release_recovery_fails_closed_when_protected_credential_rotates() {
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!(
+            "release-credential-rotation-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let profiles = PowderProfileEnv::install(&profile, server.addr);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let path = captains_tmp("release-credential-rotation");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "rotation-captain");
+        let crew_session_id = "rotation-crew";
+        registry
+            .record_crew("rotation-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "rotation-captain",
+                crew_session_id,
+                "Reject a rotated protected endpoint credential",
+                "codex",
+                Some("/tmp/rotation-crew"),
+                Some("rotation-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_identity: client.endpoint_identity().unwrap(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:credential-rotation".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        let (ctx, _) = dispatch_test_context(registry.clone());
+
+        let mut malformed = recovery.clone();
+        malformed.connection_endpoint_identity = "hmac-sha256:not-a-tag".into();
+        let malformed_error =
+            recover_pending_dispatch_release_guarded(&ctx, &malformed).unwrap_err();
+        assert_eq!(
+            malformed_error,
+            "the frozen profile endpoint identity is malformed before release recovery"
+        );
+        profiles.set_profile_api_key(&profile, "rotated-test-key");
+
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen profile endpoint changed before release recovery"
+        );
+        reconcile_powder_leases(&ctx);
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery]
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn run_dispatch_release_producer_serialization(
+        rollback_boundary: &'static str,
+        periodic_consumer: bool,
+    ) {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "run_dispatch_release_producer_serialization: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(4);
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!(
+            "release-producer-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "release-producer-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &original_profile, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (authority_reached, wait_for_authority) = mpsc::sync_channel(1);
+        let (authority_resume, continue_dispatch) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_launch",
+            reached: authority_reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": format!("Serialize producer rollback at {rollback_boundary}"),
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let producer = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_authority
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach its post-bind authority barrier"),
+            "before_launch"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry.projects()[0].clone();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = replacement_profile.clone();
+        replacement_project.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(replacement_project).unwrap();
+        let (rollback_reached, wait_for_rollback) = mpsc::sync_channel(1);
+        let (rollback_resume, continue_rollback) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: rollback_boundary,
+            reached: rollback_reached,
+            resume: continue_rollback,
+        }));
+        authority_resume.send(()).unwrap();
+        assert_eq!(
+            wait_for_rollback
+                .recv_timeout(Duration::from_secs(3))
+                .expect("producer did not reach the rollback serialization barrier"),
+            rollback_boundary
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
+        assert_eq!(
+            snapshot.pending_dispatch_releases[0].state,
+            if rollback_boundary == "release_prepared_before_teardown" {
+                PendingDispatchReleaseState::Prepared
+            } else {
+                PendingDispatchReleaseState::InFlight
+            }
+        );
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let consumer_ctx = ctx.clone();
+        let consumer_crew_session_id = crew_session_id.clone();
+        let consumer = std::thread::spawn(move || {
+            if periodic_consumer {
+                reconcile_powder_leases(&consumer_ctx);
+                Ok(())
+            } else {
+                finalize_crew_powder_cleanup(&consumer_ctx, &consumer_crew_session_id, true)
+                    .map(|_| ())
+            }
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            crew_session_id,
+            "the consumer must queue behind the originating rollback transaction"
+        );
+        rollback_resume.send(()).unwrap();
+        let error = producer.join().unwrap().unwrap_err();
+        assert!(error.contains("authority changed before launch"), "{error}");
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        consumer.join().unwrap().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "authority rollback must finish before any provider command"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let replacement_captain = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement_captain.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement_captain.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.claim_posts, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(original_state.run_evidence_gets, 0);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_periodic_reconcile_before_teardown() {
+        run_dispatch_release_producer_serialization("release_prepared_before_teardown", true);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_ordinary_cleanup_before_teardown() {
+        run_dispatch_release_producer_serialization("release_prepared_before_teardown", false);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_periodic_reconcile_before_release_post() {
+        run_dispatch_release_producer_serialization("release_inflight_before_post", true);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_ordinary_cleanup_before_release_post() {
+        run_dispatch_release_producer_serialization("release_inflight_before_post", false);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_serializes_periodic_reconcile_and_ordinary_cleanup() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_recovery_serializes_periodic_reconcile_and_ordinary_cleanup: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        // The original scope loses the response after committing the exact
+        // release.  The first periodic reconcile is held at canonical run
+        // evidence while ordinary cleanup queues behind the same Crew guard.
+        let original = LoopbackPowderServer::start(7);
+        {
+            let mut state = original.state.lock().unwrap();
+            state.pause_run_evidence = true;
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!("release-guard-original-{}", uuid::Uuid::new_v4().simple());
+        let replacement_profile = format!(
+            "release-guard-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let path = captains_tmp("release-guard-periodic-close");
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        let crew_session_id = format!("release-guard-{}", uuid::Uuid::new_v4().simple());
+        registry
+            .record_crew(&captain.session_id, &crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                &captain.session_id,
+                &crew_session_id,
+                "Recover one exact release",
+                "codex",
+                Some("/tmp/release-guard"),
+                Some("release-guard"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.clone(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: original_profile.clone(),
+            connection_endpoint_identity: powder::Client::from_profile(&original_profile)
+                .unwrap()
+                .endpoint_identity()
+                .unwrap(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:release-guard".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery).unwrap();
+        let mut rebound = registry.projects()[0].clone();
+        rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+        rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        let (ctx, _) = dispatch_test_context(registry.clone());
+
+        let periodic_ctx = ctx.clone();
+        let periodic = std::thread::spawn(move || reconcile_powder_leases(&periodic_ctx));
+        assert_eq!(
+            original
+                .run_evidence_started
+                .recv_timeout(Duration::from_secs(3))
+                .expect("periodic reconcile did not block at original-scope evidence"),
+            ()
+        );
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let close_ctx = ctx.clone();
+        let close_crew_session_id = crew_session_id.clone();
+        let close = std::thread::spawn(move || {
+            finalize_crew_powder_cleanup(&close_ctx, &close_crew_session_id, true)
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            crew_session_id,
+            "ordinary cleanup must queue behind periodic recovery for the exact Crew"
+        );
+        original.state.lock().unwrap().pause_run_evidence = false;
+        original.resume_run_evidence.send(()).unwrap();
+        periodic.join().unwrap();
+        let close_result = close.join().unwrap().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        assert_eq!(
+            close_result
+                .0
+                .as_ref()
+                .and_then(|release| release["outcome"].as_str()),
+            Some("released"),
+            "ordinary cleanup result: {close_result:?}"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 2);
+        assert_eq!(original_state.run_evidence_gets, 2);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_inflight_before_post_survives_restart_without_blind_repost() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_inflight_before_post_survives_restart_without_blind_repost: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(7);
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!(
+            "release-inflight-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "release-inflight-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let path = captains_tmp("release-inflight-restart");
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (authority_reached, wait_for_authority) = std::sync::mpsc::sync_channel(1);
+        let (authority_resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_launch",
+            reached: authority_reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Crash after exact release teardown before POST",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_authority
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the post-bind authority barrier"),
+            "before_launch"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut rebound = registry.projects()[0].clone();
+        rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+        rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        let (release_reached, wait_for_release) = std::sync::mpsc::sync_channel(1);
+        let (release_resume, continue_release) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "release_inflight_before_post",
+            reached: release_reached,
+            resume: continue_release,
+        }));
+        authority_resume.send(()).unwrap();
+        assert_eq!(
+            wait_for_release
+                .recv_timeout(Duration::from_secs(3))
+                .expect("rollback did not stop at the durable in-flight release barrier"),
+            "release_inflight_before_post"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let before_restart = registry.snapshot();
+        assert_eq!(before_restart.pending_dispatch_releases.len(), 1);
+        assert_eq!(
+            before_restart.pending_dispatch_releases[0].state,
+            PendingDispatchReleaseState::InFlight
+        );
+        assert!(before_restart.pending_dispatch_claims.is_empty());
+        assert_eq!(
+            before_restart.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, _) = dispatch_test_context(restarted.clone());
+        reconcile_powder_leases(&restarted_ctx);
+        let recovered = restarted.snapshot();
+        assert!(recovered.pending_dispatch_claims.is_empty());
+        assert!(recovered.pending_dispatch_releases.is_empty());
+        assert!(recovered.captains[0].crew.is_empty());
+        assert_eq!(
+            recovered.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        // Dropping the only resume sender is the process-death equivalent at
+        // the exact post-teardown, pre-POST barrier.  The restarted registry
+        // must own the only subsequent release attempt.
+        drop(release_resume);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains(
+                "test crash occurred after durable release teardown before its release POST"
+            ),
+            "{error}"
+        );
+        assert!(!provider.was_invoked());
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.claim_posts, 1);
+        assert_eq!(original_state.card_evidence_gets, 2);
+        assert_eq!(original_state.run_evidence_gets, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_post_bind_release_resumes_from_original_scope_after_terminal_teardown() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "prepared_post_bind_release_resumes_from_original_scope_after_terminal_teardown: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(4);
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!(
+            "prepared-release-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "prepared-release-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        {
+            let mut state = original.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
+        let path = captains_tmp("prepared-release-restart");
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let crew_session_id = format!("prepared-release-{}", uuid::Uuid::new_v4().simple());
+        create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        registry
+            .record_crew(&captain.session_id, &crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                &captain.session_id,
+                &crew_session_id,
+                "Recover Prepared exact release",
+                "codex",
+                Some("/tmp/prepared-release"),
+                Some("prepared-release"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.clone(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: original_profile.clone(),
+            connection_endpoint_identity: powder::Client::from_profile(&original_profile)
+                .unwrap()
+                .endpoint_identity()
+                .unwrap(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:prepared-release".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.prepare_dispatch_release(recovery).unwrap();
+        let mut rebound = registry.projects()[0].clone();
+        rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+        rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(rebound).unwrap();
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (ctx, _) = dispatch_test_context(restarted.clone());
+        reconcile_powder_leases(&ctx);
+        let snapshot = restarted.snapshot();
+        assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
+        assert_eq!(
+            snapshot.pending_dispatch_releases[0].state,
+            PendingDispatchReleaseState::InFlight,
+        );
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(matches!(
+            snapshot.captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        assert!(
+            snapshot.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .dispatch_release_recovery
+        );
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 1);
+        assert_eq!(original_state.run_evidence_gets, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.card_evidence_gets, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_rejects_reclaimed_different_unknown_and_malformed_card_state() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_recovery_rejects_reclaimed_different_unknown_and_malformed_card_state: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        for (case, expected_requests) in [
+            ("reclaimed", 3usize),
+            ("different-claim", 3),
+            ("unknown-run", 3),
+            ("malformed-card", 2),
+        ] {
+            let original = LoopbackPowderServer::start(expected_requests);
+            let replacement = LoopbackPowderServer::start(0);
+            {
+                let mut state = original.state.lock().unwrap();
+                state.evidence_claim_agent = Some("t-hub".into());
+                state.evidence_run_agent = Some("t-hub".into());
+                match case {
+                    "reclaimed" => {
+                        state.force_claim = true;
+                        state.evidence_run_id = Some("run-reclaimed".into());
+                    }
+                    "different-claim" => state.evidence_claim_agent = Some("other-agent".into()),
+                    "unknown-run" => state.completed = true,
+                    "malformed-card" => state.malformed_card_evidence = true,
+                    _ => unreachable!(),
+                }
+            }
+            let original_profile = format!(
+                "release-card-state-original-{case}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let replacement_profile = format!(
+                "release-card-state-replacement-{case}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profiles = PowderProfileEnv::install_profiles(&[
+                (&original_profile, original.addr),
+                (&replacement_profile, replacement.addr),
+            ]);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let crew_session_id = format!("release-card-state-{}", uuid::Uuid::new_v4().simple());
+            let registry = dispatch_test_registry(None, &original_profile, &captain.session_id);
+            registry
+                .record_crew(&captain.session_id, &crew_session_id)
+                .unwrap();
+            registry
+                .bind_crew_context(
+                    &captain.session_id,
+                    &crew_session_id,
+                    "Reject changed current card state",
+                    "codex",
+                    Some("/tmp/release-card-state"),
+                    Some("release-card-state"),
+                    PowderWorkBinding {
+                        card_id: "thub-powder-control-lifecycle".into(),
+                        run_id: "run-authoritative".into(),
+                        agent: Some("t-hub".into()),
+                        claim_expires_at: Some(100),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                )
+                .unwrap();
+            let recovery = PendingDispatchRelease {
+                crew_session_id,
+                project_id: "project-dispatch-attestation".into(),
+                connection_profile: original_profile.clone(),
+                connection_endpoint_identity: powder::Client::from_profile(&original_profile)
+                    .unwrap()
+                    .endpoint_identity()
+                    .unwrap(),
+                repository: "t-hub".into(),
+                card_id: "thub-powder-control-lifecycle".into(),
+                run_id: "run-authoritative".into(),
+                agent: "t-hub".into(),
+                operation_id: format!("initial-claim:actor-t-hub:release-card-state:{case}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            };
+            registry.prepare_dispatch_release(recovery.clone()).unwrap();
+            let mut rebound = registry.projects()[0].clone();
+            rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+            rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+            registry.upsert_project(rebound).unwrap();
+            let (ctx, _) = dispatch_test_context(registry.clone());
+            reconcile_powder_leases(&ctx);
+            let snapshot = registry.snapshot();
+            assert_eq!(
+                snapshot.pending_dispatch_releases,
+                vec![recovery],
+                "{case} must retain the exact frozen recovery"
+            );
+            assert!(snapshot.pending_dispatch_claims.is_empty());
+            assert!(matches!(
+                snapshot.captains[0].crew[0].state,
+                CrewState::CleanupPending { .. }
+            ));
+            assert_eq!(
+                snapshot.projects[0]
+                    .powder
+                    .as_ref()
+                    .unwrap()
+                    .connection_profile,
+                replacement_profile
+            );
+            let original_state = original.finish().unwrap();
+            assert_eq!(
+                original_state.release_posts, 0,
+                "{case} issued a release POST"
+            );
+            let replacement_state = replacement.finish().unwrap();
+            assert_eq!(replacement_state.card_evidence_gets, 0);
+            assert_eq!(replacement_state.run_evidence_gets, 0);
+            assert_eq!(replacement_state.release_posts, 0);
+        }
+    }
+
+    #[test]
+    fn dispatch_release_prepare_persistence_failure_emits_no_release_post_or_cleanup_mutation() {
+        let path = captains_tmp("release-prepare-persist-failure");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "prepare-failure-profile",
+            "prepare-failure-crew",
+        );
+        let work = registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .clone()
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "prepare-failure-crew".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "prepare-failure-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: work.card_id,
+            run_id: work.run_id,
+            agent: work.agent.unwrap(),
+            operation_id: "initial-claim:actor-t-hub:prepare-failure".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.fail_next_persist("injected release prepare persistence failure");
+        assert!(registry.prepare_dispatch_release(recovery).is_err());
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        assert!(matches!(
+            snapshot.captains[0].crew[0].state,
+            CrewState::Active
+        ));
+        assert!(
+            !snapshot.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .dispatch_release_recovery
+        );
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_release_never_clears_a_reused_terminal_without_its_exact_transaction_crew() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "clear-reuse-profile",
+            "clear-reuse-crew",
+        );
+        let work = registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .clone()
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "clear-reuse-crew".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "clear-reuse-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: work.card_id,
+            run_id: work.run_id,
+            agent: work.agent.unwrap(),
+            operation_id: "initial-claim:actor-t-hub:clear-reuse".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        {
+            let mut inner = registry.lock();
+            let crew = &mut inner.captains[0].crew[0];
+            crew.state = CrewState::Active;
+            let work = crew.powder_work.as_mut().unwrap();
+            work.card_id = "replacement-card".into();
+            work.run_id = "replacement-run".into();
+            work.agent = Some("replacement-agent".into());
+            work.dispatch_release_recovery = false;
+        }
+        let error = registry
+            .clear_confirmed_dispatch_release(&recovery)
+            .unwrap_err();
+        assert!(error.contains("transaction-owned CleanupPending"));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_releases, vec![recovery]);
+        let replacement = &snapshot.captains[0].crew[0];
+        assert_eq!(replacement.terminal_id, "clear-reuse-crew");
+        assert_eq!(
+            replacement.powder_work.as_ref().unwrap().card_id,
+            "replacement-card"
+        );
+    }
+
+    #[test]
+    fn dispatch_launch_races_fail_closed_and_roll_back_exact_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_launch_races_fail_closed_and_roll_back_exact_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let accepted = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let changed_posture = dispatch_race_evidence(
+            &["codex", "--sandbox", "workspace-write", "work"],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let wrapper = dispatch_race_evidence(
+            &["sh", "/tmp/codex-wrapper"],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let changed_ancestry = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_456,
+            &[(42, 900), (8, 101), (7, 100)],
+        );
+        let changed_generation = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_457,
+            &[(42, 900), (7, 100)],
+        );
+        let cases = [
+            (
+                "provider-exit",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Err(LaunchAttestationError::UnreadableEvidence),
+                ],
+                "before durable acceptance: provider-native process evidence is unreadable",
+            ),
+            (
+                "posture-change",
+                vec![Ok(shell.clone()), Ok(accepted.clone()), Ok(changed_posture)],
+                "provider-native permission evidence has the wrong mode",
+            ),
+            (
+                "wrapper-change",
+                vec![Ok(shell.clone()), Ok(accepted.clone()), Ok(wrapper)],
+                "a wrapper obscures the provider-native foreground process",
+            ),
+            (
+                "ancestry-change",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(changed_ancestry),
+                ],
+                "provider-native process ancestry changed during launch acceptance",
+            ),
+            (
+                "generation-change",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(changed_generation),
+                ],
+                "terminal pane generation changed during launch",
+            ),
+            (
+                "post-persistence-exit",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(accepted.clone()),
+                    Err(LaunchAttestationError::UnreadableEvidence),
+                ],
+                "after durable persistence: provider-native process evidence is unreadable",
+            ),
+        ];
+
+        for (case_name, observations, expected_error) in cases {
+            let server = LoopbackPowderServer::start(4);
+            let profile_name = format!(
+                "dispatch-race-{case_name}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            let mut observations = std::collections::VecDeque::from(observations);
+            let mut observer = |_target: &str| {
+                observations
+                    .pop_front()
+                    .expect("dispatch made an unexpected attestation observation")
+            };
+
+            let error = dispatch_crew_with_observer(
+                &ctx,
+                &json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Reject a launch acceptance race",
+                    "harness": "codex",
+                    "testHarnessCommand": "sleep 60",
+                    "testCodexUnobservedCommand": ":",
+                    "testSkipHarnessLiveness": true,
+                }),
+                None,
+                true,
+                &mut observer,
+            )
+            .unwrap_err();
+
+            assert!(error.contains(expected_error), "{case_name}: {error}");
+            assert!(error.contains("all side effects were rolled back"));
+            assert!(observations.is_empty(), "{case_name}: unused observations");
+            let crew_session_id = dispatched_terminal_id(&sink);
+            assert_eq!(
+                tmux::session_liveness(&tmux_target(&crew_session_id)),
+                tmux::SessionLiveness::Gone
+            );
+            assert!(registry.snapshot().captains[0].crew.is_empty());
+            let state = server.finish().unwrap();
+            assert_eq!(state.claim_posts, 1);
+            assert_eq!(state.release_posts, 1);
+            assert_eq!(
+                state.release_bodies,
+                vec![json!({"run_id": "run-authoritative"})]
+            );
+        }
+    }
+
+    #[test]
     fn dispatch_test_harness_command_failures_roll_back_all_side_effects() {
         if !tmux_process_tests_available() {
             eprintln!(
@@ -22423,8 +30811,67 @@ mod tests {
             ": api_key=supersecret",
             "false",
             true,
-            "provider-native process evidence predates this launch",
+            "a wrapper obscures the provider-native foreground process",
         );
+    }
+
+    #[test]
+    fn dispatch_empty_private_claude_respawn_command_rolls_back_exact_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_empty_private_claude_respawn_command_rolls_back_exact_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!("dispatch-empty-respawn-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let error = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Reject an empty private Claude respawn command",
+                "harness": "claude",
+                "testHarnessCommand": "",
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("private provider respawn command is empty"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        assert!(!error.contains("api_key"), "{error}");
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
     }
 
     #[test]
@@ -22496,6 +30943,8 @@ mod tests {
             );
             assert_eq!(persisted.t_hub_capability.as_deref(), Some("read"));
             assert_eq!(persisted.harness.as_deref(), Some(harness.as_provider()));
+            assert!(restored.pending_dispatch_claims.is_empty());
+            assert!(restored.pending_dispatch_releases.is_empty());
 
             let state = server.finish().unwrap();
             assert_eq!(state.claim_posts, 1);
@@ -22504,6 +30953,199 @@ mod tests {
             let _ = std::fs::remove_file(path.with_extension("json.bak"));
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn dispatch_private_respawn_launches_from_hostile_dormant_pane() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_private_respawn_launches_from_hostile_dormant_pane: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let fixture = tempfile::tempdir().unwrap();
+        let hostile_pane = fixture.path().join("hostile-pane");
+        let ready = fixture.path().join("ready");
+        std::fs::write(
+            &hostile_pane,
+            format!(
+                "#!/bin/sh\n: > {}\nwhile IFS= read -r ignored; do :; done\n",
+                serde_json::to_string(&ready).unwrap()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hostile_pane, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_respawn) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_respawn",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Launch from a hostile dormant pane without injecting provider keys",
+                "harness": "codex",
+                "testHarnessCommand": provider.command,
+                "testCodexUnobservedCommand": ":",
+                "testDispatchDormantPaneCommand": format!("exec {}", hostile_pane.display()),
+        });
+        let completion = Arc::new(AtomicBool::new(false));
+        let mut worker =
+            DispatchWorker::start(ctx.clone(), args, sink.clone(), resume, completion.clone());
+        assert_eq!(
+            wait_for_respawn
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the private respawn barrier"),
+            "before_respawn"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "hostile dormant pane did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !provider.was_invoked(),
+            "the provider must not execute before private pane respawn"
+        );
+        let spawn_forward = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(command, _)| command == "spawn_terminal")
+            .map(|(_, args)| args.clone())
+            .unwrap();
+        assert!(spawn_forward
+            .get("startupCommand")
+            .is_none_or(Value::is_null));
+        let forwarded = serde_json::to_string(&spawn_forward).unwrap();
+        assert!(!forwarded.contains(CREW_DORMANT_PANE_COMMAND));
+        assert!(!forwarded.contains(&provider.command));
+        let result = worker.join().unwrap().unwrap();
+        assert!(completion.load(Ordering::SeqCst));
+        provider.wait_for_invocation();
+        assert_eq!(result["crew"]["terminalId"], json!(crew_session_id));
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Alive
+        );
+        assert_eq!(
+            result["crew"]["harnessPermission"],
+            json!("bypassPermissions")
+        );
+        assert_eq!(result["crew"]["tHubCapability"], json!("read"));
+        assert!(registry.snapshot().pending_dispatch_claims.is_empty());
+        assert!(registry.snapshot().pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    fn assert_dispatch_worker_unwind_reaps_at_respawn_barrier(wait_for_barrier: bool) {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "assert_dispatch_worker_unwind_reaps_at_respawn_barrier: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!(
+            "dispatch-worker-unwind-{}-{}",
+            if wait_for_barrier { "after" } else { "before" },
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_respawn) = mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_respawn",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let completion = Arc::new(AtomicBool::new(false));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _worker = DispatchWorker::start(
+                ctx.clone(),
+                json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Prove panic-safe dispatch worker cleanup",
+                    "harness": "codex",
+                    "testHarnessCommand": provider.command,
+                    "testCodexUnobservedCommand": ":",
+                }),
+                sink.clone(),
+                resume,
+                completion.clone(),
+            );
+            if wait_for_barrier {
+                assert_eq!(
+                    wait_for_respawn
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("dispatch did not reach the private respawn barrier"),
+                    "before_respawn"
+                );
+            }
+            panic!("intentional dispatch-worker unwind");
+        }));
+        assert!(panic_result.is_err());
+        assert!(
+            completion.load(Ordering::SeqCst),
+            "the RAII fixture must join the dispatch worker before unwinding fixtures"
+        );
+        let terminal_ids = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(command, _)| command == "spawn_terminal")
+            .filter_map(|(_, args)| args["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_ids.len(),
+            1,
+            "dispatch must spawn exactly one terminal"
+        );
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&terminal_ids[0])),
+            tmux::SessionLiveness::Gone,
+            "the RAII fixture must reap the dispatched terminal after joining"
+        );
+    }
+
+    #[test]
+    fn dispatch_worker_unwind_before_respawn_barrier_reaps_worker_and_terminal() {
+        assert_dispatch_worker_unwind_reaps_at_respawn_barrier(false);
+    }
+
+    #[test]
+    fn dispatch_worker_unwind_after_respawn_barrier_reaps_worker_and_terminal() {
+        assert_dispatch_worker_unwind_reaps_at_respawn_barrier(true);
     }
 
     #[test]
@@ -22578,7 +31220,7 @@ mod tests {
         let entry: t_hub_protocol::EventJournalEntry = serde_json::from_str(entries[0]).unwrap();
         assert_eq!(
             entry.event_type,
-            t_hub_protocol::JournalEventType::CoreAction
+            t_hub_protocol::JournalEventType::AgentCommand
         );
         assert_eq!(entry.payload["tmux_session"], expected_tmux_session);
         assert_eq!(entry.payload["telemetry"]["runtime_health"], "degraded");
@@ -22877,6 +31519,1690 @@ mod tests {
     }
 
     #[test]
+    fn powder_work_log_uses_stable_atomic_card_run_and_operation_identity() {
+        let server = LoopbackPowderServer::start(11);
+        let _profile = PowderProfileEnv::install("loopback-work-log", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let expected_operation_id = "work-log:focused-atomic";
+        let args = json!({
+            "message": "focused atomic work-log evidence",
+            "operationId": expected_operation_id,
+        });
+        let rejected = post_loopback_powder(
+            server.addr,
+            "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/work-log",
+            &json!({
+                "operation_id": "work-log:terminal-attribution",
+                "agent": "crew-powder",
+                "model": Value::Null,
+                "reasoning": Value::Null,
+                "harness": "codex",
+                "body": "terminal attribution must be rejected",
+            }),
+        )
+        .unwrap();
+        assert_eq!(rejected["state"], "rejected");
+
+        for _ in 0..2 {
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "loopback-work-log",
+                    &crew,
+                    "append_crew_powder_work_log",
+                    args.clone(),
+                ),
+            );
+            assert!(response.ok, "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["operationId"], expected_operation_id);
+            assert_eq!(result["repository"], "t-hub");
+        }
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 3);
+        assert_eq!(state.work_log_posts[0]["agent"], "crew-powder");
+        assert_eq!(
+            state.work_log_posts[1]["operation_id"],
+            expected_operation_id
+        );
+        assert_eq!(
+            state.work_log_posts[2]["operation_id"],
+            expected_operation_id
+        );
+        assert_eq!(state.work_log_posts[1], state.work_log_posts[2]);
+        assert_eq!(state.work_log_posts[1]["agent"], "powder-agent");
+        assert_ne!(state.work_log_posts[1]["agent"], "crew-powder");
+        assert_eq!(state.work_log_posts[1]["harness"], "codex");
+        assert_eq!(
+            state.work_log_posts[1]["body"],
+            "focused atomic work-log evidence"
+        );
+        assert!(state.work_log_posts[1].get("card_id").is_none());
+        assert!(state.work_log_posts[1].get("expected_run_id").is_none());
+    }
+
+    #[test]
+    fn powder_work_log_rejects_substituted_authoritative_agents_without_post() {
+        for target in ["card", "run"] {
+            let server = LoopbackPowderServer::start(2);
+            {
+                let mut state = server.state.lock().unwrap();
+                if target == "card" {
+                    state.evidence_claim_agent = Some("substituted-agent".into());
+                } else {
+                    state.evidence_run_agent = Some("substituted-agent".into());
+                }
+            }
+            let profile = format!("loopback-work-log-substituted-{target}");
+            let _profile = PowderProfileEnv::install(&profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(None, &profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(&profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({
+                        "operationId": format!("work-log:substituted-{target}"),
+                        "message": "substituted agent must fail before mutation"
+                    }),
+                ),
+            );
+            let error = response.error.unwrap();
+            assert!(error.contains("not Crew Powder agent"), "{target}: {error}");
+            assert!(registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .is_none());
+            let state = server.finish().unwrap();
+            assert_eq!(state.card_evidence_gets, 1);
+            assert_eq!(state.run_evidence_gets, 1);
+            assert!(state.work_log_posts.is_empty());
+        }
+    }
+
+    #[test]
+    fn powder_work_log_rejects_repository_rehome_without_post() {
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().evidence_repository = Some("merged-repository".into());
+        let profile = "loopback-work-log-repository-rehome";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:repository-rehome",
+                    "message": "re-homed card must not mutate"
+                }),
+            ),
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .contains("not Crew Project repository"));
+        let state = server.finish().unwrap();
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_retains_recovery_when_binding_goes_stale_after_post() {
+        let server = LoopbackPowderServer::start(5);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .rehome_repository_after_work_log = Some("merged-repository".into());
+        let profile = "loopback-work-log-stale-binding";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:stale-binding",
+                    "message": "post-write scope must remain authoritative"
+                }),
+            ),
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .contains("not Crew Project repository"));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .is_some_and(|intent| intent.terminal_rejection.is_none()));
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.card_evidence_gets, 2);
+        assert_eq!(state.run_evidence_gets, 2);
+    }
+
+    #[test]
+    fn powder_work_log_rejects_malformed_scope_evidence_without_post() {
+        let server = LoopbackPowderServer::start(1);
+        server.state.lock().unwrap().malformed_card_evidence = true;
+        let profile = "loopback-work-log-malformed-scope";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:malformed-scope",
+                    "message": "malformed evidence must not mutate"
+                }),
+            ),
+        );
+        assert!(response.error.unwrap().contains("card id"));
+        let state = server.finish().unwrap();
+        assert!(state.work_log_posts.is_empty());
+        assert_eq!(state.run_evidence_gets, 0);
+    }
+
+    #[test]
+    fn powder_mutations_are_disabled_before_write_on_unsupported_schema() {
+        let server = LoopbackPowderServer::start(0);
+        server.state.lock().unwrap().capability_schema_version = Some(17);
+        let _profile = PowderProfileEnv::install("loopback-unsupported-schema", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-unsupported-schema");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-unsupported-schema")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-unsupported-schema",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:unsupported",
+                    "message": "must not reach an unsupported Powder deployment",
+                }),
+            ),
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "Powder work-log append: Powder mutation state 'unsupported': deployed run-bound capability verification failed"
+            )
+        );
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.capability_requests, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_criterion_review_binds_run_criterion_reviewer_and_normalized_proof() {
+        let server = LoopbackPowderServer::start(3);
+        let _profile = PowderProfileEnv::install("loopback-criterion-review", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-criterion-review");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-criterion-review")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let criterion_id = loopback_run_criterion("run-authoritative")["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-criterion-review",
+                &captain,
+                "review_crew_powder_criterion",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "criterion:authoritative",
+                    "criterion": 0,
+                    "criterionId": criterion_id,
+                    "decision": "approved",
+                    "proof": "raw secret-shaped review proof",
+                    "expectedReviewerIdentity": "actor-captain-powder",
+                }),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["operationId"], "criterion:authoritative");
+        assert_eq!(result["review"]["reviewerIdentity"], "actor-captain-powder");
+        assert_eq!(result["review"]["proof"], "[scrubbed review proof]");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.criterion_review_posts.len(), 1);
+        let posted = &state.criterion_review_posts[0];
+        assert_eq!(posted["operation_id"], "criterion:authoritative");
+        assert_eq!(posted["criterion"], 0);
+        assert_eq!(posted["decision"], "approved");
+        assert_eq!(posted["proof"], "raw secret-shaped review proof");
+        assert!(posted.get("reviewer").is_none());
+        assert!(posted.get("reviewer_identity").is_none());
+    }
+
+    #[test]
+    fn powder_mutation_intent_survives_restart_and_rejects_changed_payload_replay() {
+        let path = captains_tmp("powder-mutation-intent");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile(
+            Some(path.clone()),
+            "profile-that-does-not-exist-for-control-tests",
+        );
+        let ctx = test_ctx("powder-mutation-intent").with_captains_registry(registry.clone());
+        let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        let intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &scope,
+            "work-log:durable-replay",
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": "durable replay",
+            }),
+        );
+        let (_, changed) = registry
+            .begin_crew_powder_mutation(&scope, intent.clone())
+            .unwrap();
+        assert!(changed);
+        drop(ctx);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let restarted_ctx =
+            test_ctx("powder-mutation-intent").with_captains_registry(restarted.clone());
+        let restored = restarted.snapshot();
+        assert_eq!(
+            restored.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+
+        let scope = resolve_crew_powder_scope(&restarted_ctx, "crew-powder").unwrap();
+        let mut replay = intent.clone();
+        replay.created_at = 20;
+        let (_, changed) = restarted
+            .begin_crew_powder_mutation(&scope, replay)
+            .unwrap();
+        assert!(!changed);
+
+        let mut conflict = intent.clone();
+        conflict.payload_digest = "b".repeat(64);
+        assert!(restarted
+            .begin_crew_powder_mutation(&scope, conflict)
+            .unwrap_err()
+            .contains("conflicts with its durable payload or identity"));
+        assert_eq!(
+            restarted.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+
+        let (_, changed) = restarted
+            .finish_crew_powder_mutation(&scope, &intent.operation_id, &intent.payload_digest)
+            .unwrap();
+        assert!(changed);
+        assert!(
+            CaptainsRegistry::load(path.clone()).snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .is_none()
+        );
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powder_work_log_restart_recovers_exact_operation_without_reposting() {
+        let path = captains_tmp("powder-work-log-restart-recovery");
+        let _ = std::fs::remove_file(&path);
+        let operation_id = "work-log:restart-recovery";
+        let message = "recover after registry restart";
+        let server = LoopbackPowderServer::start(5);
+        let _profile = PowderProfileEnv::install("loopback-work-log-restart", server.addr);
+        let registry =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-restart");
+        let seed_ctx =
+            test_ctx("loopback-work-log-restart").with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(&registry, &seed_ctx, operation_id, message, None);
+        drop(seed_ctx);
+        drop(registry);
+
+        let body = loopback_work_log_body(operation_id, message);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_work_log_outcome(&body));
+        }
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("loopback-work-log-restart")
+            .with_identity_store(identities)
+            .with_captains_registry(restarted.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-restart",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+        assert!(restarted.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+        assert_eq!(intent.operation_id, operation_id);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powder_work_log_exact_replay_upgrades_legacy_intent_before_recovery() {
+        let path = captains_tmp("powder-work-log-legacy-recovery");
+        let _ = std::fs::remove_file(&path);
+        let operation_id = "work-log:legacy-recovery";
+        let message = "recover exact legacy operation";
+        let server = LoopbackPowderServer::start(5);
+        let _profile = PowderProfileEnv::install("loopback-work-log-legacy", server.addr);
+        let registry =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-legacy");
+        let seed_ctx =
+            test_ctx("loopback-work-log-legacy").with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &seed_ctx, operation_id, message, None);
+        drop(seed_ctx);
+        drop(registry);
+        downgrade_persisted_mutation_intent_to_v1(&path);
+
+        let body = loopback_work_log_body(operation_id, message);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_work_log_outcome(&body));
+        }
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("loopback-work-log-legacy")
+            .with_identity_store(identities)
+            .with_captains_registry(restarted.clone());
+        let restored = restarted.snapshot();
+        let legacy_intent = restored.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(legacy_intent.schema_version, 1);
+        assert!(legacy_intent.powder_request_digest.is_none());
+
+        let changed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-legacy",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": operation_id,
+                    "message": "changed legacy payload",
+                }),
+            ),
+        );
+        assert!(changed
+            .error
+            .unwrap()
+            .contains("conflicts with its durable payload or identity"));
+        let retained = restarted.snapshot();
+        let retained_intent = retained.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(retained_intent.schema_version, 1);
+        assert!(retained_intent.powder_request_digest.is_none());
+
+        let recovered = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-legacy",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(recovered.ok, "{:?}", recovered.error);
+        assert_eq!(recovered.result.unwrap()["mutationState"], "recovered");
+        assert!(restarted.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powder_work_log_response_loss_recovers_by_status_without_reposting() {
+        for (suffix, failure) in [
+            ("eof", LoopbackPowderResponseFailure::Eof),
+            ("partial", LoopbackPowderResponseFailure::Partial),
+        ] {
+            let profile = format!("loopback-work-log-response-loss-{suffix}");
+            let operation_id = format!("work-log:response-loss-{suffix}");
+            let message = format!("recover {suffix} response loss");
+            let body = loopback_work_log_body(&operation_id, &message);
+            let server = LoopbackPowderServer::start(6);
+            server.state.lock().unwrap().work_log_response_failure = Some(failure);
+            server.state.lock().unwrap().recovery_outcome = Some(loopback_work_log_outcome(&body));
+            let _profile = PowderProfileEnv::install(&profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(None, &profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(&profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({"operationId": operation_id, "message": message}),
+                ),
+            );
+            assert!(response.ok, "{suffix}: {:?}", response.error);
+            assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+            assert!(registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .is_none());
+            let state = server.finish().unwrap();
+            assert_eq!(state.work_log_posts, vec![body]);
+            assert_eq!(state.recovery_gets, 1);
+        }
+    }
+
+    #[test]
+    fn powder_work_log_recovery_rejects_a_different_authoritative_payload() {
+        let operation_id = "work-log:wrong-recovery";
+        let message = "requested payload";
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.work_log_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+            state.recovery_outcome = Some(loopback_work_log_outcome(&loopback_work_log_body(
+                operation_id,
+                "different committed payload",
+            )));
+        }
+        let _profile = PowderProfileEnv::install("loopback-work-log-wrong-recovery", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-wrong-recovery");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-wrong-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-wrong-recovery",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(!response.retryable);
+        assert!(response.error.unwrap().contains("state 'malformed'"));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_some());
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 1);
+    }
+
+    #[test]
+    fn powder_work_log_recovery_accepts_normalized_result_with_original_digest() {
+        let operation_id = "work-log:normalized-recovery";
+        let message = "raw secret-shaped work-log evidence";
+        let body = loopback_work_log_body(operation_id, message);
+        let mut outcome = loopback_work_log_outcome(&body);
+        outcome["result"]["body"] = json!("[scrubbed work-log evidence]");
+        let server = LoopbackPowderServer::start(5);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(outcome);
+        }
+        let _profile =
+            PowderProfileEnv::install("loopback-work-log-normalized-recovery", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-normalized-recovery");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-normalized-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-normalized-recovery",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_recovered_terminal_rejection_records_exact_mutation_intent() {
+        let operation_id = "work-log:recovered-rejection";
+        let message = "terminal rejection evidence";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(3);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_rejected_outcome(
+                "work_log_append",
+                &body,
+                "conflict",
+            ));
+        }
+        let _profile =
+            PowderProfileEnv::install("loopback-work-log-recovered-rejection", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-recovered-rejection");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-recovered-rejection")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-recovered-rejection",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(error.contains("stale, released, or reclaimed"), "{error}");
+        let snapshot = registry.snapshot();
+        let rejection = snapshot.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap()
+            .terminal_rejection
+            .as_ref()
+            .unwrap();
+        assert_eq!(rejection.state, PowderMutationTerminalState::Conflict);
+        assert!(rejection.recorded_at > 0);
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_http_conflict_is_durable_and_identical_replay_is_local() {
+        let operation_id = "work-log:http-conflict";
+        let message = "different requested payload";
+        let server = LoopbackPowderServer::start(3);
+        server.state.lock().unwrap().work_log_http_conflict = true;
+        let _profile = PowderProfileEnv::install("loopback-work-log-http-conflict", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-http-conflict");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-http-conflict")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let request = || {
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "loopback-work-log-http-conflict",
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({"operationId": operation_id, "message": message}),
+                ),
+            )
+        };
+        let first = request();
+        assert!(!first.retryable);
+        let first_error = first.error.unwrap();
+        assert!(first_error.contains("state 'conflict'"));
+        let replay = request();
+        assert!(!replay.retryable);
+        assert_eq!(replay.error.as_deref(), Some(first_error.as_str()));
+        let changed_payload = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-http-conflict",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": operation_id,
+                    "message": "changed payload must stay local"
+                }),
+            ),
+        );
+        assert!(changed_payload
+            .error
+            .unwrap()
+            .contains("durable terminal payload or identity"));
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 0);
+    }
+
+    #[test]
+    fn powder_terminal_conflict_allows_a_changed_operation_after_durable_recording() {
+        let server = LoopbackPowderServer::start(8);
+        server.state.lock().unwrap().work_log_http_conflict = true;
+        let _profile =
+            PowderProfileEnv::install("loopback-work-log-conflict-replacement", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-conflict-replacement");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-conflict-replacement")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let conflict = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-conflict-replacement",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:conflict-original",
+                    "message": "conflicting evidence"
+                }),
+            ),
+        );
+        assert!(conflict.error.unwrap().contains("state 'conflict'"));
+        server.state.lock().unwrap().work_log_http_conflict = false;
+        let replacement = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-conflict-replacement",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:conflict-replacement",
+                    "message": "replacement evidence"
+                }),
+            ),
+        );
+        assert!(replacement.ok, "{:?}", replacement.error);
+        assert!(resolve_crew_powder_scope(&ctx, "crew-powder")
+            .unwrap()
+            .work
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 2);
+        assert_eq!(state.recovery_gets, 0);
+    }
+
+    #[test]
+    fn powder_terminal_conflict_allows_normal_cleanup_after_durable_recording() {
+        let server = LoopbackPowderServer::start(6);
+        server.state.lock().unwrap().work_log_http_conflict = true;
+        let _profile = PowderProfileEnv::install("loopback-work-log-conflict-cleanup", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-conflict-cleanup");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-conflict-cleanup")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let conflict = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-conflict-cleanup",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:conflict-cleanup",
+                    "message": "conflicting cleanup evidence"
+                }),
+            ),
+        );
+        assert!(conflict.error.unwrap().contains("state 'conflict'"));
+        server.state.lock().unwrap().work_log_http_conflict = false;
+        let (release, retained, _) =
+            finalize_crew_powder_cleanup(&ctx, "crew-powder", false).unwrap();
+        assert_eq!(release.as_ref().unwrap()["released"], true);
+        assert!(!retained);
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.release_posts, 1);
+    }
+
+    #[test]
+    fn powder_terminal_conflict_survives_restart_and_replays_without_remote_io() {
+        let path = captains_tmp("powder-terminal-conflict-restart");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let profile = "loopback-work-log-conflict-restart";
+        let operation_id = "work-log:conflict-restart";
+        let message = "restart conflict evidence";
+        let first_error = {
+            let server = LoopbackPowderServer::start(3);
+            server.state.lock().unwrap().work_log_http_conflict = true;
+            let _profile = PowderProfileEnv::install(profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(Some(path.clone()), profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry);
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({"operationId": operation_id, "message": message}),
+                ),
+            );
+            let error = response.error.unwrap();
+            assert!(error.contains("state 'conflict'"));
+            let persisted: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let persisted_intent =
+                &persisted["captains"][0]["crew"][0]["powderWork"]["mutationIntent"];
+            assert_eq!(persisted_intent["schemaVersion"], 3);
+            assert_eq!(persisted_intent["terminalRejection"]["state"], "conflict");
+            assert!(persisted_intent["terminalRejection"]["recordedAt"]
+                .as_u64()
+                .is_some_and(|recorded_at| recorded_at > 0));
+            assert!(!persisted_intent.to_string().contains(message));
+            assert_eq!(server.finish().unwrap().work_log_posts.len(), 1);
+            error
+        };
+
+        let server = LoopbackPowderServer::start(0);
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(restarted);
+        let replay = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert_eq!(replay.error.as_deref(), Some(first_error.as_str()));
+        let state = server.finish().unwrap();
+        assert!(state.work_log_posts.is_empty());
+        assert_eq!(state.recovery_gets, 0);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn powder_expired_intent_can_record_a_terminal_status_without_reissue() {
+        let operation_id = "work-log:expired-terminal";
+        let message = "expired terminal evidence";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(3);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_rejected_outcome(
+                "work_log_append",
+                &body,
+                "conflict",
+            ));
+        }
+        let _profile = PowderProfileEnv::install("loopback-work-log-expired-terminal", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-expired-terminal");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-expired-terminal")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(
+            &registry,
+            &ctx,
+            operation_id,
+            message,
+            Some(now_ms().saturating_sub(POWDER_OPERATION_RETENTION_MS)),
+        );
+        let request = || {
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "loopback-work-log-expired-terminal",
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({"operationId": operation_id, "message": message}),
+                ),
+            )
+        };
+        let first = request();
+        assert!(first.error.as_deref().unwrap().contains("state 'conflict'"));
+        assert_eq!(request().error, first.error);
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_terminal_conflict_persistence_failure_keeps_the_pending_wedge_honest() {
+        let server = LoopbackPowderServer::start(3);
+        server.state.lock().unwrap().work_log_http_conflict = true;
+        let profile = "loopback-work-log-conflict-persist-failure";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-powder-conflict-persist-failure-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join("captains.json");
+        let registry = powder_lifecycle_registry_with_profile(Some(path.clone()), profile);
+        let persist_count = Arc::new(AtomicUsize::new(0));
+        let hook_count = persist_count.clone();
+        let blocked_dir = dir.clone();
+        registry.set_persist_hook(Box::new(move || {
+            if hook_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = std::fs::remove_file(blocked_dir.join("captains.json"));
+                let _ = std::fs::remove_file(blocked_dir.join("captains.json.bak"));
+                std::fs::remove_dir(&blocked_dir).unwrap();
+                std::fs::write(&blocked_dir, b"block terminal rejection persistence").unwrap();
+            }
+        }));
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:conflict-persist-failure",
+                    "message": "conflict must stay pending if recording fails"
+                }),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(
+            error.contains("durable terminal convergence failed"),
+            "{error}"
+        );
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .is_some_and(|intent| intent.terminal_rejection.is_none()));
+        let release = release_crew_powder_binding(&ctx, "crew-powder").unwrap();
+        assert_eq!(release["released"], false);
+        assert_eq!(release["outcome"], "recovery_pending");
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        std::fs::remove_file(&dir).unwrap();
+    }
+
+    #[test]
+    fn powder_work_log_pending_status_retains_intent_without_reposting() {
+        let operation_id = "work-log:pending-status";
+        let message = "operation remains pending";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(3);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_pending_outcome("work_log_append", &body));
+        }
+        let _profile = PowderProfileEnv::install("loopback-work-log-pending", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-pending");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-pending")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-pending",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.retryable);
+        let error = response.error.unwrap();
+        assert!(error.contains("Powder mutation state 'pending'"), "{error}");
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_unknown_status_reissues_identical_request_once() {
+        let operation_id = "work-log:unknown-reissue";
+        let message = "reissue exact retained operation";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(6);
+        server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
+        let _profile = PowderProfileEnv::install("loopback-work-log-unknown", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-unknown");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-unknown")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-unknown",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "committed");
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert_eq!(state.work_log_posts, vec![body]);
+    }
+
+    #[test]
+    fn powder_work_log_expired_intent_refuses_unknown_reissue() {
+        let operation_id = "work-log:expired-intent";
+        let message = "must not reissue outside retention";
+        let server = LoopbackPowderServer::start(3);
+        server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
+        let _profile = PowderProfileEnv::install("loopback-work-log-expired", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-expired");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-expired")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(
+            &registry,
+            &ctx,
+            operation_id,
+            message,
+            Some(now_ms().saturating_sub(POWDER_OPERATION_RETENTION_MS)),
+        );
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-expired",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(!response.retryable);
+        assert!(error.contains("Powder mutation state 'expired'"), "{error}");
+        assert!(error.contains("refusing to reissue"), "{error}");
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_transport_recovery_states_are_structured_and_retryable() {
+        for (message, expected_state) in [
+            ("Powder transport timed out", "timeout"),
+            ("Powder connection reset by peer", "pending"),
+            ("Powder response ended at EOF", "pending"),
+        ] {
+            let response = ControlResponse::err(powder_recovery_unavailable(
+                "Powder work-log append",
+                &powder::PowderError {
+                    kind: powder::PowderErrorKind::Unreachable,
+                    message: message.into(),
+                },
+            ));
+            assert!(response.retryable, "{message}");
+            assert!(
+                response
+                    .error
+                    .unwrap()
+                    .contains(&format!("Powder mutation state '{expected_state}'")),
+                "{message}"
+            );
+        }
+        let malformed = ControlResponse::err(powder_recovery_unavailable(
+            "Powder work-log append",
+            &powder::PowderError {
+                kind: powder::PowderErrorKind::InvalidResponse,
+                message: "truncated JSON response".into(),
+            },
+        ));
+        assert!(!malformed.retryable);
+        assert!(malformed
+            .error
+            .unwrap()
+            .contains("Powder mutation state 'malformed'"));
+    }
+
+    #[test]
+    fn powder_mutation_intent_finish_rejects_scoped_authority_aba() {
+        let registry = powder_lifecycle_registry(None);
+        let ctx = test_ctx("powder-mutation-authority").with_captains_registry(registry.clone());
+        let initial_scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        let intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &initial_scope,
+            "work-log:authority-aba",
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": "authority ABA",
+            }),
+        );
+        registry
+            .begin_crew_powder_mutation(&initial_scope, intent.clone())
+            .unwrap();
+        let post_intent_scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        registry
+            .update_crew_claim_expiry("crew-powder", 200)
+            .unwrap();
+        registry
+            .update_crew_claim_expiry("crew-powder", 100)
+            .unwrap();
+        assert!(registry
+            .finish_crew_powder_mutation(
+                &post_intent_scope,
+                &intent.operation_id,
+                &intent.payload_digest,
+            )
+            .unwrap_err()
+            .contains("authority generation changed"));
+        let fresh_scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        registry
+            .finish_crew_powder_mutation(&fresh_scope, &intent.operation_id, &intent.payload_digest)
+            .unwrap();
+    }
+
+    #[test]
+    fn powder_mutation_verification_accepts_normalized_scrubbed_evidence() {
+        let server = LoopbackPowderServer::start(5);
+        server.state.lock().unwrap().normalized_work_log_body = Some("progress [REDACTED]".into());
+        let _profile = PowderProfileEnv::install("loopback-normalized-work-log", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-normalized-work-log");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-normalized-work-log")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-normalized-work-log",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "message": "progress POWDER_API_KEY=secret",
+                    "operationId": "work-log:normalized",
+                }),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(
+            response.result.unwrap()["messageBytes"],
+            "progress POWDER_API_KEY=secret".len()
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        drop(_profile);
+
+        let server = LoopbackPowderServer::start(5);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.normalized_completion_proof = Some("proof [REDACTED]".into());
+            state.normalized_completion_url = Some("https://example.test/[REDACTED]".into());
+        }
+        let _profile = PowderProfileEnv::install("loopback-normalized-completion", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-normalized-completion");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-normalized-completion")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let completion_ctx = ctx.clone();
+        let completion = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &completion_ctx,
+                req_session(
+                    "loopback-normalized-completion",
+                    &captain,
+                    "complete_crew_powder",
+                    json!({
+                        "crewSessionId": "crew-powder",
+                        "operationId": "completion:normalized",
+                        "proof": "proof POWDER_API_KEY=secret",
+                        "criterionProofs": [{
+                            "criterion": 0,
+                            "criterionId": loopback_criterion_id(),
+                            "url": "https://example.test/?token=secret"
+                        }]
+                    }),
+                ),
+            )
+        });
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        server.release_post.send(()).unwrap();
+        let response = completion.join().unwrap();
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["outcome"], "completed");
+        assert_eq!(result["receipt"]["proof"], "proof [REDACTED]");
+        assert_eq!(
+            result["receipt"]["criterionProofs"][0]["url"],
+            "https://example.test/[REDACTED]"
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.proof.as_deref(), Some("proof [REDACTED]"));
+        assert_eq!(
+            state.proof_url.as_deref(),
+            Some("https://example.test/[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn powder_atomic_mutations_reject_expired_reclaimed_and_mismatched_runs() {
+        for (failure_code, expected_error) in [
+            ("claim_expired", "claim expired"),
+            ("conflict", "stale, released, or reclaimed"),
+        ] {
+            let server = LoopbackPowderServer::start(3);
+            server.state.lock().unwrap().mutation_failure_code = Some(failure_code.into());
+            let profile = format!("loopback-work-log-rejection-{failure_code}");
+            let _profile = PowderProfileEnv::install(&profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(None, &profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(&profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry);
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({
+                        "message": "must stay on the exact run",
+                        "operationId": format!("work-log:{failure_code}"),
+                    }),
+                ),
+            );
+            let error = response.error.unwrap();
+            assert!(error.contains(expected_error), "{error}");
+            assert!(!error.contains("sensitive upstream details"));
+            let state = server.finish().unwrap();
+            assert_eq!(state.work_log_posts.len(), 1);
+        }
+
+        let server = LoopbackPowderServer::start(4);
+        server.state.lock().unwrap().response_run_id = Some("run-reclaimed".into());
+        let _profile = PowderProfileEnv::install("loopback-work-log-mismatch", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-mismatch");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-mismatch")
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-mismatch",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "message": "mismatch must fail closed",
+                    "operationId": "work-log:mismatch",
+                }),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(error.contains("not yet recorded"), "{error}");
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 1);
+        drop(_profile);
+
+        let server = LoopbackPowderServer::start(8);
+        server.state.lock().unwrap().mutation_failure_code = Some("conflict".into());
+        let _profile = PowderProfileEnv::install("loopback-completion-reclaimed", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-completion-reclaimed");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-completion-reclaimed")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let args = json!({
+            "crewSessionId": "crew-powder",
+            "operationId": "completion:reclaimed",
+            "proof": "commit rejected",
+            "criterionProofs": [{
+                "criterion": 0,
+                "criterionId": loopback_criterion_id(),
+                "url": "https://example.test/rejected"
+            }]
+        });
+        let expected_operation_id = "completion:reclaimed";
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-completion-reclaimed",
+                &captain,
+                "complete_crew_powder",
+                args,
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(error.contains("stale, released, or reclaimed"), "{error}");
+        assert!(!error.contains("sensitive upstream details"));
+        assert!(error.contains("corrected proof with a new operation identity"));
+        assert!(!error.contains("retry only with the same proof"));
+        let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        assert!(matches!(scope.work.state, PowderWorkState::Active));
+        assert_eq!(
+            scope
+                .work
+                .mutation_intent
+                .as_ref()
+                .unwrap()
+                .terminal_rejection
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderMutationTerminalState::Conflict
+        );
+        server.state.lock().unwrap().mutation_failure_code = None;
+        let corrected = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-completion-reclaimed",
+                &captain,
+                "complete_crew_powder",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "completion:corrected",
+                    "proof": "corrected commit proof",
+                    "criterionProofs": [{
+                        "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
+                        "url": "https://example.test/corrected"
+                    }]
+                }),
+            ),
+        );
+        assert!(corrected.ok, "{:?}", corrected.error);
+        assert_eq!(corrected.result.unwrap()["mutationState"], "committed");
+        let state = server.finish().unwrap();
+        assert_eq!(state.completion_posts.len(), 2);
+        assert_eq!(
+            state.completion_posts[0]["operation_id"],
+            expected_operation_id
+        );
+        assert_eq!(
+            state.completion_posts[1]["operation_id"],
+            "completion:corrected"
+        );
+        assert_eq!(state.completion_posts[1]["proof"], "corrected commit proof");
+    }
+
+    #[test]
+    fn powder_pending_completion_recovers_exact_operation_without_reposting() {
+        let server = LoopbackPowderServer::start(3);
+        let _profile = PowderProfileEnv::install("loopback-completion-recovery", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-completion-recovery");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-completion-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let args = json!({
+            "crewSessionId": "crew-powder",
+            "operationId": "completion:recovery",
+            "proof": "commit recovered",
+            "criterionProofs": [{
+                "criterion": 0,
+                "criterionId": loopback_criterion_id(),
+                "url": "https://example.test/recovered"
+            }]
+        });
+        let proof = parse_completion_proof(&args).unwrap();
+        let digest = proof.digest();
+        let operation_id = "completion:recovery".to_string();
+        registry
+            .begin_crew_powder_completion("crew-powder", &digest)
+            .unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.completed = true;
+            state.proof = Some("commit recovered".into());
+            state.proof_url = Some("https://example.test/recovered".into());
+            state.recovery_succeeds = true;
+            state.recovery_operation_id = Some(operation_id);
+        }
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-completion-recovery",
+                &captain,
+                "complete_crew_powder",
+                args,
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["outcome"], "recovered");
+        assert!(matches!(
+            &resolve_crew_powder_scope(&ctx, "crew-powder")
+                .unwrap()
+                .work
+                .state,
+            PowderWorkState::Completed { request_digest, .. }
+                if request_digest == &digest
+        ));
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert_eq!(state.completion_posts.len(), 0);
+    }
+
+    #[test]
     fn powder_completion_serializes_same_crew_through_post_and_verification() {
         use std::sync::mpsc;
 
@@ -22895,13 +33221,17 @@ mod tests {
             .with_captains_registry(registry.clone());
         let args = json!({
             "crewSessionId": "crew-powder",
+            "operationId": "completion:serialized",
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/proof"
             }]
         });
-        let expected_digest = parse_completion_proof(&args).unwrap().digest();
+        let parsed_proof = parse_completion_proof(&args).unwrap();
+        let expected_digest = parsed_proof.digest();
+        let expected_operation_id = "completion:serialized";
         let (wait_tx, wait_rx) = mpsc::sync_channel(2);
         registry.set_powder_operation_wait_hook(Some(wait_tx));
         let (result_tx, result_rx) = mpsc::sync_channel(2);
@@ -22927,6 +33257,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         assert_eq!(posted["proof"], "commit abc123");
+        assert_eq!(posted["operation_id"], expected_operation_id);
         assert!(matches!(
             &registry.snapshot().captains[0].crew[0]
                 .powder_work
@@ -23000,6 +33331,7 @@ mod tests {
                 .iter()
                 .map(|proof| json!({
                     "criterion": proof["criterion"],
+                    "criterionId": loopback_criterion_id(),
                     "url": proof["url"]
                 }))
                 .collect::<Vec<_>>()
@@ -23029,9 +33361,11 @@ mod tests {
             .with_captains_registry(registry.clone());
         let args = json!({
             "crewSessionId": "crew-powder",
+            "operationId": "completion:complete-renew",
             "proof": "commit complete-renew",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/complete-renew"
             }]
         });
@@ -23110,9 +33444,11 @@ mod tests {
             .with_captains_registry(registry.clone());
         let args = json!({
             "crewSessionId": "crew-powder",
+            "operationId": "completion:cleanup-race",
             "proof": "commit cleanup-race",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/cleanup-race"
             }]
         });
@@ -23268,15 +33604,161 @@ mod tests {
     }
 
     #[test]
+    fn powder_cleanup_preserves_every_unresolved_mutation_intent() {
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!("cleanup-intent-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile, server.addr);
+
+        for (kind, operation_id) in [
+            (
+                PowderMutationKind::WorkLogAppend,
+                "work-log:cleanup-pending",
+            ),
+            (
+                PowderMutationKind::CriterionReview,
+                "criterion:cleanup-pending",
+            ),
+            (PowderMutationKind::Completion, "completion:cleanup-pending"),
+        ] {
+            let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let registry =
+                powder_lifecycle_registry_with_profile_and_crew(None, &profile, &crew_id);
+            let ctx = test_ctx("cleanup-intent").with_captains_registry(registry.clone());
+            let scope = resolve_crew_powder_scope(&ctx, &crew_id).unwrap();
+            let (requested_by, payload) = match kind {
+                PowderMutationKind::WorkLogAppend => (
+                    crew_id.as_str(),
+                    json!({
+                        "agent": "powder-agent",
+                        "harness": "codex",
+                        "message": "unresolved work log",
+                    }),
+                ),
+                PowderMutationKind::CriterionReview => (
+                    "captain-powder",
+                    json!({
+                        "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
+                        "criterionText": "Criterion 0",
+                        "decision": "approved",
+                        "proof": "unresolved review",
+                        "expectedReviewerIdentity": "actor-captain-powder",
+                    }),
+                ),
+                PowderMutationKind::Completion => (
+                    "captain-powder",
+                    json!({
+                        "proof": "unresolved completion",
+                        "criterionProofs": [{
+                            "criterion": 0,
+                            "url": "https://example.test/unresolved",
+                        }],
+                    }),
+                ),
+            };
+            let intent = powder_mutation_intent(kind, &scope, operation_id, requested_by, &payload);
+            registry
+                .begin_crew_powder_mutation(&scope, intent.clone())
+                .unwrap();
+
+            let (release, retained, changed) =
+                finalize_crew_powder_cleanup(&ctx, &crew_id, false).unwrap();
+
+            assert_eq!(release.as_ref().unwrap()["released"], false);
+            assert_eq!(release.as_ref().unwrap()["outcome"], "recovery_pending");
+            assert!(release.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("mutation intent"));
+            assert!(retained);
+            assert!(changed);
+            let crew = registry.snapshot().captains[0].crew[0].clone();
+            assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+            assert_eq!(
+                crew.powder_work.as_ref().unwrap().mutation_intent.as_ref(),
+                Some(&intent)
+            );
+        }
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_cleanup_preserves_legacy_intent_without_remote_access() {
+        let path = captains_tmp("powder-cleanup-legacy-intent");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!("cleanup-legacy-intent-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile, server.addr);
+        let registry = powder_lifecycle_registry_with_profile(Some(path.clone()), &profile);
+        let seed_ctx = test_ctx("cleanup-legacy-intent").with_captains_registry(registry.clone());
+        seed_work_log_intent(
+            &registry,
+            &seed_ctx,
+            "work-log:legacy-cleanup",
+            "legacy cleanup evidence",
+            None,
+        );
+        drop(seed_ctx);
+        drop(registry);
+        downgrade_persisted_mutation_intent_to_v1(&path);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("cleanup-legacy-intent").with_captains_registry(restarted.clone());
+        let (release, retained, changed) =
+            finalize_crew_powder_cleanup(&ctx, "crew-powder", false).unwrap();
+
+        assert_eq!(release.as_ref().unwrap()["released"], false);
+        assert_eq!(release.as_ref().unwrap()["outcome"], "recovery_pending");
+        assert!(release.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("legacy Powder mutation intent"));
+        assert!(retained);
+        assert!(changed);
+        let snapshot = restarted.snapshot();
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+        let retained_intent = crew
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(retained_intent.schema_version, 1);
+        assert!(retained_intent.powder_request_digest.is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.capability_requests, 0);
+        assert_eq!(state.recovery_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn powder_close_vs_complete_terminal_entry_point_waits_before_cleanup() {
         use std::sync::mpsc;
 
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "powder_close_vs_complete_terminal_entry_point_waits_before_cleanup: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let server = LoopbackPowderServer::start(5);
         let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
         let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
+        create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
         assert!(matches!(
             tmux::session_liveness(&tmux_target(&crew_session_id)),
-            tmux::SessionLiveness::Gone
+            tmux::SessionLiveness::Alive
         ));
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile_and_crew(
@@ -23295,9 +33777,11 @@ mod tests {
             .with_captains_registry(registry.clone());
         let args = json!({
             "crewSessionId": crew_session_id,
+            "operationId": "completion:close-race",
             "proof": "commit close-race",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/close-race"
             }]
         });
@@ -23336,6 +33820,7 @@ mod tests {
                     &close_ctx,
                     &json!({"sessionId": close_session_id}),
                     false,
+                    None,
                 ))
                 .unwrap();
         });
@@ -23344,6 +33829,10 @@ mod tests {
             wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             crew_session_id
         );
+        assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Alive
+        ));
         assert!(matches!(
             &resolve_crew_powder_scope(&ctx, &crew_session_id)
                 .unwrap()
@@ -23360,9 +33849,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
-        assert_eq!(closed["outcome"], "already_gone");
+        assert_eq!(closed["outcome"], "killed");
         assert_eq!(closed["powderRelease"]["outcome"], "already_completed");
         assert_eq!(closed["crewBindingRetained"], false);
+        assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        ));
         completion.join().unwrap();
         close.join().unwrap();
         registry.set_powder_operation_wait_hook(None);
@@ -23382,6 +33875,2566 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.completion_posts.len(), 1);
         assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_close_rejects_captain_replacement_before_tmux_teardown() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_close_rejects_captain_replacement_before_tmux_teardown: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-authority-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let old_captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let close_ctx = ctx.clone();
+        let close_crew = crew.session_id.clone();
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
+        let close = std::thread::spawn(move || {
+            close_tx
+                .send(dispatch_authenticated(
+                    &close_ctx,
+                    req_session(
+                        &profile_name,
+                        &old_captain,
+                        "close_terminal",
+                        json!({"sessionId": close_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        drop(completion_guard);
+
+        let response = close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .contains("lifecycle authority changed"));
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew.session_id)),
+            tmux::SessionLiveness::Alive
+        );
+        close.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn close_foreign_removed_crew_is_generic_before_project_scope_resolution() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("foreign-removed-close-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("captain-owner", Some("owner-ship"), vec![])
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-owner", "crew-removed")
+            .unwrap());
+        registry
+            .bind_crew_context(
+                "captain-owner",
+                "crew-removed",
+                "removed foreign task",
+                "codex",
+                None,
+                None,
+                PowderWorkBinding {
+                    card_id: "foreign-card".into(),
+                    run_id: "foreign-run".into(),
+                    agent: Some("foreign-agent".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        assert!(registry.remove_session("crew-removed").unwrap());
+        registry
+            .claim_test("captain-attacker", Some("attacker-ship"), vec![])
+            .unwrap();
+        let attacker = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "attacker-ship",
+            "captain-attacker",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &profile_name,
+                &attacker,
+                "close_terminal",
+                json!({"sessionId": "crew-removed"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+            )
+        );
+        let after = registry.snapshot();
+        assert_eq!(after.seq, before.seq);
+        assert!(after.captains[0].crew[0].powder_work.is_some());
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn removed_crew_powder_cleanup_allows_only_owning_captain_and_unblocks_dispatch() {
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().released = true;
+        let _profile = PowderProfileEnv::install("loopback-removed-cleanup", server.addr);
+        let crew_session_id = format!("powder-removed-{}", uuid::Uuid::new_v4().simple());
+        assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        ));
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "loopback-removed-cleanup",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .claim_test("captain-foreign", Some("foreign-ship"), vec![])
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let foreign = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "foreign-ship",
+            "captain-foreign",
+        );
+        let ctx = test_ctx("loopback-removed-cleanup")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        assert_eq!(before.captains[0].crew.len(), 1);
+        assert!(matches!(
+            before.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "loopback-removed-cleanup",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .unwrap_err()
+        .contains("durable active or recoverable Crew binding"));
+        let denied = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-removed-cleanup",
+                &foreign,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(
+            !denied.ok,
+            "a foreign Captain must not clean historical work"
+        );
+        assert_eq!(
+            denied.error.as_deref(),
+            Some(
+                "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+            )
+        );
+        let after_denial = registry.snapshot();
+        assert_eq!(after_denial.seq, before.seq);
+        assert!(after_denial.captains[0].crew[0].powder_work.is_some());
+
+        let closed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-removed-cleanup",
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(closed.ok, "{:?}", closed.error);
+        let closed = closed.result.unwrap();
+        assert_eq!(closed["outcome"], "already_gone");
+        assert_eq!(closed["powderRelease"]["outcome"], "already_released");
+        assert_eq!(closed["crewBindingRetained"], false);
+        let snapshot = registry.snapshot();
+        let crew = snapshot.captains[0]
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .unwrap();
+        assert_eq!(snapshot.captains[0].crew.len(), 1);
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_none());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "loopback-removed-cleanup",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+        reconcile_powder_leases(&ctx);
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn removed_crew_cleanup_rejects_authenticated_captain_released_before_scope_capture() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(0);
+        server.state.lock().unwrap().released = true;
+        let profile_name = "historical-authority-vacancy";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(profile_name);
+        let crew_session_id = format!("powder-vacant-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .record_crew("captain-powder", "crew-still-active")
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let original_crew = registry.snapshot().captains[0].crew[0].clone();
+        let (authenticated_tx, authenticated_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_historical_scope_capture_hook(authenticated_tx, resume_rx);
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        assert_eq!(
+            authenticated_rx
+                .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                .unwrap(),
+            crew_session_id
+        );
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "release_captain",
+                json!({"shipSlug": "powder-ship"}),
+            ),
+        );
+        assert!(released.ok, "{:?}", released.error);
+        let after_release = registry.snapshot();
+        assert_eq!(after_release.captains[0].state, ClaimState::Vacant);
+        resume_tx.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+
+        assert!(
+            !cleanup.ok,
+            "a request authenticated as the released Captain must fail closed"
+        );
+        assert!(cleanup
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authenticated Captain")));
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(memory.seq, after_release.seq);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert_eq!(memory.captains[0].crew[0], original_crew);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_release.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_cleanup_rejects_same_terminal_release_reclaim_aba_before_scope_capture() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(0);
+        server.state.lock().unwrap().released = true;
+        let profile_name = "historical-authority-pre-scope-aba";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(profile_name);
+        let crew_session_id = format!("powder-pre-scope-aba-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_captain = before.captains[0].clone();
+        let (authenticated_tx, authenticated_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_historical_scope_capture_hook(authenticated_tx, resume_rx);
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        authenticated_rx
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .unwrap();
+        assert!(
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    profile_name,
+                    &owner,
+                    "release_captain",
+                    json!({"shipSlug": "powder-ship"}),
+                ),
+            )
+            .ok
+        );
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let after_aba = registry.snapshot();
+        assert_eq!(after_aba.seq, before.seq + 2);
+        assert_eq!(after_aba.captains[0], original_captain);
+        resume_tx.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+
+        assert!(!stale.ok);
+        assert!(stale
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authenticated Captain")));
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(memory.seq, after_aba.seq);
+        assert_eq!(memory.captains[0], original_captain);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_aba.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_cleanup_binds_scope_to_authenticated_captain_and_allows_fresh_replacement() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().released = true;
+        let profile_name = "historical-authority-replacement";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let crew_session_id = format!("powder-replaced-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .record_crew("captain-powder", "crew-still-active")
+            .unwrap();
+        let old_owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities.clone())
+            .with_captains_registry(registry.clone());
+        let original_crew = registry.snapshot().captains[0].crew[0].clone();
+        let (authenticated_tx, authenticated_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_historical_scope_capture_hook(authenticated_tx, resume_rx);
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        authenticated_rx
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .unwrap();
+        assert!(
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    profile_name,
+                    &old_owner,
+                    "release_captain",
+                    json!({"shipSlug": "powder-ship"}),
+                ),
+            )
+            .ok
+        );
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                Some("replacement-conversation"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let replacement = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-replacement",
+        );
+        resume_tx.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+
+        assert!(
+            !stale.ok,
+            "the prior Captain must not borrow replacement authority"
+        );
+        assert!(stale
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authenticated Captain")));
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.card_evidence_gets, 0);
+            assert_eq!(state.run_evidence_gets, 0);
+        }
+        assert_eq!(registry.snapshot().captains[0].crew[0], original_crew);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+
+        let fresh = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &replacement,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(fresh.ok, "{:?}", fresh.error);
+        let crew = &registry.snapshot().captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_none());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+    }
+
+    #[test]
+    fn removed_crew_cleanup_revalidates_authenticated_owner_after_evidence_read() {
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let profile_name = "historical-authority-evidence-race";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let crew_session_id = format!("powder-evidence-owner-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .record_crew("captain-powder", "crew-still-active")
+            .unwrap();
+        let old_owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities.clone())
+            .with_captains_registry(registry.clone());
+        let original_crew = registry.snapshot().captains[0].crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .unwrap();
+        assert!(
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    profile_name,
+                    &old_owner,
+                    "release_captain",
+                    json!({"shipSlug": "powder-ship"}),
+                ),
+            )
+            .ok
+        );
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                Some("replacement-conversation"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let replacement = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-replacement",
+        );
+        server.state.lock().unwrap().pause_run_evidence = false;
+        server.resume_run_evidence.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+
+        assert!(!stale.ok);
+        assert!(stale.retryable);
+        assert_eq!(registry.snapshot().captains[0].crew[0], original_crew);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.card_evidence_gets, 1);
+            assert_eq!(state.run_evidence_gets, 1);
+            assert_eq!(state.release_posts, 0);
+            assert_eq!(state.completion_posts.len(), 0);
+            assert_eq!(state.work_log_posts.len(), 0);
+        }
+
+        let fresh = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &replacement,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(fresh.ok, "{:?}", fresh.error);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 2);
+        assert_eq!(state.run_evidence_gets, 2);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+    }
+
+    #[test]
+    fn release_captain_retains_removed_active_powder_work_and_allows_reclaim() {
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().released = true;
+        let profile_name = "release-removed-active";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(profile_name);
+        let crew_session_id = format!("powder-release-active-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                Some("old-provider-session"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities.clone())
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_crew = before.captains[0].crew[0].clone();
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "release_captain",
+                json!({"shipSlug": "powder-ship"}),
+            ),
+        );
+        assert!(released.ok, "{:?}", released.error);
+        let retained = registry.snapshot();
+        assert_eq!(retained.captains.len(), 1);
+        let captain = &retained.captains[0];
+        assert_eq!(captain.state, ClaimState::Vacant);
+        assert!(captain.terminal_id.is_none());
+        assert_eq!(captain.provider.as_deref(), Some("codex"));
+        assert!(captain.provider_session_id.is_none());
+        assert!(captain.conversation_id.is_none());
+        assert!(captain.claude_uuid.is_none());
+        assert_eq!(captain.crew, vec![original_crew.clone()]);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        {
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.card_evidence_gets, 0);
+            assert_eq!(state.run_evidence_gets, 0);
+            assert_eq!(state.release_posts, 0);
+            assert_eq!(state.completion_posts.len(), 0);
+            assert_eq!(state.work_log_posts.len(), 0);
+        }
+
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                Some("replacement-provider-session"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let replacement = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-replacement",
+        );
+        let reconciled = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &replacement,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(reconciled.ok, "{:?}", reconciled.error);
+        let recovered = registry.snapshot();
+        assert_eq!(recovered.captains[0].state, ClaimState::Active);
+        assert_eq!(
+            recovered.captains[0].terminal_id.as_deref(),
+            Some("captain-replacement")
+        );
+        assert!(recovered.captains[0].crew[0].powder_work.is_none());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn release_captain_retains_removed_completion_recovery_without_remote_io() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = "release-removed-recovery";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let crew_session_id = format!("powder-release-pending-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        let digest = "a".repeat(64);
+        registry
+            .begin_crew_powder_completion(&crew_session_id, &digest)
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities.clone())
+            .with_captains_registry(registry.clone());
+        let original_crew = registry.snapshot().captains[0].crew[0].clone();
+
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "release_captain",
+                json!({"shipSlug": "powder-ship"}),
+            ),
+        );
+        assert!(released.ok, "{:?}", released.error);
+        let retained = registry.snapshot();
+        assert_eq!(retained.captains.len(), 1);
+        assert_eq!(retained.captains[0].state, ClaimState::Vacant);
+        assert_eq!(retained.captains[0].crew, vec![original_crew.clone()]);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                Some("replacement-provider-session"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let replacement = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-replacement",
+        );
+        let recovery = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &replacement,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(!recovery.ok);
+        assert!(recovery.retryable);
+        assert!(recovery
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("same-proof recovery")));
+        assert_eq!(registry.snapshot().captains[0].crew[0], original_crew);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+    }
+
+    #[test]
+    fn release_captain_hard_removes_removed_only_ship_without_powder_obligation() {
+        let profile_name = "release-removed-no-obligation";
+        let crew_session_id = format!("powder-release-none-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .clear_released_crew_powder_binding(
+                &crew_session_id,
+                "thub-powder-control-lifecycle",
+                "run-authoritative",
+            )
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "release_captain",
+                json!({"shipSlug": "powder-ship"}),
+            ),
+        );
+
+        assert!(released.ok, "{:?}", released.error);
+        assert!(registry.snapshot().captains.is_empty());
+    }
+
+    #[test]
+    fn release_captain_retention_rolls_back_on_persistence_failure() {
+        let profile_name = "release-removed-persistence-failure";
+        let path = captains_tmp(profile_name);
+        let backup = path.with_extension("json.bak");
+        let crew_session_id = format!("powder-release-fault-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let _ = std::fs::remove_file(&backup);
+        std::fs::create_dir(&backup).unwrap();
+
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "release_captain",
+                json!({"shipSlug": "powder-ship"}),
+            ),
+        );
+
+        assert!(!released.ok);
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert!(matches!(
+            memory.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::Active
+        ));
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoricalProjectScopeRace {
+        ProfileRebind,
+        RepositoryRebind,
+        PowderUnbind,
+    }
+
+    impl HistoricalProjectScopeRace {
+        fn label(self) -> &'static str {
+            match self {
+                Self::ProfileRebind => "profile-rebind",
+                Self::RepositoryRebind => "repository-rebind",
+                Self::PowderUnbind => "powder-unbind",
+            }
+        }
+
+        fn rebound_profile(self, original_profile: &'static str) -> &'static str {
+            match self {
+                Self::ProfileRebind => "loopback-historical-profile-rebound",
+                Self::RepositoryRebind | Self::PowderUnbind => original_profile,
+            }
+        }
+
+        fn rebound_repository(self) -> &'static str {
+            match self {
+                Self::RepositoryRebind => "t-hub-rebound",
+                Self::ProfileRebind | Self::PowderUnbind => "t-hub",
+            }
+        }
+    }
+
+    fn assert_removed_crew_historical_cleanup_scope_race(race: HistoricalProjectScopeRace) {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let original_profile = "loopback-historical-profile-race";
+        let rebound_profile = race.rebound_profile(original_profile);
+        let rebound_repository = race.rebound_repository();
+        let _profile = PowderProfileEnv::install(original_profile, server.addr);
+        let path = captains_tmp(race.label());
+        let crew_session_id = format!("powder-{}-{}", race.label(), uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            original_profile,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(original_profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_crew = before.captains[0].crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    original_profile,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during the remote run evidence read");
+
+        match race {
+            HistoricalProjectScopeRace::ProfileRebind
+            | HistoricalProjectScopeRace::RepositoryRebind => {
+                let rebound = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        original_profile,
+                        &owner,
+                        "bind_project_powder",
+                        json!({
+                            "projectId": "project-powder-lifecycle",
+                            "connectionProfile": rebound_profile,
+                            "repository": rebound_repository,
+                            "testCanonicalPowderRepository": rebound_repository,
+                            "testInitialEventCursor": 0,
+                        }),
+                    ),
+                );
+                assert!(
+                    rebound.ok,
+                    "authorized {} failed: {:?}",
+                    race.label(),
+                    rebound.error
+                );
+            }
+            HistoricalProjectScopeRace::PowderUnbind => {
+                let mut project = registry.projects().into_iter().next().unwrap();
+                project.powder = None;
+                registry.upsert_project(project).unwrap();
+            }
+        }
+        let after_rebind = registry.snapshot();
+        assert_eq!(after_rebind.seq, before.seq + 1);
+        server.resume_run_evidence.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory.captains[0].crew[0];
+        let duplicate_dispatch =
+            (!matches!(race, HistoricalProjectScopeRace::PowderUnbind)).then(|| {
+                ensure_dispatch_powder_binding_available(
+                    &ctx,
+                    rebound_profile,
+                    rebound_repository,
+                    "thub-powder-control-lifecycle",
+                    Some("run-authoritative"),
+                )
+            });
+        assert!(
+            !(cleanup.ok
+                && crew.powder_work.is_none()
+                && duplicate_dispatch.as_ref().is_some_and(|result| result.is_ok())),
+            "stale old-scope evidence cleared the historical binding and unblocked duplicate dispatch after {}",
+            race.label()
+        );
+        assert!(!cleanup.ok, "stale-scope cleanup must fail closed");
+        assert!(
+            cleanup.retryable,
+            "stale-scope cleanup must invite a fresh retry"
+        );
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed") || error.contains("removed")),
+            "stale-scope cleanup must report an honest scope error: {:?}",
+            cleanup.error
+        );
+        assert_eq!(memory.seq, after_rebind.seq);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap(),
+            "stale-scope refusal must leave memory and disk consistent"
+        );
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert_eq!(crew, &original_crew);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        if let Some(duplicate_dispatch) = duplicate_dispatch {
+            assert!(duplicate_dispatch.is_err());
+        } else {
+            assert!(resolve_crew_powder_scope(&ctx, &crew_session_id).is_err());
+        }
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_rebind.seq);
+        if matches!(race, HistoricalProjectScopeRace::PowderUnbind) {
+            let mut project = registry.projects().into_iter().next().unwrap();
+            project.powder = Some(PowderProjectBinding {
+                connection_profile: original_profile.into(),
+                repository: "t-hub".into(),
+                event_cursor: 0,
+            });
+            registry.upsert_project(project).unwrap();
+            assert!(ensure_dispatch_powder_binding_available(
+                &ctx,
+                original_profile,
+                "t-hub",
+                "thub-powder-control-lifecycle",
+                Some("run-authoritative"),
+            )
+            .is_err());
+            let restored_memory = registry.snapshot();
+            let restored_disk = CaptainsRegistry::load(path.clone()).snapshot();
+            assert_eq!(
+                serde_json::to_value(restored_memory).unwrap(),
+                serde_json::to_value(restored_disk).unwrap()
+            );
+        }
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(backup);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_profile_rebind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(
+            HistoricalProjectScopeRace::ProfileRebind,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_repository_rebind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(
+            HistoricalProjectScopeRace::RepositoryRebind,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_powder_unbind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(HistoricalProjectScopeRace::PowderUnbind);
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoricalScopeAba {
+        CaptainReleaseReclaim,
+        CrewWork,
+        Profile,
+        ProjectRemovalRecreation,
+        Repository,
+    }
+
+    impl HistoricalScopeAba {
+        fn label(self) -> &'static str {
+            match self {
+                Self::CaptainReleaseReclaim => "captain-release-reclaim-aba",
+                Self::CrewWork => "crew-work-aba",
+                Self::Profile => "profile-aba",
+                Self::ProjectRemovalRecreation => "project-removal-recreation-aba",
+                Self::Repository => "repository-aba",
+            }
+        }
+    }
+
+    fn assert_removed_crew_historical_cleanup_rejects_aba(race: HistoricalScopeAba) {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let profile_name = "loopback-historical-aba";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(race.label());
+        let crew_session_id = format!("powder-{}-{}", race.label(), uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_captain = before.captains[0].clone();
+        let original_project = before.projects[0].clone();
+        let original_crew = original_captain.crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during remote run evidence");
+
+        match race {
+            HistoricalScopeAba::CaptainReleaseReclaim => {
+                let released = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        profile_name,
+                        &owner,
+                        "release_captain",
+                        json!({"shipSlug": "powder-ship"}),
+                    ),
+                );
+                assert!(released.ok, "Captain release failed: {:?}", released.error);
+                registry
+                    .claim_provider(
+                        "captain-powder",
+                        Some("powder-ship"),
+                        FleetRole::Captain,
+                        Some("codex"),
+                        None,
+                        vec![],
+                        &all_alive,
+                        &crew_all_alive,
+                    )
+                    .unwrap();
+                assert_eq!(registry.snapshot().captains[0], original_captain);
+            }
+            HistoricalScopeAba::CrewWork => {
+                registry
+                    .update_crew_claim_expiry(&crew_session_id, 101)
+                    .unwrap();
+                registry
+                    .update_crew_claim_expiry(&crew_session_id, 100)
+                    .unwrap();
+                assert_eq!(registry.snapshot().captains[0].crew[0], original_crew);
+            }
+            HistoricalScopeAba::Profile | HistoricalScopeAba::Repository => {
+                let mut changed = original_project.clone();
+                let binding = changed.powder.as_mut().unwrap();
+                match race {
+                    HistoricalScopeAba::Profile => {
+                        binding.connection_profile = "loopback-historical-aba-rebound".into();
+                    }
+                    HistoricalScopeAba::Repository => {
+                        binding.repository = "t-hub-rebound".into();
+                    }
+                    _ => unreachable!(),
+                }
+                registry.upsert_project(changed).unwrap();
+                registry.upsert_project(original_project.clone()).unwrap();
+                let restored = registry.projects().into_iter().next().unwrap();
+                assert_eq!(restored.project_id, original_project.project_id);
+                assert_eq!(restored.repo_root, original_project.repo_root);
+                assert_eq!(restored.powder, original_project.powder);
+            }
+            HistoricalScopeAba::ProjectRemovalRecreation => {
+                registry
+                    .test_remove_captain_and_project(
+                        &original_captain.ship_slug,
+                        &original_project.project_id,
+                    )
+                    .unwrap();
+                registry
+                    .test_restore_captain_and_project(
+                        original_captain.clone(),
+                        original_project.clone(),
+                    )
+                    .unwrap();
+                let restored = registry.snapshot();
+                assert_eq!(restored.captains[0], original_captain);
+                assert_eq!(restored.projects[0], original_project);
+            }
+        }
+        let after_aba = registry.snapshot();
+        assert_eq!(after_aba.seq, before.seq + 2);
+
+        server.resume_run_evidence.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory.captains[0].crew[0];
+        let duplicate_dispatch = ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        );
+
+        assert!(
+            !stale.ok,
+            "ABA bug: stale {} cleanup passed final value-only CAS, binding_present={}, duplicate_dispatch={duplicate_dispatch:?}",
+            race.label(),
+            crew.powder_work.is_some(),
+        );
+        assert!(stale.retryable, "stale ABA refusal must be retryable");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("authority generation changed")),
+            "stale ABA refusal must identify the scoped authority change: {:?}",
+            stale.error
+        );
+        assert_eq!(memory.seq, after_aba.seq);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap(),
+            "stale ABA refusal must leave memory and disk equal"
+        );
+        assert_eq!(crew, &original_crew);
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(duplicate_dispatch.is_err());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_aba.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_same_terminal_captain_release_reclaim_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(
+            HistoricalScopeAba::CaptainReleaseReclaim,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_crew_work_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::CrewWork);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_profile_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Profile);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_repository_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Repository);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_project_removal_recreation_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(
+            HistoricalScopeAba::ProjectRemovalRecreation,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_allows_unrelated_scope_mutations() {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let profile_name = "loopback-historical-unrelated-scope";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp("historical-unrelated-scope");
+        let crew_session_id = format!("powder-unrelated-scope-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_crew = before.captains[0].crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during remote run evidence");
+
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-unrelated".into(),
+                name: "Unrelated Project".into(),
+                repo_root: "/tmp/powder-unrelated-project".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "unrelated-profile".into(),
+                    repository: "unrelated-repository".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .claim_provider(
+                "captain-unrelated",
+                Some("unrelated-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        registry
+            .bind_ship_context(
+                "unrelated-ship",
+                "project-unrelated",
+                "Unrelated assignment",
+                "codex",
+            )
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-unrelated", "crew-unrelated")
+            .unwrap());
+        let after_unrelated = registry.snapshot();
+        assert_eq!(after_unrelated.seq, before.seq + 4);
+
+        server.resume_run_evidence.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+        assert!(
+            cleanup.ok,
+            "unrelated scope changes rejected: {:?}",
+            cleanup.error
+        );
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "powder-ship")
+            .unwrap()
+            .crew[0];
+        let mut expected_crew = original_crew;
+        expected_crew.powder_work = None;
+        assert_eq!(crew, &expected_crew);
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert_eq!(memory.seq, after_unrelated.seq + 1);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, memory.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_authority_generation_advances_only_for_successful_relevant_mutations() {
+        let path = captains_tmp("scoped-authority-generation");
+        let backup = path.with_extension("json.bak");
+        let crew_session_id = format!("powder-generation-{}", uuid::Uuid::new_v4().simple());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "generation-profile",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let generation = || {
+            registry.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            )
+        };
+        let initial_snapshot = registry.snapshot();
+        let initial_generation = generation();
+
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 100)
+            .unwrap();
+        registry
+            .upsert_project(registry.projects().into_iter().next().unwrap())
+            .unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        assert_eq!(registry.snapshot().seq, initial_snapshot.seq);
+        assert_eq!(generation(), initial_generation);
+
+        registry
+            .advance_project_powder_cursor(
+                "project-powder-lifecycle",
+                "generation-profile",
+                "t-hub",
+                1,
+            )
+            .unwrap();
+        let after_irrelevant = registry.snapshot();
+        assert_eq!(after_irrelevant.seq, initial_snapshot.seq + 1);
+        assert_eq!(generation(), initial_generation);
+
+        let _ = std::fs::remove_file(&backup);
+        std::fs::create_dir(&backup).unwrap();
+        let failed = registry.update_crew_claim_expiry(&crew_session_id, 101);
+        assert!(failed.is_err());
+        assert_eq!(registry.snapshot().seq, after_irrelevant.seq);
+        assert_eq!(generation(), initial_generation);
+        let disk_after_failure = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(disk_after_failure).unwrap()
+        );
+
+        std::fs::remove_dir_all(&backup).unwrap();
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 101)
+            .unwrap();
+        let crew_changed = generation();
+        assert_eq!(crew_changed.captain, initial_generation.captain);
+        assert_ne!(crew_changed.crew, initial_generation.crew);
+        assert_eq!(crew_changed.project, initial_generation.project);
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 100)
+            .unwrap();
+        let crew_restored = generation();
+        assert_ne!(crew_restored.crew, crew_changed.crew);
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .claim_expires_at,
+            Some(100)
+        );
+
+        let original_project = registry.projects().into_iter().next().unwrap();
+        let mut rebound_project = original_project.clone();
+        rebound_project.powder.as_mut().unwrap().connection_profile =
+            "generation-profile-rebound".into();
+        registry.upsert_project(rebound_project).unwrap();
+        let project_changed = generation();
+        assert_ne!(project_changed.project, crew_restored.project);
+        registry.upsert_project(original_project).unwrap();
+        let project_restored = generation();
+        assert_ne!(project_restored.project, project_changed.project);
+
+        let original_captain = registry.snapshot().captains[0].clone();
+        registry.release("powder-ship").unwrap();
+        let captain_released = generation();
+        assert_ne!(captain_released.captain, project_restored.captain);
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let captain_reclaimed = generation();
+        assert_ne!(captain_reclaimed.captain, captain_released.captain);
+        assert_eq!(registry.snapshot().captains[0], original_captain);
+
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_authority_generation_rejects_preload_scope_and_accepts_fresh_scope() {
+        let path = captains_tmp("scoped-authority-reload");
+        let crew_session_id = format!("powder-generation-reload-{}", uuid::Uuid::new_v4().simple());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "generation-reload-profile",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let authority = AuthenticatedCaptainAuthority {
+            terminal_id: "captain-powder".into(),
+            ship_slug: "powder-ship".into(),
+            project_id: "project-powder-lifecycle".into(),
+            generation: registry.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            ),
+        };
+        let old_ctx =
+            test_ctx("generation-reload-profile").with_captains_registry(registry.clone());
+        let old_scope =
+            resolve_historical_removed_crew_powder_scope(&old_ctx, &crew_session_id, &authority)
+                .unwrap();
+        let old_generation = old_scope.authority_generation.unwrap();
+
+        let loaded = Arc::new(CaptainsRegistry::load(path.clone()));
+        let before = loaded.snapshot();
+        let stale = loaded
+            .compare_and_clear_released_removed_crew_powder_binding(&old_scope)
+            .unwrap_err();
+        assert!(stale.contains("authority generation changed"));
+        assert_eq!(loaded.snapshot().seq, before.seq);
+        assert!(loaded.snapshot().captains[0].crew[0].powder_work.is_some());
+
+        let loaded_ctx =
+            test_ctx("generation-reload-profile").with_captains_registry(loaded.clone());
+        let loaded_authority = AuthenticatedCaptainAuthority {
+            terminal_id: "captain-powder".into(),
+            ship_slug: "powder-ship".into(),
+            project_id: "project-powder-lifecycle".into(),
+            generation: loaded.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            ),
+        };
+        let fresh_scope = resolve_historical_removed_crew_powder_scope(
+            &loaded_ctx,
+            &crew_session_id,
+            &loaded_authority,
+        )
+        .unwrap();
+        let fresh_generation = fresh_scope.authority_generation.unwrap();
+        assert_ne!(
+            fresh_generation.registry_epoch,
+            old_generation.registry_epoch
+        );
+        assert!(loaded
+            .compare_and_clear_released_removed_crew_powder_binding(&fresh_scope)
+            .unwrap());
+        let cleared = loaded.snapshot();
+        assert!(cleared.captains[0].crew[0].powder_work.is_none());
+        assert_eq!(loaded.ship_of(&crew_session_id), None);
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(cleared).unwrap(),
+            serde_json::to_value(disk).unwrap()
+        );
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_active_exact_run_without_release() {
+        let server = LoopbackPowderServer::start(2);
+        let _profile = PowderProfileEnv::install("loopback-release-mismatch", server.addr);
+        let crew_session_id = format!("powder-active-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "loopback-release-mismatch",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-release-mismatch")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let closed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-release-mismatch",
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(
+            !closed.ok,
+            "historical cleanup must reject an active exact run"
+        );
+        let snapshot = registry.snapshot();
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(matches!(
+            crew.powder_work.as_ref().unwrap().state,
+            PowderWorkState::Active
+        ));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "loopback-release-mismatch",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        reconcile_powder_leases(&ctx);
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn ordinary_powder_cleanup_refuses_historical_removed_binding_before_remote_io() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = "loopback-ordinary-refuses-historical";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let crew_session_id = format!("powder-ordinary-{}", uuid::Uuid::new_v4().simple());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        let ctx = test_ctx(profile_name).with_captains_registry(registry.clone());
+
+        let error = finalize_crew_powder_cleanup(&ctx, &crew_session_id, false).unwrap_err();
+
+        assert!(error.contains("historically Removed"));
+        let crew = &registry.snapshot().captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn removed_crew_cleanup_retains_binding_on_mismatched_released_evidence() {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.evidence_run_id = Some("run-foreign".into());
+        }
+        let _profile = PowderProfileEnv::install("loopback-evidence-mismatch", server.addr);
+        let crew_session_id = format!("powder-mismatch-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "loopback-evidence-mismatch",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-evidence-mismatch")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let closed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-evidence-mismatch",
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+        assert!(!closed.ok, "mismatched released evidence must fail closed");
+        assert!(!closed.retryable);
+        let snapshot = registry.snapshot();
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "loopback-evidence-mismatch",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        reconcile_powder_leases(&ctx);
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_current_claim_without_mutation() {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.force_claim = true;
+        }
+        let profile_name = "loopback-historical-current-claim";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let crew_session_id = format!("powder-current-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot().seq;
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("current claim"));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.seq, before);
+        assert!(matches!(
+            snapshot.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(snapshot.captains[0].crew[0].powder_work.is_some());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        reconcile_powder_leases(&ctx);
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_mismatched_missing_and_ambiguous_evidence() {
+        for case in [
+            "card-mismatch",
+            "run-mismatch",
+            "repository-mismatch",
+            "missing-run",
+            "ambiguous-run",
+            "inconsistent-status",
+        ] {
+            let expected_requests = if case == "card-mismatch" { 1 } else { 2 };
+            let server = LoopbackPowderServer::start(expected_requests);
+            {
+                let mut state = server.state.lock().unwrap();
+                state.released = true;
+                match case {
+                    "card-mismatch" => state.evidence_card_id = Some("card-foreign".into()),
+                    "run-mismatch" => state.evidence_run_id = Some("run-foreign".into()),
+                    "repository-mismatch" => {
+                        state.evidence_repository = Some("repository-foreign".into())
+                    }
+                    "missing-run" => state.omit_card_runs = true,
+                    "ambiguous-run" => state.duplicate_card_run = true,
+                    "inconsistent-status" => {
+                        state.run_card_status_override = Some("running".into())
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let profile_name = format!("loopback-historical-{case}");
+            let profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let crew_session_id = format!("powder-{case}-{}", uuid::Uuid::new_v4().simple());
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile_and_crew(
+                None,
+                &profile_name,
+                &crew_session_id,
+            );
+            registry.remove_session(&crew_session_id).unwrap();
+            let owner = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "captain-powder",
+            );
+            let ctx = test_ctx(&profile_name)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let before = registry.snapshot().seq;
+
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile_name,
+                    &owner,
+                    "close_terminal",
+                    json!({"sessionId": crew_session_id}),
+                ),
+            );
+
+            assert!(!response.ok, "{case} must fail closed");
+            let snapshot = registry.snapshot();
+            assert_eq!(snapshot.seq, before, "{case} mutated the registry");
+            assert!(matches!(
+                snapshot.captains[0].crew[0].state,
+                CrewState::Removed { .. }
+            ));
+            assert!(snapshot.captains[0].crew[0].powder_work.is_some());
+            assert_eq!(registry.ship_of(&crew_session_id), None);
+            assert!(ensure_dispatch_powder_binding_available(
+                &ctx,
+                &profile_name,
+                "t-hub",
+                "thub-powder-control-lifecycle",
+                Some("run-authoritative"),
+            )
+            .is_err());
+            reconcile_powder_leases(&ctx);
+            let state = server.finish().unwrap();
+            assert_eq!(state.release_posts, 0, "{case} issued a release POST");
+            drop(profile);
+        }
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_preserves_completion_pending_state() {
+        let profile_name = "historical-completion-pending";
+        let crew_session_id = format!("powder-pending-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        let digest = "a".repeat(64);
+        registry
+            .begin_crew_powder_completion(&crew_session_id, &digest)
+            .unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot().seq;
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(response.retryable);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.seq, before);
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(matches!(
+            crew.powder_work.as_ref().unwrap().state,
+            PowderWorkState::CompletionPending { ref request_digest, .. }
+                if request_digest == &digest
+        ));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_preserves_binding_on_malformed_or_unreachable_evidence() {
+        let malformed_server = LoopbackPowderServer::start(1);
+        {
+            let mut state = malformed_server.state.lock().unwrap();
+            state.released = true;
+            state.malformed_card_evidence = true;
+        }
+        let malformed_profile = "historical-malformed-evidence";
+        let profile = PowderProfileEnv::install(malformed_profile, malformed_server.addr);
+        let malformed_crew = format!("powder-malformed-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            malformed_profile,
+            &malformed_crew,
+        );
+        registry.remove_session(&malformed_crew).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(malformed_profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                malformed_profile,
+                &owner,
+                "close_terminal",
+                json!({"sessionId": malformed_crew}),
+            ),
+        );
+        assert!(!response.ok);
+        assert!(!response.retryable);
+        assert!(matches!(
+            registry.snapshot().captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .is_some());
+        assert_eq!(registry.ship_of(&malformed_crew), None);
+        let state = malformed_server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        drop(profile);
+
+        let stopped_server = LoopbackPowderServer::start(0);
+        let stopped_addr = stopped_server.addr;
+        stopped_server.finish().unwrap();
+        let unreachable_profile = "historical-unreachable-evidence";
+        let _profile = PowderProfileEnv::install(unreachable_profile, stopped_addr);
+        let unreachable_crew = format!("powder-unreachable-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            unreachable_profile,
+            &unreachable_crew,
+        );
+        registry.remove_session(&unreachable_crew).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(unreachable_profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                unreachable_profile,
+                &owner,
+                "close_terminal",
+                json!({"sessionId": unreachable_crew}),
+            ),
+        );
+        assert!(!response.ok);
+        assert!(response.retryable);
+        let crew = &registry.snapshot().captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(registry.ship_of(&unreachable_crew), None);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_refuses_ambiguous_local_ownership() {
+        let profile_name = "historical-ambiguous-owner";
+        let crew_session_id = format!("powder-owner-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile_name, &crew_session_id);
+        registry.remove_session(&crew_session_id).unwrap();
+        registry
+            .claim_test("captain-duplicate", Some("duplicate-ship"), vec![])
+            .unwrap();
+        {
+            let mut inner = registry.lock();
+            let duplicate = inner.captains[0].crew[0].clone();
+            inner.captains[1].crew.push(duplicate);
+        }
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile_name,
+                &owner,
+                "close_terminal",
+                json!({"sessionId": crew_session_id}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle")
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot
+                .captains
+                .iter()
+                .flat_map(|captain| captain.crew.iter())
+                .filter(|crew| crew.terminal_id == crew_session_id)
+                .count(),
+            2
+        );
+        assert!(snapshot
+            .captains
+            .iter()
+            .flat_map(|captain| captain.crew.iter())
+            .filter(|crew| crew.terminal_id == crew_session_id)
+            .all(|crew| matches!(crew.state, CrewState::Removed { .. })
+                && crew.powder_work.is_some()));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_persists_clear_and_rolls_back_on_fault() {
+        for persistence_fails in [false, true] {
+            let server = LoopbackPowderServer::start(2);
+            server.state.lock().unwrap().released = true;
+            let profile_name = format!(
+                "historical-persist-{}",
+                if persistence_fails {
+                    "failure"
+                } else {
+                    "success"
+                }
+            );
+            let profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let path = captains_tmp(&profile_name);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&path);
+            let backup = path.with_extension("json.bak");
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::remove_dir_all(&backup);
+            let crew_session_id = format!("powder-persist-{}", uuid::Uuid::new_v4().simple());
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile_and_crew(
+                Some(path.clone()),
+                &profile_name,
+                &crew_session_id,
+            );
+            registry.remove_session(&crew_session_id).unwrap();
+            if persistence_fails {
+                let _ = std::fs::remove_file(&backup);
+                std::fs::create_dir(&backup).unwrap();
+            }
+            let owner = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "captain-powder",
+            );
+            let ctx = test_ctx(&profile_name)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let before = registry.snapshot();
+
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile_name,
+                    &owner,
+                    "close_terminal",
+                    json!({"sessionId": crew_session_id}),
+                ),
+            );
+
+            assert_eq!(response.ok, !persistence_fails);
+            if persistence_fails {
+                assert!(response.retryable);
+            }
+            let memory = registry.snapshot();
+            let disk = CaptainsRegistry::load(path.clone()).snapshot();
+            assert_eq!(
+                serde_json::to_value(&memory).unwrap(),
+                serde_json::to_value(&disk).unwrap(),
+                "memory and disk diverged when persistence_fails={persistence_fails}"
+            );
+            let crew = &memory.captains[0].crew[0];
+            assert!(matches!(crew.state, CrewState::Removed { .. }));
+            assert_eq!(crew.powder_work.is_some(), persistence_fails);
+            assert_eq!(registry.ship_of(&crew_session_id), None);
+            if persistence_fails {
+                assert_eq!(memory.seq, before.seq);
+                assert!(ensure_dispatch_powder_binding_available(
+                    &ctx,
+                    &profile_name,
+                    "t-hub",
+                    "thub-powder-control-lifecycle",
+                    Some("run-authoritative"),
+                )
+                .is_err());
+            } else {
+                assert!(ensure_dispatch_powder_binding_available(
+                    &ctx,
+                    &profile_name,
+                    "t-hub",
+                    "thub-powder-control-lifecycle",
+                    Some("run-authoritative"),
+                )
+                .is_ok());
+            }
+            reconcile_powder_leases(&ctx);
+            let state = server.finish().unwrap();
+            assert_eq!(state.release_posts, 0);
+            drop(profile);
+            let _ = std::fs::remove_dir_all(&backup);
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn powder_renewal_rejects_substituted_authoritative_agent_without_post() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_rejects_substituted_authoritative_agent_without_post: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(1);
+        {
+            server.state.lock().unwrap().evidence_claim_agent = Some("substituted-agent".into());
+        }
+        let profile_name = format!("renew-agent-substitution-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+        let error = renew_crew_powder_binding(&ctx, &crew.session_id, Some(3600)).unwrap_err();
+
+        assert!(error.contains("claim agent is not Crew Powder agent"));
+        assert_eq!(
+            resolve_crew_powder_scope(&ctx, &crew.session_id)
+                .unwrap()
+                .work
+                .claim_expires_at,
+            Some(100)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_renewal_receipt_requires_exact_card_run_and_agent_before_persistence() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_receipt_requires_exact_card_run_and_agent_before_persistence: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        for substituted_field in ["card", "run", "agent"] {
+            let server = LoopbackPowderServer::start(2);
+            {
+                let mut state = server.state.lock().unwrap();
+                match substituted_field {
+                    "card" => state.renewal_receipt_card_id = Some("another-card".into()),
+                    "run" => state.renewal_receipt_run_id = Some("another-run".into()),
+                    "agent" => state.renewal_receipt_agent = Some("another-agent".into()),
+                    _ => unreachable!(),
+                }
+            }
+            let profile_name = format!(
+                "renew-receipt-{substituted_field}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let crew = FakeHarnessSession::start(Harness::Codex);
+            let registry = powder_lifecycle_registry_with_profile_and_crew(
+                None,
+                &profile_name,
+                &crew.session_id,
+            );
+            let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+            let error = renew_crew_powder_binding(&ctx, &crew.session_id, Some(3600)).unwrap_err();
+
+            assert!(
+                error.contains(
+                    "renewal response did not match the exact requested card, run, and agent"
+                ),
+                "{substituted_field}: {error}"
+            );
+            assert_eq!(
+                resolve_crew_powder_scope(&ctx, &crew.session_id)
+                    .unwrap()
+                    .work
+                    .claim_expires_at,
+                Some(100),
+                "{substituted_field} receipt must not update durable expiry"
+            );
+            let state = server.finish().unwrap();
+            assert_eq!(state.renew_posts, 1);
+        }
+    }
+
+    #[test]
+    fn powder_renewal_expiry_cas_rejects_authority_aba_after_remote_receipt() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_expiry_cas_rejects_authority_aba_after_remote_receipt: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start_with_blocked_renewal(2);
+        let profile_name = format!("renew-cas-aba-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+        let renewal_ctx = ctx.clone();
+        let renewal_crew = crew.session_id.clone();
+        let (renewal_tx, renewal_rx) = mpsc::sync_channel(1);
+        let renewal = std::thread::spawn(move || {
+            renewal_tx
+                .send(renew_crew_powder_binding(
+                    &renewal_ctx,
+                    &renewal_crew,
+                    Some(3600),
+                ))
+                .unwrap();
+        });
+
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        server.release_post.send(()).unwrap();
+
+        let error = renewal_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("authority generation changed"), "{error}");
+        assert_eq!(
+            resolve_crew_powder_scope(&ctx, &crew.session_id)
+                .unwrap()
+                .work
+                .claim_expires_at,
+            Some(100)
+        );
+        renewal.join().unwrap();
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 1);
     }
 
     #[test]
@@ -23411,17 +36464,353 @@ mod tests {
     }
 
     #[test]
+    fn powder_queued_heartbeat_rejects_captain_replacement_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_rejects_captain_replacement_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-authority-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_rejects_removed_former_captain_scope_before_resolution() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_rejects_removed_former_captain_scope_before_resolution: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-scope-removal-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        assert!(registry.rollback_crew(&crew.session_id).unwrap());
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_rejects_captain_authority_aba_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_rejects_captain_authority_aba_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-authority-aba-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .contains("authority generation changed"));
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_revalidates_harness_liveness_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_revalidates_harness_liveness_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-liveness-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        reap_test_tmux_session(&tmux_target(&crew.session_id)).unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("is gone"));
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_reconciler_revalidates_harness_liveness_after_renewal_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_reconciler_revalidates_harness_liveness_after_renewal_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("reconciler-liveness-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let reconcile_ctx = ctx.clone();
+        let reconcile = std::thread::spawn(move || reconcile_powder_leases(&reconcile_ctx));
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        reap_test_tmux_session(&tmux_target(&crew.session_id)).unwrap();
+        drop(completion_guard);
+
+        reconcile.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
     fn powder_completion_persistence_failure_rolls_back_and_releases_guard() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_completion_persistence_failure_rolls_back_and_releases_guard: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
         let server = LoopbackPowderServer::start(4);
         let _profile = PowderProfileEnv::install("loopback-persist-failure", server.addr);
+        let harness = FakeHarnessSession::start(Harness::Codex);
         let dir = std::env::temp_dir().join(format!(
             "t-hub-powder-persist-failure-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
         let path = dir.join("captains.json");
-        let registry =
-            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-persist-failure");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "loopback-persist-failure",
+            &harness.session_id,
+        );
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let captain = mint_session(
             &identities,
@@ -23444,10 +36833,12 @@ mod tests {
                 &captain,
                 "complete_crew_powder",
                 json!({
-                    "crewSessionId": "crew-powder",
+                    "crewSessionId": harness.session_id.clone(),
+                    "operationId": "completion:persist-failure",
                     "proof": "commit persist-failure",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
                         "url": "https://example.test/persist-failure"
                     }]
                 }),
@@ -23458,13 +36849,15 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("could not be created")));
-        let work = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap().work;
+        let work = resolve_crew_powder_scope(&ctx, &harness.session_id)
+            .unwrap()
+            .work;
         assert!(matches!(work.state, PowderWorkState::Active));
         assert_eq!(work.claim_expires_at, Some(100));
 
         std::fs::remove_file(&dir).unwrap();
         std::fs::create_dir(&dir).unwrap();
-        let (renewed, crew) = renew_crew_powder_binding(&ctx, "crew-powder", None).unwrap();
+        let (renewed, crew) = renew_crew_powder_binding(&ctx, &harness.session_id, None).unwrap();
         assert_eq!(renewed.expires_at, 200);
         assert_eq!(
             crew.powder_work.as_ref().unwrap().claim_expires_at,
@@ -23484,7 +36877,7 @@ mod tests {
 
     #[test]
     fn powder_completion_pending_recovers_after_registry_restart() {
-        let server = LoopbackPowderServer::start(2);
+        let server = LoopbackPowderServer::start(3);
         let _profile = PowderProfileEnv::install("loopback-restart-recovery", server.addr);
         let dir = std::env::temp_dir().join(format!(
             "t-hub-powder-restart-recovery-{}-{}",
@@ -23494,13 +36887,16 @@ mod tests {
         let path = dir.join("captains.json");
         let args = json!({
             "crewSessionId": "crew-powder",
+            "operationId": "completion:restart-recovery",
             "proof": "commit restart-recovery",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/restart-recovery"
             }]
         });
-        let digest = parse_completion_proof(&args).unwrap().digest();
+        let proof = parse_completion_proof(&args).unwrap();
+        let digest = proof.digest();
         let initial =
             powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-restart-recovery");
         initial
@@ -23512,6 +36908,7 @@ mod tests {
             state.completed = true;
             state.proof = Some("commit restart-recovery".into());
             state.proof_url = Some("https://example.test/restart-recovery".into());
+            state.recovery_succeeds = true;
         }
 
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -23533,6 +36930,8 @@ mod tests {
         let ctx = test_ctx("loopback-restart-recovery")
             .with_identity_store(identities)
             .with_captains_registry(restarted);
+        let operation_id = "completion:restart-recovery".to_string();
+        server.state.lock().unwrap().recovery_operation_id = Some(operation_id);
         let recovered = dispatch_authenticated(
             &ctx,
             req_session(
@@ -23557,6 +36956,7 @@ mod tests {
         ));
         let state = server.finish().unwrap();
         assert!(state.completion_posts.is_empty());
+        assert_eq!(state.recovery_gets, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -23578,7 +36978,7 @@ mod tests {
             BoundPowderReality::Active
         );
         assert_eq!(
-            powder_cleanup_disposition(&PowderWorkState::Active, BoundPowderReality::Active),
+            powder_cleanup_disposition(&PowderWorkState::Active, BoundPowderCleanupReality::Active,),
             PowderCleanupDisposition::Release
         );
         let pending = PowderWorkState::CompletionPending {
@@ -23586,11 +36986,15 @@ mod tests {
             since: 1,
         };
         assert_eq!(
-            powder_cleanup_disposition(&pending, BoundPowderReality::Active),
+            powder_cleanup_disposition(&pending, BoundPowderCleanupReality::Active),
             PowderCleanupDisposition::AwaitCompletionRecovery
         );
         assert_eq!(
-            powder_cleanup_disposition(&pending, BoundPowderReality::Completed),
+            powder_cleanup_disposition(&pending, BoundPowderCleanupReality::Completed),
+            PowderCleanupDisposition::AwaitCompletionRecovery
+        );
+        assert_eq!(
+            powder_cleanup_disposition(&pending, BoundPowderCleanupReality::Released),
             PowderCleanupDisposition::AwaitCompletionRecovery
         );
         let failed_release = json!({"released": false});
@@ -23628,7 +37032,7 @@ mod tests {
                     request_digest: "a".repeat(64),
                     completed_at: 1,
                 },
-                BoundPowderReality::Active,
+                BoundPowderCleanupReality::Active,
             ),
             PowderCleanupDisposition::AlreadyCompleted
         );
@@ -23662,6 +37066,7 @@ mod tests {
             "proof": "proof A",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": "powder.criterion.v1:sha256:test:0",
                 "url": "https://example.test/proof-a"
             }]
         }))
@@ -23678,11 +37083,28 @@ mod tests {
             "complete",
             Some("proof B"),
         );
-        assert!(
-            completion_matches_evidence(&scope, &completed_b_card, &completed_b_run, &proof_a,)
-                .unwrap_err()
-                .contains("does not match")
-        );
+        let receipt_a = powder::CompletionReceipt {
+            schema_version: "powder.run_bound_completion.v1".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            operation_id: "completion:evidence-a".into(),
+            status: "done".into(),
+            proof: Some("proof A".into()),
+            criterion_proofs: vec![powder::CriterionProof {
+                criterion: 0,
+                url: "https://example.test/proof-a".into(),
+            }],
+            updated_at: 124,
+            audit_event_id: "audit-evidence-a".into(),
+        };
+        assert!(completion_receipt_matches_evidence(
+            &scope,
+            &completed_b_card,
+            &completed_b_run,
+            &receipt_a,
+        )
+        .unwrap_err()
+        .contains("does not match"));
         assert!(registry
             .observe_crew_powder_completion("crew-powder", &observed_completion_digest(&scope))
             .unwrap_err()
@@ -23712,8 +37134,16 @@ mod tests {
         completed_a_card.criteria[0]
             .proof_links
             .push(proof_link.clone());
-        completed_a_run.criteria[0].proof_links.push(proof_link);
-        completion_matches_evidence(&scope, &completed_a_card, &completed_a_run, &proof_a).unwrap();
+        completed_a_run.card_criteria[0]
+            .proof_links
+            .push(proof_link);
+        completion_receipt_matches_evidence(
+            &scope,
+            &completed_a_card,
+            &completed_a_run,
+            &receipt_a,
+        )
+        .unwrap();
         registry
             .finish_crew_powder_completion("crew-powder", &digest)
             .unwrap();
@@ -23724,20 +37154,71 @@ mod tests {
     }
 
     #[test]
+    fn powder_release_receipt_identity_mismatch_retains_local_binding() {
+        for (index, receipt_card, receipt_run, receipt_agent) in [
+            ("card", "thub-other", "run-authoritative", "powder-agent"),
+            (
+                "run",
+                "thub-powder-control-lifecycle",
+                "run-other",
+                "powder-agent",
+            ),
+            (
+                "agent",
+                "thub-powder-control-lifecycle",
+                "run-authoritative",
+                "another-agent",
+            ),
+        ] {
+            let server = LoopbackPowderServer::start_with_release_receipt(
+                3,
+                receipt_card,
+                receipt_run,
+                receipt_agent,
+            );
+            let profile_name = format!("loopback-release-receipt-{index}");
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let registry = powder_lifecycle_registry_with_profile(None, &profile_name);
+            let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+            let (release, retained, changed) =
+                finalize_crew_powder_cleanup(&ctx, "crew-powder", false).unwrap();
+
+            let release = release.unwrap();
+            assert_eq!(release["released"], false);
+            assert_eq!(release["cardId"], "thub-powder-control-lifecycle");
+            assert_eq!(release["runId"], "run-authoritative");
+            assert!(retained);
+            assert!(changed);
+            let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+            assert_eq!(scope.work.card_id, "thub-powder-control-lifecycle");
+            assert_eq!(scope.work.run_id, "run-authoritative");
+            assert!(matches!(scope.crew.state, CrewState::CleanupPending { .. }));
+
+            let state = server.finish().unwrap();
+            assert_eq!(state.release_posts, 1);
+            assert_eq!(
+                state.release_bodies,
+                vec![json!({"run_id": "run-authoritative"})]
+            );
+        }
+    }
+
+    #[test]
     fn powder_completion_proof_is_bounded_canonical_and_rejects_duplicates() {
         let first = parse_completion_proof(&json!({
             "proof": " commit abc123 ",
             "criterionProofs": [
-                {"criterion": 0, "url": "https://example.test/proof-0"},
-                {"criterion": 1, "url": "https://example.test/proof-1"}
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/proof-0"},
+                {"criterion": 1, "criterionId": "criterion-1", "url": "https://example.test/proof-1"}
             ]
         }))
         .unwrap();
         let same = parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [
-                {"criterion": 1, "url": "https://example.test/proof-1"},
-                {"criterion": 0, "url": "https://example.test/proof-0"}
+                {"criterion": 1, "criterionId": "criterion-1", "url": "https://example.test/proof-1"},
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/proof-0"}
             ]
         }))
         .unwrap();
@@ -23753,8 +37234,8 @@ mod tests {
         assert!(parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [
-                {"criterion": 0, "url": "https://example.test/first"},
-                {"criterion": 0, "url": "https://example.test/duplicate"}
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/first"},
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/duplicate"}
             ]
         }))
         .unwrap_err()
@@ -23762,32 +37243,44 @@ mod tests {
     }
 
     #[test]
-    fn powder_completion_requires_checked_criteria_and_valid_proof_indexes() {
+    fn powder_completion_requires_approved_run_criteria_and_valid_proof_indexes() {
         let proof = parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": "powder.criterion.v1:sha256:test:0",
                 "url": "https://example.test/proof"
             }]
         }))
         .unwrap();
-        let checked = vec![powder_criterion(0, true)];
-        validate_completion_criteria(&checked, &proof).unwrap();
+        let approved = vec![powder_run_criterion(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            0,
+            true,
+        )];
+        validate_completion_criteria(&approved, &proof).unwrap();
 
-        let unchecked = vec![powder_criterion(0, false)];
-        assert!(validate_completion_criteria(&unchecked, &proof)
+        let unapproved = vec![powder_run_criterion(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            0,
+            false,
+        )];
+        assert!(validate_completion_criteria(&unapproved, &proof)
             .unwrap_err()
-            .contains("not checked"));
+            .contains("not approved"));
 
         let missing_index = parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 1,
+                "criterionId": "powder.criterion.v1:sha256:test:1",
                 "url": "https://example.test/proof"
             }]
         }))
         .unwrap();
-        assert!(validate_completion_criteria(&checked, &missing_index)
+        assert!(validate_completion_criteria(&approved, &missing_index)
             .unwrap_err()
             .contains("missing acceptance criterion"));
     }
@@ -23797,14 +37290,6 @@ mod tests {
         let ctx =
             test_ctx("proof-evidence").with_captains_registry(powder_lifecycle_registry(None));
         let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
-        let proof = parse_completion_proof(&json!({
-            "proof": "commit abc123",
-            "criterionProofs": [{
-                "criterion": 0,
-                "url": "https://example.test/criterion-0"
-            }]
-        }))
-        .unwrap();
         let (mut card, mut run) = powder_lifecycle_evidence(
             "thub-powder-control-lifecycle",
             "run-authoritative",
@@ -23819,14 +37304,30 @@ mod tests {
             created_at: 124,
         };
         card.criteria[0].proof_links.push(link.clone());
-        run.criteria[0].proof_links.push(link);
-        completion_matches_evidence(&scope, &card, &run, &proof).unwrap();
+        run.card_criteria[0].proof_links.push(link);
+        let receipt = powder::CompletionReceipt {
+            schema_version: "powder.run_bound_completion.v1".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            operation_id: "completion:evidence".into(),
+            status: "done".into(),
+            proof: Some("commit abc123".into()),
+            criterion_proofs: vec![powder::CriterionProof {
+                criterion: 0,
+                url: "https://example.test/criterion-0".into(),
+            }],
+            updated_at: 124,
+            audit_event_id: "audit-evidence".into(),
+        };
+        completion_receipt_matches_evidence(&scope, &card, &run, &receipt).unwrap();
 
         run.run.proof = Some("different proof".into());
         card.runs[0].proof = Some("different proof".into());
-        assert!(completion_matches_evidence(&scope, &card, &run, &proof)
-            .unwrap_err()
-            .contains("does not match"));
+        assert!(
+            completion_receipt_matches_evidence(&scope, &card, &run, &receipt)
+                .unwrap_err()
+                .contains("does not match")
+        );
     }
 
     #[test]
@@ -23846,7 +37347,10 @@ mod tests {
         );
         card.work_log = (0..25)
             .map(|index| powder::WorkLogEntry {
+                schema_version: None,
+                entry_id: None,
                 card_id: card.card_id.clone(),
+                actor: None,
                 agent: "crew-powder".into(),
                 model: None,
                 reasoning: None,
@@ -23854,6 +37358,7 @@ mod tests {
                 run_id: Some("run-authoritative".into()),
                 body: format!("entry {index}"),
                 created_at: index,
+                updated_at: None,
             })
             .collect();
         card.work_log_total = card.work_log.len();
@@ -23885,7 +37390,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         card.criteria = criteria.clone();
-        run.criteria = criteria;
+        run.card_criteria = criteria;
+        let run_criteria = (0..9)
+            .map(|criterion| {
+                powder_run_criterion(
+                    "thub-powder-control-lifecycle",
+                    "run-authoritative",
+                    criterion,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        card.current_run_criteria = Some(run_criteria.clone());
+        run.criteria = run_criteria;
         run.activities = (0..25)
             .map(|index| powder::EvidenceActivity {
                 activity_type: "work".into(),
@@ -23917,7 +37434,7 @@ mod tests {
         assert_eq!(run.links.len(), 7);
         assert_eq!(run.criteria.len(), 7);
         assert!(run
-            .criteria
+            .card_criteria
             .iter()
             .all(|criterion| criterion.proof_links.len() == 7));
         assert_eq!(card.work_log_total, 25);
@@ -23970,7 +37487,7 @@ mod tests {
                 "read-control",
                 &crew,
                 "append_crew_powder_work_log",
-                json!({"message": "started"}),
+                json!({"message": "started", "operationId": "work-log:started"}),
             ),
         );
         assert!(!self_log.ok);
@@ -23985,7 +37502,7 @@ mod tests {
                 "read-control",
                 &foreign_crew,
                 "append_crew_powder_work_log",
-                json!({"message": "spoofed"}),
+                json!({"message": "spoofed", "operationId": "work-log:spoofed"}),
             ),
         );
         assert!(foreign_log.error.unwrap().contains("has no Powder binding"));
@@ -23996,7 +37513,11 @@ mod tests {
                 "read-control",
                 &foreign_crew,
                 "append_crew_powder_work_log",
-                json!({"crewSessionId": "crew-powder", "message": "spoofed"}),
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "message": "spoofed",
+                    "operationId": "work-log:caller-substitution",
+                }),
             ),
         );
         assert!(caller_substitution
@@ -24010,7 +37531,10 @@ mod tests {
                 "control",
                 &captain,
                 "append_crew_powder_work_log",
-                json!({"message": "captain spoof"}),
+                json!({
+                    "message": "captain spoof",
+                    "operationId": "work-log:captain-spoof",
+                }),
             ),
         );
         assert!(captain_log
@@ -24024,7 +37548,11 @@ mod tests {
                 "control",
                 &captain,
                 "complete_crew_powder",
-                json!({"crewSessionId": "crew-powder", "proof": "commit abc123"}),
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "completion:captain",
+                    "proof": "commit abc123",
+                }),
             ),
         );
         assert!(captain_completion
@@ -24038,7 +37566,11 @@ mod tests {
                 "control",
                 &foreign_captain,
                 "complete_crew_powder",
-                json!({"crewSessionId": "crew-powder", "proof": "commit bad"}),
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "completion:foreign",
+                    "proof": "commit bad",
+                }),
             ),
         );
         assert!(foreign_completion
@@ -24150,9 +37682,11 @@ mod tests {
                 "complete_crew_powder",
                 json!({
                     "crewSessionId": "crew-powder",
+                    "operationId": "completion:refused-audit",
                     "proof": "SECRET refused overall proof",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": "powder.criterion.v1:sha256:test:0",
                         "url": "https://secret.example.test/refused"
                     }]
                 }),
@@ -24168,9 +37702,11 @@ mod tests {
                 "complete_crew_powder",
                 json!({
                     "crewSessionId": "crew-powder",
+                    "operationId": "completion:failed-audit",
                     "proof": "SECRET failed overall proof",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": "powder.criterion.v1:sha256:test:0",
                         "url": "https://secret.example.test/failed"
                     }]
                 }),
@@ -24187,7 +37723,10 @@ mod tests {
                 "read-powder-audit",
                 &crew,
                 "append_crew_powder_work_log",
-                json!({"message": "SECRET failed work-log body"}),
+                json!({
+                    "message": "SECRET failed work-log body",
+                    "operationId": "work-log:failed-audit",
+                }),
             ),
         );
         assert!(failed_work_log

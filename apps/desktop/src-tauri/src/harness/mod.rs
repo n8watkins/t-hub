@@ -100,7 +100,7 @@ impl std::fmt::Display for Harness {
 #[serde(rename_all = "camelCase")]
 pub enum PermMode {
     /// Crew default: no approval prompts. Claude `--dangerously-skip-permissions`;
-    /// Codex `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
+    /// Codex `--dangerously-bypass-approvals-and-sandbox`.
     BypassPermissions,
     /// Approximate "edits allowed without prompt". Codex `--sandbox
     /// workspace-write` (documented gap: no exact analog, and network is off by
@@ -109,6 +109,12 @@ pub enum PermMode {
     /// Read-only / default posture.
     Default,
 }
+
+/// The General-authorized local execution posture for dispatched Crew in this
+/// Captain fleet. This grants full local worktree execution through the
+/// provider Harness, but does not expand Crew scope, T-Hub capability, Powder
+/// authority, or authority over destructive and outward-facing actions.
+pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 
 impl PermMode {
     pub fn as_str(self) -> &'static str {
@@ -130,8 +136,25 @@ impl std::fmt::Display for PermMode {
 /// terminal at one instant. The raw argv is used only for in-process provider
 /// verification and is never included in a response or error because the
 /// initial Harness prompt may contain sensitive task context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalGeneration {
+    session_id: u64,
+    session_created: u64,
+    window_id: u64,
+    pane_id: u64,
+    pane_pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_ticks: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProcessEvidence {
+    terminal: TerminalGeneration,
+    ancestry: Vec<ProcessIdentity>,
     pid: u32,
     start_ticks: u64,
     executable_device: u64,
@@ -142,13 +165,16 @@ pub struct HarnessProcessEvidence {
 impl HarnessProcessEvidence {
     #[cfg(test)]
     pub(crate) fn test(pid: u32, start_ticks: u64, argv: &[&str]) -> Self {
-        Self {
+        Self::test_with_context(
             pid,
             start_ticks,
-            executable_device: u64::from(pid),
-            executable_inode: start_ticks,
-            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
-        }
+            u64::from(pid),
+            start_ticks,
+            argv,
+            123_456,
+            pid,
+            &[(pid, start_ticks)],
+        )
     }
 
     #[cfg(test)]
@@ -158,10 +184,48 @@ impl HarnessProcessEvidence {
         executable_inode: u64,
         argv: &[&str],
     ) -> Self {
-        Self {
+        Self::test_with_context(
             pid,
             start_ticks,
-            executable_device: u64::from(pid),
+            u64::from(pid),
+            executable_inode,
+            argv,
+            123_456,
+            pid,
+            &[(pid, start_ticks)],
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn test_with_context(
+        pid: u32,
+        start_ticks: u64,
+        executable_device: u64,
+        executable_inode: u64,
+        argv: &[&str],
+        session_created: u64,
+        pane_pid: u32,
+        ancestry: &[(u32, u64)],
+    ) -> Self {
+        Self {
+            terminal: TerminalGeneration {
+                session_id: 17,
+                session_created,
+                window_id: 9,
+                pane_id: 42,
+                pane_pid,
+            },
+            ancestry: ancestry
+                .iter()
+                .map(|(pid, start_ticks)| ProcessIdentity {
+                    pid: *pid,
+                    start_ticks: *start_ticks,
+                })
+                .collect(),
+            pid,
+            start_ticks,
+            executable_device,
             executable_inode,
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
         }
@@ -173,6 +237,14 @@ impl HarnessProcessEvidence {
 
     fn executable_identity(&self) -> (u64, u64) {
         (self.executable_device, self.executable_inode)
+    }
+
+    fn matches_pane_generation(&self, pane: &crate::tmux::PaneGeneration) -> bool {
+        self.terminal.session_id == pane.session_id
+            && self.terminal.session_created == pane.session_created
+            && self.terminal.window_id == pane.window_id
+            && self.terminal.pane_id == pane.pane_id
+            && self.terminal.pane_pid == pane.pane_pid
     }
 }
 
@@ -187,6 +259,9 @@ pub enum LaunchAttestationError {
     WrongPermission,
     ConflictingPermission,
     MalformedPermission,
+    TerminalChanged,
+    ProcessChanged,
+    AncestryChanged,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -203,6 +278,11 @@ impl std::fmt::Display for LaunchAttestationError {
             }
             Self::MalformedPermission => {
                 "provider-native permission evidence contains a malformed option"
+            }
+            Self::TerminalChanged => "the terminal pane generation changed during launch",
+            Self::ProcessChanged => "the provider-native process changed during launch acceptance",
+            Self::AncestryChanged => {
+                "the provider-native process ancestry changed during launch acceptance"
             }
         };
         f.write_str(message)
@@ -275,12 +355,95 @@ pub fn attest_launch_permissions(
     after: &HarnessProcessEvidence,
     expected: PermMode,
 ) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
+    if before.terminal != after.terminal {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
     if before.identity() == after.identity()
         && before.executable_identity() == after.executable_identity()
     {
         return Err(LaunchAttestationError::StaleEvidence);
     }
     adapter.attest_permissions(after, expected)
+}
+
+/// Authorize a private dormant-pane to provider-pane respawn.
+///
+/// A respawn intentionally replaces `pane_pid`, unlike the normal shell-to-exec
+/// launch path.  This verifier therefore requires the exact pre/post tmux
+/// transition, preserves the session/window/pane tuple, rejects an unchanged
+/// process generation, and delegates provider-native posture validation only
+/// after that provenance check succeeds.
+pub fn attest_respawn_launch_permissions(
+    adapter: &dyn HarnessAdapter,
+    before: &HarnessProcessEvidence,
+    transition: &crate::tmux::RespawnPaneTransition,
+    after: &HarnessProcessEvidence,
+    expected: PermMode,
+) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
+    if !before.matches_pane_generation(&transition.before)
+        || !after.matches_pane_generation(&transition.after)
+        || transition.before.session_id != transition.after.session_id
+        || transition.before.session_created != transition.after.session_created
+        || transition.before.window_id != transition.after.window_id
+        || transition.before.pane_id != transition.after.pane_id
+    {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    if transition.before.pane_pid == transition.after.pane_pid
+        || before.identity() == after.identity()
+        || before.executable_identity() == after.executable_identity()
+    {
+        return Err(LaunchAttestationError::StaleEvidence);
+    }
+    adapter.attest_permissions(after, expected)
+}
+
+/// Confirm that two pre-launch observations refer to the exact same foreground
+/// process in the same pane generation.  This is stricter than accepting a
+/// readable shell once: startup may replace a just-observed login shell before
+/// the provider command can be sent.
+pub fn confirm_stable_launch_baseline(
+    first: &HarnessProcessEvidence,
+    second: &HarnessProcessEvidence,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    if first.terminal != second.terminal {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    if first.identity() != second.identity()
+        || first.executable_identity() != second.executable_identity()
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    if first.ancestry != second.ancestry {
+        return Err(LaunchAttestationError::AncestryChanged);
+    }
+    Ok(second.clone())
+}
+
+/// Re-verify provider posture and exact process provenance at a durable launch
+/// acceptance boundary. The final observation must belong to the same tmux
+/// pane generation, provider process lifetime, executable, and ancestry as the
+/// already-attested process.
+pub fn attest_final_launch_permissions(
+    adapter: &dyn HarnessAdapter,
+    accepted: &HarnessProcessEvidence,
+    final_observation: Result<HarnessProcessEvidence, LaunchAttestationError>,
+    expected: PermMode,
+) -> Result<(HarnessPermissionAttestation, HarnessProcessEvidence), LaunchAttestationError> {
+    let final_evidence = final_observation?;
+    if accepted.terminal != final_evidence.terminal {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    let attestation = adapter.attest_permissions(&final_evidence, expected)?;
+    if accepted.identity() != final_evidence.identity()
+        || accepted.executable_identity() != final_evidence.executable_identity()
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    if accepted.ancestry != final_evidence.ancestry {
+        return Err(LaunchAttestationError::AncestryChanged);
+    }
+    Ok((attestation, final_evidence))
 }
 
 /// Read one authoritative foreground process identity and argv from the tmux
@@ -293,14 +456,21 @@ pub fn observe_harness_process(
 ) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
     const SCRIPT: &str = r#"
 set -eu
-pane_pid=$(tmux -L "$1" list-panes -t "$2" -F '#{pane_pid}')
-set -- $pane_pid
-[ "$#" -eq 1 ]
-case "$1" in ''|*[!0-9]*) exit 21;; esac
-foreground_pid=$(ps -o tpgid= -p "$1" | tr -d ' ')
+tmux_socket=$1
+tmux_target=$2
+pane=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+set -- $pane
+[ "$#" -eq 5 ]
+session_id=$1
+session_created=$2
+window_id=$3
+pane_id=$4
+pane_pid=$5
+case "$session_created:$pane_pid" in *[!0-9:]*) exit 21;; esac
+foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
 case "$foreground_pid" in ''|*[!0-9]*|0) exit 22;; esac
-stat=$(cat "/proc/$foreground_pid/stat")
-rest=${stat##*) }
+process_stat=$(cat "/proc/$foreground_pid/stat")
+rest=${process_stat##*) }
 set -- $rest
 [ "$#" -ge 20 ]
 start_ticks=${20}
@@ -309,11 +479,49 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 case "$1:$2" in *[!0-9:]*) exit 24;; esac
 executable_device=$1
 executable_inode=$2
+ancestry=
+ancestry_count=0
+current_pid=$foreground_pid
+while :; do
+    process_stat=$(cat "/proc/$current_pid/stat")
+    rest=${process_stat##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    parent_pid=$2
+    current_start_ticks=${20}
+    case "$parent_pid:$current_start_ticks" in *[!0-9:]*) exit 25;; esac
+    if [ -z "$ancestry" ]; then
+        ancestry="$current_pid:$current_start_ticks"
+    else
+        ancestry="$ancestry,$current_pid:$current_start_ticks"
+    fi
+    ancestry_count=$((ancestry_count + 1))
+    [ "$ancestry_count" -le 64 ]
+    [ "$current_pid" = "$pane_pid" ] && break
+    [ "$parent_pid" -gt 0 ]
+    [ "$parent_pid" != "$current_pid" ]
+    current_pid=$parent_pid
+done
 cmdline="/proc/$foreground_pid/cmdline"
 size=$(wc -c < "$cmdline" | tr -d ' ')
 case "$size" in ''|*[!0-9]*|0) exit 23;; esac
 [ "$size" -le 65536 ]
-printf 'THPA2\n%s\n%s\n%s\n%s\n' "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode"
+pane_after=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+[ "$pane_after" = "$pane" ]
+foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
+[ "$foreground_after" = "$foreground_pid" ]
+process_stat=$(cat "/proc/$foreground_pid/stat")
+rest=${process_stat##*) }
+set -- $rest
+[ "$#" -ge 20 ]
+[ "${20}" = "$start_ticks" ]
+set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+[ "$#" -eq 2 ]
+[ "$1" = "$executable_device" ]
+[ "$2" = "$executable_inode" ]
+printf 'THPA3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
+    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" "$ancestry"
 cat "$cmdline"
 "#;
 
@@ -355,14 +563,26 @@ cat "$cmdline"
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let mut fields = bytes.splitn(6, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THPA2".as_slice()) {
+    let mut fields = bytes.splitn(12, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA3".as_slice()) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let terminal = TerminalGeneration {
+        session_id: parse_prefixed_ascii_number(fields.next(), b'$')?,
+        session_created: parse_ascii_number(fields.next())?,
+        window_id: parse_prefixed_ascii_number(fields.next(), b'@')?,
+        pane_id: parse_prefixed_ascii_number(fields.next(), b'%')?,
+        pane_pid: u32::try_from(parse_ascii_number(fields.next())?)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?,
+    };
+    if terminal.session_created == 0 || terminal.pane_pid == 0 {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     let pid = parse_ascii_number(fields.next())?;
     let start_ticks = parse_ascii_number(fields.next())?;
     let executable_device = parse_ascii_number(fields.next())?;
     let executable_inode = parse_ascii_number(fields.next())?;
+    let ancestry = parse_process_ancestry(fields.next())?;
     let cmdline = fields
         .next()
         .ok_or(LaunchAttestationError::UnreadableEvidence)?;
@@ -380,13 +600,70 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
     if argv.is_empty() || argv.len() > 256 || argv.iter().any(|arg| arg.len() > 16_384) {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
+    let pid = u32::try_from(pid).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if ancestry.first() != Some(&ProcessIdentity { pid, start_ticks })
+        || ancestry.last().map(|identity| identity.pid) != Some(terminal.pane_pid)
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
     Ok(HarnessProcessEvidence {
-        pid: u32::try_from(pid).map_err(|_| LaunchAttestationError::UnreadableEvidence)?,
+        terminal,
+        ancestry,
+        pid,
         start_ticks,
         executable_device,
         executable_inode,
         argv,
     })
+}
+
+fn parse_prefixed_ascii_number(
+    field: Option<&[u8]>,
+    prefix: u8,
+) -> Result<u64, LaunchAttestationError> {
+    let field = field.ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    if field.first() != Some(&prefix) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    parse_ascii_number(Some(&field[1..]))
+}
+
+fn parse_process_ancestry(
+    field: Option<&[u8]>,
+) -> Result<Vec<ProcessIdentity>, LaunchAttestationError> {
+    let field = std::str::from_utf8(field.ok_or(LaunchAttestationError::UnreadableEvidence)?)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let ancestry = field
+        .split(',')
+        .map(|identity| {
+            let (pid, start_ticks) = identity
+                .split_once(':')
+                .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+            Ok(ProcessIdentity {
+                pid: pid
+                    .parse()
+                    .ok()
+                    .filter(|pid| *pid > 0)
+                    .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+                start_ticks: start_ticks
+                    .parse()
+                    .ok()
+                    .filter(|start_ticks| *start_ticks > 0)
+                    .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ancestry.is_empty()
+        || ancestry.len() > 64
+        || ancestry.iter().enumerate().any(|(index, identity)| {
+            ancestry[..index]
+                .iter()
+                .any(|seen| seen.pid == identity.pid)
+        })
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(ancestry)
 }
 
 fn parse_ascii_number(field: Option<&[u8]>) -> Result<u64, LaunchAttestationError> {
@@ -596,6 +873,280 @@ pub(crate) fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn shell_evidence() -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_after_exec(42, 900, 100, &["zsh"])
+    }
+
+    fn codex_bypass_evidence(pid: u32, start_ticks: u64) -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_after_exec(
+            pid,
+            start_ticks,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+        )
+    }
+
+    fn respawn_transition(
+        before_pane_pid: u32,
+        after_pane_pid: u32,
+    ) -> crate::tmux::RespawnPaneTransition {
+        crate::tmux::RespawnPaneTransition {
+            before: crate::tmux::PaneGeneration {
+                session_id: 17,
+                session_created: 123_456,
+                window_id: 9,
+                pane_id: 42,
+                pane_pid: before_pane_pid,
+            },
+            after: crate::tmux::PaneGeneration {
+                session_id: 17,
+                session_created: 123_456,
+                window_id: 9,
+                pane_id: 42,
+                pane_pid: after_pane_pid,
+            },
+        }
+    }
+
+    fn respawn_provider_evidence() -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_with_context(
+            77,
+            901,
+            77,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            123_456,
+            77,
+            &[(77, 901)],
+        )
+    }
+
+    #[test]
+    fn respawn_attestation_requires_exact_new_pane_generation_and_provider_posture() {
+        let before = shell_evidence();
+        let after = respawn_provider_evidence();
+        let transition = respawn_transition(42, 77);
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap()
+            .permission,
+            PermMode::BypassPermissions
+        );
+
+        let mut substituted = transition;
+        substituted.after.window_id = 10;
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &substituted,
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::TerminalChanged
+        );
+
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &respawn_transition(42, 42),
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::TerminalChanged
+        );
+
+        let stale_after = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            42,
+            100,
+            &["zsh"],
+            123_456,
+            77,
+            &[(42, 900)],
+        );
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &stale_after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::StaleEvidence
+        );
+
+        let wrapper = HarnessProcessEvidence::test_with_context(
+            77,
+            901,
+            77,
+            200,
+            &["sh", "/tmp/codex-wrapper"],
+            123_456,
+            77,
+            &[(77, 901)],
+        );
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &wrapper,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::WrapperObscured
+        );
+    }
+
+    #[test]
+    fn launch_acceptance_rejects_provider_exit_between_observations() {
+        let before = shell_evidence();
+        let first = codex_bypass_evidence(42, 900);
+        attest_launch_permissions(
+            Harness::Codex.adapter(),
+            &before,
+            &first,
+            PermMode::BypassPermissions,
+        )
+        .unwrap();
+        assert_eq!(
+            attest_final_launch_permissions(
+                Harness::Codex.adapter(),
+                &first,
+                Err(LaunchAttestationError::UnreadableEvidence),
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::UnreadableEvidence
+        );
+    }
+
+    #[test]
+    fn launch_acceptance_rejects_posture_change_between_observations() {
+        let first = codex_bypass_evidence(42, 900);
+        let changed = HarnessProcessEvidence::test_after_exec(
+            42,
+            900,
+            200,
+            &["codex", "--sandbox", "workspace-write", "work"],
+        );
+        assert_eq!(
+            attest_final_launch_permissions(
+                Harness::Codex.adapter(),
+                &first,
+                Ok(changed),
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::WrongPermission
+        );
+    }
+
+    #[test]
+    fn launch_acceptance_rejects_wrapper_or_ancestry_change_between_observations() {
+        let first = codex_bypass_evidence(42, 900);
+        let wrapper =
+            HarnessProcessEvidence::test_after_exec(42, 900, 200, &["sh", "/tmp/codex-wrapper"]);
+        assert_eq!(
+            attest_final_launch_permissions(
+                Harness::Codex.adapter(),
+                &first,
+                Ok(wrapper),
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::WrapperObscured
+        );
+
+        let first = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            42,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            123_456,
+            7,
+            &[(42, 900), (7, 100)],
+        );
+        let changed_ancestry = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            42,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            123_456,
+            7,
+            &[(42, 900), (8, 101), (7, 100)],
+        );
+        assert_eq!(
+            attest_final_launch_permissions(
+                Harness::Codex.adapter(),
+                &first,
+                Ok(changed_ancestry),
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::AncestryChanged
+        );
+    }
+
+    #[test]
+    fn launch_acceptance_rejects_pane_generation_change_between_observations() {
+        let first = codex_bypass_evidence(42, 900);
+        let replacement = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            42,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            123_457,
+            42,
+            &[(42, 900)],
+        );
+        assert_eq!(
+            attest_final_launch_permissions(
+                Harness::Codex.adapter(),
+                &first,
+                Ok(replacement),
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::TerminalChanged
+        );
+    }
+
     #[test]
     fn provider_string_maps_to_adapter() {
         assert_eq!(Harness::from_provider("claude"), Harness::Claude);
@@ -711,15 +1262,24 @@ mod tests {
 
     #[test]
     fn process_evidence_parser_is_bounded_and_strict() {
-        let parsed =
-            parse_process_evidence(b"THPA2\n42\n900\n8\n1234\ncodex\0--sandbox\0read-only\0")
-                .unwrap();
+        let parsed = parse_process_evidence(
+            b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex\0--sandbox\0read-only\0",
+        )
+        .unwrap();
         assert_eq!(parsed.identity(), (42, 900));
         assert_eq!(parsed.executable_identity(), (8, 1234));
         assert_eq!(parsed.argv, ["codex", "--sandbox", "read-only"]);
 
         assert_eq!(
-            parse_process_evidence(b"THPA2\n42\n900\n8\n1234\ncodex"),
+            parse_process_evidence(
+                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex",
+            ),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+        assert_eq!(
+            parse_process_evidence(
+                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900,7:100\ncodex\0",
+            ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
         let oversized = vec![b'x'; 65_537];
@@ -736,5 +1296,22 @@ mod tests {
             serde_json::json!("bypassPermissions")
         );
         assert_eq!(PermMode::BypassPermissions.to_string(), "bypassPermissions");
+    }
+
+    #[test]
+    fn crew_default_permission_uses_exact_provider_native_bypass_flags() {
+        assert_eq!(CREW_DEFAULT_PERMISSION, PermMode::BypassPermissions);
+        assert_eq!(
+            Harness::Codex
+                .adapter()
+                .permission_map(CREW_DEFAULT_PERMISSION),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(
+            Harness::Claude
+                .adapter()
+                .permission_map(CREW_DEFAULT_PERMISSION),
+            ["--dangerously-skip-permissions"]
+        );
     }
 }
