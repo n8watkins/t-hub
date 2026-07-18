@@ -4803,6 +4803,18 @@ impl CaptainsRegistry {
         };
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let previous = self.lock().clone();
+        if let Some(existing) = previous
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some(terminal_id))
+        {
+            if existing.ship_slug != slug && existing.project_id.is_some() {
+                return Err(format!(
+                    "claim_captain: project-bound Captain '{}' cannot be redesignated as ship '{slug}'; release the existing Captain explicitly before reusing its terminal or slug",
+                    existing.ship_slug
+                ));
+            }
+        }
 
         for _attempt in 0..CLAIM_CAS_ATTEMPTS {
             // Phase 1 (under `inner`): decide whether an incumbent liveness probe is
@@ -4843,6 +4855,7 @@ impl CaptainsRegistry {
             for workspace_id in &workspace_tab_ids {
                 if let Some(owner) = g.captains.iter().find(|captain| {
                     captain.terminal_id.as_deref() != Some(terminal_id)
+                        && !Self::key_matches(captain, role, &slug)
                         && captain
                             .workspace_tab_ids
                             .iter()
@@ -21213,6 +21226,88 @@ mod tests {
             "re-designation must not duplicate the claim"
         );
         assert_eq!(snap.seq, 3);
+    }
+
+    #[test]
+    fn project_bound_same_terminal_redesignation_is_rejected_without_identity_drift() {
+        let path = captains_tmp("project-bound-redesignation");
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-alpha".into(),
+                name: "Alpha Project".into(),
+                repo_root: "/tmp/project-alpha".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry
+            .bind_ship_context("alpha", "project-alpha", "Own Alpha", "codex")
+            .unwrap();
+        registry
+            .rename_captain(Some("captain-a"), None, "Alpha Lead")
+            .unwrap();
+        registry.record_crew("captain-a", "crew-a").unwrap();
+        let before = registry.snapshot();
+
+        let error = registry
+            .claim_provider(
+                "captain-a",
+                Some("beta"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec!["work-b".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap_err();
+        assert!(error.contains("project-bound"), "got: {error}");
+        let after = registry.snapshot();
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.captains, before.captains);
+        let restarted = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restarted.seq, before.seq);
+        assert_eq!(restarted.captains, before.captains);
+
+        registry.release("captain-a").unwrap();
+        let reused = registry
+            .claim_provider(
+                "captain-b",
+                Some("alpha"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec!["work-a".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        assert_eq!(reused.record.ship_slug, "alpha");
+        assert_eq!(reused.record.terminal_id.as_deref(), Some("captain-b"));
+        assert_eq!(reused.record.project_id.as_deref(), Some("project-alpha"));
+        assert_eq!(
+            reused.record.assignment_id,
+            "assignment:project-alpha:alpha"
+        );
+        assert_eq!(reused.record.display_name, "Alpha Lead");
+        assert_eq!(crew_tiles(&reused.record), vec!["crew-a"]);
+        let reused_after_restart = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(reused_after_restart.captains.len(), 1);
+        assert_eq!(
+            reused_after_restart.captains[0].terminal_id.as_deref(),
+            Some("captain-b")
+        );
+        assert_eq!(reused_after_restart.captains[0].ship_slug, "alpha");
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
