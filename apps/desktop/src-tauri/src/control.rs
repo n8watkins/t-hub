@@ -3950,6 +3950,7 @@ impl CaptainsRegistry {
     fn prepare_close_terminal_operation(
         &self,
         terminal_id: &str,
+        expected_seq: u64,
         frozen_powder_release: Option<PendingDispatchRelease>,
     ) -> Result<PendingFleetOperation, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
@@ -3964,6 +3965,12 @@ impl CaptainsRegistry {
             )
         }) {
             return Ok(existing.clone());
+        }
+        if current.seq != expected_seq {
+            return Err(format!(
+                "terminal close authority changed after scope capture (expected seq {expected_seq}, current seq {})",
+                current.seq
+            ));
         }
         let previous = current.clone();
         let powder_release = match frozen_powder_release {
@@ -4148,7 +4155,7 @@ impl CaptainsRegistry {
         &self,
         operation: &PendingFleetOperation,
         retain_crew_binding: bool,
-        released_binding: Option<(&str, &str)>,
+        released_recovery: Option<&PendingDispatchRelease>,
     ) -> Result<CloseTerminalCommitResult, String> {
         let terminal_id = match &operation.payload {
             PendingFleetOperationPayload::CloseTerminal { terminal_id, .. } => terminal_id,
@@ -4172,6 +4179,38 @@ impl CaptainsRegistry {
                 "terminal close operation '{}' changed before commit",
                 operation.operation_id
             ));
+        }
+        let operation_recovery = match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { powder_release, .. } => {
+                powder_release.as_ref()
+            }
+            _ => None,
+        };
+        if released_recovery.is_some() && released_recovery != operation_recovery {
+            return Err(format!(
+                "terminal close operation '{}' does not own the released Powder recovery",
+                operation.operation_id
+            ));
+        }
+        if let Some(recovery) = released_recovery {
+            let durable_recovery = current
+                .pending_dispatch_releases
+                .iter()
+                .find(|pending| pending.crew_session_id == *terminal_id)
+                .ok_or_else(|| {
+                    format!(
+                        "terminal close operation '{}' lost its durable Powder recovery",
+                        operation.operation_id
+                    )
+                })?;
+            let mut expected_recovery = recovery.clone();
+            expected_recovery.state = PendingDispatchReleaseState::InFlight;
+            if durable_recovery != &expected_recovery {
+                return Err(format!(
+                    "terminal close operation '{}' Powder recovery changed before finalization",
+                    operation.operation_id
+                ));
+            }
         }
 
         let now = now_ms();
@@ -4200,11 +4239,12 @@ impl CaptainsRegistry {
                     crew.state = next_state;
                     captain_state_changed = true;
                 }
-                if let Some((card_id, run_id)) = released_binding {
+                if let Some(recovery) = released_recovery {
                     let matches = crew.powder_work.as_ref().is_some_and(|work| {
-                        work.card_id == card_id
-                            && work.run_id == run_id
-                            && matches!(work.state, PowderWorkState::Active)
+                        work.card_id == recovery.card_id
+                            && work.run_id == recovery.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                            && work.dispatch_release_recovery
                     });
                     if !matches {
                         return Err(format!(
@@ -4215,6 +4255,11 @@ impl CaptainsRegistry {
                     captain_state_changed = true;
                 }
             }
+        }
+        if let Some(recovery) = released_recovery {
+            current
+                .pending_dispatch_releases
+                .retain(|pending| pending.crew_session_id != recovery.crew_session_id);
         }
         let mut workspace_changed = false;
         for workspace in &mut current.workspaces {
@@ -16363,6 +16408,18 @@ fn recover_pending_dispatch_release_guarded(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
 ) -> Result<(), String> {
+    apply_pending_dispatch_release_effect_guarded(ctx, recovery)?;
+    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
+}
+
+fn apply_pending_dispatch_release_effect_guarded(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let mut durable_recovery = ctx
+        .captains
+        .pending_dispatch_release(&recovery.crew_session_id)
+        .ok_or("the exact durable release recovery no longer exists")?;
     let client = powder::Client::from_profile(&recovery.connection_profile)?;
     if client.configured_agent() != recovery.agent {
         return Err("the frozen profile agent changed".into());
@@ -16383,6 +16440,11 @@ fn recover_pending_dispatch_release_guarded(
                     .into(),
             );
         }
+    }
+    let mut expected_recovery = recovery.clone();
+    expected_recovery.state = durable_recovery.state;
+    if durable_recovery != expected_recovery {
+        return Err("the exact durable release recovery changed before its external effect".into());
     }
     let repository = client
         .get_repository(&recovery.repository)
@@ -16412,7 +16474,15 @@ fn recover_pending_dispatch_release_guarded(
             );
         }
         ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
-        return clear_confirmed_dispatch_release_and_retire(ctx, recovery);
+        if durable_recovery.state == PendingDispatchReleaseState::Prepared {
+            ctx.captains.transition_dispatch_release(
+                &durable_recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )?;
+            durable_recovery.state = PendingDispatchReleaseState::InFlight;
+        }
+        return Ok(());
     }
     if evidence.run.state != "active" {
         return Err(format!(
@@ -16428,12 +16498,13 @@ fn recover_pending_dispatch_release_guarded(
         return Err("the active card claim no longer matches the exact release ownership".into());
     }
     ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
-    if recovery.state == PendingDispatchReleaseState::Prepared {
+    if durable_recovery.state == PendingDispatchReleaseState::Prepared {
         ctx.captains.transition_dispatch_release(
-            recovery,
+            &durable_recovery,
             PendingDispatchReleaseState::Prepared,
             PendingDispatchReleaseState::InFlight,
         )?;
+        durable_recovery.state = PendingDispatchReleaseState::InFlight;
     }
     let claim = powder::Claim {
         card_id: recovery.card_id.clone(),
@@ -16442,7 +16513,7 @@ fn recover_pending_dispatch_release_guarded(
         expires_at: 0,
     };
     client.release(&claim)?;
-    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
+    Ok(())
 }
 
 fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
@@ -19087,7 +19158,7 @@ fn retain_crew_binding_after_powder_failure(
 fn freeze_close_terminal_powder_release(
     ctx: &ControlContext,
     crew_session_id: &str,
-) -> Result<Option<PendingDispatchRelease>, String> {
+) -> Result<(u64, Option<PendingDispatchRelease>), String> {
     let snapshot = ctx.captains.snapshot();
     let matching_crew = snapshot
         .captains
@@ -19096,7 +19167,7 @@ fn freeze_close_terminal_powder_release(
         .filter(|crew| crew.terminal_id == crew_session_id)
         .collect::<Vec<_>>();
     let crew = match matching_crew.as_slice() {
-        [] => return Ok(None),
+        [] => return Ok((snapshot.seq, None)),
         [crew] => *crew,
         _ => {
             return Err(format!(
@@ -19104,11 +19175,23 @@ fn freeze_close_terminal_powder_release(
             ));
         }
     };
+    if matches!(crew.state, CrewState::Removed { .. }) && crew.powder_work.is_some() {
+        return Err(format!(
+            "Crew session '{crew_session_id}' is historically Removed; ordinary live Powder cleanup is refused"
+        ));
+    }
     let Some(work) = crew.powder_work.as_ref() else {
-        return Ok(None);
+        return Ok((snapshot.seq, None));
     };
+    if let Some(recovery) = snapshot
+        .pending_dispatch_releases
+        .iter()
+        .find(|recovery| recovery.crew_session_id == crew_session_id)
+    {
+        return Ok((snapshot.seq, Some(recovery.clone())));
+    }
     match work.state {
-        PowderWorkState::Completed { .. } => return Ok(None),
+        PowderWorkState::Completed { .. } => return Ok((snapshot.seq, None)),
         PowderWorkState::CompletionPending { .. } => {
             return Err(retryable_error(format!(
                 "Crew session '{crew_session_id}' has Powder completion pending; close must wait for exact same-proof recovery"
@@ -19125,25 +19208,28 @@ fn freeze_close_terminal_powder_release(
     let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
         format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
     })?;
-    Ok(Some(PendingDispatchRelease {
-        crew_session_id: crew_session_id.to_string(),
-        project_id: scope.project_id,
-        connection_profile: scope.binding.connection_profile,
-        connection_endpoint_identity,
-        repository: scope.binding.repository,
-        card_id: scope.work.card_id,
-        run_id: scope.work.run_id,
-        agent,
-        operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
-        created_at: now_ms(),
-        state: PendingDispatchReleaseState::Prepared,
-    }))
+    Ok((
+        snapshot.seq,
+        Some(PendingDispatchRelease {
+            crew_session_id: crew_session_id.to_string(),
+            project_id: scope.project_id,
+            connection_profile: scope.binding.connection_profile,
+            connection_endpoint_identity,
+            repository: scope.binding.repository,
+            card_id: scope.work.card_id,
+            run_id: scope.work.run_id,
+            agent,
+            operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        }),
+    ))
 }
 
 fn close_terminal_with_policy(
     ctx: &ControlContext,
     args: &Value,
-    preserve_crew_on_powder_failure: bool,
+    _preserve_crew_on_powder_failure: bool,
     authority: Option<&TargetLifecycleAuthority>,
 ) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
@@ -19208,9 +19294,12 @@ fn close_terminal_with_policy(
     let fleet_operation = match ctx.captains.pending_close_terminal_operation(tile_id) {
         Some(operation) => operation,
         None => {
-            let powder_release = freeze_close_terminal_powder_release(ctx, tile_id)?;
+            let (expected_seq, powder_release) =
+                freeze_close_terminal_powder_release(ctx, tile_id)?;
+            #[cfg(test)]
+            ctx.captains.pause_dispatch("close_terminal_scope_frozen");
             ctx.captains
-                .prepare_close_terminal_operation(tile_id, powder_release)?
+                .prepare_close_terminal_operation(tile_id, expected_seq, powder_release)?
         }
     };
     #[cfg(test)]
@@ -19245,16 +19334,20 @@ fn close_terminal_with_policy(
         }
         _ => None,
     };
+    let mut release_effect_applied = frozen_powder_release.is_none();
     let powder_release = match frozen_powder_release.as_ref() {
         Some(recovery) => Some(
-            match recover_pending_dispatch_release_guarded(ctx, recovery) {
-                Ok(()) => json!({
+            match apply_pending_dispatch_release_effect_guarded(ctx, recovery) {
+                Ok(()) => {
+                    release_effect_applied = true;
+                    json!({
                     "released": true,
                     "outcome": "released",
                     "projectId": recovery.project_id,
                     "cardId": recovery.card_id,
                     "runId": recovery.run_id,
-                }),
+                    })
+                }
                 Err(error) => json!({
                     "released": false,
                     "outcome": "recovery_pending",
@@ -19267,16 +19360,27 @@ fn close_terminal_with_policy(
         ),
         None => completed_powder_release,
     };
-    let crew_binding_retained = frozen_powder_release.is_some()
-        && (preserve_crew_on_powder_failure
-            || powder_release.as_ref().is_some_and(|release| {
-                release.get("released").and_then(Value::as_bool) != Some(true)
-            }));
-    let committed = ctx.captains.commit_close_terminal_operation(
-        &fleet_operation,
-        crew_binding_retained,
-        None,
-    )?;
+    #[cfg(test)]
+    if release_effect_applied
+        && frozen_powder_release.is_some()
+        && !ctx
+            .captains
+            .pause_dispatch("close_terminal_release_applied")
+    {
+        return Err(format!(
+            "Crew terminal '{tile_id}' test crash occurred after remote release before atomic local close finalization"
+        ));
+    }
+    let crew_binding_retained = frozen_powder_release.is_some() && !release_effect_applied;
+    let committed = release_effect_applied
+        .then(|| {
+            ctx.captains.commit_close_terminal_operation(
+                &fleet_operation,
+                false,
+                frozen_powder_release.as_ref(),
+            )
+        })
+        .transpose()?;
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -19286,19 +19390,21 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    ctx.tabs.replace(ctx.captains.workspace_projection());
-    if committed.workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
-        let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+    if let Some(committed) = committed {
+        ctx.tabs.replace(ctx.captains.workspace_projection());
+        if committed.workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
+            let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+        }
+        // Captain-chat phase 2: a dead session leaves the captains registry too -
+        // its captaincy is released and it drops out of every crew list.
+        if committed.captain_state_changed {
+            let _ = captains_sync_apply(ctx);
+        }
+        // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
+        // retired too, so its secret stops resolving and the identity store does not
+        // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
+        ctx.identity.retire_tile(tile_id)?;
     }
-    // Captain-chat phase 2: a dead session leaves the captains registry too -
-    // its captaincy is released and it drops out of every crew list.
-    if committed.captain_state_changed {
-        let _ = captains_sync_apply(ctx);
-    }
-    // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
-    // retired too, so its secret stops resolving and the identity store does not
-    // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
-    ctx.identity.retire_tile(tile_id)?;
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -28028,6 +28134,275 @@ mod tests {
     }
 
     #[test]
+    fn close_terminal_project_rebind_after_scope_capture_has_zero_effects() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "close_terminal_project_rebind_after_scope_capture_has_zero_effects: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-rebind-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Close with frozen Project authority",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context =
+            Arc::new(test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry)));
+        let before = registry.snapshot();
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_scope_frozen",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let close_context = Arc::clone(&context);
+        let close_crew = crew_id.clone();
+        let close = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &close_context,
+                &json!({"sessionId": close_crew}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "close_terminal_scope_frozen"
+        );
+        let mut rebound = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-powder-lifecycle")
+            .unwrap();
+        rebound.powder.as_mut().unwrap().repository = "foreign-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        resume_tx.send(()).unwrap();
+
+        let error = close.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("authority changed after scope capture"),
+            "{error}"
+        );
+        let after = registry.snapshot();
+        assert!(after.pending_fleet_operations.is_empty());
+        assert!(after.pending_dispatch_releases.is_empty());
+        assert_eq!(after.captains[0].crew[0], before.captains[0].crew[0]);
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+    }
+
+    #[test]
+    fn released_terminal_close_crash_restarts_to_one_removed_history_record() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "released_terminal_close_crash_restarts_to_one_removed_history_record: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(7);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let profile_name = format!("close-crash-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let path = captains_tmp("close-terminal-release-crash");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            &crew_id,
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Crash after exact release",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context =
+            Arc::new(test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry)));
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (_resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_release_applied",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let close_context = Arc::clone(&context);
+        let close_crew = crew_id.clone();
+        let close = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &close_context,
+                &json!({"sessionId": close_crew}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "close_terminal_release_applied"
+        );
+        drop(_resume_tx);
+        let error = close.join().unwrap().unwrap_err();
+        assert!(error.contains("test crash occurred after remote release"));
+        let crashed = registry.snapshot();
+        assert_eq!(crashed.pending_fleet_operations.len(), 1);
+        assert_eq!(crashed.pending_dispatch_releases.len(), 1);
+        assert!(matches!(
+            crashed.captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        drop(context);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let restart_context = test_ctx(&profile_name)
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(tabs);
+        recover_pending_fleet_operations(&restart_context);
+
+        let recovered = restarted.snapshot();
+        assert!(recovered.pending_fleet_operations.is_empty());
+        assert!(recovered.pending_dispatch_releases.is_empty());
+        assert_eq!(recovered.captains[0].crew.len(), 1);
+        assert!(matches!(
+            recovered.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(recovered.captains[0].crew[0].powder_work.is_none());
+        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_close_response_loss_retries_the_same_durable_operation() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "terminal_close_response_loss_retries_the_same_durable_operation: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(7);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
+        let profile_name = format!("close-retry-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Retry exact close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+
+        let first =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+        assert_eq!(first["powderRelease"]["outcome"], "recovery_pending");
+        let pending = registry.snapshot();
+        assert_eq!(pending.pending_fleet_operations.len(), 1);
+        assert_eq!(pending.pending_dispatch_releases.len(), 1);
+        let operation_id = pending.pending_fleet_operations[0].operation_id.clone();
+        let recovery_id = pending.pending_dispatch_releases[0].operation_id.clone();
+
+        let second =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+        assert_eq!(second["powderRelease"]["released"], true);
+        let finalized = registry.snapshot();
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert_eq!(finalized.captains[0].crew.len(), 1);
+        assert!(matches!(
+            finalized.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(finalized.captains[0].crew[0].powder_work.is_none());
+        assert_ne!(operation_id, recovery_id);
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+    }
+
+    #[test]
     fn prepared_terminal_close_recovers_before_first_list_after_restart() {
         let path = captains_tmp("close-terminal-wal-restart");
         let registry = CaptainsRegistry::load(path.clone());
@@ -28035,8 +28410,9 @@ mod tests {
             .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
             .unwrap();
         registry.record_crew("cap-1", "crew-1").unwrap();
+        let expected_seq = registry.snapshot().seq;
         let prepared = registry
-            .prepare_close_terminal_operation("crew-1", None)
+            .prepare_close_terminal_operation("crew-1", expected_seq, None)
             .unwrap();
         assert_eq!(prepared.phase, PendingFleetOperationPhase::Prepared);
         drop(registry);
@@ -28103,9 +28479,9 @@ mod tests {
             )
             .unwrap();
         let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
-        let recovery = freeze_close_terminal_powder_release(&context, "crew-powder")
-            .unwrap()
-            .unwrap();
+        let (expected_seq, recovery) =
+            freeze_close_terminal_powder_release(&context, "crew-powder").unwrap();
+        let recovery = recovery.unwrap();
         assert_eq!(recovery.connection_profile, profile_name);
         assert_eq!(recovery.project_id, "project-powder-lifecycle");
         assert_eq!(recovery.repository, "t-hub");
@@ -28115,7 +28491,7 @@ mod tests {
             .starts_with("hmac-sha256:"));
 
         let prepared = registry
-            .prepare_close_terminal_operation("crew-powder", Some(recovery.clone()))
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
             .unwrap();
         drop(registry);
 
@@ -28141,6 +28517,122 @@ mod tests {
         server.finish().unwrap();
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn released_terminal_close_finalizes_history_recovery_and_wal_atomically() {
+        let path = captains_tmp("close-terminal-atomic-finalize");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "atomic-close-profile",
+            "crew-powder",
+        );
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "crew-powder".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "atomic-close-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "powder-agent".into(),
+            operation_id: "close-terminal:atomic-finalize".into(),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        let expected_seq = registry.snapshot().seq;
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
+            .unwrap();
+        registry
+            .transition_dispatch_release(
+                &recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )
+            .unwrap();
+        let before_finalize = registry.snapshot();
+        registry.fail_next_persist("injected atomic finalization failure");
+        assert!(registry
+            .commit_close_terminal_operation(&prepared, false, Some(&recovery))
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before_finalize).unwrap()
+        );
+
+        registry
+            .commit_close_terminal_operation(&prepared, false, Some(&recovery))
+            .unwrap();
+        let finalized = registry.snapshot();
+        let crew = &finalized.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_none());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized
+            .workspaces
+            .iter()
+            .all(|workspace| !workspace.tile_ids.contains(&"crew-powder".to_string())));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_close_reuses_an_exact_orphaned_pending_release() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "retry-close-profile",
+            "crew-powder",
+        );
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "crew-powder".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "retry-close-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "powder-agent".into(),
+            operation_id: "close-terminal:original-retry".into(),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        let expected_seq = registry.snapshot().seq;
+
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
+            .unwrap();
+
+        assert!(matches!(
+            prepared.payload,
+            PendingFleetOperationPayload::CloseTerminal {
+                powder_release: Some(ref frozen),
+                ..
+            } if frozen == &recovery
+        ));
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery]
+        );
+    }
+
+    #[test]
+    fn removed_crew_binding_cannot_prepare_a_live_terminal_close() {
+        let registry = powder_lifecycle_registry(None);
+        registry.remove_session("crew-powder").unwrap();
+        let context = test_ctx("removed-close").with_captains_registry(Arc::clone(&registry));
+        let before = registry.snapshot();
+
+        let error = freeze_close_terminal_powder_release(&context, "crew-powder").unwrap_err();
+
+        assert!(error.contains("historically Removed"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 
     #[test]
@@ -33191,13 +33683,37 @@ mod tests {
             );
             return;
         }
-        let server = LoopbackPowderServer::start(3);
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
         let profile_name = format!("attestation-rollback-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let registry =
             powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Roll back exact attestation claim",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
         let target = tmux_target(&crew_id);
         create_test_tmux_session(&target).unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
@@ -36051,6 +36567,9 @@ mod tests {
             );
             return;
         }
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let captain = FakeHarnessSession::start(Harness::Codex);
         let fixture = tempfile::tempdir().unwrap();
         let hostile_pane = fixture.path().join("hostile-pane");
@@ -36072,9 +36591,6 @@ mod tests {
         let provider =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
 
-        let server = LoopbackPowderServer::start(3);
-        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
-        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
         let (ctx, sink) = dispatch_test_context(registry.clone());
         let (reached, wait_for_respawn) = std::sync::mpsc::sync_channel(1);
@@ -38993,9 +39509,9 @@ mod tests {
             );
             return;
         }
-        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
-        let server = LoopbackPowderServer::start(5);
+        let server = LoopbackPowderServer::start(3);
         let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
         create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
         assert!(matches!(
@@ -39028,6 +39544,18 @@ mod tests {
             }]
         });
         let expected_digest = parse_completion_proof(&args).unwrap().digest();
+        registry
+            .begin_crew_powder_completion(&crew_session_id, &expected_digest)
+            .unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.completed = true;
+            state.proof = Some("commit close-race".into());
+            state.proof_url = Some("https://example.test/close-race".into());
+            state.recovery_succeeds = true;
+            state.recovery_operation_id = Some("completion:close-race".into());
+            state.pause_run_evidence = true;
+        }
         let (wait_tx, wait_rx) = mpsc::sync_channel(2);
         registry.set_powder_operation_wait_hook(Some(wait_tx));
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
@@ -39046,7 +39574,7 @@ mod tests {
                 .unwrap();
         });
         server
-            .post_started
+            .run_evidence_started
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
 
@@ -39083,7 +39611,7 @@ mod tests {
             PowderWorkState::CompletionPending { request_digest, .. }
                 if request_digest == &expected_digest
         ));
-        server.release_post.send(()).unwrap();
+        server.resume_run_evidence.send(()).unwrap();
 
         let completion_result = completion_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(completion_result.ok, "{:?}", completion_result.error);
@@ -39115,7 +39643,8 @@ mod tests {
                 if request_digest == &expected_digest
         ));
         let state = server.finish().unwrap();
-        assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 1);
+        assert_eq!(state.completion_posts.len(), 0);
         assert_eq!(state.release_posts, 0);
     }
 
