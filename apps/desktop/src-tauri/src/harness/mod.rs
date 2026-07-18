@@ -805,6 +805,11 @@ fn unique_config_value(
             argument
                 .strip_prefix("--config=")
                 .or_else(|| argument.strip_prefix("-c="))
+                .or_else(|| {
+                    argument
+                        .strip_prefix("-c")
+                        .filter(|value| !value.is_empty())
+                })
         };
         if let Some(config) = config {
             if let Some(value) = protected_toml_override(config, key)? {
@@ -1604,17 +1609,16 @@ mod tests {
 
     #[test]
     fn codex_reasoning_attestation_matches_toml_whitespace_quotes_and_rejects_overrides() {
-        for config in [
-            "model_reasoning_effort=medium",
-            "model_reasoning_effort = medium",
-            "model_reasoning_effort = \"medium\"",
-            "'model_reasoning_effort' = 'medium'",
+        for config_args in [
+            vec!["-c", "model_reasoning_effort=medium"],
+            vec!["-c=model_reasoning_effort = medium"],
+            vec!["-cmodel_reasoning_effort = \"medium\""],
+            vec!["--config", "'model_reasoning_effort' = 'medium'"],
+            vec!["--config=model_reasoning_effort=medium"],
         ] {
-            let evidence = HarnessProcessEvidence::test(
-                42,
-                900,
-                &["codex", "--model", "gpt-5.6-terra", "-c", config],
-            );
+            let mut argv = vec!["codex", "--model", "gpt-5.6-terra"];
+            argv.extend(config_args);
+            let evidence = HarnessProcessEvidence::test(42, 900, &argv);
             attest_runtime_policy(&evidence, Harness::Codex, "gpt-5.6-terra", "medium").unwrap();
         }
 
@@ -1636,6 +1640,22 @@ mod tests {
                 "model_reasoning_effort=high",
                 "-c",
                 "model_reasoning_effort = medium",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+                "-cmodel_reasoning_effort=high",
+            ],
+            vec![
+                "codex",
+                "--model",
+                "gpt-5.6-terra",
+                "-cmodel_reasoning_effort=high",
+                "-c",
+                "model_reasoning_effort=medium",
             ],
             vec![
                 "codex",
