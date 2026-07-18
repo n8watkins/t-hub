@@ -7211,8 +7211,8 @@ impl CaptainsRegistry {
     }
 
     /// Persist a candidate failure before revoking the exact operation allocation.
-    /// If revocation persistence fails, the durable Failed intent remains as a
-    /// restart reconciliation instruction and an exact replay retries revocation.
+    /// If revocation persistence fails, the bearer remains denied in this process
+    /// and the durable Failed intent makes every restart retry the tombstone.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn fail_cortana_candidate(
         &self,
@@ -23055,13 +23055,37 @@ mod tests {
             .unwrap();
         assert!(identities.get(&identity.id).is_some());
 
+        let identity_bytes = std::fs::read(&identities_path).unwrap();
+        for _ in 0..2 {
+            let restarted_registry = CaptainsRegistry::load(captains_path.clone());
+            let restarted_identities =
+                crate::identity::IdentityStore::load(identities_path.clone());
+            let (retain, revoke) = restarted_registry
+                .cortana_identity_allocation_policy()
+                .unwrap();
+            assert!(retain.is_empty());
+            assert_eq!(revoke.len(), 1);
+            restarted_identities.fail_persist_after(0);
+            assert!(restarted_identities
+                .reconcile_operation_allocations(
+                    |_| true,
+                    |key| if revoke.contains(key) {
+                        crate::identity::OperationAllocationDisposition::Revoke
+                    } else {
+                        crate::identity::OperationAllocationDisposition::Unowned
+                    },
+                )
+                .is_err());
+            assert!(restarted_identities.get(&identity.id).is_none());
+            assert!(restarted_identities.resolve(&identity.secret).is_none());
+            assert_eq!(std::fs::read(&identities_path).unwrap(), identity_bytes);
+        }
+
         let restarted_registry = CaptainsRegistry::load(captains_path);
         let restarted_identities = crate::identity::IdentityStore::load(identities_path.clone());
-        let (retain, revoke) = restarted_registry
+        let (_, revoke) = restarted_registry
             .cortana_identity_allocation_policy()
             .unwrap();
-        assert!(retain.is_empty());
-        assert_eq!(revoke.len(), 1);
         assert_eq!(
             restarted_identities
                 .reconcile_operation_allocations(
@@ -23305,7 +23329,8 @@ mod tests {
                 .phase,
             CortanaEnsurePhase::Failed
         );
-        assert!(identities.get(&allocated.id).is_some());
+        assert!(identities.get(&allocated.id).is_none());
+        assert!(identities.resolve(&allocated.secret).is_none());
         let failed = registry
             .fail_cortana_candidate(
                 &identities,

@@ -990,6 +990,14 @@ impl IdentityStore {
         if removed > 0 {
             if let Err(error) = self.persist(&snap) {
                 *snap = previous;
+                // A journal-directed revoke is an authorization boundary. Even if
+                // its durable tombstone cannot be written, this process must deny
+                // every affected bearer while restart reconciliation retries the
+                // same durable Failed instruction.
+                for id in &revoke_ids {
+                    snap.revoked.insert(id.clone());
+                    snap.identities.remove(id);
+                }
                 return Err(error);
             }
         }
@@ -1008,13 +1016,12 @@ impl IdentityStore {
         }) else {
             return Ok(false);
         };
-        let previous = snap.clone();
         snap.revoked.insert(id.clone());
         snap.identities.remove(&id);
-        if let Err(error) = self.persist(&snap) {
-            *snap = previous;
-            return Err(error);
-        }
+        // Keep the failed operation's bearer denied in memory if persistence fails.
+        // The durable registry journal remains the restart instruction that retries
+        // this tombstone until persistence succeeds.
+        self.persist(&snap)?;
         Ok(true)
     }
 

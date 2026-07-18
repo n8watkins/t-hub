@@ -657,7 +657,7 @@ pub fn run() {
                         if pruned == 1 { "y" } else { "ies" }
                     ),
                     Err(error) => eprintln!(
-                        "t-hub-identity: load-time prune was rolled back after persistence failed: {error}"
+                        "t-hub-identity: load-time reconciliation could not persist; journal-directed bearers remain denied in memory: {error}"
                     ),
                     _ => {}
                 }
