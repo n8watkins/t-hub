@@ -932,8 +932,24 @@ pub(crate) fn observe_provider_launch_receipt(
     {
         return Err(LaunchAttestationError::WrongProvider);
     }
+    let launcher_is_symlink = std::fs::symlink_metadata(provider_executable)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?
+        .file_type()
+        .is_symlink();
     let executable = std::fs::canonicalize(provider_executable)
         .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if launcher_is_symlink && !approved_provider_package_target(&executable, expected) {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    if !launcher_is_symlink
+        && executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(executable_name)
+            != Some(expected.as_provider())
+    {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
     let identity = provider_file_identity(&executable)?;
     Ok(VerifiedHarnessProviderLaunch(
         HarnessProviderLaunchReceipt {
@@ -942,6 +958,14 @@ pub(crate) fn observe_provider_launch_receipt(
             provider_executable_inode: identity.inode,
         },
     ))
+}
+
+fn approved_provider_package_target(executable: &std::path::Path, expected: Harness) -> bool {
+    let suffix = match expected {
+        Harness::Codex => std::path::Path::new("@openai/codex/bin/codex.js"),
+        Harness::Claude => std::path::Path::new("@anthropic-ai/claude-code/bin/claude.exe"),
+    };
+    executable.ends_with(suffix)
 }
 
 #[cfg(test)]
@@ -2328,7 +2352,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let installed_script = temp.path().join("codex.js");
+        let package_bin = temp.path().join("@openai/codex/bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        let installed_script = package_bin.join("codex.js");
         let launch_token = temp.path().join("codex");
         std::fs::write(&installed_script, "#!/usr/bin/env node\n").unwrap();
         symlink(&installed_script, &launch_token).unwrap();
@@ -2354,6 +2380,31 @@ mod tests {
             observe_provider_launch_receipt(&launch_token, Harness::Claude),
             Err(LaunchAttestationError::WrongProvider)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_named_symlink_rejects_claude_and_foreign_canonical_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let claude_bin = temp.path().join("@anthropic-ai/claude-code/bin/claude.exe");
+        std::fs::create_dir_all(claude_bin.parent().unwrap()).unwrap();
+        std::fs::write(&claude_bin, "#!/usr/bin/env node\n").unwrap();
+        let foreign = temp.path().join("foreign-provider.js");
+        std::fs::write(&foreign, "#!/usr/bin/env node\n").unwrap();
+
+        for (label, target) in [("claude", &claude_bin), ("foreign", &foreign)] {
+            let launch_token = temp.path().join(format!("codex-{label}"));
+            symlink(target, &launch_token).unwrap();
+            let codex_token = temp.path().join("codex");
+            std::fs::rename(&launch_token, &codex_token).unwrap();
+            assert!(matches!(
+                observe_provider_launch_receipt(&codex_token, Harness::Codex),
+                Err(LaunchAttestationError::WrongProvider)
+            ));
+            std::fs::remove_file(codex_token).unwrap();
+        }
     }
 
     #[cfg(unix)]
