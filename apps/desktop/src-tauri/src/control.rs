@@ -2000,6 +2000,7 @@ fn startup_supervisor_reconciliation_required(
             .collect::<Vec<_>>()
     };
     let mut required = false;
+    let backend_is_unseeded = current_tabs.is_empty();
     for terminal_id in captains
         .iter()
         .filter(|captain| captain.state == ClaimState::Active)
@@ -2007,6 +2008,17 @@ fn startup_supervisor_reconciliation_required(
     {
         let reported = placements(reported_tabs, terminal_id);
         if reported == [CAPTAIN_WORKSPACE_ID.to_string()] {
+            continue;
+        }
+        // Production deliberately starts every app run with an empty in-memory
+        // TabRegistry and lets the frontend's first complete report seed it.
+        // Durable Active supervisor identity is sufficient to canonicalize that
+        // known terminal into Captain Workspace during this one unseeded state.
+        // Duplicate placements were already rejected, and the post-reconcile
+        // occupant validation still rejects every unknown/foreign tile in the
+        // reserved Workspace.
+        if backend_is_unseeded {
+            required = true;
             continue;
         }
         let current = placements(current_tabs, terminal_id);
@@ -22800,18 +22812,13 @@ mod tests {
     }
 
     #[test]
-    fn restart_report_reconciles_a_durable_captain_from_stale_work_placement() {
+    fn empty_backend_restart_report_reconciles_a_durable_captain_from_stale_work_placement() {
         let path = captains_tmp("captain-relocation-crash");
         CaptainsRegistry::load(path.clone())
             .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
             .unwrap();
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         let tabs = Arc::new(TabRegistry::new());
-        tabs.replace(vec![TabRecord {
-            id: "work-a".into(),
-            name: "Work A".into(),
-            tile_ids: vec!["captain-a".into()],
-        }]);
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -22819,15 +22826,22 @@ mod tests {
             .with_captains_registry(Arc::clone(&captains))
             .with_tab_registry(Arc::clone(&tabs))
             .with_apply_sink(sink.clone());
-        let stale = tabs.snapshot_full();
+        let startup = tabs.snapshot_full();
+        assert!(
+            startup.tabs.is_empty(),
+            "production starts with no backend tabs"
+        );
 
         let response = dispatch(
             &context,
             "report_workspace_tabs",
             &json!({
-                "baseSeq": stale.seq,
-                "tabs": stale.tabs,
-                "activeTabId": stale.active_tab_id
+                "baseSeq": startup.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": []}
+                ],
+                "activeTabId": "work-a"
             }),
         )
         .unwrap();
@@ -22856,6 +22870,60 @@ mod tests {
 
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_backend_restart_rejects_foreign_or_duplicate_supervisor_placement_without_effect() {
+        for (tag, reported_tabs) in [
+            (
+                "foreign",
+                json!([
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["foreign-captain"]}
+                ]),
+            ),
+            (
+                "duplicate",
+                json!([
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                ]),
+            ),
+        ] {
+            let path = captains_tmp(&format!("empty-restart-{tag}"));
+            CaptainsRegistry::load(path.clone())
+                .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+                .unwrap();
+            let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+            let tabs = Arc::new(TabRegistry::new());
+            let context = test_ctx(&format!("empty-restart-{tag}"))
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs));
+            let before_captains = captains.snapshot();
+            let before_tabs = tabs.snapshot_full();
+
+            assert!(dispatch(
+                &context,
+                "report_workspace_tabs",
+                &json!({"baseSeq": 0, "tabs": reported_tabs}),
+            )
+            .is_err());
+            assert_eq!(captains.snapshot().seq, before_captains.seq, "case {tag}");
+            assert_eq!(
+                captains.snapshot().captains,
+                before_captains.captains,
+                "case {tag}"
+            );
+            assert_eq!(tabs.snapshot_full().seq, before_tabs.seq, "case {tag}");
+            assert_eq!(
+                serde_json::to_value(tabs.snapshot_full().tabs).unwrap(),
+                serde_json::to_value(before_tabs.tabs).unwrap(),
+                "case {tag}"
+            );
+
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
