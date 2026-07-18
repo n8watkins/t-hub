@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -39,6 +39,7 @@ const IDENTITIES_SCHEMA_VERSION: u32 = 2;
 const LEGACY_IDENTITIES_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_GENERATION_WATERMARK_FORMAT: &str = "t-hub:identity-generation-watermark:v1";
+const IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION: u32 = 2;
 
 /// Best-effort org role captured at mint. Durable role-keying is item 2 (see the
 /// module note); this is enough for the plane to record "in what role" alongside the
@@ -227,9 +228,11 @@ struct IdentityGenerationWatermark {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IdentitySchemaMigrationReceipt {
+    schema_version: u32,
     from_schema_version: u32,
     to_schema_version: u32,
     source_sha256: String,
+    target_semantic_sha256: String,
 }
 
 impl IdentityGenerationWatermark {
@@ -243,12 +246,18 @@ impl IdentityGenerationWatermark {
         }
     }
 
-    fn migrating_v1(generation_high_water: u64, source_sha256: String) -> Self {
+    fn migrating_v1(
+        generation_high_water: u64,
+        source_sha256: String,
+        target_semantic_sha256: String,
+    ) -> Self {
         Self {
             migration: Some(IdentitySchemaMigrationReceipt {
+                schema_version: IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION,
                 from_schema_version: LEGACY_IDENTITIES_SCHEMA_VERSION,
                 to_schema_version: IDENTITIES_SCHEMA_VERSION,
                 source_sha256,
+                target_semantic_sha256,
             }),
             ..Self::current(generation_high_water)
         }
@@ -263,9 +272,11 @@ impl IdentityGenerationWatermark {
             return Err("identity generation watermark is malformed or unsupported".into());
         }
         if let Some(migration) = &self.migration {
-            if migration.from_schema_version != LEGACY_IDENTITIES_SCHEMA_VERSION
+            if migration.schema_version != IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION
+                || migration.from_schema_version != LEGACY_IDENTITIES_SCHEMA_VERSION
                 || migration.to_schema_version != IDENTITIES_SCHEMA_VERSION
                 || !is_canonical_sha256(&migration.source_sha256)
+                || !is_canonical_sha256(&migration.target_semantic_sha256)
                 || self.identities_schema_version != IDENTITIES_SCHEMA_VERSION
             {
                 return Err("identity generation watermark migration receipt is malformed".into());
@@ -352,6 +363,37 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
         return Err("identity store generation high-water mark is inconsistent".into());
     }
     Ok(())
+}
+
+fn identity_snapshot_semantic_sha256(snapshot: &IdentitiesSnapshot) -> Result<String, String> {
+    let mut identities = BTreeMap::new();
+    for (id, identity) in &snapshot.identities {
+        let secret = crate::secret_seal::unseal_str(&identity.secret)
+            .ok_or("identity migration target contains an unreadable sealed secret")?;
+        identities.insert(
+            id,
+            serde_json::json!({
+                "id": identity.id,
+                "generation": identity.generation,
+                "secretSha256": sha256_hex(secret.as_bytes()),
+                "role": identity.role.label(),
+                "sessionTile": identity.session_tile,
+                "shipSlug": identity.ship_slug,
+                "allocationKey": identity.allocation_key,
+                "mintedAt": identity.minted_at,
+            }),
+        );
+    }
+    let mut revoked = snapshot.revoked.iter().collect::<Vec<_>>();
+    revoked.sort_unstable();
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": IDENTITIES_SCHEMA_VERSION,
+        "generation": snapshot.generation,
+        "identities": identities,
+        "revoked": revoked,
+    }))
+    .map_err(|error| format!("identity migration target could not be digested: {error}"))?;
+    Ok(sha256_hex(&canonical))
 }
 
 fn validate_allocation_key(allocation_key: &str) -> Result<(), String> {
@@ -620,8 +662,12 @@ impl IdentityStore {
                     ))),
                     Ok(Some(watermark)),
                 ) if watermark.identities_schema_version == IDENTITIES_SCHEMA_VERSION => {
+                    let target_semantic_sha256 =
+                        identity_snapshot_semantic_sha256(&snapshot).ok();
                     let matching_migration = watermark.migration.as_ref().is_some_and(|receipt| {
                         receipt.source_sha256 == source_sha256
+                            && target_semantic_sha256.as_deref()
+                                == Some(receipt.target_semantic_sha256.as_str())
                             && snapshot.generation == watermark.generation_high_water
                     });
                     if matching_migration {
@@ -680,12 +726,28 @@ impl IdentityStore {
                     Ok(Some((snapshot, IdentitySnapshotSource::Current, _source_sha256))),
                     Ok(Some(watermark)),
                 ) => {
-                    let action = if watermark.migration.is_some() {
-                        IdentityLoadPersistAction::FinalizeSchemaV1
+                    let matching_target = watermark.migration.as_ref().is_none_or(|receipt| {
+                        identity_snapshot_semantic_sha256(&snapshot).ok().as_deref()
+                            == Some(receipt.target_semantic_sha256.as_str())
+                    });
+                    if !matching_target {
+                        (
+                            IdentitiesSnapshot::default(),
+                            IdentityLoadPersistAction::None,
+                            Some(
+                                "identity schema migration target digest does not match identities.json"
+                                    .to_string(),
+                            ),
+                            watermark,
+                        )
                     } else {
-                        IdentityLoadPersistAction::None
-                    };
-                    (snapshot, action, None, watermark)
+                        let action = if watermark.migration.is_some() {
+                            IdentityLoadPersistAction::FinalizeSchemaV1
+                        } else {
+                            IdentityLoadPersistAction::None
+                        };
+                        (snapshot, action, None, watermark)
+                    }
                 }
                 (
                     Ok(Some((
@@ -811,8 +873,11 @@ impl IdentityStore {
             .watermark_path
             .as_ref()
             .ok_or("identity generation watermark path is unavailable")?;
-        let migration =
-            IdentityGenerationWatermark::migrating_v1(snapshot.generation, source_sha256);
+        let migration = IdentityGenerationWatermark::migrating_v1(
+            snapshot.generation,
+            source_sha256,
+            identity_snapshot_semantic_sha256(snapshot)?,
+        );
         write_generation_watermark(watermark_path, &migration).map_err(|error| {
             format!(
                 "identity migration receipt persist to '{}' failed: {error}",
@@ -1331,20 +1396,44 @@ fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> std::io::Result<()
 }
 
 fn write_private_atomic(path: &PathBuf, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, body)?;
+    let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(body)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1740,9 +1829,13 @@ mod tests {
             "revoked": []
         });
         let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
-        let migration = IdentityGenerationWatermark::migrating_v1(4, sha256_hex(&v1_bytes));
-
         std::fs::write(&path, &v1_bytes).unwrap();
+        let target = read_identities_snapshot(&path).unwrap().0;
+        let migration = IdentityGenerationWatermark::migrating_v1(
+            4,
+            sha256_hex(&v1_bytes),
+            identity_snapshot_semantic_sha256(&target).unwrap(),
+        );
         write_generation_watermark(&watermark_path, &migration).unwrap();
         let after_receipt = IdentityStore::load(path.clone());
         assert!(after_receipt.write_blocked.is_none());
@@ -1789,7 +1882,8 @@ mod tests {
             "revoked": []
         });
         let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
-        let migration = IdentityGenerationWatermark::migrating_v1(4, "0".repeat(64));
+        let migration =
+            IdentityGenerationWatermark::migrating_v1(4, "0".repeat(64), "1".repeat(64));
         let watermark_bytes = serde_json::to_vec_pretty(&migration).unwrap();
         std::fs::write(&path, &v1_bytes).unwrap();
         std::fs::write(&watermark_path, &watermark_bytes).unwrap();
@@ -1799,6 +1893,100 @@ mod tests {
             reason.contains("downgraded to schema v1")
                 && reason.contains("operation allocation ownership")
         }));
+        assert!(blocked.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), v1_bytes);
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn pending_migration_rejects_tampered_same_generation_v2_target() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let v1 = serde_json::json!({
+            "schemaVersion": LEGACY_IDENTITIES_SCHEMA_VERSION,
+            "generation": 4,
+            "identities": {
+                "identity-four": {
+                    "id": "identity-four",
+                    "generation": 4,
+                    "secret": "secret-four",
+                    "role": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
+        std::fs::write(&path, &v1_bytes).unwrap();
+        let target = read_identities_snapshot(&path).unwrap().0;
+        let migration = IdentityGenerationWatermark::migrating_v1(
+            4,
+            sha256_hex(&v1_bytes),
+            identity_snapshot_semantic_sha256(&target).unwrap(),
+        );
+        write_atomic(&path, &target).unwrap();
+        write_generation_watermark(&watermark_path, &migration).unwrap();
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tampered["identities"]["identity-four"]["role"] = serde_json::json!("crew");
+        let tampered_bytes = serde_json::to_vec_pretty(&tampered).unwrap();
+        let watermark_bytes = std::fs::read(&watermark_path).unwrap();
+        std::fs::write(&path, &tampered_bytes).unwrap();
+
+        let blocked = IdentityStore::load(path.clone());
+        assert!(blocked
+            .write_blocked
+            .as_deref()
+            .is_some_and(|reason| reason.contains("target digest does not match")));
+        assert!(blocked.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), tampered_bytes);
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn pre_target_digest_migration_receipt_is_incompatible_and_byte_preserved() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let v1 = serde_json::json!({
+            "schemaVersion": LEGACY_IDENTITIES_SCHEMA_VERSION,
+            "generation": 4,
+            "identities": {
+                "identity-four": {
+                    "id": "identity-four",
+                    "generation": 4,
+                    "secret": "secret-four",
+                    "role": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
+        let legacy_receipt = serde_json::json!({
+            "schemaVersion": IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+            "formatIdentity": IDENTITY_GENERATION_WATERMARK_FORMAT,
+            "identitiesSchemaVersion": IDENTITIES_SCHEMA_VERSION,
+            "generationHighWater": 4,
+            "migration": {
+                "fromSchemaVersion": LEGACY_IDENTITIES_SCHEMA_VERSION,
+                "toSchemaVersion": IDENTITIES_SCHEMA_VERSION,
+                "sourceSha256": sha256_hex(&v1_bytes)
+            }
+        });
+        let watermark_bytes = serde_json::to_vec_pretty(&legacy_receipt).unwrap();
+        std::fs::write(&path, &v1_bytes).unwrap();
+        std::fs::write(&watermark_path, &watermark_bytes).unwrap();
+
+        let blocked = IdentityStore::load(path.clone());
+        assert!(blocked
+            .write_blocked
+            .as_deref()
+            .is_some_and(|reason| reason.contains("watermark") && reason.contains("malformed")));
         assert!(blocked.mint(Role::Crew).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), v1_bytes);
         assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
