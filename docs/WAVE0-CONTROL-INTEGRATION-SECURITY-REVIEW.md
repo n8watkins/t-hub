@@ -532,6 +532,29 @@ An authenticated `th send` report of the final-gate results was attempted from e
 The installed control plane rejected it because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+At `1c069ab42c5b932866bab790f9f3d4dd75f50c70`, the six legacy real-tmux tests were reproduced individually on the fresh isolated socket `t-hub-wave0-1c069ab-legacy-repro` with `RUST_TEST_THREADS=1`, `timeout 120s`, `--nocapture`, and `--test-threads=1`.
+`apply_forwards_are_broadcast_to_event_subscribers` failed at `src/control.rs:19394` when its final `close_terminal` unwrap received `tmux kill-session-tree failed (exit 1): server exited unexpectedly`.
+`attach_captain_refuses_read_only_and_preserves_existing_control_capability` failed at `src/control.rs:22113` with the same final close error.
+Its read-only capability assertion completed before teardown, so no startup or Alive wait was added.
+`commission_captain_spawns_binds_bootstraps_and_deduplicates` failed at `src/control.rs:21906` with the same final close error.
+`claim_and_release_are_audited_and_forward_the_captains_snapshot` failed at `src/control.rs:22701` with the same final close error.
+`codex_claim_never_inherits_a_stale_claude_session_id` failed at `src/control.rs:22768` with the same final close error.
+`claim_conflicts_liveness_and_bad_release_are_dispatch_errors` failed at `src/control.rs:22841` with the same final close error.
+These results confirm the test-fixture final-session teardown race and do not expose a production control, Powder, HMAC, schema, or permission-attestation behavior defect.
+
+Commit `74e5e52` changes only the `#[cfg(test)]` module in `src/control.rs`.
+It acquires the existing `ProcessAttestationTmuxGuard` at the beginning of exactly those six tests, keeping a separate anchor session alive while each test's own terminal is closed.
+It preserves every tested `close_terminal` call and does not change production `tmux.rs`, error handling, liveness classification, or any production source.
+On fresh socket `t-hub-wave0-1c069ab-legacy-fixed`, each of the six exact tests then passed individually with `RUST_TEST_THREADS=1`, an external 120-second timeout, `--nocapture`, and one test thread.
+The requested serial fresh-socket control matrix ran once on `t-hub-wave0-1c069ab-control-focused` with `RUST_TEST_THREADS=1`, `timeout 600s cargo test -p t-hub control::tests:: -- --nocapture --test-threads=1`.
+It began 364 tests and its captured portion was green, including all six remediated fixtures.
+Its output channel detached before Cargo's final aggregate was returned, while the one test process continued and then exited.
+The serial matrix was not rerun, so no complete 364-test aggregate is claimed.
+On fresh sockets, the existing tmux matrix passed 11 tests and the process-level permission-attestation matrix passed 4 tests.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
+The workspace gate was not run again.
+This focused test-only remediation requires a fresh exact-head independent review before any completion decision.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
