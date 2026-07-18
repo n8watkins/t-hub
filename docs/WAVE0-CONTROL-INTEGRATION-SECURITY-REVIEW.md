@@ -611,6 +611,9 @@ The current fixed head passed the exact Codex marker test and the 4-test process
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
 No full control aggregate or workspace aggregate was run for this follow-up.
 The prior workspace aggregate residual remains unresolved and is not claimed as fixed.
+An authenticated `th send` report for this follow-up was attempted from evidence head `618d3f577deeab842e7b47c2f6c40bf462dd6777` to Captain session `0c7b7560`.
+The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 ## Independent Reviewer Checklist
 
