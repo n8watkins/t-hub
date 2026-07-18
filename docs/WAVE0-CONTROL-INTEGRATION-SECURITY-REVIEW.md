@@ -633,6 +633,9 @@ The two dispatch-worker unwind cleanup tests passed.
 The exact empty-private-Claude rollback test and the retained harness-command rollback test passed.
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
 No aggregate test gate was run for this fixture-only follow-up.
+An authenticated `th send` report for this follow-up was attempted from evidence head `0c3041cf5c7ffe536d8fdf2a40c1d61bf1bdaf3e` to Captain session `0c7b7560`.
+The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 ## Independent Reviewer Checklist
 
