@@ -594,6 +594,7 @@ struct RegistryInner {
 #[derive(Default)]
 pub struct TabRegistry {
     inner: Mutex<RegistryInner>,
+    identity_transaction: Mutex<()>,
 }
 
 impl TabRegistry {
@@ -605,6 +606,12 @@ impl TabRegistry {
         // A poisoned registry lock means a panic mid-mutation; the data is a plain
         // Vec so continuing with it is safe (same policy as recovering the guard).
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn identity_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.identity_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Replace the whole registry (legacy up-sync; no staleness check). Kept for
@@ -735,6 +742,28 @@ impl TabRegistry {
             .iter()
             .find(|tab| tab.id == id && tab.kind() == WorkspaceKind::Work)
             .cloned()
+    }
+
+    fn workspace_for_tile(&self, tile_id: &str) -> Option<String> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|tab| tab.tile_ids.iter().any(|tile| tile == tile_id))
+            .map(|tab| tab.id.clone())
+    }
+
+    fn restore_tile_placement(
+        &self,
+        tile_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        match workspace_id {
+            Some(workspace_id) => self.move_tile(tile_id, workspace_id),
+            None => {
+                self.remove_tile(tile_id);
+                Ok(())
+            }
+        }
     }
 
     /// Record a new (empty) tab so its id is addressable immediately. No-op (no
@@ -1984,6 +2013,7 @@ pub fn apply_workspace_report(
     active_tab_id: Option<String>,
     base_seq: Option<u64>,
 ) -> Result<(ReportOutcome, bool), String> {
+    let _identity_transaction = tabs_registry.identity_transaction();
     let mut tabs = TabRegistry::normalize_tabs(tabs)?;
     let _mutation = captains_registry
         .mutation
@@ -10839,6 +10869,7 @@ fn attach_captain(
             captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 || captain.ship_slug == ship_slug
         });
+    let previous_workspace = ctx.tabs.workspace_for_tile(&terminal_id);
     claim_captain(ctx, &claim_args, None, true)?;
     let claimed = ctx
         .captains
@@ -10856,11 +10887,18 @@ fn attach_captain(
                     &claimed,
                     previous_claim.clone(),
                 );
+                let placement_rollback = ctx
+                    .tabs
+                    .restore_tile_placement(&terminal_id, previous_workspace.as_deref());
                 return Err(format!(
-                    "attach_captain: durable project binding failed: {error}{}",
+                    "attach_captain: durable project binding failed: {error}{}{}",
                     rollback
                         .err()
                         .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                        .unwrap_or_default(),
+                    placement_rollback
+                        .err()
+                        .map(|rollback| format!("; placement rollback failed: {rollback}"))
                         .unwrap_or_default()
                 ));
             }
@@ -10878,14 +10916,21 @@ fn attach_captain(
             let rollback =
                 ctx.captains
                     .rollback_provisioned_claim(&terminal_id, &captain, previous_claim);
+            let placement_rollback = ctx
+                .tabs
+                .restore_tile_placement(&terminal_id, previous_workspace.as_deref());
             if rollback.is_ok() {
                 let _ = captains_sync_apply(ctx);
             }
             return Err(format!(
-                "attach_captain: target bootstrap delivery failed: {error}{}",
+                "attach_captain: target bootstrap delivery failed: {error}{}{}",
                 rollback
                     .err()
                     .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                    .unwrap_or_default(),
+                placement_rollback
+                    .err()
+                    .map(|rollback| format!("; placement rollback failed: {rollback}"))
                     .unwrap_or_default()
             ));
         }
@@ -16349,6 +16394,25 @@ fn claim_captain(
                 .collect()
         })
         .unwrap_or_default();
+    let _identity_transaction = ctx.tabs.identity_transaction();
+    let previous_workspace = ctx.tabs.workspace_for_tile(&captain_session_id);
+    let requested_slug = match role {
+        FleetRole::Cortana => CORTANA_SLUG.to_string(),
+        FleetRole::Captain => ship_slug
+            .as_deref()
+            .map(slugify_ship)
+            .filter(|slug| !slug.is_empty())
+            .unwrap_or_else(|| slugify_ship(&format!("ship-{captain_session_id}"))),
+    };
+    let previous_claim = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| {
+            captain.terminal_id.as_deref() == Some(captain_session_id.as_str())
+                || captain.ship_slug == requested_slug
+        });
     let mut unique_workspace_ids = std::collections::HashSet::new();
     for workspace_id in &workspace_tab_ids {
         if !unique_workspace_ids.insert(workspace_id.as_str()) {
@@ -16409,9 +16473,51 @@ fn claim_captain(
         &is_terminal_dead,
         &crew_liveness,
     )?;
+    if let Err(error) = ctx
+        .tabs
+        .move_tile(&captain_session_id, CAPTAIN_WORKSPACE_ID)
+    {
+        let rollback = ctx.captains.rollback_provisioned_claim(
+            &captain_session_id,
+            &outcome.record,
+            previous_claim.clone(),
+        );
+        return Err(format!(
+            "claim_captain: Captain Workspace relocation failed: {error}{}",
+            rollback
+                .err()
+                .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default()
+        ));
+    }
     let snap = ctx.captains.snapshot();
+    if let Err(error) = organization_sync_apply(
+        ctx,
+        "move_tile",
+        json!({"terminalId": captain_session_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+    ) {
+        let placement_rollback = ctx
+            .tabs
+            .restore_tile_placement(&captain_session_id, previous_workspace.as_deref());
+        let registry_rollback = ctx.captains.rollback_provisioned_claim(
+            &captain_session_id,
+            &outcome.record,
+            previous_claim,
+        );
+        return Err(format!(
+            "claim_captain: Captain Workspace synchronization failed: {error}{}{}",
+            placement_rollback
+                .err()
+                .map(|rollback| format!("; placement rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            registry_rollback
+                .err()
+                .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default()
+        ));
+    }
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
-    // redundant forward. A real change bumps `seq` and forwards the snapshot.
+    // redundant Captain forward. Placement sync above still heals a stale tile.
     let applied = snap.seq != before_seq && captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "claim_captain",
@@ -23403,10 +23509,15 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "attach-work".into(),
+            name: "Attach Work".into(),
+            tile_ids: Vec::new(),
+        }]);
         let read_id = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({ "cwd": "/tmp", "capability": "read" }),
+            &json!({ "cwd": "/tmp", "capability": "read", "tabId": "attach-work" }),
         )
         .unwrap()["id"]
             .as_str()
@@ -23436,6 +23547,7 @@ mod tests {
             &json!({
                 "cwd": "/tmp",
                 "capability": "control",
+                "tabId": "attach-work",
                 "startupCommand": harness_command,
             }),
         )
@@ -23461,6 +23573,37 @@ mod tests {
         assert_eq!(attached["captain"]["provider"], "codex");
         assert!(attached["captain"].get("providerSessionId").is_none());
         assert!(attached["captain"].get("claudeUuid").is_none());
+        let attached_tabs = ctx.tabs.snapshot_full();
+        assert!(!attached_tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&control_id));
+        assert_eq!(
+            attached_tabs
+                .tabs
+                .iter()
+                .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+                .unwrap()
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &control_id)
+                .count(),
+            1
+        );
+        let unchanged_report = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": attached_tabs.seq,
+                "tabs": attached_tabs.tabs,
+                "activeTabId": attached_tabs.active_tab_id
+            }),
+        )
+        .unwrap();
+        assert!(unchanged_report.get("reported").is_some());
 
         let checkpoint = dispatch(
             &ctx,
@@ -23480,6 +23623,144 @@ mod tests {
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": read_id })).unwrap();
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": control_id })).unwrap();
         std::fs::remove_dir_all(harness_bin_dir).unwrap();
+    }
+
+    #[test]
+    fn attach_captain_binding_failure_restores_placement_and_retry_is_durable() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("attach-relocation-rollback");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-attach-rollback".into(),
+                name: "Attach Rollback".into(),
+                repo_root: "/tmp/attach-rollback".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "attach-rollback".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "attach-work".into(),
+            name: "Attach Work".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let mut ctx = test_ctx("attach-relocation-rollback")
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        ctx.addr = "127.0.0.1:4242".into();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({
+                "cwd": "/tmp",
+                "capability": "control",
+                "tabId": "attach-work",
+                "startupCommand": harness_command
+            }),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        let persist_count = Arc::new(AtomicU64::new(0));
+        let fail_registry = Arc::clone(&captains);
+        let hook_count = Arc::clone(&persist_count);
+        captains.set_persist_hook(Box::new(move || {
+            if hook_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                fail_registry.fail_next_persist("attach bind persistence failure");
+            }
+        }));
+
+        let error = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("attach bind persistence failure"),
+            "got: {error}"
+        );
+        assert!(captains.snapshot().captains.is_empty());
+        let rolled_back = tabs.snapshot_full();
+        assert_eq!(
+            rolled_back
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        assert!(rolled_back
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+
+        captains.set_persist_hook(Box::new(|| {}));
+        let retry = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(retry["accepted"], "attach_captain");
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 1);
+        assert_eq!(
+            restored.captains[0].project_id.as_deref(),
+            Some("project-attach-rollback")
+        );
+        let final_tabs = tabs.snapshot_full();
+        assert_eq!(
+            final_tabs
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        assert!(final_tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -24068,6 +24349,167 @@ mod tests {
         assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+    }
+
+    #[test]
+    fn claim_captain_relocates_the_tile_atomically_and_survives_retry_and_restart() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("claim-relocation-restart");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let ctx = test_ctx("claim-relocation")
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "work-a", "startupCommand": harness_command}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+
+        let claimed = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "shipSlug": "alpha",
+                "workspaceTabIds": ["work-a"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(claimed["accepted"], "claim_captain");
+        let snapshot = tabs.snapshot_full();
+        let work = snapshot.tabs.iter().find(|tab| tab.id == "work-a").unwrap();
+        let captain_workspace = snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap();
+        assert!(!work.tile_ids.contains(&captain_id));
+        assert_eq!(
+            captain_workspace
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+
+        let unchanged = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": snapshot.seq,
+                "tabs": snapshot.tabs,
+                "activeTabId": snapshot.active_tab_id
+            }),
+        )
+        .unwrap();
+        assert!(unchanged.get("reported").is_some());
+        dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "shipSlug": "alpha",
+                "workspaceTabIds": ["work-a"]
+            }),
+        )
+        .unwrap();
+        let after_retry = tabs.snapshot_full();
+        assert_eq!(
+            after_retry
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 1);
+        assert_eq!(
+            restored.captains[0].terminal_id.as_deref(),
+            Some(captain_id.as_str())
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_claim_captain_persistence_keeps_the_original_work_placement() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let captains = Arc::new(CaptainsRegistry::load(captains_tmp(
+            "claim-relocation-fail",
+        )));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let ctx = test_ctx("claim-relocation-fail")
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "work-a", "startupCommand": harness_command}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        let before = tabs.snapshot_full();
+        captains.fail_next_persist("claim relocation persistence failure");
+        let error = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": captain_id, "shipSlug": "alpha"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("claim relocation persistence failure"));
+        assert!(captains.snapshot().captains.is_empty());
+        let after = tabs.snapshot_full();
+        assert_eq!(after.seq, before.seq);
+        assert!(after
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "work-a")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(!after
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
