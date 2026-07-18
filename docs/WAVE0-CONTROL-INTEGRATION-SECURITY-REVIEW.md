@@ -412,6 +412,10 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+An authenticated `th send` report to Captain session `0c7b7560` was attempted from final evidence head `001650a31d1088d24c370ad9d90882075fce5442`.
+The installed control plane rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
