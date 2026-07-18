@@ -306,7 +306,8 @@ It uses only the frozen connection profile, repository, card, run, agent, and op
 For `InFlight` or `Ambiguous` recovery, it first reads authoritative exact-run evidence.
 If Powder already reports the exact run released after response loss, recovery clears local transaction-owned state without a second release POST.
 If the run remains active with the exact card and agent, recovery may perform one exact release using the frozen scope.
-`Prepared` remains explicitly recovery-pending because no release POST was durably recorded.
+`Prepared` recovery first validates frozen profile, repository, current card claim, and exact run evidence, ensures its transaction terminal is gone, then atomically advances to `InFlight` before any exact release POST.
+If that recovery-side POST has an ambiguous response, the durable `InFlight` record remains authoritative for the next reconciliation.
 
 Schema version 11 makes the endpoint-pinned recovery shape incompatible with an older binary that could silently discard it.
 Version 10 snapshots without a release recovery load and upgrade on their next write.
@@ -314,7 +315,7 @@ Version 10 snapshots containing a release recovery fail closed before any recove
 Snapshot validation requires each release recovery to map to exactly one `CleanupPending` Crew under the exact Project with matching terminal, card, run, agent, and frozen-scope marker.
 The reciprocal marker check rejects orphaned Crew recovery state, mismatched or foreign records, and duplicate recovery state before any remote release.
 
-Deterministic coverage at `1568bbd` proves a crash-equivalent restart before POST retains `Prepared`, preserves a replacement Powder binding, and emits zero release requests to either original or replacement profile.
+The earlier Prepared restart description is superseded by the post-rereview test below.
 The response-loss test proves a release POST can commit while its response is lost, and that restart reconciles released run evidence without a blind second POST.
 The same test forces ambiguity-state persistence failure after the POST and proves restart recovers from the last durable `InFlight` state without touching the replacement scope.
 Malformed persistence pair coverage exercises orphan, foreign Project, mismatched agent, and missing reciprocal marker records with no network client construction.
@@ -371,6 +372,19 @@ No post-remediation workspace-wide test result is claimed.
 The standalone CLI suite passed 47 unit tests and 10 Powder contract tests.
 One immediately chained MCP command was started from the standalone CLI manifest, where Cargo rejected `-p t-hub-mcp` before MCP test execution because that package is outside that manifest's package set.
 The MCP suite was then run from the desktop workspace and passed 16 library tests and 75 binary tests.
+
+Commit `11a2204` adds frozen-endpoint current-card validation to dispatch release recovery and repairs the prior Prepared false-positive fixture.
+Recovery now reads authoritative current card evidence after repository validation and before run evidence.
+Already-released convergence requires an exact released run plus a ready card with no current claim, and emits no release POST.
+An active release requires the exact current card claim run and agent plus the exact active run before it can POST.
+Reclaimed, different-claim, unknown-run, and malformed-card evidence retain the durable recovery and issue zero release mutation or replacement-scope I/O.
+The repaired Prepared regression uses a real transaction-owned tmux terminal and coherent `t-hub` ownership.
+It proves terminal teardown, durable `Prepared` to `InFlight` transition before the response-loss release attempt, one original-scope card read, one run read, one exact release POST, and zero replacement-scope I/O.
+Replacement, same-terminal ABA, and exhausted-baseline success tests now assert both pending dispatch collections are empty.
+At `11a2204`, the serialized dispatch filter passed 32 tests with one existing real-agent test intentionally ignored.
+The serialized control Powder filter passed 63 tests, the Powder client filter passed 30 tests, the Harness filter passed 15 tests, and the close filter passed 7 tests.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
+No post-remediation workspace-wide test result is claimed.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
