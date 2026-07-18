@@ -17378,6 +17378,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_with_sink_spawns_places_and_returns_id() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Headless-org: with a UI sink wired, the SERVER spawns the real session,
         // resolves `tabName` against the authoritative registry (minting a hidden
         // tab without switching the active one), places the tile there, returns
@@ -17440,6 +17441,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_terminal_converts_wsl_unc_for_tmux_but_preserves_the_public_cwd() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -17486,6 +17488,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_forwards_the_startup_command() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // T-B: the socket spawn carries the webview presets' `startupCommand`
         // (the resume flow's `claude --resume <id>` in production; a harmless
         // echo here - headless-org spawns the REAL session server-side now, so
@@ -18643,6 +18646,7 @@ mod tests {
 
     #[test]
     fn spawn_survives_a_concurrent_close_of_its_target_tab() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Dispatch-level tab-closed-during-spawn race: close_tab races the spawn's
         // resolve->tmux->place window. Whichever side wins, the invariant holds:
         // the spawned session ends up in EXACTLY ONE registry tab, and the
@@ -18807,6 +18811,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_default_placement_is_the_active_tab_without_switching() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // No tabName/tabId: the tile lands in the tab the USER has active (per the
         // registry mirror) - matching the "+" menu - and never switches it.
         let sink = Arc::new(RecordingSink {
@@ -18886,6 +18891,7 @@ mod tests {
     /// Needs a real tmux on PATH (WSL2 dev shell; not the Windows CI target).
     #[test]
     fn live_send_read_close_roundtrip() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // The id must honor the production invariant "the id IS the tmux session
         // suffix, capped at 8 chars" (`tmux::target_for_id`) — the previous long
         // `mcp3test<nanos>` id created `th_mcp3test<nanos>` but dispatched
@@ -22850,6 +22856,7 @@ mod tests {
 
     #[test]
     fn idempotent_reclaim_does_not_bump_seq_or_forward() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -22901,6 +22908,7 @@ mod tests {
 
     #[test]
     fn spawn_with_spawned_by_records_crew_and_close_terminal_removes_it() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -22976,6 +22984,7 @@ mod tests {
 
     #[test]
     fn spawn_with_an_unclaimed_spawned_by_still_spawns_without_a_crew_link() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -23417,6 +23426,7 @@ mod tests {
 
     #[test]
     fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // End-to-end through dispatch_authenticated (governor + audit) against a
         // REAL tmux session: a legitimate crew spawn -> send_text -> close must all
         // be ADMITTED and audited allowed. This is the "legit orchestration still
@@ -25285,6 +25295,7 @@ mod tests {
 
     #[test]
     fn spawn_terminal_retry_with_same_request_id_does_not_duplicate() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // Repro of Incident A/B at the dispatch layer: a spawn that is RETRIED with
         // the same requestId (the client's recovery from an ambiguous response leg)
         // must apply exactly once - one tmux session, one tile, one UI forward - and
