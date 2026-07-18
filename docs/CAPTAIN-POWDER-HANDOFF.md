@@ -10,16 +10,156 @@ The CLI-first phase is governed by [cli-contract.md](./cli-contract.md), which p
 Agent status is governed by [STATUS-MODEL.md](./STATUS-MODEL.md), and shared worktree state is governed by [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
 Where the narrower ordered list in this handoff differs from the phased plan, follow the phased plan.
 
-**Updated:** 2026-07-15.
+**Updated:** 2026-07-18.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `fix/captain-control-runtime`.
-**Source head before this handoff update:** `b058b1b`.
-**Installed Windows build:** locally built T-Hub `0.3.103` from exact detached source `8654986`.
+**Source head before this handoff update:** `20c14a3`.
+**Last verified installed Windows build:** locally built T-Hub `0.3.104` from exact detached source `e2ab7e3`; current installed identity after the later token rotation is unknown.
 
 ## Active Resume Boundary
 
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
+
+### Replacement Captain Resume Point, 2026-07-18
+
+This subsection supersedes every older resume point below for current orchestration state.
+It was written because Captain terminal `0c7b7560` retained a pinned control token after the T-Hub application rotated its token.
+The terminal remains alive, but `my_capability` and `captain_bootstrap` now fail with `unauthorized: bad control token`.
+The client correctly refuses to adopt the read-only token from `control.json`.
+The old Captain therefore cannot checkpoint, dispatch, steer, reap, release its registry claim, or communicate through T-Hub.
+The General must close or replace that terminal through the T-Hub UI, create a new control-capability Captain for the existing `t-hub-app` Project, and give it the kickoff prompt at the end of this subsection.
+
+#### Assignment and authority
+
+Recover ship `t-hub-app` for Project `t-hub-app` at `/home/natkins/projects/tools/t-hub/t-hub-app`.
+Continue improving T-Hub through the existing phased chain rather than starting a replacement roadmap.
+Powder profile name `n8desktop-wsl` and Powder repository `t-hub` are authoritative for work and claims.
+Never read the protected profile file, resolve its credential command, expose a token, or emulate a Powder claim locally.
+Read `AGENTS.md`, this handoff, and the canonical documents listed in `docs/REVIEW-INDEX.md` before changing work.
+Treat `docs/PHASED-PRODUCTION-PLAN.md` as the canonical implementation order.
+Treat `docs/CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md` as integrated General-directed input rather than a competing roadmap.
+Preserve cross-Project isolation, Crew read-capability defaults, protected credentials, production and protected-branch gates, idempotency, rollback guarantees, and installed-runtime verification.
+Commit every verified logical change separately with no agent co-author.
+Do not push, merge, install, restart, deploy, publish, or release unless the General explicitly authorizes that action.
+Preserve `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md`.
+Do not touch either Appturnity checkout or dispatch Appturnity Crew until its Project link is authoritative.
+
+#### Coordinator landing point
+
+The coordinator branch is `fix/captain-control-runtime` at `20c14a3e0b0cc6de9cee0f32826b18de85fdd8d9`.
+Commit `034b520` merged the independently approved Fleet Workspace Identity lane.
+Commit `20c14a3` serialized the request-status tmux fixture after landing.
+The coordinator has no tracked modification.
+Its only observed untracked paths are protected `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md`.
+No push, new install, restart, deploy, publication, or release followed this landing.
+
+Fleet Workspace Identity was independently approved at immutable head `f77ffae478d1239ed9720a99a3141859df21811b` before merge.
+Recorded exact-head evidence includes Rust formatting, warnings-denied Clippy, a clean Rust rerun with 932 passed and 2 ignored, frontend verification with 57 files and 477 tests, TypeScript, the production Vite build, real MCP E2E with 2 passed and 1 helper ignored, restart-convergence and foreign or duplicate rejection with 2 passed, and durable pre-report seed coverage with 1 passed.
+The separate Fleet worktree is clean except protected untracked `CLAUDE.md`.
+
+#### Active Cortana lane
+
+The Cortana worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/cortana-startup-recovery` on branch `feat/cortana-startup-recovery`.
+Its observed head is `fbed6e8`, `harden Cortana provider receipt observation`.
+Earlier reviewed foundations include authenticated journal migration at `c16bd10` and provider-session authentication at `6721fa4`.
+Independent review rejected `6721fa4` because provider validation used the canonical `.js` basename of an installed Codex symlink and because tmux environment observation could resolve a unique-prefix collision after the expected session died.
+Commit `fbed6e8` changes `control.rs`, `harness/mod.rs`, and `tmux.rs` and appears scoped to those two receipt-observation blockers.
+No post-rotation T-Hub report or independent approval for `fbed6e8` was available to the old Captain.
+The replacement Captain must not infer approval from the commit title.
+It must collect the Crew report and Powder evidence, inspect the exact diff, rerun proportionate gates, and obtain fresh independent exact-head review.
+
+The Cortana worktree currently also has uncommitted changes in `apps/desktop/src-tauri/src/control.rs` and `apps/desktop/src-tauri/src/identity.rs` totaling approximately 645 insertions and 28 deletions, plus protected untracked `CLAUDE.md`.
+Before token rotation, this was described as separate operation-bound Cortana identity and orphan-recovery work that had been restored after the receipt fix.
+That attribution is not freshly verified.
+Preserve the changes, inspect them before sending any instruction, and keep them separate from receipt review and remediation commits.
+
+Before token rotation, the authoritative Crew binding was Captain Crew terminal `ef9925f8`, Powder card `thub-cortana-startup-recovery`, and run `run-EE-3gLkCnBnn`.
+The replacement Captain must reread the manifest, terminal, claim, run, and work log before treating that binding as live.
+
+#### Active Codex capacity fallback lane
+
+The capacity worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-capacity-fallback` on branch `feat/codex-capacity-fallback`.
+Its observed head is `b45fd468e583dd9f40ad17ff091981effdcb37a2`, `fix(codex): close picker proof replay gaps`.
+The durable recovery policy and bounded journal through `7d3c9d0` were independently approved before token rotation.
+The official Codex 0.144.5 picker adapter at `b45fd46` was independently approved before token rotation with 20 focused tests, formatting, warnings-denied Clippy, exact capture freshness and predecessor binding, bounded row movement, strict Quick and All Models grammar, and official fixture coverage.
+That approval may not yet be appended to the authoritative Powder work log because the token rotated immediately afterward.
+The replacement Captain must reconcile the work log and append only through the sanctioned Crew binding if evidence is missing and the operation is unambiguous.
+
+The capacity worktree contains uncommitted integration work across the Harness, desktop library, Captain list, theme editor, tile header, IPC client, auto-continue watcher, and settings store.
+It also contains untracked implementation files `apps/desktop/src-tauri/src/codex_capacity.rs` and `apps/desktop/src/store/codexCapacity.ts`, plus protected untracked `CLAUDE.md`.
+Preserve all of that work.
+Do not ask the General to log in to Codex merely to continue this lane.
+Official source, exact snapshots, and disposable credential-free fixtures are sufficient for current development, while a real authenticated installed E2E may remain a final acceptance gate.
+
+Before token rotation, the authoritative Crew binding was Captain Crew terminal `100e3851`, Powder card `thub-codex-capacity-fallback`, and run `run-vZQTh0E9o5fe`.
+The replacement Captain must reread the manifest, terminal, claim, run, and work log before treating that binding as live.
+
+#### Newly requested chain workspace and terminal-header plan
+
+The General requested that a GPT-5.6-solo extra-high Crew create the plan and that the Captain not author the product implementation plan itself.
+The request strengthens card `thub-captain-workspace-integration` with durable chain-based Work Workspace ownership.
+Related tasks should share one named chain workspace instead of receiving duplicate worktree-named workspaces.
+Captains must remain in Captain Workspace, and Crew terminals must be created in the owning chain workspace.
+An eligible Work Workspace should be closed and destroyed only after its chain has landed and its terminals and worktrees are safely retired.
+Terminal headers should show the project or product first, the chain or workspace second, and branch or worktree detail as secondary information without repeating equivalent names.
+Responsive layouts should truncate deliberately, rename `Run + Preview` to `Preview`, and collapse Terminal, Files, Preview, and Board controls to accessible icons at narrow widths.
+
+A clean planning worktree already exists at `/home/natkins/projects/tools/t-hub/t-hub-worktrees/workspace-chain-lifecycle` on branch `plan/workspace-chain-lifecycle` at coordinator base `20c14a3`.
+It has no changes and no protected artifact.
+Two sanctioned `dispatch_crew` attempts against `thub-captain-workspace-integration` returned Powder HTTP 409.
+Each attempt rolled back cleanly with no Crew terminal, Powder claim, run binding, or partial local terminal retained.
+The card was last observed as `ready` and unclaimed, and protected Powder health was good.
+The sanitized error did not establish whether the conflict was a dependency, WIP limit, or another authoritative claim rule.
+Do not retry the dispatch blindly and do not create an unclaimed terminal as a substitute.
+First reread the board and reconcile any retained T-Hub operation intent.
+If the conflict persists, route this exact evidence to the Powder Captain through a sanctioned cross-Project communication surface.
+Once the card is authoritatively staffable, dispatch exactly one planning-only Crew into the shared chain workspace, verify the prompt, and select GPT-5.6-solo extra-high through the supported Codex UI because `dispatch_crew` does not currently accept model or reasoning parameters.
+Require an independent plan review before scheduling implementation with fresh context.
+
+#### Powder and control-plane state
+
+Immediately before token rotation, the T-Hub Project was authoritatively bound to protected profile `n8desktop-wsl` and repository `t-hub`.
+The Cortana and capacity claims above were healthy and auto-renewing.
+Fleet watches were armed for both active Crew on completed, needs-question, needs-permission, and failed transitions.
+The old Captain observed a Captain-only tab `captains-reserved`, a shared Crew tab `tab-mrqu9mvx-1`, and another generic tab `tab-mrl21zhy-1`.
+Those observations directly support the General's workspace naming and placement concern, but they are not current after token rotation.
+
+The only observed sentinel after token rotation was the older `powder-control-remediation.done`.
+No active Cortana, capacity, or planning sentinel was present.
+The old Captain could not update `captain_checkpoint` or append a Powder work log after rotation.
+The durable manifest is therefore expected to omit `fbed6e8`, the approval status of `b45fd46`, the two failed planning dispatches, and the token-rotation blocker.
+
+#### Ordered recovery and continuation
+
+1. Run the Captain skill environment check and confirm the new terminal has T-Hub `control` capability.
+2. Run full `captain_bootstrap`, then reconcile `list_captains`, `list_terminals`, tabs, live terminal reads, Git worktrees, provider conversation identifiers, the Project binding, Powder health, the board, active claims, runs, criteria, work logs, blockers, awaiting-input records, pending operation intents, and sentinels.
+3. Resolve the stale registry ownership left by terminal `0c7b7560` only through sanctioned T-Hub operations and observed liveness.
+4. Persist a new `captain_checkpoint` containing the exact reconciled facts and the next ordered action.
+5. Preserve and supervise the two active lanes before staffing new work.
+6. Review and land the Cortana receipt fix first if `fbed6e8` passes fresh independent review, then continue the separate identity and orphan-recovery slice.
+7. Reconcile the missing Powder approval log for `b45fd46`, then continue capacity integration and its real fallback flow.
+8. Reconcile the planning card's two HTTP 409 outcomes and staff the planning Crew only when Powder authoritatively allows one claim without overlap.
+9. Continue the remaining chain in canonical order: provider-neutral History, terminal and agent status prerequisites, sidebar status, final Captain Workspace integration including new-board Captain flow and obsolete-board cleanup, then installed-runtime completion audit.
+10. Use parallel Crew only when dependencies unlock and file ownership does not overlap, with independent review along the way.
+11. Reap terminals, worktrees, and Work Workspaces only after landed-work, evidence, follow-up, and clean-state gates all pass.
+
+The last user-facing progress estimate was approximately 45 percent of the full chain when weighted by exit gates.
+That estimate reflects Fleet Workspace Identity landed, substantial Cortana and capacity foundations complete, and significant integration, History, status, workspace UX, cleanup, and installed-runtime work still open.
+
+#### Captain creation purpose prompt
+
+Use the following as the assignment or purpose in the T-Hub Captain creation flow:
+
+```text
+Recover and continue ship t-hub-app for the existing T-Hub Project t-hub-app at /home/natkins/projects/tools/t-hub/t-hub-app.
+Use Powder profile n8desktop-wsl and repository t-hub as authoritative.
+First read AGENTS.md, docs/CAPTAIN-POWDER-HANDOFF.md, and every canonical document listed in docs/REVIEW-INDEX.md.
+Run full Captain durable recovery before acting, reconcile the stale prior Captain claim, all live Crew, Git worktrees, Powder claims and runs, pending operation intents, sentinels, and the two cleanly rolled-back HTTP 409 planning dispatches.
+Preserve every active lane and uncommitted change.
+Continue supervising Cortana startup recovery and Codex capacity fallback, require fresh independent review at each landing boundary, and staff the GPT-5.6-solo extra-high workspace-chain planning Crew only after Powder authoritatively permits the claim.
+Keep the Captain at orchestration altitude, use sanctioned T-Hub and Powder surfaces only, keep the durable checkpoint current, commit every verified logical change separately without a co-author, and do not push, merge, install, restart, deploy, publish, or release without explicit General authorization.
+```
 
 ### Verified 2026-07-17 Wave 0 Installed Activation Boundary
 
