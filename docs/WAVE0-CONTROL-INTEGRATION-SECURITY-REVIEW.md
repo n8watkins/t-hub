@@ -380,6 +380,9 @@ An active release requires the exact current card claim run and agent plus the e
 Reclaimed, different-claim, unknown-run, and malformed-card evidence retain the durable recovery and issue zero release mutation or replacement-scope I/O.
 The repaired Prepared regression uses a real transaction-owned tmux terminal and coherent `t-hub` ownership.
 It proves terminal teardown, durable `Prepared` to `InFlight` transition before the response-loss release attempt, one original-scope card read, one run read, one exact release POST, and zero replacement-scope I/O.
+The first repair attempt started a second `FakeHarnessSession` while the Captain fixture held its test-only process-attestation tmux guard, so the test blocked before exercising recovery.
+Only that attempt's exact zsh, Cargo, and `t_hub_lib` test PIDs `1818144`, `1818347`, and `1819163` were terminated.
+The final test creates its transaction-owned tmux terminal directly under the existing fixture guard and has no production `tmux.rs` change.
 Replacement, same-terminal ABA, and exhausted-baseline success tests now assert both pending dispatch collections are empty.
 At `11a2204`, the serialized dispatch filter passed 32 tests with one existing real-agent test intentionally ignored.
 The serialized control Powder filter passed 63 tests, the Powder client filter passed 30 tests, the Harness filter passed 15 tests, and the close filter passed 7 tests.
