@@ -23925,12 +23925,24 @@ mod tests {
 
     #[test]
     fn cortana_node_script_atomic_replacement_cannot_reach_attested() {
+        use std::os::unix::fs::symlink;
+
         let temp = tempfile::tempdir().unwrap();
-        let provider = temp.path().join("codex");
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let provider = package_bin.join("codex.js");
+        let launcher = launcher_bin.join("codex");
         std::fs::write(&provider, "provider-v1").unwrap();
-        let launch =
-            crate::harness::observe_provider_launch_receipt(&provider, Harness::Codex).unwrap();
-        let provider_path = provider.to_str().unwrap();
+        symlink(&provider, &launcher).unwrap();
+        let launch = crate::harness::test_observe_provider_launch_receipt(
+            &launcher,
+            Harness::Codex,
+            temp.path(),
+        )
+        .unwrap();
+        let provider_path = launcher.to_str().unwrap();
         let evidence = crate::harness::HarnessProcessEvidence::test(
             42,
             900,
