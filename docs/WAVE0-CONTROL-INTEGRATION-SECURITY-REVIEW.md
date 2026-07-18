@@ -554,6 +554,9 @@ On fresh sockets, the existing tmux matrix passed 11 tests and the process-level
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
 The workspace gate was not run again.
 This focused test-only remediation requires a fresh exact-head independent review before any completion decision.
+An authenticated `th send` report for this focused remediation was attempted from evidence head `94cdc62c718f28a3024bff19f4b09786f6d12fe4`.
+The installed control plane rejected it because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 ## Independent Reviewer Checklist
 
