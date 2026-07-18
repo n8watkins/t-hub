@@ -414,6 +414,19 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `ad74042` closes gateway response-body credential disclosure on matching keyed endpoints.
+Every externally surfaced Powder HTTP status error now retains only the typed error kind and a bounded generic `Powder HTTP status <code>` message.
+No untrusted gateway status body is parsed, redacted, persisted, returned, or logged by this client path.
+The Powder client regression covers both 403 and 500 responses whose JSON error body echoes protected path, query, fragment, and API-key tokens.
+It proves returned and `Debug` errors retain the expected typed class while containing none of those values.
+The dispatch-release regression uses the exact same matching HMAC identity and invokes both direct recovery and periodic reconciliation for 403 and 500 gateway echoes.
+It proves the returned recovery error, periodic log-facing message, registry JSON, sync payload, and recovery `Debug` output omit every endpoint and API-key token.
+The credential-rotation regression changes only the protected API credential while retaining the protected URL.
+It proves the recomputed HMAC differs, recovery retains the exact pending record, and zero repository, card, run, or release I/O occurs before the generic endpoint-identity failure.
+At `ad74042`, five production-load regressions, 13 dispatch-release regressions, 33 Powder client regressions, the serial 63-test control Powder filter, and the 15-test Harness filter passed.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 Commit `5dc37df` replaces the prior unsalted endpoint digest with a standard HMAC-SHA-256 endpoint identity.
 The HMAC key is the protected client API credential and is never persisted, synchronized, logged, or returned by the board surface.
 `PendingDispatchRelease` stores only `connectionEndpointIdentity`, while recovery recomputes the same keyed identity from the protected profile before repository, card, run, terminal, or release I/O.
@@ -499,3 +512,4 @@ No independent reviewer has approved this integration yet.
 25. Verify a schema-13 recovery rejects unknown or raw endpoint fields before client construction and cannot emit credential-bearing bytes through registry, sync, errors, or logs.
 26. Verify matching-endpoint transport failures retain only an endpoint-free typed classification and external board links omit protected profile path, query, and fragment data.
 27. Verify the persisted endpoint identity is standard HMAC-SHA-256 keyed only by the protected client credential, never described as credential-free, and fails closed when it cannot be recomputed.
+28. Verify every HTTP status-body failure is generic and typed, cannot echo protected endpoint or API-key material through recovery or periodic logs, and credential rotation rejects recovery before network I/O.
