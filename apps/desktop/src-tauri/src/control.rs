@@ -1025,7 +1025,7 @@ pub struct PendingDispatchClaim {
 /// claim attempt.  It is a transaction-owned release recovery record that pins
 /// the original protected Powder scope across Captain or Project replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PendingDispatchRelease {
     pub crew_session_id: String,
     pub project_id: String,
@@ -1074,6 +1074,36 @@ fn is_canonical_dispatch_recovery_endpoint_digest(value: &str) -> bool {
         && hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Detect release-record fields an older or foreign writer could have added
+/// before serde deserializes the snapshot.  A raw endpoint must be treated as
+/// incompatible state, not as recoverable corruption, because it can identify
+/// an exact outstanding remote claim.
+fn releases_contain_unknown_fields(snapshot: &Value) -> bool {
+    const FIELDS: &[&str] = &[
+        "crewSessionId",
+        "projectId",
+        "connectionProfile",
+        "connectionEndpointDigest",
+        "repository",
+        "cardId",
+        "runId",
+        "agent",
+        "operationId",
+        "createdAt",
+        "state",
+    ];
+    snapshot
+        .get("pendingDispatchReleases")
+        .and_then(Value::as_array)
+        .is_some_and(|releases| {
+            releases.iter().any(|release| {
+                release.as_object().is_none_or(|fields| {
+                    fields.keys().any(|field| !FIELDS.contains(&field.as_str()))
+                })
+            })
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1468,6 +1498,7 @@ pub type CaptainRecord = FleetIdentity;
 enum SnapshotReadError {
     Invalid(String),
     UnsupportedSchema { path: PathBuf, version: u32 },
+    IncompatibleRecovery { path: PathBuf },
 }
 
 impl std::fmt::Display for SnapshotReadError {
@@ -1477,6 +1508,11 @@ impl std::fmt::Display for SnapshotReadError {
             Self::UnsupportedSchema { path, version } => write!(
                 f,
                 "'{}' uses unsupported schemaVersion {version}",
+                path.display()
+            ),
+            Self::IncompatibleRecovery { path } => write!(
+                f,
+                "'{}' contains dispatch release recovery state incompatible with this T-Hub version",
                 path.display()
             ),
         }
@@ -2038,7 +2074,9 @@ impl CaptainsRegistry {
 
     /// Load the registry from `path`, falling back to the last validated backup
     /// and quarantining a corrupt primary. A first run with no files starts empty;
-    /// an unrecoverable corrupt file is reported before starting empty.
+    /// an unrecoverable corrupt file is reported before starting empty. An
+    /// incompatible dispatch-release recovery is different from corruption: both
+    /// primary and backup bytes are preserved and every mutation is blocked.
     pub fn load(path: PathBuf) -> Self {
         let backup = path.with_extension("json.bak");
         let primary = if !path.exists() && !backup.exists() {
@@ -2056,6 +2094,15 @@ impl CaptainsRegistry {
         let backup_probe = backup.exists().then(|| Self::read_snapshot(&backup));
         let mut recovered_from_backup = false;
         let mut write_blocked = None;
+        let incompatible_recovery = match (&primary, &backup_probe) {
+            (Err(error @ SnapshotReadError::IncompatibleRecovery { .. }), _) => {
+                Some(error.to_string())
+            }
+            (_, Some(Err(error @ SnapshotReadError::IncompatibleRecovery { .. }))) => {
+                Some(error.to_string())
+            }
+            _ => None,
+        };
         let future_schema = match (&primary, &backup_probe) {
             (Err(error @ SnapshotReadError::UnsupportedSchema { .. }), _) => {
                 Some(error.to_string())
@@ -2065,7 +2112,14 @@ impl CaptainsRegistry {
             }
             _ => None,
         };
-        let loaded = if let Some(reason) = future_schema {
+        let loaded = if let Some(reason) = incompatible_recovery {
+            // A legacy or unknown recovery record can name an exact remote claim.
+            // Never use an older backup, quarantine either copy, or expose a
+            // partially loaded registry that could redispatch it.  Explicit safe
+            // handling is required before any local or remote action resumes.
+            write_blocked = Some(reason.clone());
+            Err(SnapshotReadError::IncompatibleRecovery { path: path.clone() })
+        } else if let Some(reason) = future_schema {
             // Either file may be the last copy written by a newer T-Hub. Preserve
             // both byte-for-byte and block every write. A supported primary remains
             // readable, but an unsupported primary is never replaced by an older
@@ -2166,8 +2220,39 @@ impl CaptainsRegistry {
         let body = std::fs::read_to_string(path).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' could not be read: {error}", path.display()))
         })?;
-        let snapshot: CaptainsSnapshot = serde_json::from_str(&body).map_err(|error| {
+        let document: Value = serde_json::from_str(&body).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
+        })?;
+        let schema_version = document
+            .get("schemaVersion")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if schema_version > CAPTAINS_SCHEMA_VERSION as u64 {
+            return Err(SnapshotReadError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                version: schema_version as u32,
+            });
+        }
+        let has_release_recovery = document
+            .get("pendingDispatchReleases")
+            .and_then(Value::as_array)
+            .is_some_and(|releases| !releases.is_empty());
+        if has_release_recovery
+            && (schema_version < CAPTAINS_SCHEMA_VERSION as u64
+                || releases_contain_unknown_fields(&document))
+        {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        let snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
+            if has_release_recovery {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
+            }
         })?;
         if snapshot.schema_version > CAPTAINS_SCHEMA_VERSION {
             return Err(SnapshotReadError::UnsupportedSchema {
@@ -2175,7 +2260,15 @@ impl CaptainsRegistry {
                 version: snapshot.schema_version,
             });
         }
-        Self::validate_snapshot(&snapshot).map_err(SnapshotReadError::Invalid)?;
+        Self::validate_snapshot(&snapshot).map_err(|error| {
+            if has_release_recovery {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SnapshotReadError::Invalid(error)
+            }
+        })?;
         Ok(snapshot)
     }
 
@@ -21003,6 +21096,201 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.schema_version, CAPTAINS_SCHEMA_VERSION);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn pending_release_snapshot_document(profile: &str, crew_session_id: &str) -> Value {
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, profile, crew_session_id);
+        let mut snapshot = registry.snapshot();
+        let crew = &mut snapshot.captains[0].crew[0];
+        crew.state = CrewState::CleanupPending { since: 1 };
+        let work = crew.powder_work.as_mut().unwrap();
+        work.dispatch_release_recovery = true;
+        snapshot
+            .pending_dispatch_releases
+            .push(PendingDispatchRelease {
+                crew_session_id: crew.terminal_id.clone(),
+                project_id: "project-powder-lifecycle".into(),
+                connection_profile: profile.into(),
+                connection_endpoint_digest: format!("sha256:{}", "0".repeat(64)),
+                repository: "t-hub".into(),
+                card_id: work.card_id.clone(),
+                run_id: work.run_id.clone(),
+                agent: work.agent.clone().unwrap(),
+                operation_id: "initial-claim:actor-t-hub:incompatible-load".into(),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            });
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    fn assert_incompatible_release_load_blocks_actions(
+        path: &Path,
+        primary_body: &str,
+        backup_body: Option<&str>,
+        server: LoopbackPowderServer,
+    ) {
+        let backup = path.with_extension("json.bak");
+        let registry = Arc::new(CaptainsRegistry::load(path.to_path_buf()));
+        assert!(registry.write_blocked.is_some());
+        assert!(registry.snapshot().captains.is_empty());
+        assert!(registry.snapshot().pending_dispatch_releases.is_empty());
+        assert!(registry
+            .claim_test("blocked-captain", Some("blocked-ship"), vec![])
+            .unwrap_err()
+            .contains("read-only"));
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        reconcile_powder_leases(&ctx);
+        assert!(dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": "captain-powder",
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "must not redispatch incompatible recovery",
+                "harness": "codex",
+            }),
+            None,
+            true,
+        )
+        .is_err());
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), primary_body);
+        match backup_body {
+            Some(body) => assert_eq!(std::fs::read_to_string(&backup).unwrap(), body),
+            None => assert!(!backup.exists()),
+        }
+        let prefix = format!("{}.corrupt.", path.file_name().unwrap().to_string_lossy());
+        assert!(
+            !std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)),
+            "incompatible release state must never be quarantined"
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn production_load_blocks_v11_release_recovery_without_backup() {
+        let path = captains_tmp("incompatible-v11-release-primary");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-v11-primary-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document =
+            pending_release_snapshot_document(profile, "incompatible-v11-primary-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointDigest");
+        let body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(&path, &body, None, server);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_load_preserves_v11_release_primary_over_clean_stale_backup() {
+        let path = captains_tmp("incompatible-v11-release-primary-backup");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-v11-backup-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document =
+            pending_release_snapshot_document(profile, "incompatible-v11-backup-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointDigest");
+        let primary_body = serde_json::to_string(&document).unwrap();
+        let backup_body = json!({
+            "schemaVersion": 11,
+            "seq": 1,
+            "captains": [],
+            "projects": [],
+            "pendingDispatchClaims": [],
+            "pendingDispatchReleases": [],
+        })
+        .to_string();
+        std::fs::write(&path, &primary_body).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(
+            &path,
+            &primary_body,
+            Some(&backup_body),
+            server,
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn production_load_blocks_actions_when_backup_has_incompatible_release_recovery() {
+        let path = captains_tmp("incompatible-release-backup");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-backup-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let primary_body = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+            "seq": 9,
+            "captains": [],
+            "projects": [],
+            "pendingDispatchClaims": [],
+            "pendingDispatchReleases": [],
+        })
+        .to_string();
+        let mut document = pending_release_snapshot_document(profile, "incompatible-backup-crew");
+        document["schemaVersion"] = json!(11);
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectionEndpointDigest");
+        let backup_body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &primary_body).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(
+            &path,
+            &primary_body,
+            Some(&backup_body),
+            server,
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn production_load_rejects_raw_endpoint_field_in_schema_v12_release_recovery() {
+        let path = captains_tmp("incompatible-raw-release-endpoint");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = "incompatible-raw-profile";
+        let _profiles = PowderProfileEnv::install(profile, server.addr);
+        let mut document = pending_release_snapshot_document(profile, "incompatible-raw-crew");
+        document["pendingDispatchReleases"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "connectionEndpoint".into(),
+                json!("http://gateway.invalid/path-token?access_token=query-token#fragment-token"),
+            );
+        let body = serde_json::to_string(&document).unwrap();
+        std::fs::write(&path, &body).unwrap();
+
+        assert_incompatible_release_load_blocks_actions(&path, &body, None, server);
         let _ = std::fs::remove_file(path);
     }
 
