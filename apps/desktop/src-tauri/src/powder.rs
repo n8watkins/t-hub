@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -781,12 +782,23 @@ impl Client {
         &self.agent_name
     }
 
-    /// Credential-free stable identity for a validated protected endpoint.
+    /// Non-persisted keyed identity for a validated protected endpoint.
     ///
-    /// The endpoint itself remains private to this client because path, query,
-    /// and fragment components may contain gateway credentials.
-    pub fn endpoint_identity(&self) -> String {
-        format!("sha256:{:x}", Sha256::digest(self.base_url.as_bytes()))
+    /// This is HMAC-SHA-256 over the normalized protected URL, keyed by the
+    /// protected API credential.  The key and URL remain client-local, and only
+    /// the resulting identity is safe to persist for exact remap detection.
+    pub fn endpoint_identity(&self) -> Result<String, String> {
+        let credential = self
+            .api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or(
+                "Powder protected endpoint identity cannot be derived without an API credential",
+            )?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(credential.as_bytes())
+            .map_err(|_| "Powder protected endpoint identity could not be initialized")?;
+        mac.update(self.base_url.as_bytes());
+        Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
     }
 
     pub fn initial_claim_operation_id(&self, card_id: &str) -> Result<String, PowderError> {
@@ -4773,6 +4785,23 @@ mod tests {
                 "debug leaked {secret:?}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_identity_requires_a_protected_credential() {
+        let client = Client::new(ProfileConfig {
+            base_url: "https://powder.example.test".into(),
+            agent_name: "t-hub".into(),
+            operation_identity: None,
+            api_key: None,
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+        assert_eq!(
+            client.endpoint_identity().unwrap_err(),
+            "Powder protected endpoint identity cannot be derived without an API credential"
+        );
     }
 
     #[test]

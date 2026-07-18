@@ -91,6 +91,8 @@ base64 = "0.22"
 # (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
 # makes it a direct dependency (no lockfile resolution change).
 sha2 = "0.10"
+# Standard HMAC construction for non-persisted protected endpoint identities.
+hmac = "0.12"
 # RFC3339 timestamps for the control-socket audit log (audit.rs). Already in the
 # tree transitively; this only makes it a direct dependency.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
