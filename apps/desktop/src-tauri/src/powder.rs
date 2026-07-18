@@ -23,7 +23,6 @@ const MAX_MUTATION_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CLAIM_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CLAIM_IDENTITY_BYTES: usize = 512;
 const MAX_CAPABILITY_RESPONSE_BYTES: usize = 128 * 1024;
-const MAX_ERROR_RESPONSE_BYTES: usize = 4096;
 const MAX_EVIDENCE_ITEMS: usize = 20;
 const MAX_CRITERIA: usize = 100;
 const MAX_CRITERION_PROOFS: usize = 20;
@@ -1283,7 +1282,7 @@ impl Client {
             Ok(response) => response
                 .into_string()
                 .map_err(|error| format!("Powder returned unreadable text: {error}")),
-            Err(error) => Err(response_error(error, self.api_key.as_deref())),
+            Err(error) => Err(response_error(error)),
         }
     }
 
@@ -1340,7 +1339,7 @@ impl Client {
             Some(body) => request.send_json(body),
             None => request.call(),
         };
-        response.map_err(|error| typed_response_error(error, self.api_key.as_deref()))
+        response.map_err(typed_response_error)
     }
 }
 
@@ -2827,15 +2826,13 @@ fn validate_base_url(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn response_error(error: ureq::Error, credential: Option<&str>) -> String {
-    typed_response_error(error, credential).to_string()
+fn response_error(error: ureq::Error) -> String {
+    typed_response_error(error).to_string()
 }
 
-fn typed_response_error(error: ureq::Error, credential: Option<&str>) -> PowderError {
+fn typed_response_error(error: ureq::Error) -> PowderError {
     match error {
-        ureq::Error::Status(status, response) => {
-            let detail = bounded_error_detail(response).unwrap_or_else(|| format!("HTTP {status}"));
-            let detail = safe_error_detail(&detail, credential);
+        ureq::Error::Status(status, _) => {
             PowderError {
                 kind: match status {
                     401 | 403 => PowderErrorKind::Unauthorized,
@@ -2843,7 +2840,10 @@ fn typed_response_error(error: ureq::Error, credential: Option<&str>) -> PowderE
                     409 => PowderErrorKind::Conflict,
                     _ => PowderErrorKind::Upstream,
                 },
-                message: format!("Powder HTTP {status}: {detail}"),
+                // Gateway response bodies are untrusted and can echo the full
+                // protected request URL.  Preserve the typed HTTP status without
+                // surfacing any upstream body text.
+                message: format!("Powder HTTP status {status}"),
             }
         }
         ureq::Error::Transport(_) => PowderError {
@@ -2876,49 +2876,6 @@ fn public_endpoint_origin(base_url: &str) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
     format!("{scheme}://{authority}")
-}
-
-fn bounded_error_detail(response: ureq::Response) -> Option<String> {
-    if response
-        .header("Content-Length")
-        .and_then(|length| length.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_ERROR_RESPONSE_BYTES)
-    {
-        return None;
-    }
-    let mut body = Vec::with_capacity(MAX_ERROR_RESPONSE_BYTES);
-    response
-        .into_reader()
-        .take((MAX_ERROR_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .ok()?;
-    if body.len() > MAX_ERROR_RESPONSE_BYTES {
-        return None;
-    }
-    serde_json::from_slice::<Value>(&body)
-        .ok()?
-        .get("error")?
-        .as_str()
-        .map(str::to_string)
-}
-
-fn safe_error_detail(detail: &str, credential: Option<&str>) -> String {
-    let mut safe = credential
-        .filter(|credential| !credential.is_empty())
-        .map_or_else(
-            || detail.to_string(),
-            |credential| detail.replace(credential, "[REDACTED]"),
-        );
-    safe.retain(|character| !character.is_control() || character == ' ');
-    if safe.len() > MAX_SHORT_TEXT_BYTES {
-        let mut end = MAX_SHORT_TEXT_BYTES;
-        while !safe.is_char_boundary(end) {
-            end -= 1;
-        }
-        safe.truncate(end);
-        safe.push_str("...");
-    }
-    safe
 }
 
 fn resolve_key_command(command: &str) -> Result<String, String> {
@@ -4614,7 +4571,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind, PowderErrorKind::Upstream);
-        assert!(error.message.contains("[REDACTED]"));
+        assert_eq!(error.message, "Powder HTTP status 500");
         assert!(!error.message.contains("test-key"));
         assert!(!error.message.contains('\n'));
         assert!(client
@@ -4784,6 +4741,58 @@ mod tests {
                 !format!("{error:?}").contains(secret),
                 "debug leaked {secret:?}"
             );
+        }
+    }
+
+    #[test]
+    fn status_error_bodies_never_surface_protected_endpoint_or_credential_material() {
+        for (status, expected_kind) in [
+            ("403 Forbidden", PowderErrorKind::Unauthorized),
+            ("500 Internal Server Error", PowderErrorKind::Upstream),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let response_body = json!({
+                "error": "gateway echoed /gateway/path-token?access_token=query-token#fragment-token with secret-key"
+            })
+            .to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                write_json_response(&mut stream, status, &response_body);
+            });
+            let endpoint =
+                format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+            let client = Client::new(ProfileConfig {
+                base_url: endpoint.clone(),
+                agent_name: "t-hub".into(),
+                operation_identity: None,
+                api_key: Some("secret-key".into()),
+                api_key_env: None,
+                api_key_command: None,
+            })
+            .unwrap();
+
+            let error = client.repository_for_board("t-hub").unwrap_err();
+            assert_eq!(error.kind, expected_kind);
+            assert!(error.message.starts_with("Powder HTTP status "));
+            for secret in [
+                "path-token",
+                "query-token",
+                "fragment-token",
+                "secret-key",
+                endpoint.as_str(),
+            ] {
+                assert!(
+                    !error.to_string().contains(secret),
+                    "status leaked {secret:?}"
+                );
+                assert!(
+                    !format!("{error:?}").contains(secret),
+                    "debug leaked {secret:?}"
+                );
+            }
+            server.join().unwrap();
         }
     }
 

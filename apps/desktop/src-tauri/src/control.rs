@@ -26760,6 +26760,13 @@ mod tests {
             document["profiles"][profile]["baseUrl"] = json!(base_url);
             std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
         }
+
+        fn set_profile_api_key(&self, profile: &str, api_key: &str) {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
+            document["profiles"][profile]["apiKey"] = json!(api_key);
+            std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
+        }
     }
 
     impl Drop for PowderProfileEnv {
@@ -29289,6 +29296,180 @@ mod tests {
             assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
             assert!(!error.contains(secret), "error leaked {secret:?}");
         }
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_status_errors_never_leak_gateway_echoes() {
+        for (status, reason, expected_message) in [
+            (403_u16, "Forbidden", "Powder HTTP status 403"),
+            (500_u16, "Internal Server Error", "Powder HTTP status 500"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body = json!({
+                "error": "gateway echoed /gateway/path-token?access_token=query-token#fragment-token with test-key"
+            });
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let _ = read_loopback_powder_request(&mut stream).unwrap();
+                    write_loopback_json_status(&mut stream, status, reason, &body).unwrap();
+                }
+            });
+            let profile = format!(
+                "release-status-secret-{}-{}",
+                status,
+                uuid::Uuid::new_v4().simple()
+            );
+            let profiles = PowderProfileEnv::install(&profile, addr);
+            let endpoint =
+                format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
+            profiles.set_profile_base_url(&profile, &endpoint);
+            let client = powder::Client::from_profile(&profile).unwrap();
+            let path = captains_tmp("release-status-secret");
+            let _ = std::fs::remove_file(&path);
+            let registry = dispatch_test_registry(Some(path.clone()), &profile, "status-captain");
+            let crew_session_id = "status-crew";
+            registry
+                .record_crew("status-captain", crew_session_id)
+                .unwrap();
+            registry
+                .bind_crew_context(
+                    "status-captain",
+                    crew_session_id,
+                    "Keep gateway status echoes private",
+                    "codex",
+                    Some("/tmp/status-crew"),
+                    Some("status-crew"),
+                    PowderWorkBinding {
+                        card_id: "thub-powder-control-lifecycle".into(),
+                        run_id: "run-authoritative".into(),
+                        agent: Some("t-hub".into()),
+                        claim_expires_at: Some(100),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                )
+                .unwrap();
+            let recovery = PendingDispatchRelease {
+                crew_session_id: crew_session_id.into(),
+                project_id: "project-dispatch-attestation".into(),
+                connection_profile: profile.clone(),
+                connection_endpoint_identity: client.endpoint_identity().unwrap(),
+                repository: "t-hub".into(),
+                card_id: "thub-powder-control-lifecycle".into(),
+                run_id: "run-authoritative".into(),
+                agent: "t-hub".into(),
+                operation_id: format!("initial-claim:actor-t-hub:status-{status}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            };
+            registry.prepare_dispatch_release(recovery.clone()).unwrap();
+            let persisted = std::fs::read_to_string(&path).unwrap();
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            assert!(captains_sync_apply(&ctx));
+            let sync_payload = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+
+            let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+            assert_eq!(
+                error,
+                format!("the frozen repository cannot be reconciled: {expected_message}")
+            );
+            // Periodic reconciliation emits this same endpoint-free error to its
+            // log-facing path and must retain the frozen recovery.
+            reconcile_powder_leases(&ctx);
+            assert_eq!(
+                registry.snapshot().pending_dispatch_releases,
+                vec![recovery.clone()]
+            );
+            let debug_output = format!("{recovery:?}");
+            for secret in [
+                "path-token",
+                "query-token",
+                "fragment-token",
+                "test-key",
+                endpoint.as_str(),
+            ] {
+                assert!(!persisted.contains(secret), "registry leaked {secret:?}");
+                assert!(!sync_payload.contains(secret), "sync leaked {secret:?}");
+                assert!(!debug_output.contains(secret), "debug leaked {secret:?}");
+                assert!(!error.contains(secret), "error leaked {secret:?}");
+            }
+            server.join().unwrap();
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn dispatch_release_recovery_fails_closed_when_protected_credential_rotates() {
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!(
+            "release-credential-rotation-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let profiles = PowderProfileEnv::install(&profile, server.addr);
+        let client = powder::Client::from_profile(&profile).unwrap();
+        let path = captains_tmp("release-credential-rotation");
+        let _ = std::fs::remove_file(&path);
+        let registry = dispatch_test_registry(Some(path.clone()), &profile, "rotation-captain");
+        let crew_session_id = "rotation-crew";
+        registry
+            .record_crew("rotation-captain", crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                "rotation-captain",
+                crew_session_id,
+                "Reject a rotated protected endpoint credential",
+                "codex",
+                Some("/tmp/rotation-crew"),
+                Some("rotation-crew"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.into(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: profile.clone(),
+            connection_endpoint_identity: client.endpoint_identity().unwrap(),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:credential-rotation".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        profiles.set_profile_api_key(&profile, "rotated-test-key");
+        let (ctx, _) = dispatch_test_context(registry.clone());
+
+        let error = recover_pending_dispatch_release_guarded(&ctx, &recovery).unwrap_err();
+        assert_eq!(
+            error,
+            "the frozen profile endpoint changed before release recovery"
+        );
+        reconcile_powder_leases(&ctx);
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery]
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
     }
