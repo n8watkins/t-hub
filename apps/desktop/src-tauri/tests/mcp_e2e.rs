@@ -618,7 +618,7 @@ fn handle_powder_fixture_request(
                             "criterion_text": "MCP dispatcher criterion",
                             "decision": body["decision"],
                             "reviewer": "mcp-captain",
-                            "reviewer_identity": "actor-mcp-owned-captain",
+                            "reviewer_identity": "actor-t-hub",
                             "proof": body["proof"],
                             "supersedes_review_id": "review-initial",
                             "created_at": 124
@@ -885,7 +885,7 @@ fn powder_run_criterion() -> Value {
             "criterion_text": "MCP dispatcher criterion",
             "decision": "approved",
             "reviewer": "mcp-captain",
-            "reviewer_identity": "actor-mcp-owned-captain",
+            "reviewer_identity": "actor-t-hub",
             "proof": "initial review proof",
             "supersedes_review_id": null,
             "created_at": 123
