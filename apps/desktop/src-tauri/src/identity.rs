@@ -78,6 +78,10 @@ impl Role {
 pub struct SessionIdentity {
     /// Stable, non-secret identity handle (the attribution stamp).
     pub id: String,
+    /// Durable monotonic generation allocated by the IdentityStore.
+    /// Legacy identities deserialize as zero and cannot attest a new runtime.
+    #[serde(default)]
+    pub generation: u64,
     /// The per-session bearer secret (env-injected; unforgeable across sessions).
     pub secret: String,
     /// Best-effort role at mint (see the module note re: item-2 durable re-key).
@@ -104,6 +108,7 @@ impl std::fmt::Debug for SessionIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionIdentity")
             .field("id", &self.id)
+            .field("generation", &self.generation)
             .field("secret", &"<redacted>")
             .field("role", &self.role)
             .field("session_tile", &self.session_tile)
@@ -119,6 +124,7 @@ impl std::fmt::Debug for SessionIdentity {
 #[serde(rename_all = "camelCase")]
 pub struct IdentityStamp {
     pub id: String,
+    pub generation: u64,
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_tile: Option<String>,
@@ -132,6 +138,7 @@ impl SessionIdentity {
     pub fn stamp(&self) -> IdentityStamp {
         IdentityStamp {
             id: self.id.clone(),
+            generation: self.generation,
             role: self.role,
             session_tile: self.session_tile.clone(),
             ship_slug: self.ship_slug.clone(),
@@ -169,6 +176,9 @@ fn ct_eq(a: &str, b: &str) -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IdentitiesSnapshot {
+    /// Last generation allocated to a SessionIdentity.
+    #[serde(default)]
+    generation: u64,
     /// Keyed by the minted identity id.
     identities: HashMap<String, SessionIdentity>,
     /// item-3 Pillar B: the explicit REVOCATION set (minted ids). An id here never
@@ -212,6 +222,13 @@ impl IdentityStore {
             .ok()
             .and_then(|body| serde_json::from_str::<IdentitiesSnapshot>(&body).ok())
             .unwrap_or_default();
+        inner.generation = inner
+            .identities
+            .values()
+            .map(|identity| identity.generation)
+            .max()
+            .unwrap_or_default()
+            .max(inner.generation);
         for ident in inner.identities.values_mut() {
             if let Some(plain) = crate::secret_seal::unseal_str(&ident.secret) {
                 ident.secret = plain;
@@ -285,8 +302,14 @@ impl IdentityStore {
     /// could be resolved at spawn (a crew inherits its spawner's ship), else `None`.
     /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
     pub fn mint_for(&self, role: Role, ship: Option<String>) -> Result<SessionIdentity, String> {
+        let mut snap = self.lock();
+        let generation = snap
+            .generation
+            .checked_add(1)
+            .ok_or("identity store generation exhausted")?;
         let identity = SessionIdentity {
             id: uuid::Uuid::new_v4().simple().to_string(),
+            generation,
             // Two v4 uuids => ~244 bits of entropy; a bearer secret, not a display id.
             secret: format!(
                 "{}{}",
@@ -298,8 +321,8 @@ impl IdentityStore {
             ship_slug: ship,
             minted_at: now_ms(),
         };
-        let mut snap = self.lock();
         let previous = snap.clone();
+        snap.generation = generation;
         snap.identities
             .insert(identity.id.clone(), identity.clone());
         if let Err(error) = self.persist(&snap) {
@@ -545,6 +568,8 @@ mod tests {
         let b = store.mint(Role::Crew).unwrap();
         assert_ne!(a.id, b.id, "ids are distinct");
         assert_ne!(a.secret, b.secret, "secrets are distinct");
+        assert_eq!(a.generation, 1);
+        assert_eq!(b.generation, 2);
         assert!(!a.secret.is_empty());
         assert_eq!(store.len(), 2);
     }
@@ -700,12 +725,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let id;
         let secret;
+        let generation;
         {
             let store = IdentityStore::load(path.clone());
             let a = store.mint(Role::Captain).unwrap();
             store.bind_tile(&a.id, "tile-1").unwrap();
             id = a.id.clone();
             secret = a.secret.clone();
+            generation = a.generation;
         }
         // Reopen from disk: the identity + binding survive, and the secret still
         // resolves.
@@ -713,9 +740,25 @@ mod tests {
         assert_eq!(store2.len(), 1);
         let resolved = store2.resolve(&secret).unwrap();
         assert_eq!(resolved.id, id);
+        assert_eq!(resolved.generation, generation);
         assert_eq!(resolved.role, Role::Captain);
         assert_eq!(resolved.session_tile.as_deref(), Some("tile-1"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn identity_generation_is_durable_monotonic_and_never_reuses_retired_values() {
+        let path = temp_path();
+        let first_generation = {
+            let store = IdentityStore::load(path.clone());
+            let first = store.mint(Role::Cortana).unwrap();
+            assert!(store.retire(&first.id).unwrap());
+            first.generation
+        };
+        let reloaded = IdentityStore::load(path.clone());
+        let replacement = reloaded.mint(Role::Cortana).unwrap();
+        assert_eq!(replacement.generation, first_generation + 1);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

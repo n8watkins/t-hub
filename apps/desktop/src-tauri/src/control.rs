@@ -1092,14 +1092,14 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 17;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 18;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 1;
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 2;
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
 const CORTANA_PROFILE_CATALOG_ID: &str = "profile-catalog:v1:coordination";
-const CORTANA_LEGACY_PROVENANCE_ID: &str = "legacy-observed:schema-16";
+const CORTANA_LEGACY_PROVENANCE_ID: &str = "legacy-observed:schema-17-or-earlier";
 const MAX_CORTANA_IDENTIFIER_BYTES: usize = 512;
 const MAX_CORTANA_OPERATION_ID_BYTES: usize = 128;
 const MAX_CORTANA_GUIDANCE_BYTES: usize = 512;
@@ -1232,20 +1232,64 @@ pub enum CortanaEnsurePhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CortanaEnsureIntent {
-    pub schema_version: u32,
-    pub operation_id: String,
-    pub request_digest: String,
+pub struct CortanaEnsureRequestPayload {
     pub expected_identity_id: String,
     pub expected_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incumbent_terminal_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_terminal_id: Option<String>,
     pub desired_runtime: CortanaRuntimePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaInstalledRuntimeEvidence {
+    pub resolved_executable: String,
+    pub executable_version: String,
+    pub evidence_id: String,
+    pub observed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaRuntimeAttestation {
+    pub terminal_id: String,
+    pub tmux_session_id: String,
+    pub control_identity_id: String,
+    pub session_identity_generation: u64,
+    pub authority_generation: u64,
+    pub observed_provider: String,
+    pub observed_harness: String,
+    pub provider_session_id: String,
+    pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    pub installed_runtime: CortanaInstalledRuntimeEvidence,
+    pub attested_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaCandidateRuntimeEvidence {
+    pub terminal_id: String,
+    pub tmux_session_id: String,
+    pub control_identity_id: String,
+    pub session_identity_generation: u64,
+    pub authority_generation: u64,
+    pub spawned_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_attestation: Option<CortanaRuntimeAttestation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaEnsureIntent {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub request_digest: String,
+    pub request: CortanaEnsureRequestPayload,
     pub phase: CortanaEnsurePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_identity_id: Option<String>,
+    pub candidate: Option<CortanaCandidateRuntimeEvidence>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -1266,7 +1310,10 @@ pub struct CortanaRuntimeLineageEntry {
     pub provider_session_id: String,
     pub conversation_id: String,
     pub terminal_id: String,
-    pub runtime_identity_id: String,
+    pub control_identity_id: String,
+    pub session_identity_generation: u64,
+    pub authority_generation: u64,
+    pub installed_runtime: CortanaInstalledRuntimeEvidence,
     pub state: CortanaLineageState,
     pub recorded_at: u64,
 }
@@ -1293,6 +1340,8 @@ pub struct CortanaRuntimeRecord {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_attestation: Option<CortanaRuntimeAttestation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<CortanaRecoveryReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1335,6 +1384,7 @@ impl CortanaRuntimeRecord {
             provider_session_id: captain.provider_session_id.clone(),
             conversation_id: captain.conversation_id.clone(),
             checkpoint: captain.resume_point.clone(),
+            runtime_attestation: None,
             reason_code: Some(CortanaRecoveryReason::LegacyPolicyIncomplete),
             guidance: Some(
                 "Legacy Cortana runtime policy is incomplete. Review and record an exact runtime policy before recovery."
@@ -1376,6 +1426,19 @@ fn validate_cortana_canonical_id(value: &str, field: &str, max: usize) -> Result
     Ok(())
 }
 
+fn validate_cortana_control_identity_id(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "Cortana {field} is not an IdentityStore SessionIdentity id"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_cortana_policy(policy: &CortanaRuntimePolicy) -> Result<(), String> {
     validate_cortana_canonical_id(
         &policy.work_profile,
@@ -1400,20 +1463,19 @@ fn validate_cortana_policy(policy: &CortanaRuntimePolicy) -> Result<(), String> 
     Ok(())
 }
 
-fn cortana_candidate_identity(terminal_id: &str, generation: u64) -> String {
-    let marker = format!("{CORTANA_IDENTITY_ID}\0{generation}\0{terminal_id}");
-    format!("candidate:sha256:{:x}", Sha256::digest(marker.as_bytes()))
+fn cortana_installed_runtime_evidence_id(
+    harness: &str,
+    resolved_executable: &str,
+    executable_version: &str,
+) -> String {
+    let marker = format!("{harness}\0{resolved_executable}\0{executable_version}");
+    format!("installed-runtime:sha256:{:x}", Sha256::digest(marker))
 }
 
 fn cortana_ensure_request_digest(intent: &CortanaEnsureIntent) -> Result<String, String> {
     let canonical = serde_json::to_vec(&json!({
-        "candidateIdentityId": intent.candidate_identity_id,
-        "candidateTerminalId": intent.candidate_terminal_id,
-        "desiredRuntime": intent.desired_runtime,
-        "expectedGeneration": intent.expected_generation,
-        "expectedIdentityId": intent.expected_identity_id,
-        "incumbentTerminalId": intent.incumbent_terminal_id,
         "operationId": intent.operation_id,
+        "request": intent.request,
         "schemaVersion": intent.schema_version,
     }))
     .map_err(|error| format!("Cortana ensure request could not be canonicalized: {error}"))?;
@@ -1423,8 +1485,10 @@ fn cortana_ensure_request_digest(intent: &CortanaEnsureIntent) -> Result<String,
 fn cortana_runtime_attestation_identity(
     runtime: &CortanaRuntimeRecord,
     policy: &CortanaRuntimePolicy,
+    attestation: &CortanaRuntimeAttestation,
 ) -> Result<String, String> {
     let canonical = serde_json::to_vec(&json!({
+        "attestation": attestation,
         "checkpoint": runtime.checkpoint,
         "conversationId": runtime.conversation_id,
         "generation": runtime.generation,
@@ -1443,6 +1507,153 @@ fn cortana_runtime_attestation_identity(
         "attestation:sha256:{:x}",
         Sha256::digest(canonical)
     ))
+}
+
+fn validate_cortana_installed_runtime(
+    harness: &str,
+    evidence: &CortanaInstalledRuntimeEvidence,
+    enclosing_updated_at: u64,
+) -> Result<(), String> {
+    validate_cortana_optional_text(Some(&evidence.resolved_executable), "resolvedExecutable")?;
+    validate_cortana_optional_text(Some(&evidence.executable_version), "executableVersion")?;
+    if !Path::new(&evidence.resolved_executable).is_absolute()
+        || evidence.observed_at == 0
+        || evidence.observed_at > enclosing_updated_at
+        || evidence.evidence_id
+            != cortana_installed_runtime_evidence_id(
+                harness,
+                &evidence.resolved_executable,
+                &evidence.executable_version,
+            )
+    {
+        return Err("Cortana installed-runtime evidence is malformed or not exact".into());
+    }
+    Ok(())
+}
+
+fn validate_cortana_attestation(
+    attestation: &CortanaRuntimeAttestation,
+    policy: &CortanaRuntimePolicy,
+    expected_authority_generation: u64,
+    enclosing_updated_at: u64,
+) -> Result<(), String> {
+    validate_cortana_canonical_id(
+        &attestation.terminal_id,
+        "attestedTerminalId",
+        MAX_CORTANA_IDENTIFIER_BYTES,
+    )?;
+    validate_cortana_canonical_id(
+        &attestation.tmux_session_id,
+        "attestedTmuxSessionId",
+        MAX_CORTANA_IDENTIFIER_BYTES,
+    )?;
+    validate_cortana_control_identity_id(&attestation.control_identity_id, "controlIdentityId")?;
+    validate_harness_name(&attestation.observed_provider, "Cortana observed provider")?;
+    validate_harness_name(&attestation.observed_harness, "Cortana observed harness")?;
+    for (field, value) in [
+        (
+            "providerSessionId",
+            Some(attestation.provider_session_id.as_str()),
+        ),
+        ("conversationId", Some(attestation.conversation_id.as_str())),
+        ("checkpoint", attestation.checkpoint.as_deref()),
+    ] {
+        validate_cortana_optional_text(value, field)?;
+    }
+    if attestation.session_identity_generation == 0
+        || attestation.tmux_session_id != format!("th_{}", attestation.terminal_id)
+        || attestation.authority_generation != expected_authority_generation
+        || attestation.observed_provider != policy.provider
+        || attestation.observed_harness != policy.harness
+        || attestation.attested_at == 0
+        || attestation.attested_at > enclosing_updated_at
+        || attestation.attested_at < attestation.installed_runtime.observed_at
+    {
+        return Err("Cortana runtime attestation does not match exact policy and authority".into());
+    }
+    validate_cortana_installed_runtime(
+        &attestation.observed_harness,
+        &attestation.installed_runtime,
+        enclosing_updated_at,
+    )
+}
+
+fn validate_cortana_candidate(
+    candidate: &CortanaCandidateRuntimeEvidence,
+    policy: &CortanaRuntimePolicy,
+    expected_authority_generation: u64,
+    enclosing_updated_at: u64,
+) -> Result<(), String> {
+    validate_cortana_canonical_id(
+        &candidate.terminal_id,
+        "candidateTerminalId",
+        MAX_CORTANA_IDENTIFIER_BYTES,
+    )?;
+    validate_cortana_canonical_id(
+        &candidate.tmux_session_id,
+        "candidateTmuxSessionId",
+        MAX_CORTANA_IDENTIFIER_BYTES,
+    )?;
+    validate_cortana_control_identity_id(
+        &candidate.control_identity_id,
+        "candidateControlIdentityId",
+    )?;
+    if candidate.tmux_session_id != format!("th_{}", candidate.terminal_id)
+        || candidate.session_identity_generation == 0
+        || candidate.authority_generation != expected_authority_generation
+        || candidate.spawned_at == 0
+        || candidate.spawned_at > enclosing_updated_at
+    {
+        return Err(
+            "Cortana candidate evidence is not bound to its exact session authority".into(),
+        );
+    }
+    if let Some(attestation) = candidate.runtime_attestation.as_ref() {
+        validate_cortana_attestation(
+            attestation,
+            policy,
+            expected_authority_generation,
+            enclosing_updated_at,
+        )?;
+        if attestation.control_identity_id != candidate.control_identity_id
+            || attestation.session_identity_generation != candidate.session_identity_generation
+            || attestation.terminal_id != candidate.terminal_id
+            || attestation.tmux_session_id != candidate.tmux_session_id
+            || attestation.attested_at < candidate.spawned_at
+        {
+            return Err("Cortana candidate attestation does not match its spawned identity".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate the durable non-secret control identity against the IdentityStore
+/// record captured in the same registry transaction as a candidate transition.
+/// This never accepts the permanent Cortana id or a derived terminal hash as a
+/// substitute for the minted SessionIdentity.
+pub fn validate_cortana_session_identity(
+    expected_control_identity_id: &str,
+    expected_session_identity_generation: u64,
+    expected_authority_generation: u64,
+    observed_authority_generation: u64,
+    terminal_id: &str,
+    identity: &crate::identity::SessionIdentity,
+) -> Result<(), String> {
+    if identity.id != expected_control_identity_id
+        || identity.generation == 0
+        || identity.generation != expected_session_identity_generation
+        || expected_authority_generation == 0
+        || observed_authority_generation != expected_authority_generation
+        || identity.role != crate::identity::Role::Cortana
+        || identity.session_tile.as_deref() != Some(terminal_id)
+        || identity.ship_slug.as_deref() != Some(CORTANA_SLUG)
+    {
+        return Err(
+            "Cortana control identity does not match the exact IdentityStore session generation"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_cortana_runtime(
@@ -1514,6 +1725,7 @@ fn validate_cortana_runtime(
             .ok_or("Cortana profile catalog version is unsupported")?;
             if runtime.provenance.identity != CORTANA_PROFILE_CATALOG_ID
                 || *policy != catalog_policy
+                || runtime.lifecycle == CortanaRuntimeLifecycle::Ready
             {
                 return Err(
                     "Cortana profile-catalog provenance does not match the protected catalog"
@@ -1526,7 +1738,18 @@ fn validate_cortana_runtime(
                 .policy
                 .as_ref()
                 .ok_or("runtime-attested provenance requires exact policy")?;
-            if runtime.provenance.identity != cortana_runtime_attestation_identity(runtime, policy)?
+            let attestation = runtime
+                .runtime_attestation
+                .as_ref()
+                .ok_or("runtime-attested provenance requires post-launch evidence")?;
+            validate_cortana_attestation(
+                attestation,
+                policy,
+                runtime.generation,
+                runtime.updated_at,
+            )?;
+            if runtime.provenance.identity
+                != cortana_runtime_attestation_identity(runtime, policy, attestation)?
             {
                 return Err(
                     "Cortana runtime attestation identity does not match its exact metadata".into(),
@@ -1538,6 +1761,9 @@ fn validate_cortana_runtime(
         return Err("Cortana runtime lineage exceeds its bounded retention".into());
     }
     let mut lineage_keys = std::collections::HashSet::new();
+    let mut provider_session_keys = std::collections::HashSet::new();
+    let mut control_identity_ids = std::collections::HashSet::new();
+    let mut session_identity_generations = std::collections::HashSet::new();
     let mut lineage_generations = std::collections::HashSet::new();
     let mut current_lineage = 0usize;
     let mut previous_generation = 0;
@@ -1553,25 +1779,38 @@ fn validate_cortana_runtime(
             ("lineage conversationId", entry.conversation_id.as_str()),
             ("lineage terminalId", entry.terminal_id.as_str()),
             (
-                "lineage runtimeIdentityId",
-                entry.runtime_identity_id.as_str(),
+                "lineage controlIdentityId",
+                entry.control_identity_id.as_str(),
             ),
         ] {
             validate_cortana_optional_text(Some(value), field)?;
         }
+        validate_cortana_control_identity_id(
+            &entry.control_identity_id,
+            "lineage controlIdentityId",
+        )?;
         if entry.generation == 0
             || entry.generation > runtime.generation
             || entry.generation <= previous_generation
             || entry.recorded_at == 0
             || entry.recorded_at < previous_recorded_at
             || entry.recorded_at > runtime.updated_at
-            || entry.runtime_identity_id
-                != cortana_candidate_identity(&entry.terminal_id, entry.generation)
+            || entry.session_identity_generation == 0
+            || entry.authority_generation != entry.generation
             || !lineage_generations.insert(entry.generation)
             || !lineage_keys.insert((entry.harness.as_str(), entry.conversation_id.as_str()))
+            || !provider_session_keys
+                .insert((entry.provider.as_str(), entry.provider_session_id.as_str()))
+            || !control_identity_ids.insert(entry.control_identity_id.as_str())
+            || !session_identity_generations.insert(entry.session_identity_generation)
         {
             return Err("Cortana runtime lineage contains malformed or duplicate identity".into());
         }
+        validate_cortana_installed_runtime(
+            &entry.harness,
+            &entry.installed_runtime,
+            entry.recorded_at,
+        )?;
         previous_generation = entry.generation;
         previous_recorded_at = entry.recorded_at;
         current_lineage += usize::from(entry.state == CortanaLineageState::Current);
@@ -1585,13 +1824,12 @@ fn validate_cortana_runtime(
             "ensure operationId",
             MAX_CORTANA_OPERATION_ID_BYTES,
         )?;
-        validate_cortana_policy(&intent.desired_runtime)?;
-        let candidate_terminal = intent.candidate_terminal_id.as_deref();
-        let candidate_identity = intent.candidate_identity_id.as_deref();
+        validate_cortana_policy(&intent.request.desired_runtime)?;
         if intent.schema_version != CORTANA_RUNTIME_SCHEMA_VERSION
             || !valid_lower_hex_digest(&intent.request_digest)
             || intent.request_digest != cortana_ensure_request_digest(intent)?
-            || intent.expected_identity_id != CORTANA_IDENTITY_ID
+            || intent.request.expected_identity_id != CORTANA_IDENTITY_ID
+            || intent.request.expected_generation == u64::MAX
             || intent.created_at == 0
             || intent.updated_at < intent.created_at
             || intent.updated_at > runtime.updated_at
@@ -1599,22 +1837,23 @@ fn validate_cortana_runtime(
             return Err("Cortana ensure intent is malformed or stale".into());
         }
         validate_cortana_optional_text(
-            intent.incumbent_terminal_id.as_deref(),
+            intent.request.incumbent_terminal_id.as_deref(),
             "incumbentTerminalId",
         )?;
-        if runtime.policy.as_ref() != Some(&intent.desired_runtime)
-            || (intent.expected_generation == 0) != intent.incumbent_terminal_id.is_none()
+        if runtime.policy.as_ref() != Some(&intent.request.desired_runtime)
+            || (intent.request.expected_generation == 0)
+                != intent.request.incumbent_terminal_id.is_none()
         {
             return Err("Cortana ensure intent does not match its exact runtime policy or incumbent generation".into());
         }
-        if let Some(incumbent_terminal_id) = intent.incumbent_terminal_id.as_deref() {
+        if let Some(incumbent_terminal_id) = intent.request.incumbent_terminal_id.as_deref() {
             validate_cortana_canonical_id(
                 incumbent_terminal_id,
                 "incumbentTerminalId",
                 MAX_CORTANA_IDENTIFIER_BYTES,
             )?;
             if !runtime.lineage.iter().any(|entry| {
-                entry.generation == intent.expected_generation
+                entry.generation == intent.request.expected_generation
                     && entry.terminal_id == incumbent_terminal_id
                     && entry.state == CortanaLineageState::Replaced
             }) {
@@ -1623,11 +1862,26 @@ fn validate_cortana_runtime(
                 );
             }
         }
+        let target_generation = intent
+            .request
+            .expected_generation
+            .checked_add(1)
+            .ok_or("Cortana ensure authority generation is exhausted")?;
+        if let Some(candidate) = intent.candidate.as_ref() {
+            validate_cortana_candidate(
+                candidate,
+                &intent.request.desired_runtime,
+                target_generation,
+                intent.updated_at,
+            )?;
+            if candidate.spawned_at < intent.created_at {
+                return Err("Cortana candidate evidence predates its immutable request".into());
+            }
+        }
         match intent.phase {
-            CortanaEnsurePhase::Prepared | CortanaEnsurePhase::CandidateSpawned => {
-                if intent.expected_generation != runtime.generation
-                    || candidate_terminal.is_none()
-                    || candidate_identity.is_none()
+            CortanaEnsurePhase::Prepared => {
+                if intent.request.expected_generation != runtime.generation
+                    || intent.candidate.is_some()
                     || runtime.lifecycle
                         != if runtime.generation == 0 {
                             CortanaRuntimeLifecycle::Starting
@@ -1641,15 +1895,39 @@ fn validate_cortana_runtime(
                     );
                 }
             }
+            CortanaEnsurePhase::CandidateSpawned => {
+                if intent.request.expected_generation != runtime.generation
+                    || intent
+                        .candidate
+                        .as_ref()
+                        .is_none_or(|candidate| candidate.runtime_attestation.is_some())
+                    || runtime.lifecycle
+                        != if runtime.generation == 0 {
+                            CortanaRuntimeLifecycle::Starting
+                        } else {
+                            CortanaRuntimeLifecycle::Restoring
+                        }
+                {
+                    return Err(
+                        "Cortana spawned candidate lacks distinct durable spawn evidence".into(),
+                    );
+                }
+            }
             CortanaEnsurePhase::Committed => {
-                if intent.expected_generation.checked_add(1) != Some(runtime.generation)
-                    || candidate_terminal != captain.terminal_id.as_deref()
-                    || candidate_identity.is_none()
+                let candidate = intent.candidate.as_ref();
+                if target_generation != runtime.generation
+                    || candidate.map(|candidate| candidate.terminal_id.as_str())
+                        != captain.terminal_id.as_deref()
+                    || candidate.is_none_or(|candidate| candidate.runtime_attestation.is_none())
                     || runtime.lifecycle != CortanaRuntimeLifecycle::Ready
                     || !runtime.lineage.iter().any(|entry| {
                         entry.generation == runtime.generation
-                            && Some(entry.terminal_id.as_str()) == candidate_terminal
-                            && Some(entry.runtime_identity_id.as_str()) == candidate_identity
+                            && candidate.is_some_and(|candidate| {
+                                entry.terminal_id == candidate.terminal_id
+                                    && entry.control_identity_id == candidate.control_identity_id
+                                    && entry.session_identity_generation
+                                        == candidate.session_identity_generation
+                            })
                             && entry.state == CortanaLineageState::Current
                     })
                 {
@@ -1659,9 +1937,8 @@ fn validate_cortana_runtime(
                 }
             }
             CortanaEnsurePhase::CleanupPending => {
-                if intent.expected_generation != runtime.generation
-                    || candidate_terminal.is_none()
-                    || candidate_identity.is_none()
+                if intent.request.expected_generation != runtime.generation
+                    || intent.candidate.is_none()
                     || runtime.lifecycle != CortanaRuntimeLifecycle::NeedsAttention
                     || runtime.reason_code != Some(CortanaRecoveryReason::CandidateCleanupPending)
                     || current_lineage != 0
@@ -1672,32 +1949,14 @@ fn validate_cortana_runtime(
                 }
             }
             CortanaEnsurePhase::Failed => {
-                if intent.expected_generation != runtime.generation
-                    || candidate_terminal.is_some()
-                    || candidate_identity.is_some()
+                if intent.request.expected_generation != runtime.generation
+                    || intent.candidate.is_some()
                     || runtime.lifecycle != CortanaRuntimeLifecycle::Failed
                 {
                     return Err(
                         "Cortana failed intent retains a candidate or mismatched generation".into(),
                     );
                 }
-            }
-        }
-        if let (Some(terminal_id), Some(identity_id)) = (candidate_terminal, candidate_identity) {
-            validate_cortana_canonical_id(
-                terminal_id,
-                "candidateTerminalId",
-                MAX_CORTANA_IDENTIFIER_BYTES,
-            )?;
-            if identity_id
-                != cortana_candidate_identity(
-                    terminal_id,
-                    intent.expected_generation.saturating_add(1),
-                )
-            {
-                return Err(
-                    "Cortana candidate identity is not bound to its terminal generation".into(),
-                );
             }
         }
     }
@@ -1711,16 +1970,32 @@ fn validate_cortana_runtime(
                 .terminal_id
                 .as_deref()
                 .ok_or("ready Cortana runtime is missing terminalId")?;
+            let attestation = runtime
+                .runtime_attestation
+                .as_ref()
+                .ok_or("ready Cortana runtime is missing authoritative post-launch evidence")?;
             if captain.state != ClaimState::Active
                 || runtime.generation == 0
+                || runtime.provenance.source != CortanaRuntimeProvenanceSource::RuntimeAttested
                 || runtime.reason_code.is_some()
                 || runtime.guidance.is_some()
+                || runtime.observed_provider.as_deref() != Some(policy.provider.as_str())
+                || runtime.observed_harness.as_deref() != Some(policy.harness.as_str())
                 || captain.provider.as_deref() != Some(policy.provider.as_str())
                 || captain.harness.as_deref() != Some(policy.harness.as_str())
                 || captain.provider_session_id.as_deref() != runtime.provider_session_id.as_deref()
                 || captain.conversation_id.as_deref() != runtime.conversation_id.as_deref()
+                || captain.resume_point != runtime.checkpoint
                 || runtime.provider_session_id.is_none()
                 || runtime.conversation_id.is_none()
+                || attestation.observed_provider != policy.provider
+                || attestation.observed_harness != policy.harness
+                || Some(attestation.provider_session_id.as_str())
+                    != runtime.provider_session_id.as_deref()
+                || Some(attestation.conversation_id.as_str()) != runtime.conversation_id.as_deref()
+                || attestation.checkpoint != runtime.checkpoint
+                || attestation.terminal_id != terminal_id
+                || attestation.tmux_session_id != format!("th_{terminal_id}")
             {
                 return Err(
                     "ready Cortana runtime does not exactly match its active Fleet identity".into(),
@@ -1739,6 +2014,11 @@ fn validate_cortana_runtime(
                         && Some(entry.conversation_id.as_str())
                             == runtime.conversation_id.as_deref()
                         && entry.terminal_id == terminal_id
+                        && entry.control_identity_id == attestation.control_identity_id
+                        && entry.session_identity_generation
+                            == attestation.session_identity_generation
+                        && entry.authority_generation == attestation.authority_generation
+                        && entry.installed_runtime == attestation.installed_runtime
                 })
                 .count();
             if current_lineage != 1 || matching_current != 1 {
@@ -1751,6 +2031,7 @@ fn validate_cortana_runtime(
             if captain.terminal_id.is_some()
                 || runtime.provider_session_id.is_some()
                 || runtime.conversation_id.is_some()
+                || runtime.runtime_attestation.is_some()
                 || current_lineage != 0
                 || runtime.reason_code.is_some()
                 || runtime.guidance.is_some()
@@ -1765,6 +2046,7 @@ fn validate_cortana_runtime(
             if captain.terminal_id.is_some()
                 || runtime.provider_session_id.is_some()
                 || runtime.conversation_id.is_some()
+                || runtime.runtime_attestation.is_some()
                 || current_lineage != 0
                 || runtime.reason_code.is_none()
                 || runtime.guidance.is_none()
@@ -1778,6 +2060,15 @@ fn validate_cortana_runtime(
         }
         CortanaRuntimeLifecycle::Starting | CortanaRuntimeLifecycle::Restoring => {
             if captain.terminal_id.is_some()
+                || captain.provider.is_some()
+                || captain.harness.is_some()
+                || captain.provider_session_id.is_some()
+                || captain.conversation_id.is_some()
+                || runtime.observed_provider.is_some()
+                || runtime.observed_harness.is_some()
+                || runtime.provider_session_id.is_some()
+                || runtime.conversation_id.is_some()
+                || runtime.runtime_attestation.is_some()
                 || current_lineage != 0
                 || runtime.ensure_intent.is_none()
                 || runtime.reason_code.is_some()
@@ -3734,7 +4025,7 @@ impl CaptainsRegistry {
                 } else {
                     snap.seq
                 };
-                Some(CaptainsInner {
+                let candidate = CaptainsInner {
                     captains,
                     projects: snap.projects,
                     workspaces,
@@ -3744,7 +4035,15 @@ impl CaptainsRegistry {
                     pending_dispatch_releases: snap.pending_dispatch_releases,
                     seq,
                     authority_generations: AuthorityGenerations::default(),
-                })
+                };
+                let upgraded_snapshot = Self::snapshot_for_persist(&candidate);
+                if let Err(error) = Self::validate_snapshot(&upgraded_snapshot) {
+                    write_blocked = Some(format!(
+                        "Cortana registry migration produced invalid current-schema state: {error}"
+                    ));
+                    return None;
+                }
+                Some(candidate)
             })
             .unwrap_or_default();
         // N3: seed the persist guard from the LOADED seq, not 0, so a stale
@@ -3813,7 +4112,7 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_legacy_cortana_runtime = schema_version <= 16
+        let has_legacy_cortana_runtime = schema_version < CAPTAINS_SCHEMA_VERSION as u64
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -20570,7 +20869,31 @@ mod tests {
         )
         .unwrap();
         let terminal_id = "cor-runtime-1".to_string();
-        CaptainRecord {
+        let installed_runtime = CortanaInstalledRuntimeEvidence {
+            resolved_executable: "/opt/t-hub/bin/codex".to_string(),
+            executable_version: "codex-cli 1.2.3".to_string(),
+            evidence_id: cortana_installed_runtime_evidence_id(
+                &policy.harness,
+                "/opt/t-hub/bin/codex",
+                "codex-cli 1.2.3",
+            ),
+            observed_at: 80,
+        };
+        let attestation = CortanaRuntimeAttestation {
+            terminal_id: terminal_id.clone(),
+            tmux_session_id: format!("th_{terminal_id}"),
+            control_identity_id: "11111111111111111111111111111111".to_string(),
+            session_identity_generation: 7,
+            authority_generation: 1,
+            observed_provider: policy.provider.clone(),
+            observed_harness: policy.harness.clone(),
+            provider_session_id: "provider-session-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            checkpoint: Some("checkpoint-1".to_string()),
+            installed_runtime: installed_runtime.clone(),
+            attested_at: 85,
+        };
+        let mut captain = CaptainRecord {
             ship_slug: CORTANA_SLUG.to_string(),
             assignment_id: "cortana-assignment".to_string(),
             display_name: "Cortana".to_string(),
@@ -20590,8 +20913,8 @@ mod tests {
                 generation: 1,
                 lifecycle: CortanaRuntimeLifecycle::Ready,
                 provenance: CortanaRuntimeProvenance {
-                    source: CortanaRuntimeProvenanceSource::ProfileCatalog,
-                    identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
+                    source: CortanaRuntimeProvenanceSource::RuntimeAttested,
+                    identity: String::new(),
                 },
                 policy: Some(policy.clone()),
                 observed_provider: Some(policy.provider.clone()),
@@ -20599,6 +20922,7 @@ mod tests {
                 provider_session_id: Some("provider-session-1".to_string()),
                 conversation_id: Some("conversation-1".to_string()),
                 checkpoint: Some("checkpoint-1".to_string()),
+                runtime_attestation: Some(attestation.clone()),
                 reason_code: None,
                 guidance: None,
                 lineage: vec![CortanaRuntimeLineageEntry {
@@ -20608,7 +20932,10 @@ mod tests {
                     provider_session_id: "provider-session-1".to_string(),
                     conversation_id: "conversation-1".to_string(),
                     terminal_id: terminal_id.clone(),
-                    runtime_identity_id: cortana_candidate_identity(&terminal_id, 1),
+                    control_identity_id: attestation.control_identity_id.clone(),
+                    session_identity_generation: attestation.session_identity_generation,
+                    authority_generation: 1,
+                    installed_runtime,
                     state: CortanaLineageState::Current,
                     recorded_at: 90,
                 }],
@@ -20618,13 +20945,63 @@ mod tests {
             workspace_tab_ids: Vec::new(),
             crew: Vec::new(),
             state: ClaimState::Active,
+        };
+        let runtime = captain.cortana_runtime.as_mut().unwrap();
+        runtime.provenance.identity = cortana_runtime_attestation_identity(
+            runtime,
+            runtime.policy.as_ref().unwrap(),
+            runtime.runtime_attestation.as_ref().unwrap(),
+        )
+        .unwrap();
+        captain
+    }
+
+    fn cortana_candidate_fixture(
+        authority_generation: u64,
+        with_attestation: bool,
+    ) -> CortanaCandidateRuntimeEvidence {
+        let policy = CortanaRuntimePolicy::from_profile_catalog(
+            CORTANA_PROFILE_CATALOG_VERSION,
+            CORTANA_WORK_PROFILE,
+        )
+        .unwrap();
+        let installed_runtime = CortanaInstalledRuntimeEvidence {
+            resolved_executable: "/opt/t-hub/bin/codex".to_string(),
+            executable_version: "codex-cli 1.2.3".to_string(),
+            evidence_id: cortana_installed_runtime_evidence_id(
+                &policy.harness,
+                "/opt/t-hub/bin/codex",
+                "codex-cli 1.2.3",
+            ),
+            observed_at: 96,
+        };
+        CortanaCandidateRuntimeEvidence {
+            terminal_id: "cor-candidate-2".to_string(),
+            tmux_session_id: "th_cor-candidate-2".to_string(),
+            control_identity_id: "22222222222222222222222222222222".to_string(),
+            session_identity_generation: 8,
+            authority_generation,
+            spawned_at: 95,
+            runtime_attestation: with_attestation.then(|| CortanaRuntimeAttestation {
+                terminal_id: "cor-candidate-2".to_string(),
+                tmux_session_id: "th_cor-candidate-2".to_string(),
+                control_identity_id: "22222222222222222222222222222222".to_string(),
+                session_identity_generation: 8,
+                authority_generation,
+                observed_provider: policy.provider,
+                observed_harness: policy.harness,
+                provider_session_id: "provider-session-2".to_string(),
+                conversation_id: "conversation-2".to_string(),
+                checkpoint: Some("checkpoint-1".to_string()),
+                installed_runtime,
+                attested_at: 98,
+            }),
         }
     }
 
     fn cortana_prepared_fixture(generation: u64) -> CaptainRecord {
         let mut captain = cortana_ready_fixture();
         let runtime = captain.cortana_runtime.as_mut().unwrap();
-        let candidate_terminal_id = "cor-candidate-2".to_string();
         captain.terminal_id = None;
         captain.state = ClaimState::Vacant;
         captain.provider = None;
@@ -20637,30 +21014,34 @@ mod tests {
         } else {
             CortanaRuntimeLifecycle::Restoring
         };
+        runtime.provenance = CortanaRuntimeProvenance {
+            source: CortanaRuntimeProvenanceSource::ProfileCatalog,
+            identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
+        };
+        runtime.observed_provider = None;
+        runtime.observed_harness = None;
         runtime.provider_session_id = None;
         runtime.conversation_id = None;
+        runtime.runtime_attestation = None;
         if generation == 0 {
             runtime.lineage.clear();
         } else {
             runtime.lineage[0].generation = generation;
+            runtime.lineage[0].authority_generation = generation;
             runtime.lineage[0].state = CortanaLineageState::Replaced;
-            runtime.lineage[0].runtime_identity_id =
-                cortana_candidate_identity(&runtime.lineage[0].terminal_id, generation);
         }
         runtime.ensure_intent = Some(CortanaEnsureIntent {
             schema_version: CORTANA_RUNTIME_SCHEMA_VERSION,
             operation_id: "ensure-cortana-1".to_string(),
             request_digest: "a".repeat(64),
-            expected_identity_id: CORTANA_IDENTITY_ID.to_string(),
-            expected_generation: generation,
-            incumbent_terminal_id: (generation > 0).then(|| "cor-runtime-1".to_string()),
-            candidate_terminal_id: Some(candidate_terminal_id.clone()),
-            desired_runtime: runtime.policy.clone().unwrap(),
+            request: CortanaEnsureRequestPayload {
+                expected_identity_id: CORTANA_IDENTITY_ID.to_string(),
+                expected_generation: generation,
+                incumbent_terminal_id: (generation > 0).then(|| "cor-runtime-1".to_string()),
+                desired_runtime: runtime.policy.clone().unwrap(),
+            },
             phase: CortanaEnsurePhase::Prepared,
-            candidate_identity_id: Some(cortana_candidate_identity(
-                &candidate_terminal_id,
-                generation + 1,
-            )),
+            candidate: None,
             created_at: 90,
             updated_at: 95,
         });
@@ -25019,6 +25400,122 @@ mod tests {
                 Box::new(|captain| captain.conversation_id = Some("other".into())),
             ),
             (
+                "missing runtime attestation",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation = None
+                }),
+            ),
+            (
+                "missing observed provider",
+                Box::new(|captain| {
+                    captain.cortana_runtime.as_mut().unwrap().observed_provider = None
+                }),
+            ),
+            (
+                "missing observed harness",
+                Box::new(|captain| {
+                    captain.cortana_runtime.as_mut().unwrap().observed_harness = None
+                }),
+            ),
+            (
+                "missing control identity",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .control_identity_id = String::new()
+                }),
+            ),
+            (
+                "attested terminal mismatch",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .terminal_id = "other-terminal".into()
+                }),
+            ),
+            (
+                "zero session identity generation",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .session_identity_generation = 0
+                }),
+            ),
+            (
+                "wrong authority generation",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .authority_generation = 2
+                }),
+            ),
+            (
+                "relative executable",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .installed_runtime
+                        .resolved_executable = "codex".into()
+                }),
+            ),
+            (
+                "missing executable version",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .installed_runtime
+                        .executable_version = String::new()
+                }),
+            ),
+            (
+                "wrong installed-runtime evidence",
+                Box::new(|captain| {
+                    captain
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation
+                        .as_mut()
+                        .unwrap()
+                        .installed_runtime
+                        .evidence_id = "installed-runtime:sha256:wrong".into()
+                }),
+            ),
+            (
                 "recovery reason",
                 Box::new(|captain| {
                     let runtime = captain.cortana_runtime.as_mut().unwrap();
@@ -25045,7 +25542,10 @@ mod tests {
                         provider_session_id: "provider-session-2".into(),
                         conversation_id: "conversation-2".into(),
                         terminal_id: terminal_id.clone(),
-                        runtime_identity_id: cortana_candidate_identity(&terminal_id, 2),
+                        control_identity_id: "22222222222222222222222222222222".into(),
+                        session_identity_generation: 8,
+                        authority_generation: 2,
+                        installed_runtime: runtime.lineage[0].installed_runtime.clone(),
                         state: CortanaLineageState::Current,
                         recorded_at: 95,
                     });
@@ -25069,7 +25569,25 @@ mod tests {
         let valid = cortana_prepared_fixture(1);
         validate_cortana_runtime(&valid, valid.cortana_runtime.as_ref().unwrap()).unwrap();
         let mut spawned = valid.clone();
-        spawned
+        let intent = spawned
+            .cortana_runtime
+            .as_mut()
+            .unwrap()
+            .ensure_intent
+            .as_mut()
+            .unwrap();
+        let immutable_digest = intent.request_digest.clone();
+        intent.phase = CortanaEnsurePhase::CandidateSpawned;
+        intent.candidate = Some(cortana_candidate_fixture(2, false));
+        intent.updated_at = 100;
+        assert_eq!(intent.request_digest, immutable_digest);
+        assert_eq!(
+            cortana_ensure_request_digest(intent).unwrap(),
+            immutable_digest
+        );
+        validate_cortana_runtime(&spawned, spawned.cortana_runtime.as_ref().unwrap()).unwrap();
+        let mut missing_spawn_evidence = valid.clone();
+        missing_spawn_evidence
             .cortana_runtime
             .as_mut()
             .unwrap()
@@ -25077,30 +25595,61 @@ mod tests {
             .as_mut()
             .unwrap()
             .phase = CortanaEnsurePhase::CandidateSpawned;
-        validate_cortana_runtime(&spawned, spawned.cortana_runtime.as_ref().unwrap()).unwrap();
+        assert!(validate_cortana_runtime(
+            &missing_spawn_evidence,
+            missing_spawn_evidence.cortana_runtime.as_ref().unwrap()
+        )
+        .is_err());
+        let mut prematurely_attested = spawned.clone();
+        prematurely_attested
+            .cortana_runtime
+            .as_mut()
+            .unwrap()
+            .ensure_intent
+            .as_mut()
+            .unwrap()
+            .candidate = Some(cortana_candidate_fixture(2, true));
+        assert!(validate_cortana_runtime(
+            &prematurely_attested,
+            prematurely_attested.cortana_runtime.as_ref().unwrap()
+        )
+        .is_err());
 
         for (label, mutate) in [
             ("wrong generation", 0_u8),
-            ("missing terminal", 1),
-            ("missing identity", 2),
-            ("wrong identity", 3),
+            ("prepared candidate", 1),
+            ("identity generation", 2),
+            ("authority generation", 3),
             ("wrong lifecycle", 4),
             ("uppercase digest", 5),
             ("unsafe operation", 6),
             ("future update", 7),
+            ("exhausted generation", 8),
         ] {
             let mut captain = valid.clone();
             let runtime = captain.cortana_runtime.as_mut().unwrap();
             let intent = runtime.ensure_intent.as_mut().unwrap();
             match mutate {
-                0 => intent.expected_generation = 0,
-                1 => intent.candidate_terminal_id = None,
-                2 => intent.candidate_identity_id = None,
-                3 => intent.candidate_identity_id = Some("candidate:sha256:wrong".into()),
+                0 => intent.request.expected_generation = 0,
+                1 => intent.candidate = Some(cortana_candidate_fixture(2, false)),
+                2 => {
+                    intent.phase = CortanaEnsurePhase::CandidateSpawned;
+                    let mut candidate = cortana_candidate_fixture(2, false);
+                    candidate.session_identity_generation = 0;
+                    intent.candidate = Some(candidate);
+                }
+                3 => {
+                    intent.phase = CortanaEnsurePhase::CandidateSpawned;
+                    intent.candidate = Some(cortana_candidate_fixture(3, false));
+                }
                 4 => runtime.lifecycle = CortanaRuntimeLifecycle::Degraded,
                 5 => intent.request_digest = "A".repeat(64),
                 6 => intent.operation_id = "unsafe operation".into(),
                 7 => intent.updated_at = runtime.updated_at + 1,
+                8 => {
+                    intent.request.expected_generation = u64::MAX;
+                    intent.request_digest = cortana_ensure_request_digest(intent).unwrap();
+                }
                 _ => unreachable!(),
             }
             assert!(
@@ -25112,21 +25661,29 @@ mod tests {
 
         let mut committed = cortana_ready_fixture();
         let runtime = committed.cortana_runtime.as_mut().unwrap();
+        let attestation = runtime.runtime_attestation.clone().unwrap();
+        let candidate = CortanaCandidateRuntimeEvidence {
+            terminal_id: committed.terminal_id.clone().unwrap(),
+            tmux_session_id: format!("th_{}", committed.terminal_id.as_deref().unwrap()),
+            control_identity_id: attestation.control_identity_id.clone(),
+            session_identity_generation: attestation.session_identity_generation,
+            authority_generation: 1,
+            spawned_at: 75,
+            runtime_attestation: Some(attestation),
+        };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
             schema_version: CORTANA_RUNTIME_SCHEMA_VERSION,
             operation_id: "ensure-cortana-committed".into(),
             request_digest: "b".repeat(64),
-            expected_identity_id: CORTANA_IDENTITY_ID.into(),
-            expected_generation: 0,
-            incumbent_terminal_id: None,
-            candidate_terminal_id: committed.terminal_id.clone(),
-            desired_runtime: runtime.policy.clone().unwrap(),
+            request: CortanaEnsureRequestPayload {
+                expected_identity_id: CORTANA_IDENTITY_ID.into(),
+                expected_generation: 0,
+                incumbent_terminal_id: None,
+                desired_runtime: runtime.policy.clone().unwrap(),
+            },
             phase: CortanaEnsurePhase::Committed,
-            candidate_identity_id: Some(cortana_candidate_identity(
-                committed.terminal_id.as_deref().unwrap(),
-                1,
-            )),
-            created_at: 80,
+            candidate: Some(candidate),
+            created_at: 70,
             updated_at: 100,
         });
         let intent = runtime.ensure_intent.as_mut().unwrap();
@@ -25138,7 +25695,9 @@ mod tests {
         runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
         runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
         runtime.guidance = Some("Resolve the exact candidate cleanup before retrying.".into());
-        runtime.ensure_intent.as_mut().unwrap().phase = CortanaEnsurePhase::CleanupPending;
+        let intent = runtime.ensure_intent.as_mut().unwrap();
+        intent.phase = CortanaEnsurePhase::CleanupPending;
+        intent.candidate = Some(cortana_candidate_fixture(2, false));
         validate_cortana_runtime(&cleanup, cleanup.cortana_runtime.as_ref().unwrap()).unwrap();
 
         let mut failed = cortana_prepared_fixture(1);
@@ -25148,9 +25707,7 @@ mod tests {
         runtime.guidance = Some("Review the bounded startup failure before retrying.".into());
         let intent = runtime.ensure_intent.as_mut().unwrap();
         intent.phase = CortanaEnsurePhase::Failed;
-        intent.candidate_terminal_id = None;
-        intent.candidate_identity_id = None;
-        intent.request_digest = cortana_ensure_request_digest(intent).unwrap();
+        intent.candidate = None;
         validate_cortana_runtime(&failed, failed.cortana_runtime.as_ref().unwrap()).unwrap();
     }
 
@@ -25160,11 +25717,14 @@ mod tests {
         for (label, mutate) in [
             ("unknown harness", 0_u8),
             ("oversized native id", 1),
-            ("duplicate native identity", 2),
+            ("duplicate harness conversation", 2),
             ("unordered generation", 3),
             ("future generation", 4),
             ("future timestamp", 5),
-            ("unbound runtime identity", 6),
+            ("zero identity generation", 6),
+            ("duplicate provider session", 7),
+            ("duplicate control identity", 8),
+            ("duplicate session identity generation", 9),
         ] {
             let mut captain = valid.clone();
             let runtime = captain.cortana_runtime.as_mut().unwrap();
@@ -25177,8 +25737,9 @@ mod tests {
                 2 => {
                     let mut duplicate = runtime.lineage[0].clone();
                     duplicate.generation = 2;
-                    duplicate.runtime_identity_id =
-                        cortana_candidate_identity(&duplicate.terminal_id, 2);
+                    duplicate.authority_generation = 2;
+                    duplicate.control_identity_id = "22222222222222222222222222222222".into();
+                    duplicate.session_identity_generation = 8;
                     duplicate.recorded_at = 95;
                     runtime.lineage.push(duplicate);
                     runtime.generation = 2;
@@ -25186,14 +25747,50 @@ mod tests {
                 3 => {
                     let mut older = runtime.lineage[0].clone();
                     older.generation = 2;
+                    older.authority_generation = 2;
                     older.conversation_id = "conversation-2".into();
-                    older.runtime_identity_id = cortana_candidate_identity(&older.terminal_id, 2);
+                    older.provider_session_id = "provider-session-2".into();
+                    older.control_identity_id = "22222222222222222222222222222222".into();
+                    older.session_identity_generation = 8;
                     runtime.lineage.insert(0, older);
                     runtime.generation = 2;
                 }
                 4 => runtime.lineage[0].generation = 2,
                 5 => runtime.lineage[0].recorded_at = runtime.updated_at + 1,
-                6 => runtime.lineage[0].runtime_identity_id = "candidate:sha256:wrong".into(),
+                6 => runtime.lineage[0].session_identity_generation = 0,
+                7 => {
+                    let mut duplicate = runtime.lineage[0].clone();
+                    duplicate.generation = 2;
+                    duplicate.authority_generation = 2;
+                    duplicate.conversation_id = "conversation-2".into();
+                    duplicate.control_identity_id = "22222222222222222222222222222222".into();
+                    duplicate.session_identity_generation = 8;
+                    duplicate.recorded_at = 95;
+                    runtime.lineage.push(duplicate);
+                    runtime.generation = 2;
+                }
+                8 => {
+                    let mut duplicate = runtime.lineage[0].clone();
+                    duplicate.generation = 2;
+                    duplicate.authority_generation = 2;
+                    duplicate.conversation_id = "conversation-2".into();
+                    duplicate.provider_session_id = "provider-session-2".into();
+                    duplicate.session_identity_generation = 8;
+                    duplicate.recorded_at = 95;
+                    runtime.lineage.push(duplicate);
+                    runtime.generation = 2;
+                }
+                9 => {
+                    let mut duplicate = runtime.lineage[0].clone();
+                    duplicate.generation = 2;
+                    duplicate.authority_generation = 2;
+                    duplicate.conversation_id = "conversation-2".into();
+                    duplicate.provider_session_id = "provider-session-2".into();
+                    duplicate.control_identity_id = "22222222222222222222222222222222".into();
+                    duplicate.recorded_at = 95;
+                    runtime.lineage.push(duplicate);
+                    runtime.generation = 2;
+                }
                 _ => unreachable!(),
             }
             assert!(
@@ -25208,7 +25805,7 @@ mod tests {
     fn cortana_policy_and_provenance_require_exact_protected_catalog_or_attestation() {
         let valid = cortana_ready_fixture();
         for (label, mutate) in [
-            ("catalog identity", 0_u8),
+            ("catalog cannot prove ready", 0_u8),
             ("catalog model", 1),
             ("unknown provider", 2),
             ("unknown harness", 3),
@@ -25220,7 +25817,10 @@ mod tests {
             let mut captain = valid.clone();
             let runtime = captain.cortana_runtime.as_mut().unwrap();
             match mutate {
-                0 => runtime.provenance.identity = "profile-catalog:v1:other".into(),
+                0 => {
+                    runtime.provenance.source = CortanaRuntimeProvenanceSource::ProfileCatalog;
+                    runtime.provenance.identity = CORTANA_PROFILE_CATALOG_ID.into();
+                }
                 1 => runtime.policy.as_mut().unwrap().model = "invented-model".into(),
                 2 => runtime.policy.as_mut().unwrap().provider = "other".into(),
                 3 => runtime.policy.as_mut().unwrap().harness = "other".into(),
@@ -25252,10 +25852,18 @@ mod tests {
         runtime.policy.as_mut().unwrap().provider = "claude".into();
         runtime.observed_provider = Some("claude".into());
         runtime.lineage[0].provider = "claude".into();
+        runtime
+            .runtime_attestation
+            .as_mut()
+            .unwrap()
+            .observed_provider = "claude".into();
         runtime.provenance.source = CortanaRuntimeProvenanceSource::RuntimeAttested;
-        runtime.provenance.identity =
-            cortana_runtime_attestation_identity(runtime, runtime.policy.as_ref().unwrap())
-                .unwrap();
+        runtime.provenance.identity = cortana_runtime_attestation_identity(
+            runtime,
+            runtime.policy.as_ref().unwrap(),
+            runtime.runtime_attestation.as_ref().unwrap(),
+        )
+        .unwrap();
         let snapshot = CaptainsSnapshot {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 1,
@@ -25282,8 +25890,15 @@ mod tests {
         let runtime = absent.cortana_runtime.as_mut().unwrap();
         runtime.generation = 0;
         runtime.lifecycle = CortanaRuntimeLifecycle::Absent;
+        runtime.provenance = CortanaRuntimeProvenance {
+            source: CortanaRuntimeProvenanceSource::ProfileCatalog,
+            identity: CORTANA_PROFILE_CATALOG_ID.into(),
+        };
+        runtime.observed_provider = None;
+        runtime.observed_harness = None;
         runtime.provider_session_id = None;
         runtime.conversation_id = None;
+        runtime.runtime_attestation = None;
         runtime.lineage.clear();
         validate_cortana_runtime(&absent, absent.cortana_runtime.as_ref().unwrap()).unwrap();
 
@@ -25315,6 +25930,52 @@ mod tests {
             validate_cortana_runtime(&starting, starting.cortana_runtime.as_ref().unwrap())
                 .is_err()
         );
+
+        let valid_starting = cortana_prepared_fixture(0);
+        for (label, mutate) in [
+            ("outer provider session", 0_u8),
+            ("outer conversation", 1),
+            ("runtime provider session", 2),
+            ("runtime conversation", 3),
+            ("runtime current identity", 4),
+            ("outer provider", 5),
+            ("outer harness", 6),
+        ] {
+            let mut candidate = valid_starting.clone();
+            match mutate {
+                0 => candidate.provider_session_id = Some("stale-provider-session".into()),
+                1 => candidate.conversation_id = Some("stale-conversation".into()),
+                2 => {
+                    candidate
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .provider_session_id = Some("stale-provider-session".into())
+                }
+                3 => {
+                    candidate.cortana_runtime.as_mut().unwrap().conversation_id =
+                        Some("stale-conversation".into())
+                }
+                4 => {
+                    candidate
+                        .cortana_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runtime_attestation = cortana_ready_fixture()
+                        .cortana_runtime
+                        .unwrap()
+                        .runtime_attestation
+                }
+                5 => candidate.provider = Some("codex".into()),
+                6 => candidate.harness = Some("codex".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_cortana_runtime(&candidate, candidate.cortana_runtime.as_ref().unwrap())
+                    .is_err(),
+                "{label} was accepted during Starting"
+            );
+        }
     }
 
     #[test]
@@ -25326,13 +25987,14 @@ mod tests {
             schema_version: CORTANA_RUNTIME_SCHEMA_VERSION,
             operation_id: "ensure-cortana-replay".into(),
             request_digest: "c".repeat(64),
-            expected_identity_id: CORTANA_IDENTITY_ID.into(),
-            expected_generation: 1,
-            incumbent_terminal_id: None,
-            candidate_terminal_id: Some(terminal_id.clone()),
-            desired_runtime: runtime.policy.clone().unwrap(),
+            request: CortanaEnsureRequestPayload {
+                expected_identity_id: CORTANA_IDENTITY_ID.into(),
+                expected_generation: 1,
+                incumbent_terminal_id: Some(terminal_id),
+                desired_runtime: runtime.policy.clone().unwrap(),
+            },
             phase: CortanaEnsurePhase::Committed,
-            candidate_identity_id: Some(cortana_candidate_identity(&terminal_id, 2)),
+            candidate: Some(cortana_candidate_fixture(2, true)),
             created_at: 80,
             updated_at: 100,
         });
@@ -25349,11 +26011,7 @@ mod tests {
         runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
         runtime.guidance = Some("Resolve exact cleanup before another recovery.".into());
         runtime.ensure_intent.as_mut().unwrap().phase = CortanaEnsurePhase::CleanupPending;
-        runtime
-            .ensure_intent
-            .as_mut()
-            .unwrap()
-            .candidate_identity_id = None;
+        runtime.ensure_intent.as_mut().unwrap().candidate = None;
         assert!(
             validate_cortana_runtime(&cleanup, cleanup.cortana_runtime.as_ref().unwrap()).is_err()
         );
@@ -25363,7 +26021,9 @@ mod tests {
         runtime.lifecycle = CortanaRuntimeLifecycle::Failed;
         runtime.reason_code = Some(CortanaRecoveryReason::RuntimeStartFailed);
         runtime.guidance = Some("Review the exact candidate failure.".into());
-        runtime.ensure_intent.as_mut().unwrap().phase = CortanaEnsurePhase::Failed;
+        let intent = runtime.ensure_intent.as_mut().unwrap();
+        intent.phase = CortanaEnsurePhase::Failed;
+        intent.candidate = Some(cortana_candidate_fixture(2, false));
         assert!(
             validate_cortana_runtime(&failed, failed.cortana_runtime.as_ref().unwrap()).is_err()
         );
@@ -25374,15 +26034,105 @@ mod tests {
         let mut captain = cortana_ready_fixture();
         let runtime = captain.cortana_runtime.as_mut().unwrap();
         runtime.provenance.source = CortanaRuntimeProvenanceSource::RuntimeAttested;
-        runtime.provenance.identity =
-            cortana_runtime_attestation_identity(runtime, runtime.policy.as_ref().unwrap())
-                .unwrap();
+        runtime.provenance.identity = cortana_runtime_attestation_identity(
+            runtime,
+            runtime.policy.as_ref().unwrap(),
+            runtime.runtime_attestation.as_ref().unwrap(),
+        )
+        .unwrap();
         validate_cortana_runtime(&captain, captain.cortana_runtime.as_ref().unwrap()).unwrap();
 
         captain.cortana_runtime.as_mut().unwrap().checkpoint = Some("changed-checkpoint".into());
         assert!(
             validate_cortana_runtime(&captain, captain.cortana_runtime.as_ref().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn cortana_control_identity_requires_exact_identity_store_id_generation_role_and_tile() {
+        let store = crate::identity::IdentityStore::ephemeral();
+        let identity = store
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        store.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let bound = store.get(&identity.id).unwrap();
+        validate_cortana_session_identity(
+            &bound.id,
+            bound.generation,
+            1,
+            1,
+            "cor-runtime-1",
+            &bound,
+        )
+        .unwrap();
+        let mut ready = cortana_ready_fixture();
+        let runtime = ready.cortana_runtime.as_mut().unwrap();
+        let attestation = runtime.runtime_attestation.as_mut().unwrap();
+        attestation.control_identity_id = bound.id.clone();
+        attestation.session_identity_generation = bound.generation;
+        runtime.lineage[0].control_identity_id = bound.id.clone();
+        runtime.lineage[0].session_identity_generation = bound.generation;
+        runtime.provenance.identity = cortana_runtime_attestation_identity(
+            runtime,
+            runtime.policy.as_ref().unwrap(),
+            runtime.runtime_attestation.as_ref().unwrap(),
+        )
+        .unwrap();
+        validate_cortana_runtime(&ready, ready.cortana_runtime.as_ref().unwrap()).unwrap();
+        assert!(validate_cortana_session_identity(
+            "derived-terminal-hash",
+            bound.generation,
+            1,
+            1,
+            "cor-runtime-1",
+            &bound,
+        )
+        .is_err());
+        assert!(validate_cortana_session_identity(
+            &bound.id,
+            bound.generation + 1,
+            1,
+            1,
+            "cor-runtime-1",
+            &bound,
+        )
+        .is_err());
+        assert!(validate_cortana_session_identity(
+            &bound.id,
+            bound.generation,
+            1,
+            1,
+            "other-terminal",
+            &bound,
+        )
+        .is_err());
+        assert!(validate_cortana_session_identity(
+            &bound.id,
+            bound.generation,
+            1,
+            2,
+            "cor-runtime-1",
+            &bound,
+        )
+        .is_err());
+
+        let crew = store
+            .mint_for(crate::identity::Role::Crew, Some(CORTANA_SLUG.to_string()))
+            .unwrap();
+        store.bind_tile(&crew.id, "crew-terminal").unwrap();
+        let crew = store.get(&crew.id).unwrap();
+        assert!(validate_cortana_session_identity(
+            &crew.id,
+            crew.generation,
+            1,
+            1,
+            "crew-terminal",
+            &crew,
+        )
+        .is_err());
     }
 
     #[test]
@@ -25470,7 +26220,7 @@ mod tests {
         let mut legacy = cortana_ready_fixture();
         legacy.cortana_runtime = None;
         let snapshot = CaptainsSnapshot {
-            schema_version: 16,
+            schema_version: 17,
             seq: 7,
             captains: vec![legacy.clone()],
             projects: Vec::new(),
@@ -25501,6 +26251,29 @@ mod tests {
         assert!(oversized_registry.write_blocked.is_some());
         assert!(oversized_registry.snapshot().captains.is_empty());
         assert_eq!(std::fs::read(&oversized_path).unwrap(), oversized_bytes);
+    }
+
+    #[test]
+    fn cortana_pre_v15_migration_validates_full_current_schema_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pre-v15-malformed.json");
+        let legacy = json!({
+            "schemaVersion": 14,
+            "seq": 9,
+            "captains": [],
+            "retiredFleetTileIds": ["duplicate-terminal", "duplicate-terminal"]
+        });
+        let source = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&path, &source).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry.write_blocked.as_deref().is_some_and(|reason| {
+            reason.contains("invalid current-schema state")
+                && reason.contains("retired Fleet terminal")
+        }));
+        assert!(registry.snapshot().captains.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert!(!path.with_extension("json.bak").exists());
     }
 
     #[test]
