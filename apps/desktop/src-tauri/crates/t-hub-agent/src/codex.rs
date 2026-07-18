@@ -231,10 +231,24 @@ fn map_app_server_message(
         | "applyPatchApproval" => {
             state.active_turn = true;
             state.terminal_turn = false;
-            permission_entry(method, value, state, binding)
+            permission_entry(method, value, state, binding).or_else(|| {
+                malformed_permission_entry(
+                    method,
+                    state,
+                    binding,
+                    "invalid_permission_request_identity",
+                )
+            })
         }
         "serverRequest/resolved" => {
-            let request_id = value_id(params.get("requestId"))?;
+            let Some(request_id) = value_id(params.get("requestId")) else {
+                return health_entry(
+                    state,
+                    binding,
+                    "degraded",
+                    "invalid_permission_resolution_identity",
+                );
+            };
             let mut entry = lifecycle_entry(
                 state,
                 binding,
@@ -288,15 +302,8 @@ fn permission_entry(
     binding: &TmuxBinding,
 ) -> Option<EventJournalEntry> {
     let params = value.get("params").unwrap_or(&Value::Null);
-    let request_id = value_id(value.get("id"))
-        .or_else(|| value_id(params.get("approvalId")))
-        .or_else(|| bounded_string(params.get("itemId"), MAX_ID_BYTES))?;
-    let kind = match method {
-        "item/commandExecution/requestApproval" | "execCommandApproval" => "command_execution",
-        "item/fileChange/requestApproval" | "applyPatchApproval" => "file_change",
-        "item/permissions/requestApproval" => "additional_permissions",
-        _ => "unknown",
-    };
+    let request_id = permission_request_id(value, params)?;
+    let kind = permission_kind(method);
     let tool_name = match kind {
         "command_execution" => "Bash",
         "file_change" => "apply_patch",
@@ -324,7 +331,7 @@ fn permission_entry(
         "provider_request_id": provider_request_id,
         "session_id": state.session_id,
         "turn_id": state.turn_id,
-        "item_id": bounded_string(params.get("itemId"), MAX_ID_BYTES),
+        "item_id": exact_string(params.get("itemId"), MAX_ID_BYTES),
         "tool_name": tool_name,
         "requested_at_ms": requested_at_ms,
         "has_command": params.get("command").is_some_and(|value| !value.is_null()),
@@ -336,6 +343,52 @@ fn permission_entry(
     });
     entry.payload["permission_request_id"] = entry.payload["permission_request"]["id"].clone();
     Some(entry)
+}
+
+fn malformed_permission_entry(
+    method: &str,
+    state: &TapState,
+    binding: &TmuxBinding,
+    detail: &str,
+) -> Option<EventJournalEntry> {
+    let mut entry = lifecycle_entry(
+        state,
+        binding,
+        JournalEventType::PermissionRequest,
+        "permission_requested",
+    )?;
+    entry.payload["permission_observation"] = json!({
+        "schema_version": PERMISSION_SCHEMA,
+        "kind": permission_kind(method),
+        "provider": "codex",
+        "valid": false,
+    });
+    entry.payload["telemetry"] = json!({
+        "transport": "structured",
+        "quality": "stale",
+        "runtime_health": "degraded",
+        "detail": detail,
+    });
+    Some(entry)
+}
+
+fn permission_kind(method: &str) -> &'static str {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => "command_execution",
+        "item/fileChange/requestApproval" | "applyPatchApproval" => "file_change",
+        "item/permissions/requestApproval" => "additional_permissions",
+        _ => "unknown",
+    }
+}
+
+fn permission_request_id(value: &Value, params: &Value) -> Option<String> {
+    if let Some(id) = value.get("id") {
+        return value_id(Some(id));
+    }
+    if let Some(id) = params.get("approvalId") {
+        return value_id(Some(id));
+    }
+    exact_string(params.get("itemId"), MAX_ID_BYTES)
 }
 
 fn lifecycle_entry(
@@ -508,7 +561,7 @@ pub fn entry_from_hook(
             "turn_started",
         ),
         "PermissionRequest" => {
-            let request_id = bounded_string(
+            let request_id = exact_string(
                 raw.get("approval_id")
                     .or_else(|| raw.get("tool_use_id"))
                     .or_else(|| raw.get("item_id")),
@@ -540,7 +593,7 @@ pub fn entry_from_hook(
             permission_entry(method, &envelope, &state, &binding)
         }
         "PostToolUse" => {
-            let request_id = bounded_string(
+            let request_id = exact_string(
                 raw.get("approval_id")
                     .or_else(|| raw.get("tool_use_id"))
                     .or_else(|| raw.get("item_id")),
@@ -574,10 +627,20 @@ pub fn entry_from_hook(
 
 fn value_id(value: Option<&Value>) -> Option<String> {
     match value? {
-        Value::String(value) => Some(bounded_str(value, MAX_ID_BYTES)),
-        Value::Number(value) => Some(value.to_string()),
+        Value::String(value) if value.len() <= MAX_ID_BYTES => Some(value.clone()),
+        Value::Number(value) => {
+            let value = value.to_string();
+            (value.len() <= MAX_ID_BYTES).then_some(value)
+        }
         _ => None,
     }
+}
+
+fn exact_string(value: Option<&Value>, max: usize) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= max)
+        .map(str::to_string)
 }
 
 fn bounded_string(value: Option<&Value>, max: usize) -> Option<String> {
@@ -738,6 +801,77 @@ mod tests {
             entries.last().unwrap().payload["telemetry"]["runtime_health"],
             "disconnected"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn oversized_approval_ids_cannot_alias_or_cross_resolve() {
+        let dir = temp_dir("oversized-approval-id");
+        let journal = crate::journal::Journal::open(&dir).unwrap();
+        let shared_prefix = "p".repeat(MAX_ID_BYTES);
+        let oversized_id = format!("{shared_prefix}x");
+        let input = format!(
+            "{{\"method\":\"thread/started\",\"params\":{{\"thread\":{{\"id\":\"thread-1\"}}}}}}\n\
+             {{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"thread-1\",\"turn\":{{\"id\":\"turn-1\"}}}}}}\n\
+             {{\"method\":\"item/commandExecution/requestApproval\",\"id\":\"{shared_prefix}\",\"params\":{{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"itemId\":\"item-1\"}}}}\n\
+             {{\"method\":\"item/commandExecution/requestApproval\",\"id\":\"{oversized_id}\",\"params\":{{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"itemId\":\"item-2\",\"command\":\"credential-bearing-command\"}}}}\n\
+             {{\"method\":\"serverRequest/resolved\",\"params\":{{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",\"requestId\":\"{oversized_id}\"}}}}\n"
+        );
+        ingest_reader(
+            std::io::Cursor::new(input),
+            &journal,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+
+        let entries = journal.replay(0).unwrap();
+        let valid = entries
+            .iter()
+            .find(|entry| {
+                entry.payload["permission_request"]["provider_request_id"] == shared_prefix
+            })
+            .expect("the exact 512-byte provider id remains valid");
+        assert_eq!(valid.event_type, JournalEventType::PermissionRequest);
+        assert!(entries.iter().any(|entry| {
+            entry.event_type == JournalEventType::PermissionRequest
+                && entry.payload["telemetry"]["runtime_health"] == "degraded"
+                && entry.payload.get("permission_request").is_none()
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.payload["lifecycle"] == "permission_resolved"
+                && entry.payload["permission_request_id"] == shared_prefix
+        }));
+        let persisted = serde_json::to_string(&entries).unwrap();
+        assert!(!persisted.contains(&oversized_id));
+        assert!(!persisted.contains("credential-bearing-command"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recognized_approval_without_identity_is_fail_closed_degraded() {
+        let dir = temp_dir("missing-approval-id");
+        let journal = crate::journal::Journal::open(&dir).unwrap();
+        let input = r#"{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}
+{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}
+{"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","command":"credential-bearing-command","reason":"credential-bearing-reason"}}
+"#;
+        ingest_reader(
+            std::io::Cursor::new(input),
+            &journal,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+
+        let entries = journal.replay(0).unwrap();
+        let malformed = entries
+            .iter()
+            .find(|entry| entry.event_type == JournalEventType::PermissionRequest)
+            .expect("recognized malformed approval must remain an explicit pause");
+        assert_eq!(malformed.payload["telemetry"]["runtime_health"], "degraded");
+        assert!(malformed.payload.get("permission_request").is_none());
+        let persisted = serde_json::to_string(&entries).unwrap();
+        assert!(!persisted.contains("credential-bearing-command"));
+        assert!(!persisted.contains("credential-bearing-reason"));
         std::fs::remove_dir_all(dir).ok();
     }
 

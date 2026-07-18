@@ -1491,6 +1491,119 @@ mod tests {
     }
 
     #[test]
+    fn malformed_codex_permission_cannot_cross_clear_a_valid_request() {
+        let bridge = AgentBridge::new();
+        let request_id = "p".repeat(512);
+        let entry = |seq, event_type, payload| EventJournalEntry {
+            seq,
+            timestamp_ms: seq * 10,
+            source: JournalSource::Agent,
+            entity_id: Some("thread-1".to_string()),
+            event_type,
+            payload,
+            result: None,
+        };
+        bridge.consume_journal_entry(&entry(
+            1,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "permission_request_id": request_id,
+                "permission_request": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "id": request_id,
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "provider_request_id": request_id,
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "tool_name": "Bash",
+                    "requested_at_ms": 10
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        ));
+        bridge.consume_journal_entry(&entry(
+            2,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "permission_observation": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "valid": false
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "invalid_permission_request_identity"
+                }
+            }),
+        ));
+        bridge.consume_journal_entry(&entry(
+            3,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "telemetry_health",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "invalid_permission_resolution_identity"
+                }
+            }),
+        ));
+
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::NeedsPermission
+        );
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+            .is_none());
+        assert_eq!(
+            bridge
+                .with_supervisor(|supervisor| supervisor.runtime_health("thread-1"))
+                .unwrap()
+                .health,
+            crate::supervision::RuntimeHealth::Degraded
+        );
+
+        let replayed = entry(3, JournalEventType::SessionStart, serde_json::json!({}));
+        assert!(bridge.consume_journal_entry(&replayed).is_none());
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::NeedsPermission
+        );
+
+        bridge.consume_journal_entry(&entry(
+            4,
+            JournalEventType::UserPromptSubmit,
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::Working
+        );
+    }
+
+    #[test]
     fn unobserved_interactive_codex_is_degraded_never_false_working() {
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
