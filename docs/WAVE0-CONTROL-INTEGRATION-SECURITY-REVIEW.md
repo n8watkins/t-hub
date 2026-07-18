@@ -558,6 +558,32 @@ An authenticated `th send` report for this focused remediation was attempted fro
 The installed control plane rejected it because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+## Private Pane Respawn Remediation
+
+Production remediation head `c8a6752` replaces Crew dispatch's injected `send_text` provider launch with a private dormant-pane to exact `tmux respawn-pane -k` transaction.
+The dormant pane preserves the server-minted terminal id, capability and identity environment, tab placement, and durable Crew binding before the provider is launched.
+The crate-private tmux primitive accepts only an exact target, cwd, and argv-wrapped command, and it returns pre and post pane-generation evidence.
+It requires the same tmux session creation, window, and pane identity with a new pane process id before launch acceptance can continue.
+Dispatch revalidates captured Captain, Project, Powder, and caller authority immediately before and after respawn.
+The respawn command uses the existing `commands::pane_command` wrapper around the existing `crew_interactive_launch` result.
+No provider command is sent with `send_text`, and no provider launch command is added to public snapshots or logs.
+The Harness attestation requires the pre and post evidence to match the exact respawn transition before applying the existing provider, permission, executable, process, and ancestry checks.
+
+The red-first hostile-shell dispatch regression sets tmux `default-shell` to a shell that discards interactive input.
+It proves a direct injected provider command never reaches the provider, while the real dispatch transaction launches and attests the provider through the private dormant-pane respawn.
+The live tmux regression separately proves an exact dormant pane respawns in place with a new process generation and that an injected-key-hostile pane still executes the private respawn command.
+The pre-respawn distinct-Captain replacement regression proves no provider invocation and exact trusted-claim rollback.
+The post-respawn same-terminal release-reclaim regression proves the replacement Captain and Powder binding survive while only the transaction-owned Crew and exact claim are rolled back.
+
+From `apps/desktop/src-tauri`, `cargo test -p t-hub 'control::tests::dispatch_' -- --nocapture --test-threads=1` passed 39 tests with 1 intentionally ignored combined-agent test.
+`cargo test -p t-hub tmux::tests:: -- --test-threads=1` passed 13 tests.
+`cargo test -p t-hub harness::tests:: -- --test-threads=1` passed 16 tests.
+`cargo test -p t-hub control::tests::codex_unobserved_marker_runs_in_owning_pane_and_fails_closed_without_affecting_claude -- --exact --test-threads=1` passed 1 test.
+`cargo test -p t-hub process_level_permission_attestation -- --test-threads=1` passed 4 tests.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No full control aggregate or workspace aggregate was run for this remediation.
+The prior workspace aggregate failure remains an unresolved release-blocking residual and is not claimed as resolved by this focused production remediation.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
