@@ -10629,7 +10629,7 @@ fn ensure_dispatch_powder_binding_available(
 }
 
 const CODEX_UNOBSERVED_COMMAND: &str = "t-hub-agent --codex-unobserved";
-const CREW_DORMANT_PANE_COMMAND: &str = "exec sleep 2147483647";
+const CREW_DORMANT_PANE_COMMAND: &str = "exec /bin/sleep 2147483647";
 
 fn crew_interactive_launch(
     harness: Harness,
@@ -10964,7 +10964,6 @@ fn dispatch_crew_with_observer_inner(
         "name": format!("Crew - {}", card_id),
         "spawnedBy": captain_session_id,
         "capability": "read",
-        "startupCommand": CREW_DORMANT_PANE_COMMAND,
     });
     if let Some(tab_id) = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")) {
         spawn_args["tabId"] = json!(tab_id);
@@ -10984,7 +10983,16 @@ fn dispatch_crew_with_observer_inner(
     };
     ctx.captains
         .begin_pending_dispatch_claim(pending_claim.clone())?;
-    let spawned = match spawn_terminal(ctx, &spawn_args) {
+    #[cfg(not(test))]
+    let private_dormant_pane_command = CREW_DORMANT_PANE_COMMAND.to_string();
+    #[cfg(test)]
+    let private_dormant_pane_command = arg_str(args, "testDispatchDormantPaneCommand")
+        .unwrap_or_else(|| CREW_DORMANT_PANE_COMMAND.to_string());
+    let spawned = match spawn_terminal_with_private_pane_command(
+        ctx,
+        &spawn_args,
+        Some(&private_dormant_pane_command),
+    ) {
         Ok(spawned) => spawned,
         Err(error) => {
             return match ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
@@ -11149,8 +11157,14 @@ fn dispatch_crew_with_observer_inner(
             .unwrap_or_else(|| CODEX_UNOBSERVED_COMMAND.to_string());
         crew_interactive_launch(harness, &provider_launch, &codex_unobserved_command)
     };
-    let respawn_command = crate::commands::pane_command(None, Some(&launch))
-        .ok_or("dispatch_crew: private provider respawn command is empty")?;
+    let respawn_command = if let Some(command) = crate::commands::pane_command(None, Some(&launch))
+    {
+        command
+    } else {
+        rollback_launch_failure!(
+            "dispatch_crew: private provider respawn command is empty".to_string()
+        );
+    };
     #[cfg(test)]
     ctx.captains.pause_dispatch("before_respawn");
     revalidate_or_rollback!("immediately before provider send");
@@ -15894,6 +15908,18 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    spawn_terminal_with_private_pane_command(ctx, args, None)
+}
+
+/// Internal spawn variant for an already-formed private pane command.
+///
+/// The raw command is accepted only by in-process dispatch and is deliberately
+/// excluded from the public response, apply forward, and command arguments.
+fn spawn_terminal_with_private_pane_command(
+    ctx: &ControlContext,
+    args: &Value,
+    private_pane_command: Option<&str>,
+) -> Result<Value, String> {
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
     let shell = arg_str(args, "shell");
@@ -15964,7 +15990,8 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let tmux_cwd = files::posix_form(&cwd_effective);
-    let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+    let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+    let pane = private_pane_command.map(str::to_owned).or(public_pane);
     // item-3: grant this session its capability token via env (READ by default,
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
@@ -26901,47 +26928,6 @@ mod tests {
         }
     }
 
-    struct TmuxGlobalOptionGuard {
-        option: String,
-        previous: Option<String>,
-    }
-
-    impl TmuxGlobalOptionGuard {
-        fn set(option: &str, value: &str) -> Self {
-            let previous = std::process::Command::new("tmux")
-                .args(["-L", tmux::socket(), "show-options", "-gv", option])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            let output = std::process::Command::new("tmux")
-                .args(["-L", tmux::socket(), "set-option", "-g", option, value])
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "could not set tmux global {option}"
-            );
-            Self {
-                option: option.to_string(),
-                previous,
-            }
-        }
-    }
-
-    impl Drop for TmuxGlobalOptionGuard {
-        fn drop(&mut self) {
-            let mut command = std::process::Command::new("tmux");
-            command.args(["-L", tmux::socket(), "set-option", "-g"]);
-            if let Some(value) = self.previous.as_deref() {
-                command.args([self.option.as_str(), value]);
-                let _ = command.output();
-            }
-        }
-    }
-
     struct FakeCodexObserver {
         fixture_dir: PathBuf,
         command: String,
@@ -27051,6 +27037,25 @@ mod tests {
     impl Drop for FakeHarnessSession {
         fn drop(&mut self) {
             let _ = reap_test_tmux_session(&tmux_target(&self.session_id));
+        }
+    }
+
+    #[derive(Default)]
+    struct TestTmuxSessionCleanup {
+        target: Option<String>,
+    }
+
+    impl TestTmuxSessionCleanup {
+        fn track(&mut self, terminal_id: &str) {
+            self.target = Some(tmux_target(terminal_id));
+        }
+    }
+
+    impl Drop for TestTmuxSessionCleanup {
+        fn drop(&mut self) {
+            if let Some(target) = self.target.as_deref() {
+                let _ = reap_test_tmux_session(target);
+            }
         }
     }
 
@@ -30754,8 +30759,67 @@ mod tests {
             ": api_key=supersecret",
             "false",
             true,
-            "provider-native process evidence predates this launch",
+            "a wrapper obscures the provider-native foreground process",
         );
+    }
+
+    #[test]
+    fn dispatch_empty_private_claude_respawn_command_rolls_back_exact_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_empty_private_claude_respawn_command_rolls_back_exact_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!("dispatch-empty-respawn-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let error = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Reject an empty private Claude respawn command",
+                "harness": "claude",
+                "testHarnessCommand": "",
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("private provider respawn command is empty"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        assert!(!error.contains("api_key"), "{error}");
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
     }
 
     #[test]
@@ -30840,25 +30904,21 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_private_respawn_launches_through_a_hostile_shell_that_discards_keys() {
+    fn dispatch_private_respawn_launches_from_hostile_dormant_pane() {
         if !tmux_process_tests_available() {
             eprintln!(
-                "dispatch_private_respawn_launches_through_a_hostile_shell_that_discards_keys: tmux or node not on PATH - skipping"
+                "dispatch_private_respawn_launches_from_hostile_dormant_pane: tmux or node not on PATH - skipping"
             );
             return;
         }
         let captain = FakeHarnessSession::start(Harness::Codex);
-        let fixture = std::env::temp_dir().join(format!(
-            "t-hub-dispatch-hostile-shell-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&fixture).unwrap();
-        let hostile_shell = fixture.join("hostile-shell");
-        let ready = fixture.join("ready");
+        let fixture = tempfile::tempdir().unwrap();
+        let hostile_pane = fixture.path().join("hostile-pane");
+        let ready = fixture.path().join("ready");
         std::fs::write(
-            &hostile_shell,
+            &hostile_pane,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n  *c*) exec /bin/sh -c \"$2\" ;;\n  *) : > {}; while IFS= read -r ignored; do :; done ;;\nesac\n",
+                "#!/bin/sh\n: > {}\nwhile IFS= read -r ignored; do :; done\n",
                 serde_json::to_string(&ready).unwrap()
             ),
         )
@@ -30866,57 +30926,76 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hostile_shell, std::fs::Permissions::from_mode(0o700))
+            std::fs::set_permissions(&hostile_pane, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
-        let _shell = TmuxGlobalOptionGuard::set("default-shell", hostile_shell.to_str().unwrap());
         let provider =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
-        let hostile_terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        let hostile_target = tmux_target(&hostile_terminal_id);
-        tmux::new_session_with_env(&hostile_target, "/tmp", None, &[]).unwrap();
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "hostile shell did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        tmux::send_text(&hostile_target, &provider.command, true).unwrap();
-        let discarded_deadline = Instant::now() + Duration::from_millis(250);
-        while Instant::now() < discarded_deadline {
-            assert!(
-                !provider.was_invoked(),
-                "the old injected-key path unexpectedly reached the provider"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        tmux::kill_session_tree(&hostile_target).unwrap();
 
         let server = LoopbackPowderServer::start(3);
         let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
-        let (ctx, _) = dispatch_test_context(registry.clone());
-        let result = dispatch_crew(
-            &ctx,
-            &json!({
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_respawn) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_respawn",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
                 "captainSessionId": captain.session_id,
                 "cardId": "thub-powder-control-lifecycle",
-                "task": "Launch through a hostile shell without injecting provider keys",
+                "task": "Launch from a hostile dormant pane without injecting provider keys",
                 "harness": "codex",
                 "testHarnessCommand": provider.command,
                 "testCodexUnobservedCommand": ":",
-            }),
-            None,
-            true,
-        )
-        .unwrap();
-        provider.wait_for_invocation();
-        let crew_session_id = result["crew"]["terminalId"].as_str().unwrap();
+                "testDispatchDormantPaneCommand": format!("exec {}", hostile_pane.display()),
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
         assert_eq!(
-            tmux::session_liveness(&tmux_target(crew_session_id)),
+            wait_for_respawn
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the private respawn barrier"),
+            "before_respawn"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        let mut cleanup = TestTmuxSessionCleanup::default();
+        cleanup.track(&crew_session_id);
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "hostile dormant pane did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !provider.was_invoked(),
+            "the provider must not execute before private pane respawn"
+        );
+        let spawn_forward = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(command, _)| command == "spawn_terminal")
+            .map(|(_, args)| args.clone())
+            .unwrap();
+        assert!(spawn_forward
+            .get("startupCommand")
+            .is_none_or(Value::is_null));
+        let forwarded = serde_json::to_string(&spawn_forward).unwrap();
+        assert!(!forwarded.contains(CREW_DORMANT_PANE_COMMAND));
+        assert!(!forwarded.contains(&provider.command));
+        resume.send(()).unwrap();
+        let result = worker.join().unwrap().unwrap();
+        provider.wait_for_invocation();
+        assert_eq!(result["crew"]["terminalId"], json!(crew_session_id));
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
             tmux::SessionLiveness::Alive
         );
         assert_eq!(
@@ -30929,8 +31008,6 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 0);
-        tmux::kill_session_tree(&tmux_target(crew_session_id)).unwrap();
-        let _ = std::fs::remove_dir_all(&fixture);
     }
 
     #[test]
