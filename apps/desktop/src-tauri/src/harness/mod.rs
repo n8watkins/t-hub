@@ -232,6 +232,7 @@ impl VerifiedHarnessProviderLaunch {
 pub(crate) struct OpenedHarnessProviderLaunch {
     receipt: HarnessProviderLaunchReceipt,
     executable: std::fs::File,
+    provenance: Vec<ProviderPathBinding>,
     opened_path: PathBuf,
 }
 
@@ -242,6 +243,7 @@ impl OpenedHarnessProviderLaunch {
     ) -> Result<(VerifiedHarnessProviderLaunch, T), E> {
         let result = launch_and_wait_until_opened(&self.opened_path)?;
         let _keep_open_through_handoff = self.executable;
+        let _keep_provenance_open_through_handoff = self.provenance;
         Ok((VerifiedHarnessProviderLaunch(self.receipt), result))
     }
 }
@@ -398,6 +400,7 @@ pub enum LaunchAttestationError {
     TerminalChanged,
     ProcessChanged,
     AncestryChanged,
+    UntrustedUserInstall,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -423,6 +426,9 @@ impl std::fmt::Display for LaunchAttestationError {
             Self::ProcessChanged => "the provider-native process changed during launch acceptance",
             Self::AncestryChanged => {
                 "the provider-native process ancestry changed during launch acceptance"
+            }
+            Self::UntrustedUserInstall => {
+                "user-managed provider install requires protected catalog provenance"
             }
         };
         f.write_str(message)
@@ -924,6 +930,23 @@ struct ProviderFileIdentity {
     inode: u64,
 }
 
+struct ProviderPathBinding {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: ProviderFileIdentity,
+}
+
+impl ProviderPathBinding {
+    fn revalidate(&self) -> Result<(), LaunchAttestationError> {
+        if provider_path_identity(&self.path)? != self.identity
+            || provider_path_identity_from_open_file(&self.file)? != self.identity
+        {
+            return Err(LaunchAttestationError::ProcessChanged);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderInstallLayout {
     launcher_directory: PathBuf,
@@ -940,6 +963,23 @@ fn provider_file_identity(
     let metadata =
         std::fs::metadata(path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     if !metadata.is_file() || metadata.ino() == 0 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(ProviderFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn provider_path_identity(
+    path: &std::path::Path,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata =
+        std::fs::metadata(path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if metadata.ino() == 0 {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     Ok(ProviderFileIdentity {
@@ -984,7 +1024,13 @@ where
     let layout = layouts
         .iter()
         .find(|layout| layout.launcher_directory == launcher_directory)
-        .ok_or(LaunchAttestationError::WrongProvider)?;
+        .ok_or_else(|| {
+            if user_managed_provider_launcher(&launcher_directory) {
+                LaunchAttestationError::UntrustedUserInstall
+            } else {
+                LaunchAttestationError::WrongProvider
+            }
+        })?;
     let launcher_is_symlink = std::fs::symlink_metadata(provider_executable)
         .map_err(|_| LaunchAttestationError::UnreadableEvidence)?
         .file_type()
@@ -1003,7 +1049,10 @@ where
     if !launcher_is_symlink {
         return Err(LaunchAttestationError::WrongProvider);
     }
-    validate_provider_package_provenance(layout, &executable, expected)?;
+    let provenance = validate_provider_package_provenance(layout, &executable, expected)?;
+    for binding in &provenance {
+        binding.revalidate()?;
+    }
     let opened_path = open_file_descriptor_path(&opened);
     Ok(OpenedHarnessProviderLaunch {
         receipt: HarnessProviderLaunchReceipt {
@@ -1012,8 +1061,31 @@ where
             provider_executable_inode: identity.inode,
         },
         executable: opened,
+        provenance,
         opened_path,
     })
+}
+
+fn user_managed_provider_launcher(launcher_directory: &std::path::Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    user_managed_provider_launcher_under(launcher_directory, &home)
+}
+
+fn user_managed_provider_launcher_under(
+    launcher_directory: &std::path::Path,
+    home: &std::path::Path,
+) -> bool {
+    let candidates = [
+        home.join(".bun/bin"),
+        home.join(".npm-global/bin"),
+        home.join(".local/bin"),
+    ];
+    candidates
+        .iter()
+        .any(|candidate| candidate == launcher_directory)
+        || launcher_directory.starts_with(home.join(".nvm/versions/node"))
 }
 
 fn provider_package_relative_root(expected: Harness) -> &'static std::path::Path {
@@ -1034,7 +1106,7 @@ fn validate_provider_package_provenance(
     layout: &ProviderInstallLayout,
     executable: &std::path::Path,
     expected: Harness,
-) -> Result<(), LaunchAttestationError> {
+) -> Result<Vec<ProviderPathBinding>, LaunchAttestationError> {
     let package_root = layout
         .package_root
         .join(provider_package_relative_root(expected));
@@ -1042,8 +1114,18 @@ fn validate_provider_package_provenance(
         return Err(LaunchAttestationError::WrongProvider);
     }
     let manifest_path = package_root.join("package.json");
-    let manifest_bytes =
-        std::fs::read(&manifest_path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let manifest_file = std::fs::File::open(&manifest_path)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let manifest_bytes = {
+        use std::io::Read;
+
+        let mut bytes = Vec::new();
+        manifest_file
+            .try_clone()
+            .and_then(|mut file| file.by_ref().take(64 * 1024 + 1).read_to_end(&mut bytes))
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        bytes
+    };
     if manifest_bytes.is_empty() || manifest_bytes.len() > 64 * 1024 {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
@@ -1063,22 +1145,35 @@ fn validate_provider_package_provenance(
     {
         return Err(LaunchAttestationError::WrongProvider);
     }
-    if layout.require_protected_ownership {
-        validate_protected_provider_path(&layout.launcher_directory)?;
-        validate_protected_provider_path(&layout.package_root)?;
-        validate_protected_provider_path(&package_root)?;
-        validate_protected_provider_path(&manifest_path)?;
-        validate_protected_provider_path(executable)?;
-    }
-    Ok(())
+    let mut bindings = bind_provider_path_chain(
+        &layout.launcher_directory,
+        layout.require_protected_ownership,
+    )?;
+    bindings.extend(bind_provider_path_chain(
+        &manifest_path,
+        layout.require_protected_ownership,
+    )?);
+    bindings.extend(bind_provider_path_chain(
+        executable,
+        layout.require_protected_ownership,
+    )?);
+    bindings.push(ProviderPathBinding {
+        path: manifest_path,
+        identity: provider_path_identity_from_open_file(&manifest_file)?,
+        file: manifest_file,
+    });
+    Ok(bindings)
 }
 
 #[cfg(unix)]
-fn validate_protected_provider_path(path: &std::path::Path) -> Result<(), LaunchAttestationError> {
+fn validate_protected_provider_open_file(
+    file: &std::fs::File,
+) -> Result<(), LaunchAttestationError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let metadata =
-        std::fs::metadata(path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
         return Err(LaunchAttestationError::WrongProvider);
     }
@@ -1086,8 +1181,57 @@ fn validate_protected_provider_path(path: &std::path::Path) -> Result<(), Launch
 }
 
 #[cfg(not(unix))]
-fn validate_protected_provider_path(_path: &std::path::Path) -> Result<(), LaunchAttestationError> {
+fn validate_protected_provider_open_file(
+    _file: &std::fs::File,
+) -> Result<(), LaunchAttestationError> {
     Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+fn bind_provider_path_chain(
+    path: &std::path::Path,
+    require_protected_ownership: bool,
+) -> Result<Vec<ProviderPathBinding>, LaunchAttestationError> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    let mut current = PathBuf::from("/");
+    let mut bindings = Vec::new();
+    let root =
+        std::fs::File::open(&current).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if require_protected_ownership {
+        validate_protected_provider_open_file(&root)?;
+    }
+    bindings.push(ProviderPathBinding {
+        path: current.clone(),
+        identity: provider_path_identity_from_open_file(&root)?,
+        file: root,
+    });
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        current.push(component);
+        if std::fs::symlink_metadata(&current)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(LaunchAttestationError::WrongProvider);
+        }
+        let file = std::fs::File::open(&current)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        if require_protected_ownership {
+            validate_protected_provider_open_file(&file)?;
+        }
+        bindings.push(ProviderPathBinding {
+            path: current.clone(),
+            identity: provider_path_identity_from_open_file(&file)?,
+            file,
+        });
+    }
+    Ok(bindings)
 }
 
 fn trusted_provider_install_layouts() -> Vec<ProviderInstallLayout> {
@@ -1134,6 +1278,24 @@ fn provider_file_identity_from_open_file(
 }
 
 #[cfg(unix)]
+fn provider_path_identity_from_open_file(
+    file: &std::fs::File,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if metadata.ino() == 0 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(ProviderFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
 fn canonical_open_file_path(file: &std::fs::File) -> Result<PathBuf, LaunchAttestationError> {
     use std::os::fd::AsRawFd;
 
@@ -1159,6 +1321,20 @@ fn open_file_descriptor_path(file: &std::fs::File) -> PathBuf {
 #[cfg(not(unix))]
 fn provider_file_identity_from_open_file(
     _file: &std::fs::File,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+#[cfg(not(unix))]
+fn provider_path_identity_from_open_file(
+    _file: &std::fs::File,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+#[cfg(not(unix))]
+fn provider_path_identity(
+    _path: &std::path::Path,
 ) -> Result<ProviderFileIdentity, LaunchAttestationError> {
     Err(LaunchAttestationError::UnreadableEvidence)
 }
@@ -2673,6 +2849,52 @@ mod tests {
             test_observe_provider_launch_receipt(&launch_token, Harness::Codex, temp.path()),
             Err(LaunchAttestationError::WrongProvider)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_provenance_binds_every_intermediate_directory_against_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("lib/node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&package).unwrap();
+        let executable = package.join("codex.js");
+        std::fs::write(&executable, "trusted").unwrap();
+        let bindings = bind_provider_path_chain(&executable, false).unwrap();
+
+        let openai = temp.path().join("lib/node_modules/@openai");
+        let displaced = temp.path().join("lib/node_modules/@openai-old");
+        std::fs::rename(&openai, &displaced).unwrap();
+        let forged = openai.join("codex/bin");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(forged.join("codex.js"), "attacker").unwrap();
+
+        assert!(bindings.iter().any(|binding| {
+            matches!(
+                binding.revalidate(),
+                Err(LaunchAttestationError::ProcessChanged)
+            )
+        }));
+    }
+
+    #[test]
+    fn user_managed_provider_layouts_require_protected_catalog_provenance() {
+        let home = PathBuf::from("/home/operator");
+        for launcher in [
+            home.join(".bun/bin"),
+            home.join(".npm-global/bin"),
+            home.join(".local/bin"),
+            home.join(".nvm/versions/node/v24.0.0/bin"),
+        ] {
+            assert!(user_managed_provider_launcher_under(&launcher, &home));
+        }
+        assert!(!user_managed_provider_launcher_under(
+            std::path::Path::new("/usr/local/bin"),
+            &home
+        ));
+        assert_eq!(
+            LaunchAttestationError::UntrustedUserInstall.to_string(),
+            "user-managed provider install requires protected catalog provenance"
+        );
     }
 
     #[cfg(unix)]
