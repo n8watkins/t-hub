@@ -421,6 +421,17 @@ At `d31e847`, the three endpoint-identity tests and the complete 35-test Powder 
 `cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `8619968` replaces recovery's formatted endpoint-identity string comparison with decoded HMAC tag verification through the standard `hmac::Mac::verify_slice` API.
+The verifier returns typed fail-closed outcomes for a missing protected credential, malformed persisted identity, or HMAC mismatch.
+It accepts only the canonical `hmac-sha256:` prefix followed by 64 lower-case hexadecimal tag characters before passing decoded bytes to the standard verifier.
+Recovery maps each typed outcome to an endpoint-free static error and performs no repository, card, run, terminal, or release I/O on any verification failure.
+The deterministic client coverage proves a matching identity succeeds, malformed length and upper-case tag encodings fail, and a changed endpoint or rotated credential fails verification.
+The dispatch recovery regression invokes the malformed-identity path plus protected credential rotation and proves the loopback receives zero card, run, or release requests.
+The existing remap regression continues to prove zero wrong-scope I/O on a keyed endpoint mismatch.
+At `8619968`, all 36 Powder client tests and 7 dispatch-release-recovery tests passed serially.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 Commit `ad74042` closes gateway response-body credential disclosure on matching keyed endpoints.
 Every externally surfaced Powder HTTP status error now retains only the typed error kind and a bounded generic `Powder HTTP status <code>` message.
 No untrusted gateway status body is parsed, redacted, persisted, returned, or logged by this client path.
@@ -436,7 +447,7 @@ No post-remediation workspace-wide test result is claimed.
 
 Commit `5dc37df` replaces the prior unsalted endpoint digest with a standard HMAC-SHA-256 endpoint identity.
 The HMAC key is the protected client API credential and is never persisted, synchronized, logged, or returned by the board surface.
-`PendingDispatchRelease` stores only `connectionEndpointIdentity`, while recovery recomputes the same keyed identity from the protected profile before repository, card, run, terminal, or release I/O.
+`PendingDispatchRelease` stores only `connectionEndpointIdentity`, while recovery decodes that persisted tag and verifies it against a protected-profile HMAC before repository, card, run, terminal, or release I/O.
 If the protected credential is unavailable, the identity cannot be recomputed and dispatch or recovery fails closed before remote work.
 Schema version 13 rejects every version 12 release recovery, including the prior `connectionEndpointDigest` shape, as incompatible state that remains preserved and write-blocked.
 This does not describe the keyed value as categorically credential-free.
