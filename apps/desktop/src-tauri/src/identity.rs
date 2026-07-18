@@ -34,6 +34,7 @@ use std::sync::Mutex;
 /// existing tier token (`T_HUB_CONTROL_TOKEN`). The in-session client presents it so
 /// the app can resolve the calling session's identity.
 pub const SESSION_TOKEN_ENV: &str = "T_HUB_SESSION_TOKEN";
+const IDENTITIES_SCHEMA_VERSION: u32 = 1;
 
 /// Best-effort org role captured at mint. Durable role-keying is item 2 (see the
 /// module note); this is enough for the plane to record "in what role" alongside the
@@ -173,9 +174,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 /// On-disk shape of the identity store.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IdentitiesSnapshot {
+    schema_version: u32,
     /// Last generation allocated to a SessionIdentity.
     #[serde(default)]
     generation: u64,
@@ -188,6 +190,142 @@ struct IdentitiesSnapshot {
     /// lifecycle cleanup); this is a deliberate "this credential is burned" act.
     #[serde(default)]
     revoked: HashSet<String>,
+}
+
+impl Default for IdentitiesSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: IDENTITIES_SCHEMA_VERSION,
+            generation: 0,
+            identities: HashMap::new(),
+            revoked: HashSet::new(),
+        }
+    }
+}
+
+fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), String> {
+    if snapshot.schema_version != IDENTITIES_SCHEMA_VERSION {
+        return Err(format!(
+            "identity store uses unsupported schemaVersion {}",
+            snapshot.schema_version
+        ));
+    }
+    let mut generations = HashSet::new();
+    let mut maximum = 0;
+    for (key, identity) in &snapshot.identities {
+        if key != &identity.id {
+            return Err("identity store key does not match the persisted identity id".into());
+        }
+        if identity.generation == 0
+            || identity.generation > snapshot.generation
+            || !generations.insert(identity.generation)
+        {
+            return Err(
+                "identity store contains a zero, duplicate, or out-of-range generation".into(),
+            );
+        }
+        maximum = maximum.max(identity.generation);
+    }
+    if maximum > snapshot.generation
+        || (snapshot.generation == 0 && !snapshot.identities.is_empty())
+    {
+        return Err("identity store generation high-water mark is inconsistent".into());
+    }
+    Ok(())
+}
+
+fn read_identities_snapshot(path: &PathBuf) -> Result<(IdentitiesSnapshot, bool), String> {
+    let source = std::fs::read(path).map_err(|error| {
+        format!(
+            "identity store '{}' could not be read: {error}",
+            path.display()
+        )
+    })?;
+    let mut document: serde_json::Value = serde_json::from_slice(&source).map_err(|error| {
+        format!(
+            "identity store '{}' is invalid JSON: {error}",
+            path.display()
+        )
+    })?;
+    let object = document.as_object_mut().ok_or_else(|| {
+        format!(
+            "identity store '{}' is not a versioned object",
+            path.display()
+        )
+    })?;
+    if let Some(version) = object.get("schemaVersion") {
+        let version = version.as_u64().ok_or_else(|| {
+            format!(
+                "identity store '{}' has a malformed schemaVersion",
+                path.display()
+            )
+        })?;
+        if version != IDENTITIES_SCHEMA_VERSION as u64 {
+            return Err(format!(
+                "identity store '{}' uses unsupported schemaVersion {version}",
+                path.display()
+            ));
+        }
+        let snapshot: IdentitiesSnapshot = serde_json::from_value(document).map_err(|error| {
+            format!(
+                "identity store '{}' has an invalid current-schema shape: {error}",
+                path.display()
+            )
+        })?;
+        validate_identities_snapshot(&snapshot)?;
+        return Ok((snapshot, false));
+    }
+
+    let generation_counter_present = object.contains_key("generation");
+    let identities = object
+        .get("identities")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "legacy identity store '{}' has no identities object",
+                path.display()
+            )
+        })?;
+    let generated_identity_count = identities
+        .values()
+        .filter(|identity| identity.get("generation").is_some())
+        .count();
+    if (generation_counter_present && generated_identity_count != identities.len())
+        || (!generation_counter_present && generated_identity_count != 0)
+    {
+        return Err(format!(
+            "legacy identity store '{}' has a partial durable generation shape",
+            path.display()
+        ));
+    }
+    object.insert(
+        "schemaVersion".to_string(),
+        serde_json::Value::from(IDENTITIES_SCHEMA_VERSION),
+    );
+    let mut snapshot: IdentitiesSnapshot = serde_json::from_value(document).map_err(|error| {
+        format!(
+            "legacy identity store '{}' could not be migrated: {error}",
+            path.display()
+        )
+    })?;
+    if !generation_counter_present {
+        let mut ids = snapshot.identities.keys().cloned().collect::<Vec<_>>();
+        ids.sort_by(|left, right| {
+            let left_identity = &snapshot.identities[left];
+            let right_identity = &snapshot.identities[right];
+            (left_identity.minted_at, left).cmp(&(right_identity.minted_at, right))
+        });
+        for (index, id) in ids.into_iter().enumerate() {
+            let generation = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or("legacy identity store has too many identities to migrate")?;
+            snapshot.identities.get_mut(&id).unwrap().generation = generation;
+            snapshot.generation = generation;
+        }
+    }
+    validate_identities_snapshot(&snapshot)?;
+    Ok((snapshot, true))
 }
 
 /// Identity-secret TTL in ms, from `T_HUB_IDENTITY_TTL_SECS` (seconds). `0` (the
@@ -208,27 +346,29 @@ fn identity_ttl_ms() -> u64 {
 pub struct IdentityStore {
     path: Option<PathBuf>,
     inner: Mutex<IdentitiesSnapshot>,
+    write_blocked: Option<String>,
     #[cfg(test)]
     persist_fail_after: Mutex<Option<usize>>,
 }
 
 impl IdentityStore {
-    /// Load (or start empty) from `path`. A missing/corrupt file starts empty - never
-    /// a startup failure, matching `CaptainsRegistry::load`. item-3 Pillar B: each
+    /// Load (or start empty) from `path`. A missing file starts empty. Malformed or
+    /// unsupported persisted state remains byte-preserved and blocks every write.
+    /// item-3 Pillar B: each
     /// secret is UNSEALED on load (DPAPI on Windows; a legacy/plaintext secret reads
     /// verbatim), so the in-memory secret is always the plaintext `resolve` compares.
     pub fn load(path: PathBuf) -> Self {
-        let mut inner = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| serde_json::from_str::<IdentitiesSnapshot>(&body).ok())
-            .unwrap_or_default();
-        inner.generation = inner
-            .identities
-            .values()
-            .map(|identity| identity.generation)
-            .max()
-            .unwrap_or_default()
-            .max(inner.generation);
+        let (mut inner, schema_upgraded, write_blocked) = if path.exists() {
+            match read_identities_snapshot(&path) {
+                Ok((snapshot, upgraded)) => (snapshot, upgraded, None),
+                Err(error) => {
+                    eprintln!("t-hub-identity: writes blocked: {error}");
+                    (IdentitiesSnapshot::default(), false, Some(error))
+                }
+            }
+        } else {
+            (IdentitiesSnapshot::default(), false, None)
+        };
         for ident in inner.identities.values_mut() {
             if let Some(plain) = crate::secret_seal::unseal_str(&ident.secret) {
                 ident.secret = plain;
@@ -236,12 +376,25 @@ impl IdentityStore {
             // If a sealed secret cannot be unsealed here (wrong host), it is left as-is
             // and simply never resolves - the store belongs to the Windows-hosted app.
         }
-        IdentityStore {
+        let mut store = IdentityStore {
             path: Some(path),
             inner: Mutex::new(inner),
+            write_blocked,
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
+        };
+        if schema_upgraded && store.write_blocked.is_none() {
+            let persist_result = {
+                let snapshot = store.lock();
+                store.persist(&snapshot)
+            };
+            if let Err(error) = persist_result {
+                store.write_blocked = Some(format!(
+                    "identity store migration could not be persisted: {error}"
+                ));
+            }
         }
+        store
     }
 
     /// Load from the default `~/.t-hub/identities.json` (override
@@ -255,6 +408,7 @@ impl IdentityStore {
         IdentityStore {
             path: None,
             inner: Mutex::new(IdentitiesSnapshot::default()),
+            write_blocked: None,
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
         }
@@ -265,6 +419,10 @@ impl IdentityStore {
     }
 
     fn persist(&self, snap: &IdentitiesSnapshot) -> Result<(), String> {
+        if let Some(reason) = self.write_blocked.as_deref() {
+            return Err(format!("identity store writes are blocked: {reason}"));
+        }
+        validate_identities_snapshot(snap)?;
         #[cfg(test)]
         {
             let mut fail_after = self
@@ -743,6 +901,12 @@ mod tests {
         assert_eq!(resolved.generation, generation);
         assert_eq!(resolved.role, Role::Captain);
         assert_eq!(resolved.session_tile.as_deref(), Some("tile-1"));
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["schemaVersion"],
+            serde_json::Value::from(IDENTITIES_SCHEMA_VERSION)
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -782,6 +946,178 @@ mod tests {
     fn missing_file_starts_empty() {
         let store = IdentityStore::load(temp_path());
         assert!(store.is_empty());
+        assert!(store.write_blocked.is_none());
+    }
+
+    #[test]
+    fn legacy_identity_store_migration_is_explicit_deterministic_and_persisted() {
+        let path = temp_path();
+        let legacy = serde_json::json!({
+            "identities": {
+                "identity-b": {
+                    "id": "identity-b",
+                    "secret": "secret-b",
+                    "role": "crew",
+                    "mintedAt": 20
+                },
+                "identity-a": {
+                    "id": "identity-a",
+                    "secret": "secret-a",
+                    "role": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let store = IdentityStore::load(path.clone());
+        assert!(store.write_blocked.is_none());
+        assert_eq!(store.get("identity-a").unwrap().generation, 1);
+        assert_eq!(store.get("identity-b").unwrap().generation, 2);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["schemaVersion"],
+            serde_json::Value::from(IDENTITIES_SCHEMA_VERSION)
+        );
+        assert_eq!(persisted["generation"], 2);
+        assert_eq!(persisted["identities"]["identity-a"]["generation"], 1);
+        assert_eq!(persisted["identities"]["identity-b"]["generation"], 2);
+
+        let reloaded = IdentityStore::load(path.clone());
+        assert_eq!(reloaded.get("identity-a").unwrap().generation, 1);
+        assert_eq!(reloaded.get("identity-b").unwrap().generation, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unversioned_generation_store_preserves_its_durable_high_water_mark() {
+        let path = temp_path();
+        let e6_shape = serde_json::json!({
+            "generation": 9,
+            "identities": {
+                "identity-seven": {
+                    "id": "identity-seven",
+                    "generation": 7,
+                    "secret": "secret-seven",
+                    "role": "cortana",
+                    "mintedAt": 10
+                }
+            },
+            "revoked": []
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&e6_shape).unwrap()).unwrap();
+
+        let store = IdentityStore::load(path.clone());
+        assert!(store.write_blocked.is_none());
+        assert_eq!(store.get("identity-seven").unwrap().generation, 7);
+        assert_eq!(store.mint(Role::Crew).unwrap().generation, 10);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["generation"], 10);
+        assert_eq!(
+            persisted["schemaVersion"],
+            serde_json::Value::from(IDENTITIES_SCHEMA_VERSION)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn future_identity_schema_blocks_downgrade_writes_and_preserves_bytes() {
+        let path = temp_path();
+        let future = serde_json::json!({
+            "schemaVersion": IDENTITIES_SCHEMA_VERSION + 1,
+            "generation": 41,
+            "identities": {},
+            "revoked": []
+        });
+        let source = serde_json::to_vec_pretty(&future).unwrap();
+        std::fs::write(&path, &source).unwrap();
+
+        let store = IdentityStore::load(path.clone());
+        assert!(store
+            .write_blocked
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("unsupported schemaVersion") }));
+        assert!(store
+            .mint(Role::Crew)
+            .unwrap_err()
+            .contains("writes are blocked"));
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_identity_generations_fail_closed_and_preserve_source_bytes() {
+        let cases = [
+            (
+                "duplicate",
+                serde_json::json!({
+                    "schemaVersion": IDENTITIES_SCHEMA_VERSION,
+                    "generation": 2,
+                    "identities": {
+                        "identity-a": {
+                            "id": "identity-a", "generation": 1, "secret": "a",
+                            "role": "crew", "mintedAt": 1
+                        },
+                        "identity-b": {
+                            "id": "identity-b", "generation": 1, "secret": "b",
+                            "role": "crew", "mintedAt": 2
+                        }
+                    },
+                    "revoked": []
+                }),
+            ),
+            (
+                "above-high-water",
+                serde_json::json!({
+                    "schemaVersion": IDENTITIES_SCHEMA_VERSION,
+                    "generation": 1,
+                    "identities": {
+                        "identity-a": {
+                            "id": "identity-a", "generation": 2, "secret": "a",
+                            "role": "crew", "mintedAt": 1
+                        }
+                    },
+                    "revoked": []
+                }),
+            ),
+            (
+                "partial-legacy",
+                serde_json::json!({
+                    "generation": 2,
+                    "identities": {
+                        "identity-a": {
+                            "id": "identity-a", "generation": 1, "secret": "a",
+                            "role": "crew", "mintedAt": 1
+                        },
+                        "identity-b": {
+                            "id": "identity-b", "secret": "b",
+                            "role": "crew", "mintedAt": 2
+                        }
+                    },
+                    "revoked": []
+                }),
+            ),
+        ];
+
+        for (name, malformed) in cases {
+            let path = temp_path();
+            let source = serde_json::to_vec_pretty(&malformed).unwrap();
+            std::fs::write(&path, &source).unwrap();
+            let store = IdentityStore::load(path.clone());
+            assert!(store.write_blocked.is_some(), "case {name}");
+            assert!(
+                store
+                    .mint(Role::Crew)
+                    .unwrap_err()
+                    .contains("writes are blocked"),
+                "case {name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), source, "case {name}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
