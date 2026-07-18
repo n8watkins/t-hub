@@ -82,6 +82,27 @@ pub struct TmuxError {
     pub message: String,
 }
 
+/// The identity of exactly one tmux pane at one instant.
+///
+/// This is crate-private launch evidence, not a public control-plane value.
+/// A respawn must retain the session, window, and pane identities while replacing
+/// the pane process generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneGeneration {
+    pub(crate) session_id: u64,
+    pub(crate) session_created: u64,
+    pub(crate) window_id: u64,
+    pub(crate) pane_id: u64,
+    pub(crate) pane_pid: u32,
+}
+
+/// Evidence for a private dormant-pane to provider-pane transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RespawnPaneTransition {
+    pub(crate) before: PaneGeneration,
+    pub(crate) after: PaneGeneration,
+}
+
 impl std::fmt::Display for TmuxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.code {
@@ -211,6 +232,105 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
     }
+}
+
+fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
+    let output = run(
+        "list-panes",
+        &[
+            "list-panes",
+            "-t",
+            target,
+            "-F",
+            "#{session_id}|#{session_created}|#{window_id}|#{pane_id}|#{pane_pid}",
+        ],
+    )?;
+    let value = String::from_utf8_lossy(&output.stdout);
+    let mut lines = value.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next().ok_or_else(|| TmuxError {
+        op: "list-panes",
+        code: None,
+        message: "target pane generation is unavailable".into(),
+    })?;
+    if lines.next().is_some() {
+        return Err(TmuxError {
+            op: "list-panes",
+            code: None,
+            message: "target resolved to more than one pane".into(),
+        });
+    }
+    let mut fields = line.trim().split('|');
+    let parse_prefixed = |value: Option<&str>, prefix: char| {
+        value
+            .and_then(|value| value.strip_prefix(prefix))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    };
+    let parse_number = |value: Option<&str>| {
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    };
+    let session_id = parse_prefixed(fields.next(), '$');
+    let session_created = parse_number(fields.next());
+    let window_id = parse_prefixed(fields.next(), '@');
+    let pane_id = parse_prefixed(fields.next(), '%');
+    let pane_pid = parse_number(fields.next()).and_then(|value| u32::try_from(value).ok());
+    if fields.next().is_some()
+        || session_id.is_none()
+        || session_created.is_none()
+        || window_id.is_none()
+        || pane_id.is_none()
+        || pane_pid.is_none()
+    {
+        return Err(TmuxError {
+            op: "list-panes",
+            code: None,
+            message: "target pane generation is malformed".into(),
+        });
+    }
+    Ok(PaneGeneration {
+        session_id: session_id.unwrap(),
+        session_created: session_created.unwrap(),
+        window_id: window_id.unwrap(),
+        pane_id: pane_id.unwrap(),
+        pane_pid: pane_pid.unwrap(),
+    })
+}
+
+/// Replace one exact dormant pane with `command` without injecting keys into a
+/// shell line editor.
+///
+/// `target`, `cwd`, and `command` remain argv values to tmux.  The command is
+/// intentionally not returned or logged.  The pre/post evidence proves the
+/// same session, window, and pane survived while the pane process generation
+/// changed.
+pub(crate) fn respawn_pane_exact(
+    target: &str,
+    cwd: &str,
+    command: &str,
+) -> Result<RespawnPaneTransition, TmuxError> {
+    let before = pane_generation(target)?;
+    let mut args = vec!["respawn-pane", "-k", "-t", target];
+    if !cwd.is_empty() {
+        args.extend(["-c", cwd]);
+    }
+    args.push(command);
+    run("respawn-pane", &args)?;
+    let after = pane_generation(target)?;
+    if before.session_id != after.session_id
+        || before.session_created != after.session_created
+        || before.window_id != after.window_id
+        || before.pane_id != after.pane_id
+        || before.pane_pid == after.pane_pid
+    {
+        return Err(TmuxError {
+            op: "respawn-pane",
+            code: None,
+            message: "target pane generation changed unexpectedly during respawn".into(),
+        });
+    }
+    Ok(RespawnPaneTransition { before, after })
 }
 
 /// Read one value from a tmux session's private environment without exposing it
@@ -1029,6 +1149,45 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    #[test]
+    fn dormant_pane_respawns_in_place_with_a_new_generation() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::dormant_pane_respawns_in_place_with_a_new_generation: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let name = unique_name();
+        let _ = kill_session(&name);
+        new_session_with_env(
+            &name,
+            "/tmp",
+            Some("exec sleep 2147483647"),
+            &[("T_HUB_RESPAWN_ENV".into(), "preserved".into())],
+        )
+        .unwrap();
+        let command = crate::commands::pane_command(
+            None,
+            Some("printf 'T_HUB_RESPAWN_OK\\n'; exec sleep 2147483647"),
+        )
+        .unwrap();
+        let transition = respawn_pane_exact(&name, "/tmp", &command).unwrap();
+        assert_eq!(transition.before.session_id, transition.after.session_id);
+        assert_eq!(
+            transition.before.session_created,
+            transition.after.session_created
+        );
+        assert_eq!(transition.before.window_id, transition.after.window_id);
+        assert_eq!(transition.before.pane_id, transition.after.pane_id);
+        assert_ne!(transition.before.pane_pid, transition.after.pane_pid);
+        assert_eq!(
+            session_environment(&name, "T_HUB_RESPAWN_ENV").unwrap(),
+            Some("preserved".into())
+        );
+        assert!(has_session(&name));
+        kill_session(&name).unwrap();
     }
 
     /// The MCP read/write helpers round-trip through a real session: send a
