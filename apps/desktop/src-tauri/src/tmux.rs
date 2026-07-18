@@ -1109,6 +1109,27 @@ mod tests {
         format!("th_test_{ts}")
     }
 
+    fn create_shell_session_after_final_teardown(name: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match new_session_with_env(name, "/tmp", None, &[]) {
+                Ok(()) => return,
+                Err(error) if error.message == "server exited unexpectedly" => {
+                    match session_liveness(name) {
+                        SessionLiveness::Alive => return,
+                        SessionLiveness::Gone if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        liveness => panic!(
+                            "new_session did not recover after final-server teardown: {liveness:?}: {error}"
+                        ),
+                    }
+                }
+                Err(error) => panic!("new_session should succeed: {error}"),
+            }
+        }
+    }
+
     struct TestSession {
         name: String,
     }
@@ -1337,7 +1358,7 @@ mod tests {
         }
         let name = unique_name();
         let _ = kill_session(&name);
-        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
+        create_shell_session_after_final_teardown(&name);
 
         send_keys(&name, &["C-c"]).expect("send_keys C-c should succeed");
         send_keys(&name, &["Enter"]).expect("send_keys Enter should succeed");
