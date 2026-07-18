@@ -23971,7 +23971,13 @@ mod tests {
             Harness::Codex,
             temp.path(),
         )
-        .unwrap();
+        .unwrap()
+        .handoff_exact(|opened_path| {
+            assert_eq!(std::fs::read(opened_path).unwrap(), b"provider-v1");
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .0;
         let provider_path = launcher.to_str().unwrap();
         let evidence = crate::harness::HarnessProcessEvidence::test(
             42,

@@ -225,6 +225,27 @@ impl VerifiedHarnessProviderLaunch {
     }
 }
 
+/// Provider selection that retains the exact opened executable until the launch
+/// handoff has completed. The launch callback must not return until the child has
+/// opened this `/proc` handle, so credentials can never be handed to a later path
+/// replacement. Only a successful handoff can produce a journalable receipt.
+pub(crate) struct OpenedHarnessProviderLaunch {
+    receipt: HarnessProviderLaunchReceipt,
+    executable: std::fs::File,
+    opened_path: PathBuf,
+}
+
+impl OpenedHarnessProviderLaunch {
+    pub(crate) fn handoff_exact<T, E>(
+        self,
+        launch_and_wait_until_opened: impl FnOnce(&std::path::Path) -> Result<T, E>,
+    ) -> Result<(VerifiedHarnessProviderLaunch, T), E> {
+        let result = launch_and_wait_until_opened(&self.opened_path)?;
+        let _keep_open_through_handoff = self.executable;
+        Ok((VerifiedHarnessProviderLaunch(self.receipt), result))
+    }
+}
+
 pub(crate) struct VerifiedHarnessRuntimeReceipt(HarnessRuntimePolicyReceipt);
 
 impl VerifiedHarnessRuntimeReceipt {
@@ -930,7 +951,7 @@ fn provider_file_identity(
 pub(crate) fn observe_provider_launch_receipt(
     provider_executable: &std::path::Path,
     expected: Harness,
-) -> Result<VerifiedHarnessProviderLaunch, LaunchAttestationError> {
+) -> Result<OpenedHarnessProviderLaunch, LaunchAttestationError> {
     observe_provider_launch_receipt_with_layouts(
         provider_executable,
         expected,
@@ -944,7 +965,7 @@ fn observe_provider_launch_receipt_with_layouts<F>(
     expected: Harness,
     layouts: &[ProviderInstallLayout],
     after_open: F,
-) -> Result<VerifiedHarnessProviderLaunch, LaunchAttestationError>
+) -> Result<OpenedHarnessProviderLaunch, LaunchAttestationError>
 where
     F: FnOnce(),
 {
@@ -983,13 +1004,16 @@ where
         return Err(LaunchAttestationError::WrongProvider);
     }
     validate_provider_package_provenance(layout, &executable, expected)?;
-    Ok(VerifiedHarnessProviderLaunch(
-        HarnessProviderLaunchReceipt {
+    let opened_path = open_file_descriptor_path(&opened);
+    Ok(OpenedHarnessProviderLaunch {
+        receipt: HarnessProviderLaunchReceipt {
             resolved_provider_executable: executable.to_string_lossy().into_owned(),
             provider_executable_device: identity.device,
             provider_executable_inode: identity.inode,
         },
-    ))
+        executable: opened,
+        opened_path,
+    })
 }
 
 fn provider_package_relative_root(expected: Harness) -> &'static std::path::Path {
@@ -1121,6 +1145,17 @@ fn canonical_open_file_path(file: &std::fs::File) -> Result<PathBuf, LaunchAttes
     .map_err(|_| LaunchAttestationError::UnreadableEvidence)
 }
 
+#[cfg(unix)]
+fn open_file_descriptor_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        file.as_raw_fd()
+    ))
+}
+
 #[cfg(not(unix))]
 fn provider_file_identity_from_open_file(
     _file: &std::fs::File,
@@ -1131,6 +1166,11 @@ fn provider_file_identity_from_open_file(
 #[cfg(not(unix))]
 fn canonical_open_file_path(_file: &std::fs::File) -> Result<PathBuf, LaunchAttestationError> {
     Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+#[cfg(not(unix))]
+fn open_file_descriptor_path(_file: &std::fs::File) -> PathBuf {
+    PathBuf::new()
 }
 
 #[cfg(test)]
@@ -1147,7 +1187,7 @@ pub(crate) fn test_observe_provider_launch_receipt(
     provider_executable: &std::path::Path,
     expected: Harness,
     installation_root: &std::path::Path,
-) -> Result<VerifiedHarnessProviderLaunch, LaunchAttestationError> {
+) -> Result<OpenedHarnessProviderLaunch, LaunchAttestationError> {
     observe_provider_launch_receipt_with_layouts(
         provider_executable,
         expected,
@@ -2555,10 +2595,18 @@ mod tests {
         symlink(&installed_script, &launch_token).unwrap();
         let expected_identity = provider_file_identity(&installed_script).unwrap();
 
-        let receipt =
+        let (receipt, ()) =
             test_observe_provider_launch_receipt(&launch_token, Harness::Codex, temp.path())
                 .unwrap()
-                .into_persisted();
+                .handoff_exact(|opened_path| {
+                    assert_eq!(
+                        std::fs::read(opened_path).unwrap(),
+                        b"#!/usr/bin/env node\n"
+                    );
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+        let receipt = receipt.into_persisted();
         assert_eq!(
             receipt.resolved_provider_executable,
             std::fs::canonicalize(&installed_script)
@@ -2708,6 +2756,48 @@ mod tests {
             result,
             Err(LaunchAttestationError::ProcessChanged)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_swap_after_observation_hands_credentials_only_to_opened_inode() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher_bin = temp.path().join("bin");
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        std::fs::create_dir_all(&package_bin).unwrap();
+        let accepted = package_bin.join("codex.js");
+        let replacement = temp.path().join("attacker.js");
+        std::fs::write(&accepted, "trusted-provider-v1").unwrap();
+        std::fs::write(&replacement, "attacker-provider-v2").unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&accepted, &launcher).unwrap();
+        let observed =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+
+        std::fs::remove_file(&launcher).unwrap();
+        symlink(&replacement, &launcher).unwrap();
+        let credential = "candidate-secret-never-for-attacker";
+        let (verified, handed_to) = observed
+            .handoff_exact(|opened_path| {
+                assert_eq!(std::fs::read(&launcher).unwrap(), b"attacker-provider-v2");
+                assert_eq!(std::fs::read(opened_path).unwrap(), b"trusted-provider-v1");
+                Ok::<_, ()>((opened_path.to_path_buf(), credential.to_string()))
+            })
+            .unwrap();
+        assert_eq!(handed_to.1, credential);
+        assert!(handed_to.0.to_string_lossy().contains("/proc/"));
+        assert_eq!(
+            verified.into_persisted().provider_executable_inode,
+            provider_file_identity(&accepted).unwrap().inode
+        );
     }
 
     #[cfg(unix)]
