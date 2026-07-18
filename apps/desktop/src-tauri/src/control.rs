@@ -6001,8 +6001,8 @@ impl CaptainsRegistry {
             created_at: observed_at,
             updated_at: observed_at,
         };
-        if observed_at == 0 {
-            return Err("Cortana ensure observedAt must be nonzero".into());
+        if observed_at == 0 || observed_at == u64::MAX {
+            return Err("Cortana ensure observedAt must be nonzero and non-exhausted".into());
         }
         requested_intent.request_digest = cortana_ensure_request_digest(&requested_intent)?;
 
@@ -21568,6 +21568,54 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("changed request") || error.contains("protected profile"));
         assert_eq!(restarted.snapshot().captains[0], prepared);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cortana_first_prepare_timestamp_exhaustion_leaves_memory_and_disk_unchanged() {
+        let path = captains_tmp("cortana-ensure-exhausted");
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-existing".to_string(),
+                name: "Existing".to_string(),
+                repo_root: "/tmp/existing".to_string(),
+                remote_url: None,
+                default_branch: Some("main".to_string()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let before_snapshot = registry.snapshot();
+        let before_value = serde_json::to_value(&before_snapshot).unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
+
+        let error = registry
+            .prepare_cortana_ensure("ensure-exhausted-1", cortana_ensure_request(None), u64::MAX)
+            .unwrap_err();
+        assert!(error.contains("non-exhausted"), "got: {error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            before_value
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        assert!(registry
+            .snapshot()
+            .captains
+            .iter()
+            .all(|captain| captain.role != FleetRole::Cortana));
+
+        let (prepared, mutation) = registry
+            .prepare_cortana_ensure("ensure-after-exhaustion", cortana_ensure_request(None), 100)
+            .unwrap();
+        assert_eq!(mutation, CortanaEnsureMutation::Prepared);
+        assert_eq!(
+            prepared.cortana_runtime.unwrap().lifecycle,
+            CortanaRuntimeLifecycle::Starting
+        );
+        assert_eq!(registry.snapshot().captains.len(), 1);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
     }
