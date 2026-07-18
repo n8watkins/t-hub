@@ -589,7 +589,7 @@ fn schema_review_crew_powder_criterion() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 256,
-                "description": "Exact authenticated Powder reviewer identity expected in the authoritative receipt."
+                "description": "Legacy caller-facing reviewer label retained for durable-intent compatibility. It is not authoritative: T-Hub verifies the receipt against the protected Powder profile operationIdentity."
             }
         },
         "required": [
@@ -1329,6 +1329,10 @@ mod tests {
                 "proof",
                 "expectedReviewerIdentity"
             ])
+        );
+        assert_eq!(
+            (review.input_schema)()["properties"]["expectedReviewerIdentity"]["description"],
+            "Legacy caller-facing reviewer label retained for durable-intent compatibility. It is not authoritative: T-Hub verifies the receipt against the protected Powder profile operationIdentity."
         );
 
         // Append and review remain Organization mutations. The backend

@@ -268,7 +268,7 @@ fn completion_requires_confirmation_before_endpoint_discovery() {
 }
 
 #[test]
-fn criterion_review_forwards_exact_run_scoped_identity_without_powder_authority_escape() {
+fn criterion_review_forwards_legacy_reviewer_label_without_powder_authority_escape() {
     let mock = MockControl::start(json!({
         "ok": true,
         "result": {
@@ -293,7 +293,7 @@ fn criterion_review_forwards_exact_run_scoped_identity_without_powder_authority_
             "--proof",
             "focused tests pass",
             "--expected-reviewer-identity",
-            "actor-captain-123",
+            "t-hub",
             "--json",
         ],
         Some("captain-token"),
@@ -311,7 +311,7 @@ fn criterion_review_forwards_exact_run_scoped_identity_without_powder_authority_
             "criterionId": "powder.criterion.v1:sha256:abc:0",
             "decision": "approved",
             "proof": "focused tests pass",
-            "expectedReviewerIdentity": "actor-captain-123"
+            "expectedReviewerIdentity": "t-hub"
         })
     );
 }
