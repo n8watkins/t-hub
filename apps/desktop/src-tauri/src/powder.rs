@@ -4814,6 +4814,39 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_identity_hmac_uses_the_rfc_4231_sha256_vector() {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[0x0b; 20]).unwrap();
+        mac.update(b"Hi There");
+        assert_eq!(
+            format!("{:x}", mac.finalize().into_bytes()),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn endpoint_identity_is_stable_for_a_key_and_separated_by_key() {
+        let client = |api_key: &str| {
+            Client::new(ProfileConfig {
+                base_url: "https://powder.example.test/gateway".into(),
+                agent_name: "t-hub".into(),
+                operation_identity: None,
+                api_key: Some(api_key.into()),
+                api_key_env: None,
+                api_key_command: None,
+            })
+            .unwrap()
+        };
+        let first = client("test-key-one");
+        let same = client("test-key-one");
+        let rotated = client("test-key-two");
+        let first_identity = first.endpoint_identity().unwrap();
+        assert_eq!(first_identity, same.endpoint_identity().unwrap());
+        assert_ne!(first_identity, rotated.endpoint_identity().unwrap());
+        assert!(first_identity.starts_with("hmac-sha256:"));
+        assert!(!first_identity.contains("test-key"));
+    }
+
+    #[test]
     fn board_requests_preserve_authorization_failure_kind() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
