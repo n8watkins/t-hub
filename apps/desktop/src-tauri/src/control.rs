@@ -4719,6 +4719,25 @@ impl CaptainsRegistry {
         captain.conversation_id = provider_session_id.map(str::to_string);
     }
 
+    fn apply_claim_binding(
+        captain: &mut FleetIdentity,
+        binding: Option<(&str, &str, &str)>,
+    ) -> bool {
+        let Some((project_id, assignment, harness)) = binding else {
+            return false;
+        };
+        let assignment_id = assignment_id_for(Some(project_id), &captain.ship_slug);
+        let changed = captain.project_id.as_deref() != Some(project_id)
+            || captain.assignment_id != assignment_id
+            || captain.assignment.as_deref() != Some(assignment)
+            || captain.harness.as_deref() != Some(harness);
+        captain.project_id = Some(project_id.to_string());
+        captain.assignment_id = assignment_id;
+        captain.assignment = Some(assignment.to_string());
+        captain.harness = Some(harness.to_string());
+        changed
+    }
+
     /// Bump seq + persist iff `changed`, then package the [`ClaimOutcome`]. The guard
     /// is consumed here so the (potentially slow) disk write runs AFTER `inner` is
     /// dropped (Incident-D discipline).
@@ -4778,6 +4797,31 @@ impl CaptainsRegistry {
         is_terminal_dead: &dyn Fn(&str) -> bool,
         crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
     ) -> Result<ClaimOutcome, String> {
+        self.claim_provider_with_binding(
+            terminal_id,
+            ship_slug,
+            role,
+            provider,
+            provider_session_id,
+            workspace_tab_ids,
+            None,
+            is_terminal_dead,
+            crew_liveness,
+        )
+    }
+
+    fn claim_provider_with_binding(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        role: FleetRole,
+        provider: Option<&str>,
+        provider_session_id: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+        binding: Option<(&str, &str, &str)>,
+        is_terminal_dead: &dyn Fn(&str) -> bool,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
+    ) -> Result<ClaimOutcome, String> {
         if terminal_id.trim().is_empty() {
             return Err("claim_captain requires a non-empty 'captainSessionId'".into());
         }
@@ -4803,6 +4847,19 @@ impl CaptainsRegistry {
         };
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let previous = self.lock().clone();
+        if let Some((project_id, assignment, harness)) = binding {
+            if assignment.trim().is_empty() || harness.trim().is_empty() {
+                return Err("Captain binding requires a non-empty assignment and harness".into());
+            }
+            validate_harness_name(harness, "Captain harness")?;
+            if !previous
+                .projects
+                .iter()
+                .any(|project| project.project_id == project_id)
+            {
+                return Err(format!("unknown projectId '{project_id}'"));
+            }
+        }
         if let Some(existing) = previous
             .captains
             .iter()
@@ -4904,6 +4961,7 @@ impl CaptainsRegistry {
                             c.workspace_tab_ids = workspace_tab_ids;
                         }
                         c.state = ClaimState::Active;
+                        Self::apply_claim_binding(c, binding);
                         let rec = c.clone();
                         return self.commit_claim(
                             g,
@@ -4913,7 +4971,7 @@ impl CaptainsRegistry {
                             true,
                         );
                     }
-                    let rec = FleetIdentity {
+                    let mut rec = FleetIdentity {
                         ship_slug: slug.clone(),
                         assignment_id: assignment_id_for(None, &slug),
                         display_name: slug.clone(),
@@ -4933,6 +4991,7 @@ impl CaptainsRegistry {
                         crew: Vec::new(),
                         state: ClaimState::Active,
                     };
+                    Self::apply_claim_binding(&mut rec, binding);
                     g.captains.push(rec.clone());
                     return self.commit_claim(
                         g,
@@ -4963,7 +5022,9 @@ impl CaptainsRegistry {
                             c.state = ClaimState::Active;
                             Self::readopt_orphaned_crew(c, crew_liveness);
                         }
-                        let changed = tabs_change || provider_change || reactivate;
+                        let binding_change = Self::apply_claim_binding(c, binding);
+                        let changed =
+                            tabs_change || provider_change || reactivate || binding_change;
                         let rec = c.clone();
                         return self.commit_claim(
                             g,
@@ -5013,6 +5074,7 @@ impl CaptainsRegistry {
                     }
                     c.state = ClaimState::Active;
                     Self::readopt_orphaned_crew(c, crew_liveness);
+                    Self::apply_claim_binding(c, binding);
                     let rec = c.clone();
                     return self.commit_claim(g, previous.clone(), rec, disposition, true);
                 }
@@ -10646,7 +10708,8 @@ fn commission_captain(
     });
     ctx.tabs
         .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
-    let spawned = spawn_terminal_with_private_pane_command(ctx, &spawn_args, None, true, true)?;
+    let spawned =
+        spawn_terminal_with_private_pane_command(ctx, &spawn_args, None, true, true, false)?;
     let terminal_id = spawned["id"]
         .as_str()
         .ok_or("commission_captain: spawn returned no terminal id")?
@@ -10657,57 +10720,34 @@ fn commission_captain(
             "commission_captain: harness startup failed and the terminal was rolled back: {error}"
         ));
     }
-    let previous_claim = ctx
-        .captains
-        .snapshot()
-        .captains
-        .into_iter()
-        .find(|captain| {
-            captain.terminal_id.as_deref() == Some(terminal_id.as_str())
-                || captain.ship_slug == ship_slug
-        });
-    let claim = claim_captain(
-        ctx,
-        &json!({
-            "captainSessionId": terminal_id,
-            "shipSlug": ship_slug,
-            "provider": harness.as_provider(),
-            "workspaceTabIds": workspace_tab_ids,
-        }),
-        None,
-        true,
-    );
+    let claim_args = json!({
+        "captainSessionId": terminal_id,
+        "shipSlug": ship_slug,
+        "provider": harness.as_provider(),
+        "workspaceTabIds": workspace_tab_ids,
+    });
+    let claim = {
+        let _identity_transaction = ctx.tabs.identity_transaction();
+        claim_captain_locked(
+            ctx,
+            &claim_args,
+            None,
+            true,
+            Some((&project.project_id, &assignment, harness.as_provider())),
+            false,
+        )
+    };
     if let Err(error) = claim {
         let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
         return Err(format!(
             "commission_captain: terminal was spawned but its Captain claim failed and was rolled back: {error}"
         ));
     }
-    let claimed = ctx
+    let captain = ctx
         .captains
         .captain_for_session(&terminal_id)
-        .ok_or("commission_captain: claimed terminal disappeared before project binding")?;
-    let captain = match ctx.captains.bind_ship_context(
-        &ship_slug,
-        &project.project_id,
-        &assignment,
-        harness.as_provider(),
-    ) {
-        Ok(captain) => captain,
-        Err(error) => {
-            let rollback =
-                ctx.captains
-                    .rollback_provisioned_claim(&terminal_id, &claimed, previous_claim);
-            let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
-            return Err(format!(
-                "commission_captain: durable project binding failed and the terminal was rolled back: {error}{}",
-                rollback
-                    .err()
-                    .map(|rollback| format!("; registry rollback failed: {rollback}"))
-                    .unwrap_or_default()
-            ));
-        }
-    };
+        .ok_or("commission_captain: bound Captain disappeared before projection")?;
+    let _ = forward_apply(ctx, "spawn_terminal", &with_sync(ctx, spawned));
     let _ = captains_sync_apply(ctx);
     Ok(commissioned_response(captain, project, false))
 }
@@ -10882,59 +10922,52 @@ fn attach_captain(
             captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 || captain.ship_slug == ship_slug
         });
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let previous_workspace = ctx.tabs.workspace_for_tile(&terminal_id);
-    claim_captain(ctx, &claim_args, None, true)?;
-    let claimed = ctx
+    claim_captain_locked(
+        ctx,
+        &claim_args,
+        None,
+        true,
+        Some((&project_id, &assignment, &provider)),
+        false,
+    )
+    .map_err(|error| format!("attach_captain: durable claim and binding failed: {error}"))?;
+    let captain = ctx
         .captains
         .captain_for_session(&terminal_id)
-        .ok_or("attach_captain: claimed terminal disappeared before project binding")?;
-    let captain =
-        match ctx
-            .captains
-            .bind_ship_context(&ship_slug, &project_id, &assignment, &provider)
-        {
-            Ok(captain) => captain,
-            Err(error) => {
-                let rollback = ctx.captains.rollback_provisioned_claim(
-                    &terminal_id,
-                    &claimed,
-                    previous_claim.clone(),
-                );
-                let placement_rollback = ctx
-                    .tabs
-                    .restore_tile_placement(&terminal_id, previous_workspace.as_deref());
-                return Err(format!(
-                    "attach_captain: durable project binding failed: {error}{}{}",
-                    rollback
-                        .err()
-                        .map(|rollback| format!("; registry rollback failed: {rollback}"))
-                        .unwrap_or_default(),
-                    placement_rollback
-                        .err()
-                        .map(|rollback| format!("; placement rollback failed: {rollback}"))
-                        .unwrap_or_default()
-                ));
-            }
-        };
-    let _ = captains_sync_apply(ctx);
+        .ok_or("attach_captain: bound Captain disappeared before projection")?;
     let instructions = bootstrap_instructions(&captain, &project);
     let attaching_other_terminal =
         caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str());
     if attaching_other_terminal {
-        if let Err(error) = send_text(&json!({
+        #[cfg(test)]
+        let bootstrap_delivery = if args
+            .get("testFailBootstrapDelivery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            Err("injected bootstrap delivery failure".to_string())
+        } else {
+            send_text(&json!({
+                "sessionId": terminal_id,
+                "text": instructions,
+                "enter": true,
+            }))
+        };
+        #[cfg(not(test))]
+        let bootstrap_delivery = send_text(&json!({
             "sessionId": terminal_id,
             "text": instructions,
             "enter": true,
-        })) {
+        }));
+        if let Err(error) = bootstrap_delivery {
             let rollback =
                 ctx.captains
                     .rollback_provisioned_claim(&terminal_id, &captain, previous_claim);
             let placement_rollback = ctx
                 .tabs
                 .restore_tile_placement(&terminal_id, previous_workspace.as_deref());
-            if rollback.is_ok() {
-                let _ = captains_sync_apply(ctx);
-            }
             return Err(format!(
                 "attach_captain: target bootstrap delivery failed: {error}{}{}",
                 rollback
@@ -10948,6 +10981,12 @@ fn attach_captain(
             ));
         }
     }
+    let _ = organization_sync_apply(
+        ctx,
+        "move_tile",
+        json!({"terminalId": terminal_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+    );
+    let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "attach_captain",
         "audited": true,
@@ -11723,6 +11762,7 @@ fn dispatch_crew_with_observer_inner(
         &spawn_args,
         Some(&private_dormant_pane_command),
         false,
+        true,
         true,
     ) {
         Ok(spawned) => spawned,
@@ -16312,6 +16352,18 @@ fn claim_captain(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    let _identity_transaction = ctx.tabs.identity_transaction();
+    claim_captain_locked(ctx, args, caller, trusted_internal, None, true)
+}
+
+fn claim_captain_locked(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    binding: Option<(&str, &str, &str)>,
+    forward_projection: bool,
+) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "claim_captain")?;
     let captain_session_id = arg_str(args, "captainSessionId")
         .or_else(|| arg_str(args, "captain_session_id"))
@@ -16407,7 +16459,13 @@ fn claim_captain(
                 .collect()
         })
         .unwrap_or_default();
-    let _identity_transaction = ctx.tabs.identity_transaction();
+    if tmux::harness_liveness(&tmux_target(&captain_session_id), &provider)
+        != tmux::SessionLiveness::Alive
+    {
+        return Err(format!(
+            "claim_captain: provider '{provider}' stopped before the identity transaction committed"
+        ));
+    }
     let previous_workspace = ctx.tabs.workspace_for_tile(&captain_session_id);
     let captain_workspace_existed = ctx.tabs.has_tab(CAPTAIN_WORKSPACE_ID);
     let requested_slug = match role {
@@ -16477,13 +16535,14 @@ fn claim_captain(
             .copied()
             .unwrap_or(tmux::SessionLiveness::Unknown)
     };
-    let outcome = ctx.captains.claim_provider(
+    let outcome = ctx.captains.claim_provider_with_binding(
         &captain_session_id,
         ship_slug.as_deref(),
         role,
         Some(&provider),
         provider_session_id.as_deref(),
         workspace_tab_ids,
+        binding,
         &is_terminal_dead,
         &crew_liveness,
     )?;
@@ -16514,11 +16573,16 @@ fn claim_captain(
         ));
     }
     let snap = ctx.captains.snapshot();
-    if let Err(error) = organization_sync_apply(
-        ctx,
-        "move_tile",
-        json!({"terminalId": captain_session_id, "tabId": CAPTAIN_WORKSPACE_ID}),
-    ) {
+    let projection = if forward_projection {
+        organization_sync_apply(
+            ctx,
+            "move_tile",
+            json!({"terminalId": captain_session_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+        )
+    } else {
+        Ok(Value::Null)
+    };
+    if let Err(error) = projection {
         let placement_rollback = ctx
             .tabs
             .restore_tile_placement(&captain_session_id, previous_workspace.as_deref());
@@ -16548,7 +16612,7 @@ fn claim_captain(
     }
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
     // redundant Captain forward. Placement sync above still heals a stale tile.
-    let applied = snap.seq != before_seq && captains_sync_apply(ctx);
+    let applied = forward_projection && snap.seq != before_seq && captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "claim_captain",
         "audited": true,
@@ -16782,7 +16846,7 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    spawn_terminal_with_private_pane_command(ctx, args, None, false, false)
+    spawn_terminal_with_private_pane_command(ctx, args, None, false, false, true)
 }
 
 /// Internal spawn variant for an already-formed private pane command.
@@ -16795,6 +16859,7 @@ fn spawn_terminal_with_private_pane_command(
     private_pane_command: Option<&str>,
     allow_captain_workspace: bool,
     require_exact_tab: bool,
+    forward_projection: bool,
 ) -> Result<Value, String> {
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
@@ -16985,7 +17050,7 @@ fn spawn_terminal_with_private_pane_command(
             "spawnedBy": spawned_by,
         }),
     );
-    let applied = forward_apply(ctx, "spawn_terminal", &forward);
+    let applied = forward_projection && forward_apply(ctx, "spawn_terminal", &forward);
     Ok(json!({
         "accepted": "spawn_terminal",
         "id": id,
@@ -23491,6 +23556,85 @@ mod tests {
     }
 
     #[test]
+    fn commission_binding_failure_never_projects_a_ghost_captain_or_placement() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("commission-projection-rollback");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-commission-fail".into(),
+                name: "Commission Failure".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "commission-failure".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "commission-work".into(),
+            name: "Commission Work".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("commission-projection-rollback")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        captains.fail_next_persist("commission binding persistence failure");
+
+        let error = dispatch(
+            &context,
+            "commission_captain",
+            &json!({
+                "projectId": "project-commission-fail",
+                "assignment": "Own failure",
+                "harness": "codex",
+                "shipSlug": "commission-failure",
+                "workspaceTabIds": ["commission-work"],
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("commission binding persistence failure"));
+        assert!(captains.snapshot().captains.is_empty());
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .is_empty());
+        let projected_commands: Vec<String> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(command, _)| command.clone())
+            .collect();
+        assert!(!projected_commands.iter().any(|command| {
+            matches!(
+                command.as_str(),
+                "spawn_terminal" | "move_tile" | "sync_captains"
+            )
+        }));
+
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn captain_bootstrap_uses_the_wsl_runtime_root_without_mutating_the_project() {
         let canonical_repo_root =
             "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\projects\\tools\\t-hub\\t-hub-app";
@@ -23764,10 +23908,11 @@ mod tests {
             name: "Attach Work".into(),
             tile_ids: Vec::new(),
         }]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
         let mut ctx = test_ctx("attach-relocation-rollback")
-            .with_apply_sink(Arc::new(RecordingSink {
-                calls: StdMutex::new(Vec::new()),
-            }))
+            .with_apply_sink(sink.clone())
             .with_captains_registry(Arc::clone(&captains))
             .with_tab_registry(Arc::clone(&tabs));
         ctx.addr = "127.0.0.1:4242".into();
@@ -23787,14 +23932,8 @@ mod tests {
             .unwrap()
             .to_string();
         wait_for_harness_started(&captain_id, "codex").unwrap();
-        let persist_count = Arc::new(AtomicU64::new(0));
-        let fail_registry = Arc::clone(&captains);
-        let hook_count = Arc::clone(&persist_count);
-        captains.set_persist_hook(Box::new(move || {
-            if hook_count.fetch_add(1, Ordering::SeqCst) == 1 {
-                fail_registry.fail_next_persist("attach bind persistence failure");
-            }
-        }));
+        sink.calls.lock().unwrap().clear();
+        captains.fail_next_persist("attach bind persistence failure");
 
         let error = dispatch(
             &ctx,
@@ -23830,8 +23969,12 @@ mod tests {
             .unwrap()
             .tile_ids
             .contains(&captain_id));
+        let failed_projection = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+        assert!(
+            !failed_projection.contains(&captain_id),
+            "failed attachment must never project a ghost Captain or placement: {failed_projection}"
+        );
 
-        captains.set_persist_hook(Box::new(|| {}));
         let retry = dispatch(
             &ctx,
             "attach_captain",
@@ -23868,6 +24011,50 @@ mod tests {
             .unwrap()
             .tile_ids
             .contains(&captain_id));
+
+        dispatch(
+            &ctx,
+            "release_captain",
+            &json!({"captainSessionId": captain_id}),
+        )
+        .unwrap();
+        dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": captain_id, "tabId": "attach-work"}),
+        )
+        .unwrap();
+        let before_bootstrap_failure = captains.snapshot();
+        sink.calls.lock().unwrap().clear();
+        let bootstrap_error = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true,
+                "testFailBootstrapDelivery": true
+            }),
+        )
+        .unwrap_err();
+        assert!(bootstrap_error.contains("injected bootstrap delivery failure"));
+        assert_eq!(
+            captains.snapshot().captains,
+            before_bootstrap_failure.captains
+        );
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(
+            sink.calls.lock().unwrap().is_empty(),
+            "bootstrap rollback must occur before any Captain or Workspace projection"
+        );
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
