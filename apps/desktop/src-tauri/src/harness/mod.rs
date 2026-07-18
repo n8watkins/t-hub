@@ -321,6 +321,18 @@ pub trait HarnessAdapter: Send + Sync {
     /// uses this instead of inheriting a harness or user default implicitly.
     fn fresh_argv_with_permissions(&self, prompt: &str, perm: PermMode) -> String;
 
+    /// Interactive fresh or resume launch with every runtime-policy axis stated
+    /// in provider-native argv. Recovery uses this surface so post-launch
+    /// attestation verifies effective policy instead of comparing desired data.
+    fn interactive_argv_with_runtime_policy(
+        &self,
+        prompt: &str,
+        resume: Option<&str>,
+        model: &str,
+        reasoning_effort: &str,
+        perm: PermMode,
+    ) -> String;
+
     /// Interactive launch string that RESUMES a specific `session_id` (the
     /// harness's own resume entry: `claude --resume '<id>'` / `codex resume
     /// '<id>'`). The frontend "Resume ..." picker preset (no id) is a separate,

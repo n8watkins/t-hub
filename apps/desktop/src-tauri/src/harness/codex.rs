@@ -51,6 +51,32 @@ impl HarnessAdapter for CodexHarness {
         }
     }
 
+    fn interactive_argv_with_runtime_policy(
+        &self,
+        prompt: &str,
+        resume: Option<&str>,
+        model: &str,
+        reasoning_effort: &str,
+        perm: PermMode,
+    ) -> String {
+        let mut arguments = vec![
+            "codex".to_string(),
+            "--model".to_string(),
+            sh_single_quote(model),
+            "-c".to_string(),
+            sh_single_quote(&format!("model_reasoning_effort=\"{reasoning_effort}\"")),
+        ];
+        arguments.extend(self.permission_map(perm));
+        if let Some(session_id) = resume {
+            arguments.push("resume".to_string());
+            arguments.push(sh_single_quote(session_id));
+        }
+        if !prompt.is_empty() {
+            arguments.push(sh_single_quote(prompt));
+        }
+        arguments.join(" ")
+    }
+
     fn resume_argv(&self, session_id: &str) -> String {
         // Codex's interactive resume-by-id (verified on 0.142.5). The no-id
         // picker preset (`codex resume`) lives in SpawnMenu.tsx.
@@ -177,6 +203,31 @@ mod tests {
         assert!(!a
             .fresh_argv_with_permissions("build it", PermMode::BypassPermissions)
             .contains("--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn interactive_runtime_policy_is_exact_for_fresh_and_resume() {
+        let adapter = CodexHarness;
+        assert_eq!(
+            adapter.interactive_argv_with_runtime_policy(
+                "coordinate",
+                None,
+                "gpt-5.6-terra",
+                "medium",
+                PermMode::BypassPermissions,
+            ),
+            "codex --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"medium\"' --dangerously-bypass-approvals-and-sandbox 'coordinate'"
+        );
+        assert_eq!(
+            adapter.interactive_argv_with_runtime_policy(
+                "",
+                Some("thread-1"),
+                "gpt-5.6-terra",
+                "high",
+                PermMode::Default,
+            ),
+            "codex --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"high\"' --sandbox read-only resume 'thread-1'"
+        );
     }
 
     #[test]

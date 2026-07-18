@@ -42,6 +42,32 @@ impl HarnessAdapter for ClaudeHarness {
         }
     }
 
+    fn interactive_argv_with_runtime_policy(
+        &self,
+        prompt: &str,
+        resume: Option<&str>,
+        model: &str,
+        reasoning_effort: &str,
+        perm: PermMode,
+    ) -> String {
+        let mut arguments = vec!["claude".to_string()];
+        if let Some(session_id) = resume {
+            arguments.push("--resume".to_string());
+            arguments.push(sh_single_quote(session_id));
+        }
+        arguments.extend([
+            "--model".to_string(),
+            sh_single_quote(model),
+            "--effort".to_string(),
+            sh_single_quote(reasoning_effort),
+        ]);
+        arguments.extend(self.permission_map(perm));
+        if !prompt.is_empty() {
+            arguments.push(sh_single_quote(prompt));
+        }
+        arguments.join(" ")
+    }
+
     fn resume_argv(&self, session_id: &str) -> String {
         // Matches the recall path's `claude --resume '<id>'` (the interactive,
         // id-specific resume). The no-id picker preset lives in SpawnMenu.tsx.
@@ -153,6 +179,31 @@ mod tests {
         assert_eq!(
             a.fresh_argv_with_permissions("do the thing", PermMode::BypassPermissions),
             "claude --dangerously-skip-permissions 'do the thing'"
+        );
+    }
+
+    #[test]
+    fn interactive_runtime_policy_is_exact_for_fresh_and_resume() {
+        let adapter = ClaudeHarness;
+        assert_eq!(
+            adapter.interactive_argv_with_runtime_policy(
+                "coordinate",
+                None,
+                "claude-opus-4-1",
+                "high",
+                PermMode::BypassPermissions,
+            ),
+            "claude --model 'claude-opus-4-1' --effort 'high' --dangerously-skip-permissions 'coordinate'"
+        );
+        assert_eq!(
+            adapter.interactive_argv_with_runtime_policy(
+                "",
+                Some("session-1"),
+                "claude-opus-4-1",
+                "medium",
+                PermMode::Default,
+            ),
+            "claude --resume 'session-1' --model 'claude-opus-4-1' --effort 'medium'"
         );
     }
 
