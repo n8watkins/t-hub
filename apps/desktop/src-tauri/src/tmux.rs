@@ -1190,6 +1190,78 @@ mod tests {
         kill_session(&name).unwrap();
     }
 
+    #[test]
+    fn respawn_executes_when_a_hostile_pane_discards_injected_keys() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::respawn_executes_when_a_hostile_pane_discards_injected_keys: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let fixture = std::env::temp_dir().join(format!(
+            "t-hub-respawn-hostile-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let ready = fixture.join("ready");
+        let injected = fixture.join("injected");
+        let respawned = fixture.join("respawned");
+        let hostile = fixture.join("hostile-shell");
+        std::fs::write(
+            &hostile,
+            format!(
+                "#!/bin/sh\n: > {}\nwhile IFS= read -r ignored; do :; done\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hostile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let name = unique_name();
+        let _ = kill_session(&name);
+        new_session_with_env(&name, "/tmp", Some(hostile.to_str().unwrap()), &[]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hostile pane did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        send_text(
+            &name,
+            &format!("printf injected > {}", injected.display()),
+            true,
+        )
+        .unwrap();
+        assert!(
+            !injected.exists(),
+            "the hostile pane must discard the injected line rather than execute it"
+        );
+        let command = crate::commands::pane_command(
+            None,
+            Some(&format!(
+                "printf respawned > {}; exec sleep 2147483647",
+                respawned.display()
+            )),
+        )
+        .unwrap();
+        respawn_pane_exact(&name, "/tmp", &command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !respawned.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "respawn command did not execute"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        kill_session(&name).unwrap();
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
     /// The MCP read/write helpers round-trip through a real session: send a
     /// literal line, then read it back as plain text from the captured pane.
     ///

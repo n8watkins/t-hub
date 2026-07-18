@@ -57,9 +57,9 @@ use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
-    attest_final_launch_permissions, attest_launch_permissions, confirm_stable_launch_baseline,
-    observe_harness_process, Harness, HarnessPermissionAttestation, HarnessProcessEvidence,
-    LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
+    attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
+    confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
+    HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -10629,6 +10629,7 @@ fn ensure_dispatch_powder_binding_available(
 }
 
 const CODEX_UNOBSERVED_COMMAND: &str = "t-hub-agent --codex-unobserved";
+const CREW_DORMANT_PANE_COMMAND: &str = "exec sleep 2147483647";
 
 fn crew_interactive_launch(
     harness: Harness,
@@ -10963,6 +10964,7 @@ fn dispatch_crew_with_observer_inner(
         "name": format!("Crew - {}", card_id),
         "spawnedBy": captain_session_id,
         "capability": "read",
+        "startupCommand": CREW_DORMANT_PANE_COMMAND,
     });
     if let Some(tab_id) = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")) {
         spawn_args["tabId"] = json!(tab_id);
@@ -11147,11 +11149,22 @@ fn dispatch_crew_with_observer_inner(
             .unwrap_or_else(|| CODEX_UNOBSERVED_COMMAND.to_string());
         crew_interactive_launch(harness, &provider_launch, &codex_unobserved_command)
     };
-    if let Err(error) =
-        send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
-    {
-        rollback_launch_failure!(format!("dispatch_crew: harness launch failed: {error}"));
-    }
+    let respawn_command = crate::commands::pane_command(None, Some(&launch))
+        .ok_or("dispatch_crew: private provider respawn command is empty")?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_respawn");
+    revalidate_or_rollback!("immediately before provider send");
+    let respawn = match tmux::respawn_pane_exact(&tmux_target, &checkout, &respawn_command) {
+        Ok(transition) => transition,
+        Err(error) => {
+            rollback_launch_failure!(format!(
+                "dispatch_crew: private harness respawn failed: {error}"
+            ));
+        }
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_respawn");
+    revalidate_or_rollback!("immediately after provider respawn");
     #[cfg(test)]
     let skip_harness_liveness = args
         .get("testSkipHarnessLiveness")
@@ -11172,12 +11185,26 @@ fn dispatch_crew_with_observer_inner(
             ));
         }
     };
-    if let Err(error) = attest_launch_permissions(
-        harness.adapter(),
-        &before_launch,
-        &after_launch,
-        CREW_DEFAULT_PERMISSION,
-    ) {
+    let launch_attestation = if stabilize_baseline {
+        attest_respawn_launch_permissions(
+            harness.adapter(),
+            &before_launch,
+            &respawn,
+            &after_launch,
+            CREW_DEFAULT_PERMISSION,
+        )
+    } else {
+        // Synthetic observer tests intentionally model provider process races
+        // without claiming a real tmux pane identity.  Production always takes
+        // the respawn-provenance branch above.
+        attest_launch_permissions(
+            harness.adapter(),
+            &before_launch,
+            &after_launch,
+            CREW_DEFAULT_PERMISSION,
+        )
+    };
+    if let Err(error) = launch_attestation {
         rollback_launch_failure!(format!(
             "dispatch_crew: Harness permission attestation failed: {error}"
         ));
@@ -26855,11 +26882,63 @@ mod tests {
         fn was_invoked(&self) -> bool {
             self.invocation_path.exists()
         }
+
+        fn wait_for_invocation(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.was_invoked() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake Harness command was not invoked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     impl Drop for FakeHarnessCommand {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.fixture_dir);
+        }
+    }
+
+    struct TmuxGlobalOptionGuard {
+        option: String,
+        previous: Option<String>,
+    }
+
+    impl TmuxGlobalOptionGuard {
+        fn set(option: &str, value: &str) -> Self {
+            let previous = std::process::Command::new("tmux")
+                .args(["-L", tmux::socket(), "show-options", "-gv", option])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let output = std::process::Command::new("tmux")
+                .args(["-L", tmux::socket(), "set-option", "-g", option, value])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "could not set tmux global {option}"
+            );
+            Self {
+                option: option.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TmuxGlobalOptionGuard {
+        fn drop(&mut self) {
+            let mut command = std::process::Command::new("tmux");
+            command.args(["-L", tmux::socket(), "set-option", "-g"]);
+            if let Some(value) = self.previous.as_deref() {
+                command.args([self.option.as_str(), value]);
+                let _ = command.output();
+            }
         }
     }
 
@@ -28802,6 +28881,162 @@ mod tests {
         assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
     }
 
+    fn run_dispatch_authority_replacement_at_respawn_boundary(
+        boundary: &'static str,
+        same_terminal_reclaim: bool,
+    ) {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "run_dispatch_authority_replacement_at_respawn_boundary: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-respawn-authority-{boundary}-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary,
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": format!("Reject authority replacement at {boundary}"),
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the private-respawn authority barrier"),
+            boundary
+        );
+        if boundary == "after_respawn" {
+            provider.wait_for_invocation();
+        }
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                if same_terminal_reclaim {
+                    &captain.session_id
+                } else {
+                    "replacement-captain"
+                },
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        if same_terminal_reclaim {
+            let mut replacement_project = registry
+                .projects()
+                .into_iter()
+                .find(|project| project.project_id == "project-dispatch-attestation")
+                .unwrap();
+            replacement_project
+                .powder
+                .as_mut()
+                .unwrap()
+                .connection_profile = "replacement-powder-profile".into();
+            registry.upsert_project(replacement_project).unwrap();
+        }
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        let expected_phase = if boundary == "before_respawn" {
+            "immediately before provider send"
+        } else {
+            "immediately after provider respawn"
+        };
+        assert!(error.contains(expected_phase), "{error}");
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        if boundary == "before_respawn" {
+            assert!(
+                !provider.was_invoked(),
+                "authority rejection before respawn must not execute the provider command"
+            );
+        } else {
+            assert!(
+                provider.was_invoked(),
+                "the post-respawn barrier must observe a real provider launch before rollback"
+            );
+        }
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(if same_terminal_reclaim {
+                captain.session_id.as_str()
+            } else {
+                "replacement-captain"
+            })
+        );
+        assert!(replacement.crew.is_empty());
+        if same_terminal_reclaim {
+            assert_eq!(
+                snapshot.projects[0]
+                    .powder
+                    .as_ref()
+                    .unwrap()
+                    .connection_profile,
+                "replacement-powder-profile"
+            );
+        }
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    #[test]
+    fn dispatch_replacement_before_private_respawn_never_starts_provider() {
+        run_dispatch_authority_replacement_at_respawn_boundary("before_respawn", false);
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_private_respawn_rolls_back_exact_claim() {
+        run_dispatch_authority_replacement_at_respawn_boundary("after_respawn", true);
+    }
+
     #[test]
     fn dispatch_exhausted_unreadable_baseline_releases_exact_claim_without_provider_send() {
         if !tmux_process_tests_available() {
@@ -30602,6 +30837,100 @@ mod tests {
             let _ = std::fs::remove_file(path.with_extension("json.bak"));
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn dispatch_private_respawn_launches_through_a_hostile_shell_that_discards_keys() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_private_respawn_launches_through_a_hostile_shell_that_discards_keys: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let fixture = std::env::temp_dir().join(format!(
+            "t-hub-dispatch-hostile-shell-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let hostile_shell = fixture.join("hostile-shell");
+        let ready = fixture.join("ready");
+        std::fs::write(
+            &hostile_shell,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  *c*) exec /bin/sh -c \"$2\" ;;\n  *) : > {}; while IFS= read -r ignored; do :; done ;;\nesac\n",
+                serde_json::to_string(&ready).unwrap()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hostile_shell, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let _shell = TmuxGlobalOptionGuard::set("default-shell", hostile_shell.to_str().unwrap());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let hostile_terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let hostile_target = tmux_target(&hostile_terminal_id);
+        tmux::new_session_with_env(&hostile_target, "/tmp", None, &[]).unwrap();
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "hostile shell did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tmux::send_text(&hostile_target, &provider.command, true).unwrap();
+        let discarded_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < discarded_deadline {
+            assert!(
+                !provider.was_invoked(),
+                "the old injected-key path unexpectedly reached the provider"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tmux::kill_session_tree(&hostile_target).unwrap();
+
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, _) = dispatch_test_context(registry.clone());
+        let result = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Launch through a hostile shell without injecting provider keys",
+                "harness": "codex",
+                "testHarnessCommand": provider.command,
+                "testCodexUnobservedCommand": ":",
+            }),
+            None,
+            true,
+        )
+        .unwrap();
+        provider.wait_for_invocation();
+        let crew_session_id = result["crew"]["terminalId"].as_str().unwrap();
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(crew_session_id)),
+            tmux::SessionLiveness::Alive
+        );
+        assert_eq!(
+            result["crew"]["harnessPermission"],
+            json!("bypassPermissions")
+        );
+        assert_eq!(result["crew"]["tHubCapability"], json!("read"));
+        assert!(registry.snapshot().pending_dispatch_claims.is_empty());
+        assert!(registry.snapshot().pending_dispatch_releases.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+        tmux::kill_session_tree(&tmux_target(crew_session_id)).unwrap();
+        let _ = std::fs::remove_dir_all(&fixture);
     }
 
     #[test]
