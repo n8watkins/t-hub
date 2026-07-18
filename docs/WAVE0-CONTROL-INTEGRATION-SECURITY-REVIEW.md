@@ -693,6 +693,31 @@ An authenticated `th send` report to Captain session `0c7b7560` was attempted fr
 The installed control plane rejected it with gated exit code `5` because `send_text` requires control capability and this Crew token is read-only.
 No Captain message delivery is claimed.
 
+## MCP Dispatcher Fixture and Frozen Legacy Intent Follow-Up
+
+Independent pre-review reproduced `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test mcp_e2e powder_tools_reach_real_authenticated_dispatcher -- --nocapture` at prior evidence head `48153e6836026471a9d4f957645dc5fe0548e6fb`.
+The real authenticated dispatcher test failed at `tests/mcp_e2e.rs:1450` because its fixture profile used `operationIdentity` `actor-t-hub`, while both authoritative criterion receipt projections used `actor-mcp-owned-captain`.
+The caller also supplied `actor-mcp-owned-captain` as the legacy label, so the production profile-identity validation correctly rejected the fixture receipt and the MCP response data was null.
+
+Commit `d42af13` changes only the two fixture authoritative receipt identities to `actor-t-hub`.
+It intentionally retains the distinct legacy caller label `actor-mcp-owned-captain` in the real authenticated MCP dispatcher request.
+The passing E2E therefore proves that the caller label is not receipt authority.
+
+Commit `b802bc1` hardens the durable recovery regression with a frozen literal schema-v3 intent representing the installed 0.3.104 form.
+The fixture persists and reloads fixed operation id `wave0-e2ab7e3-review-criterion-0`, payload digest `609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a`, Powder request digest `sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8`, exact repository, card, run, mutation kind, requester, and creation timestamp.
+It asserts those frozen fields after registry restart, uses the unchanged legacy review payload, performs exactly one operation-recovery GET, makes zero criterion-review POSTs, and clears only the exact intent after validating the successful receipt.
+
+At head `b802bc183b23b50e10bbbb33c4ca91a7c64edace`, the exact MCP dispatcher E2E passed.
+The frozen schema-v3 restart and zero-POST recovery test passed.
+The profile-identity acceptance and caller-label confused-deputy rejection tests passed.
+The durable mutation-intent restart and changed-payload rejection test passed.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+No broad aggregate was rerun.
+No live Powder operation, protected profile, credential, installed runtime, or card state was read or mutated.
+An authenticated `th send` report to Captain session `0c7b7560` was attempted from code head `b802bc183b23b50e10bbbb33c4ca91a7c64edace`.
+The installed control plane rejected it with gated exit code `5` because `send_text` requires control capability and this Crew token is read-only.
+No Captain message delivery is claimed.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
