@@ -583,6 +583,9 @@ From `apps/desktop/src-tauri`, `cargo test -p t-hub 'control::tests::dispatch_' 
 `cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 No full control aggregate or workspace aggregate was run for this remediation.
 The prior workspace aggregate failure remains an unresolved release-blocking residual and is not claimed as resolved by this focused production remediation.
+An authenticated `th send` report for this remediation was attempted from evidence head `5572ce01aa329834189b25009195429b16076add` to Captain session `0c7b7560`.
+The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 ## Independent Reviewer Checklist
 
