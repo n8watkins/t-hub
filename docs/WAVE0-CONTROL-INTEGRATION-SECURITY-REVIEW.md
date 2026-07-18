@@ -288,7 +288,7 @@ That Crew's normal restart cleanup could then resolve the replacement Captain Pr
 Commit `2e4a332` introduced the initial distinct `PendingDispatchRelease` recovery record with the original Project, protected profile name, repository, card, run, agent, initial operation identity, and transaction Crew terminal.
 The profile-name-only recovery description in this historical section is superseded by the later durability remediation below.
 It was not sufficient to defend a protected profile endpoint remap, release preparation before terminal teardown, or concurrent recovery cleanup.
-Current recovery retains a frozen canonical endpoint and repository identity, prepares its exact CleanupPending Crew before teardown, and serializes periodic and ordinary cleanup through one per-Crew guard.
+Current recovery retains a frozen credential-free endpoint identity digest and repository identity, prepares its exact CleanupPending Crew before teardown, and serializes periodic and ordinary cleanup through one per-Crew guard.
 Confirmed recovery removes a record only with its exact transaction-owned CleanupPending Crew.
 It does not retire a reused terminal identity when that Crew is absent or replaced.
 The newer remap and response-loss regressions replace the older claim of a second release POST.
@@ -309,9 +309,9 @@ If the run remains active with the exact card and agent, recovery may perform on
 `Prepared` recovery first validates frozen profile, repository, current card claim, and exact run evidence, ensures its transaction terminal is gone, then atomically advances to `InFlight` before any exact release POST.
 If that recovery-side POST has an ambiguous response, the durable `InFlight` record remains authoritative for the next reconciliation.
 
-Schema version 11 makes the endpoint-pinned recovery shape incompatible with an older binary that could silently discard it.
-Version 10 snapshots without a release recovery load and upgrade on their next write.
-Version 10 snapshots containing a release recovery fail closed before any recovery or network call.
+Schema version 11 made the endpoint-pinned recovery shape incompatible with an older binary that could silently discard it.
+Schema version 12 replaces its raw endpoint field with a credential-free endpoint identity digest and makes a version 11 release recovery fail closed before any recovery or network call.
+Version 11 snapshots without a release recovery load and upgrade on their next write.
 Snapshot validation requires each release recovery to map to exactly one `CleanupPending` Crew under the exact Project with matching terminal, card, run, agent, and frozen-scope marker.
 The reciprocal marker check rejects orphaned Crew recovery state, mismatched or foreign records, and duplicate recovery state before any remote release.
 
@@ -387,6 +387,29 @@ Replacement, same-terminal ABA, and exhausted-baseline success tests now assert 
 At `11a2204`, the serialized dispatch filter passed 32 tests with one existing real-agent test intentionally ignored.
 The serialized control Powder filter passed 63 tests, the Powder client filter passed 30 tests, the Harness filter passed 15 tests, and the close filter passed 7 tests.
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
+Commit `0fd0faa` closes the credential-safety review finding for frozen dispatch-release recovery scope.
+`PendingDispatchRelease` now stores only `connectionEndpointDigest`, a canonical lowercase SHA-256 digest computed from the validated and normalized protected profile base URL.
+It no longer persists the profile URL, path, query, or fragment, so `captains_sync_apply` cannot forward those values in a registry snapshot.
+Recovery reconstructs the protected profile locally and exact-compares the recomputed digest before repository, card, run-evidence, terminal, or release network I/O.
+An endpoint or profile remap retains the durable original recovery with a generic error and makes zero original- or replacement-scope requests.
+Snapshot schema version 12 accepts a version 11 snapshot with no release recovery and stamps version 12 on its next write.
+Any version 11 snapshot carrying a recovery fails closed before network use.
+A legacy raw `connectionEndpoint` recovery document also fails deserialization before recovery can construct a client.
+The deterministic gateway-secret regression uses token-like path, query, and fragment values in both the original and remapped protected profile URLs.
+It proves registry JSON, `sync_captains` payloads, `Debug` output, and endpoint-remap errors contain none of those values, while the persisted digest remains present.
+It also proves zero card evidence, run evidence, or release requests reach either scope after the remap.
+At `0fd0faa`, the focused endpoint secrecy regression, schema upgrade and legacy raw-state regressions, and the serialized dispatch-release filter with 10 tests passed.
+A broader serial dispatch command selected 34 tests but did not return a complete aggregate summary after printing its first 28 progress markers, so it is not counted as a completed 34-test gate.
+Its six remaining cases, including `dispatch_restart_rejects_contender_without_releasing_successful_winner`, were each isolated once and passed serially.
+The 63-test control Powder filter, 30-test Powder client filter, 15-test Harness filter, and 7-test close filter passed serially.
+The agent package suite passed 55 unit tests, 3 Codex TAP E2E tests, and 1 unobserved E2E test.
+The CLI suite passed 47 unit tests and 10 Powder contract tests.
+The MCP library and binary suites passed 16 and 75 tests respectively.
+`cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check`, and `git diff --cached --check` passed.
+One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before test execution because that binary package has no library target.
+One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
