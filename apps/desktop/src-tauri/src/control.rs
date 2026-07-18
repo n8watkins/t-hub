@@ -2401,6 +2401,12 @@ struct CloseWorkspaceResult {
     captains_changed: bool,
 }
 
+#[derive(Debug)]
+struct CloseTerminalCommitResult {
+    captain_state_changed: bool,
+    workspace_changed: bool,
+}
+
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
 /// what every `sync_captains` forward carries down to the UI (the UI renders FROM
 /// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
@@ -3899,22 +3905,146 @@ impl CaptainsRegistry {
         self.commit_mutation(current, previous)
     }
 
-    fn retire_workspace_tile(&self, tile_id: &str) -> Result<bool, String> {
+    fn prepare_close_terminal_operation(
+        &self,
+        terminal_id: &str,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current.pending_fleet_operations.iter().find(|operation| {
+            matches!(
+                &operation.payload,
+                PendingFleetOperationPayload::CloseTerminal {
+                    terminal_id: pending_terminal,
+                    ..
+                } if pending_terminal == terminal_id
+            )
+        }) {
+            return Ok(existing.clone());
+        }
+        let previous = current.clone();
+        let operation = PendingFleetOperation {
+            operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+            expected_seq: current.seq,
+            phase: PendingFleetOperationPhase::Prepared,
+            created_at: now_ms(),
+            payload: PendingFleetOperationPayload::CloseTerminal {
+                terminal_id: terminal_id.to_string(),
+                powder_release: current
+                    .pending_dispatch_releases
+                    .iter()
+                    .find(|release| release.crew_session_id == terminal_id)
+                    .cloned(),
+            },
+        };
+        current.pending_fleet_operations.push(operation.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(operation)
+    }
+
+    fn abort_close_terminal_operation(&self, operation_id: &str) -> Result<(), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
-        let mut changed = false;
-        for workspace in &mut current.workspaces {
-            let before = workspace.tile_ids.len();
-            workspace.tile_ids.retain(|candidate| candidate != tile_id);
-            changed |= workspace.tile_ids.len() != before;
-        }
-        if !changed {
-            return Ok(false);
+        let before = current.pending_fleet_operations.len();
+        current
+            .pending_fleet_operations
+            .retain(|operation| operation.operation_id != operation_id);
+        if current.pending_fleet_operations.len() == before {
+            return Ok(());
         }
         current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn commit_close_terminal_operation(
+        &self,
+        operation: &PendingFleetOperation,
+        retain_crew_binding: bool,
+        released_binding: Option<(&str, &str)>,
+    ) -> Result<CloseTerminalCommitResult, String> {
+        let terminal_id = match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { terminal_id, .. } => terminal_id,
+            _ => return Err("Fleet operation is not a terminal close".into()),
+        };
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let Some(pending) = current
+            .pending_fleet_operations
+            .iter()
+            .find(|pending| pending.operation_id == operation.operation_id)
+        else {
+            return Err(format!(
+                "terminal close operation '{}' is no longer pending",
+                operation.operation_id
+            ));
+        };
+        if pending != operation || pending.phase != PendingFleetOperationPhase::Prepared {
+            return Err(format!(
+                "terminal close operation '{}' changed before commit",
+                operation.operation_id
+            ));
+        }
+
+        let now = now_ms();
+        let mut captain_state_changed = false;
+        for captain in &mut current.captains {
+            if captain.terminal_id.as_deref() == Some(terminal_id.as_str()) {
+                captain.state = ClaimState::Orphaned { since: now };
+                captain.terminal_id = None;
+                for crew in &mut captain.crew {
+                    if matches!(crew.state, CrewState::Active) {
+                        crew.state = CrewState::Orphaned { since: now };
+                    }
+                }
+                captain_state_changed = true;
+            }
+            for crew in &mut captain.crew {
+                if crew.terminal_id != *terminal_id {
+                    continue;
+                }
+                let next_state = if retain_crew_binding {
+                    CrewState::CleanupPending { since: now }
+                } else {
+                    CrewState::Removed { since: now }
+                };
+                if crew.state != next_state {
+                    crew.state = next_state;
+                    captain_state_changed = true;
+                }
+                if let Some((card_id, run_id)) = released_binding {
+                    let matches = crew.powder_work.as_ref().is_some_and(|work| {
+                        work.card_id == card_id
+                            && work.run_id == run_id
+                            && matches!(work.state, PowderWorkState::Active)
+                    });
+                    if !matches {
+                        return Err(format!(
+                            "Crew session '{terminal_id}' Powder binding changed before terminal close commit"
+                        ));
+                    }
+                    crew.powder_work = None;
+                    captain_state_changed = true;
+                }
+            }
+        }
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace.tile_ids.retain(|tile| tile != terminal_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        current
+            .pending_fleet_operations
+            .retain(|pending| pending.operation_id != operation.operation_id);
+        current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
-        Ok(true)
+        Ok(CloseTerminalCommitResult {
+            captain_state_changed,
+            workspace_changed,
+        })
     }
 
     fn close_workspace(
@@ -15657,6 +15787,36 @@ pub fn start_powder_reconciler(ctx: ControlContext) {
         .ok();
 }
 
+/// Replay durable Fleet intents before the control listener accepts requests.
+/// External effects are idempotent, and each handler verifies the exact persisted
+/// operation identity again before committing its post-state.
+pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
+    let pending = ctx.captains.snapshot().pending_fleet_operations;
+    for operation in pending {
+        match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { terminal_id, .. } => {
+                if let Err(error) = close_terminal_with_policy(
+                    ctx,
+                    &json!({"sessionId": terminal_id, "force": true}),
+                    false,
+                    None,
+                ) {
+                    eprintln!(
+                        "t-hub-fleet: pending close operation '{}' remains for retry: {error}",
+                        operation.operation_id
+                    );
+                }
+            }
+            PendingFleetOperationPayload::CommissionCaptain { .. } => {
+                eprintln!(
+                    "t-hub-fleet: pending commission operation '{}' awaits commission recovery",
+                    operation.operation_id
+                );
+            }
+        }
+    }
+}
+
 /// Reuse a resolved Powder profile across event polls. A profile command may
 /// cross the Windows-to-WSL boundary to retrieve a credential, so rebuilding a
 /// client every 15 seconds creates needless process churn. Entries expire to
@@ -18506,7 +18666,6 @@ fn close_terminal_with_policy(
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
-    let _identity_transaction = ctx.tabs.identity_transaction();
     // Serialize the entire terminal-close transaction with completion,
     // renewal, and cleanup for this Crew. The guard must precede liveness and
     // tmux teardown so a close queued behind completion cannot kill the worker
@@ -18517,6 +18676,9 @@ fn close_terminal_with_policy(
     if let Some(authority) = authority {
         revalidate_target_lifecycle_authority(ctx, authority)?;
     }
+    let fleet_operation = ctx.captains.prepare_close_terminal_operation(tile_id)?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("close_terminal_effect");
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
     // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
@@ -18541,6 +18703,8 @@ fn close_terminal_with_policy(
     let (existed, forced) = match plan_close(force, initial, reprobe) {
         ClosePlan::Kill { existed, forced } => (existed, forced),
         ClosePlan::RetryableTimeout => {
+            ctx.captains
+                .abort_close_terminal_operation(&fleet_operation.operation_id)?;
             return Err(retryable_error(format!(
                 "close_terminal: liveness probe for '{session_id}' (target {target}) timed out; \
                  session NOT confirmed gone — retry once the control plane recovers, or pass \
@@ -18548,6 +18712,8 @@ fn close_terminal_with_policy(
             )));
         }
         ClosePlan::RefuseForceOnLive => {
+            ctx.captains
+                .abort_close_terminal_operation(&fleet_operation.operation_id)?;
             return Err(format!(
                 "close_terminal: force refused — a re-probe shows session '{session_id}' (target \
                  {target}) is LIVE; the earlier probe was merely slow, not dead. Retry a normal \
@@ -18555,14 +18721,67 @@ fn close_terminal_with_policy(
             ));
         }
     };
-    tmux::kill_session_tree(&target)
-        .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    if let Err(error) = tmux::kill_session_tree(&target) {
+        ctx.captains
+            .abort_close_terminal_operation(&fleet_operation.operation_id)?;
+        return Err(format!("failed to close terminal '{session_id}': {error}"));
+    }
     // The terminal is now definitely stopped. Release any Crew claim after the
     // kill so a failed kill can never leave a live worker without its lease.
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
-    let (powder_release, crew_binding_retained, mut captain_state_changed) =
-        finalize_crew_powder_cleanup_guarded(ctx, tile_id, preserve_crew_on_powder_failure)?;
+    let (cleanup_was_pending, completion_recovery_required, has_powder_binding, is_removed) = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .find(|crew| crew.terminal_id == tile_id)
+        .map(|crew| {
+            (
+                matches!(crew.state, CrewState::CleanupPending { .. })
+                    && crew.powder_work.is_some(),
+                crew.powder_work.as_ref().is_some_and(|work| {
+                    matches!(work.state, PowderWorkState::CompletionPending { .. })
+                }),
+                crew.powder_work.is_some(),
+                matches!(crew.state, CrewState::Removed { .. }),
+            )
+        })
+        .unwrap_or((false, false, false, false));
+    if is_removed && has_powder_binding {
+        ctx.captains
+            .abort_close_terminal_operation(&fleet_operation.operation_id)?;
+        return Err(format!(
+            "Crew session '{tile_id}' is historically Removed; ordinary live Powder cleanup is refused"
+        ));
+    }
+    let powder_release = release_crew_powder_binding_guarded(ctx, tile_id);
+    let crew_binding_retained = retain_crew_binding_after_powder_failure(
+        preserve_crew_on_powder_failure,
+        cleanup_was_pending,
+        completion_recovery_required,
+        has_powder_binding,
+        powder_release.as_ref(),
+    );
+    let released_binding = powder_release.as_ref().and_then(|release| {
+        matches!(
+            release.get("outcome").and_then(Value::as_str),
+            Some("released" | "already_released")
+        )
+        .then(|| {
+            (
+                release.get("cardId").and_then(Value::as_str),
+                release.get("runId").and_then(Value::as_str),
+            )
+        })
+        .and_then(|(card_id, run_id)| Some((card_id?, run_id?)))
+    });
+    let committed = ctx.captains.commit_close_terminal_operation(
+        &fleet_operation,
+        crew_binding_retained,
+        released_binding,
+    )?;
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -18572,15 +18791,13 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    let workspace_changed = ctx.captains.retire_workspace_tile(tile_id)?;
-    captain_state_changed |= workspace_changed;
     ctx.tabs.replace(ctx.captains.workspace_projection());
-    if workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
+    if committed.workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
     // Captain-chat phase 2: a dead session leaves the captains registry too -
     // its captaincy is released and it drops out of every crew list.
-    if captain_state_changed {
+    if committed.captain_state_changed {
         let _ = captains_sync_apply(ctx);
     }
     // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
@@ -20795,7 +21012,7 @@ mod tests {
     }
 
     #[test]
-    fn close_terminal_waits_for_claim_or_attach_identity_transaction() {
+    fn close_terminal_does_not_hold_or_wait_for_projection_identity_during_effects() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let terminal_id = format!(
             "close-race-{}",
@@ -20820,15 +21037,28 @@ mod tests {
             ))
             .unwrap();
         });
-        assert!(
-            received.recv_timeout(Duration::from_millis(100)).is_err(),
-            "close_terminal escaped a concurrent claim or attach transaction"
-        );
-        drop(transaction);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && (tmux::has_session(&tmux_target(&terminal_id))
+                || !context
+                    .captains
+                    .snapshot()
+                    .pending_fleet_operations
+                    .is_empty())
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert!(context
+            .captains
+            .snapshot()
+            .pending_fleet_operations
+            .is_empty());
         received
             .recv_timeout(Duration::from_secs(2))
-            .unwrap()
+            .expect("close_terminal must not wait for the projection identity mutex")
             .unwrap();
+        drop(transaction);
         closing.join().unwrap();
         assert!(!tmux::has_session(&tmux_target(&terminal_id)));
         assert!(!tabs
@@ -27107,6 +27337,109 @@ mod tests {
             ClaimState::Orphaned { .. }
         ));
         assert!(snap.captains[0].terminal_id.is_none(), "un-pointed");
+    }
+
+    #[test]
+    fn close_terminal_releases_fleet_lock_during_external_effects() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry.record_crew("cap-1", "crew-1").unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(registry.workspace_projection());
+        let context = Arc::new(
+            test_ctx("close-effect-lock")
+                .with_captains_registry(Arc::clone(&registry))
+                .with_tab_registry(Arc::clone(&tabs)),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_effect",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let closing_context = Arc::clone(&context);
+        let closing = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &closing_context,
+                &json!({"sessionId": "crew-1"}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "close_terminal_effect"
+        );
+        assert_eq!(registry.snapshot().pending_fleet_operations.len(), 1);
+
+        let (listed_tx, listed_rx) = std::sync::mpsc::sync_channel(1);
+        let listing_context = Arc::clone(&context);
+        std::thread::spawn(move || {
+            listed_tx
+                .send((
+                    dispatch(&listing_context, "list_captains", &Value::Null),
+                    dispatch(&listing_context, "list_tabs", &Value::Null),
+                ))
+                .unwrap();
+        });
+        let (captains, listed_tabs) = listed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("Fleet readers must remain prompt during terminal effects");
+        captains.unwrap();
+        listed_tabs.unwrap();
+        resume_tx.send(()).unwrap();
+        closing.join().unwrap().unwrap();
+        assert!(registry.snapshot().pending_fleet_operations.is_empty());
+        assert!(matches!(
+            registry.snapshot().captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+    }
+
+    #[test]
+    fn prepared_terminal_close_recovers_before_first_list_after_restart() {
+        let path = captains_tmp("close-terminal-wal-restart");
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry.record_crew("cap-1", "crew-1").unwrap();
+        let prepared = registry.prepare_close_terminal_operation("crew-1").unwrap();
+        assert_eq!(prepared.phase, PendingFleetOperationPhase::Prepared);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        assert_eq!(
+            restarted.snapshot().pending_fleet_operations,
+            vec![prepared]
+        );
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let context = test_ctx("close-terminal-wal-restart")
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(Arc::clone(&tabs));
+        recover_pending_fleet_operations(&context);
+
+        let durable = restarted.snapshot();
+        assert!(durable.pending_fleet_operations.is_empty());
+        assert!(matches!(
+            durable.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().all(|workspace| {
+            workspace["tileIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tile| tile != "crew-1")
+        }));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

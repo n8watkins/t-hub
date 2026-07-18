@@ -348,6 +348,7 @@ fn start_control_listener(
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz);
+    control::recover_pending_fleet_operations(&ctx);
     control::start_powder_reconciler(ctx.clone());
     match control::start(ctx) {
         Ok(h) => {
