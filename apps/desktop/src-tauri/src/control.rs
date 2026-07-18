@@ -826,7 +826,9 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Powder instance during recovery. v12 replaces that persisted endpoint with
 /// its credential-free SHA-256 identity, so a protected profile URL can never
 /// be copied into the registry or a captain sync payload.
-/// All prior shapes remain readable and upgrade on write.
+/// Snapshots older than a recovery shape load and upgrade only when they carry
+/// no such recovery state.  A recovery record requires its exact schema and
+/// fails closed rather than letting an older binary discard it.
 pub const CAPTAINS_SCHEMA_VERSION: u32 = 12;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
