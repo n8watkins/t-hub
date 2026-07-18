@@ -1132,20 +1132,86 @@ mod tests {
 
     struct TestSession {
         name: String,
+        closed: bool,
+    }
+
+    fn test_session_cleanup_confirmed(
+        result: &Result<(), TmuxError>,
+        liveness_after_error: Option<SessionLiveness>,
+    ) -> bool {
+        result.is_ok() || liveness_after_error == Some(SessionLiveness::Gone)
     }
 
     impl TestSession {
         fn new() -> Self {
             let name = unique_name();
             let _ = kill_session(&name);
-            Self { name }
+            Self {
+                name,
+                closed: false,
+            }
+        }
+
+        fn close(&mut self) -> Result<(), TmuxError> {
+            let result = kill_session(&self.name);
+            let liveness_after_error = result.as_ref().err().map(|_| session_liveness(&self.name));
+            self.closed = test_session_cleanup_confirmed(&result, liveness_after_error);
+            result
         }
     }
 
     impl Drop for TestSession {
         fn drop(&mut self) {
-            let _ = kill_session(&self.name);
+            if !self.closed {
+                let _ = kill_session(&self.name);
+            }
         }
+    }
+
+    struct TmuxTestsAnchorGuard {
+        session: TestSession,
+    }
+
+    impl TmuxTestsAnchorGuard {
+        fn new() -> Self {
+            let session = TestSession::new();
+            create_shell_session_after_final_teardown(&session.name);
+            Self { session }
+        }
+    }
+
+    impl Drop for TmuxTestsAnchorGuard {
+        fn drop(&mut self) {
+            if let Err(error) = self.session.close() {
+                assert!(
+                    error.message == "server exited unexpectedly"
+                        && session_liveness(&self.session.name) == SessionLiveness::Gone,
+                    "anchor cleanup failed before confirmed final-session teardown: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_cleanup_retries_unexpected_live_or_ambiguous_failures() {
+        let error = || TmuxError {
+            op: "kill-session",
+            code: Some(1),
+            message: "unexpected cleanup failure".to_string(),
+        };
+        assert!(test_session_cleanup_confirmed(&Ok(()), None));
+        assert!(test_session_cleanup_confirmed(
+            &Err(error()),
+            Some(SessionLiveness::Gone)
+        ));
+        assert!(!test_session_cleanup_confirmed(
+            &Err(error()),
+            Some(SessionLiveness::Alive)
+        ));
+        assert!(!test_session_cleanup_confirmed(
+            &Err(error()),
+            Some(SessionLiveness::Unknown)
+        ));
     }
 
     #[test]
@@ -1356,14 +1422,14 @@ mod tests {
             );
             return;
         }
-        let name = unique_name();
-        let _ = kill_session(&name);
-        create_shell_session_after_final_teardown(&name);
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let mut target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
 
-        send_keys(&name, &["C-c"]).expect("send_keys C-c should succeed");
-        send_keys(&name, &["Enter"]).expect("send_keys Enter should succeed");
+        send_keys(&target.name, &["C-c"]).expect("send_keys C-c should succeed");
+        send_keys(&target.name, &["Enter"]).expect("send_keys Enter should succeed");
 
-        kill_session(&name).expect("kill_session should succeed");
+        target.close().expect("target cleanup should succeed");
     }
 
     /// The attach belt-and-braces: [`reassert_window_size_latest`] restores
