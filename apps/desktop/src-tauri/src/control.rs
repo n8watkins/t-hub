@@ -19240,6 +19240,11 @@ fn freeze_close_terminal_powder_release(
     })?;
     let client = powder::Client::from_profile(&scope.binding.connection_profile)
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    if client.configured_agent() != agent {
+        return Err(format!(
+            "Crew session '{crew_session_id}' Powder profile configured agent does not match its durable work agent"
+        ));
+    }
     let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
         format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
     })?;
@@ -28255,6 +28260,46 @@ mod tests {
         tmux::kill_session_tree(&target).unwrap();
         let powder = server.finish().unwrap();
         assert_eq!(powder.release_posts, 0);
+    }
+
+    #[test]
+    fn close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-agent-mismatch-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let before = registry.snapshot();
+
+        let error =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap_err();
+
+        assert!(error.contains("configured agent"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+        assert_eq!(powder.card_evidence_gets, 0);
+        assert_eq!(powder.run_evidence_gets, 0);
     }
 
     #[test]
