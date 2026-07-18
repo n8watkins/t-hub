@@ -907,6 +907,7 @@ struct ProviderFileIdentity {
 struct ProviderInstallLayout {
     launcher_directory: PathBuf,
     package_root: PathBuf,
+    require_protected_ownership: bool,
 }
 
 #[cfg(unix)]
@@ -978,16 +979,10 @@ where
     {
         return Err(LaunchAttestationError::ProcessChanged);
     }
-    if launcher_is_symlink {
-        let expected_target = layout
-            .package_root
-            .join(approved_provider_package_relative_path(expected));
-        if executable != expected_target {
-            return Err(LaunchAttestationError::WrongProvider);
-        }
-    } else if executable != launcher_directory.join(expected.as_provider()) {
+    if !launcher_is_symlink {
         return Err(LaunchAttestationError::WrongProvider);
     }
+    validate_provider_package_provenance(layout, &executable, expected)?;
     Ok(VerifiedHarnessProviderLaunch(
         HarnessProviderLaunchReceipt {
             resolved_provider_executable: executable.to_string_lossy().into_owned(),
@@ -997,15 +992,82 @@ where
     ))
 }
 
-fn approved_provider_package_relative_path(expected: Harness) -> &'static std::path::Path {
+fn provider_package_relative_root(expected: Harness) -> &'static std::path::Path {
     match expected {
-        Harness::Codex => std::path::Path::new("@openai/codex/bin/codex.js"),
-        Harness::Claude => std::path::Path::new("@anthropic-ai/claude-code/bin/claude.exe"),
+        Harness::Codex => std::path::Path::new("@openai/codex"),
+        Harness::Claude => std::path::Path::new("@anthropic-ai/claude-code"),
     }
 }
 
+fn provider_package_bin_relative_path(expected: Harness) -> &'static str {
+    match expected {
+        Harness::Codex => "bin/codex.js",
+        Harness::Claude => "bin/claude.exe",
+    }
+}
+
+fn validate_provider_package_provenance(
+    layout: &ProviderInstallLayout,
+    executable: &std::path::Path,
+    expected: Harness,
+) -> Result<(), LaunchAttestationError> {
+    let package_root = layout
+        .package_root
+        .join(provider_package_relative_root(expected));
+    if executable != package_root.join(provider_package_bin_relative_path(expected)) {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    let manifest_path = package_root.join("package.json");
+    let manifest_bytes =
+        std::fs::read(&manifest_path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if manifest_bytes.is_empty() || manifest_bytes.len() > 64 * 1024 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let expected_package = match expected {
+        Harness::Codex => "@openai/codex",
+        Harness::Claude => "@anthropic-ai/claude-code",
+    };
+    if manifest.get("name").and_then(serde_json::Value::as_str) != Some(expected_package)
+        || manifest
+            .get("bin")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|bin| bin.get(expected.as_provider()))
+            .and_then(serde_json::Value::as_str)
+            != Some(provider_package_bin_relative_path(expected))
+    {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    if layout.require_protected_ownership {
+        validate_protected_provider_path(&layout.launcher_directory)?;
+        validate_protected_provider_path(&layout.package_root)?;
+        validate_protected_provider_path(&package_root)?;
+        validate_protected_provider_path(&manifest_path)?;
+        validate_protected_provider_path(executable)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_protected_provider_path(path: &std::path::Path) -> Result<(), LaunchAttestationError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata =
+        std::fs::metadata(path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_protected_provider_path(_path: &std::path::Path) -> Result<(), LaunchAttestationError> {
+    Err(LaunchAttestationError::UnreadableEvidence)
+}
+
 fn trusted_provider_install_layouts() -> Vec<ProviderInstallLayout> {
-    let mut layouts = [
+    let layouts = [
         ("/usr/bin", "/usr/lib/node_modules"),
         ("/usr/local/bin", "/usr/local/lib/node_modules"),
         ("/opt/homebrew/bin", "/opt/homebrew/lib/node_modules"),
@@ -1014,36 +1076,16 @@ fn trusted_provider_install_layouts() -> Vec<ProviderInstallLayout> {
     .map(|(launcher, packages)| ProviderInstallLayout {
         launcher_directory: PathBuf::from(launcher),
         package_root: PathBuf::from(packages),
+        require_protected_ownership: true,
     })
     .collect::<Vec<_>>();
-    if let Some(home) = dirs::home_dir() {
-        layouts.extend([
-            ProviderInstallLayout {
-                launcher_directory: home.join(".bun/bin"),
-                package_root: home.join(".bun/install/global/node_modules"),
-            },
-            ProviderInstallLayout {
-                launcher_directory: home.join(".local/bin"),
-                package_root: home.join(".local/lib/node_modules"),
-            },
-        ]);
-        let nvm_versions = home.join(".nvm/versions/node");
-        if let Ok(entries) = std::fs::read_dir(nvm_versions) {
-            for entry in entries.flatten() {
-                let prefix = entry.path();
-                layouts.push(ProviderInstallLayout {
-                    launcher_directory: prefix.join("bin"),
-                    package_root: prefix.join("lib/node_modules"),
-                });
-            }
-        }
-    }
     layouts
         .into_iter()
         .filter_map(|layout| {
             Some(ProviderInstallLayout {
                 launcher_directory: std::fs::canonicalize(layout.launcher_directory).ok()?,
                 package_root: std::fs::canonicalize(layout.package_root).ok()?,
+                require_protected_ownership: layout.require_protected_ownership,
             })
         })
         .collect()
@@ -1096,6 +1138,7 @@ fn test_provider_install_layout(root: &std::path::Path) -> ProviderInstallLayout
     ProviderInstallLayout {
         launcher_directory: root.join("bin"),
         package_root: root.join("lib/node_modules"),
+        require_protected_ownership: false,
     }
 }
 
@@ -2504,6 +2547,11 @@ mod tests {
         let installed_script = package_bin.join("codex.js");
         let launch_token = launcher_bin.join("codex");
         std::fs::write(&installed_script, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
         symlink(&installed_script, &launch_token).unwrap();
         let expected_identity = provider_file_identity(&installed_script).unwrap();
 
@@ -2581,6 +2629,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn direct_provider_binaries_in_launcher_directories_are_never_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        for harness in [Harness::Codex, Harness::Claude] {
+            let direct = launcher_bin.join(harness.as_provider());
+            std::fs::write(&direct, "#!/bin/sh\nexit 0\n").unwrap();
+            assert!(matches!(
+                test_observe_provider_launch_receipt(&direct, harness, temp.path()),
+                Err(LaunchAttestationError::WrongProvider)
+            ));
+            std::fs::remove_file(direct).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_substituted_package_manifest_cannot_prove_a_provider() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher_bin = temp.path().join("bin");
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        std::fs::create_dir_all(&package_bin).unwrap();
+        let script = package_bin.join("codex.js");
+        let launcher = launcher_bin.join("codex");
+        std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+        symlink(&script, &launcher).unwrap();
+        assert!(matches!(
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        ));
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"attacker/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()),
+            Err(LaunchAttestationError::WrongProvider)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn provider_launcher_swap_after_open_cannot_issue_a_receipt() {
         use std::os::unix::fs::symlink;
 
@@ -2593,6 +2687,11 @@ mod tests {
         let replacement = temp.path().join("replacement.js");
         std::fs::write(&accepted, "#!/usr/bin/env node\n").unwrap();
         std::fs::write(&replacement, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
         let launch_token = launcher_bin.join("codex");
         symlink(&accepted, &launch_token).unwrap();
 

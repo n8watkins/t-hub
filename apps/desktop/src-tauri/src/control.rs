@@ -23960,6 +23960,11 @@ mod tests {
         let provider = package_bin.join("codex.js");
         let launcher = launcher_bin.join("codex");
         std::fs::write(&provider, "provider-v1").unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
         symlink(&provider, &launcher).unwrap();
         let launch = crate::harness::test_observe_provider_launch_receipt(
             &launcher,
