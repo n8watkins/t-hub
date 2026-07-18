@@ -4065,6 +4065,24 @@ impl CaptainsRegistry {
             .cloned()
     }
 
+    fn close_operation_owns_dispatch_release(&self, recovery: &PendingDispatchRelease) -> bool {
+        self.lock()
+            .pending_fleet_operations
+            .iter()
+            .any(|operation| {
+                let PendingFleetOperationPayload::CloseTerminal {
+                    terminal_id,
+                    powder_release: Some(owned),
+                } = &operation.payload
+                else {
+                    return false;
+                };
+                let mut expected = recovery.clone();
+                expected.state = owned.state;
+                terminal_id == &recovery.crew_session_id && owned == &expected
+            })
+    }
+
     fn prepare_commission_operation(
         &self,
         terminal_id: &str,
@@ -16518,6 +16536,23 @@ fn apply_pending_dispatch_release_effect_guarded(
 
 fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
     for recovery in ctx.captains.snapshot().pending_dispatch_releases {
+        if ctx
+            .captains
+            .close_operation_owns_dispatch_release(&recovery)
+        {
+            if let Err(error) = close_terminal_with_policy(
+                ctx,
+                &json!({"sessionId": recovery.crew_session_id, "force": true}),
+                false,
+                None,
+            ) {
+                eprintln!(
+                    "t-hub-control: Fleet-owned terminal close recovery for '{}' remains pending: {error}",
+                    recovery.crew_session_id
+                );
+            }
+            continue;
+        }
         if let Err(error) = recover_pending_dispatch_release(ctx, &recovery) {
             eprintln!(
                 "t-hub-control: trusted dispatch release recovery for '{}' remains pending: {error}",
@@ -28400,6 +28435,81 @@ mod tests {
         assert_ne!(operation_id, recovery_id);
         let powder = server.finish().unwrap();
         assert_eq!(powder.release_posts, 1);
+    }
+
+    #[test]
+    fn periodic_reconcile_finalizes_a_persisted_close_owned_release_atomically() {
+        let server = LoopbackPowderServer::start(3);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let profile_name = format!("close-periodic-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp("close-terminal-periodic-reconcile");
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            &crew_id,
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Periodically recover exact close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let (expected_seq, recovery) =
+            freeze_close_terminal_powder_release(&context, &crew_id).unwrap();
+        let recovery = recovery.unwrap();
+        registry
+            .prepare_close_terminal_operation(&crew_id, expected_seq, Some(recovery.clone()))
+            .unwrap();
+        registry
+            .transition_dispatch_release(
+                &recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )
+            .unwrap();
+        drop(context);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let restart_context =
+            test_ctx(&profile_name).with_captains_registry(Arc::clone(&restarted));
+        reconcile_pending_dispatch_releases(&restart_context);
+
+        let finalized = restarted.snapshot();
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert_eq!(finalized.captains[0].crew.len(), 1);
+        assert!(matches!(
+            finalized.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(finalized.captains[0].crew[0].powder_work.is_none());
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
