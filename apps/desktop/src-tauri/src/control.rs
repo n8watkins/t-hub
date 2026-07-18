@@ -932,10 +932,30 @@ impl TabRegistry {
     ///     its reconciler, so nothing is orphaned).
     /// Returns the closed tab's tile ids.
     fn remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
+        self.validate_remove_tab(tab_id, force)?;
+        let mut g = self.lock();
+        let idx = g
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .ok_or_else(|| format!("close_tab: unknown tabId '{tab_id}'"))?;
+        let removed = g.tabs.remove(idx);
+        let active_valid = g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|id| g.tabs.iter().any(|tab| &tab.id == id));
+        if !active_valid {
+            g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
+        }
+        g.seq += 1;
+        Ok(removed.tile_ids)
+    }
+
+    fn validate_remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
         if tab_id == CAPTAIN_WORKSPACE_ID {
             return Err("close_tab: Captain Workspace cannot be closed".into());
         }
-        let mut g = self.lock();
+        let g = self.lock();
         let Some(idx) = g.tabs.iter().position(|t| t.id == tab_id) else {
             return Err(format!("close_tab: unknown tabId '{tab_id}'"));
         };
@@ -956,19 +976,7 @@ impl TabRegistry {
                 g.tabs[idx].tile_ids.len()
             ));
         }
-        let removed = g.tabs.remove(idx);
-        // Heal the active pointer under the SAME lock as the removal, and against
-        // the post-removal tab set rather than just the removed id - a concurrent
-        // close/focus interleaving must never leave it referencing a deleted tab.
-        let active_valid = g
-            .active_tab_id
-            .as_ref()
-            .is_some_and(|id| g.tabs.iter().any(|t| &t.id == id));
-        if !active_valid {
-            g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
-        }
-        g.seq += 1;
-        Ok(removed.tile_ids)
+        Ok(g.tabs[idx].tile_ids.clone())
     }
 
     /// Mirror the UI's active tab (from `focus_tab` - the one organization command
@@ -16307,10 +16315,14 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         })
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
+    let _identity_transaction = ctx.tabs.identity_transaction();
+    let planned_orphans = ctx.tabs.validate_remove_tab(&tab_id, force)?;
     // Captains must never advertise ownership of a tab that no longer exists
     // (the claim itself survives - a captain can control zero tabs).
-    if ctx.captains.prune_tab(&tab_id)? {
+    let captains_changed = ctx.captains.prune_tab(&tab_id)?;
+    let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
+    debug_assert_eq!(orphaned, planned_orphans);
+    if captains_changed {
         let _ = captains_sync_apply(ctx);
     }
     let mut res =
@@ -16966,6 +16978,7 @@ fn spawn_terminal_with_private_pane_command(
     require_exact_tab: bool,
     forward_projection: bool,
 ) -> Result<Value, String> {
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
     let shell = arg_str(args, "shell");
@@ -22863,6 +22876,52 @@ mod tests {
         assert!(reg.prune_tab("tab-2").unwrap());
         // Zero controlled tabs is a valid claim state.
         assert_eq!(reg.snapshot().captains.len(), 1);
+    }
+
+    #[test]
+    fn close_tab_persistence_failure_preserves_both_registries_and_projection() {
+        let path = captains_tmp("close-tab-transaction");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("close-tab-transaction")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        captains.fail_next_persist("close tab prune persistence failure");
+
+        let error = dispatch(&context, "close_tab", &json!({"tabId": "work-a"})).unwrap_err();
+        assert!(error.contains("close tab prune persistence failure"));
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(
+            serde_json::to_value(tabs.snapshot_full().tabs).unwrap(),
+            serde_json::to_value(before_tabs.tabs).unwrap()
+        );
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+        assert!(sink.calls.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
