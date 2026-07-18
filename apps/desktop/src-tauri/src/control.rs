@@ -1810,27 +1810,31 @@ impl ShipMembership {
     }
 }
 
-fn terminal_requires_captain_workspace(captains: &CaptainsRegistry, terminal_id: &str) -> bool {
-    matches!(
-        captains.ship_of(terminal_id),
-        Some(ShipMembership::Supervisor { .. })
-    )
-}
-
 fn validate_workspace_occupant(
     captains: &CaptainsRegistry,
     terminal_id: &str,
+    workspace_id: &str,
     kind: WorkspaceKind,
 ) -> Result<(), String> {
-    let supervisor = terminal_requires_captain_workspace(captains, terminal_id);
-    match (kind, supervisor) {
-        (WorkspaceKind::Captain, true) | (WorkspaceKind::Work, false) => Ok(()),
-        (WorkspaceKind::Captain, false) => Err(format!(
+    let membership = captains.ship_of(terminal_id);
+    match (kind, membership) {
+        (WorkspaceKind::Captain, Some(ShipMembership::Supervisor { .. })) => Ok(()),
+        (WorkspaceKind::Captain, _) => Err(format!(
             "Workspace placement denied: terminal '{terminal_id}' is not a durable Cortana or Captain identity"
         )),
-        (WorkspaceKind::Work, true) => Err(format!(
+        (WorkspaceKind::Work, Some(ShipMembership::Supervisor { .. })) => Err(format!(
             "Workspace placement denied: Captain terminal '{terminal_id}' belongs to Captain Workspace"
         )),
+        (WorkspaceKind::Work, Some(ShipMembership::Crew { ship_slug })) => {
+            if captains.workspace_is_owned_by_ship(workspace_id, &ship_slug) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Workspace placement denied: Work Workspace '{workspace_id}' is not owned by Crew terminal '{terminal_id}' Captain '{ship_slug}'"
+                ))
+            }
+        }
+        (WorkspaceKind::Work, None) => Ok(()),
     }
 }
 
@@ -1846,7 +1850,7 @@ pub fn validate_workspace_report(
                     "Workspace report assigns terminal '{terminal_id}' more than once"
                 ));
             }
-            validate_workspace_occupant(captains, terminal_id, tab.kind())?;
+            validate_workspace_occupant(captains, terminal_id, &tab.id, tab.kind())?;
         }
     }
     Ok(())
@@ -2649,6 +2653,7 @@ impl CaptainsRegistry {
         let mut ships = std::collections::HashSet::new();
         let mut terminals = std::collections::HashSet::new();
         let mut assignment_ids = std::collections::HashSet::new();
+        let mut workspace_owners = std::collections::HashMap::new();
         let mut cortana_count = 0;
         for captain in &snapshot.captains {
             if captain.ship_slug.trim().is_empty() || !ships.insert(captain.ship_slug.as_str()) {
@@ -2715,6 +2720,22 @@ impl CaptainsRegistry {
                     "ship '{}' has an empty or duplicate workspace tab",
                     captain.ship_slug
                 ));
+            }
+            for workspace_id in &captain.workspace_tab_ids {
+                if workspace_id == CAPTAIN_WORKSPACE_ID {
+                    return Err(format!(
+                        "ship '{}' cannot own Captain Workspace as a Work Workspace",
+                        captain.ship_slug
+                    ));
+                }
+                if let Some(owner) =
+                    workspace_owners.insert(workspace_id.as_str(), captain.ship_slug.as_str())
+                {
+                    return Err(format!(
+                        "Work Workspace '{workspace_id}' is already owned by ship '{owner}' and cannot also be owned by ship '{}'",
+                        captain.ship_slug
+                    ));
+                }
             }
             if let Some(project_id) = captain.project_id.as_deref() {
                 if !project_ids.contains(project_id) {
@@ -3138,6 +3159,16 @@ impl CaptainsRegistry {
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
+    }
+
+    fn workspace_is_owned_by_ship(&self, workspace_id: &str, ship_slug: &str) -> bool {
+        self.lock().captains.iter().any(|captain| {
+            captain.ship_slug == ship_slug
+                && captain
+                    .workspace_tab_ids
+                    .iter()
+                    .any(|owned| owned == workspace_id)
+        })
     }
 
     fn pending_dispatch_claim(
@@ -4656,6 +4687,20 @@ impl CaptainsRegistry {
 
             // Phase 3 (re-acquire `inner`): re-validate then mutate.
             let mut g = self.lock();
+            for workspace_id in &workspace_tab_ids {
+                if let Some(owner) = g.captains.iter().find(|captain| {
+                    captain.terminal_id.as_deref() != Some(terminal_id)
+                        && captain
+                            .workspace_tab_ids
+                            .iter()
+                            .any(|owned| owned == workspace_id)
+                }) {
+                    return Err(format!(
+                        "claim_captain: Work Workspace '{workspace_id}' is already owned by Captain '{}'",
+                        owner.ship_slug
+                    ));
+                }
+            }
             let holder_pos = g
                 .captains
                 .iter()
@@ -14976,6 +15021,7 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .get("baseSeq")
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
+    validate_workspace_report(&tabs, &ctx.captains)?;
     let current_seq = ctx.tabs.snapshot_full().seq;
     let reconciled = if base_seq.is_none_or(|seq| seq == current_seq) {
         ctx.captains.reconcile_crew_workspaces(&mut tabs)?
@@ -16464,7 +16510,7 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 .tabs
                 .kind_for_id(&tab)
                 .ok_or_else(|| format!("move_tile: unknown tabId '{tab}'"))?;
-            validate_workspace_occupant(&ctx.captains, &tile, kind)?;
+            validate_workspace_occupant(&ctx.captains, &tile, &tab, kind)?;
             ctx.tabs.move_tile(&tile, &tab)?;
             organization_sync_apply(
                 ctx,
@@ -21696,6 +21742,158 @@ mod tests {
                 .unwrap_err()
                 .starts_with("workspace_required:")
         );
+    }
+
+    #[test]
+    fn work_workspace_ownership_is_globally_exclusive_sequentially_and_concurrently() {
+        let sequential = CaptainsRegistry::new();
+        sequential
+            .claim_test("captain-a", Some("alpha"), vec!["shared-work".into()])
+            .unwrap();
+        let before = sequential.snapshot();
+        let error = sequential
+            .claim_test("captain-b", Some("beta"), vec!["shared-work".into()])
+            .unwrap_err();
+        assert!(error.contains("already owned"), "got: {error}");
+        assert_eq!(sequential.snapshot().seq, before.seq);
+        assert_eq!(sequential.snapshot().captains, before.captains);
+
+        let concurrent = Arc::new(CaptainsRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let joins = [("captain-a", "alpha"), ("captain-b", "beta")]
+            .into_iter()
+            .map(|(terminal, ship)| {
+                let registry = Arc::clone(&concurrent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.claim_test(terminal, Some(ship), vec!["shared-work".into()])
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let snapshot = concurrent.snapshot();
+        assert_eq!(snapshot.captains.len(), 1);
+        assert_eq!(snapshot.captains[0].workspace_tab_ids, vec!["shared-work"]);
+    }
+
+    #[test]
+    fn schema_load_rejects_duplicate_global_workspace_ownership() {
+        let path = captains_tmp("duplicate-global-workspace-owner");
+        let source = CaptainsRegistry::load(path.clone());
+        source
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        source
+            .claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        let mut invalid = source.snapshot();
+        invalid.captains[1].workspace_tab_ids = vec!["work-a".into()];
+        std::fs::write(&path, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert!(
+            restored.captains.is_empty(),
+            "ambiguous persisted ownership must fail closed instead of selecting an owner"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cross_project_workspace_reports_and_moves_are_rejected_without_effect() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
+            registry
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.into(),
+                    name: name.into(),
+                    repo_root: format!("/tmp/{project_id}"),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        registry
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry
+            .claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        registry
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        registry
+            .bind_ship_context("beta", "project-b", "Assignment B", "codex")
+            .unwrap();
+        registry.record_crew("captain-b", "crew-b").unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: vec!["crew-b".into()],
+            },
+        ]);
+        let ctx = test_ctx("cross-project-workspace")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_tab_registry(Arc::clone(&tabs));
+        let before_tabs = tabs.snapshot_full();
+        let before_captains = registry.snapshot();
+
+        let report_error = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": before_tabs.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["crew-b"]},
+                    {"id": "work-b", "name": "Work B", "tileIds": []},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a", "captain-b"]}
+                ]
+            }),
+        )
+        .unwrap_err();
+        assert!(report_error.contains("not owned"), "got: {report_error}");
+        let after_report_tabs = tabs.snapshot_full();
+        assert_eq!(after_report_tabs.seq, before_tabs.seq);
+        assert_eq!(after_report_tabs.active_tab_id, before_tabs.active_tab_id);
+        assert_eq!(
+            serde_json::to_value(after_report_tabs.tabs).unwrap(),
+            serde_json::to_value(&before_tabs.tabs).unwrap()
+        );
+        assert_eq!(registry.snapshot().seq, before_captains.seq);
+        assert_eq!(registry.snapshot().captains, before_captains.captains);
+
+        let move_error = dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": "crew-b", "tabId": "work-a"}),
+        )
+        .unwrap_err();
+        assert!(move_error.contains("not owned"), "got: {move_error}");
+        let after_move_tabs = tabs.snapshot_full();
+        assert_eq!(after_move_tabs.seq, before_tabs.seq);
+        assert_eq!(after_move_tabs.active_tab_id, before_tabs.active_tab_id);
+        assert_eq!(
+            serde_json::to_value(after_move_tabs.tabs).unwrap(),
+            serde_json::to_value(&before_tabs.tabs).unwrap()
+        );
+        assert_eq!(registry.snapshot().seq, before_captains.seq);
     }
 
     #[test]
