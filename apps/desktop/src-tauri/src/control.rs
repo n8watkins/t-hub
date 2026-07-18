@@ -3950,6 +3950,7 @@ impl CaptainsRegistry {
     fn prepare_close_terminal_operation(
         &self,
         terminal_id: &str,
+        frozen_powder_release: Option<PendingDispatchRelease>,
     ) -> Result<PendingFleetOperation, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
@@ -3965,6 +3966,66 @@ impl CaptainsRegistry {
             return Ok(existing.clone());
         }
         let previous = current.clone();
+        let powder_release = match frozen_powder_release {
+            Some(recovery) => {
+                if recovery.crew_session_id != terminal_id
+                    || recovery.state != PendingDispatchReleaseState::Prepared
+                {
+                    return Err(
+                        "terminal close Powder recovery does not match the prepared terminal"
+                            .into(),
+                    );
+                }
+                if let Some(existing) = current
+                    .pending_dispatch_releases
+                    .iter()
+                    .find(|existing| existing.crew_session_id == terminal_id)
+                {
+                    if existing != &recovery {
+                        return Err(format!(
+                            "Crew session '{terminal_id}' already has a different frozen Powder cleanup scope"
+                        ));
+                    }
+                    Some(existing.clone())
+                } else {
+                    let crew = current
+                        .captains
+                        .iter_mut()
+                        .filter(|captain| {
+                            captain.project_id.as_deref() == Some(recovery.project_id.as_str())
+                        })
+                        .flat_map(|captain| captain.crew.iter_mut())
+                        .find(|crew| crew.terminal_id == terminal_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "terminal close refused because Crew session '{terminal_id}' is no longer in the frozen Project"
+                            )
+                        })?;
+                    let work = crew.powder_work.as_mut().ok_or_else(|| {
+                        format!(
+                            "terminal close refused because Crew session '{terminal_id}' lost its Powder binding"
+                        )
+                    })?;
+                    if work.card_id != recovery.card_id
+                        || work.run_id != recovery.run_id
+                        || work.agent.as_deref() != Some(recovery.agent.as_str())
+                    {
+                        return Err(format!(
+                            "terminal close refused because Crew session '{terminal_id}' no longer owns the frozen Powder claim"
+                        ));
+                    }
+                    crew.state = CrewState::CleanupPending { since: now_ms() };
+                    work.dispatch_release_recovery = true;
+                    current.pending_dispatch_releases.push(recovery.clone());
+                    Some(recovery)
+                }
+            }
+            None => current
+                .pending_dispatch_releases
+                .iter()
+                .find(|release| release.crew_session_id == terminal_id)
+                .cloned(),
+        };
         let operation = PendingFleetOperation {
             operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
             expected_seq: current.seq,
@@ -3972,17 +4033,29 @@ impl CaptainsRegistry {
             created_at: now_ms(),
             payload: PendingFleetOperationPayload::CloseTerminal {
                 terminal_id: terminal_id.to_string(),
-                powder_release: current
-                    .pending_dispatch_releases
-                    .iter()
-                    .find(|release| release.crew_session_id == terminal_id)
-                    .cloned(),
+                powder_release,
             },
         };
         current.pending_fleet_operations.push(operation.clone());
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
         Ok(operation)
+    }
+
+    fn pending_close_terminal_operation(&self, terminal_id: &str) -> Option<PendingFleetOperation> {
+        self.lock()
+            .pending_fleet_operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    &operation.payload,
+                    PendingFleetOperationPayload::CloseTerminal {
+                        terminal_id: pending_terminal,
+                        ..
+                    } if pending_terminal == terminal_id
+                )
+            })
+            .cloned()
     }
 
     fn prepare_commission_operation(
@@ -19011,6 +19084,62 @@ fn retain_crew_binding_after_powder_failure(
             .is_some_and(|release| release.get("released").and_then(Value::as_bool) != Some(true))
 }
 
+fn freeze_close_terminal_powder_release(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+) -> Result<Option<PendingDispatchRelease>, String> {
+    let snapshot = ctx.captains.snapshot();
+    let matching_crew = snapshot
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .filter(|crew| crew.terminal_id == crew_session_id)
+        .collect::<Vec<_>>();
+    let crew = match matching_crew.as_slice() {
+        [] => return Ok(None),
+        [crew] => *crew,
+        _ => {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+            ));
+        }
+    };
+    let Some(work) = crew.powder_work.as_ref() else {
+        return Ok(None);
+    };
+    match work.state {
+        PowderWorkState::Completed { .. } => return Ok(None),
+        PowderWorkState::CompletionPending { .. } => {
+            return Err(retryable_error(format!(
+                "Crew session '{crew_session_id}' has Powder completion pending; close must wait for exact same-proof recovery"
+            )));
+        }
+        PowderWorkState::Active => {}
+    }
+    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+    let agent = scope.work.agent.clone().ok_or_else(|| {
+        format!("Crew session '{crew_session_id}' Powder binding has no exact agent identity")
+    })?;
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
+        format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
+    })?;
+    Ok(Some(PendingDispatchRelease {
+        crew_session_id: crew_session_id.to_string(),
+        project_id: scope.project_id,
+        connection_profile: scope.binding.connection_profile,
+        connection_endpoint_identity,
+        repository: scope.binding.repository,
+        card_id: scope.work.card_id,
+        run_id: scope.work.run_id,
+        agent,
+        operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+        created_at: now_ms(),
+        state: PendingDispatchReleaseState::Prepared,
+    }))
+}
+
 fn close_terminal_with_policy(
     ctx: &ControlContext,
     args: &Value,
@@ -19033,7 +19162,57 @@ fn close_terminal_with_policy(
     if let Some(authority) = authority {
         revalidate_target_lifecycle_authority(ctx, authority)?;
     }
-    let fleet_operation = ctx.captains.prepare_close_terminal_operation(tile_id)?;
+    // Probe and choose the requested effect before preparing durable state.
+    // A refused close therefore leaves no cleanup intent for startup recovery
+    // to misinterpret as authority to force-reap the terminal.
+    let initial = tmux::session_liveness(&target);
+    let reprobe = if force && matches!(initial, tmux::SessionLiveness::Unknown) {
+        Some(tmux::session_liveness(&target))
+    } else {
+        None
+    };
+    let (existed, forced) = match plan_close(force, initial, reprobe) {
+        ClosePlan::Kill { existed, forced } => (existed, forced),
+        ClosePlan::RetryableTimeout => {
+            return Err(retryable_error(format!(
+                "close_terminal: liveness probe for '{session_id}' (target {target}) timed out; \
+                 session NOT confirmed gone — retry once the control plane recovers, or pass \
+                 force:true to reap a session you know is dead (refusing an unverifiable tree-kill)"
+            )));
+        }
+        ClosePlan::RefuseForceOnLive => {
+            return Err(format!(
+                "close_terminal: force refused — a re-probe shows session '{session_id}' (target \
+                 {target}) is LIVE; the earlier probe was merely slow, not dead. Retry a normal \
+                 close_terminal (no force) to reap it."
+            ));
+        }
+    };
+    let completed_powder_release = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .find(|crew| crew.terminal_id == tile_id)
+        .and_then(|crew| crew.powder_work.as_ref())
+        .filter(|work| matches!(work.state, PowderWorkState::Completed { .. }))
+        .map(|work| {
+            json!({
+                "released": true,
+                "outcome": "already_completed",
+                "cardId": work.card_id,
+                "runId": work.run_id,
+            })
+        });
+    let fleet_operation = match ctx.captains.pending_close_terminal_operation(tile_id) {
+        Some(operation) => operation,
+        None => {
+            let powder_release = freeze_close_terminal_powder_release(ctx, tile_id)?;
+            ctx.captains
+                .prepare_close_terminal_operation(tile_id, powder_release)?
+        }
+    };
     #[cfg(test)]
     ctx.captains.pause_dispatch("close_terminal_effect");
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
@@ -19051,93 +19230,52 @@ fn close_terminal_with_policy(
     // but-slow session's re-probe is also `Unknown` - indistinguishable from dead - so
     // force reaps it too; force is a deliberate reap-during-wedge override, not a
     // never-touch-a-live-session guarantee. See `plan_close`.
-    let initial = tmux::session_liveness(&target);
-    let reprobe = if force && matches!(initial, tmux::SessionLiveness::Unknown) {
-        Some(tmux::session_liveness(&target))
-    } else {
-        None
-    };
-    let (existed, forced) = match plan_close(force, initial, reprobe) {
-        ClosePlan::Kill { existed, forced } => (existed, forced),
-        ClosePlan::RetryableTimeout => {
-            ctx.captains
-                .abort_close_terminal_operation(&fleet_operation.operation_id)?;
-            return Err(retryable_error(format!(
-                "close_terminal: liveness probe for '{session_id}' (target {target}) timed out; \
-                 session NOT confirmed gone — retry once the control plane recovers, or pass \
-                 force:true to reap a session you know is dead (refusing an unverifiable tree-kill)"
-            )));
-        }
-        ClosePlan::RefuseForceOnLive => {
-            ctx.captains
-                .abort_close_terminal_operation(&fleet_operation.operation_id)?;
-            return Err(format!(
-                "close_terminal: force refused — a re-probe shows session '{session_id}' (target \
-                 {target}) is LIVE; the earlier probe was merely slow, not dead. Retry a normal \
-                 close_terminal (no force) to reap it."
-            ));
-        }
-    };
     if let Err(error) = tmux::kill_session_tree(&target) {
-        ctx.captains
-            .abort_close_terminal_operation(&fleet_operation.operation_id)?;
-        return Err(format!("failed to close terminal '{session_id}': {error}"));
+        return Err(retryable_error(format!(
+            "failed to close terminal '{session_id}': {error}; durable close recovery remains prepared"
+        )));
     }
     // The terminal is now definitely stopped. Release any Crew claim after the
     // kill so a failed kill can never leave a live worker without its lease.
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
-    let (cleanup_was_pending, completion_recovery_required, has_powder_binding, is_removed) = ctx
-        .captains
-        .snapshot()
-        .captains
-        .iter()
-        .flat_map(|captain| captain.crew.iter())
-        .find(|crew| crew.terminal_id == tile_id)
-        .map(|crew| {
-            (
-                matches!(crew.state, CrewState::CleanupPending { .. })
-                    && crew.powder_work.is_some(),
-                crew.powder_work.as_ref().is_some_and(|work| {
-                    matches!(work.state, PowderWorkState::CompletionPending { .. })
+    let frozen_powder_release = match &fleet_operation.payload {
+        PendingFleetOperationPayload::CloseTerminal { powder_release, .. } => {
+            powder_release.clone()
+        }
+        _ => None,
+    };
+    let powder_release = match frozen_powder_release.as_ref() {
+        Some(recovery) => Some(
+            match recover_pending_dispatch_release_guarded(ctx, recovery) {
+                Ok(()) => json!({
+                    "released": true,
+                    "outcome": "released",
+                    "projectId": recovery.project_id,
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
                 }),
-                crew.powder_work.is_some(),
-                matches!(crew.state, CrewState::Removed { .. }),
-            )
-        })
-        .unwrap_or((false, false, false, false));
-    if is_removed && has_powder_binding {
-        ctx.captains
-            .abort_close_terminal_operation(&fleet_operation.operation_id)?;
-        return Err(format!(
-            "Crew session '{tile_id}' is historically Removed; ordinary live Powder cleanup is refused"
-        ));
-    }
-    let powder_release = release_crew_powder_binding_guarded(ctx, tile_id);
-    let crew_binding_retained = retain_crew_binding_after_powder_failure(
-        preserve_crew_on_powder_failure,
-        cleanup_was_pending,
-        completion_recovery_required,
-        has_powder_binding,
-        powder_release.as_ref(),
-    );
-    let released_binding = powder_release.as_ref().and_then(|release| {
-        matches!(
-            release.get("outcome").and_then(Value::as_str),
-            Some("released" | "already_released")
-        )
-        .then(|| {
-            (
-                release.get("cardId").and_then(Value::as_str),
-                release.get("runId").and_then(Value::as_str),
-            )
-        })
-        .and_then(|(card_id, run_id)| Some((card_id?, run_id?)))
-    });
+                Err(error) => json!({
+                    "released": false,
+                    "outcome": "recovery_pending",
+                    "projectId": recovery.project_id,
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
+                    "error": error,
+                }),
+            },
+        ),
+        None => completed_powder_release,
+    };
+    let crew_binding_retained = frozen_powder_release.is_some()
+        && (preserve_crew_on_powder_failure
+            || powder_release.as_ref().is_some_and(|release| {
+                release.get("released").and_then(Value::as_bool) != Some(true)
+            }));
     let committed = ctx.captains.commit_close_terminal_operation(
         &fleet_operation,
         crew_binding_retained,
-        released_binding,
+        None,
     )?;
     let outcome = if forced {
         "force_reaped"
@@ -26778,7 +26916,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_close_retains_cleanup_pending_crew_when_powder_release_fails() {
+    fn close_terminal_refuses_before_tmux_when_powder_scope_cannot_be_frozen() {
         if !std::process::Command::new("tmux")
             .arg("-V")
             .output()
@@ -26844,28 +26982,20 @@ mod tests {
             .unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
-        let closed =
-            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None).unwrap();
+        let before = registry.snapshot();
+        let error = close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None)
+            .unwrap_err();
 
-        assert_eq!(closed["powderRelease"]["released"], false);
-        assert_eq!(closed["crewBindingRetained"], true);
-        let snapshot = registry.snapshot();
-        let crew = &snapshot.captains[0].crew[0];
-        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
-        assert!(crew.powder_work.is_some());
-        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
-
-        let retried = close_terminal(&ctx, &json!({ "sessionId": crew_id })).unwrap();
-        assert_eq!(retried["outcome"], "already_gone");
-        assert_eq!(retried["powderRelease"]["released"], false);
-        assert_eq!(retried["crewBindingRetained"], true);
-        let retried_snapshot = registry.snapshot();
-        let retried_crew = &retried_snapshot.captains[0].crew[0];
-        assert!(matches!(
-            retried_crew.state,
-            CrewState::CleanupPending { .. }
-        ));
-        assert!(retried_crew.powder_work.is_some());
+        assert!(error.contains("exact agent identity"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
     }
 
     #[test]
@@ -27905,7 +28035,9 @@ mod tests {
             .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
             .unwrap();
         registry.record_crew("cap-1", "crew-1").unwrap();
-        let prepared = registry.prepare_close_terminal_operation("crew-1").unwrap();
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-1", None)
+            .unwrap();
         assert_eq!(prepared.phase, PendingFleetOperationPhase::Prepared);
         drop(registry);
 
@@ -27936,6 +28068,77 @@ mod tests {
                 .all(|tile| tile != "crew-1")
         }));
 
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_terminal_close_freezes_exact_powder_scope_in_the_durable_intent() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("frozen-close-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp("close-terminal-frozen-powder");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            "crew-powder",
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                "crew-powder",
+                "Implement Powder lifecycle",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let recovery = freeze_close_terminal_powder_release(&context, "crew-powder")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.connection_profile, profile_name);
+        assert_eq!(recovery.project_id, "project-powder-lifecycle");
+        assert_eq!(recovery.repository, "t-hub");
+        assert_eq!(recovery.agent, "t-hub");
+        assert!(recovery
+            .connection_endpoint_identity
+            .starts_with("hmac-sha256:"));
+
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", Some(recovery.clone()))
+            .unwrap();
+        drop(registry);
+
+        let restarted = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            restarted.snapshot().pending_dispatch_releases,
+            vec![recovery.clone()]
+        );
+        assert!(matches!(
+            &prepared.payload,
+            PendingFleetOperationPayload::CloseTerminal {
+                powder_release: Some(frozen),
+                ..
+            } if frozen == &recovery
+        ));
+        let crew = &restarted.snapshot().captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+        assert!(crew
+            .powder_work
+            .as_ref()
+            .is_some_and(|work| work.dispatch_release_recovery));
+
+        server.finish().unwrap();
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
     }
