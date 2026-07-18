@@ -13945,6 +13945,12 @@ fn recover_pending_dispatch_release_guarded(
     if repository.get("name").and_then(Value::as_str) != Some(recovery.repository.as_str()) {
         return Err("the frozen repository identity changed before release recovery".into());
     }
+    let card = client
+        .card_evidence(&recovery.card_id)
+        .map_err(|error| format!("the frozen card cannot be reconciled: {error}"))?;
+    if card.repository.as_deref() != Some(recovery.repository.as_str()) {
+        return Err("the frozen card repository changed before release recovery".into());
+    }
     let evidence = client
         .run_evidence(&recovery.run_id)
         .map_err(|error| format!("the exact release cannot be reconciled: {error}"))?;
@@ -13955,6 +13961,11 @@ fn recover_pending_dispatch_release_guarded(
         return Err("the authoritative run identity changed before release recovery".into());
     }
     if evidence.run.state == "released" {
+        if card.status != "ready" || card.claim.is_some() {
+            return Err(
+                "the released run does not have an exact ready card with no current claim".into(),
+            );
+        }
         ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
         return clear_confirmed_dispatch_release_and_retire(ctx, recovery);
     }
@@ -13963,6 +13974,13 @@ fn recover_pending_dispatch_release_guarded(
             "the authoritative run is '{}' rather than active or released",
             evidence.run.state
         ));
+    }
+    if !card
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.run_id == recovery.run_id && claim.agent == recovery.agent)
+    {
+        return Err("the active card claim no longer matches the exact release ownership".into());
     }
     ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
     if recovery.state == PendingDispatchReleaseState::Prepared {
@@ -27747,7 +27765,9 @@ mod tests {
             Some("replacement-captain")
         );
         assert!(replacement.crew.is_empty());
-        assert!(registry.snapshot().pending_dispatch_claims.is_empty());
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 0);
         assert_eq!(state.release_posts, 0);
@@ -27852,6 +27872,7 @@ mod tests {
             "replacement-powder-profile"
         );
         assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
@@ -28196,6 +28217,7 @@ mod tests {
         );
         assert!(replacement.crew.is_empty());
         assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
@@ -28315,6 +28337,7 @@ mod tests {
             "replacement-powder-profile"
         );
         assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
@@ -28389,6 +28412,7 @@ mod tests {
         let snapshot = registry.snapshot();
         assert!(snapshot.captains[0].crew.is_empty());
         assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
@@ -28414,7 +28438,7 @@ mod tests {
             );
             return;
         }
-        let server = LoopbackPowderServer::start(if remap_frozen_profile { 4 } else { 6 });
+        let server = LoopbackPowderServer::start(if remap_frozen_profile { 4 } else { 7 });
         server.state.lock().unwrap().release_response_failure =
             Some(LoopbackPowderResponseFailure::Eof);
         let replacement_server = LoopbackPowderServer::start(0);
@@ -28608,6 +28632,10 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.card_evidence_gets,
+            1 + usize::from(!remap_frozen_profile)
+        );
         assert_eq!(state.run_evidence_gets, usize::from(!remap_frozen_profile));
         assert_eq!(
             state.release_paths,
@@ -28851,11 +28879,12 @@ mod tests {
         // The original scope loses the response after committing the exact
         // release.  The first periodic reconcile is held at canonical run
         // evidence while ordinary cleanup queues behind the same Crew guard.
-        let original = LoopbackPowderServer::start(5);
+        let original = LoopbackPowderServer::start(7);
         {
             let mut state = original.state.lock().unwrap();
             state.pause_run_evidence = true;
             state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+            state.evidence_claim_agent = Some("t-hub".into());
             state.evidence_run_agent = Some("t-hub".into());
         }
         let replacement = LoopbackPowderServer::start(0);
@@ -28963,6 +28992,7 @@ mod tests {
             replacement_profile
         );
         let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 2);
         assert_eq!(original_state.run_evidence_gets, 2);
         assert_eq!(original_state.release_posts, 1);
         assert_eq!(
@@ -28984,7 +29014,7 @@ mod tests {
             );
             return;
         }
-        let original = LoopbackPowderServer::start(6);
+        let original = LoopbackPowderServer::start(7);
         let replacement = LoopbackPowderServer::start(0);
         let original_profile = format!(
             "release-inflight-original-{}",
@@ -29109,6 +29139,7 @@ mod tests {
         assert!(!provider.was_invoked());
         let original_state = original.finish().unwrap();
         assert_eq!(original_state.claim_posts, 1);
+        assert_eq!(original_state.card_evidence_gets, 2);
         assert_eq!(original_state.run_evidence_gets, 1);
         assert_eq!(original_state.release_posts, 1);
         assert_eq!(
@@ -29123,8 +29154,14 @@ mod tests {
     }
 
     #[test]
-    fn prepared_post_bind_release_survives_restart_without_a_release_post() {
-        let original = LoopbackPowderServer::start(0);
+    fn prepared_post_bind_release_resumes_from_original_scope_after_terminal_teardown() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "prepared_post_bind_release_resumes_from_original_scope_after_terminal_teardown: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(4);
         let replacement = LoopbackPowderServer::start(0);
         let original_profile = format!(
             "prepared-release-original-{}",
@@ -29138,26 +29175,50 @@ mod tests {
             (&original_profile, original.addr),
             (&replacement_profile, replacement.addr),
         ]);
+        {
+            let mut state = original.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
         let path = captains_tmp("prepared-release-restart");
         let _ = std::fs::remove_file(&path);
-        let registry = powder_lifecycle_registry_with_profile_and_crew(
-            Some(path.clone()),
-            &original_profile,
-            "prepared-release-crew",
-        );
-        let work = registry.snapshot().captains[0].crew[0]
-            .powder_work
-            .clone()
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let crew_session_id = format!("prepared-release-{}", uuid::Uuid::new_v4().simple());
+        create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        registry
+            .record_crew(&captain.session_id, &crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                &captain.session_id,
+                &crew_session_id,
+                "Recover Prepared exact release",
+                "codex",
+                Some("/tmp/prepared-release"),
+                Some("prepared-release"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
             .unwrap();
         let recovery = PendingDispatchRelease {
-            crew_session_id: "prepared-release-crew".into(),
-            project_id: "project-powder-lifecycle".into(),
+            crew_session_id: crew_session_id.clone(),
+            project_id: "project-dispatch-attestation".into(),
             connection_profile: original_profile.clone(),
             connection_endpoint: format!("http://{}", original.addr),
             repository: "t-hub".into(),
-            card_id: work.card_id,
-            run_id: work.run_id,
-            agent: work.agent.unwrap(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
             operation_id: "initial-claim:actor-t-hub:prepared-release".into(),
             created_at: 1,
             state: PendingDispatchReleaseState::Prepared,
@@ -29175,7 +29236,11 @@ mod tests {
         assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
         assert_eq!(
             snapshot.pending_dispatch_releases[0].state,
-            PendingDispatchReleaseState::Prepared
+            PendingDispatchReleaseState::InFlight,
+        );
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
         );
         assert!(matches!(
             snapshot.captains[0].crew[0].state,
@@ -29196,10 +29261,139 @@ mod tests {
                 .connection_profile,
             replacement_profile
         );
-        assert_eq!(original.finish().unwrap().release_posts, 0);
-        assert_eq!(replacement.finish().unwrap().release_posts, 0);
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.card_evidence_gets, 1);
+        assert_eq!(original_state.run_evidence_gets, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.card_evidence_gets, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_rejects_reclaimed_different_unknown_and_malformed_card_state() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_recovery_rejects_reclaimed_different_unknown_and_malformed_card_state: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        for (case, expected_requests) in [
+            ("reclaimed", 3usize),
+            ("different-claim", 3),
+            ("unknown-run", 3),
+            ("malformed-card", 2),
+        ] {
+            let original = LoopbackPowderServer::start(expected_requests);
+            let replacement = LoopbackPowderServer::start(0);
+            {
+                let mut state = original.state.lock().unwrap();
+                state.evidence_claim_agent = Some("t-hub".into());
+                state.evidence_run_agent = Some("t-hub".into());
+                match case {
+                    "reclaimed" => {
+                        state.force_claim = true;
+                        state.evidence_run_id = Some("run-reclaimed".into());
+                    }
+                    "different-claim" => state.evidence_claim_agent = Some("other-agent".into()),
+                    "unknown-run" => state.completed = true,
+                    "malformed-card" => state.malformed_card_evidence = true,
+                    _ => unreachable!(),
+                }
+            }
+            let original_profile = format!(
+                "release-card-state-original-{case}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let replacement_profile = format!(
+                "release-card-state-replacement-{case}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profiles = PowderProfileEnv::install_profiles(&[
+                (&original_profile, original.addr),
+                (&replacement_profile, replacement.addr),
+            ]);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let crew_session_id = format!("release-card-state-{}", uuid::Uuid::new_v4().simple());
+            let registry = dispatch_test_registry(None, &original_profile, &captain.session_id);
+            registry
+                .record_crew(&captain.session_id, &crew_session_id)
+                .unwrap();
+            registry
+                .bind_crew_context(
+                    &captain.session_id,
+                    &crew_session_id,
+                    "Reject changed current card state",
+                    "codex",
+                    Some("/tmp/release-card-state"),
+                    Some("release-card-state"),
+                    PowderWorkBinding {
+                        card_id: "thub-powder-control-lifecycle".into(),
+                        run_id: "run-authoritative".into(),
+                        agent: Some("t-hub".into()),
+                        claim_expires_at: Some(100),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                )
+                .unwrap();
+            let recovery = PendingDispatchRelease {
+                crew_session_id,
+                project_id: "project-dispatch-attestation".into(),
+                connection_profile: original_profile.clone(),
+                connection_endpoint: format!("http://{}", original.addr),
+                repository: "t-hub".into(),
+                card_id: "thub-powder-control-lifecycle".into(),
+                run_id: "run-authoritative".into(),
+                agent: "t-hub".into(),
+                operation_id: format!("initial-claim:actor-t-hub:release-card-state:{case}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::InFlight,
+            };
+            registry.prepare_dispatch_release(recovery.clone()).unwrap();
+            let mut rebound = registry.projects()[0].clone();
+            rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+            rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+            registry.upsert_project(rebound).unwrap();
+            let (ctx, _) = dispatch_test_context(registry.clone());
+            reconcile_powder_leases(&ctx);
+            let snapshot = registry.snapshot();
+            assert_eq!(
+                snapshot.pending_dispatch_releases,
+                vec![recovery],
+                "{case} must retain the exact frozen recovery"
+            );
+            assert!(snapshot.pending_dispatch_claims.is_empty());
+            assert!(matches!(
+                snapshot.captains[0].crew[0].state,
+                CrewState::CleanupPending { .. }
+            ));
+            assert_eq!(
+                snapshot.projects[0]
+                    .powder
+                    .as_ref()
+                    .unwrap()
+                    .connection_profile,
+                replacement_profile
+            );
+            let original_state = original.finish().unwrap();
+            assert_eq!(
+                original_state.release_posts, 0,
+                "{case} issued a release POST"
+            );
+            let replacement_state = replacement.finish().unwrap();
+            assert_eq!(replacement_state.card_evidence_gets, 0);
+            assert_eq!(replacement_state.run_evidence_gets, 0);
+            assert_eq!(replacement_state.release_posts, 0);
+        }
     }
 
     #[test]
