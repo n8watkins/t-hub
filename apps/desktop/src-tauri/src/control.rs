@@ -1492,10 +1492,20 @@ fn cortana_installed_runtime_evidence_id(
 }
 
 fn cortana_ensure_request_digest(intent: &CortanaEnsureIntent) -> Result<String, String> {
+    let request = serde_json::to_value(&intent.request)
+        .map_err(|error| format!("Cortana ensure request could not be canonicalized: {error}"))?;
+    cortana_ensure_request_digest_parts(intent.schema_version, &intent.operation_id, &request)
+}
+
+fn cortana_ensure_request_digest_parts(
+    schema_version: u32,
+    operation_id: &str,
+    request: &Value,
+) -> Result<String, String> {
     let canonical = serde_json::to_vec(&json!({
-        "operationId": intent.operation_id,
-        "request": intent.request,
-        "schemaVersion": intent.schema_version,
+        "operationId": operation_id,
+        "request": request,
+        "schemaVersion": schema_version,
     }))
     .map_err(|error| format!("Cortana ensure request could not be canonicalized: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(canonical)))
@@ -2433,17 +2443,14 @@ fn migrate_cortana_runtime_v2_document(document: &mut Value) -> Result<(), Strin
         let runtime = runtime
             .as_object_mut()
             .ok_or("schema-18 Cortana runtime is not an object")?;
-        match runtime.get("schemaVersion").and_then(Value::as_u64) {
-            Some(2) => {
-                runtime.insert("schemaVersion".to_string(), Value::from(3));
-            }
-            Some(3) => continue,
-            _ => return Err("schema-18 Cortana runtime has an unsupported nested version".into()),
+        if runtime.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
+            return Err("schema-18 Cortana runtime has an unsupported nested version".into());
         }
         let Some(intent) = runtime
             .get_mut("ensureIntent")
             .filter(|intent| !intent.is_null())
         else {
+            runtime.insert("schemaVersion".to_string(), Value::from(3));
             continue;
         };
         let intent = intent
@@ -2452,7 +2459,24 @@ fn migrate_cortana_runtime_v2_document(document: &mut Value) -> Result<(), Strin
         if intent.get("schemaVersion").and_then(Value::as_u64) != Some(2) {
             return Err("schema-18 Cortana ensure intent has an unsupported version".into());
         }
+        let operation_id = intent
+            .get("operationId")
+            .and_then(Value::as_str)
+            .ok_or("schema-18 Cortana ensure intent lacks operationId")?;
+        let request = intent
+            .get("request")
+            .ok_or("schema-18 Cortana ensure intent lacks request")?;
+        let stored_digest = intent
+            .get("requestDigest")
+            .and_then(Value::as_str)
+            .ok_or("schema-18 Cortana ensure intent lacks requestDigest")?;
+        let v2_digest = cortana_ensure_request_digest_parts(2, operation_id, request)?;
+        if stored_digest != v2_digest {
+            return Err("schema-18 Cortana ensure request digest does not match schema 2".into());
+        }
+        let v3_digest = cortana_ensure_request_digest_parts(3, operation_id, request)?;
         intent.insert("schemaVersion".to_string(), Value::from(3));
+        intent.insert("requestDigest".to_string(), Value::from(v3_digest));
         if let Some(candidate) = intent
             .get_mut("candidate")
             .filter(|candidate| !candidate.is_null())
@@ -2467,6 +2491,7 @@ fn migrate_cortana_runtime_v2_document(document: &mut Value) -> Result<(), Strin
                 .ok_or("schema-18 Cortana candidate lacks spawnedAt")?;
             candidate.insert("reservedAt".to_string(), Value::from(spawned_at));
         }
+        runtime.insert("schemaVersion".to_string(), Value::from(3));
     }
     Ok(())
 }
@@ -4227,6 +4252,17 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
+        let has_schema_18_cortana_recovery = schema_version == 18
+            && document
+                .get("captains")
+                .and_then(Value::as_array)
+                .is_some_and(|captains| {
+                    captains.iter().any(|captain| {
+                        captain
+                            .get("cortanaRuntime")
+                            .is_some_and(|runtime| !runtime.is_null())
+                    })
+                });
         if schema_version == 18 {
             migrate_cortana_runtime_v2_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
@@ -4258,7 +4294,7 @@ impl CaptainsRegistry {
             });
         }
         let snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
-            if has_release_recovery {
+            if has_release_recovery || has_schema_18_cortana_recovery {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -4272,8 +4308,17 @@ impl CaptainsRegistry {
                 version: snapshot.schema_version,
             });
         }
+        if has_schema_18_cortana_recovery {
+            let mut migrated = snapshot.clone();
+            migrated.schema_version = CAPTAINS_SCHEMA_VERSION;
+            Self::validate_snapshot(&migrated).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
         Self::validate_snapshot(&snapshot).map_err(|error| {
-            if has_release_recovery {
+            if has_release_recovery || has_schema_18_cortana_recovery {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -6649,6 +6694,16 @@ impl CaptainsRegistry {
             .ok_or("Cortana ensure intent is missing")?;
         if intent.operation_id != operation_id || intent.request_digest != request_digest {
             return Err("Cortana candidate failure does not match the immutable request".into());
+        }
+        if (!cleanup_confirmed_gone
+            && intent.phase == CortanaEnsurePhase::CleanupPending
+            && runtime.guidance.as_deref() == Some(guidance))
+            || (cleanup_confirmed_gone
+                && intent.phase == CortanaEnsurePhase::Failed
+                && intent.candidate.is_none()
+                && runtime.guidance.as_deref() == Some(guidance))
+        {
+            return Ok(captain.clone());
         }
         if !matches!(
             intent.phase,
@@ -21772,6 +21827,72 @@ mod tests {
         registry
     }
 
+    fn cortana_committed_intent_fixture() -> CaptainRecord {
+        let mut captain = cortana_ready_fixture();
+        let runtime = captain.cortana_runtime.as_mut().unwrap();
+        let attestation = runtime.runtime_attestation.clone().unwrap();
+        let candidate = CortanaCandidateRuntimeEvidence {
+            terminal_id: captain.terminal_id.clone().unwrap(),
+            tmux_session_id: format!("th_{}", captain.terminal_id.as_deref().unwrap()),
+            control_identity_id: attestation.control_identity_id.clone(),
+            session_identity_generation: attestation.session_identity_generation,
+            authority_generation: attestation.authority_generation,
+            reserved_at: 74,
+            spawned_at: Some(75),
+            runtime_attestation: Some(attestation),
+        };
+        runtime.ensure_intent = Some(CortanaEnsureIntent {
+            schema_version: CORTANA_RUNTIME_SCHEMA_VERSION,
+            operation_id: "ensure-schema-18-runtime-2".into(),
+            request_digest: "a".repeat(64),
+            request: CortanaEnsureRequestPayload {
+                expected_identity_id: CORTANA_IDENTITY_ID.into(),
+                expected_generation: 0,
+                incumbent_terminal_id: None,
+                desired_runtime: runtime.policy.clone().unwrap(),
+            },
+            phase: CortanaEnsurePhase::Committed,
+            candidate: Some(candidate),
+            created_at: 70,
+            updated_at: 100,
+        });
+        let intent = runtime.ensure_intent.as_mut().unwrap();
+        intent.request_digest = cortana_ensure_request_digest(intent).unwrap();
+        captain
+    }
+
+    fn schema_18_runtime_2_document(captain: CaptainRecord) -> Value {
+        let mut document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 18,
+            seq: 18,
+            captains: vec![captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let runtime = document["captains"][0]["cortanaRuntime"]
+            .as_object_mut()
+            .unwrap();
+        runtime.insert("schemaVersion".into(), Value::from(2));
+        let intent = runtime["ensureIntent"].as_object_mut().unwrap();
+        intent.insert("schemaVersion".into(), Value::from(2));
+        if let Some(candidate) = intent.get_mut("candidate").and_then(Value::as_object_mut) {
+            candidate.remove("reservedAt");
+        }
+        let digest = cortana_ensure_request_digest_parts(
+            2,
+            intent["operationId"].as_str().unwrap(),
+            &intent["request"],
+        )
+        .unwrap();
+        intent.insert("requestDigest".into(), Value::from(digest));
+        document
+    }
+
     #[test]
     fn cortana_ensure_prepare_is_durable_idempotent_and_rejects_changed_replay() {
         let path = captains_tmp("cortana-ensure-prepare");
@@ -22149,6 +22270,514 @@ mod tests {
         let runtime = failed.cortana_runtime.unwrap();
         assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::Failed);
         assert!(runtime.ensure_intent.unwrap().candidate.is_none());
+    }
+
+    #[test]
+    fn cortana_candidate_journal_rolls_back_persist_failures_and_replays_each_phase() {
+        let path = captains_tmp("cortana-phase-persist-rollback");
+        let mut registry = CaptainsRegistry::load(path.clone());
+        let (prepared, _) = registry
+            .prepare_cortana_ensure("ensure-phase-rollback", cortana_ensure_request(None), 100)
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let identities = crate::identity::IdentityStore::ephemeral();
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities
+            .bind_tile(&identity.id, "cor-candidate-2")
+            .unwrap();
+        let mut candidate = cortana_candidate_fixture(1, false);
+        candidate.control_identity_id = identity.id.clone();
+        candidate.session_identity_generation = identity.generation;
+        candidate.reserved_at = 101;
+        candidate.spawned_at = None;
+
+        let assert_rollback = |registry: &CaptainsRegistry, before: &Value, bytes: &[u8]| {
+            assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), *before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        };
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        registry.fail_next_persist("reserved persist failure");
+        assert!(registry
+            .reserve_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                candidate.clone(),
+                101,
+            )
+            .is_err());
+        assert_rollback(&registry, &before, &bytes);
+        let reserved = registry
+            .reserve_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                candidate.clone(),
+                101,
+            )
+            .unwrap();
+        registry = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            registry
+                .reserve_cortana_candidate(
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    candidate.clone(),
+                    999,
+                )
+                .unwrap(),
+            reserved
+        );
+
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        registry.fail_next_persist("spawned persist failure");
+        assert!(registry
+            .record_cortana_candidate_spawn(
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.terminal_id,
+                102,
+                102,
+            )
+            .is_err());
+        assert_rollback(&registry, &before, &bytes);
+        let spawned = registry
+            .record_cortana_candidate_spawn(
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.terminal_id,
+                102,
+                102,
+            )
+            .unwrap();
+        registry = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            registry
+                .record_cortana_candidate_spawn(
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    &candidate.terminal_id,
+                    102,
+                    999,
+                )
+                .unwrap(),
+            spawned
+        );
+
+        let mut attestation = cortana_candidate_fixture(1, true)
+            .runtime_attestation
+            .unwrap();
+        attestation.control_identity_id = identity.id.clone();
+        attestation.session_identity_generation = identity.generation;
+        attestation.installed_runtime.observed_at = 103;
+        attestation.attested_at = 104;
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        registry.fail_next_persist("attested persist failure");
+        assert!(registry
+            .attest_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                attestation.clone(),
+                &identities.get(&identity.id).unwrap(),
+                1,
+                105,
+            )
+            .is_err());
+        assert_rollback(&registry, &before, &bytes);
+        let attested = registry
+            .attest_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                attestation.clone(),
+                &identities.get(&identity.id).unwrap(),
+                1,
+                105,
+            )
+            .unwrap();
+        registry = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            registry
+                .attest_cortana_candidate(
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    attestation,
+                    &identities.get(&identity.id).unwrap(),
+                    1,
+                    999,
+                )
+                .unwrap(),
+            attested
+        );
+
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        registry.fail_next_persist("committed persist failure");
+        assert!(registry
+            .commit_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                106,
+            )
+            .is_err());
+        assert_rollback(&registry, &before, &bytes);
+        let committed = registry
+            .commit_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                106,
+            )
+            .unwrap();
+        assert_eq!(
+            committed
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .lineage
+                .iter()
+                .filter(|entry| entry.state == CortanaLineageState::Current)
+                .count(),
+            1
+        );
+        registry = CaptainsRegistry::load(path.clone());
+        let replayed = registry
+            .commit_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                999,
+            )
+            .unwrap();
+        assert_eq!(replayed, committed);
+        assert_eq!(
+            replayed.cortana_runtime.unwrap().lineage.len(),
+            1,
+            "commit retry appended duplicate lineage"
+        );
+
+        let cleanup_path = captains_tmp("cortana-cleanup-persist-rollback");
+        let cleanup_registry = CaptainsRegistry::load(cleanup_path.clone());
+        let (prepared, _) = cleanup_registry
+            .prepare_cortana_ensure("ensure-cleanup-rollback", cortana_ensure_request(None), 200)
+            .unwrap();
+        let cleanup_intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut cleanup_candidate = cortana_candidate_fixture(1, false);
+        cleanup_candidate.reserved_at = 201;
+        cleanup_candidate.spawned_at = None;
+        cleanup_registry
+            .reserve_cortana_candidate(
+                &cleanup_intent.operation_id,
+                &cleanup_intent.request_digest,
+                cleanup_candidate.clone(),
+                201,
+            )
+            .unwrap();
+        cleanup_registry
+            .record_cortana_candidate_spawn(
+                &cleanup_intent.operation_id,
+                &cleanup_intent.request_digest,
+                &cleanup_candidate.terminal_id,
+                202,
+                202,
+            )
+            .unwrap();
+        let cleanup_before = serde_json::to_value(cleanup_registry.snapshot()).unwrap();
+        let cleanup_bytes = std::fs::read(&cleanup_path).unwrap();
+        cleanup_registry.fail_next_persist("cleanup pending persist failure");
+        assert!(cleanup_registry
+            .fail_cortana_candidate(
+                &cleanup_intent.operation_id,
+                &cleanup_intent.request_digest,
+                false,
+                "Candidate cleanup is not yet definitive.",
+                203,
+            )
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(cleanup_registry.snapshot()).unwrap(),
+            cleanup_before
+        );
+        assert_eq!(std::fs::read(&cleanup_path).unwrap(), cleanup_bytes);
+        let cleanup_pending = cleanup_registry
+            .fail_cortana_candidate(
+                &cleanup_intent.operation_id,
+                &cleanup_intent.request_digest,
+                false,
+                "Candidate cleanup is not yet definitive.",
+                203,
+            )
+            .unwrap();
+        let cleanup_restarted = CaptainsRegistry::load(cleanup_path.clone());
+        assert_eq!(
+            cleanup_restarted
+                .fail_cortana_candidate(
+                    &cleanup_intent.operation_id,
+                    &cleanup_intent.request_digest,
+                    false,
+                    "Candidate cleanup is not yet definitive.",
+                    999,
+                )
+                .unwrap(),
+            cleanup_pending
+        );
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(cleanup_path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(cleanup_path);
+    }
+
+    #[test]
+    fn cortana_cleanup_covers_reserved_spawned_and_attested_candidate_phases() {
+        for (label, phase) in [
+            ("reserved", CortanaEnsurePhase::CandidateReserved),
+            ("spawned", CortanaEnsurePhase::CandidateSpawned),
+            ("attested", CortanaEnsurePhase::Attested),
+        ] {
+            let mut captain = cortana_prepared_fixture(1);
+            let runtime = captain.cortana_runtime.as_mut().unwrap();
+            let intent = runtime.ensure_intent.as_mut().unwrap();
+            intent.phase = phase;
+            let mut candidate =
+                cortana_candidate_fixture(2, matches!(phase, CortanaEnsurePhase::Attested));
+            if phase == CortanaEnsurePhase::CandidateReserved {
+                candidate.spawned_at = None;
+            }
+            intent.candidate = Some(candidate);
+            let operation_id = intent.operation_id.clone();
+            let request_digest = intent.request_digest.clone();
+            let registry = seed_cortana_registry(captain);
+            let pending = registry
+                .fail_cortana_candidate(
+                    &operation_id,
+                    &request_digest,
+                    false,
+                    "Candidate cleanup remains unresolved and blocks replacement.",
+                    101,
+                )
+                .unwrap();
+            let pending_replay = registry
+                .fail_cortana_candidate(
+                    &operation_id,
+                    &request_digest,
+                    false,
+                    "Candidate cleanup remains unresolved and blocks replacement.",
+                    999,
+                )
+                .unwrap();
+            assert_eq!(pending_replay, pending, "{label} response replay drifted");
+            let failed = registry
+                .fail_cortana_candidate(
+                    &operation_id,
+                    &request_digest,
+                    true,
+                    "Exact candidate cleanup is confirmed gone.",
+                    102,
+                )
+                .unwrap();
+            let runtime = failed.cortana_runtime.as_ref().unwrap();
+            assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::Failed);
+            assert!(runtime.ensure_intent.as_ref().unwrap().candidate.is_none());
+            assert!(runtime
+                .lineage
+                .iter()
+                .all(|entry| entry.state != CortanaLineageState::Current));
+            let failed_replay = registry
+                .fail_cortana_candidate(
+                    &operation_id,
+                    &request_digest,
+                    true,
+                    "Exact candidate cleanup is confirmed gone.",
+                    999,
+                )
+                .unwrap();
+            assert_eq!(failed_replay, failed, "{label} final replay drifted");
+        }
+    }
+
+    #[test]
+    fn cortana_candidate_transition_mismatch_matrix_never_advances_phase() {
+        let registry = CaptainsRegistry::new();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure("ensure-mismatch-matrix", cortana_ensure_request(None), 100)
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let identities = crate::identity::IdentityStore::ephemeral();
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities
+            .bind_tile(&identity.id, "cor-candidate-2")
+            .unwrap();
+        let mut candidate = cortana_candidate_fixture(1, false);
+        candidate.control_identity_id = identity.id.clone();
+        candidate.session_identity_generation = identity.generation;
+        candidate.reserved_at = 101;
+        candidate.spawned_at = None;
+        for mutation in 0_u8..4 {
+            let mut mismatched = candidate.clone();
+            match mutation {
+                0 => mismatched.authority_generation = 2,
+                1 => mismatched.tmux_session_id = "th_other-terminal".into(),
+                2 => mismatched.session_identity_generation = 0,
+                3 => {
+                    mismatched.runtime_attestation =
+                        cortana_candidate_fixture(1, true).runtime_attestation
+                }
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(registry.snapshot()).unwrap();
+            assert!(registry
+                .reserve_cortana_candidate(
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    mismatched,
+                    101,
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+        }
+        registry
+            .reserve_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                candidate.clone(),
+                101,
+            )
+            .unwrap();
+        for (operation_id, digest, terminal_id, spawned_at, observed_at) in [
+            (
+                "wrong-operation",
+                intent.request_digest.as_str(),
+                candidate.terminal_id.as_str(),
+                102,
+                102,
+            ),
+            (
+                intent.operation_id.as_str(),
+                "0",
+                candidate.terminal_id.as_str(),
+                102,
+                102,
+            ),
+            (
+                intent.operation_id.as_str(),
+                intent.request_digest.as_str(),
+                "other-terminal",
+                102,
+                102,
+            ),
+            (
+                intent.operation_id.as_str(),
+                intent.request_digest.as_str(),
+                candidate.terminal_id.as_str(),
+                99,
+                102,
+            ),
+            (
+                intent.operation_id.as_str(),
+                intent.request_digest.as_str(),
+                candidate.terminal_id.as_str(),
+                103,
+                102,
+            ),
+        ] {
+            let before = serde_json::to_value(registry.snapshot()).unwrap();
+            assert!(registry
+                .record_cortana_candidate_spawn(
+                    operation_id,
+                    digest,
+                    terminal_id,
+                    spawned_at,
+                    observed_at,
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+        }
+        registry
+            .record_cortana_candidate_spawn(
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.terminal_id,
+                102,
+                102,
+            )
+            .unwrap();
+        let mut attestation = cortana_candidate_fixture(1, true)
+            .runtime_attestation
+            .unwrap();
+        attestation.control_identity_id = identity.id.clone();
+        attestation.session_identity_generation = identity.generation;
+        attestation.installed_runtime.observed_at = 103;
+        attestation.attested_at = 104;
+        for mutation in 0_u8..5 {
+            let mut mismatched = attestation.clone();
+            match mutation {
+                0 => mismatched.terminal_id = "other-terminal".into(),
+                1 => mismatched.control_identity_id = "f".repeat(32),
+                2 => mismatched.authority_generation = 2,
+                3 => mismatched.observed_provider = "claude".into(),
+                4 => mismatched.installed_runtime.resolved_executable = "/tmp/codex".into(),
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(registry.snapshot()).unwrap();
+            assert!(registry
+                .attest_cortana_candidate(
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    mismatched,
+                    &identities.get(&identity.id).unwrap(),
+                    1,
+                    105,
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+        }
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        assert!(registry
+            .commit_cortana_candidate(
+                &intent.operation_id,
+                &intent.request_digest,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                105,
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
     }
 
     fn cortana_prepared_fixture(generation: u64) -> CaptainRecord {
@@ -27544,6 +28173,85 @@ mod tests {
     }
 
     #[test]
+    fn genuine_schema_18_runtime_2_digests_migrate_for_every_v2_phase() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = cortana_prepared_fixture(1);
+        let mut spawned = prepared.clone();
+        {
+            let intent = spawned
+                .cortana_runtime
+                .as_mut()
+                .unwrap()
+                .ensure_intent
+                .as_mut()
+                .unwrap();
+            intent.phase = CortanaEnsurePhase::CandidateSpawned;
+            intent.candidate = Some(cortana_candidate_fixture(2, false));
+        }
+        let mut cleanup = prepared.clone();
+        {
+            let runtime = cleanup.cortana_runtime.as_mut().unwrap();
+            runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
+            runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
+            runtime.guidance = Some("Resolve exact candidate cleanup before retrying.".into());
+            let intent = runtime.ensure_intent.as_mut().unwrap();
+            intent.phase = CortanaEnsurePhase::CleanupPending;
+            intent.candidate = Some(cortana_candidate_fixture(2, false));
+        }
+        let mut failed = prepared.clone();
+        {
+            let runtime = failed.cortana_runtime.as_mut().unwrap();
+            runtime.lifecycle = CortanaRuntimeLifecycle::Failed;
+            runtime.reason_code = Some(CortanaRecoveryReason::RuntimeStartFailed);
+            runtime.guidance = Some("Review the bounded runtime startup failure.".into());
+            let intent = runtime.ensure_intent.as_mut().unwrap();
+            intent.phase = CortanaEnsurePhase::Failed;
+            intent.candidate = None;
+        }
+        for (label, captain, expected_phase) in [
+            ("prepared", prepared, CortanaEnsurePhase::Prepared),
+            ("spawned", spawned, CortanaEnsurePhase::CandidateSpawned),
+            (
+                "committed",
+                cortana_committed_intent_fixture(),
+                CortanaEnsurePhase::Committed,
+            ),
+            (
+                "cleanup-pending",
+                cleanup,
+                CortanaEnsurePhase::CleanupPending,
+            ),
+            ("failed", failed, CortanaEnsurePhase::Failed),
+        ] {
+            let path = temp.path().join(format!("{label}.json"));
+            let legacy = schema_18_runtime_2_document(captain);
+            let legacy_digest = legacy["captains"][0]["cortanaRuntime"]["ensureIntent"]
+                ["requestDigest"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+            let registry = CaptainsRegistry::load(path.clone());
+            assert!(registry.write_blocked.is_none(), "{label} was blocked");
+            let runtime = registry.snapshot().captains[0]
+                .cortana_runtime
+                .clone()
+                .unwrap();
+            let intent = runtime.ensure_intent.unwrap();
+            assert_eq!(intent.phase, expected_phase, "{label} phase drifted");
+            assert_eq!(intent.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+            assert_ne!(intent.request_digest, legacy_digest);
+            assert_eq!(
+                intent.request_digest,
+                cortana_ensure_request_digest(&intent).unwrap()
+            );
+            if let Some(candidate) = intent.candidate {
+                assert_eq!(candidate.reserved_at, candidate.spawned_at.unwrap());
+            }
+        }
+    }
+
+    #[test]
     fn schema_18_runtime_2_candidate_journal_migrates_exactly_or_preserves_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("captains.json");
@@ -27600,6 +28308,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("reservedAt");
+        let v2_digest = cortana_ensure_request_digest_parts(
+            2,
+            legacy_intent["operationId"].as_str().unwrap(),
+            &legacy_intent["request"],
+        )
+        .unwrap();
+        legacy_intent.insert("requestDigest".into(), Value::from(v2_digest.clone()));
         let source = serde_json::to_vec_pretty(&legacy).unwrap();
         std::fs::write(&path, &source).unwrap();
 
@@ -27614,6 +28329,11 @@ mod tests {
         );
         let loaded_intent = loaded_runtime.ensure_intent.as_ref().unwrap();
         assert_eq!(loaded_intent.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_ne!(loaded_intent.request_digest, v2_digest);
+        assert_eq!(
+            loaded_intent.request_digest,
+            cortana_ensure_request_digest(loaded_intent).unwrap()
+        );
         let loaded_candidate = loaded_intent.candidate.as_ref().unwrap();
         assert_eq!(loaded_candidate.reserved_at, 75);
         assert_eq!(loaded_candidate.spawned_at, Some(75));
@@ -27624,21 +28344,69 @@ mod tests {
             CORTANA_RUNTIME_SCHEMA_VERSION
         );
 
-        let malformed_path = temp.path().join("malformed.json");
-        legacy["captains"][0]["cortanaRuntime"]["ensureIntent"]["candidate"]
-            .as_object_mut()
-            .unwrap()
-            .remove("spawnedAt");
-        let malformed_source = serde_json::to_vec_pretty(&legacy).unwrap();
-        std::fs::write(&malformed_path, &malformed_source).unwrap();
-        assert!(matches!(
-            CaptainsRegistry::read_snapshot(&malformed_path),
-            Err(SnapshotReadError::IncompatibleRecovery { .. })
-        ));
-        let blocked = CaptainsRegistry::load(malformed_path.clone());
-        assert!(blocked.write_blocked.is_some());
-        assert!(blocked.snapshot().captains.is_empty());
-        assert_eq!(std::fs::read(&malformed_path).unwrap(), malformed_source);
+        let supported_backup = serde_json::to_vec_pretty(&CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 99,
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        for (label, mutation) in [
+            ("digest-mismatch", 0_u8),
+            ("hybrid-runtime-3", 1),
+            ("future-runtime", 2),
+            ("missing-request", 3),
+            ("missing-spawn", 4),
+            ("unknown-field", 5),
+            ("invalid-semantics", 6),
+        ] {
+            let mut malformed = legacy.clone();
+            let runtime = &mut malformed["captains"][0]["cortanaRuntime"];
+            match mutation {
+                0 => runtime["ensureIntent"]["requestDigest"] = Value::from("0".repeat(64)),
+                1 => runtime["schemaVersion"] = Value::from(3),
+                2 => runtime["schemaVersion"] = Value::from(99),
+                3 => {
+                    runtime["ensureIntent"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("request");
+                }
+                4 => {
+                    runtime["ensureIntent"]["candidate"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("spawnedAt");
+                }
+                5 => {
+                    runtime["unknownRecoveryField"] = Value::Bool(true);
+                }
+                6 => {
+                    runtime["generation"] = Value::from(2);
+                }
+                _ => unreachable!(),
+            }
+            let malformed_path = temp.path().join(format!("{label}.json"));
+            let backup = malformed_path.with_extension("json.bak");
+            let malformed_source = serde_json::to_vec_pretty(&malformed).unwrap();
+            std::fs::write(&malformed_path, &malformed_source).unwrap();
+            std::fs::write(&backup, &supported_backup).unwrap();
+            assert!(matches!(
+                CaptainsRegistry::read_snapshot(&malformed_path),
+                Err(SnapshotReadError::IncompatibleRecovery { .. })
+            ));
+            let blocked = CaptainsRegistry::load(malformed_path.clone());
+            assert!(blocked.write_blocked.is_some(), "{label} was not blocked");
+            assert!(blocked.snapshot().captains.is_empty());
+            assert_eq!(std::fs::read(&malformed_path).unwrap(), malformed_source);
+            assert_eq!(std::fs::read(&backup).unwrap(), supported_backup);
+            assert!(!temp.path().join(format!("{label}.json.corrupt")).exists());
+        }
     }
 
     #[test]
