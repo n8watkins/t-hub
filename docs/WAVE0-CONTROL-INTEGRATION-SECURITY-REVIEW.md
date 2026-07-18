@@ -651,6 +651,9 @@ The complete workspace log is `/tmp/wave0-workspace-aggregate-01acc1c28b9e-20260
 The workspace gate passed with zero failures across `t_hub_lib` at 888 passed and 2 ignored, MCP E2E at 2 passed and 1 ignored, `t_hub_agent` at 55 passed plus 3 and 1 E2E tests, `t_hub_mcp` at 16 and 75 passed, and `t_hub_protocol` at 8 passed.
 The workspace log elapsed time from launch timestamp to final write was 124 seconds.
 No aggregate was rerun.
+An authenticated `th send` report for the retained aggregate results was attempted from evidence head `86aa719e417604961ddb116ad93ccce322a6d61b` to Captain session `0c7b7560`.
+The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 ## Independent Reviewer Checklist
 
