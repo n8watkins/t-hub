@@ -412,6 +412,16 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `b359faf` closes matching-endpoint transport-error endpoint disclosure.
+`ureq::Error::Transport` now preserves the typed `Unreachable` classification while returning the bounded endpoint-free message `Powder transport failure`.
+This prevents `ureq`'s full failing URL rendering from entering recovery errors or periodic reconciliation logs.
+`external_board_url` now emits only the validated scheme and authority followed by `/board`, excluding protected profile path, query, and fragment material from board sync output.
+The Powder client transport regression uses a matching loopback endpoint with token-like path, query, and fragment values and proves the error and `Debug` rendering contain none of them while retaining `Unreachable`.
+The dispatch-release recovery regression uses the same matching-digest transport failure, invokes periodic reconciliation, and proves the recovery error, registry JSON, sync payload, and recovery `Debug` output contain no endpoint or API-key token.
+At `b359faf`, the four production-load regressions, eleven dispatch-release regressions, 31 Powder client regressions, and serial 63-test control Powder filter passed.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 Commit `698955e` closes the production-load fail-open for incompatible dispatch-release recovery state.
 `SnapshotReadError` now distinguishes incompatible recovery from generic corrupt state.
 Loading either a primary or backup with nonempty pre-v12 recovery, unknown release fields, or a release record that cannot deserialize or validate preserves both files byte-for-byte, starts with no actionable registry state, and blocks every write until explicit safe handling.
@@ -464,3 +474,4 @@ No independent reviewer has approved this integration yet.
 23. Verify any ambiguous initial claim retains a trusted durable recovery intent, attempts no untrusted release, survives restart, and blocks duplicate redispatch until authoritative reconciliation.
 24. Verify incompatible pending-release recovery in either primary or backup blocks writes and redispatch, preserves both files without fallback or quarantine, and exposes no actionable cleanup state.
 25. Verify a schema-12 recovery rejects unknown or raw endpoint fields before client construction and cannot emit credential-bearing bytes through registry, sync, errors, or logs.
+26. Verify matching-endpoint transport failures retain only an endpoint-free typed classification and external board links omit protected profile path, query, and fragment data.
