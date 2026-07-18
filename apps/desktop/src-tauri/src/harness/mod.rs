@@ -159,7 +159,59 @@ pub struct HarnessProcessEvidence {
     start_ticks: u64,
     executable_device: u64,
     executable_inode: u64,
+    resolved_process_executable: String,
     argv: Vec<String>,
+}
+
+/// Non-secret tmux generation proven by one bounded foreground-process read.
+/// Recovery journals this before it treats a reserved terminal as spawned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessTerminalGenerationReceipt {
+    pub tmux_target: String,
+    pub session_id: u64,
+    pub session_created: u64,
+    pub window_id: u64,
+    pub pane_id: u64,
+    pub pane_pid: u32,
+}
+
+/// Adapter-produced receipt for the effective provider runtime. Callers cannot
+/// obtain this from desired policy alone: construction runs provider-native
+/// permission, model, reasoning, executable, and process-generation checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessRuntimePolicyReceipt {
+    pub terminal: HarnessTerminalGenerationReceipt,
+    pub process_pid: u32,
+    pub process_start_ticks: u64,
+    pub process_executable_device: u64,
+    pub process_executable_inode: u64,
+    pub provider_executable_device: u64,
+    pub provider_executable_inode: u64,
+    pub resolved_provider_executable: String,
+    pub executable_version: String,
+    pub observed_provider: String,
+    pub observed_harness: String,
+    pub observed_model: String,
+    pub observed_reasoning_effort: String,
+    pub observed_permission: PermMode,
+}
+
+pub(crate) struct VerifiedHarnessTerminalGeneration(HarnessTerminalGenerationReceipt);
+
+impl VerifiedHarnessTerminalGeneration {
+    pub(crate) fn into_persisted(self) -> HarnessTerminalGenerationReceipt {
+        self.0
+    }
+}
+
+pub(crate) struct VerifiedHarnessRuntimeReceipt(HarnessRuntimePolicyReceipt);
+
+impl VerifiedHarnessRuntimeReceipt {
+    pub(crate) fn into_persisted(self) -> HarnessRuntimePolicyReceipt {
+        self.0
+    }
 }
 
 impl HarnessProcessEvidence {
@@ -227,6 +279,11 @@ impl HarnessProcessEvidence {
             start_ticks,
             executable_device,
             executable_inode,
+            resolved_process_executable: if PathBuf::from(argv[0]).is_absolute() {
+                argv[0].to_string()
+            } else {
+                format!("/usr/bin/{}", executable_name(argv[0]))
+            },
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
         }
     }
@@ -246,6 +303,36 @@ impl HarnessProcessEvidence {
             && self.terminal.pane_id == pane.pane_id
             && self.terminal.pane_pid == pane.pane_pid
     }
+}
+
+pub fn terminal_generation_receipt(
+    tmux_target: &str,
+    evidence: &HarnessProcessEvidence,
+) -> HarnessTerminalGenerationReceipt {
+    HarnessTerminalGenerationReceipt {
+        tmux_target: tmux_target.to_string(),
+        session_id: evidence.terminal.session_id,
+        session_created: evidence.terminal.session_created,
+        window_id: evidence.terminal.window_id,
+        pane_id: evidence.terminal.pane_id,
+        pane_pid: evidence.terminal.pane_pid,
+    }
+}
+
+pub(crate) fn observe_terminal_generation_receipt(
+    tmux_target: &str,
+) -> Result<VerifiedHarnessTerminalGeneration, LaunchAttestationError> {
+    observe_harness_process(tmux_target).map(|evidence| {
+        VerifiedHarnessTerminalGeneration(terminal_generation_receipt(tmux_target, &evidence))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_terminal_generation(
+    tmux_target: &str,
+    evidence: &HarnessProcessEvidence,
+) -> VerifiedHarnessTerminalGeneration {
+    VerifiedHarnessTerminalGeneration(terminal_generation_receipt(tmux_target, evidence))
 }
 
 /// Credential-safe failure classes for fail-closed launch attestation.
@@ -497,6 +584,9 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 case "$1:$2" in *[!0-9:]*) exit 24;; esac
 executable_device=$1
 executable_inode=$2
+resolved_process_executable=$(readlink -f "/proc/$foreground_pid/exe")
+case "$resolved_process_executable" in /*) ;; *) exit 26;; esac
+[ "${#resolved_process_executable}" -le 16384 ]
 ancestry=
 ancestry_count=0
 current_pid=$foreground_pid
@@ -537,9 +627,10 @@ set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
 [ "$#" -eq 2 ]
 [ "$1" = "$executable_device" ]
 [ "$2" = "$executable_inode" ]
-printf 'THPA3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+printf 'THPA4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
-    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" "$ancestry"
+    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" \
+    "$resolved_process_executable" "$ancestry"
 cat "$cmdline"
 "#;
 
@@ -581,8 +672,8 @@ cat "$cmdline"
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let mut fields = bytes.splitn(12, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THPA3".as_slice()) {
+    let mut fields = bytes.splitn(13, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA4".as_slice()) {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     let terminal = TerminalGeneration {
@@ -600,6 +691,20 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
     let start_ticks = parse_ascii_number(fields.next())?;
     let executable_device = parse_ascii_number(fields.next())?;
     let executable_inode = parse_ascii_number(fields.next())?;
+    let resolved_process_executable = std::str::from_utf8(
+        fields
+            .next()
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+    )
+    .ok()
+    .filter(|path| {
+        !path.is_empty()
+            && path.len() <= 16_384
+            && PathBuf::from(path).is_absolute()
+            && !path.chars().any(char::is_control)
+    })
+    .ok_or(LaunchAttestationError::UnreadableEvidence)?
+    .to_string();
     let ancestry = parse_process_ancestry(fields.next())?;
     let cmdline = fields
         .next()
@@ -631,6 +736,7 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
         start_ticks,
         executable_device,
         executable_inode,
+        resolved_process_executable,
         argv,
     })
 }
@@ -723,6 +829,115 @@ pub(crate) fn provider_executable_path(
         .ok_or(LaunchAttestationError::UnreadableEvidence)
 }
 
+/// Resolve the exact provider executable represented by foreground evidence.
+/// A native provider launched through PATH is bound to `/proc/<pid>/exe`; a
+/// script provider behind an accepted node-style runtime must name an absolute
+/// script path. Relative wrapper arguments fail closed.
+pub(crate) fn resolved_provider_executable_path(
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+) -> Result<PathBuf, LaunchAttestationError> {
+    let (provider, provider_index) =
+        process_provider(&evidence.argv).ok_or(LaunchAttestationError::WrapperObscured)?;
+    if provider != expected {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    if provider_index == 0 {
+        return Ok(PathBuf::from(&evidence.resolved_process_executable));
+    }
+    let provider_path = evidence
+        .argv
+        .get(provider_index)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(LaunchAttestationError::WrapperObscured)?;
+    std::fs::canonicalize(provider_path).map_err(|_| LaunchAttestationError::UnreadableEvidence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn provider_file_identity(
+    path: &std::path::Path,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata =
+        std::fs::metadata(path).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !metadata.is_file() || metadata.ino() == 0 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(ProviderFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn provider_file_identity(
+    _path: &std::path::Path,
+) -> Result<ProviderFileIdentity, LaunchAttestationError> {
+    Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+#[cfg(unix)]
+fn probe_provider_version(
+    executable: &std::path::Path,
+) -> Result<(String, ProviderFileIdentity), LaunchAttestationError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let executable_file =
+        std::fs::File::open(executable).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let metadata = executable_file
+        .metadata()
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !metadata.is_file() || metadata.ino() == 0 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let file_identity = ProviderFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let opened_executable = format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        executable_file.as_raw_fd()
+    );
+    let mut command = Command::new(opened_executable);
+    command.arg("--version");
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(3))
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !output.status.success()
+        || output.stdout.is_empty()
+        || !output.stderr.is_empty()
+        || output.stdout.len() > 4096
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let executable_version = std::str::from_utf8(&output.stdout)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?
+        .trim();
+    if executable_version.is_empty()
+        || executable_version.len() > 4096
+        || executable_version.chars().any(char::is_control)
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok((executable_version.to_string(), file_identity))
+}
+
+#[cfg(not(unix))]
+fn probe_provider_version(
+    _executable: &std::path::Path,
+) -> Result<(String, ProviderFileIdentity), LaunchAttestationError> {
+    Err(LaunchAttestationError::UnreadableEvidence)
+}
+
 /// Attest the exact model and reasoning selection from provider-native argv.
 /// Missing, repeated, malformed, or substituted options fail closed.
 pub(crate) fn attest_runtime_policy(
@@ -749,6 +964,164 @@ pub(crate) fn attest_runtime_policy(
         return Err(LaunchAttestationError::WrongReasoningEffort);
     }
     Ok(())
+}
+
+/// Produce one typed receipt only after every effective runtime-policy axis and
+/// the exact foreground process generation have been verified.
+fn seal_runtime_policy_receipt(
+    tmux_target: &str,
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+    provider_file: ProviderFileIdentity,
+    executable_version: &str,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    expected
+        .adapter()
+        .attest_permissions(evidence, expected_permission)?;
+    attest_runtime_policy(
+        evidence,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+    )?;
+    let executable = resolved_provider_executable_path(evidence, expected)?;
+    let (_, provider_index) = process_provider(&evidence.argv)
+        .filter(|(provider, _)| *provider == expected)
+        .ok_or(LaunchAttestationError::WrongProvider)?;
+    if provider_index == 0
+        && (provider_file.device, provider_file.inode) != evidence.executable_identity()
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    let executable = executable
+        .to_str()
+        .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    let executable_version = executable_version.trim();
+    if executable_version.is_empty()
+        || executable_version.len() > 4096
+        || executable_version.chars().any(char::is_control)
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(VerifiedHarnessRuntimeReceipt(HarnessRuntimePolicyReceipt {
+        terminal: terminal_generation_receipt(tmux_target, evidence),
+        process_pid: evidence.pid,
+        process_start_ticks: evidence.start_ticks,
+        process_executable_device: evidence.executable_device,
+        process_executable_inode: evidence.executable_inode,
+        provider_executable_device: provider_file.device,
+        provider_executable_inode: provider_file.inode,
+        resolved_provider_executable: executable.to_string(),
+        executable_version: executable_version.to_string(),
+        observed_provider: expected.as_provider().to_string(),
+        observed_harness: expected.as_provider().to_string(),
+        observed_model: expected_model.to_string(),
+        observed_reasoning_effort: expected_reasoning_effort.to_string(),
+        observed_permission: expected_permission,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_probed_runtime_policy_receipt(
+    tmux_target: &str,
+    accepted: &HarnessProcessEvidence,
+    post_probe: Result<HarnessProcessEvidence, LaunchAttestationError>,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+    probed_executable: &std::path::Path,
+    provider_file_before: ProviderFileIdentity,
+    provider_file_after: ProviderFileIdentity,
+    executable_version: &str,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    if provider_file_before != provider_file_after
+        || resolved_provider_executable_path(accepted, expected)? != probed_executable
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    let (_, stable_evidence) = attest_final_launch_permissions(
+        expected.adapter(),
+        accepted,
+        post_probe,
+        expected_permission,
+    )?;
+    if resolved_provider_executable_path(&stable_evidence, expected)? != probed_executable {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    seal_runtime_policy_receipt(
+        tmux_target,
+        &stable_evidence,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+        expected_permission,
+        provider_file_after,
+        executable_version,
+    )
+}
+
+/// Observe one stable foreground provider generation and probe that exact
+/// executable's bounded version output before issuing a non-forgeable receipt.
+pub(crate) fn observe_runtime_policy_receipt(
+    tmux_target: &str,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    let accepted = observe_harness_process(tmux_target)?;
+    let (_, final_evidence) = attest_final_launch_permissions(
+        expected.adapter(),
+        &accepted,
+        observe_harness_process(tmux_target),
+        expected_permission,
+    )?;
+    let executable = resolved_provider_executable_path(&final_evidence, expected)?;
+    let (executable_version, provider_file) = probe_provider_version(&executable)?;
+    let provider_file_after = provider_file_identity(&executable)?;
+    verify_probed_runtime_policy_receipt(
+        tmux_target,
+        &final_evidence,
+        observe_harness_process(tmux_target),
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+        expected_permission,
+        &executable,
+        provider_file,
+        provider_file_after,
+        &executable_version,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_runtime_receipt(
+    tmux_target: &str,
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+    executable_version: &str,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    seal_runtime_policy_receipt(
+        tmux_target,
+        evidence,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+        expected_permission,
+        ProviderFileIdentity {
+            device: evidence.executable_device,
+            inode: evidence.executable_inode,
+        },
+        executable_version,
+    )
 }
 
 fn unique_option_value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<&'a str>, ()> {
@@ -1477,7 +1850,7 @@ mod tests {
     #[test]
     fn process_evidence_parser_is_bounded_and_strict() {
         let parsed = parse_process_evidence(
-            b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex\0--sandbox\0read-only\0",
+            b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex\0--sandbox\0read-only\0",
         )
         .unwrap();
         assert_eq!(parsed.identity(), (42, 900));
@@ -1486,13 +1859,13 @@ mod tests {
 
         assert_eq!(
             parse_process_evidence(
-                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\ncodex",
+                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900\ncodex",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
         assert_eq!(
             parse_process_evidence(
-                b"THPA3\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900,7:100\ncodex\0",
+                b"THPA4\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n/usr/bin/codex\n42:900,7:100\ncodex\0",
             ),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
@@ -1617,6 +1990,240 @@ mod tests {
                 Err(expected)
             );
         }
+    }
+
+    #[test]
+    fn runtime_policy_receipt_binds_exact_process_terminal_and_policy_or_fails_closed() {
+        let argv = [
+            "/opt/t-hub/bin/codex",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model",
+            "gpt-5.6-terra",
+            "-c",
+            "model_reasoning_effort=medium",
+        ];
+        let evidence = HarnessProcessEvidence::test(42, 900, &argv);
+        let receipt = seal_runtime_policy_receipt(
+            "th_cor-candidate-2",
+            &evidence,
+            Harness::Codex,
+            "gpt-5.6-terra",
+            "medium",
+            PermMode::BypassPermissions,
+            ProviderFileIdentity {
+                device: evidence.executable_device,
+                inode: evidence.executable_inode,
+            },
+            "codex-cli 1.2.3",
+        )
+        .unwrap()
+        .into_persisted();
+        assert_eq!(
+            receipt.terminal,
+            terminal_generation_receipt("th_cor-candidate-2", &evidence)
+        );
+        assert_eq!(receipt.process_pid, 42);
+        assert_eq!(receipt.process_start_ticks, 900);
+        assert_eq!(receipt.resolved_provider_executable, "/opt/t-hub/bin/codex");
+        assert_eq!(receipt.observed_model, "gpt-5.6-terra");
+        assert_eq!(receipt.observed_reasoning_effort, "medium");
+        assert_eq!(receipt.observed_permission, PermMode::BypassPermissions);
+
+        for (model, reasoning, permission, version, expected) in [
+            (
+                "other-model",
+                "medium",
+                PermMode::BypassPermissions,
+                "codex-cli 1.2.3",
+                LaunchAttestationError::WrongModel,
+            ),
+            (
+                "gpt-5.6-terra",
+                "high",
+                PermMode::BypassPermissions,
+                "codex-cli 1.2.3",
+                LaunchAttestationError::WrongReasoningEffort,
+            ),
+            (
+                "gpt-5.6-terra",
+                "medium",
+                PermMode::Default,
+                "codex-cli 1.2.3",
+                LaunchAttestationError::ConflictingPermission,
+            ),
+            (
+                "gpt-5.6-terra",
+                "medium",
+                PermMode::BypassPermissions,
+                "\n",
+                LaunchAttestationError::UnreadableEvidence,
+            ),
+        ] {
+            assert_eq!(
+                seal_runtime_policy_receipt(
+                    "th_cor-candidate-2",
+                    &evidence,
+                    Harness::Codex,
+                    model,
+                    reasoning,
+                    permission,
+                    ProviderFileIdentity {
+                        device: evidence.executable_device,
+                        inode: evidence.executable_inode,
+                    },
+                    version,
+                )
+                .map(VerifiedHarnessRuntimeReceipt::into_persisted),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn probed_runtime_receipt_rejects_unreadable_foreign_and_drifting_evidence() {
+        let argv = [
+            "/opt/t-hub/bin/codex",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model",
+            "gpt-5.6-terra",
+            "-c",
+            "model_reasoning_effort=medium",
+        ];
+        let accepted = HarnessProcessEvidence::test(42, 900, &argv);
+        let provider_file = ProviderFileIdentity {
+            device: accepted.executable_device,
+            inode: accepted.executable_inode,
+        };
+        let executable = PathBuf::from("/opt/t-hub/bin/codex");
+        let verify = |post_probe, after, version| {
+            verify_probed_runtime_policy_receipt(
+                "th_cor-candidate-2",
+                &accepted,
+                post_probe,
+                Harness::Codex,
+                "gpt-5.6-terra",
+                "medium",
+                PermMode::BypassPermissions,
+                &executable,
+                provider_file,
+                after,
+                version,
+            )
+            .map(VerifiedHarnessRuntimeReceipt::into_persisted)
+        };
+        assert!(verify(Ok(accepted.clone()), provider_file, "codex-cli 1.2.3").is_ok());
+        assert_eq!(
+            verify(
+                Err(LaunchAttestationError::UnreadableEvidence),
+                provider_file,
+                "codex-cli 1.2.3"
+            ),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+
+        let mut foreign_pane = accepted.clone();
+        foreign_pane.terminal.pane_id += 1;
+        assert_eq!(
+            verify(Ok(foreign_pane), provider_file, "codex-cli 1.2.3"),
+            Err(LaunchAttestationError::TerminalChanged)
+        );
+        let mut process_drift = accepted.clone();
+        process_drift.start_ticks += 1;
+        assert_eq!(
+            verify(Ok(process_drift), provider_file, "codex-cli 1.2.3"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+        let mut executable_drift = accepted.clone();
+        executable_drift.executable_inode += 1;
+        assert_eq!(
+            verify(Ok(executable_drift), provider_file, "codex-cli 1.2.3"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+        let mut path_drift = accepted.clone();
+        path_drift.resolved_process_executable = "/tmp/replaced-codex".into();
+        assert_eq!(
+            verify(Ok(path_drift), provider_file, "codex-cli 1.2.3"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+        assert_eq!(
+            verify(
+                Ok(accepted.clone()),
+                ProviderFileIdentity {
+                    device: provider_file.device,
+                    inode: provider_file.inode + 1,
+                },
+                "codex-cli 9.9.9"
+            ),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+        assert_eq!(
+            verify(Ok(accepted.clone()), provider_file, "\n"),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_provider_receipt_binds_script_inode_separately_from_node_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("codex");
+        std::fs::write(&provider, "#!/usr/bin/env node\n").unwrap();
+        let provider_path = provider.to_str().unwrap();
+        let evidence = HarnessProcessEvidence::test(
+            42,
+            900,
+            &[
+                "/usr/bin/node",
+                provider_path,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+            ],
+        );
+        let provider_file = provider_file_identity(&provider).unwrap();
+        let receipt = seal_runtime_policy_receipt(
+            "th_cor-candidate-2",
+            &evidence,
+            Harness::Codex,
+            "gpt-5.6-terra",
+            "medium",
+            PermMode::BypassPermissions,
+            provider_file,
+            "codex-cli 1.2.3",
+        )
+        .unwrap()
+        .into_persisted();
+        assert_eq!(
+            (
+                receipt.provider_executable_device,
+                receipt.provider_executable_inode,
+            ),
+            (provider_file.device, provider_file.inode)
+        );
+        assert_ne!(
+            (
+                receipt.process_executable_device,
+                receipt.process_executable_inode,
+            ),
+            (provider_file.device, provider_file.inode)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_executes_the_opened_provider_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("codex");
+        std::fs::write(&provider, "#!/bin/sh\nprintf 'codex-cli 1.2.3\\n'\n").unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let expected_identity = provider_file_identity(&provider).unwrap();
+        let (version, observed_identity) = probe_provider_version(&provider).unwrap();
+        assert_eq!(version, "codex-cli 1.2.3");
+        assert_eq!(observed_identity, expected_identity);
     }
 
     #[test]
