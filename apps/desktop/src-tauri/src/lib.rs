@@ -628,10 +628,28 @@ pub fn run() {
             // De-conflation (spawn-wedge): `is_live` is true unless the probe is
             // DEFINITIVELY `Gone`, so an `Unknown` (timed-out) probe keeps the
             // identity - a degraded spawn path must never retire a live session's
-            // secret. `prune_dead` retires only where `is_live` is false.
+            // secret. Registry-owned operation allocations are reconciled separately:
+            // an active journal remains adoptable, a durable failed journal revokes
+            // its credential, and an unowned allocation requires exact death.
             {
-                match identity_store.prune_dead(|tile| {
-                    !tmux::is_definitively_gone(tmux::session_liveness(&tmux::target_for_id(tile)))
+                let allocation_policy = captains_registry.cortana_identity_allocation_policy();
+                match allocation_policy.and_then(|(retain, revoke)| {
+                    identity_store.reconcile_operation_allocations(
+                        |tile| {
+                            !tmux::is_definitively_gone(tmux::session_liveness(
+                                &tmux::target_for_id(tile),
+                            ))
+                        },
+                        |allocation_key| {
+                            if revoke.contains(allocation_key) {
+                                identity::OperationAllocationDisposition::Revoke
+                            } else if retain.contains(allocation_key) {
+                                identity::OperationAllocationDisposition::Retain
+                            } else {
+                                identity::OperationAllocationDisposition::Unowned
+                            }
+                        },
+                    )
                 }) {
                     Ok(pruned) if pruned > 0 => eprintln!(
                         "t-hub-identity: load-time prune retired {pruned} dead/unbound \

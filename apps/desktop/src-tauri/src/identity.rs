@@ -494,6 +494,13 @@ pub struct IdentityStore {
     fail_identity_write_after_watermark: Mutex<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperationAllocationDisposition {
+    Retain,
+    Revoke,
+    Unowned,
+}
+
 impl IdentityStore {
     /// Load (or start empty) from `path`. A missing file starts empty. Malformed or
     /// unsupported persisted state remains byte-preserved and blocks every write.
@@ -921,9 +928,8 @@ impl IdentityStore {
         let mut snap = self.lock();
         let previous = snap.clone();
         let before = snap.identities.len();
-        snap.identities.retain(|_, ident| {
-            ident.allocation_key.is_some() || ident.session_tile.as_deref().is_some_and(&is_live)
-        });
+        snap.identities
+            .retain(|_, ident| ident.session_tile.as_deref().is_some_and(&is_live));
         let removed = before - snap.identities.len();
         if removed > 0 {
             if let Err(error) = self.persist(&snap) {
@@ -932,6 +938,72 @@ impl IdentityStore {
             }
         }
         Ok(removed)
+    }
+
+    /// Reconcile restart state with the durable operation journal without keeping
+    /// operation allocations forever. Active journal ownership retains an identity.
+    /// A confirmed failed operation is revoked immediately. An allocation with no
+    /// journal owner is revoked only when unbound or its exact terminal is confirmed
+    /// gone; live or ambiguous terminals remain fail-closed.
+    pub(crate) fn reconcile_operation_allocations(
+        &self,
+        is_live: impl Fn(&str) -> bool,
+        disposition: impl Fn(&str) -> OperationAllocationDisposition,
+    ) -> Result<usize, String> {
+        let mut snap = self.lock();
+        let previous = snap.clone();
+        let mut revoke_ids = Vec::new();
+        let mut retire_ids = Vec::new();
+        for (id, identity) in &snap.identities {
+            let live = identity.session_tile.as_deref().is_some_and(&is_live);
+            match identity.allocation_key.as_deref() {
+                Some(key) => match disposition(key) {
+                    OperationAllocationDisposition::Retain => {}
+                    OperationAllocationDisposition::Revoke => revoke_ids.push(id.clone()),
+                    OperationAllocationDisposition::Unowned if !live => revoke_ids.push(id.clone()),
+                    OperationAllocationDisposition::Unowned => {}
+                },
+                None if !live => retire_ids.push(id.clone()),
+                None => {}
+            }
+        }
+        for id in &revoke_ids {
+            snap.revoked.insert(id.clone());
+            snap.identities.remove(id);
+        }
+        for id in &retire_ids {
+            snap.identities.remove(id);
+        }
+        let removed = revoke_ids.len() + retire_ids.len();
+        if removed > 0 {
+            if let Err(error) = self.persist(&snap) {
+                *snap = previous;
+                return Err(error);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Revoke the identity allocated by one durable operation. Exact replay after
+    /// the identity is already absent is idempotent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn revoke_operation_allocation(&self, allocation_key: &str) -> Result<bool, String> {
+        validate_allocation_key(allocation_key)?;
+        let mut snap = self.lock();
+        let Some(id) = snap.identities.values().find_map(|identity| {
+            (identity.allocation_key.as_deref() == Some(allocation_key))
+                .then(|| identity.id.clone())
+        }) else {
+            return Ok(false);
+        };
+        let previous = snap.clone();
+        snap.revoked.insert(id.clone());
+        snap.identities.remove(&id);
+        if let Err(error) = self.persist(&snap) {
+            *snap = previous;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// Explicitly REVOKE an identity by its minted id (item-3 Pillar B): record it in
@@ -1997,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_owned_unbound_or_dead_identity_survives_generic_pruning_for_adoption() {
+    fn operation_allocation_reconciliation_retains_only_durable_or_live_ownership() {
         let store = IdentityStore::ephemeral();
         let unbound = store
             .mint_for_operation(Role::Cortana, Some("cortana".into()), "operation:unbound")
@@ -2006,9 +2078,75 @@ mod tests {
             .mint_for_operation(Role::Cortana, Some("cortana".into()), "operation:bound")
             .unwrap();
         store.bind_tile_exact(&bound.id, "dead-candidate").unwrap();
-        assert_eq!(store.prune_dead(|_| false).unwrap(), 0);
+        assert_eq!(
+            store
+                .reconcile_operation_allocations(
+                    |_| false,
+                    |_| OperationAllocationDisposition::Retain,
+                )
+                .unwrap(),
+            0
+        );
         assert_eq!(store.get(&unbound.id).unwrap().id, unbound.id);
         assert_eq!(store.get(&bound.id).unwrap().id, bound.id);
+
+        assert_eq!(
+            store
+                .reconcile_operation_allocations(
+                    |_| false,
+                    |key| if key == "operation:bound" {
+                        OperationAllocationDisposition::Revoke
+                    } else {
+                        OperationAllocationDisposition::Retain
+                    },
+                )
+                .unwrap(),
+            1
+        );
+        assert!(store.get(&bound.id).is_none());
+        assert!(store.lock().revoked.contains(&bound.id));
+        assert!(store.get(&unbound.id).is_some());
+
+        let live_unowned = store
+            .mint_for_operation(
+                Role::Cortana,
+                Some("cortana".into()),
+                "operation:live-unowned",
+            )
+            .unwrap();
+        store
+            .bind_tile_exact(&live_unowned.id, "live-candidate")
+            .unwrap();
+        assert_eq!(
+            store
+                .reconcile_operation_allocations(
+                    |tile| tile == "live-candidate",
+                    |key| {
+                        if key == "operation:unbound" {
+                            OperationAllocationDisposition::Retain
+                        } else {
+                            OperationAllocationDisposition::Unowned
+                        }
+                    },
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .reconcile_operation_allocations(
+                    |_| false,
+                    |key| if key == "operation:unbound" {
+                        OperationAllocationDisposition::Retain
+                    } else {
+                        OperationAllocationDisposition::Unowned
+                    },
+                )
+                .unwrap(),
+            1
+        );
+        assert!(store.get(&live_unowned.id).is_none());
+        assert!(store.lock().revoked.contains(&live_unowned.id));
     }
 
     #[test]

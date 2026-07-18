@@ -7136,7 +7136,8 @@ impl CaptainsRegistry {
 
     /// Persist the exact failure disposition for a spawned candidate.
     /// Unresolved cleanup retains the candidate and blocks all later spawning.
-    pub fn fail_cortana_candidate(
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn record_cortana_candidate_failure(
         &self,
         operation_id: &str,
         request_digest: &str,
@@ -7207,6 +7208,72 @@ impl CaptainsRegistry {
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
         Ok(result)
+    }
+
+    /// Persist a candidate failure before revoking the exact operation allocation.
+    /// If revocation persistence fails, the durable Failed intent remains as a
+    /// restart reconciliation instruction and an exact replay retries revocation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn fail_cortana_candidate(
+        &self,
+        identities: &crate::identity::IdentityStore,
+        operation_id: &str,
+        request_digest: &str,
+        cleanup_confirmed_gone: bool,
+        guidance: &str,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let result = self.record_cortana_candidate_failure(
+            operation_id,
+            request_digest,
+            cleanup_confirmed_gone,
+            guidance,
+            observed_at,
+        )?;
+        if cleanup_confirmed_gone {
+            let allocation_key = cortana_identity_allocation_key(request_digest)?;
+            identities.revoke_operation_allocation(&allocation_key)?;
+        }
+        Ok(result)
+    }
+
+    /// Snapshot journal-owned operation allocations before any tmux probes run.
+    /// Active phases retain their exact identity. Failed phases are durable revoke
+    /// instructions. Committed operations fall back to exact terminal liveness.
+    pub(crate) fn cortana_identity_allocation_policy(
+        &self,
+    ) -> Result<(HashSet<String>, HashSet<String>), String> {
+        if let Some(reason) = self.write_blocked.as_deref() {
+            return Err(format!(
+                "Cortana identity allocation reconciliation is blocked by registry recovery: {reason}"
+            ));
+        }
+        let snapshot = self.snapshot();
+        let mut retain = HashSet::new();
+        let mut revoke = HashSet::new();
+        if let Some(intent) = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .and_then(|captain| captain.cortana_runtime.as_ref())
+            .and_then(|runtime| runtime.ensure_intent.as_ref())
+        {
+            let key = cortana_identity_allocation_key(&intent.request_digest)?;
+            match intent.phase {
+                CortanaEnsurePhase::Failed => {
+                    revoke.insert(key);
+                }
+                CortanaEnsurePhase::Committed => {}
+                CortanaEnsurePhase::Prepared
+                | CortanaEnsurePhase::CandidateReserved
+                | CortanaEnsurePhase::CandidateSpawned
+                | CortanaEnsurePhase::Attested
+                | CortanaEnsurePhase::CleanupPending => {
+                    retain.insert(key);
+                }
+            }
+        }
+        Ok((retain, revoke))
     }
 
     /// Return the durable project registry without exposing the registry lock.
@@ -22829,7 +22896,24 @@ mod tests {
             let restarted_registry = CaptainsRegistry::load(captains_path.clone());
             let restarted_identities =
                 crate::identity::IdentityStore::load(identities_path.clone());
-            assert_eq!(restarted_identities.prune_dead(|_| false).unwrap(), 0);
+            let (retain, revoke) = restarted_registry
+                .cortana_identity_allocation_policy()
+                .unwrap();
+            assert_eq!(
+                restarted_identities
+                    .reconcile_operation_allocations(
+                        |_| false,
+                        |key| if revoke.contains(key) {
+                            crate::identity::OperationAllocationDisposition::Revoke
+                        } else if retain.contains(key) {
+                            crate::identity::OperationAllocationDisposition::Retain
+                        } else {
+                            crate::identity::OperationAllocationDisposition::Unowned
+                        },
+                    )
+                    .unwrap(),
+                0
+            );
             let (reserved, adopted) = restarted_registry
                 .reserve_cortana_candidate_identity(
                     &restarted_identities,
@@ -22926,6 +23010,98 @@ mod tests {
                 .phase,
             CortanaEnsurePhase::CandidateReserved
         );
+    }
+
+    #[test]
+    fn failed_candidate_restart_reconciliation_revokes_the_operation_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let captains_path = temp.path().join("captains.json");
+        let identities_path = temp.path().join("identities.json");
+        let registry = CaptainsRegistry::load(captains_path.clone());
+        let identities = crate::identity::IdentityStore::load(identities_path.clone());
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-failed-restart-revoke",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let (_, identity) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                1,
+                101,
+            )
+            .unwrap();
+
+        registry
+            .record_cortana_candidate_failure(
+                &intent.operation_id,
+                &intent.request_digest,
+                true,
+                "Candidate is confirmed gone before identity revocation persisted.",
+                102,
+            )
+            .unwrap();
+        assert!(identities.get(&identity.id).is_some());
+
+        let restarted_registry = CaptainsRegistry::load(captains_path);
+        let restarted_identities = crate::identity::IdentityStore::load(identities_path.clone());
+        let (retain, revoke) = restarted_registry
+            .cortana_identity_allocation_policy()
+            .unwrap();
+        assert!(retain.is_empty());
+        assert_eq!(revoke.len(), 1);
+        assert_eq!(
+            restarted_identities
+                .reconcile_operation_allocations(
+                    |_| true,
+                    |key| if revoke.contains(key) {
+                        crate::identity::OperationAllocationDisposition::Revoke
+                    } else {
+                        crate::identity::OperationAllocationDisposition::Unowned
+                    },
+                )
+                .unwrap(),
+            1
+        );
+        assert!(restarted_identities.get(&identity.id).is_none());
+        assert!(restarted_identities.resolve(&identity.secret).is_none());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&identities_path).unwrap()).unwrap();
+        assert!(persisted["revoked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some(identity.id.as_str())));
+    }
+
+    #[test]
+    fn blocked_registry_never_authorizes_operation_identity_reconciliation() {
+        let path = captains_tmp("blocked-operation-identity-reconciliation");
+        let source = serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
+            "seq": 0,
+            "captains": [],
+            "projects": [],
+            "workspaces": []
+        }))
+        .unwrap();
+        std::fs::write(&path, &source).unwrap();
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry.cortana_identity_allocation_policy().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -23030,6 +23206,7 @@ mod tests {
     fn cortana_candidate_cleanup_ambiguity_blocks_spawn_until_exact_gone() {
         let incumbent = cortana_ready_fixture();
         let registry = seed_cortana_registry(incumbent.clone());
+        let identities = crate::identity::IdentityStore::ephemeral();
         let (prepared, _) = registry
             .prepare_cortana_ensure(
                 "ensure-cleanup-1",
@@ -23045,11 +23222,24 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
+        let allocation_key = cortana_identity_allocation_key(&intent.request_digest).unwrap();
+        let allocated = identities
+            .mint_for_operation(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.into()),
+                &allocation_key,
+            )
+            .unwrap();
         let mut candidate = cortana_candidate_fixture(2, false);
+        candidate.control_identity_id = allocated.id.clone();
+        candidate.session_identity_generation = allocated.generation;
         candidate.reserved_at = 111;
         candidate.spawned_at = None;
         candidate.spawn_generation = None;
         candidate.spawn_provider = None;
+        identities
+            .bind_tile_exact(&allocated.id, &candidate.terminal_id)
+            .unwrap();
         registry
             .reserve_cortana_candidate(
                 &intent.operation_id,
@@ -23071,6 +23261,7 @@ mod tests {
             .unwrap();
         let blocked = registry
             .fail_cortana_candidate(
+                &identities,
                 &intent.operation_id,
                 &intent.request_digest,
                 false,
@@ -23082,6 +23273,7 @@ mod tests {
             blocked.cortana_runtime.as_ref().unwrap().lifecycle,
             CortanaRuntimeLifecycle::NeedsAttention
         );
+        assert!(identities.get(&allocated.id).is_some());
         let error = registry
             .prepare_cortana_ensure(
                 "ensure-cleanup-contender",
@@ -23091,18 +23283,44 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("already in progress"));
 
-        let failed = registry
+        identities.fail_persist_after(0);
+        assert!(registry
             .fail_cortana_candidate(
+                &identities,
                 &intent.operation_id,
                 &intent.request_digest,
                 true,
                 "Candidate was confirmed gone. A new operation may be reviewed and retried.",
                 114,
             )
+            .is_err());
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::Failed
+        );
+        assert!(identities.get(&allocated.id).is_some());
+        let failed = registry
+            .fail_cortana_candidate(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                true,
+                "Candidate was confirmed gone. A new operation may be reviewed and retried.",
+                999,
+            )
             .unwrap();
         let runtime = failed.cortana_runtime.unwrap();
         assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::Failed);
         assert!(runtime.ensure_intent.unwrap().candidate.is_none());
+        assert!(identities.get(&allocated.id).is_none());
+        assert!(identities.resolve(&allocated.secret).is_none());
     }
 
     #[test]
@@ -23364,9 +23582,11 @@ mod tests {
             .unwrap();
         let cleanup_before = serde_json::to_value(cleanup_registry.snapshot()).unwrap();
         let cleanup_bytes = std::fs::read(&cleanup_path).unwrap();
+        let cleanup_identities = crate::identity::IdentityStore::ephemeral();
         cleanup_registry.fail_next_persist("cleanup pending persist failure");
         assert!(cleanup_registry
             .fail_cortana_candidate(
+                &cleanup_identities,
                 &cleanup_intent.operation_id,
                 &cleanup_intent.request_digest,
                 false,
@@ -23381,6 +23601,7 @@ mod tests {
         assert_eq!(std::fs::read(&cleanup_path).unwrap(), cleanup_bytes);
         let cleanup_pending = cleanup_registry
             .fail_cortana_candidate(
+                &cleanup_identities,
                 &cleanup_intent.operation_id,
                 &cleanup_intent.request_digest,
                 false,
@@ -23392,6 +23613,7 @@ mod tests {
         assert_eq!(
             cleanup_restarted
                 .fail_cortana_candidate(
+                    &cleanup_identities,
                     &cleanup_intent.operation_id,
                     &cleanup_intent.request_digest,
                     false,
@@ -23430,8 +23652,10 @@ mod tests {
             let operation_id = intent.operation_id.clone();
             let request_digest = intent.request_digest.clone();
             let registry = seed_cortana_registry(captain);
+            let identities = crate::identity::IdentityStore::ephemeral();
             let pending = registry
                 .fail_cortana_candidate(
+                    &identities,
                     &operation_id,
                     &request_digest,
                     false,
@@ -23441,6 +23665,7 @@ mod tests {
                 .unwrap();
             let pending_replay = registry
                 .fail_cortana_candidate(
+                    &identities,
                     &operation_id,
                     &request_digest,
                     false,
@@ -23451,6 +23676,7 @@ mod tests {
             assert_eq!(pending_replay, pending, "{label} response replay drifted");
             let failed = registry
                 .fail_cortana_candidate(
+                    &identities,
                     &operation_id,
                     &request_digest,
                     true,
@@ -23467,6 +23693,7 @@ mod tests {
                 .all(|entry| entry.state != CortanaLineageState::Current));
             let failed_replay = registry
                 .fail_cortana_candidate(
+                    &identities,
                     &operation_id,
                     &request_digest,
                     true,
