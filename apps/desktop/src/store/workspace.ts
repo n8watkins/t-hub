@@ -194,7 +194,12 @@ const DEFAULT_TAB_NAME = "Workspace 1";
  * dependency on the captain store.
  */
 export const CAPTAINS_TAB_ID = "captains-reserved";
-export const CAPTAINS_TAB_NAME = "Captains";
+export const CAPTAINS_TAB_NAME = "Captain Workspace";
+export type WorkspaceKind = "work" | "captain";
+
+function workspaceKind(tab: Pick<WorkspaceTab, "id" | "kind">): WorkspaceKind {
+  return tab.kind ?? (tab.id === CAPTAINS_TAB_ID ? "captain" : "work");
+}
 
 /** A synchronous read of the authoritative AGENT id set (the orchestrator plus
  *  every pinned/claimed captain), registered by the captain store. captain.ts
@@ -224,9 +229,29 @@ export function registerCaptainRegistry(fn: () => Iterable<TerminalId>): void {
 function ensureReservedCaptainsTab(tabs: WorkspaceTab[]): WorkspaceTab[] {
   const copies = tabs.filter((t) => t.id === CAPTAINS_TAB_ID);
   if (copies.length === 0) {
-    return [...tabs, { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] }];
+    return [
+      ...tabs,
+      {
+        schemaVersion: 1,
+        id: CAPTAINS_TAB_ID,
+        name: CAPTAINS_TAB_NAME,
+        kind: "captain",
+        order: [],
+      },
+    ];
   }
-  if (copies.length === 1) return tabs;
+  if (copies.length === 1) {
+    return tabs.map((tab) =>
+      tab.id === CAPTAINS_TAB_ID
+        ? {
+            ...tab,
+            schemaVersion: 1,
+            name: CAPTAINS_TAB_NAME,
+            kind: "captain",
+          }
+        : tab,
+    );
+  }
   // Merge duplicates: union their orders (dedup, first-seen wins) into the first
   // copy's slot; drop the rest.
   const mergedOrder: TerminalId[] = [];
@@ -243,6 +268,8 @@ function ensureReservedCaptainsTab(tabs: WorkspaceTab[]): WorkspaceTab[] {
     ...copies[0],
     id: CAPTAINS_TAB_ID,
     name: CAPTAINS_TAB_NAME,
+    schemaVersion: 1,
+    kind: "captain",
     order: mergedOrder,
     // A changed tile set invalidates manual grid ratios.
     sizes: copies[0].order.length === mergedOrder.length ? copies[0].sizes : undefined,
@@ -273,8 +300,10 @@ export interface TabSizes {
 
 /** A user-named canvas: an ordered tile set plus optional manual size ratios. */
 export interface WorkspaceTab {
+  schemaVersion?: 1;
   id: string;
   name: string;
+  kind?: WorkspaceKind;
   /** Tile order within this tab, by terminal id. */
   order: TerminalId[];
   /** Optional manual-mode grid ratios; absent => even auto-grid. */
@@ -740,9 +769,18 @@ function cleanSizes(value: unknown): TabSizes | undefined {
 
 /** Sanitize one parsed tab record (id/name/order/sizes) into a clean WorkspaceTab. */
 function cleanTab(t: Partial<WorkspaceTab>): WorkspaceTab {
+  const id = typeof t.id === "string" && t.id ? t.id : newTabId();
+  const kind: WorkspaceKind = id === CAPTAINS_TAB_ID ? "captain" : "work";
   return {
-    id: typeof t.id === "string" && t.id ? t.id : newTabId(),
-    name: typeof t.name === "string" && t.name ? t.name : "Workspace",
+    schemaVersion: 1,
+    id,
+    name:
+      kind === "captain"
+        ? CAPTAINS_TAB_NAME
+        : typeof t.name === "string" && t.name
+          ? t.name
+          : "Workspace",
+    kind,
     order: cleanOrder(t.order),
     sizes: cleanSizes(t.sizes),
   };
@@ -753,6 +791,11 @@ function cleanTabs(value: unknown): WorkspaceTab[] {
   return Array.isArray(value)
     ? value
         .filter((t): t is Partial<WorkspaceTab> => !!t && typeof t === "object")
+        .filter(
+          (tab) =>
+            tab.kind === undefined ||
+            tab.kind === (tab.id === CAPTAINS_TAB_ID ? "captain" : "work"),
+        )
         .map(cleanTab)
     : [];
 }
@@ -1085,7 +1128,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
    *  plain spawn out of Captains when it happens to be the active tab. */
   const placeWorkTile = (info: TerminalInfo, preferredTabId?: string): void => {
     const { tabs, terminals } = get();
-    const isWork = (t: WorkspaceTab): boolean => t.id !== CAPTAINS_TAB_ID;
+    const isWork = (t: WorkspaceTab): boolean => workspaceKind(t) === "work";
     const preferred =
       preferredTabId && preferredTabId !== CAPTAINS_TAB_ID
         ? tabs.find((t) => t.id === preferredTabId && isWork(t))
@@ -1240,7 +1283,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // A plain work spawn must never land in the reserved Captains tab (only
       // agent tiles belong there, via moveTileToCaptainsTab): if the active tab
       // is Captains, redirect the tile into a work tab instead.
-      if (active.id === CAPTAINS_TAB_ID) {
+      if (workspaceKind(active) === "captain") {
         placeWorkTile(info);
         return;
       }
@@ -1332,7 +1375,12 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // keeps in step) and drops out of Captains, cleaned up below like any gone
       // tile. The surviving ids are then held out of the server-derived work tabs
       // so an agent tile never reappears in a work tab after a sync.
-      const serverTileIds = new Set(regTabs.flatMap((r) => r.tileIds));
+      const validRegistryTabs = regTabs.filter(
+        (tab) =>
+          tab.kind === undefined ||
+          tab.kind === (tab.id === CAPTAINS_TAB_ID ? "captain" : "work"),
+      );
+      const serverTileIds = new Set(validRegistryTabs.flatMap((r) => r.tileIds));
       const registeredCaptains = new Set(captainRegistryIds());
       const localCaptains = tabs.find((t) => t.id === CAPTAINS_TAB_ID);
       const captainsOrder = (localCaptains?.order ?? []).filter(
@@ -1364,7 +1412,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // subset of locallyPlaced, so this gate also subsumes not-in-captainsOrder.)
       const locallyPlaced = new Set(tabs.flatMap((t) => t.order));
       const serverCaptainsTiles =
-        regTabs.find((r) => r.id === CAPTAINS_TAB_ID)?.tileIds ?? [];
+        validRegistryTabs.find((r) => r.id === CAPTAINS_TAB_ID)?.tileIds ?? [];
       for (const id of serverCaptainsTiles) {
         if (!locallyPlaced.has(id)) captainsOrder.push(id);
       }
@@ -1378,8 +1426,12 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // and since the echoed copy's tiles are all agent tiles filtered out by
       // `agentSet`, that duplicate has an empty `order` and shows the stray "new
       // terminal" placeholder even though the real Captains tab has terminals.
-      const serverTabs: WorkspaceTab[] = regTabs
-        .filter((r) => r.id !== CAPTAINS_TAB_ID)
+      const serverTabs: WorkspaceTab[] = validRegistryTabs
+        .filter(
+          (r) =>
+            (r.kind ?? (r.id === CAPTAINS_TAB_ID ? "captain" : "work")) !==
+            "captain",
+        )
         .map((r) => {
           const existing = byId.get(r.id);
           const order = r.tileIds.filter((id) => !agentSet.has(id));
@@ -1388,8 +1440,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
             existing.order.length === order.length &&
             existing.order.every((x, i) => x === order[i]);
           return {
+            schemaVersion: 1,
             id: r.id,
             name: r.name.trim() || existing?.name || "Workspace",
+            kind: "work",
             order,
             // Manual grid ratios survive only if the tile set didn't change.
             sizes: sameOrder ? existing.sizes : undefined,
@@ -1401,6 +1455,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         {
           id: CAPTAINS_TAB_ID,
           name: CAPTAINS_TAB_NAME,
+          schemaVersion: 1,
+          kind: "captain",
           order: captainsOrder,
           sizes:
             localCaptains &&
@@ -1420,6 +1476,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           return (
             t.id === o.id &&
             t.name === o.name &&
+            t.schemaVersion === o.schemaVersion &&
+            workspaceKind(t) === workspaceKind(o) &&
             t.order.length === o.order.length &&
             t.order.every((x, j) => x === o.order[j])
           );
@@ -1857,7 +1915,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // Guard on the WORK-tab count: the reserved Captains tab is ALWAYS present,
       // so it must not count toward the last-tab check - else the last work tab
       // could be closed, parking the user on the Captains-only view.
-      if (tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length <= 1) return;
+      if (tabs.filter((t) => workspaceKind(t) === "work").length <= 1) return;
       const target = tabs.find((t) => t.id === id);
       if (!target) return;
 
@@ -1919,7 +1977,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // Keep at least one WORK tab: the reserved Captains tab is always present
       // and must not count toward the guard, so closing the last work tab is
       // refused (else the user is parked on the Captains-only view).
-      if (tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length <= 1) return [];
+      if (tabs.filter((t) => workspaceKind(t) === "work").length <= 1) return [];
       const target = tabs.find((t) => t.id === id);
       if (!target) return [];
 
@@ -2166,7 +2224,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       set({
         tabs: [
           ...tabs,
-          { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] },
+          {
+            schemaVersion: 1,
+            id: CAPTAINS_TAB_ID,
+            name: CAPTAINS_TAB_NAME,
+            kind: "captain",
+            order: [],
+          },
         ],
       });
       persist();

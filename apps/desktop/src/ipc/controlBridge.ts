@@ -144,6 +144,7 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
                 tHubCapability: tHubCapability(raw.tHubCapability),
                 conversationId: str(raw, "conversationId"),
                 resumePoint: str(raw, "resumePoint"),
+                workspaceTabId: str(raw, "workspaceTabId"),
                 state: raw.state as CrewRef["state"],
               },
             ];
@@ -154,6 +155,9 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
     records.push({
       terminalId,
       shipSlug: typeof r.shipSlug === "string" ? r.shipSlug : "",
+      assignmentId:
+        typeof r.assignmentId === "string" ? r.assignmentId : undefined,
+      displayName: typeof r.displayName === "string" ? r.displayName : undefined,
       role: r.role === "cortana" ? "cortana" : "captain",
       claudeUuid: typeof r.claudeUuid === "string" ? r.claudeUuid : undefined,
       provider: harness(r.provider),
@@ -492,8 +496,10 @@ function startTabReporter(): void {
     inFlight = true;
     const { tabs, activeTabId } = useWorkspace.getState();
     const payload = tabs.map((t) => ({
+      schemaVersion: 1 as const,
       id: t.id,
       name: t.name,
+      kind: t.kind ?? (t.id === "captains-reserved" ? "captain" : "work"),
       tileIds: t.order,
     }));
     void import("./client")

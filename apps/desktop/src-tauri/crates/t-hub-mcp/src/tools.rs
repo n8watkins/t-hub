@@ -338,9 +338,26 @@ fn schema_claim_captain() -> Value {
             "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused." },
             "provider":         { "type": "string", "enum": ["codex", "claude"], "description": "Harness that owns providerSessionId. Legacy callers default to Claude." },
             "providerSessionId": { "type": "string", "description": "Optional provider-native conversation id, such as CODEX_THREAD_ID or a Claude session UUID." },
-            "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional workspace tab ids this captain controls (defaults to the tab currently holding the captain's tile)." }
+            "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional existing Work Workspace ids this Captain owns. No placement, cwd, or active-tab inference occurs when omitted." }
         },
         "required": ["captainSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_rename_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
+            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
+            "displayName": { "type": "string", "minLength": 1, "maxLength": 120, "description": "Durable trimmed Captain display name." }
+        },
+        "required": ["displayName"],
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["shipSlug"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -440,7 +457,7 @@ fn schema_attach_captain() -> Value {
             "provider": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
             "providerSessionId": { "type": "string", "description": "Provider-native conversation id to checkpoint immediately." },
             "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
-            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Project workspace tabs this Captain owns. Defaults to the terminal's current tab." }
+            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Existing project Work Workspace ids this Captain owns. No current-tab inference occurs." }
         },
         "required": ["captainSessionId", "projectId", "assignment"],
         "additionalProperties": false
@@ -470,8 +487,9 @@ fn schema_dispatch_crew() -> Value {
             "worktreePath": { "type": "string", "description": "Existing Git worktree of the Captain project. Defaults to the main worktree." },
             "branch": { "type": "string", "description": "Branch recorded in the durable Crew manifest." },
             "ttlSeconds": { "type": "integer", "minimum": 300, "maximum": 86400, "description": "Initial Powder claim TTL. Defaults to 3600." },
-            "tabId": { "type": "string", "description": "Optional existing workspace tab for the Crew tile." },
-            "tabName": { "type": "string", "description": "Optional workspace tab name, reused or created without switching focus." }
+            "workspaceTabId": { "type": "string", "description": "Exact existing Work Workspace owned by this Captain. Omit only when exactly one owned candidate exists." },
+            "tabId": { "type": "string", "description": "Compatibility alias for workspaceTabId." },
+            "tabName": { "type": "string", "description": "Compatibility selector for one uniquely named existing Work Workspace owned by this Captain. It never creates a Workspace." }
         },
         "required": ["cardId", "task"],
         "anyOf": [
@@ -878,6 +896,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_release_captain,
         },
         ToolDef {
+            name: "rename_captain",
+            tier: Tier::Organization,
+            summary: "Rename one durable Captain identity without changing its Assignment, terminal, Harness, or Workspace ownership.",
+            input_schema: schema_rename_captain,
+        },
+        ToolDef {
             name: "captain_checkpoint",
             tier: Tier::Organization,
             summary: "Persist a Captain or Crew conversation identifier and reset-safe resume point in the ship manifest.",
@@ -1061,6 +1085,7 @@ mod tests {
             "claim_captain",
             "attach_captain",
             "release_captain",
+            "rename_captain",
             "append_crew_powder_work_log",
             "read_crew_powder_evidence",
             "review_crew_powder_criterion",
@@ -1154,7 +1179,12 @@ mod tests {
         let list = find("list_captains").unwrap().to_mcp();
         assert_eq!(list["annotations"]["t-hubTier"], "read");
         assert_eq!(list["annotations"]["confirmationRequired"], false);
-        for name in ["claim_captain", "release_captain", "captain_checkpoint"] {
+        for name in [
+            "claim_captain",
+            "release_captain",
+            "rename_captain",
+            "captain_checkpoint",
+        ] {
             let mcp = find(name).unwrap().to_mcp();
             assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
@@ -1165,6 +1195,9 @@ mod tests {
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+        let rename_schema = (find("rename_captain").unwrap().input_schema)();
+        assert_eq!(rename_schema["required"], json!(["displayName"]));
+        assert_eq!(rename_schema["properties"]["displayName"]["maxLength"], 120);
     }
 
     #[test]
@@ -1257,6 +1290,10 @@ mod tests {
         assert_eq!(
             (dispatch.input_schema)()["anyOf"].as_array().unwrap().len(),
             2
+        );
+        assert_eq!(
+            (dispatch.input_schema)()["properties"]["workspaceTabId"]["type"],
+            "string"
         );
 
         let checkpoint = find("captain_checkpoint").unwrap();

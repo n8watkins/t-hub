@@ -155,7 +155,16 @@ export interface CrewRef {
   tHubCapability?: "read" | "control";
   conversationId?: string;
   resumePoint?: string;
-  state?: { kind: "active" | "orphaned" | "removed"; since?: number };
+  workspaceTabId?: string;
+  state?: {
+    kind:
+      | "active"
+      | "orphaned"
+      | "cleanupPending"
+      | "needsAssignment"
+      | "removed";
+    since?: number;
+  };
 }
 
 /** One claim from the SERVER captains registry (item-2 identity re-key): the ship
@@ -164,6 +173,8 @@ export interface CrewRef {
  *  tabs it controls, and the crew it spawned. */
 export interface CaptainClaimRecord {
   shipSlug: string;
+  assignmentId?: string;
+  displayName?: string;
   role?: "cortana" | "captain";
   claudeUuid?: string;
   provider?: "codex" | "claude";
