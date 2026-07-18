@@ -35619,7 +35619,10 @@ mod tests {
         );
 
         assert!(!response.ok);
-        assert!(response.error.unwrap().contains("ambiguous historical"));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle")
+        );
         let snapshot = registry.snapshot();
         assert_eq!(
             snapshot
