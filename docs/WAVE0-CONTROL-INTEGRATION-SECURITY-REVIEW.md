@@ -441,6 +441,10 @@ An authenticated `th send` report for the incompatible-load remediation was atte
 The installed control plane again rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+An authenticated `th send` report for the matching-endpoint transport remediation was attempted from evidence head `684c2c4b3f6d6e6e17f0cc50ef87221790cb5c58`.
+The installed control plane again rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
