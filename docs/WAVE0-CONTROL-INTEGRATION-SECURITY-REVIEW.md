@@ -499,6 +499,13 @@ An authenticated `th send` report for the HTTP status-body remediation was attem
 The installed control plane again rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+An authenticated `th send` report for the HMAC endpoint-verification remediation was attempted from evidence head `64b09c3fc1863c07daa6fd003b0503b64c56971a`.
+The installed control plane rejected it because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
+The exact-run work-log append was attempted once with stable operation identity `work-log:wave0-hmac-verify-8619968`.
+The sanctioned CLI returned `unsupported` because deployed run-bound capability verification failed before any mutation.
+No work-log append is claimed as delivered.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
