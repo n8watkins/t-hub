@@ -27040,21 +27040,73 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestTmuxSessionCleanup {
-        target: Option<String>,
-    }
+    struct DispatchWorkerCompletion(Arc<AtomicBool>);
 
-    impl TestTmuxSessionCleanup {
-        fn track(&mut self, terminal_id: &str) {
-            self.target = Some(tmux_target(terminal_id));
+    impl Drop for DispatchWorkerCompletion {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
-    impl Drop for TestTmuxSessionCleanup {
+    struct DispatchWorker {
+        sink: Arc<RecordingSink>,
+        resume: Option<mpsc::SyncSender<()>>,
+        worker: Option<std::thread::JoinHandle<Result<Value, String>>>,
+    }
+
+    impl DispatchWorker {
+        fn start(
+            ctx: ControlContext,
+            args: Value,
+            sink: Arc<RecordingSink>,
+            resume: mpsc::SyncSender<()>,
+            completion: Arc<AtomicBool>,
+        ) -> Self {
+            let worker = std::thread::spawn(move || {
+                let _completion = DispatchWorkerCompletion(completion);
+                dispatch_crew(&ctx, &args, None, true)
+            });
+            Self {
+                sink,
+                resume: Some(resume),
+                worker: Some(worker),
+            }
+        }
+
+        fn resume(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+        }
+
+        fn join(&mut self) -> std::thread::Result<Result<Value, String>> {
+            self.resume();
+            self.worker
+                .take()
+                .expect("dispatch worker was already joined")
+                .join()
+        }
+
+        fn dispatched_terminal_ids(&self) -> Vec<String> {
+            self.sink
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(command, _)| command == "spawn_terminal")
+                .filter_map(|(_, args)| args["id"].as_str().map(str::to_string))
+                .collect()
+        }
+    }
+
+    impl Drop for DispatchWorker {
         fn drop(&mut self) {
-            if let Some(target) = self.target.as_deref() {
-                let _ = reap_test_tmux_session(target);
+            self.resume();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            for terminal_id in self.dispatched_terminal_ids() {
+                let _ = reap_test_tmux_session(&tmux_target(&terminal_id));
             }
         }
     }
@@ -30953,8 +31005,9 @@ mod tests {
                 "testCodexUnobservedCommand": ":",
                 "testDispatchDormantPaneCommand": format!("exec {}", hostile_pane.display()),
         });
-        let dispatch_ctx = ctx.clone();
-        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        let completion = Arc::new(AtomicBool::new(false));
+        let mut worker =
+            DispatchWorker::start(ctx.clone(), args, sink.clone(), resume, completion.clone());
         assert_eq!(
             wait_for_respawn
                 .recv_timeout(Duration::from_secs(3))
@@ -30962,8 +31015,6 @@ mod tests {
             "before_respawn"
         );
         let crew_session_id = dispatched_terminal_id(&sink);
-        let mut cleanup = TestTmuxSessionCleanup::default();
-        cleanup.track(&crew_session_id);
         let ready_deadline = Instant::now() + Duration::from_secs(2);
         while !ready.exists() {
             assert!(
@@ -30990,8 +31041,8 @@ mod tests {
         let forwarded = serde_json::to_string(&spawn_forward).unwrap();
         assert!(!forwarded.contains(CREW_DORMANT_PANE_COMMAND));
         assert!(!forwarded.contains(&provider.command));
-        resume.send(()).unwrap();
         let result = worker.join().unwrap().unwrap();
+        assert!(completion.load(Ordering::SeqCst));
         provider.wait_for_invocation();
         assert_eq!(result["crew"]["terminalId"], json!(crew_session_id));
         assert_eq!(
@@ -31008,6 +31059,93 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 0);
+    }
+
+    fn assert_dispatch_worker_unwind_reaps_at_respawn_barrier(wait_for_barrier: bool) {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "assert_dispatch_worker_unwind_reaps_at_respawn_barrier: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!(
+            "dispatch-worker-unwind-{}-{}",
+            if wait_for_barrier { "after" } else { "before" },
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_respawn) = mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_respawn",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let completion = Arc::new(AtomicBool::new(false));
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _worker = DispatchWorker::start(
+                ctx.clone(),
+                json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Prove panic-safe dispatch worker cleanup",
+                    "harness": "codex",
+                    "testHarnessCommand": provider.command,
+                    "testCodexUnobservedCommand": ":",
+                }),
+                sink.clone(),
+                resume,
+                completion.clone(),
+            );
+            if wait_for_barrier {
+                assert_eq!(
+                    wait_for_respawn
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("dispatch did not reach the private respawn barrier"),
+                    "before_respawn"
+                );
+            }
+            panic!("intentional dispatch-worker unwind");
+        }));
+        assert!(panic_result.is_err());
+        assert!(
+            completion.load(Ordering::SeqCst),
+            "the RAII fixture must join the dispatch worker before unwinding fixtures"
+        );
+        let terminal_ids = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(command, _)| command == "spawn_terminal")
+            .filter_map(|(_, args)| args["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_ids.len(),
+            1,
+            "dispatch must spawn exactly one terminal"
+        );
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&terminal_ids[0])),
+            tmux::SessionLiveness::Gone,
+            "the RAII fixture must reap the dispatched terminal after joining"
+        );
+    }
+
+    #[test]
+    fn dispatch_worker_unwind_before_respawn_barrier_reaps_worker_and_terminal() {
+        assert_dispatch_worker_unwind_reaps_at_respawn_barrier(false);
+    }
+
+    #[test]
+    fn dispatch_worker_unwind_after_respawn_barrier_reaps_worker_and_terminal() {
+        assert_dispatch_worker_unwind_reaps_at_respawn_barrier(true);
     }
 
     #[test]
