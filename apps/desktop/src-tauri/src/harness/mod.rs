@@ -257,6 +257,8 @@ pub enum LaunchAttestationError {
     WrapperObscured,
     MissingPermission,
     WrongPermission,
+    WrongModel,
+    WrongReasoningEffort,
     ConflictingPermission,
     MalformedPermission,
     TerminalChanged,
@@ -273,6 +275,10 @@ impl std::fmt::Display for LaunchAttestationError {
             Self::WrapperObscured => "a wrapper obscures the provider-native foreground process",
             Self::MissingPermission => "the required provider-native permission flag is missing",
             Self::WrongPermission => "provider-native permission evidence has the wrong mode",
+            Self::WrongModel => "provider-native process evidence has the wrong model",
+            Self::WrongReasoningEffort => {
+                "provider-native process evidence has the wrong reasoning effort"
+            }
             Self::ConflictingPermission => {
                 "provider-native permission evidence contains conflicting modes"
             }
@@ -684,6 +690,139 @@ pub(crate) fn provider_arguments(
         return Err(LaunchAttestationError::WrongProvider);
     }
     Ok(&evidence.argv[provider_index + 1..])
+}
+
+/// Return the exact provider executable token attested in the foreground argv.
+/// This is non-secret and is used to resolve installed-runtime evidence without
+/// trusting a separate PATH lookup to identify what the pane is running.
+pub(crate) fn provider_executable_path(
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+) -> Result<&str, LaunchAttestationError> {
+    let (provider, provider_index) =
+        process_provider(&evidence.argv).ok_or(LaunchAttestationError::WrapperObscured)?;
+    if provider != expected {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    evidence
+        .argv
+        .get(provider_index)
+        .map(String::as_str)
+        .ok_or(LaunchAttestationError::UnreadableEvidence)
+}
+
+/// Attest the exact model and reasoning selection from provider-native argv.
+/// Missing, repeated, malformed, or substituted options fail closed.
+pub(crate) fn attest_runtime_policy(
+    evidence: &HarnessProcessEvidence,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+) -> Result<(), LaunchAttestationError> {
+    let args = provider_arguments(evidence, expected)?;
+    let model = unique_option_value(args, &["--model", "-m"])
+        .map_err(|_| LaunchAttestationError::WrongModel)?
+        .ok_or(LaunchAttestationError::WrongModel)?;
+    if model != expected_model {
+        return Err(LaunchAttestationError::WrongModel);
+    }
+    let reasoning = match expected {
+        Harness::Codex => unique_config_value(args, "model_reasoning_effort")?,
+        Harness::Claude => unique_option_value(args, &["--effort"])
+            .map_err(|_| LaunchAttestationError::WrongReasoningEffort)?,
+    }
+    .ok_or(LaunchAttestationError::WrongReasoningEffort)?;
+    if reasoning.trim_matches('"') != expected_reasoning_effort {
+        return Err(LaunchAttestationError::WrongReasoningEffort);
+    }
+    Ok(())
+}
+
+fn unique_option_value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<&'a str>, ()> {
+    let mut found = None;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !argument.starts_with('-') {
+            break;
+        }
+        let mut matched = None;
+        for name in names {
+            if argument == name {
+                matched = Some(
+                    args.get(index + 1)
+                        .filter(|value| !value.starts_with('-'))
+                        .map(String::as_str)
+                        .ok_or(())?,
+                );
+                index += 1;
+                break;
+            }
+            if let Some(value) = argument.strip_prefix(&format!("{name}=")) {
+                if value.is_empty() {
+                    return Err(());
+                }
+                matched = Some(value);
+                break;
+            }
+        }
+        if let Some(value) = matched {
+            if found.replace(value).is_some() {
+                return Err(());
+            }
+        } else if matches!(
+            argument.as_str(),
+            "--model" | "-m" | "--effort" | "--config" | "-c" | "--sandbox" | "-s"
+        ) {
+            if args.get(index + 1).is_none() {
+                return Err(());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(found)
+}
+
+fn unique_config_value<'a>(
+    args: &'a [String],
+    key: &str,
+) -> Result<Option<&'a str>, LaunchAttestationError> {
+    let mut found = None;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !argument.starts_with('-') {
+            break;
+        }
+        let config = if matches!(argument.as_str(), "--config" | "-c") {
+            index += 1;
+            Some(
+                args.get(index)
+                    .map(String::as_str)
+                    .ok_or(LaunchAttestationError::WrongReasoningEffort)?,
+            )
+        } else {
+            argument
+                .strip_prefix("--config=")
+                .or_else(|| argument.strip_prefix("-c="))
+        };
+        if let Some(config) = config {
+            if let Some(value) = config.strip_prefix(&format!("{key}=")) {
+                if value.is_empty() || found.replace(value).is_some() {
+                    return Err(LaunchAttestationError::WrongReasoningEffort);
+                }
+            }
+        } else if matches!(
+            argument.as_str(),
+            "--model" | "-m" | "--effort" | "--sandbox" | "-s"
+        ) {
+            if args.get(index + 1).is_none() {
+                return Err(LaunchAttestationError::WrongReasoningEffort);
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(found)
 }
 
 fn process_provider(argv: &[String]) -> Option<(Harness, usize)> {
@@ -1313,5 +1452,95 @@ mod tests {
                 .permission_map(CREW_DEFAULT_PERMISSION),
             ["--dangerously-skip-permissions"]
         );
+    }
+
+    #[test]
+    fn runtime_policy_attestation_accepts_exact_codex_and_claude_options() {
+        let codex = HarnessProcessEvidence::test(
+            42,
+            900,
+            &[
+                "/opt/t-hub/bin/codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5.6-terra",
+                "-c",
+                "model_reasoning_effort=medium",
+                "coordinate",
+            ],
+        );
+        attest_runtime_policy(&codex, Harness::Codex, "gpt-5.6-terra", "medium").unwrap();
+        assert_eq!(
+            provider_executable_path(&codex, Harness::Codex).unwrap(),
+            "/opt/t-hub/bin/codex"
+        );
+
+        let claude = HarnessProcessEvidence::test(
+            43,
+            901,
+            &[
+                "node",
+                "/opt/t-hub/bin/claude",
+                "--dangerously-skip-permissions",
+                "--model=claude-opus-4-1",
+                "--effort",
+                "high",
+                "coordinate",
+            ],
+        );
+        attest_runtime_policy(&claude, Harness::Claude, "claude-opus-4-1", "high").unwrap();
+        assert_eq!(
+            provider_executable_path(&claude, Harness::Claude).unwrap(),
+            "/opt/t-hub/bin/claude"
+        );
+    }
+
+    #[test]
+    fn runtime_policy_attestation_fails_closed_on_missing_duplicate_or_substituted_axes() {
+        let cases = [
+            (
+                vec![
+                    "codex",
+                    "--model",
+                    "other",
+                    "-c",
+                    "model_reasoning_effort=medium",
+                ],
+                LaunchAttestationError::WrongModel,
+            ),
+            (
+                vec![
+                    "codex",
+                    "--model",
+                    "gpt-5.6-terra",
+                    "--model",
+                    "gpt-5.6-terra",
+                    "-c",
+                    "model_reasoning_effort=medium",
+                ],
+                LaunchAttestationError::WrongModel,
+            ),
+            (
+                vec!["codex", "--model", "gpt-5.6-terra"],
+                LaunchAttestationError::WrongReasoningEffort,
+            ),
+            (
+                vec![
+                    "codex",
+                    "--model",
+                    "gpt-5.6-terra",
+                    "-c",
+                    "model_reasoning_effort=high",
+                ],
+                LaunchAttestationError::WrongReasoningEffort,
+            ),
+        ];
+        for (argv, expected) in cases {
+            let evidence = HarnessProcessEvidence::test(42, 900, &argv);
+            assert_eq!(
+                attest_runtime_policy(&evidence, Harness::Codex, "gpt-5.6-terra", "medium"),
+                Err(expected)
+            );
+        }
     }
 }
