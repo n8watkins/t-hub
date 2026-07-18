@@ -43,6 +43,7 @@ const IDENTITY_GENERATION_WATERMARK_FORMAT: &str = "t-hub:identity-generation-wa
 const LEGACY_IDENTITY_GENERATION_WATERMARK_FORMAT: &str = "t-hub:identity-generation-watermark:v1";
 const IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION: u32 = 2;
 const IDENTITY_SNAPSHOT_INTEGRITY_VERSION: u32 = 1;
+const IDENTITY_SNAPSHOT_COMMIT_VERSION: u32 = 1;
 
 /// Best-effort org role captured at mint. Durable role-keying is item 2 (see the
 /// module note); this is enough for the plane to record "in what role" alongside the
@@ -228,6 +229,8 @@ struct IdentityGenerationWatermark {
     integrity: Option<IdentitySnapshotIntegrity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration: Option<IdentitySchemaMigrationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_pending: Option<IdentitySnapshotCommitReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +238,15 @@ struct IdentityGenerationWatermark {
 struct IdentitySnapshotIntegrity {
     schema_version: u32,
     semantic_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentitySnapshotCommitReceipt {
+    schema_version: u32,
+    previous_semantic_sha256: String,
+    target_semantic_sha256: String,
+    target_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +271,7 @@ impl IdentityGenerationWatermark {
                 semantic_sha256: identity_snapshot_semantic_sha256(snapshot)?,
             }),
             migration: None,
+            commit_pending: None,
         }
         .validated()
     }
@@ -288,6 +301,33 @@ impl IdentityGenerationWatermark {
                 to_schema_version: IDENTITIES_SCHEMA_VERSION,
                 source_sha256,
                 target_semantic_sha256,
+            }),
+            commit_pending: None,
+        }
+        .validated()
+    }
+
+    fn staging_commit(previous: &Self, target: &IdentitiesSnapshot) -> Result<Self, String> {
+        previous.validate()?;
+        let previous_digest = previous
+            .integrity
+            .as_ref()
+            .ok_or("identity commit requires a current integrity anchor")?
+            .semantic_sha256
+            .clone();
+        let target_digest = identity_snapshot_semantic_sha256(target)?;
+        Self {
+            schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+            format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.to_string(),
+            identities_schema_version: IDENTITIES_SCHEMA_VERSION,
+            generation_high_water: previous.generation_high_water.max(target.generation),
+            integrity: previous.integrity.clone(),
+            migration: None,
+            commit_pending: Some(IdentitySnapshotCommitReceipt {
+                schema_version: IDENTITY_SNAPSHOT_COMMIT_VERSION,
+                previous_semantic_sha256: previous_digest,
+                target_semantic_sha256: target_digest,
+                target_generation: target.generation,
             }),
         }
         .validated()
@@ -332,6 +372,21 @@ impl IdentityGenerationWatermark {
                 return Err("identity generation watermark migration receipt is malformed".into());
             }
         }
+        if let Some(commit) = &self.commit_pending {
+            if commit.schema_version != IDENTITY_SNAPSHOT_COMMIT_VERSION
+                || !is_canonical_sha256(&commit.previous_semantic_sha256)
+                || !is_canonical_sha256(&commit.target_semantic_sha256)
+                || self.migration.is_some()
+                || self
+                    .integrity
+                    .as_ref()
+                    .map(|anchor| &anchor.semantic_sha256)
+                    != Some(&commit.previous_semantic_sha256)
+                || commit.target_generation > self.generation_high_water
+            {
+                return Err("identity snapshot commit receipt is malformed".into());
+            }
+        }
         Ok(())
     }
 }
@@ -372,9 +427,14 @@ fn read_generation_watermark(path: &PathBuf) -> Result<IdentityGenerationWaterma
 fn write_generation_watermark(
     path: &PathBuf,
     watermark: &IdentityGenerationWatermark,
-) -> std::io::Result<()> {
-    watermark.validate().map_err(std::io::Error::other)?;
-    write_private_atomic(path, &serde_json::to_vec_pretty(watermark)?)
+) -> Result<(), AtomicWriteError> {
+    watermark
+        .validate()
+        .map_err(std::io::Error::other)
+        .map_err(AtomicWriteError::BeforeCommit)?;
+    let body = serde_json::to_vec_pretty(watermark)
+        .map_err(|error| AtomicWriteError::BeforeCommit(error.into()))?;
+    write_private_atomic(path, &body)
 }
 
 fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), String> {
@@ -628,10 +688,13 @@ pub struct IdentityStore {
     inner: Mutex<IdentitiesSnapshot>,
     generation_watermark: Mutex<IdentityGenerationWatermark>,
     write_blocked: Option<String>,
+    durability_blocked: Mutex<Option<String>>,
     #[cfg(test)]
     persist_fail_after: Mutex<Option<usize>>,
     #[cfg(test)]
     fail_identity_write_after_watermark: Mutex<bool>,
+    #[cfg(test)]
+    fail_identity_parent_sync_after_rename: Mutex<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,6 +709,22 @@ enum IdentityLoadPersistAction {
     OrdinaryUpgrade,
     UpgradeSchemaV1 { source_sha256: String },
     FinalizeSchemaV1,
+    FinalizeSnapshotCommit,
+    RollBackSnapshotCommit,
+}
+
+fn pending_commit_accepts_snapshot(
+    snapshot: &IdentitiesSnapshot,
+    watermark: &IdentityGenerationWatermark,
+) -> bool {
+    let Ok(digest) = identity_snapshot_semantic_sha256(snapshot) else {
+        return false;
+    };
+    watermark.commit_pending.as_ref().is_some_and(|commit| {
+        (snapshot.generation == commit.target_generation && digest == commit.target_semantic_sha256)
+            || (snapshot.generation <= watermark.generation_high_water
+                && digest == commit.previous_semantic_sha256)
+    })
 }
 
 impl IdentityStore {
@@ -740,7 +819,8 @@ impl IdentityStore {
                     }
                 }
                 (Ok(Some((snapshot, _source, _source_sha256))), Ok(Some(watermark)))
-                    if snapshot.generation != watermark.generation_high_water =>
+                    if snapshot.generation != watermark.generation_high_water
+                        && !pending_commit_accepts_snapshot(&snapshot, &watermark) =>
                 {
                     (
                         IdentitiesSnapshot::default(),
@@ -784,7 +864,20 @@ impl IdentityStore {
                         snapshot_digest.as_deref()
                             == Some(receipt.target_semantic_sha256.as_str())
                     });
-                    if !matching_integrity && !matching_migration {
+                    let pending_target = watermark.commit_pending.as_ref().is_some_and(|commit| {
+                        snapshot.generation == commit.target_generation
+                            && snapshot_digest.as_deref()
+                                == Some(commit.target_semantic_sha256.as_str())
+                    });
+                    let pending_previous = watermark.commit_pending.as_ref().is_some_and(|commit| {
+                        snapshot_digest.as_deref()
+                            == Some(commit.previous_semantic_sha256.as_str())
+                    });
+                    if !matching_integrity
+                        && !matching_migration
+                        && !pending_target
+                        && !pending_previous
+                    {
                         (
                             IdentitiesSnapshot::default(),
                             IdentityLoadPersistAction::None,
@@ -795,7 +888,11 @@ impl IdentityStore {
                             watermark,
                         )
                     } else {
-                        let action = if watermark.migration.is_some() {
+                        let action = if pending_target {
+                            IdentityLoadPersistAction::FinalizeSnapshotCommit
+                        } else if pending_previous {
+                            IdentityLoadPersistAction::RollBackSnapshotCommit
+                        } else if watermark.migration.is_some() {
                             IdentityLoadPersistAction::FinalizeSchemaV1
                         } else {
                             IdentityLoadPersistAction::None
@@ -858,23 +955,32 @@ impl IdentityStore {
             inner: Mutex::new(inner),
             generation_watermark: Mutex::new(watermark),
             write_blocked,
+            durability_blocked: Mutex::new(None),
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
             #[cfg(test)]
             fail_identity_write_after_watermark: Mutex::new(false),
+            #[cfg(test)]
+            fail_identity_parent_sync_after_rename: Mutex::new(false),
         };
         let watermark_missing = !watermark_source_exists;
         let should_persist = !matches!(persist_action, IdentityLoadPersistAction::None)
             || (identity_source_exists && watermark_missing);
         if should_persist && store.write_blocked.is_none() {
             let persist_result = {
-                let snapshot = store.lock();
+                let mut snapshot = store.lock();
                 match persist_action {
                     IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 } => {
                         store.persist_schema_v1_migration(&snapshot, source_sha256)
                     }
                     IdentityLoadPersistAction::FinalizeSchemaV1 => {
                         store.finalize_schema_v1_migration(&snapshot)
+                    }
+                    IdentityLoadPersistAction::FinalizeSnapshotCommit => {
+                        store.finalize_snapshot_commit(&snapshot)
+                    }
+                    IdentityLoadPersistAction::RollBackSnapshotCommit => {
+                        store.roll_back_snapshot_commit(&mut snapshot)
                     }
                     IdentityLoadPersistAction::None
                     | IdentityLoadPersistAction::OrdinaryUpgrade => store.persist(&snapshot),
@@ -903,10 +1009,13 @@ impl IdentityStore {
             inner: Mutex::new(IdentitiesSnapshot::default()),
             generation_watermark: Mutex::new(IdentityGenerationWatermark::empty()),
             write_blocked: None,
+            durability_blocked: Mutex::new(None),
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
             #[cfg(test)]
             fail_identity_write_after_watermark: Mutex::new(false),
+            #[cfg(test)]
+            fail_identity_parent_sync_after_rename: Mutex::new(false),
         }
     }
 
@@ -986,9 +1095,60 @@ impl IdentityStore {
         Ok(())
     }
 
+    fn finalize_snapshot_commit(&self, snapshot: &IdentitiesSnapshot) -> Result<(), String> {
+        validate_identities_snapshot(snapshot)?;
+        let watermark_path = self
+            .watermark_path
+            .as_ref()
+            .ok_or("identity generation watermark path is unavailable")?;
+        let final_watermark = IdentityGenerationWatermark::current(snapshot)?;
+        write_generation_watermark(watermark_path, &final_watermark).map_err(|error| {
+            format!(
+                "identity snapshot commit completion persist to '{}' failed: {error}",
+                watermark_path.display()
+            )
+        })?;
+        *self
+            .generation_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = final_watermark;
+        Ok(())
+    }
+
+    fn roll_back_snapshot_commit(&self, snapshot: &mut IdentitiesSnapshot) -> Result<(), String> {
+        let high_water = self
+            .generation_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation_high_water;
+        snapshot.generation = high_water;
+        validate_identities_snapshot(snapshot)?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or("identity store rollback path is unavailable")?;
+        write_atomic(path, snapshot).map_err(|error| {
+            format!(
+                "identity snapshot commit rollback persist to '{}' failed: {error}",
+                path.display()
+            )
+        })?;
+        self.finalize_snapshot_commit(snapshot)
+    }
+
     fn persist(&self, snap: &IdentitiesSnapshot) -> Result<(), String> {
         if let Some(reason) = self.write_blocked.as_deref() {
             return Err(format!("identity store writes are blocked: {reason}"));
+        }
+        if let Some(reason) = self
+            .durability_blocked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_deref()
+        {
+            return Err(format!(
+                "identity store writes are blocked pending restart recovery: {reason}"
+            ));
         }
         validate_identities_snapshot(snap)?;
         #[cfg(test)]
@@ -1016,6 +1176,7 @@ impl IdentityStore {
             .watermark_path
             .as_ref()
             .ok_or("identity generation watermark path is unavailable")?;
+        let mut staged_commit = false;
         {
             let mut watermark = self
                 .generation_watermark
@@ -1026,25 +1187,27 @@ impl IdentityStore {
                     "identity store generation would regress below its durable watermark".into(),
                 );
             }
-            let advanced = IdentityGenerationWatermark::current(snap)?;
+            let target = IdentityGenerationWatermark::current(snap)?;
             let anchor_changed = watermark
                 .integrity
                 .as_ref()
-                .zip(advanced.integrity.as_ref())
+                .zip(target.integrity.as_ref())
                 .is_none_or(|(current, target)| current.semantic_sha256 != target.semantic_sha256);
-            if snap.generation > watermark.generation_high_water
+            if anchor_changed
+                || snap.generation > watermark.generation_high_water
                 || watermark.identities_schema_version != IDENTITIES_SCHEMA_VERSION
                 || watermark.schema_version != IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION
-                || anchor_changed
                 || !watermark_path.exists()
             {
-                write_generation_watermark(watermark_path, &advanced).map_err(|error| {
+                let staging = IdentityGenerationWatermark::staging_commit(&watermark, snap)?;
+                write_generation_watermark(watermark_path, &staging).map_err(|error| {
                     format!(
-                        "identity generation watermark persist to '{}' failed: {error}",
+                        "identity snapshot commit receipt persist to '{}' failed: {error}",
                         watermark_path.display()
                     )
                 })?;
-                *watermark = advanced;
+                *watermark = staging;
+                staged_commit = true;
             }
         }
         #[cfg(test)]
@@ -1060,12 +1223,47 @@ impl IdentityStore {
                 );
             }
         }
-        write_atomic(path, snap).map_err(|error| {
-            format!(
-                "identity store persist to '{}' failed: {error}",
-                path.display()
-            )
-        })
+        #[cfg(test)]
+        let identity_write = {
+            let mut fail = self
+                .fail_identity_parent_sync_after_rename
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *fail {
+                *fail = false;
+                write_atomic_with_parent_sync(snap, path, || {
+                    Err(std::io::Error::other(
+                        "identity parent sync failure injected by test",
+                    ))
+                })
+            } else {
+                write_atomic(path, snap)
+            }
+        };
+        #[cfg(not(test))]
+        let identity_write = write_atomic(path, snap);
+        match identity_write {
+            Ok(()) => {}
+            Err(AtomicWriteError::BeforeCommit(error)) => {
+                return Err(format!(
+                    "identity store persist to '{}' failed before commit: {error}",
+                    path.display()
+                ));
+            }
+            Err(AtomicWriteError::CommittedUnsynced(error)) => {
+                *self
+                    .durability_blocked
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
+                    "identity snapshot rename committed but its parent directory was not synchronized: {error}"
+                ));
+                return Ok(());
+            }
+        }
+        if staged_commit {
+            self.finalize_snapshot_commit(snap)?;
+        }
+        Ok(())
     }
 
     /// Mint a fresh per-session identity: a distinct id + secret, recorded in the
@@ -1425,6 +1623,14 @@ impl IdentityStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
     }
+
+    #[cfg(test)]
+    pub fn fail_identity_parent_sync_after_rename(&self) {
+        *self
+            .fail_identity_parent_sync_after_rename
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
 }
 
 fn default_identities_path() -> PathBuf {
@@ -1443,9 +1649,37 @@ fn default_identities_path() -> PathBuf {
 /// item-3 Pillar B: each secret is SEALED at rest (DPAPI on Windows; plaintext behind
 /// 0600 on the pure-WSL/ext4 and dev/CI hosts) so the shared-readable state file does
 /// not expose the bearer tokens in cleartext on the real Windows deployment.
-fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> std::io::Result<()> {
+#[derive(Debug)]
+enum AtomicWriteError {
+    BeforeCommit(std::io::Error),
+    CommittedUnsynced(std::io::Error),
+}
+
+impl std::fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCommit(error) => write!(f, "atomic write failed before rename: {error}"),
+            Self::CommittedUnsynced(error) => write!(
+                f,
+                "atomic rename committed but parent directory synchronization failed: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AtomicWriteError {}
+
+fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> Result<(), AtomicWriteError> {
+    write_atomic_with_parent_sync(snap, path, || sync_parent_directory(path))
+}
+
+fn write_atomic_with_parent_sync(
+    snap: &IdentitiesSnapshot,
+    path: &PathBuf,
+    sync_parent: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), AtomicWriteError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(AtomicWriteError::BeforeCommit)?;
     }
     // Seal secrets only at the disk boundary; the in-memory secret stays plaintext so
     // `resolve` compares directly.
@@ -1453,15 +1687,24 @@ fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> std::io::Result<()
     for ident in sealed.identities.values_mut() {
         ident.secret = crate::secret_seal::seal_str(&ident.secret);
     }
-    let body = serde_json::to_vec_pretty(&sealed)?;
-    write_private_atomic(path, &body)
+    let body = serde_json::to_vec_pretty(&sealed)
+        .map_err(|error| AtomicWriteError::BeforeCommit(error.into()))?;
+    write_private_atomic_with_parent_sync(path, &body, sync_parent)
 }
 
-fn write_private_atomic(path: &PathBuf, body: &[u8]) -> std::io::Result<()> {
+fn write_private_atomic(path: &PathBuf, body: &[u8]) -> Result<(), AtomicWriteError> {
+    write_private_atomic_with_parent_sync(path, body, || sync_parent_directory(path))
+}
+
+fn write_private_atomic_with_parent_sync(
+    path: &PathBuf,
+    body: &[u8],
+    sync_parent: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), AtomicWriteError> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(AtomicWriteError::BeforeCommit)?;
     }
     let tmp = path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4().simple()));
     let mut options = std::fs::OpenOptions::new();
@@ -1478,13 +1721,13 @@ fn write_private_atomic(path: &PathBuf, body: &[u8]) -> std::io::Result<()> {
     })();
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(error);
+        return Err(AtomicWriteError::BeforeCommit(error));
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(AtomicWriteError::BeforeCommit(e));
     }
-    sync_parent_directory(path)?;
+    sync_parent().map_err(AtomicWriteError::CommittedUnsynced)?;
     Ok(())
 }
 
@@ -1877,6 +2120,7 @@ mod tests {
             generation_high_water: 4,
             integrity: None,
             migration: None,
+            commit_pending: None,
         };
         std::fs::write(
             &watermark_path,
@@ -2072,6 +2316,75 @@ mod tests {
     }
 
     #[test]
+    fn parent_sync_failure_is_journaled_as_committed_unsynced_and_recovers_on_restart() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let store = IdentityStore::load(path.clone());
+        store.fail_identity_parent_sync_after_rename();
+
+        let first = store.mint(Role::Cortana).unwrap();
+        assert_eq!(first.generation, 1);
+        assert!(store.get(&first.id).is_some());
+        assert!(store
+            .mint(Role::Crew)
+            .unwrap_err()
+            .contains("restart recovery"));
+        let pending = read_generation_watermark(&watermark_path).unwrap();
+        let receipt = pending.commit_pending.as_ref().unwrap();
+        assert_eq!(receipt.target_generation, 1);
+        let persisted = read_identities_snapshot(&path).unwrap().0;
+        assert_eq!(
+            identity_snapshot_semantic_sha256(&persisted).unwrap(),
+            receipt.target_semantic_sha256
+        );
+        drop(store);
+
+        let recovered = IdentityStore::load(path.clone());
+        assert!(recovered.write_blocked.is_none());
+        assert!(recovered.get(&first.id).is_some());
+        assert!(read_generation_watermark(&watermark_path)
+            .unwrap()
+            .commit_pending
+            .is_none());
+        assert_eq!(recovered.mint(Role::Crew).unwrap().generation, 2);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn pending_commit_with_previous_bytes_retires_target_generation_on_restart() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let store = IdentityStore::load(path.clone());
+        let first = store.mint(Role::Cortana).unwrap();
+        let stable_bytes = std::fs::read(&path).unwrap();
+        store.fail_identity_write_after_watermark();
+        assert!(store.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), stable_bytes);
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .commit_pending
+                .as_ref()
+                .unwrap()
+                .target_generation,
+            2
+        );
+        drop(store);
+
+        let recovered = IdentityStore::load(path.clone());
+        assert!(recovered.write_blocked.is_none());
+        assert!(recovered.get(&first.id).is_some());
+        assert_eq!(recovered.mint(Role::Crew).unwrap().generation, 3);
+        assert!(read_generation_watermark(&watermark_path)
+            .unwrap()
+            .commit_pending
+            .is_none());
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
     fn pre_target_digest_migration_receipt_is_incompatible_and_byte_preserved() {
         let path = temp_path();
         let watermark_path = generation_watermark_path(&path);
@@ -2260,6 +2573,7 @@ mod tests {
                 semantic_sha256: "0".repeat(64),
             }),
             migration: None,
+            commit_pending: None,
         })
         .unwrap();
         std::fs::write(&path, &source).unwrap();
