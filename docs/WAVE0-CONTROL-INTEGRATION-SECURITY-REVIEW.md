@@ -414,6 +414,13 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `d31e847` adds deterministic keyed-identity acceptance coverage without changing the design.
+The HMAC-SHA-256 primitive is checked against RFC 4231 test case 1.
+Endpoint identity coverage also proves identical protected URL and key inputs are stable, a changed key produces a distinct identity, and the identity does not contain the test key material.
+At `d31e847`, the three endpoint-identity tests and the complete 35-test Powder client filter passed.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 Commit `ad74042` closes gateway response-body credential disclosure on matching keyed endpoints.
 Every externally surfaced Powder HTTP status error now retains only the typed error kind and a bounded generic `Powder HTTP status <code>` message.
 No untrusted gateway status body is parsed, redacted, persisted, returned, or logged by this client path.
