@@ -21788,7 +21788,7 @@ mod tests {
     }
 
     #[test]
-    fn project_binding_is_unique_under_concurrent_distinct_ship_claims() {
+    fn concurrent_distinct_ship_claims_create_distinct_project_captains() {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.upsert_project(ProjectRecord {
             project_id: "project-one".into(),
@@ -21814,20 +21814,29 @@ mod tests {
             }));
         }
         barrier.wait();
-        let successes = joins
+        let results = joins
             .into_iter()
             .map(|join| join.join().unwrap())
-            .filter(Result::is_ok)
-            .count();
-        assert_eq!(successes, 1);
-        assert_eq!(
-            reg.snapshot()
-                .captains
-                .iter()
-                .filter(|captain| captain.project_id.as_deref() == Some("project-one"))
-                .count(),
-            1
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok));
+
+        let snapshot = reg.snapshot();
+        let project_captains = snapshot
+            .captains
+            .iter()
+            .filter(|captain| captain.project_id.as_deref() == Some("project-one"))
+            .collect::<Vec<_>>();
+        assert_eq!(project_captains.len(), 2);
+        assert_ne!(
+            project_captains[0].assignment_id,
+            project_captains[1].assignment_id
         );
+        let mut ship_slugs = project_captains
+            .iter()
+            .map(|captain| captain.ship_slug.as_str())
+            .collect::<Vec<_>>();
+        ship_slugs.sort_unstable();
+        assert_eq!(ship_slugs, vec!["alpha", "beta"]);
     }
 
     #[test]
