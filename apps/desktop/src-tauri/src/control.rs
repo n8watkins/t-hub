@@ -421,15 +421,119 @@ impl EventFanout {
 ///
 /// Serialized camelCase (`{id, name, tileIds}`) in BOTH directions: the frontend
 /// reports its tabs up as this shape, and `list_tabs` returns it verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub const CAPTAIN_WORKSPACE_ID: &str = "captains-reserved";
+pub const CAPTAIN_WORKSPACE_NAME: &str = "Captain Workspace";
+const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum WorkspaceKind {
+    Work,
+    Captain,
+}
+
+#[derive(Debug, Clone)]
 pub struct TabRecord {
     pub id: String,
     pub name: String,
-    /// Tile ids in this tab, in order. Accepts the frontend's `order` field as an
-    /// alias so either spelling deserializes.
-    #[serde(default, alias = "order")]
+    /// Tile ids in this Workspace, in order.
     pub tile_ids: Vec<String>,
+}
+
+impl TabRecord {
+    pub fn kind(&self) -> WorkspaceKind {
+        if self.id == CAPTAIN_WORKSPACE_ID {
+            WorkspaceKind::Captain
+        } else {
+            WorkspaceKind::Work
+        }
+    }
+
+    fn canonicalize(mut self) -> Result<Self, String> {
+        if self.id.trim().is_empty() {
+            return Err("workspace id must not be empty".into());
+        }
+        if self.kind() == WorkspaceKind::Captain {
+            self.name = CAPTAIN_WORKSPACE_NAME.to_string();
+        } else if self.name.trim().is_empty() {
+            return Err(format!("work Workspace '{}' has an empty name", self.id));
+        }
+        Ok(self)
+    }
+}
+
+impl Serialize for TabRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            schema_version: u32,
+            id: &'a str,
+            name: &'a str,
+            kind: WorkspaceKind,
+            tile_ids: &'a [String],
+        }
+        let canonical_name = if self.kind() == WorkspaceKind::Captain {
+            CAPTAIN_WORKSPACE_NAME
+        } else {
+            &self.name
+        };
+        Wire {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            id: &self.id,
+            name: canonical_name,
+            kind: self.kind(),
+            tile_ids: &self.tile_ids,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TabRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            schema_version: u32,
+            id: String,
+            name: String,
+            #[serde(default)]
+            kind: Option<WorkspaceKind>,
+            #[serde(default, alias = "order")]
+            tile_ids: Vec<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version > WORKSPACE_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported Workspace schemaVersion {}",
+                wire.schema_version
+            )));
+        }
+        let derived = if wire.id == CAPTAIN_WORKSPACE_ID {
+            WorkspaceKind::Captain
+        } else {
+            WorkspaceKind::Work
+        };
+        if wire.kind.is_some_and(|kind| kind != derived) {
+            return Err(serde::de::Error::custom(
+                "Workspace kind conflicts with its canonical id",
+            ));
+        }
+        TabRecord {
+            id: wire.id,
+            name: wire.name,
+            tile_ids: wire.tile_ids,
+        }
+        .canonicalize()
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A full, versioned copy of the registry: what `list_tabs` returns and what every
@@ -459,9 +563,13 @@ pub enum ReportOutcome {
     Stale(RegistrySnapshot),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RegistryInner {
     tabs: Vec<TabRecord>,
+    /// Process-local terminal death tombstones. A cleanup commit records the
+    /// tombstone under the same identity transaction that removes the tile, so
+    /// a queued move/report cannot resurrect a killed or recovery-retired id.
+    retired_tile_ids: std::collections::HashSet<String>,
     /// The UI's active (visible) tab, mirrored from its reports and from
     /// `focus_tab`. Used as the default placement target for un-named spawns and
     /// exposed via `list_tabs` so a socket caller can prove focus did NOT move.
@@ -490,6 +598,7 @@ struct RegistryInner {
 #[derive(Default)]
 pub struct TabRegistry {
     inner: Mutex<RegistryInner>,
+    identity_transaction: Mutex<()>,
 }
 
 impl TabRegistry {
@@ -503,11 +612,52 @@ impl TabRegistry {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn identity_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.identity_transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Replace the whole registry (legacy up-sync; no staleness check). Kept for
     /// reporters that predate `baseSeq` (native cockpit) and for tests.
+    fn normalize_tabs(tabs: Vec<TabRecord>) -> Result<Vec<TabRecord>, String> {
+        let mut normalized = Vec::with_capacity(tabs.len().saturating_add(1));
+        let mut ids = std::collections::HashSet::new();
+        let mut captain_tiles = Vec::new();
+        for tab in tabs {
+            let tab = tab.canonicalize()?;
+            if tab.kind() == WorkspaceKind::Captain {
+                for tile in tab.tile_ids {
+                    if !captain_tiles.contains(&tile) {
+                        captain_tiles.push(tile);
+                    }
+                }
+                continue;
+            }
+            if !ids.insert(tab.id.clone()) {
+                return Err(format!("duplicate work Workspace id '{}'", tab.id));
+            }
+            normalized.push(tab);
+        }
+        normalized.push(TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.to_string(),
+            name: CAPTAIN_WORKSPACE_NAME.to_string(),
+            tile_ids: captain_tiles,
+        });
+        Ok(normalized)
+    }
+
     pub fn replace(&self, tabs: Vec<TabRecord>) {
         let mut g = self.lock();
-        g.tabs = tabs;
+        g.tabs = Self::normalize_tabs(tabs)
+            .expect("internal tab fixtures must contain valid Workspace records");
+        if !g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|active| g.tabs.iter().any(|tab| &tab.id == active))
+        {
+            g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
+        }
         g.seq += 1;
     }
 
@@ -519,15 +669,16 @@ impl TabRegistry {
         tabs: Vec<TabRecord>,
         active_tab_id: Option<String>,
         base_seq: Option<u64>,
-    ) -> ReportOutcome {
+    ) -> Result<ReportOutcome, String> {
+        let tabs = Self::normalize_tabs(tabs)?;
         let mut g = self.lock();
         if let Some(base) = base_seq {
             if base != g.seq {
-                return ReportOutcome::Stale(RegistrySnapshot {
+                return Ok(ReportOutcome::Stale(RegistrySnapshot {
                     seq: g.seq,
                     active_tab_id: g.active_tab_id.clone(),
                     tabs: g.tabs.clone(),
-                });
+                }));
             }
         }
         // Which tabs is this report dropping? Computed atomically under the lock
@@ -553,10 +704,10 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
-        ReportOutcome::Accepted {
+        Ok(ReportOutcome::Accepted {
             seq: g.seq,
             removed_tab_ids,
-        }
+        })
     }
 
     /// A clone of the current tab list (for tests / callers that only need tabs).
@@ -588,14 +739,42 @@ impl TabRegistry {
         self.lock().tabs.iter().any(|t| t.id == id)
     }
 
-    /// The tab currently holding `tile_id`, if any (captains: a claim with no
-    /// explicit `workspaceTabIds` defaults to the tab the captain's tile lives in).
-    fn tab_for_tile(&self, tile_id: &str) -> Option<String> {
+    fn kind_for_id(&self, id: &str) -> Option<WorkspaceKind> {
         self.lock()
             .tabs
             .iter()
-            .find(|t| t.tile_ids.iter().any(|x| x == tile_id))
-            .map(|t| t.id.clone())
+            .find(|tab| tab.id == id)
+            .map(TabRecord::kind)
+    }
+
+    fn work_workspace(&self, id: &str) -> Option<TabRecord> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id && tab.kind() == WorkspaceKind::Work)
+            .cloned()
+    }
+
+    fn workspace_for_tile(&self, tile_id: &str) -> Option<String> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|tab| tab.tile_ids.iter().any(|tile| tile == tile_id))
+            .map(|tab| tab.id.clone())
+    }
+
+    fn restore_tile_placement_locked(
+        &self,
+        tile_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        match workspace_id {
+            Some(workspace_id) => self.move_tile(tile_id, workspace_id),
+            None => {
+                self.remove_tile_locked(tile_id);
+                Ok(())
+            }
+        }
     }
 
     /// Record a new (empty) tab so its id is addressable immediately. No-op (no
@@ -605,7 +784,11 @@ impl TabRegistry {
         if !g.tabs.iter().any(|t| t.id == id) {
             g.tabs.push(TabRecord {
                 id: id.to_string(),
-                name: name.to_string(),
+                name: if id == CAPTAIN_WORKSPACE_ID {
+                    CAPTAIN_WORKSPACE_NAME.to_string()
+                } else {
+                    name.to_string()
+                },
                 tile_ids: Vec::new(),
             });
             g.seq += 1;
@@ -641,6 +824,11 @@ impl TabRegistry {
     /// is still placed (it may be a live session the UI has not adopted yet).
     fn move_tile(&self, tile_id: &str, tab_id: &str) -> Result<(), String> {
         let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return Err(format!(
+                "move_tile: terminal '{tile_id}' was retired and cannot be reinserted"
+            ));
+        }
         if !g.tabs.iter().any(|t| t.id == tab_id) {
             return Err(format!(
                 "move_tile: unknown tabId '{tab_id}' (list_tabs shows valid ids; new_tab creates one)"
@@ -666,15 +854,29 @@ impl TabRegistry {
     /// reports back).
     fn place_tile_with_fallback(&self, tile_id: &str, tab_id: Option<&str>) -> Option<String> {
         let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return None;
+        }
         let target = tab_id
-            .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+            .filter(|id| {
+                g.tabs
+                    .iter()
+                    .any(|tab| &tab.id == id && tab.kind() == WorkspaceKind::Work)
+            })
             .map(str::to_string)
             .or_else(|| {
-                g.active_tab_id
-                    .clone()
-                    .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+                g.active_tab_id.clone().filter(|id| {
+                    g.tabs
+                        .iter()
+                        .any(|tab| &tab.id == id && tab.kind() == WorkspaceKind::Work)
+                })
             })
-            .or_else(|| g.tabs.first().map(|t| t.id.clone()))?;
+            .or_else(|| {
+                g.tabs
+                    .iter()
+                    .find(|tab| tab.kind() == WorkspaceKind::Work)
+                    .map(|tab| tab.id.clone())
+            })?;
         for t in g.tabs.iter_mut() {
             t.tile_ids.retain(|x| x != tile_id);
         }
@@ -685,9 +887,37 @@ impl TabRegistry {
         Some(target)
     }
 
+    /// Place a new tile only if the exact target still exists.
+    /// This is used by durable identity transactions where fallback would silently
+    /// change ownership after authority was validated.
+    fn place_tile_exact(&self, tile_id: &str, tab_id: &str) -> Result<String, String> {
+        let mut g = self.lock();
+        if g.retired_tile_ids.contains(tile_id) {
+            return Err(format!(
+                "terminal '{tile_id}' was retired and cannot be placed"
+            ));
+        }
+        if !g.tabs.iter().any(|tab| tab.id == tab_id) {
+            return Err(format!(
+                "Workspace '{tab_id}' closed before exact terminal placement"
+            ));
+        }
+        for tab in &mut g.tabs {
+            tab.tile_ids.retain(|candidate| candidate != tile_id);
+        }
+        let target = g
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .expect("target existence checked under the same lock");
+        target.tile_ids.push(tile_id.to_string());
+        g.seq = g.seq.saturating_add(1);
+        Ok(tab_id.to_string())
+    }
+
     /// Drop a tile from every tab (a terminal was closed). Returns true (and bumps
     /// the revision) only if the tile was actually placed somewhere.
-    fn remove_tile(&self, tile_id: &str) -> bool {
+    fn remove_tile_locked(&self, tile_id: &str) -> bool {
         let mut g = self.lock();
         let mut removed = false;
         for t in g.tabs.iter_mut() {
@@ -701,8 +931,27 @@ impl TabRegistry {
         removed
     }
 
+    fn retire_tile_locked(&self, tile_id: &str) -> bool {
+        let mut g = self.lock();
+        let newly_retired = g.retired_tile_ids.insert(tile_id.to_string());
+        let mut removed = false;
+        for tab in &mut g.tabs {
+            let before = tab.tile_ids.len();
+            tab.tile_ids.retain(|candidate| candidate != tile_id);
+            removed |= tab.tile_ids.len() != before;
+        }
+        let changed = newly_retired || removed;
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+        }
+        changed
+    }
+
     /// Rename a tab. Errors when the tab is unknown.
     fn rename_tab(&self, tab_id: &str, name: &str) -> Result<(), String> {
+        if tab_id == CAPTAIN_WORKSPACE_ID {
+            return Err("rename_tab: Captain Workspace cannot be renamed".into());
+        }
         let mut g = self.lock();
         match g.tabs.iter_mut().find(|t| t.id == tab_id) {
             Some(t) => {
@@ -714,21 +963,45 @@ impl TabRegistry {
         }
     }
 
-    /// Close a tab (headless tab lifecycle). Policy:
-    ///   - unknown tab → error;
-    ///   - the LAST tab is never closed (mirrors the UI's guard) → error;
-    ///   - a NON-EMPTY tab is refused unless `force` (close its terminals first
-    ///     via `close_terminal`, or pass `force: true` - the tab record is dropped
-    ///     and any still-live sessions are re-adopted into the UI's active tab by
-    ///     its reconciler, so nothing is orphaned).
-    /// Returns the closed tab's tile ids.
+    #[cfg(test)]
     fn remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
+        self.validate_remove_tab(tab_id, force)?;
         let mut g = self.lock();
+        let idx = g
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .ok_or_else(|| format!("close_tab: unknown tabId '{tab_id}'"))?;
+        let removed = g.tabs.remove(idx);
+        let active_valid = g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|id| g.tabs.iter().any(|tab| &tab.id == id));
+        if !active_valid {
+            g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
+        }
+        g.seq += 1;
+        Ok(removed.tile_ids)
+    }
+
+    #[cfg(test)]
+    fn validate_remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
+        if tab_id == CAPTAIN_WORKSPACE_ID {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
+        let g = self.lock();
         let Some(idx) = g.tabs.iter().position(|t| t.id == tab_id) else {
             return Err(format!("close_tab: unknown tabId '{tab_id}'"));
         };
-        if g.tabs.len() <= 1 {
-            return Err("close_tab: refusing to close the last tab".to_string());
+        if g.tabs
+            .iter()
+            .filter(|tab| tab.kind() == WorkspaceKind::Work)
+            .count()
+            <= 1
+        {
+            return Err(
+                "close_tab: refusing to close the last tab (the final Work Workspace)".to_string(),
+            );
         }
         if !g.tabs[idx].tile_ids.is_empty() && !force {
             return Err(format!(
@@ -737,19 +1010,7 @@ impl TabRegistry {
                 g.tabs[idx].tile_ids.len()
             ));
         }
-        let removed = g.tabs.remove(idx);
-        // Heal the active pointer under the SAME lock as the removal, and against
-        // the post-removal tab set rather than just the removed id - a concurrent
-        // close/focus interleaving must never leave it referencing a deleted tab.
-        let active_valid = g
-            .active_tab_id
-            .as_ref()
-            .is_some_and(|id| g.tabs.iter().any(|t| &t.id == id));
-        if !active_valid {
-            g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
-        }
-        g.seq += 1;
-        Ok(removed.tile_ids)
+        Ok(g.tabs[idx].tile_ids.clone())
     }
 
     /// Mirror the UI's active tab (from `focus_tab` - the one organization command
@@ -831,8 +1092,32 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 13;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 16;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
+const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
+const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
+const MAX_RETIRED_FLEET_TILES: usize = 4096;
+
+fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
+    format!(
+        "assignment:{}:{}",
+        project_id.unwrap_or("unbound"),
+        ship_slug
+    )
+}
+
+fn normalize_captain_display_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Captain displayName must not be empty".into());
+    }
+    if value.len() > MAX_CAPTAIN_DISPLAY_NAME_BYTES {
+        return Err(format!(
+            "Captain displayName must be at most {MAX_CAPTAIN_DISPLAY_NAME_BYTES} bytes"
+        ));
+    }
+    Ok(value.to_string())
+}
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
 /// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
@@ -901,6 +1186,9 @@ pub enum CrewState {
     /// The Crew terminal is stopped, but its Powder claim could not be released.
     /// Keep the binding addressable until a later cleanup confirms the release.
     CleanupPending { since: u64 },
+    /// A live legacy Crew terminal whose owning Work Workspace cannot be resolved
+    /// without guessing. It remains visible but cannot be treated as assigned.
+    NeedsAssignment { since: u64 },
     /// The crew's OWN tile died: a terminal marker (NOT re-adoptable - the worker is
     /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
     /// epoch-ms.
@@ -952,6 +1240,9 @@ pub struct CrewRef {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Exact durable Work Workspace selected by the owning Captain before launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_tab_id: Option<String>,
     /// Powder work claimed by this Crew member. T-Hub owns the terminal binding;
     /// Powder remains authoritative for the claim and run lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -975,6 +1266,7 @@ impl CrewRef {
             t_hub_capability: None,
             worktree_path: None,
             branch: None,
+            workspace_tab_id: None,
             powder_work: None,
             state: CrewState::Active,
         }
@@ -1446,6 +1738,14 @@ pub struct FleetIdentity {
     /// The DURABLE primary key (item-2 §2.1): every registry lookup for a captain
     /// keys on this. For a Cortana claim it is the reserved [`CORTANA_SLUG`].
     pub ship_slug: String,
+    /// Durable Assignment key. This is independent of the current terminal,
+    /// Harness conversation, cwd, and Workspace placement.
+    #[serde(default)]
+    pub assignment_id: String,
+    /// Durable user-facing Captain name. Legacy records are deterministically
+    /// seeded from `ship_slug` during load and persisted on the next mutation.
+    #[serde(default)]
+    pub display_name: String,
     /// The first-class role (D1). Cortana is the registry-wide singleton.
     #[serde(default)]
     pub role: FleetRole,
@@ -1583,6 +1883,534 @@ impl ShipMembership {
     }
 }
 
+fn validate_workspace_occupant(
+    captains: &CaptainsRegistry,
+    terminal_id: &str,
+    workspace_id: &str,
+    kind: WorkspaceKind,
+) -> Result<(), String> {
+    let snapshot = captains.snapshot();
+    validate_workspace_occupant_records(&snapshot.captains, terminal_id, workspace_id, kind)
+}
+
+fn validate_workspace_occupant_records(
+    captains: &[CaptainRecord],
+    terminal_id: &str,
+    workspace_id: &str,
+    kind: WorkspaceKind,
+) -> Result<(), String> {
+    if captains.iter().any(|captain| {
+        captain.crew.iter().any(|crew| {
+            crew.terminal_id == terminal_id && matches!(crew.state, CrewState::Removed { .. })
+        })
+    }) {
+        return Err(format!(
+            "Workspace placement denied: removed Crew terminal '{terminal_id}' cannot be reinserted"
+        ));
+    }
+    let membership = captains.iter().find_map(|captain| {
+        if captain.terminal_id.as_deref() == Some(terminal_id)
+            && captain.state == ClaimState::Active
+        {
+            Some(ShipMembership::Supervisor {
+                ship_slug: captain.ship_slug.clone(),
+                role: captain.role,
+            })
+        } else if captain.crew.iter().any(|crew| {
+            crew.terminal_id == terminal_id && !matches!(crew.state, CrewState::Removed { .. })
+        }) {
+            Some(ShipMembership::Crew {
+                ship_slug: captain.ship_slug.clone(),
+            })
+        } else {
+            None
+        }
+    });
+    match (kind, membership) {
+        (WorkspaceKind::Captain, Some(ShipMembership::Supervisor { .. })) => Ok(()),
+        (WorkspaceKind::Captain, _) => Err(format!(
+            "Workspace placement denied: terminal '{terminal_id}' is not a durable Cortana or Captain identity"
+        )),
+        (WorkspaceKind::Work, Some(ShipMembership::Supervisor { .. })) => Err(format!(
+            "Workspace placement denied: Captain terminal '{terminal_id}' belongs to Captain Workspace"
+        )),
+        (WorkspaceKind::Work, Some(ShipMembership::Crew { ship_slug })) => {
+            if captains.iter().any(|captain| {
+                captain.ship_slug == ship_slug
+                    && captain
+                        .workspace_tab_ids
+                        .iter()
+                        .any(|owned| owned == workspace_id)
+            }) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Workspace placement denied: Work Workspace '{workspace_id}' is not owned by Crew terminal '{terminal_id}' Captain '{ship_slug}'"
+                ))
+            }
+        }
+        (WorkspaceKind::Work, None) => Ok(()),
+    }
+}
+
+pub fn validate_workspace_report(
+    tabs: &[TabRecord],
+    captains: &CaptainsRegistry,
+) -> Result<(), String> {
+    let snapshot = captains.snapshot();
+    validate_workspace_report_records(tabs, &snapshot.captains)
+}
+
+fn validate_workspace_report_records(
+    tabs: &[TabRecord],
+    captains: &[CaptainRecord],
+) -> Result<(), String> {
+    let mut placed = std::collections::HashSet::new();
+    for tab in tabs {
+        for terminal_id in &tab.tile_ids {
+            if !placed.insert(terminal_id.as_str()) {
+                return Err(format!(
+                    "Workspace report assigns terminal '{terminal_id}' more than once"
+                ));
+            }
+            validate_workspace_occupant_records(captains, terminal_id, &tab.id, tab.kind())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_workspace_placements(tabs: &[TabRecord]) -> Result<(), String> {
+    let mut placed = std::collections::HashSet::new();
+    for tab in tabs {
+        for terminal_id in &tab.tile_ids {
+            if !placed.insert(terminal_id.as_str()) {
+                return Err(format!(
+                    "Workspace report assigns terminal '{terminal_id}' more than once"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_supervisor_workspace_candidates(
+    captains: &[CaptainRecord],
+    tabs: &mut [TabRecord],
+) -> Result<bool, String> {
+    let supervisors = captains
+        .iter()
+        .filter(|captain| captain.state == ClaimState::Active)
+        .filter_map(|captain| captain.terminal_id.as_ref())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for terminal_id in supervisors {
+        let exact = tabs.iter().all(|tab| {
+            let occurrences = tab
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &terminal_id)
+                .count();
+            if tab.id == CAPTAIN_WORKSPACE_ID {
+                occurrences == 1
+            } else {
+                occurrences == 0
+            }
+        });
+        if exact {
+            continue;
+        }
+        for tab in tabs.iter_mut() {
+            tab.tile_ids.retain(|tile| tile != &terminal_id);
+        }
+        tabs.iter_mut()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .ok_or("Captain Workspace disappeared during startup reconciliation")?
+            .tile_ids
+            .push(terminal_id);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn startup_supervisor_reconciliation_required(
+    captains: &[CaptainRecord],
+    current_tabs: &[TabRecord],
+    reported_tabs: &[TabRecord],
+) -> Result<bool, String> {
+    let placements = |tabs: &[TabRecord], terminal_id: &str| {
+        tabs.iter()
+            .filter(|tab| tab.tile_ids.iter().any(|tile| tile == terminal_id))
+            .map(|tab| tab.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut required = false;
+    let backend_is_unseeded = current_tabs.is_empty();
+    for terminal_id in captains
+        .iter()
+        .filter(|captain| captain.state == ClaimState::Active)
+        .filter_map(|captain| captain.terminal_id.as_deref())
+    {
+        let reported = placements(reported_tabs, terminal_id);
+        if reported == [CAPTAIN_WORKSPACE_ID.to_string()] {
+            continue;
+        }
+        // Production deliberately starts every app run with an empty in-memory
+        // TabRegistry and lets the frontend's first complete report seed it.
+        // Durable Active supervisor identity is sufficient to canonicalize that
+        // known terminal into Captain Workspace during this one unseeded state.
+        // Duplicate placements were already rejected, and the post-reconcile
+        // occupant validation still rejects every unknown/foreign tile in the
+        // reserved Workspace.
+        if backend_is_unseeded {
+            required = true;
+            continue;
+        }
+        let current = placements(current_tabs, terminal_id);
+        if reported != current {
+            validate_workspace_report_records(reported_tabs, captains)?;
+            return Err(format!(
+                "Workspace report attempted to redesignate Captain terminal '{terminal_id}' outside startup reconciliation"
+            ));
+        }
+        required = true;
+    }
+    Ok(required)
+}
+
+fn reconcile_crew_workspace_candidates(
+    captains: &mut [CaptainRecord],
+    tabs: &mut [TabRecord],
+) -> Result<bool, String> {
+    let work_ids: std::collections::HashSet<String> = tabs
+        .iter()
+        .filter(|tab| tab.kind() == WorkspaceKind::Work)
+        .map(|tab| tab.id.clone())
+        .collect();
+    let mut changed = false;
+    for captain in captains {
+        let owned: Vec<String> = captain
+            .workspace_tab_ids
+            .iter()
+            .filter(|id| work_ids.contains(*id))
+            .cloned()
+            .collect();
+        for crew in &mut captain.crew {
+            if !matches!(
+                crew.state,
+                CrewState::Active | CrewState::NeedsAssignment { .. }
+            ) {
+                continue;
+            }
+            let placements: Vec<String> = tabs
+                .iter()
+                .filter(|tab| tab.tile_ids.iter().any(|id| id == &crew.terminal_id))
+                .map(|tab| tab.id.clone())
+                .collect();
+            let durable_is_exact = crew.workspace_tab_id.as_ref().is_some_and(|id| {
+                owned.iter().any(|owned_id| owned_id == id)
+                    && placements.len() == 1
+                    && placements[0] == *id
+            });
+            if durable_is_exact {
+                if matches!(crew.state, CrewState::NeedsAssignment { .. }) {
+                    crew.state = CrewState::Active;
+                    changed = true;
+                }
+                continue;
+            }
+            let legacy_exact = crew.workspace_tab_id.is_none()
+                && placements.len() == 1
+                && owned.iter().any(|id| id == &placements[0]);
+            let destination = if legacy_exact {
+                Some(placements[0].clone())
+            } else if crew.workspace_tab_id.is_none() && owned.len() == 1 {
+                Some(owned[0].clone())
+            } else {
+                None
+            };
+            if let Some(destination) = destination {
+                for tab in tabs.iter_mut() {
+                    tab.tile_ids.retain(|id| id != &crew.terminal_id);
+                }
+                let target = tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == destination)
+                    .ok_or_else(|| {
+                        format!("owned Workspace '{destination}' disappeared during reconciliation")
+                    })?;
+                target.tile_ids.push(crew.terminal_id.clone());
+                crew.workspace_tab_id = Some(destination);
+                crew.state = CrewState::Active;
+                changed = true;
+            } else {
+                for tab in tabs.iter_mut() {
+                    tab.tile_ids.retain(|id| id != &crew.terminal_id);
+                }
+                crew.workspace_tab_id = None;
+                if !matches!(crew.state, CrewState::NeedsAssignment { .. }) {
+                    crew.state = CrewState::NeedsAssignment { since: now_ms() };
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn durable_workspaces_from_report(
+    captains: &[CaptainRecord],
+    tabs: &[TabRecord],
+) -> Result<Vec<FleetWorkspaceRecord>, String> {
+    let mut durable = Vec::with_capacity(tabs.len());
+    for tab in tabs {
+        if tab.kind() == WorkspaceKind::Captain {
+            durable.push(FleetWorkspaceRecord {
+                id: CAPTAIN_WORKSPACE_ID.to_string(),
+                name: CAPTAIN_WORKSPACE_NAME.to_string(),
+                kind: WorkspaceKind::Captain,
+                owner: None,
+                tile_ids: tab.tile_ids.clone(),
+            });
+            continue;
+        }
+        let owners = captains
+            .iter()
+            .filter(|captain| captain.workspace_tab_ids.contains(&tab.id))
+            .filter_map(|captain| {
+                captain
+                    .project_id
+                    .as_ref()
+                    .map(|project_id| FleetWorkspaceOwner {
+                        project_id: project_id.clone(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if owners.len() > 1 {
+            return Err(format!(
+                "Workspace report found ambiguous durable Project/Assignment ownership for Work Workspace '{}'",
+                tab.id
+            ));
+        }
+        durable.push(FleetWorkspaceRecord {
+            id: tab.id.clone(),
+            name: tab.name.clone(),
+            kind: WorkspaceKind::Work,
+            owner: owners.into_iter().next(),
+            tile_ids: tab.tile_ids.clone(),
+        });
+    }
+    Ok(durable)
+}
+
+pub fn apply_workspace_report(
+    tabs_registry: &TabRegistry,
+    captains_registry: &CaptainsRegistry,
+    tabs: Vec<TabRecord>,
+    active_tab_id: Option<String>,
+    base_seq: Option<u64>,
+) -> Result<(ReportOutcome, bool, bool), String> {
+    let _identity_transaction = tabs_registry.identity_transaction();
+    let mut tabs = TabRegistry::normalize_tabs(tabs)?;
+    validate_unique_workspace_placements(&tabs)?;
+    let _mutation = captains_registry
+        .mutation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut current_tabs = tabs_registry.lock();
+    if base_seq.is_some_and(|base| base != current_tabs.seq) {
+        return Ok((
+            ReportOutcome::Stale(RegistrySnapshot {
+                seq: current_tabs.seq,
+                active_tab_id: current_tabs.active_tab_id.clone(),
+                tabs: current_tabs.tabs.clone(),
+            }),
+            false,
+            false,
+        ));
+    }
+    if let Some(retired) = tabs
+        .iter()
+        .flat_map(|tab| &tab.tile_ids)
+        .find(|tile| current_tabs.retired_tile_ids.contains(tile.as_str()))
+    {
+        return Err(format!(
+            "Workspace report attempted to reinsert retired terminal '{retired}'"
+        ));
+    }
+
+    let current_captains = captains_registry.lock();
+    if let Some(retired) = tabs
+        .iter()
+        .flat_map(|tab| &tab.tile_ids)
+        .find(|tile| current_captains.retired_fleet_tile_ids.contains(tile))
+    {
+        return Err(format!(
+            "Workspace report attempted to reinsert retired terminal '{retired}'"
+        ));
+    }
+    let previous_captains = current_captains.clone();
+    let mut candidate_captains = current_captains.clone();
+    let supervisor_reconciled =
+        startup_supervisor_reconciliation_required(
+            &candidate_captains.captains,
+            &current_tabs.tabs,
+            &tabs,
+        )? && reconcile_supervisor_workspace_candidates(&candidate_captains.captains, &mut tabs)?;
+    validate_workspace_report_records(&tabs, &current_captains.captains)?;
+    let crew_reconciled =
+        reconcile_crew_workspace_candidates(&mut candidate_captains.captains, &mut tabs)?;
+    let reconciled = supervisor_reconciled || crew_reconciled;
+    validate_workspace_report_records(&tabs, &candidate_captains.captains)?;
+    let removed_tab_ids = current_tabs
+        .tabs
+        .iter()
+        .filter(|old| !tabs.iter().any(|tab| tab.id == old.id))
+        .map(|tab| tab.id.clone())
+        .collect::<Vec<_>>();
+    let mut pruned = false;
+    for captain in &mut candidate_captains.captains {
+        let before = captain.workspace_tab_ids.len();
+        captain
+            .workspace_tab_ids
+            .retain(|id| !removed_tab_ids.contains(id));
+        pruned |= captain.workspace_tab_ids.len() != before;
+    }
+    candidate_captains.workspaces =
+        durable_workspaces_from_report(&candidate_captains.captains, &tabs)?;
+    let workspaces_changed = candidate_captains.workspaces != previous_captains.workspaces;
+    let captains_changed = crew_reconciled || pruned || workspaces_changed;
+    if captains_changed {
+        candidate_captains.seq = candidate_captains.seq.saturating_add(1);
+        let changes = AuthorityGenerationChanges::between(&previous_captains, &candidate_captains);
+        candidate_captains.authority_generations.advance(changes)?;
+        let snapshot = CaptainsRegistry::snapshot_for_persist(&candidate_captains);
+        CaptainsRegistry::validate_snapshot(&snapshot)?;
+        drop(current_captains);
+        captains_registry.persist(snapshot)?;
+    } else {
+        drop(current_captains);
+    }
+
+    let mut candidate_tabs = current_tabs.clone();
+    candidate_tabs.tabs = tabs;
+    if let Some(active) =
+        active_tab_id.filter(|id| candidate_tabs.tabs.iter().any(|tab| &tab.id == id))
+    {
+        candidate_tabs.active_tab_id = Some(active);
+    } else if !candidate_tabs
+        .active_tab_id
+        .as_ref()
+        .is_some_and(|id| candidate_tabs.tabs.iter().any(|tab| &tab.id == id))
+    {
+        candidate_tabs.active_tab_id = candidate_tabs.tabs.first().map(|tab| tab.id.clone());
+    }
+    candidate_tabs.seq = candidate_tabs.seq.saturating_add(1);
+    let seq = candidate_tabs.seq;
+    if captains_changed {
+        *captains_registry.lock() = candidate_captains;
+    }
+    *current_tabs = candidate_tabs;
+    Ok((
+        ReportOutcome::Accepted {
+            seq,
+            removed_tab_ids,
+        },
+        captains_changed,
+        reconciled,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceOwner {
+    pub project_id: String,
+    pub assignment_id: String,
+    pub ship_slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: WorkspaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FleetWorkspaceOwner>,
+    #[serde(default)]
+    pub tile_ids: Vec<String>,
+}
+
+impl FleetWorkspaceRecord {
+    fn captain_workspace() -> Self {
+        Self {
+            id: CAPTAIN_WORKSPACE_ID.to_string(),
+            name: CAPTAIN_WORKSPACE_NAME.to_string(),
+            kind: WorkspaceKind::Captain,
+            owner: None,
+            tile_ids: Vec::new(),
+        }
+    }
+
+    fn as_tab_record(&self) -> TabRecord {
+        TabRecord {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            tile_ids: self.tile_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingFleetOperationPhase {
+    Prepared,
+    EffectApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum PendingFleetOperationPayload {
+    CloseTerminal {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        powder_release: Option<PendingDispatchRelease>,
+    },
+    CommissionCaptain {
+        terminal_id: String,
+        project_id: String,
+        assignment: String,
+        ship_slug: String,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingFleetOperation {
+    pub operation_id: String,
+    pub expected_seq: u64,
+    pub phase: PendingFleetOperationPhase,
+    pub created_at: u64,
+    pub payload: PendingFleetOperationPayload,
+}
+
+#[derive(Debug)]
+struct CloseWorkspaceResult {
+    removed_tile_ids: Vec<String>,
+    captains_changed: bool,
+}
+
+#[derive(Debug)]
+struct CloseTerminalCommitResult {
+    captain_state_changed: bool,
+    workspace_changed: bool,
+}
+
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
 /// what every `sync_captains` forward carries down to the UI (the UI renders FROM
 /// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
@@ -1607,6 +2435,18 @@ pub struct CaptainsSnapshot {
     /// deserialize to an empty registry.
     #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    /// Durable Fleet Workspace authority. TabRegistry is only a projection cache
+    /// of these records and is seeded from them before any listener or UI report.
+    #[serde(default)]
+    pub workspaces: Vec<FleetWorkspaceRecord>,
+    /// Bounded prepare/effect/commit recovery records for operations that cross
+    /// tmux, IdentityStore, or Powder boundaries.
+    #[serde(default)]
+    pub pending_fleet_operations: Vec<PendingFleetOperation>,
+    /// Bounded durable tombstones for terminal identities retired by cleanup.
+    /// These prevent a stale projection or racing move from resurrecting a tile.
+    #[serde(default)]
+    pub retired_fleet_tile_ids: Vec<String>,
     /// Initial claim attempts whose remote outcome remains unresolved.
     #[serde(default)]
     pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
@@ -1618,6 +2458,8 @@ pub struct CaptainsSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CaptainAuthorityProjection {
     ship_slug: String,
+    assignment_id: String,
+    display_name: String,
     role: FleetRole,
     claude_uuid: Option<String>,
     provider: Option<String>,
@@ -1636,6 +2478,8 @@ impl From<&CaptainRecord> for CaptainAuthorityProjection {
     fn from(captain: &CaptainRecord) -> Self {
         Self {
             ship_slug: captain.ship_slug.clone(),
+            assignment_id: captain.assignment_id.clone(),
+            display_name: captain.display_name.clone(),
             role: captain.role,
             claude_uuid: captain.claude_uuid.clone(),
             provider: captain.provider.clone(),
@@ -1837,10 +2681,13 @@ impl AuthorityGenerations {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     projects: Vec<ProjectRecord>,
+    workspaces: Vec<FleetWorkspaceRecord>,
+    pending_fleet_operations: Vec<PendingFleetOperation>,
+    retired_fleet_tile_ids: Vec<String>,
     pending_dispatch_claims: Vec<PendingDispatchClaim>,
     pending_dispatch_releases: Vec<PendingDispatchRelease>,
     /// Monotonic revision, bumped on every accepted mutation - the same
@@ -1852,6 +2699,22 @@ struct CaptainsInner {
     /// in-flight request, and the registry epoch makes tokens from another loaded
     /// instance invalid while new requests start from the loaded durable state.
     authority_generations: AuthorityGenerations,
+}
+
+impl Default for CaptainsInner {
+    fn default() -> Self {
+        Self {
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+            seq: 0,
+            authority_generations: AuthorityGenerations::default(),
+        }
+    }
 }
 
 static NEXT_AUTHORITY_REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -2087,6 +2950,9 @@ impl CaptainsRegistry {
                 seq: 0,
                 captains: Vec::new(),
                 projects: Vec::new(),
+                workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+                pending_fleet_operations: Vec::new(),
+                retired_fleet_tile_ids: Vec::new(),
                 pending_dispatch_claims: Vec::new(),
                 pending_dispatch_releases: Vec::new(),
             })
@@ -2180,9 +3046,13 @@ impl CaptainsRegistry {
                 // then reconciles the Cortana singleton from the live incumbent.
                 let mut captains = snap.captains;
                 Self::reconcile_on_load(&mut captains);
+                let workspaces = Self::reconcile_durable_workspaces(&captains, snap.workspaces);
                 CaptainsInner {
                     captains,
                     projects: snap.projects,
+                    workspaces,
+                    pending_fleet_operations: snap.pending_fleet_operations,
+                    retired_fleet_tile_ids: snap.retired_fleet_tile_ids,
                     pending_dispatch_claims: snap.pending_dispatch_claims,
                     pending_dispatch_releases: snap.pending_dispatch_releases,
                     seq: snap.seq,
@@ -2375,11 +3245,22 @@ impl CaptainsRegistry {
         }
         let mut ships = std::collections::HashSet::new();
         let mut terminals = std::collections::HashSet::new();
-        let mut bound_projects = std::collections::HashSet::new();
+        let mut assignment_ids = std::collections::HashSet::new();
+        let mut workspace_owners = std::collections::HashMap::new();
         let mut cortana_count = 0;
         for captain in &snapshot.captains {
             if captain.ship_slug.trim().is_empty() || !ships.insert(captain.ship_slug.as_str()) {
                 return Err("captains registry contains an empty or duplicate shipSlug".into());
+            }
+            if snapshot.schema_version >= 14 {
+                if captain.assignment_id.trim().is_empty()
+                    || !assignment_ids.insert(captain.assignment_id.as_str())
+                {
+                    return Err(
+                        "captains registry contains an empty or duplicate assignmentId".into(),
+                    );
+                }
+                normalize_captain_display_name(&captain.display_name)?;
             }
             if captain.role == FleetRole::Cortana {
                 cortana_count += 1;
@@ -2433,14 +3314,27 @@ impl CaptainsRegistry {
                     captain.ship_slug
                 ));
             }
+            for workspace_id in &captain.workspace_tab_ids {
+                if workspace_id == CAPTAIN_WORKSPACE_ID {
+                    return Err(format!(
+                        "ship '{}' cannot own Captain Workspace as a Work Workspace",
+                        captain.ship_slug
+                    ));
+                }
+                if let Some(owner) =
+                    workspace_owners.insert(workspace_id.as_str(), captain.ship_slug.as_str())
+                {
+                    return Err(format!(
+                        "Work Workspace '{workspace_id}' is already owned by ship '{owner}' and cannot also be owned by ship '{}'",
+                        captain.ship_slug
+                    ));
+                }
+            }
             if let Some(project_id) = captain.project_id.as_deref() {
                 if !project_ids.contains(project_id) {
                     return Err(format!(
                         "Captain references unknown projectId '{project_id}'"
                     ));
-                }
-                if !bound_projects.insert(project_id) {
-                    return Err(format!("project '{project_id}' has multiple Captains"));
                 }
                 if captain
                     .assignment
@@ -2530,6 +3424,90 @@ impl CaptainsRegistry {
                             )?;
                         }
                     }
+                }
+            }
+        }
+        if snapshot.schema_version >= 15 {
+            if snapshot.pending_fleet_operations.len() > MAX_PENDING_FLEET_OPERATIONS {
+                return Err("captains registry contains too many pending Fleet operations".into());
+            }
+            let mut operation_ids = std::collections::HashSet::new();
+            for operation in &snapshot.pending_fleet_operations {
+                if operation.operation_id.trim().is_empty()
+                    || !operation_ids.insert(operation.operation_id.as_str())
+                    || operation.created_at == 0
+                {
+                    return Err(
+                        "captains registry contains an invalid pending Fleet operation".into(),
+                    );
+                }
+            }
+            let mut workspace_ids = std::collections::HashSet::new();
+            let mut placed_tiles = std::collections::HashSet::new();
+            let mut captain_workspace_count = 0;
+            for workspace in &snapshot.workspaces {
+                if workspace.id.trim().is_empty()
+                    || workspace.name.trim().is_empty()
+                    || !workspace_ids.insert(workspace.id.as_str())
+                {
+                    return Err("captains registry contains an empty or duplicate Workspace".into());
+                }
+                if workspace.kind == WorkspaceKind::Captain {
+                    captain_workspace_count += 1;
+                    if workspace.id != CAPTAIN_WORKSPACE_ID
+                        || workspace.name != CAPTAIN_WORKSPACE_NAME
+                        || workspace.owner.is_some()
+                    {
+                        return Err(
+                            "captains registry contains a non-canonical Captain Workspace".into(),
+                        );
+                    }
+                } else {
+                    if let Some(owner) = &workspace.owner {
+                        if !snapshot.captains.iter().any(|captain| {
+                            captain.ship_slug == owner.ship_slug
+                                && captain.assignment_id == owner.assignment_id
+                                && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                                && captain.workspace_tab_ids.contains(&workspace.id)
+                        }) {
+                            return Err(format!(
+                                "Work Workspace '{}' owner does not match one Captain Assignment",
+                                workspace.id
+                            ));
+                        }
+                    }
+                }
+                for tile in &workspace.tile_ids {
+                    if tile.trim().is_empty() || !placed_tiles.insert(tile.as_str()) {
+                        return Err(format!(
+                            "Fleet Workspace state places terminal '{tile}' more than once"
+                        ));
+                    }
+                }
+            }
+            if captain_workspace_count != 1 {
+                return Err("captains registry must contain exactly one Captain Workspace".into());
+            }
+        }
+        if snapshot.schema_version >= 16 {
+            if snapshot.retired_fleet_tile_ids.len() > MAX_RETIRED_FLEET_TILES {
+                return Err("captains registry contains too many retired Fleet terminals".into());
+            }
+            let mut retired = std::collections::HashSet::new();
+            for terminal_id in &snapshot.retired_fleet_tile_ids {
+                if terminal_id.trim().is_empty() || !retired.insert(terminal_id.as_str()) {
+                    return Err(
+                        "captains registry contains an invalid retired Fleet terminal".into(),
+                    );
+                }
+                if snapshot
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.tile_ids.contains(terminal_id))
+                {
+                    return Err(format!(
+                        "retired Fleet terminal '{terminal_id}' remains placed in a Workspace"
+                    ));
                 }
             }
         }
@@ -2647,6 +3625,9 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            workspaces: g.workspaces.clone(),
+            pending_fleet_operations: g.pending_fleet_operations.clone(),
+            retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -2663,6 +3644,16 @@ impl CaptainsRegistry {
     fn reconcile_on_load(caps: &mut [FleetIdentity]) {
         let mut seen_cortana = false;
         for c in caps.iter_mut() {
+            if c.assignment_id.trim().is_empty() {
+                c.assignment_id = assignment_id_for(c.project_id.as_deref(), &c.ship_slug);
+            }
+            if c.display_name.trim().is_empty() {
+                c.display_name = c.ship_slug.clone();
+            }
+            c.workspace_tab_ids.retain(|id| id != CAPTAIN_WORKSPACE_ID);
+            let mut seen_workspaces = std::collections::HashSet::new();
+            c.workspace_tab_ids
+                .retain(|id| seen_workspaces.insert(id.clone()));
             reconcile_legacy_runtime_identity(
                 &mut c.harness,
                 &mut c.provider,
@@ -2687,6 +3678,734 @@ impl CaptainsRegistry {
                 }
             }
         }
+    }
+
+    fn reconcile_durable_workspaces(
+        captains: &[CaptainRecord],
+        mut workspaces: Vec<FleetWorkspaceRecord>,
+    ) -> Vec<FleetWorkspaceRecord> {
+        workspaces.retain(|workspace| workspace.id != CAPTAIN_WORKSPACE_ID);
+        for workspace in &mut workspaces {
+            if workspace.owner.is_none() {
+                if let Some(captain) = captains.iter().find(|captain| {
+                    captain.project_id.is_some()
+                        && captain.workspace_tab_ids.contains(&workspace.id)
+                }) {
+                    workspace.owner = Some(FleetWorkspaceOwner {
+                        project_id: captain.project_id.clone().unwrap(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    });
+                }
+            }
+        }
+        workspaces.retain(|workspace| {
+            workspace.kind == WorkspaceKind::Work
+                && workspace.owner.as_ref().is_none_or(|owner| {
+                    captains.iter().any(|captain| {
+                        captain.ship_slug == owner.ship_slug
+                            && captain.assignment_id == owner.assignment_id
+                            && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                            && captain.workspace_tab_ids.contains(&workspace.id)
+                    })
+                })
+        });
+        let known_fleet_tiles = captains
+            .iter()
+            .flat_map(|captain| {
+                captain
+                    .terminal_id
+                    .iter()
+                    .chain(captain.crew.iter().map(|crew| &crew.terminal_id))
+            })
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for workspace in &mut workspaces {
+            workspace
+                .tile_ids
+                .retain(|tile| !known_fleet_tiles.contains(tile));
+        }
+        let supervisors = captains
+            .iter()
+            .filter(|captain| captain.state == ClaimState::Active)
+            .filter_map(|captain| captain.terminal_id.clone())
+            .collect::<Vec<_>>();
+        workspaces.push(FleetWorkspaceRecord {
+            tile_ids: supervisors,
+            ..FleetWorkspaceRecord::captain_workspace()
+        });
+        for captain in captains {
+            let Some(project_id) = captain.project_id.as_ref() else {
+                continue;
+            };
+            for workspace_id in &captain.workspace_tab_ids {
+                if let Some(workspace) = workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == *workspace_id)
+                {
+                    if workspace.owner.is_none() {
+                        workspace.owner = Some(FleetWorkspaceOwner {
+                            project_id: project_id.clone(),
+                            assignment_id: captain.assignment_id.clone(),
+                            ship_slug: captain.ship_slug.clone(),
+                        });
+                    }
+                    continue;
+                }
+                workspaces.push(FleetWorkspaceRecord {
+                    id: workspace_id.clone(),
+                    name: workspace_id.clone(),
+                    kind: WorkspaceKind::Work,
+                    owner: Some(FleetWorkspaceOwner {
+                        project_id: project_id.clone(),
+                        assignment_id: captain.assignment_id.clone(),
+                        ship_slug: captain.ship_slug.clone(),
+                    }),
+                    tile_ids: Vec::new(),
+                });
+            }
+        }
+        for captain in captains {
+            for crew in &captain.crew {
+                if matches!(crew.state, CrewState::Removed { .. }) {
+                    continue;
+                }
+                let Some(workspace_id) = crew.workspace_tab_id.as_ref() else {
+                    continue;
+                };
+                if let Some(workspace) = workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == *workspace_id)
+                {
+                    workspace.tile_ids.push(crew.terminal_id.clone());
+                }
+            }
+        }
+        workspaces
+    }
+
+    pub fn workspace_projection(&self) -> Vec<TabRecord> {
+        self.lock()
+            .workspaces
+            .iter()
+            .map(FleetWorkspaceRecord::as_tab_record)
+            .collect()
+    }
+
+    fn create_workspace(
+        &self,
+        id: &str,
+        name: &str,
+        owner: Option<&FleetWorkspaceOwner>,
+    ) -> Result<FleetWorkspaceRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == id)
+        {
+            return Err(format!("Workspace '{id}' already exists"));
+        }
+        let previous = current.clone();
+        if let Some(owner) = owner {
+            let captain = current
+                .captains
+                .iter_mut()
+                .find(|captain| {
+                    captain.ship_slug == owner.ship_slug
+                        && captain.assignment_id == owner.assignment_id
+                        && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                })
+                .ok_or("Workspace owner no longer resolves to one Captain Assignment")?;
+            captain.workspace_tab_ids.push(id.to_string());
+        }
+        let workspace = FleetWorkspaceRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: WorkspaceKind::Work,
+            owner: owner.cloned(),
+            tile_ids: Vec::new(),
+        };
+        current.workspaces.push(workspace.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(workspace)
+    }
+
+    fn adopt_unowned_workspace_projection(&self, tabs: &[TabRecord]) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let mut changed = false;
+        for tab in tabs {
+            if tab.kind() != WorkspaceKind::Work
+                || current
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == tab.id)
+            {
+                continue;
+            }
+            current.workspaces.push(FleetWorkspaceRecord {
+                id: tab.id.clone(),
+                name: tab.name.clone(),
+                kind: WorkspaceKind::Work,
+                owner: None,
+                tile_ids: tab.tile_ids.clone(),
+            });
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(true)
+    }
+
+    fn rename_workspace(&self, id: &str, name: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let workspace = current
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+            .ok_or_else(|| format!("rename_tab: unknown durable Workspace '{id}'"))?;
+        if workspace.kind == WorkspaceKind::Captain {
+            return Err("rename_tab: Captain Workspace cannot be renamed".into());
+        }
+        if workspace.name == name {
+            return Ok(());
+        }
+        workspace.name = name.to_string();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn move_workspace_tile(&self, tile_id: &str, workspace_id: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current
+            .retired_fleet_tile_ids
+            .iter()
+            .any(|retired| retired == tile_id)
+        {
+            return Err(format!("retired terminal '{tile_id}' cannot be moved"));
+        }
+        if !current
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return Err(format!(
+                "move_tile: unknown durable Workspace '{workspace_id}'"
+            ));
+        }
+        if current.captains.iter().any(|captain| {
+            captain.terminal_id.as_deref() == Some(tile_id) && workspace_id != CAPTAIN_WORKSPACE_ID
+        }) {
+            return Err(format!(
+                "Captain terminal '{tile_id}' belongs to Captain Workspace"
+            ));
+        }
+        if current.captains.iter().any(|captain| {
+            captain.crew.iter().any(|crew| {
+                crew.terminal_id == tile_id && matches!(crew.state, CrewState::Removed { .. })
+            })
+        }) {
+            return Err(format!("removed Crew terminal '{tile_id}' cannot be moved"));
+        }
+        let previous = current.clone();
+        for workspace in &mut current.workspaces {
+            workspace.tile_ids.retain(|tile| tile != tile_id);
+        }
+        current
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("target checked under the same lock")
+            .tile_ids
+            .push(tile_id.to_string());
+        for captain in &mut current.captains {
+            if let Some(crew) = captain
+                .crew
+                .iter_mut()
+                .find(|crew| crew.terminal_id == tile_id)
+            {
+                crew.workspace_tab_id =
+                    (workspace_id != CAPTAIN_WORKSPACE_ID).then(|| workspace_id.to_string());
+                if crew.workspace_tab_id.is_some()
+                    && matches!(crew.state, CrewState::NeedsAssignment { .. })
+                {
+                    crew.state = CrewState::Active;
+                }
+            }
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn prepare_close_terminal_operation(
+        &self,
+        terminal_id: &str,
+        expected_seq: u64,
+        frozen_powder_release: Option<PendingDispatchRelease>,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current.pending_fleet_operations.iter().find(|operation| {
+            matches!(
+                &operation.payload,
+                PendingFleetOperationPayload::CloseTerminal {
+                    terminal_id: pending_terminal,
+                    ..
+                } if pending_terminal == terminal_id
+            )
+        }) {
+            return Ok(existing.clone());
+        }
+        if current.seq != expected_seq {
+            return Err(format!(
+                "terminal close authority changed after scope capture (expected seq {expected_seq}, current seq {})",
+                current.seq
+            ));
+        }
+        let previous = current.clone();
+        let powder_release = match frozen_powder_release {
+            Some(recovery) => {
+                if recovery.crew_session_id != terminal_id
+                    || recovery.state != PendingDispatchReleaseState::Prepared
+                {
+                    return Err(
+                        "terminal close Powder recovery does not match the prepared terminal"
+                            .into(),
+                    );
+                }
+                if let Some(existing) = current
+                    .pending_dispatch_releases
+                    .iter()
+                    .find(|existing| existing.crew_session_id == terminal_id)
+                {
+                    if existing != &recovery {
+                        return Err(format!(
+                            "Crew session '{terminal_id}' already has a different frozen Powder cleanup scope"
+                        ));
+                    }
+                    Some(existing.clone())
+                } else {
+                    let crew = current
+                        .captains
+                        .iter_mut()
+                        .filter(|captain| {
+                            captain.project_id.as_deref() == Some(recovery.project_id.as_str())
+                        })
+                        .flat_map(|captain| captain.crew.iter_mut())
+                        .find(|crew| crew.terminal_id == terminal_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "terminal close refused because Crew session '{terminal_id}' is no longer in the frozen Project"
+                            )
+                        })?;
+                    let work = crew.powder_work.as_mut().ok_or_else(|| {
+                        format!(
+                            "terminal close refused because Crew session '{terminal_id}' lost its Powder binding"
+                        )
+                    })?;
+                    if work.card_id != recovery.card_id
+                        || work.run_id != recovery.run_id
+                        || work.agent.as_deref() != Some(recovery.agent.as_str())
+                    {
+                        return Err(format!(
+                            "terminal close refused because Crew session '{terminal_id}' no longer owns the frozen Powder claim"
+                        ));
+                    }
+                    crew.state = CrewState::CleanupPending { since: now_ms() };
+                    work.dispatch_release_recovery = true;
+                    current.pending_dispatch_releases.push(recovery.clone());
+                    Some(recovery)
+                }
+            }
+            None => current
+                .pending_dispatch_releases
+                .iter()
+                .find(|release| release.crew_session_id == terminal_id)
+                .cloned(),
+        };
+        let operation = PendingFleetOperation {
+            operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+            expected_seq: current.seq,
+            phase: PendingFleetOperationPhase::Prepared,
+            created_at: now_ms(),
+            payload: PendingFleetOperationPayload::CloseTerminal {
+                terminal_id: terminal_id.to_string(),
+                powder_release,
+            },
+        };
+        current.pending_fleet_operations.push(operation.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(operation)
+    }
+
+    fn pending_close_terminal_operation(&self, terminal_id: &str) -> Option<PendingFleetOperation> {
+        self.lock()
+            .pending_fleet_operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    &operation.payload,
+                    PendingFleetOperationPayload::CloseTerminal {
+                        terminal_id: pending_terminal,
+                        ..
+                    } if pending_terminal == terminal_id
+                )
+            })
+            .cloned()
+    }
+
+    fn close_operation_owns_dispatch_release(&self, recovery: &PendingDispatchRelease) -> bool {
+        self.lock()
+            .pending_fleet_operations
+            .iter()
+            .any(|operation| {
+                let PendingFleetOperationPayload::CloseTerminal {
+                    terminal_id,
+                    powder_release: Some(owned),
+                } = &operation.payload
+                else {
+                    return false;
+                };
+                let mut expected = recovery.clone();
+                expected.state = owned.state;
+                terminal_id == &recovery.crew_session_id && owned == &expected
+            })
+    }
+
+    fn prepare_commission_operation(
+        &self,
+        terminal_id: &str,
+        project_id: &str,
+        assignment: &str,
+        ship_slug: &str,
+        harness: &str,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current.pending_fleet_operations.iter().any(|operation| {
+            matches!(
+                operation.payload,
+                PendingFleetOperationPayload::CommissionCaptain { .. }
+            )
+        }) {
+            return Err(
+                "commission_captain: another Captain commission is pending recovery".into(),
+            );
+        }
+        let previous = current.clone();
+        let operation = PendingFleetOperation {
+            operation_id: format!("commission-captain:{}", uuid::Uuid::new_v4().simple()),
+            expected_seq: current.seq,
+            phase: PendingFleetOperationPhase::Prepared,
+            created_at: now_ms(),
+            payload: PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id: terminal_id.to_string(),
+                project_id: project_id.to_string(),
+                assignment: assignment.to_string(),
+                ship_slug: ship_slug.to_string(),
+                harness: harness.to_string(),
+                identity_id: None,
+            },
+        };
+        current.pending_fleet_operations.push(operation.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(operation)
+    }
+
+    fn bind_commission_operation_identity(
+        &self,
+        operation_id: &str,
+        identity_id: &str,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let operation = current
+            .pending_fleet_operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id)
+            .ok_or("commission_captain: durable commission intent disappeared")?;
+        let PendingFleetOperationPayload::CommissionCaptain {
+            identity_id: pending_identity,
+            ..
+        } = &mut operation.payload
+        else {
+            return Err("commission_captain: durable intent has the wrong kind".into());
+        };
+        if pending_identity.is_some() {
+            return Err("commission_captain: durable identity reservation already exists".into());
+        }
+        *pending_identity = Some(identity_id.to_string());
+        let result = operation.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    fn abort_close_terminal_operation(&self, operation_id: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let before = current.pending_fleet_operations.len();
+        current
+            .pending_fleet_operations
+            .retain(|operation| operation.operation_id != operation_id);
+        if current.pending_fleet_operations.len() == before {
+            return Ok(());
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn commit_close_terminal_operation(
+        &self,
+        operation: &PendingFleetOperation,
+        retain_crew_binding: bool,
+        released_recovery: Option<&PendingDispatchRelease>,
+    ) -> Result<CloseTerminalCommitResult, String> {
+        let terminal_id = match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { terminal_id, .. } => terminal_id,
+            _ => return Err("Fleet operation is not a terminal close".into()),
+        };
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let Some(pending) = current
+            .pending_fleet_operations
+            .iter()
+            .find(|pending| pending.operation_id == operation.operation_id)
+        else {
+            return Err(format!(
+                "terminal close operation '{}' is no longer pending",
+                operation.operation_id
+            ));
+        };
+        if pending != operation || pending.phase != PendingFleetOperationPhase::Prepared {
+            return Err(format!(
+                "terminal close operation '{}' changed before commit",
+                operation.operation_id
+            ));
+        }
+        let operation_recovery = match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { powder_release, .. } => {
+                powder_release.as_ref()
+            }
+            _ => None,
+        };
+        if released_recovery.is_some() && released_recovery != operation_recovery {
+            return Err(format!(
+                "terminal close operation '{}' does not own the released Powder recovery",
+                operation.operation_id
+            ));
+        }
+        if let Some(recovery) = released_recovery {
+            let durable_recovery = current
+                .pending_dispatch_releases
+                .iter()
+                .find(|pending| pending.crew_session_id == *terminal_id)
+                .ok_or_else(|| {
+                    format!(
+                        "terminal close operation '{}' lost its durable Powder recovery",
+                        operation.operation_id
+                    )
+                })?;
+            let mut expected_recovery = recovery.clone();
+            expected_recovery.state = PendingDispatchReleaseState::InFlight;
+            if durable_recovery != &expected_recovery {
+                return Err(format!(
+                    "terminal close operation '{}' Powder recovery changed before finalization",
+                    operation.operation_id
+                ));
+            }
+        }
+
+        let now = now_ms();
+        let mut captain_state_changed = false;
+        for captain in &mut current.captains {
+            if captain.terminal_id.as_deref() == Some(terminal_id.as_str()) {
+                captain.state = ClaimState::Orphaned { since: now };
+                captain.terminal_id = None;
+                for crew in &mut captain.crew {
+                    if matches!(crew.state, CrewState::Active) {
+                        crew.state = CrewState::Orphaned { since: now };
+                    }
+                }
+                captain_state_changed = true;
+            }
+            for crew in &mut captain.crew {
+                if crew.terminal_id != *terminal_id {
+                    continue;
+                }
+                let next_state = if retain_crew_binding {
+                    CrewState::CleanupPending { since: now }
+                } else {
+                    CrewState::Removed { since: now }
+                };
+                if crew.state != next_state {
+                    crew.state = next_state;
+                    captain_state_changed = true;
+                }
+                if let Some(recovery) = released_recovery {
+                    let matches = crew.powder_work.as_ref().is_some_and(|work| {
+                        work.card_id == recovery.card_id
+                            && work.run_id == recovery.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                            && work.dispatch_release_recovery
+                    });
+                    if !matches {
+                        return Err(format!(
+                            "Crew session '{terminal_id}' Powder binding changed before terminal close commit"
+                        ));
+                    }
+                    crew.powder_work = None;
+                    captain_state_changed = true;
+                }
+            }
+        }
+        if let Some(recovery) = released_recovery {
+            current
+                .pending_dispatch_releases
+                .retain(|pending| pending.crew_session_id != recovery.crew_session_id);
+        }
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace.tile_ids.retain(|tile| tile != terminal_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        current
+            .pending_fleet_operations
+            .retain(|pending| pending.operation_id != operation.operation_id);
+        if !current.retired_fleet_tile_ids.contains(terminal_id) {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current.retired_fleet_tile_ids.push(terminal_id.clone());
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(CloseTerminalCommitResult {
+            captain_state_changed,
+            workspace_changed,
+        })
+    }
+
+    fn close_workspace(
+        &self,
+        workspace_id: &str,
+        force: bool,
+        expected_owner: Option<&FleetWorkspaceOwner>,
+    ) -> Result<CloseWorkspaceResult, String> {
+        if workspace_id == CAPTAIN_WORKSPACE_ID {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let workspace_index = current
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| format!("close_tab: unknown durable Workspace '{workspace_id}'"))?;
+        let workspace = current.workspaces[workspace_index].clone();
+        if workspace.kind != WorkspaceKind::Work {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
+        if current
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.kind == WorkspaceKind::Work)
+            .count()
+            <= 1
+        {
+            return Err(
+                "close_tab: refusing to close the last tab (the final Work Workspace)".into(),
+            );
+        }
+        if workspace.owner.as_ref() != expected_owner && expected_owner.is_some() {
+            return Err("acl: close_tab Workspace owner changed before durable commit".into());
+        }
+        if !workspace.tile_ids.is_empty() && !force {
+            return Err(format!(
+                "close_tab: tab '{workspace_id}' still holds {} tile(s); close its terminals first (close_terminal) or pass force: true",
+                workspace.tile_ids.len()
+            ));
+        }
+
+        let previous = current.clone();
+        let owner = workspace.owner.clone();
+        let owner_candidate_ids = current
+            .workspaces
+            .iter()
+            .filter(|candidate| {
+                candidate.id != workspace_id
+                    && candidate.kind == WorkspaceKind::Work
+                    && candidate.owner.as_ref() == owner.as_ref()
+            })
+            .map(|candidate| candidate.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut captains_changed = false;
+        for captain in &mut current.captains {
+            let owns_target = owner.as_ref().map_or_else(
+                || captain.workspace_tab_ids.contains(&workspace.id),
+                |owner| {
+                    captain.ship_slug == owner.ship_slug
+                        && captain.assignment_id == owner.assignment_id
+                        && captain.project_id.as_deref() == Some(owner.project_id.as_str())
+                },
+            );
+            if !owns_target {
+                continue;
+            }
+            let before = captain.workspace_tab_ids.len();
+            captain
+                .workspace_tab_ids
+                .retain(|candidate| candidate != workspace_id);
+            captains_changed |= captain.workspace_tab_ids.len() != before;
+            let candidates = captain
+                .workspace_tab_ids
+                .iter()
+                .filter(|candidate| owner_candidate_ids.contains(candidate.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for crew in &mut captain.crew {
+                if crew.workspace_tab_id.as_deref() != Some(workspace_id) {
+                    continue;
+                }
+                let live_assignable = matches!(
+                    crew.state,
+                    CrewState::Active | CrewState::NeedsAssignment { .. }
+                );
+                if live_assignable && candidates.len() == 1 {
+                    crew.workspace_tab_id = Some(candidates[0].clone());
+                    crew.state = CrewState::Active;
+                } else {
+                    crew.workspace_tab_id = None;
+                    if live_assignable {
+                        crew.state = CrewState::NeedsAssignment { since: now_ms() };
+                    }
+                }
+                captains_changed = true;
+            }
+        }
+        current.workspaces.remove(workspace_index);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(CloseWorkspaceResult {
+            removed_tile_ids: workspace.tile_ids,
+            captains_changed,
+        })
     }
 
     /// Fallible write-through of a snapshot to disk, WITHOUT the `inner` lock
@@ -2814,6 +4533,8 @@ impl CaptainsRegistry {
         previous: CaptainsInner,
     ) -> Result<(), String> {
         let mut candidate = current.clone();
+        candidate.workspaces =
+            Self::reconcile_durable_workspaces(&candidate.captains, candidate.workspaces);
         let generation_changes = AuthorityGenerationChanges::between(&previous, &candidate);
         let generation_result = candidate.authority_generations.advance(generation_changes);
         *current = previous;
@@ -2845,6 +4566,9 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            workspaces: g.workspaces.clone(),
+            pending_fleet_operations: g.pending_fleet_operations.clone(),
+            retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
@@ -3009,7 +4733,7 @@ impl CaptainsRegistry {
     fn clear_confirmed_dispatch_release(
         &self,
         recovery: &PendingDispatchRelease,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool, bool), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let Some(position) = current
@@ -3028,7 +4752,7 @@ impl CaptainsRegistry {
                     && existing.operation_id == recovery.operation_id
             })
         else {
-            return Ok((false, false));
+            return Ok((false, false, false));
         };
         let owned_crew_count = current
             .captains
@@ -3074,9 +4798,66 @@ impl CaptainsRegistry {
             crew_removed |= captain.crew.len() != before;
         }
         debug_assert!(crew_removed, "validated transaction Crew must be removed");
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace
+                .tile_ids
+                .retain(|tile| tile != &recovery.crew_session_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        if !current
+            .retired_fleet_tile_ids
+            .contains(&recovery.crew_session_id)
+        {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current
+                .retired_fleet_tile_ids
+                .push(recovery.crew_session_id.clone());
+        }
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
-        Ok((true, crew_removed))
+        Ok((true, crew_removed, workspace_changed))
+    }
+
+    fn rollback_crew_and_workspace(&self, crew_session_id: &str) -> Result<(bool, bool), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let mut crew_removed = false;
+        for captain in &mut current.captains {
+            let before = captain.crew.len();
+            captain
+                .crew
+                .retain(|crew| crew.terminal_id != crew_session_id);
+            crew_removed |= captain.crew.len() != before;
+        }
+        let mut workspace_changed = false;
+        for workspace in &mut current.workspaces {
+            let before = workspace.tile_ids.len();
+            workspace.tile_ids.retain(|tile| tile != crew_session_id);
+            workspace_changed |= workspace.tile_ids.len() != before;
+        }
+        if !current
+            .retired_fleet_tile_ids
+            .iter()
+            .any(|retired| retired == crew_session_id)
+        {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current
+                .retired_fleet_tile_ids
+                .push(crew_session_id.to_string());
+        }
+        if !crew_removed && !workspace_changed {
+            return Ok((false, false));
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok((crew_removed, workspace_changed))
     }
 
     /// Capture durable registry values and their internal authority versions under
@@ -3090,6 +4871,9 @@ impl CaptainsRegistry {
                 seq: g.seq,
                 captains: g.captains.clone(),
                 projects: g.projects.clone(),
+                workspaces: g.workspaces.clone(),
+                pending_fleet_operations: g.pending_fleet_operations.clone(),
+                retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
                 pending_dispatch_claims: g.pending_dispatch_claims.clone(),
                 pending_dispatch_releases: g.pending_dispatch_releases.clone(),
             },
@@ -3239,20 +5023,13 @@ impl CaptainsRegistry {
         if !g.projects.iter().any(|p| p.project_id == project_id) {
             return Err(format!("unknown projectId '{project_id}'"));
         }
-        if let Some(existing) = g.captains.iter().find(|candidate| {
-            candidate.ship_slug != ship_slug && candidate.project_id.as_deref() == Some(project_id)
-        }) {
-            return Err(format!(
-                "project '{project_id}' is already captained by ship '{}'",
-                existing.ship_slug
-            ));
-        }
         let captain = g
             .captains
             .iter_mut()
             .find(|c| c.ship_slug == ship_slug)
             .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
         captain.project_id = Some(project_id.to_string());
+        captain.assignment_id = assignment_id_for(Some(project_id), ship_slug);
         captain.assignment = Some(assignment.to_string());
         captain.harness = Some(harness.to_string());
         let provider_changed = captain.provider.as_deref() != Some(harness);
@@ -3268,6 +5045,55 @@ impl CaptainsRegistry {
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
         Ok(result)
+    }
+
+    /// Rename one durable Captain identity without changing its Assignment,
+    /// terminal binding, Harness, or Workspace ownership.
+    pub fn rename_captain(
+        &self,
+        captain_session_id: Option<&str>,
+        ship_slug: Option<&str>,
+        display_name: &str,
+    ) -> Result<CaptainRecord, String> {
+        if captain_session_id.is_none() && ship_slug.is_none() {
+            return Err("rename_captain requires 'captainSessionId' or 'shipSlug'".into());
+        }
+        let display_name = normalize_captain_display_name(display_name)?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain = g
+            .captains
+            .iter_mut()
+            .find(|captain| {
+                captain_session_id.is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                    || ship_slug.is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+            })
+            .ok_or("rename_captain: no matching Captain is registered")?;
+        if captain.display_name == display_name {
+            return Ok(captain.clone());
+        }
+        captain.display_name = display_name;
+        let result = captain.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
+    /// Reconcile legacy and stale Crew placement against one authoritative
+    /// Workspace report. Exact owned placement is retained, one unambiguous owned
+    /// destination is rehomed, and every other case fails closed as
+    /// `needsAssignment` without selecting a foreign Workspace.
+    pub fn reconcile_crew_workspaces(&self, tabs: &mut [TabRecord]) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let changed = reconcile_crew_workspace_candidates(&mut g.captains, tabs)?;
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok(changed)
     }
 
     /// Enrich a spawned Crew reference with its durable task, harness, checkout,
@@ -3289,6 +5115,7 @@ impl CaptainsRegistry {
             harness,
             worktree_path,
             branch,
+            None,
             powder_work,
             None,
             None,
@@ -3303,6 +5130,7 @@ impl CaptainsRegistry {
         harness: &str,
         worktree_path: Option<&str>,
         branch: Option<&str>,
+        workspace_tab_id: Option<&str>,
         powder_work: PowderWorkBinding,
         expected_dispatch: Option<&DispatchAuthority>,
         expected_bind: Option<DispatchBindAuthority>,
@@ -3372,6 +5200,7 @@ impl CaptainsRegistry {
         }
         crew.worktree_path = worktree_path.map(str::to_string);
         crew.branch = branch.map(str::to_string);
+        crew.workspace_tab_id = workspace_tab_id.map(str::to_string);
         crew.powder_work = Some(powder_work);
         let result = crew.clone();
         g.seq = g.seq.saturating_add(1);
@@ -4126,6 +5955,25 @@ impl CaptainsRegistry {
         captain.conversation_id = provider_session_id.map(str::to_string);
     }
 
+    fn apply_claim_binding(
+        captain: &mut FleetIdentity,
+        binding: Option<(&str, &str, &str)>,
+    ) -> bool {
+        let Some((project_id, assignment, harness)) = binding else {
+            return false;
+        };
+        let assignment_id = assignment_id_for(Some(project_id), &captain.ship_slug);
+        let changed = captain.project_id.as_deref() != Some(project_id)
+            || captain.assignment_id != assignment_id
+            || captain.assignment.as_deref() != Some(assignment)
+            || captain.harness.as_deref() != Some(harness);
+        captain.project_id = Some(project_id.to_string());
+        captain.assignment_id = assignment_id;
+        captain.assignment = Some(assignment.to_string());
+        captain.harness = Some(harness.to_string());
+        changed
+    }
+
     /// Bump seq + persist iff `changed`, then package the [`ClaimOutcome`]. The guard
     /// is consumed here so the (potentially slow) disk write runs AFTER `inner` is
     /// dropped (Incident-D discipline).
@@ -4135,8 +5983,50 @@ impl CaptainsRegistry {
         previous: CaptainsInner,
         record: FleetIdentity,
         disposition: ClaimDisposition,
-        changed: bool,
+        mut changed: bool,
     ) -> Result<ClaimOutcome, String> {
+        if let Some(position) = g.pending_fleet_operations.iter().position(|operation| {
+            matches!(
+                &operation.payload,
+                PendingFleetOperationPayload::CommissionCaptain { terminal_id, .. }
+                    if record.terminal_id.as_deref() == Some(terminal_id.as_str())
+            )
+        }) {
+            let PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id,
+                project_id,
+                assignment,
+                ship_slug,
+                harness,
+                identity_id,
+            } = g.pending_fleet_operations[position].payload.clone()
+            else {
+                unreachable!("position matched a commission operation")
+            };
+            if identity_id.is_none()
+                || record.terminal_id.as_deref() != Some(terminal_id.as_str())
+                || record.project_id.as_deref() != Some(project_id.as_str())
+                || record.assignment.as_deref() != Some(assignment.as_str())
+                || record.ship_slug != ship_slug
+                || record.harness.as_deref() != Some(harness.as_str())
+            {
+                return Err(
+                    "commission_captain: claimed identity does not match its durable intent".into(),
+                );
+            }
+            for workspace in &mut g.workspaces {
+                workspace.tile_ids.retain(|tile| tile != &terminal_id);
+            }
+            g.workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+                .expect("durable registry always has Captain Workspace")
+                .tile_ids
+                .push(terminal_id.clone());
+            g.retired_fleet_tile_ids.retain(|tile| tile != &terminal_id);
+            g.pending_fleet_operations.remove(position);
+            changed = true;
+        }
         if changed {
             g.seq += 1;
             self.commit_mutation(g, previous)?;
@@ -4185,6 +6075,31 @@ impl CaptainsRegistry {
         is_terminal_dead: &dyn Fn(&str) -> bool,
         crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
     ) -> Result<ClaimOutcome, String> {
+        self.claim_provider_with_binding(
+            terminal_id,
+            ship_slug,
+            role,
+            provider,
+            provider_session_id,
+            workspace_tab_ids,
+            None,
+            is_terminal_dead,
+            crew_liveness,
+        )
+    }
+
+    fn claim_provider_with_binding(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        role: FleetRole,
+        provider: Option<&str>,
+        provider_session_id: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+        binding: Option<(&str, &str, &str)>,
+        is_terminal_dead: &dyn Fn(&str) -> bool,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
+    ) -> Result<ClaimOutcome, String> {
         if terminal_id.trim().is_empty() {
             return Err("claim_captain requires a non-empty 'captainSessionId'".into());
         }
@@ -4210,6 +6125,31 @@ impl CaptainsRegistry {
         };
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let previous = self.lock().clone();
+        if let Some((project_id, assignment, harness)) = binding {
+            if assignment.trim().is_empty() || harness.trim().is_empty() {
+                return Err("Captain binding requires a non-empty assignment and harness".into());
+            }
+            validate_harness_name(harness, "Captain harness")?;
+            if !previous
+                .projects
+                .iter()
+                .any(|project| project.project_id == project_id)
+            {
+                return Err(format!("unknown projectId '{project_id}'"));
+            }
+        }
+        if let Some(existing) = previous
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some(terminal_id))
+        {
+            if existing.ship_slug != slug && existing.project_id.is_some() {
+                return Err(format!(
+                    "claim_captain: project-bound Captain '{}' cannot be redesignated as ship '{slug}'; release the existing Captain explicitly before reusing its terminal or slug",
+                    existing.ship_slug
+                ));
+            }
+        }
 
         for _attempt in 0..CLAIM_CAS_ATTEMPTS {
             // Phase 1 (under `inner`): decide whether an incumbent liveness probe is
@@ -4247,6 +6187,21 @@ impl CaptainsRegistry {
 
             // Phase 3 (re-acquire `inner`): re-validate then mutate.
             let mut g = self.lock();
+            for workspace_id in &workspace_tab_ids {
+                if let Some(owner) = g.captains.iter().find(|captain| {
+                    captain.terminal_id.as_deref() != Some(terminal_id)
+                        && !Self::key_matches(captain, role, &slug)
+                        && captain
+                            .workspace_tab_ids
+                            .iter()
+                            .any(|owned| owned == workspace_id)
+                }) {
+                    return Err(format!(
+                        "claim_captain: Work Workspace '{workspace_id}' is already owned by Captain '{}'",
+                        owner.ship_slug
+                    ));
+                }
+            }
             let holder_pos = g
                 .captains
                 .iter()
@@ -4284,6 +6239,7 @@ impl CaptainsRegistry {
                             c.workspace_tab_ids = workspace_tab_ids;
                         }
                         c.state = ClaimState::Active;
+                        Self::apply_claim_binding(c, binding);
                         let rec = c.clone();
                         return self.commit_claim(
                             g,
@@ -4293,8 +6249,10 @@ impl CaptainsRegistry {
                             true,
                         );
                     }
-                    let rec = FleetIdentity {
+                    let mut rec = FleetIdentity {
                         ship_slug: slug.clone(),
+                        assignment_id: assignment_id_for(None, &slug),
+                        display_name: slug.clone(),
                         role,
                         claude_uuid: (provider == Some("claude"))
                             .then(|| provider_session_id.map(str::to_string))
@@ -4311,6 +6269,7 @@ impl CaptainsRegistry {
                         crew: Vec::new(),
                         state: ClaimState::Active,
                     };
+                    Self::apply_claim_binding(&mut rec, binding);
                     g.captains.push(rec.clone());
                     return self.commit_claim(
                         g,
@@ -4341,7 +6300,9 @@ impl CaptainsRegistry {
                             c.state = ClaimState::Active;
                             Self::readopt_orphaned_crew(c, crew_liveness);
                         }
-                        let changed = tabs_change || provider_change || reactivate;
+                        let binding_change = Self::apply_claim_binding(c, binding);
+                        let changed =
+                            tabs_change || provider_change || reactivate || binding_change;
                         let rec = c.clone();
                         return self.commit_claim(
                             g,
@@ -4391,6 +6352,7 @@ impl CaptainsRegistry {
                     }
                     c.state = ClaimState::Active;
                     Self::readopt_orphaned_crew(c, crew_liveness);
+                    Self::apply_claim_binding(c, binding);
                     let rec = c.clone();
                     return self.commit_claim(g, previous.clone(), rec, disposition, true);
                 }
@@ -6875,7 +8837,7 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
-        | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
+        | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "report_workspace_tabs" | "watch_fleet"
         | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
@@ -7439,6 +9401,101 @@ fn enforce_project_authority(
         Ok(())
     } else {
         Err("acl: project mutation requires General/Cortana or the owning Captain".into())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceMutationAuthority {
+    Apex,
+    Assignment(FleetWorkspaceOwner),
+}
+
+fn workspace_mutation_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<WorkspaceMutationAuthority, String> {
+    if trusted_internal {
+        return Ok(WorkspaceMutationAuthority::Apex);
+    }
+    let caller = caller
+        .ok_or_else(|| format!("acl: '{command}' requires a terminal-bound Fleet identity"))?;
+    if matches!(caller.fleet_role, Some(FleetRole::Cortana))
+        || matches!(
+            caller.mint_role,
+            crate::identity::Role::General | crate::identity::Role::Cortana
+        )
+    {
+        return Ok(WorkspaceMutationAuthority::Apex);
+    }
+    if caller.fleet_role != Some(FleetRole::Captain) {
+        return Err(format!(
+            "acl: '{command}' requires General/Cortana or a durable Captain Assignment"
+        ));
+    }
+    let terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or_else(|| format!("acl: '{command}' Captain caller has no terminal binding"))?;
+    let snapshot = ctx.captains.snapshot();
+    let matches = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain.state == ClaimState::Active
+                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "acl: '{command}' caller does not resolve to exactly one active Captain"
+        ));
+    }
+    let captain = matches[0];
+    let project_id = captain
+        .project_id
+        .clone()
+        .ok_or_else(|| format!("acl: '{command}' Captain has no durable Project binding"))?;
+    Ok(WorkspaceMutationAuthority::Assignment(
+        FleetWorkspaceOwner {
+            project_id,
+            assignment_id: captain.assignment_id.clone(),
+            ship_slug: captain.ship_slug.clone(),
+        },
+    ))
+}
+
+fn enforce_workspace_owner(
+    ctx: &ControlContext,
+    authority: &WorkspaceMutationAuthority,
+    workspace_id: &str,
+    command: &str,
+) -> Result<(), String> {
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        return Ok(());
+    }
+    let WorkspaceMutationAuthority::Assignment(caller_owner) = authority else {
+        unreachable!();
+    };
+    let snapshot = ctx.captains.snapshot();
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("{command}: unknown durable Workspace '{workspace_id}'"))?;
+    if workspace.kind == WorkspaceKind::Captain {
+        return Err(format!(
+            "acl: '{command}' Captain Workspace mutation requires General/Cortana"
+        ));
+    }
+    if workspace.owner.as_ref() == Some(caller_owner) {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' cannot mutate Workspace '{workspace_id}' outside caller Project/Assignment"
+        ))
     }
 }
 
@@ -8054,7 +10111,12 @@ fn reprobe_reaped_request(
                 .projects()
                 .into_iter()
                 .find(|project| project.project_id == project_id)?;
-            match existing_project_captain(ctx, &project_id) {
+            let ship_slug = arg_str(args, "shipSlug")
+                .or_else(|| arg_str(args, "ship_slug"))
+                .map(|value| slugify_ship(&value))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| slugify_ship(&project.name));
+            match existing_project_captain(ctx, &project_id, &ship_slug) {
                 Ok(Some(captain)) => Some(Ok(commissioned_response(captain, project, true))),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
@@ -8249,11 +10311,6 @@ fn dispatch_with_caller(
         "captain_bootstrap" => captain_bootstrap(ctx, args),
         "powder_status" => powder_status(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
-        // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
-        // socket UI (the native cockpit) reports its tab layout into the same
-        // registry the webview reports into, so `list_tabs` stays truthful
-        // whichever client is attached.
-        "report_workspace_tabs" => report_workspace_tabs(ctx, args),
         "read_terminal" | "capture_pane" => read_terminal(ctx, args, caller, trusted_internal),
         // Comms-plane Phase 2: the durable inbox's read-tier surface. `inbox_ack` is
         // the recipient's `delivered -> processed` intake confirmation (the receipt
@@ -8284,12 +10341,12 @@ fn dispatch_with_caller(
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
         // forward the registry snapshot for the UI to render from.
-        "move_tile" => move_tile(ctx, args),
-        "rename_tab" => rename_tab(ctx, args),
+        "move_tile" => move_tile(ctx, args, caller, trusted_internal),
+        "rename_tab" => rename_tab(ctx, args, caller, trusted_internal),
         // new_tab mints the tab id CORE-side so it can return it (TASK C:
         // addressable tabs) and forwards that id for the frontend to adopt.
-        "new_tab" => new_tab(ctx, args),
-        "close_tab" | "remove_tab" => close_tab(ctx, args),
+        "new_tab" => new_tab(ctx, args, caller, trusted_internal),
+        "close_tab" | "remove_tab" => close_tab(ctx, args, caller, trusted_internal),
         "focus_tab" => focus_tab(ctx, args),
         "open_file" => open_file(ctx, args),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
@@ -8310,7 +10367,9 @@ fn dispatch_with_caller(
         // UI's pin action and an MCP captain's self-registration both land here,
         // and every mutation forwards the authoritative captains snapshot.
         "claim_captain" => claim_captain(ctx, args, caller, trusted_internal),
+        "report_workspace_tabs" => report_workspace_tabs(ctx, args, caller, trusted_internal),
         "release_captain" => release_captain(ctx, args, caller, trusted_internal),
+        "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
@@ -9762,13 +11821,16 @@ fn captain_bootstrap(ctx: &ControlContext, args: &Value) -> Result<Value, String
 fn existing_project_captain(
     ctx: &ControlContext,
     project_id: &str,
+    ship_slug: &str,
 ) -> Result<Option<CaptainRecord>, String> {
     let existing = ctx
         .captains
         .snapshot()
         .captains
         .into_iter()
-        .find(|captain| captain.project_id.as_deref() == Some(project_id));
+        .find(|captain| {
+            captain.project_id.as_deref() == Some(project_id) && captain.ship_slug == ship_slug
+        });
     let Some(captain) = existing else {
         return Ok(None);
     };
@@ -9952,16 +12014,19 @@ fn commission_captain(
                 )
             })?;
     }
+    let ship_slug = arg_str(args, "shipSlug")
+        .or_else(|| arg_str(args, "ship_slug"))
+        .map(|value| slugify_ship(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slugify_ship(&project.name));
+    if ship_slug.is_empty() {
+        return Err("commission_captain: could not derive a non-empty shipSlug".into());
+    }
     let _provision = ctx.captains.provision_guard();
-    if let Some(captain) = existing_project_captain(ctx, &project.project_id)? {
-        let requested_slug = arg_str(args, "shipSlug")
-            .or_else(|| arg_str(args, "ship_slug"))
-            .map(|value| slugify_ship(&value));
+    if let Some(captain) = existing_project_captain(ctx, &project.project_id, &ship_slug)? {
         let same_contract = captain.assignment.as_deref() == Some(assignment.as_str())
             && captain.harness.as_deref() == Some(harness.as_provider())
-            && requested_slug
-                .as_deref()
-                .is_none_or(|slug| slug == captain.ship_slug);
+            && captain.ship_slug == ship_slug;
         if !same_contract {
             return Err(format!(
                 "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
@@ -9971,16 +12036,10 @@ fn commission_captain(
         return Ok(commissioned_response(captain, project, true));
     }
 
-    let ship_slug = arg_str(args, "shipSlug")
-        .or_else(|| arg_str(args, "ship_slug"))
-        .map(|value| slugify_ship(&value))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| slugify_ship(&project.name));
-    if ship_slug.is_empty() {
-        return Err("commission_captain: could not derive a non-empty shipSlug".into());
-    }
     let provisional = CaptainRecord {
         ship_slug: ship_slug.clone(),
+        assignment_id: assignment_id_for(Some(&project.project_id), &ship_slug),
+        display_name: ship_slug.clone(),
         role: FleetRole::Captain,
         claude_uuid: None,
         provider: Some(harness.as_provider().to_string()),
@@ -10013,79 +12072,157 @@ fn commission_captain(
                 .collect()
         })
         .unwrap_or_default();
-    let mut spawn_args = json!({
+    let spawn_args = json!({
         "cwd": project.repo_root,
         "name": format!("Captain - {}", project.name),
         "startupCommand": startup_command,
         "capability": "control",
+        "tabId": CAPTAIN_WORKSPACE_ID,
     });
-    if ctx.tabs.has_tab("captains-reserved") {
-        spawn_args["tabId"] = json!("captains-reserved");
-    } else {
-        spawn_args["tabName"] = json!("Captains");
+    if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
+        return Err(
+            "commission_captain: no UI is connected to adopt the commissioned Captain".into(),
+        );
     }
-    let spawned = spawn_terminal(ctx, &spawn_args)?;
-    let terminal_id = spawned["id"]
-        .as_str()
-        .ok_or("commission_captain: spawn returned no terminal id")?
-        .to_string();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let terminal_id = suffix[..8].to_string();
+    let operation = ctx.captains.prepare_commission_operation(
+        &terminal_id,
+        &project.project_id,
+        &assignment,
+        &ship_slug,
+        harness.as_provider(),
+    )?;
+    let mut elevation = elevation_env(ctx, &spawn_args);
+    if spawn_capability(&spawn_args) == Capability::Full {
+        audit_control_spawn(ctx, "commission_captain", &spawn_args);
+    }
+    let identity = match ctx
+        .identity
+        .mint_for(crate::identity::Role::Captain, Some(ship_slug.clone()))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = ctx
+                .captains
+                .abort_close_terminal_operation(&operation.operation_id);
+            return Err(error);
+        }
+    };
+    elevation.push((
+        crate::identity::SESSION_TOKEN_ENV.to_string(),
+        identity.secret.clone(),
+    ));
+    if let Err(error) = ctx
+        .captains
+        .bind_commission_operation_identity(&operation.operation_id, &identity.id)
+    {
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
+        return Err(error);
+    }
+    if let Err(error) = ctx.identity.bind_tile(&identity.id, &terminal_id) {
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
+        return Err(format!(
+            "commission_captain: identity binding failed before tmux startup: {error}"
+        ));
+    }
+    let tmux_cwd = files::posix_form(&project.repo_root);
+    let pane = crate::commands::pane_command(None, Some(&startup_command));
+    let (_, tmux_session) = match spawn_tmux_terminal_with_id(
+        &terminal_id,
+        &tmux_cwd,
+        pane.as_deref(),
+        &elevation,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = ctx.identity.retire(&identity.id);
+            let _ = ctx
+                .captains
+                .abort_close_terminal_operation(&operation.operation_id);
+            return Err(format!(
+                "commission_captain: terminal startup failed and reserved artifacts were rolled back: {error}"
+            ));
+        }
+    };
     if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
-        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
         return Err(format!(
             "commission_captain: harness startup failed and the terminal was rolled back: {error}"
         ));
     }
-    let previous_claim = ctx
-        .captains
-        .snapshot()
-        .captains
-        .into_iter()
-        .find(|captain| {
-            captain.terminal_id.as_deref() == Some(terminal_id.as_str())
-                || captain.ship_slug == ship_slug
-        });
-    let claim = claim_captain(
-        ctx,
-        &json!({
-            "captainSessionId": terminal_id,
-            "shipSlug": ship_slug,
-            "provider": harness.as_provider(),
-            "workspaceTabIds": workspace_tab_ids,
-        }),
-        None,
-        true,
-    );
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("commission_effect_applied");
+    #[cfg(test)]
+    if args
+        .get("testCrashAfterTmux")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("injected commission crash after tmux and identity effects".into());
+    }
+    let claim_args = json!({
+        "captainSessionId": terminal_id,
+        "shipSlug": ship_slug,
+        "provider": harness.as_provider(),
+        "workspaceTabIds": workspace_tab_ids,
+    });
+    #[cfg(test)]
+    if args
+        .get("testFailCommitPersist")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ctx.captains
+            .fail_next_persist("commission binding persistence failure");
+    }
+    let claim = {
+        let _identity_transaction = ctx.tabs.identity_transaction();
+        claim_captain_locked(
+            ctx,
+            &claim_args,
+            None,
+            true,
+            Some((&project.project_id, &assignment, harness.as_provider())),
+            false,
+        )
+    };
     if let Err(error) = claim {
-        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
         return Err(format!(
             "commission_captain: terminal was spawned but its Captain claim failed and was rolled back: {error}"
         ));
     }
-    let claimed = ctx
+    let captain = ctx
         .captains
         .captain_for_session(&terminal_id)
-        .ok_or("commission_captain: claimed terminal disappeared before project binding")?;
-    let captain = match ctx.captains.bind_ship_context(
-        &ship_slug,
-        &project.project_id,
-        &assignment,
-        harness.as_provider(),
-    ) {
-        Ok(captain) => captain,
-        Err(error) => {
-            let rollback =
-                ctx.captains
-                    .rollback_provisioned_claim(&terminal_id, &claimed, previous_claim);
-            let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
-            return Err(format!(
-                "commission_captain: durable project binding failed and the terminal was rolled back: {error}{}",
-                rollback
-                    .err()
-                    .map(|rollback| format!("; registry rollback failed: {rollback}"))
-                    .unwrap_or_default()
-            ));
-        }
-    };
+        .ok_or("commission_captain: bound Captain disappeared before projection")?;
+    let spawned = json!({
+        "accepted": "spawn_terminal",
+        "id": terminal_id,
+        "tmuxSession": tmux_session,
+        "cwd": project.repo_root,
+        "name": format!("Captain - {}", project.name),
+        "startupCommand": startup_command,
+        "tabId": CAPTAIN_WORKSPACE_ID,
+        "placed": true,
+        "audited": true,
+    });
+    let _ = forward_apply(ctx, "spawn_terminal", &with_sync(ctx, spawned));
     let _ = captains_sync_apply(ctx);
     Ok(commissioned_response(captain, project, false))
 }
@@ -10226,7 +12363,7 @@ fn attach_captain(
             })?;
     }
     let _provision = ctx.captains.provision_guard();
-    if let Some(existing) = existing_project_captain(ctx, &project_id)? {
+    if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
             return Err(format!(
                 "attach_captain: project '{}' already has live Captain '{}'",
@@ -10260,57 +12397,71 @@ fn attach_captain(
             captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 || captain.ship_slug == ship_slug
         });
-    claim_captain(ctx, &claim_args, None, true)?;
-    let claimed = ctx
+    let _identity_transaction = ctx.tabs.identity_transaction();
+    let previous_workspace = ctx.tabs.workspace_for_tile(&terminal_id);
+    claim_captain_locked(
+        ctx,
+        &claim_args,
+        None,
+        true,
+        Some((&project_id, &assignment, &provider)),
+        false,
+    )
+    .map_err(|error| format!("attach_captain: durable claim and binding failed: {error}"))?;
+    let captain = ctx
         .captains
         .captain_for_session(&terminal_id)
-        .ok_or("attach_captain: claimed terminal disappeared before project binding")?;
-    let captain =
-        match ctx
-            .captains
-            .bind_ship_context(&ship_slug, &project_id, &assignment, &provider)
-        {
-            Ok(captain) => captain,
-            Err(error) => {
-                let rollback = ctx.captains.rollback_provisioned_claim(
-                    &terminal_id,
-                    &claimed,
-                    previous_claim.clone(),
-                );
-                return Err(format!(
-                    "attach_captain: durable project binding failed: {error}{}",
-                    rollback
-                        .err()
-                        .map(|rollback| format!("; registry rollback failed: {rollback}"))
-                        .unwrap_or_default()
-                ));
-            }
-        };
-    let _ = captains_sync_apply(ctx);
+        .ok_or("attach_captain: bound Captain disappeared before projection")?;
     let instructions = bootstrap_instructions(&captain, &project);
     let attaching_other_terminal =
         caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str());
     if attaching_other_terminal {
-        if let Err(error) = send_text(&json!({
+        #[cfg(test)]
+        let bootstrap_delivery = if args
+            .get("testFailBootstrapDelivery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            Err("injected bootstrap delivery failure".to_string())
+        } else {
+            send_text(&json!({
+                "sessionId": terminal_id,
+                "text": instructions,
+                "enter": true,
+            }))
+        };
+        #[cfg(not(test))]
+        let bootstrap_delivery = send_text(&json!({
             "sessionId": terminal_id,
             "text": instructions,
             "enter": true,
-        })) {
+        }));
+        if let Err(error) = bootstrap_delivery {
             let rollback =
                 ctx.captains
                     .rollback_provisioned_claim(&terminal_id, &captain, previous_claim);
-            if rollback.is_ok() {
-                let _ = captains_sync_apply(ctx);
-            }
+            let placement_rollback = ctx
+                .tabs
+                .restore_tile_placement_locked(&terminal_id, previous_workspace.as_deref());
             return Err(format!(
-                "attach_captain: target bootstrap delivery failed: {error}{}",
+                "attach_captain: target bootstrap delivery failed: {error}{}{}",
                 rollback
                     .err()
                     .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                    .unwrap_or_default(),
+                placement_rollback
+                    .err()
+                    .map(|rollback| format!("; placement rollback failed: {rollback}"))
                     .unwrap_or_default()
             ));
         }
     }
+    let _ = organization_sync_apply(
+        ctx,
+        "move_tile",
+        json!({"terminalId": terminal_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+    );
+    let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "attach_captain",
         "audited": true,
@@ -10402,6 +12553,100 @@ fn captain_and_project_for_dispatch(
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("dispatch_crew: unknown projectId '{project_id}'"))?;
     Ok((captain, project))
+}
+
+fn dispatch_workspace_candidates(ctx: &ControlContext, captain: &CaptainRecord) -> Vec<TabRecord> {
+    let mut seen = std::collections::HashSet::new();
+    captain
+        .workspace_tab_ids
+        .iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .filter_map(|id| ctx.tabs.work_workspace(id))
+        .collect()
+}
+
+fn workspace_required_error(candidates: &[TabRecord]) -> String {
+    let candidates: Vec<Value> = candidates
+        .iter()
+        .take(20)
+        .map(|tab| json!({ "id": tab.id, "name": tab.name }))
+        .collect();
+    format!(
+        "workspace_required: select one owned Work Workspace from {}",
+        Value::Array(candidates)
+    )
+}
+
+fn resolve_dispatch_workspace(
+    ctx: &ControlContext,
+    args: &Value,
+    captain: &CaptainRecord,
+) -> Result<TabRecord, String> {
+    let explicit_workspace =
+        arg_str(args, "workspaceTabId").or_else(|| arg_str(args, "workspace_tab_id"));
+    let compatibility_tab = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id"));
+    if explicit_workspace.is_some()
+        && compatibility_tab.is_some()
+        && explicit_workspace != compatibility_tab
+    {
+        return Err("dispatch_crew: workspaceTabId conflicts with tabId".into());
+    }
+    let requested_id = explicit_workspace.or(compatibility_tab);
+    let requested_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    if requested_id.is_some() && requested_name.is_some() {
+        return Err("dispatch_crew: select a Workspace by id or name, not both".into());
+    }
+    let candidates = dispatch_workspace_candidates(ctx, captain);
+    if let Some(id) = requested_id {
+        if id == CAPTAIN_WORKSPACE_ID {
+            return Err("dispatch_crew: Crew cannot be placed in Captain Workspace".into());
+        }
+        return candidates
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "dispatch_crew: Workspace '{id}' is not an existing Work Workspace owned by Captain '{}'",
+                    captain.ship_slug
+                )
+            });
+    }
+    if let Some(name) = requested_name {
+        let matching: Vec<TabRecord> = candidates
+            .into_iter()
+            .filter(|tab| tab.name == name)
+            .collect();
+        return match matching.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(format!(
+                "dispatch_crew: no owned Work Workspace is named '{name}'"
+            )),
+            _ => Err(workspace_required_error(&matching)),
+        };
+    }
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(workspace_required_error(&candidates)),
+    }
+}
+
+fn revalidate_dispatch_workspace(
+    ctx: &ControlContext,
+    captain: &CaptainRecord,
+    workspace_tab_id: &str,
+) -> Result<(), String> {
+    if !captain
+        .workspace_tab_ids
+        .iter()
+        .any(|id| id == workspace_tab_id)
+        || ctx.tabs.work_workspace(workspace_tab_id).is_none()
+    {
+        return Err(format!(
+            "Workspace '{workspace_tab_id}' is stale, closed, foreign, or no longer owned by Captain '{}'",
+            captain.ship_slug
+        ));
+    }
+    Ok(())
 }
 
 fn revalidate_dispatch_authority(
@@ -10783,23 +13028,51 @@ fn rollback_trusted_dispatch_guarded(
             claim.card_id, claim.run_id
         ));
     }
-    if let Some(recovery) = release_recovery {
-        let (cleared, _) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-        if !cleared {
+    commit_trusted_dispatch_cleanup(ctx, crew_session_id, release_recovery)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+/// Commit the local half of trusted dispatch teardown under the fleet identity
+/// transaction. Remote release and tmux teardown have already completed before
+/// entry, so this lock covers only durable Crew state, tab retirement, and the
+/// local session identity. Both producer rollback and restart recovery use this
+/// exact boundary, preventing either path from racing a move/restore.
+fn commit_trusted_dispatch_cleanup(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    release_recovery: Option<&PendingDispatchRelease>,
+) -> Result<(), String> {
+    let workspace_changed = if let Some(recovery) = release_recovery {
+        let (cleared, crew_removed, workspace_changed) =
+            ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+        if !cleared || !crew_removed {
             return Err(format!(
                 "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned release recovery could not be cleared"
             ));
         }
+        workspace_changed
     } else {
-        ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
+        let (crew_removed, workspace_changed) = ctx
+            .captains
+            .rollback_crew_and_workspace(crew_session_id)
+            .map_err(|error| {
             format!(
                 "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record could not be removed: {error}"
             )
         })?;
+        if !crew_removed {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record was absent"
+            ));
+        }
+        workspace_changed
+    };
+    ctx.tabs.replace(ctx.captains.workspace_projection());
+    if workspace_changed || ctx.tabs.retire_tile_locked(crew_session_id) {
+        let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
-    ctx.tabs.remove_tile(crew_session_id);
     ctx.identity.retire_tile(crew_session_id)?;
-    let _ = captains_sync_apply(ctx);
     Ok(())
 }
 
@@ -10906,6 +13179,9 @@ fn dispatch_crew_with_observer_inner(
         &project,
         arg_str(args, "worktreePath").or_else(|| arg_str(args, "worktree_path")),
     )?;
+    // Resolve the exact durable destination before reservations, Powder reads,
+    // claims, terminal creation, or any other side effect.
+    let workspace = resolve_dispatch_workspace(ctx, args, &captain)?;
     let branch = arg_str(args, "branch");
     let ttl_seconds = args
         .get("ttlSeconds")
@@ -10959,17 +13235,13 @@ fn dispatch_crew_with_observer_inner(
     ctx.captains.pause_dispatch("after_preflight");
     revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
 
-    let mut spawn_args = json!({
+    let spawn_args = json!({
         "cwd": checkout,
         "name": format!("Crew - {}", card_id),
         "spawnedBy": captain_session_id,
         "capability": "read",
+        "tabId": workspace.id,
     });
-    if let Some(tab_id) = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")) {
-        spawn_args["tabId"] = json!(tab_id);
-    } else if let Some(tab_name) = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name")) {
-        spawn_args["tabName"] = json!(tab_name);
-    }
     let pending_claim = PendingDispatchClaim {
         project_id: project.project_id.clone(),
         connection_profile: binding.connection_profile.clone(),
@@ -10992,6 +13264,9 @@ fn dispatch_crew_with_observer_inner(
         ctx,
         &spawn_args,
         Some(&private_dormant_pane_command),
+        false,
+        true,
+        true,
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -11007,6 +13282,14 @@ fn dispatch_crew_with_observer_inner(
         .as_str()
         .ok_or("dispatch_crew: spawn returned no terminal id")?
         .to_string();
+    if let Err(error) = revalidate_dispatch_workspace(ctx, &captain, &workspace.id) {
+        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, None, None);
+        let clear = ctx.captains.clear_pending_dispatch_claim(&pending_claim);
+        return Err(dispatch_rollback_error(
+            format!("dispatch_crew: {error}"),
+            rollback.and(clear.map(|_| ())),
+        ));
+    }
     let claim = match client.claim(&card_id, ttl_seconds) {
         Ok(claim) => claim,
         Err(error) => {
@@ -11059,6 +13342,18 @@ fn dispatch_crew_with_observer_inner(
     #[cfg(test)]
     ctx.captains.pause_dispatch("after_claim");
     revalidate_or_rollback!("after claim before durable Crew binding");
+    if let Err(error) = revalidate_dispatch_workspace(ctx, &captain, &workspace.id) {
+        return Err(rollback_dispatch_authority_failure(
+            ctx,
+            &crew_session_id,
+            &client,
+            &claim,
+            &pending_claim,
+            release_recovery.as_ref(),
+            "after Workspace validation",
+            error,
+        ));
+    }
     let (_, bind_generations, _) = ctx.captains.snapshot_with_authority_generations();
     let bind_authority = DispatchBindAuthority {
         crew_generation: bind_generations
@@ -11076,6 +13371,7 @@ fn dispatch_crew_with_observer_inner(
         harness.as_provider(),
         Some(&checkout),
         branch.as_deref(),
+        Some(&workspace.id),
         PowderWorkBinding {
             card_id: claim.card_id.clone(),
             run_id: claim.run_id.clone(),
@@ -13962,6 +16258,49 @@ pub fn start_powder_reconciler(ctx: ControlContext) {
         .ok();
 }
 
+/// Replay durable Fleet intents before the control listener accepts requests.
+/// External effects are idempotent, and each handler verifies the exact persisted
+/// operation identity again before committing its post-state.
+pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
+    let pending = ctx.captains.snapshot().pending_fleet_operations;
+    for operation in pending {
+        match &operation.payload {
+            PendingFleetOperationPayload::CloseTerminal { terminal_id, .. } => {
+                if let Err(error) = close_terminal_with_policy(
+                    ctx,
+                    &json!({"sessionId": terminal_id, "force": true}),
+                    false,
+                    None,
+                ) {
+                    eprintln!(
+                        "t-hub-fleet: pending close operation '{}' remains for retry: {error}",
+                        operation.operation_id
+                    );
+                }
+            }
+            PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id,
+                identity_id,
+                ..
+            } => {
+                let _ = tmux::kill_session_tree(&tmux_target(terminal_id));
+                if let Some(identity_id) = identity_id {
+                    let _ = ctx.identity.retire(identity_id);
+                }
+                if let Err(error) = ctx
+                    .captains
+                    .abort_close_terminal_operation(&operation.operation_id)
+                {
+                    eprintln!(
+                        "t-hub-fleet: pending commission operation '{}' remains for retry: {error}",
+                        operation.operation_id
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Reuse a resolved Powder profile across event polls. A profile command may
 /// cross the Windows-to-WSL boundary to retrieve a credential, so rebuilding a
 /// client every 15 seconds creates needless process churn. Entries expire to
@@ -14072,12 +16411,13 @@ fn clear_confirmed_dispatch_release_and_retire(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
 ) -> Result<(), String> {
-    let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-    if !cleared || !crew_removed {
-        return Err("the exact durable release recovery could not remove its transaction-owned Crew binding".into());
-    }
-    ctx.tabs.remove_tile(&recovery.crew_session_id);
-    ctx.identity.retire_tile(&recovery.crew_session_id)?;
+    commit_trusted_dispatch_cleanup(ctx, &recovery.crew_session_id, Some(recovery)).map_err(
+        |error| {
+            format!(
+                "the exact durable release recovery could not remove its transaction-owned Crew binding: {error}"
+            )
+        },
+    )?;
     let _ = captains_sync_apply(ctx);
     Ok(())
 }
@@ -14086,6 +16426,18 @@ fn recover_pending_dispatch_release_guarded(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
 ) -> Result<(), String> {
+    apply_pending_dispatch_release_effect_guarded(ctx, recovery)?;
+    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
+}
+
+fn apply_pending_dispatch_release_effect_guarded(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let mut durable_recovery = ctx
+        .captains
+        .pending_dispatch_release(&recovery.crew_session_id)
+        .ok_or("the exact durable release recovery no longer exists")?;
     let client = powder::Client::from_profile(&recovery.connection_profile)?;
     if client.configured_agent() != recovery.agent {
         return Err("the frozen profile agent changed".into());
@@ -14106,6 +16458,11 @@ fn recover_pending_dispatch_release_guarded(
                     .into(),
             );
         }
+    }
+    let mut expected_recovery = recovery.clone();
+    expected_recovery.state = durable_recovery.state;
+    if durable_recovery != expected_recovery {
+        return Err("the exact durable release recovery changed before its external effect".into());
     }
     let repository = client
         .get_repository(&recovery.repository)
@@ -14135,7 +16492,15 @@ fn recover_pending_dispatch_release_guarded(
             );
         }
         ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
-        return clear_confirmed_dispatch_release_and_retire(ctx, recovery);
+        if durable_recovery.state == PendingDispatchReleaseState::Prepared {
+            ctx.captains.transition_dispatch_release(
+                &durable_recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )?;
+            durable_recovery.state = PendingDispatchReleaseState::InFlight;
+        }
+        return Ok(());
     }
     if evidence.run.state != "active" {
         return Err(format!(
@@ -14151,12 +16516,13 @@ fn recover_pending_dispatch_release_guarded(
         return Err("the active card claim no longer matches the exact release ownership".into());
     }
     ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
-    if recovery.state == PendingDispatchReleaseState::Prepared {
+    if durable_recovery.state == PendingDispatchReleaseState::Prepared {
         ctx.captains.transition_dispatch_release(
-            recovery,
+            &durable_recovery,
             PendingDispatchReleaseState::Prepared,
             PendingDispatchReleaseState::InFlight,
         )?;
+        durable_recovery.state = PendingDispatchReleaseState::InFlight;
     }
     let claim = powder::Claim {
         card_id: recovery.card_id.clone(),
@@ -14165,11 +16531,28 @@ fn recover_pending_dispatch_release_guarded(
         expires_at: 0,
     };
     client.release(&claim)?;
-    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
+    Ok(())
 }
 
 fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
     for recovery in ctx.captains.snapshot().pending_dispatch_releases {
+        if ctx
+            .captains
+            .close_operation_owns_dispatch_release(&recovery)
+        {
+            if let Err(error) = close_terminal_with_policy(
+                ctx,
+                &json!({"sessionId": recovery.crew_session_id, "force": true}),
+                false,
+                None,
+            ) {
+                eprintln!(
+                    "t-hub-control: Fleet-owned terminal close recovery for '{}' remains pending: {error}",
+                    recovery.crew_session_id
+                );
+            }
+            continue;
+        }
         if let Err(error) = recover_pending_dispatch_release(ctx, &recovery) {
             eprintln!(
                 "t-hub-control: trusted dispatch release recovery for '{}' remains pending: {error}",
@@ -14433,7 +16816,21 @@ fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, e
 /// applied yet. A report WITHOUT `baseSeq` (legacy reporter) is accepted
 /// unconditionally. Args: `tabs`: `[{id, name, tileIds}]`; `activeTabId`
 /// (optional); `baseSeq` (optional).
-fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn report_workspace_tabs(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    if !matches!(
+        workspace_mutation_authority(ctx, caller, trusted_internal, "report_workspace_tabs")?,
+        WorkspaceMutationAuthority::Apex
+    ) {
+        return Err(
+            "acl: report_workspace_tabs is a full-layout mutation restricted to General/Cortana or the trusted host"
+                .into(),
+        );
+    }
     let tabs: Vec<TabRecord> = serde_json::from_value(
         args.get("tabs")
             .cloned()
@@ -14446,29 +16843,26 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .get("baseSeq")
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
-    match ctx.tabs.report(tabs, active, base_seq) {
-        ReportOutcome::Accepted {
-            seq,
-            removed_tab_ids,
-        } => {
-            // Captain-chat phase 2: a normally-closed tab (the primary UI path)
-            // must leave every captain's workspaceTabIds too - prune, and forward
-            // a captains snapshot when anything changed so the UI/native cockpit
-            // converge.
-            let mut pruned = false;
-            for tab_id in &removed_tab_ids {
-                pruned |= ctx.captains.prune_tab(tab_id)?;
-            }
-            if pruned {
+
+    match apply_workspace_report(&ctx.tabs, &ctx.captains, tabs, active, base_seq)? {
+        (ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled) => {
+            if captains_changed {
                 let _ = captains_sync_apply(ctx);
             }
-            Ok(json!({ "reported": count, "seq": seq }))
+            let snapshot = ctx.tabs.snapshot_full();
+            Ok(json!({
+                "reported": count,
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            }))
         }
-        ReportOutcome::Stale(snap) => Ok(json!({
+        (ReportOutcome::Stale(snapshot), _, _) => Ok(json!({
             "stale": true,
-            "seq": snap.seq,
-            "activeTabId": snap.active_tab_id,
-            "tabs": snap.tabs,
+            "seq": snapshot.seq,
+            "activeTabId": snapshot.active_tab_id,
+            "tabs": snapshot.tabs,
             "note": "report based on a stale revision; adopt the returned snapshot \
                      and re-report on the next local change.",
         })),
@@ -15385,12 +17779,37 @@ fn organization_sync_apply(
 /// caller never learns). The id is recorded in the registry optimistically so
 /// `list_tabs` sees it before the frontend reports back. Args: `name` (optional;
 /// auto-named "Workspace N" when omitted).
-fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn new_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "new_tab")?;
     let name = arg_str(args, "name")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ctx.tabs.auto_name());
+    if name == CAPTAIN_WORKSPACE_NAME || name == "Captains" {
+        return Err("new_tab: Captain Workspace is reserved and already exists".into());
+    }
     let id = uuid::Uuid::new_v4().to_string();
+    let owner = match &authority {
+        WorkspaceMutationAuthority::Apex => None,
+        WorkspaceMutationAuthority::Assignment(owner) => {
+            if arg_str(args, "projectId")
+                .or_else(|| arg_str(args, "project_id"))
+                .is_some_and(|project_id| project_id != owner.project_id)
+                || arg_str(args, "shipSlug")
+                    .or_else(|| arg_str(args, "ship_slug"))
+                    .is_some_and(|ship_slug| ship_slug != owner.ship_slug)
+            {
+                return Err("acl: new_tab requested a foreign Project or Captain ship".into());
+            }
+            Some(owner)
+        }
+    };
+    ctx.captains.create_workspace(&id, &name, owner)?;
     ctx.tabs.insert_tab(&id, &name);
     let mut res = organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
     res["tabId"] = json!(id);
@@ -15407,7 +17826,12 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// Auto-created empty tabs are NOT reaped implicitly - an agent staging a
 /// workspace may empty and refill a tab, so closing is always an explicit call.
 /// Args: `tabId` (or `tabName` to resolve by exact name); `force` (optional).
-fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn close_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .or_else(|| {
@@ -15417,16 +17841,34 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         })
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
-    // Captains must never advertise ownership of a tab that no longer exists
-    // (the claim itself survives - a captain can control zero tabs).
-    if ctx.captains.prune_tab(&tab_id)? {
-        let _ = captains_sync_apply(ctx);
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "close_tab")?;
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        ctx.captains
+            .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
     }
+    enforce_workspace_owner(ctx, &authority, &tab_id, "close_tab")?;
+    let expected_owner = match &authority {
+        WorkspaceMutationAuthority::Apex => None,
+        WorkspaceMutationAuthority::Assignment(owner) => Some(owner),
+    };
+    let closed = ctx
+        .captains
+        .close_workspace(&tab_id, force, expected_owner)?;
+    #[cfg(test)]
+    if args
+        .get("testCrashAfterFleetCommit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("injected crash after durable Fleet Workspace close commit".into());
+    }
+    ctx.tabs.replace(ctx.captains.workspace_projection());
+    let _ = captains_sync_apply(ctx);
     let mut res =
         organization_sync_apply(ctx, "close_tab", json!({ "tabId": tab_id, "force": force }))?;
     res["tabId"] = json!(tab_id);
-    res["orphanedTileIds"] = json!(orphaned);
+    res["orphanedTileIds"] = json!(closed.removed_tile_ids);
+    res["captainsChanged"] = json!(closed.captains_changed);
     Ok(res)
 }
 
@@ -15434,7 +17876,12 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// first + strict (unknown tab is an error), then forwards the snapshot so the
 /// rename applies even when the tab is hidden or the window is unfocused.
 /// Args: `tabId` (or `id`), `name`.
-fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn rename_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .ok_or("rename_tab requires a 'tabId' argument")?;
@@ -15442,6 +17889,13 @@ fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or("rename_tab requires a non-empty 'name' argument")?;
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "rename_tab")?;
+    if matches!(authority, WorkspaceMutationAuthority::Apex) {
+        ctx.captains
+            .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
+    }
+    enforce_workspace_owner(ctx, &authority, &tab_id, "rename_tab")?;
+    ctx.captains.rename_workspace(&tab_id, &name)?;
     ctx.tabs.rename_tab(&tab_id, &name)?;
     organization_sync_apply(ctx, "rename_tab", json!({ "tabId": tab_id, "name": name }))
 }
@@ -15507,14 +17961,54 @@ fn captain_checkpoint(
     }))
 }
 
+fn rename_captain(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "rename_captain")?;
+    let captain_session_id =
+        arg_str(args, "captainSessionId").or_else(|| arg_str(args, "captain_session_id"));
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain_session_id
+                .as_deref()
+                .is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                || ship_slug
+                    .as_deref()
+                    .is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+        })
+        .ok_or("rename_captain: no matching Captain is registered")?;
+    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    let display_name = arg_str(args, "displayName")
+        .or_else(|| arg_str(args, "display_name"))
+        .ok_or("rename_captain requires a 'displayName' argument")?;
+    let captain = ctx.captains.rename_captain(
+        captain_session_id.as_deref(),
+        ship_slug.as_deref(),
+        &display_name,
+    )?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "rename_captain",
+        "audited": true,
+        "captain": captain,
+    }))
+}
+
 /// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
 /// of a ship. This is a durable authority mutation, separate from the UI's visual
 /// overlay pin. It is registry-first (strict: a ship already captained by another
 /// session is refused), then the authoritative captains snapshot is forwarded via
 /// `sync_captains` so every client renders from it. Args: `captainSessionId` (or
 /// `sessionId`) required; `shipSlug` optional (slugified; defaults to
-/// `ship-<sessionId>`); `workspaceTabIds` optional (defaults to the tab currently
-/// holding the captain's tile, when the tab registry knows one).
+/// `ship-<sessionId>`); `workspaceTabIds` optional and always explicit (an omitted
+/// list owns no Work Workspace).
 ///
 /// LIVENESS: the session must be a LIVE terminal (`th_<id>` exists in tmux) - a
 /// claim for a dead/unknown session would persist and linger forever (nothing
@@ -15525,6 +18019,18 @@ fn claim_captain(
     args: &Value,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
+) -> Result<Value, String> {
+    let _identity_transaction = ctx.tabs.identity_transaction();
+    claim_captain_locked(ctx, args, caller, trusted_internal, None, true)
+}
+
+fn claim_captain_locked(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    binding: Option<(&str, &str, &str)>,
+    forward_projection: bool,
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "claim_captain")?;
     let captain_session_id = arg_str(args, "captainSessionId")
@@ -15620,15 +18126,46 @@ fn claim_captain(
                 .filter_map(|t| t.as_str().map(str::to_string))
                 .collect()
         })
-        .filter(|tabs: &Vec<String>| !tabs.is_empty())
-        .unwrap_or_else(|| {
-            // No explicit tabs: default to the tab the captain's tile lives in
-            // (the same lookup the UI's liveness check does, but server-side).
-            ctx.tabs
-                .tab_for_tile(&captain_session_id)
-                .into_iter()
-                .collect()
+        .unwrap_or_default();
+    if tmux::harness_liveness(&tmux_target(&captain_session_id), &provider)
+        != tmux::SessionLiveness::Alive
+    {
+        return Err(format!(
+            "claim_captain: provider '{provider}' stopped before the identity transaction committed"
+        ));
+    }
+    let previous_workspace = ctx.tabs.workspace_for_tile(&captain_session_id);
+    let captain_workspace_existed = ctx.tabs.has_tab(CAPTAIN_WORKSPACE_ID);
+    let requested_slug = match role {
+        FleetRole::Cortana => CORTANA_SLUG.to_string(),
+        FleetRole::Captain => ship_slug
+            .as_deref()
+            .map(slugify_ship)
+            .filter(|slug| !slug.is_empty())
+            .unwrap_or_else(|| slugify_ship(&format!("ship-{captain_session_id}"))),
+    };
+    let previous_claim = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| {
+            captain.terminal_id.as_deref() == Some(captain_session_id.as_str())
+                || captain.ship_slug == requested_slug
         });
+    let mut unique_workspace_ids = std::collections::HashSet::new();
+    for workspace_id in &workspace_tab_ids {
+        if !unique_workspace_ids.insert(workspace_id.as_str()) {
+            return Err(format!(
+                "claim_captain: duplicate workspaceTabId '{workspace_id}'"
+            ));
+        }
+        if ctx.tabs.work_workspace(workspace_id).is_none() {
+            return Err(format!(
+                "claim_captain: workspaceTabId '{workspace_id}' is not an existing Work Workspace"
+            ));
+        }
+    }
     let before_seq = ctx.captains.snapshot().seq;
     // The transfer-grade liveness predicate (R1): the SOLE signal that may auto-release
     // an incumbent's slug to this claimant is its tmux session being DEFINITIVELY gone.
@@ -15666,20 +18203,84 @@ fn claim_captain(
             .copied()
             .unwrap_or(tmux::SessionLiveness::Unknown)
     };
-    let outcome = ctx.captains.claim_provider(
+    let outcome = ctx.captains.claim_provider_with_binding(
         &captain_session_id,
         ship_slug.as_deref(),
         role,
         Some(&provider),
         provider_session_id.as_deref(),
         workspace_tab_ids,
+        binding,
         &is_terminal_dead,
         &crew_liveness,
     )?;
+    ctx.tabs
+        .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
+    if let Err(error) = ctx
+        .tabs
+        .move_tile(&captain_session_id, CAPTAIN_WORKSPACE_ID)
+    {
+        let rollback = ctx.captains.rollback_provisioned_claim(
+            &captain_session_id,
+            &outcome.record,
+            previous_claim.clone(),
+        );
+        let workspace_rollback = (!captain_workspace_existed)
+            .then(|| ctx.tabs.rollback_owned_empty_tab(CAPTAIN_WORKSPACE_ID))
+            .transpose();
+        return Err(format!(
+            "claim_captain: Captain Workspace relocation failed: {error}{}{}",
+            rollback
+                .err()
+                .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            workspace_rollback
+                .err()
+                .map(|rollback| format!("; Workspace rollback failed: {rollback}"))
+                .unwrap_or_default()
+        ));
+    }
     let snap = ctx.captains.snapshot();
+    let projection = if forward_projection {
+        organization_sync_apply(
+            ctx,
+            "move_tile",
+            json!({"terminalId": captain_session_id, "tabId": CAPTAIN_WORKSPACE_ID}),
+        )
+    } else {
+        Ok(Value::Null)
+    };
+    if let Err(error) = projection {
+        let placement_rollback = ctx
+            .tabs
+            .restore_tile_placement_locked(&captain_session_id, previous_workspace.as_deref());
+        let registry_rollback = ctx.captains.rollback_provisioned_claim(
+            &captain_session_id,
+            &outcome.record,
+            previous_claim,
+        );
+        let workspace_rollback = (!captain_workspace_existed)
+            .then(|| ctx.tabs.rollback_owned_empty_tab(CAPTAIN_WORKSPACE_ID))
+            .transpose();
+        return Err(format!(
+            "claim_captain: Captain Workspace synchronization failed: {error}{}{}{}",
+            placement_rollback
+                .err()
+                .map(|rollback| format!("; placement rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            registry_rollback
+                .err()
+                .map(|rollback| format!("; registry rollback failed: {rollback}"))
+                .unwrap_or_default(),
+            workspace_rollback
+                .err()
+                .map(|rollback| format!("; Workspace rollback failed: {rollback}"))
+                .unwrap_or_default()
+        ));
+    }
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
-    // redundant forward. A real change bumps `seq` and forwards the snapshot.
-    let applied = snap.seq != before_seq && captains_sync_apply(ctx);
+    // redundant Captain forward. Placement sync above still heals a stale tile.
+    let applied = forward_projection && snap.seq != before_seq && captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "claim_captain",
         "audited": true,
@@ -15869,12 +18470,40 @@ fn focus_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// UI applies it even when the target tab is hidden. A `targetId`-only call is
 /// the legacy within-tab reorder: forwarded for the UI to apply and report back
 /// (visual order is a UI concern).
-fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn move_tile(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tile = arg_str(args, "terminalId").or_else(|| arg_str(args, "id"));
     let tab = arg_str(args, "tabId");
     match (tile, tab) {
         (Some(tile), Some(tab)) => {
-            ctx.tabs.move_tile(&tile, &tab)?;
+            let authority =
+                workspace_mutation_authority(ctx, caller, trusted_internal, "move_tile")?;
+            if matches!(authority, WorkspaceMutationAuthority::Apex) {
+                ctx.captains
+                    .adopt_unowned_workspace_projection(&ctx.tabs.snapshot())?;
+            }
+            enforce_workspace_owner(ctx, &authority, &tab, "move_tile")?;
+            if let Some(source) = ctx
+                .captains
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.tile_ids.contains(&tile))
+                .map(|workspace| workspace.id.clone())
+            {
+                enforce_workspace_owner(ctx, &authority, &source, "move_tile")?;
+            }
+            let kind = ctx
+                .tabs
+                .kind_for_id(&tab)
+                .ok_or_else(|| format!("move_tile: unknown tabId '{tab}'"))?;
+            validate_workspace_occupant(&ctx.captains, &tile, &tab, kind)?;
+            ctx.captains.move_workspace_tile(&tile, &tab)?;
+            ctx.tabs.replace(ctx.captains.workspace_projection());
             organization_sync_apply(
                 ctx,
                 "move_tile",
@@ -15908,7 +18537,7 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    spawn_terminal_with_private_pane_command(ctx, args, None)
+    spawn_terminal_with_private_pane_command(ctx, args, None, false, false, true)
 }
 
 /// Internal spawn variant for an already-formed private pane command.
@@ -15919,7 +18548,11 @@ fn spawn_terminal_with_private_pane_command(
     ctx: &ControlContext,
     args: &Value,
     private_pane_command: Option<&str>,
+    allow_captain_workspace: bool,
+    require_exact_tab: bool,
+    forward_projection: bool,
 ) -> Result<Value, String> {
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
     let shell = arg_str(args, "shell");
@@ -15966,7 +18599,24 @@ fn spawn_terminal_with_private_pane_command(
             if !ctx.tabs.has_tab(&id) {
                 return Err(format!("spawn_terminal: unknown tabId '{id}'"));
             }
+            if id == CAPTAIN_WORKSPACE_ID && !allow_captain_workspace {
+                return Err(
+                    "spawn_terminal: only durable Cortana or Captain identities may target Captain Workspace"
+                        .into(),
+                );
+            }
             Some(id)
+        }
+        (None, Some(name)) if name == CAPTAIN_WORKSPACE_NAME || name == "Captains" => {
+            if !allow_captain_workspace {
+                return Err(
+                    "spawn_terminal: only durable Cortana or Captain identities may target Captain Workspace"
+                        .into(),
+                );
+            }
+            ctx.tabs
+                .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
+            Some(CAPTAIN_WORKSPACE_ID.to_string())
         }
         (None, Some(name)) => Some(match ctx.tabs.id_for_name(name) {
             Some(id) => id,
@@ -16031,7 +18681,25 @@ fn spawn_terminal_with_private_pane_command(
     // window between spawn and placement, the tile lands in the active (else
     // first) tab instead - never orphaned outside the registry. The response
     // carries the ACTUAL placement.
-    let placed_tab = ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref());
+    let placed_tab = if require_exact_tab {
+        let exact = tab_id.as_deref().ok_or_else(|| {
+            "spawn_terminal: exact placement requires an explicit tabId".to_string()
+        });
+        match exact.and_then(|tab_id| ctx.tabs.place_tile_exact(&id, tab_id)) {
+            Ok(tab_id) => Some(tab_id),
+            Err(error) => {
+                let _ = tmux::kill_session_tree(&tmux_session);
+                if let Some(identity) = &minted_identity {
+                    let _ = ctx.identity.retire(&identity.id);
+                }
+                return Err(format!(
+                    "spawn_terminal: exact Workspace placement failed and the terminal was rolled back: {error}"
+                ));
+            }
+        }
+    } else {
+        ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref())
+    };
 
     // Captain-chat phase 2: record the crew link under the spawning captain.
     // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
@@ -16041,7 +18709,7 @@ fn spawn_terminal_with_private_pane_command(
             Ok(recorded) => recorded,
             Err(error) => {
                 let _ = tmux::kill_session_tree(&tmux_session);
-                ctx.tabs.remove_tile(&id);
+                ctx.tabs.retire_tile_locked(&id);
                 if let Some(identity) = &minted_identity {
                     if let Err(rollback) = ctx.identity.retire(&identity.id) {
                         return Err(format!(
@@ -16074,7 +18742,7 @@ fn spawn_terminal_with_private_pane_command(
             "spawnedBy": spawned_by,
         }),
     );
-    let applied = forward_apply(ctx, "spawn_terminal", &forward);
+    let applied = forward_projection && forward_apply(ctx, "spawn_terminal", &forward);
     Ok(json!({
         "accepted": "spawn_terminal",
         "id": id,
@@ -16109,6 +18777,15 @@ fn spawn_tmux_terminal(
 ) -> Result<(String, String), String> {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let id = suffix[..8].to_string();
+    spawn_tmux_terminal_with_id(&id, cwd, command, env)
+}
+
+fn spawn_tmux_terminal_with_id(
+    id: &str,
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+) -> Result<(String, String), String> {
     let tmux_session = format!("th_{id}");
     // Phase 2b: `env` carries the capability token (+ addr) for the new session, set
     // via tmux `-e` so it is present BEFORE the first pane execs and never lands in
@@ -16145,7 +18822,7 @@ fn spawn_tmux_terminal(
              was registered)"
         ));
     }
-    Ok((id, tmux_session))
+    Ok((id.to_string(), tmux_session))
 }
 
 /// comms-plane Phase 1: mark a BREAK-GLASS use of the demoted direct writers
@@ -16513,10 +19190,86 @@ fn retain_crew_binding_after_powder_failure(
             .is_some_and(|release| release.get("released").and_then(Value::as_bool) != Some(true))
 }
 
+fn freeze_close_terminal_powder_release(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+) -> Result<(u64, Option<PendingDispatchRelease>), String> {
+    let snapshot = ctx.captains.snapshot();
+    let matching_crew = snapshot
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .filter(|crew| crew.terminal_id == crew_session_id)
+        .collect::<Vec<_>>();
+    let crew = match matching_crew.as_slice() {
+        [] => return Ok((snapshot.seq, None)),
+        [crew] => *crew,
+        _ => {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+            ));
+        }
+    };
+    if matches!(crew.state, CrewState::Removed { .. }) && crew.powder_work.is_some() {
+        return Err(format!(
+            "Crew session '{crew_session_id}' is historically Removed; ordinary live Powder cleanup is refused"
+        ));
+    }
+    let Some(work) = crew.powder_work.as_ref() else {
+        return Ok((snapshot.seq, None));
+    };
+    if let Some(recovery) = snapshot
+        .pending_dispatch_releases
+        .iter()
+        .find(|recovery| recovery.crew_session_id == crew_session_id)
+    {
+        return Ok((snapshot.seq, Some(recovery.clone())));
+    }
+    match work.state {
+        PowderWorkState::Completed { .. } => return Ok((snapshot.seq, None)),
+        PowderWorkState::CompletionPending { .. } => {
+            return Err(retryable_error(format!(
+                "Crew session '{crew_session_id}' has Powder completion pending; close must wait for exact same-proof recovery"
+            )));
+        }
+        PowderWorkState::Active => {}
+    }
+    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+    let agent = scope.work.agent.clone().ok_or_else(|| {
+        format!("Crew session '{crew_session_id}' Powder binding has no exact agent identity")
+    })?;
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    if client.configured_agent() != agent {
+        return Err(format!(
+            "Crew session '{crew_session_id}' Powder profile configured agent does not match its durable work agent"
+        ));
+    }
+    let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
+        format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
+    })?;
+    Ok((
+        snapshot.seq,
+        Some(PendingDispatchRelease {
+            crew_session_id: crew_session_id.to_string(),
+            project_id: scope.project_id,
+            connection_profile: scope.binding.connection_profile,
+            connection_endpoint_identity,
+            repository: scope.binding.repository,
+            card_id: scope.work.card_id,
+            run_id: scope.work.run_id,
+            agent,
+            operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        }),
+    ))
+}
+
 fn close_terminal_with_policy(
     ctx: &ControlContext,
     args: &Value,
-    preserve_crew_on_powder_failure: bool,
+    _preserve_crew_on_powder_failure: bool,
     authority: Option<&TargetLifecycleAuthority>,
 ) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
@@ -16535,21 +19288,9 @@ fn close_terminal_with_policy(
     if let Some(authority) = authority {
         revalidate_target_lifecycle_authority(ctx, authority)?;
     }
-    // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
-    // it returns Ok for an already-gone session too - so a caller could never tell
-    // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
-    // liveness BEFORE the kill so we can report an HONEST outcome. We check first
-    // (not the kill's own status) because the tree sweep SIGKILLs the pane pids,
-    // which can auto-destroy the session before `kill-session` runs, making a real
-    // kill look already-gone. The kill stays idempotent; only the label is refined.
-    //
-    // De-conflation (spawn-wedge) + MED-1 force escape: an `Unknown` probe means the
-    // control plane is degraded, not that the session is gone, so the DEFAULT refuses
-    // (retryable). `force:true` re-probes ONCE and reaps unless that re-probe CONFIRMS
-    // `Alive` (only a definitive Alive refuses force). Under a sustained wedge a live-
-    // but-slow session's re-probe is also `Unknown` - indistinguishable from dead - so
-    // force reaps it too; force is a deliberate reap-during-wedge override, not a
-    // never-touch-a-live-session guarantee. See `plan_close`.
+    // Probe and choose the requested effect before preparing durable state.
+    // A refused close therefore leaves no cleanup intent for startup recovery
+    // to misinterpret as authority to force-reap the terminal.
     let initial = tmux::session_liveness(&target);
     let reprobe = if force && matches!(initial, tmux::SessionLiveness::Unknown) {
         Some(tmux::session_liveness(&target))
@@ -16573,14 +19314,113 @@ fn close_terminal_with_policy(
             ));
         }
     };
-    tmux::kill_session_tree(&target)
-        .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    let completed_powder_release = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .find(|crew| crew.terminal_id == tile_id)
+        .and_then(|crew| crew.powder_work.as_ref())
+        .filter(|work| matches!(work.state, PowderWorkState::Completed { .. }))
+        .map(|work| {
+            json!({
+                "released": true,
+                "outcome": "already_completed",
+                "cardId": work.card_id,
+                "runId": work.run_id,
+            })
+        });
+    let fleet_operation = match ctx.captains.pending_close_terminal_operation(tile_id) {
+        Some(operation) => operation,
+        None => {
+            let (expected_seq, powder_release) =
+                freeze_close_terminal_powder_release(ctx, tile_id)?;
+            #[cfg(test)]
+            ctx.captains.pause_dispatch("close_terminal_scope_frozen");
+            ctx.captains
+                .prepare_close_terminal_operation(tile_id, expected_seq, powder_release)?
+        }
+    };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("close_terminal_effect");
+    // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
+    // it returns Ok for an already-gone session too - so a caller could never tell
+    // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
+    // liveness BEFORE the kill so we can report an HONEST outcome. We check first
+    // (not the kill's own status) because the tree sweep SIGKILLs the pane pids,
+    // which can auto-destroy the session before `kill-session` runs, making a real
+    // kill look already-gone. The kill stays idempotent; only the label is refined.
+    //
+    // De-conflation (spawn-wedge) + MED-1 force escape: an `Unknown` probe means the
+    // control plane is degraded, not that the session is gone, so the DEFAULT refuses
+    // (retryable). `force:true` re-probes ONCE and reaps unless that re-probe CONFIRMS
+    // `Alive` (only a definitive Alive refuses force). Under a sustained wedge a live-
+    // but-slow session's re-probe is also `Unknown` - indistinguishable from dead - so
+    // force reaps it too; force is a deliberate reap-during-wedge override, not a
+    // never-touch-a-live-session guarantee. See `plan_close`.
+    if let Err(error) = tmux::kill_session_tree(&target) {
+        return Err(retryable_error(format!(
+            "failed to close terminal '{session_id}': {error}; durable close recovery remains prepared"
+        )));
+    }
     // The terminal is now definitely stopped. Release any Crew claim after the
     // kill so a failed kill can never leave a live worker without its lease.
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
-    let (powder_release, crew_binding_retained, captain_state_changed) =
-        finalize_crew_powder_cleanup_guarded(ctx, tile_id, preserve_crew_on_powder_failure)?;
+    let frozen_powder_release = match &fleet_operation.payload {
+        PendingFleetOperationPayload::CloseTerminal { powder_release, .. } => {
+            powder_release.clone()
+        }
+        _ => None,
+    };
+    let mut release_effect_applied = frozen_powder_release.is_none();
+    let powder_release = match frozen_powder_release.as_ref() {
+        Some(recovery) => Some(
+            match apply_pending_dispatch_release_effect_guarded(ctx, recovery) {
+                Ok(()) => {
+                    release_effect_applied = true;
+                    json!({
+                    "released": true,
+                    "outcome": "released",
+                    "projectId": recovery.project_id,
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
+                    })
+                }
+                Err(error) => json!({
+                    "released": false,
+                    "outcome": "recovery_pending",
+                    "projectId": recovery.project_id,
+                    "cardId": recovery.card_id,
+                    "runId": recovery.run_id,
+                    "error": error,
+                }),
+            },
+        ),
+        None => completed_powder_release,
+    };
+    #[cfg(test)]
+    if release_effect_applied
+        && frozen_powder_release.is_some()
+        && !ctx
+            .captains
+            .pause_dispatch("close_terminal_release_applied")
+    {
+        return Err(format!(
+            "Crew terminal '{tile_id}' test crash occurred after remote release before atomic local close finalization"
+        ));
+    }
+    let crew_binding_retained = frozen_powder_release.is_some() && !release_effect_applied;
+    let committed = release_effect_applied
+        .then(|| {
+            ctx.captains.commit_close_terminal_operation(
+                &fleet_operation,
+                false,
+                frozen_powder_release.as_ref(),
+            )
+        })
+        .transpose()?;
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -16590,18 +19430,26 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    if ctx.tabs.remove_tile(tile_id) {
-        let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
-    }
-    // Captain-chat phase 2: a dead session leaves the captains registry too -
-    // its captaincy is released and it drops out of every crew list.
-    if captain_state_changed {
+    if let Some(committed) = committed {
+        ctx.tabs.replace(ctx.captains.workspace_projection());
+        if committed.workspace_changed || ctx.tabs.retire_tile_locked(tile_id) {
+            let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+        }
+        // Captain-chat phase 2: a dead session leaves the captains registry too -
+        // its captaincy is released and it drops out of every crew list.
+        if committed.captain_state_changed {
+            let _ = captains_sync_apply(ctx);
+        }
+        // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
+        // retired too, so its secret stops resolving and the identity store does not
+        // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
+        ctx.identity.retire_tile(tile_id)?;
+    } else if crew_binding_retained {
+        // Preparation already made CleanupPending durable together with both
+        // recovery records. Publish that honest lifecycle state while retaining
+        // Workspace placement and identity until the exact release converges.
         let _ = captains_sync_apply(ctx);
     }
-    // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
-    // retired too, so its secret stops resolving and the identity store does not
-    // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
-    ctx.identity.retire_tile(tile_id)?;
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -17475,7 +20323,7 @@ mod tests {
             .expect("tab minted");
         assert_eq!(tab.name, "hidden-ops");
         assert_eq!(tab.tile_ids, vec![id.clone()]);
-        assert_eq!(snap.active_tab_id, None);
+        assert_eq!(snap.active_tab_id.as_deref(), Some("tab-1"));
 
         // The forward carries the id + snapshot for the UI to render from.
         {
@@ -18538,6 +21386,442 @@ mod tests {
     }
 
     #[test]
+    fn move_tile_uses_durable_fleet_authority_without_waiting_for_projection_lock() {
+        let context = Arc::new(test_ctx("move-identity-transaction"));
+        context
+            .captains
+            .create_workspace("work-a", "Work A", None)
+            .unwrap();
+        context
+            .captains
+            .create_workspace("work-b", "Work B", None)
+            .unwrap();
+        context.tab_registry().replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["ordinary".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let tabs = context.tab_registry();
+        let transaction = tabs.identity_transaction();
+        let (sent, received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving = std::thread::spawn(move || {
+            let result = dispatch(
+                &moving_context,
+                "move_tile",
+                &json!({"terminalId": "ordinary", "tabId": "work-b"}),
+            );
+            sent.send(result).unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(context
+            .captains
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+        drop(transaction);
+        moving.join().unwrap();
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+    }
+
+    #[test]
+    fn rollback_restore_cannot_clobber_a_concurrent_valid_move() {
+        let context = Arc::new(test_ctx("rollback-move-transaction"));
+        context.tab_registry().replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["ordinary".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let tabs = context.tab_registry();
+        tabs.move_tile("ordinary", CAPTAIN_WORKSPACE_ID).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving = std::thread::spawn(move || {
+            sent.send(dispatch(
+                &moving_context,
+                "move_tile",
+                &json!({"terminalId": "ordinary", "tabId": "work-b"}),
+            ))
+            .unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        moving.join().unwrap();
+        tabs.replace(context.captains.workspace_projection());
+        let snapshot = tabs.snapshot();
+        assert!(snapshot
+            .iter()
+            .find(|tab| tab.id == "work-b")
+            .unwrap()
+            .tile_ids
+            .contains(&"ordinary".to_string()));
+        assert_eq!(
+            snapshot
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| tile.as_str() == "ordinary")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn trusted_dispatch_rollback_and_recovery_cleanup_cannot_reinsert_retired_tiles() {
+        for recovery_mode in [false, true] {
+            let tag = if recovery_mode {
+                "recovery"
+            } else {
+                "rollback"
+            };
+            let captains = Arc::new(CaptainsRegistry::new());
+            captains
+                .upsert_project(ProjectRecord {
+                    project_id: "project-a".into(),
+                    name: "Project A".into(),
+                    repo_root: "/tmp/project-a".into(),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+            captains
+                .claim_test(
+                    "captain-a",
+                    Some("alpha"),
+                    vec!["work-a".into(), "work-b".into()],
+                )
+                .unwrap();
+            captains
+                .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+                .unwrap();
+            captains.record_crew("captain-a", "crew-a").unwrap();
+            captains
+                .bind_crew_context_exact(
+                    "captain-a",
+                    "crew-a",
+                    "transaction cleanup",
+                    "codex",
+                    None,
+                    None,
+                    Some("work-a"),
+                    PowderWorkBinding {
+                        card_id: "card-a".into(),
+                        run_id: "run-a".into(),
+                        agent: Some("agent-a".into()),
+                        claim_expires_at: Some(1),
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap();
+            let recovery = recovery_mode.then(|| PendingDispatchRelease {
+                crew_session_id: "crew-a".into(),
+                project_id: "project-a".into(),
+                connection_profile: "profile-a".into(),
+                connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+                repository: "repo-a".into(),
+                card_id: "card-a".into(),
+                run_id: "run-a".into(),
+                agent: "agent-a".into(),
+                operation_id: format!("cleanup:{tag}"),
+                created_at: 1,
+                state: PendingDispatchReleaseState::Prepared,
+            });
+            if let Some(recovery) = &recovery {
+                captains.prepare_dispatch_release(recovery.clone()).unwrap();
+            }
+            let tabs = Arc::new(TabRegistry::new());
+            tabs.replace(vec![
+                TabRecord {
+                    id: "work-a".into(),
+                    name: "Work A".into(),
+                    tile_ids: vec!["crew-a".into()],
+                },
+                TabRecord {
+                    id: "work-b".into(),
+                    name: "Work B".into(),
+                    tile_ids: Vec::new(),
+                },
+            ]);
+            let context = Arc::new(
+                test_ctx(&format!("trusted-cleanup-{tag}"))
+                    .with_captains_registry(Arc::clone(&captains))
+                    .with_tab_registry(Arc::clone(&tabs)),
+            );
+            let transaction = tabs.identity_transaction();
+            let (cleanup_sent, cleanup_received) = std::sync::mpsc::channel();
+            let cleanup_context = Arc::clone(&context);
+            let cleanup_recovery = recovery.clone();
+            let cleanup = std::thread::spawn(move || {
+                cleanup_sent
+                    .send(commit_trusted_dispatch_cleanup(
+                        &cleanup_context,
+                        "crew-a",
+                        cleanup_recovery.as_ref(),
+                    ))
+                    .unwrap();
+            });
+            cleanup_received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert!(captains.snapshot().captains[0]
+                .crew
+                .iter()
+                .all(|crew| crew.terminal_id != "crew-a"));
+            assert!(!tabs
+                .snapshot()
+                .iter()
+                .any(|tab| tab.tile_ids.contains(&"crew-a".to_string())));
+
+            let (move_sent, move_received) = std::sync::mpsc::channel();
+            let move_context = Arc::clone(&context);
+            let moving = std::thread::spawn(move || {
+                move_sent
+                    .send(dispatch(
+                        &move_context,
+                        "move_tile",
+                        &json!({"terminalId": "crew-a", "tabId": "work-b"}),
+                    ))
+                    .unwrap();
+            });
+            let move_error = move_received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err();
+            assert!(move_error.contains("retired terminal"), "got: {move_error}");
+            drop(transaction);
+            cleanup.join().unwrap();
+            moving.join().unwrap();
+
+            assert!(!tabs
+                .snapshot()
+                .iter()
+                .any(|tab| tab.tile_ids.contains(&"crew-a".to_string())));
+            assert!(captains.snapshot().captains[0]
+                .crew
+                .iter()
+                .all(|crew| crew.terminal_id != "crew-a"));
+            let current = tabs.snapshot_full();
+            let mut replay = current.tabs.clone();
+            replay
+                .iter_mut()
+                .find(|tab| tab.id == "work-a")
+                .unwrap()
+                .tile_ids
+                .push("crew-a".into());
+            let error = match apply_workspace_report(
+                &tabs,
+                &captains,
+                replay,
+                current.active_tab_id,
+                Some(current.seq),
+            ) {
+                Ok(_) => panic!("retired Crew report unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error.contains("retired terminal 'crew-a'"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn close_terminal_does_not_hold_or_wait_for_projection_identity_during_effects() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let terminal_id = format!(
+            "close-race-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        create_test_tmux_session(&tmux_target(&terminal_id)).unwrap();
+        let context = Arc::new(test_ctx("close-identity-transaction"));
+        context.tab_registry().replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: vec![terminal_id.clone()],
+        }]);
+        let tabs = context.tab_registry();
+        let transaction = tabs.identity_transaction();
+        let (sent, received) = std::sync::mpsc::channel();
+        let closing_context = Arc::clone(&context);
+        let closing_id = terminal_id.clone();
+        let closing = std::thread::spawn(move || {
+            sent.send(close_terminal(
+                &closing_context,
+                &json!({"sessionId": closing_id}),
+            ))
+            .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && (tmux::has_session(&tmux_target(&terminal_id))
+                || !context
+                    .captains
+                    .snapshot()
+                    .pending_fleet_operations
+                    .is_empty())
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert!(context
+            .captains
+            .snapshot()
+            .pending_fleet_operations
+            .is_empty());
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close_terminal must not wait for the projection identity mutex")
+            .unwrap();
+        drop(transaction);
+        closing.join().unwrap();
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert!(!tabs
+            .snapshot()
+            .iter()
+            .any(|tab| tab.tile_ids.contains(&terminal_id)));
+    }
+
+    #[test]
+    fn move_racing_claim_cannot_leave_an_active_captain_in_work() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("move-vs-claim-transaction");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = format!(
+            "claim-race-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        tmux::new_session_with_env(
+            &tmux_target(&captain_id),
+            "/tmp",
+            Some(&harness_command),
+            &[],
+        )
+        .unwrap();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec![captain_id.clone()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let context = Arc::new(
+            test_ctx("move-vs-claim-transaction")
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs))
+                .with_apply_sink(Arc::new(RecordingSink {
+                    calls: StdMutex::new(Vec::new()),
+                })),
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        let first_persist = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_first_persist = Arc::clone(&first_persist);
+        captains.set_persist_hook(Box::new(move || {
+            if hook_first_persist.swap(false, Ordering::SeqCst) {
+                hook_entered.wait();
+                hook_release.wait();
+            }
+        }));
+        let claiming_context = Arc::clone(&context);
+        let claiming_id = captain_id.clone();
+        let claiming = std::thread::spawn(move || {
+            dispatch(
+                &claiming_context,
+                "claim_captain",
+                &json!({
+                    "captainSessionId": claiming_id,
+                    "shipSlug": "claim-race",
+                    "provider": "codex"
+                }),
+            )
+        });
+        entered.wait();
+        let (move_sent, move_received) = std::sync::mpsc::channel();
+        let moving_context = Arc::clone(&context);
+        let moving_id = captain_id.clone();
+        let moving = std::thread::spawn(move || {
+            move_sent
+                .send(dispatch(
+                    &moving_context,
+                    "move_tile",
+                    &json!({"terminalId": moving_id, "tabId": "work-b"}),
+                ))
+                .unwrap();
+        });
+        assert!(move_received
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release.wait();
+        claiming.join().unwrap().unwrap();
+        captains.set_persist_hook(Box::new(|| {}));
+        let move_error = move_received
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(move_error.contains("belongs to Captain Workspace"));
+        moving.join().unwrap();
+        let snapshot = tabs.snapshot();
+        assert!(snapshot
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(!snapshot
+            .iter()
+            .filter(|tab| tab.kind() == WorkspaceKind::Work)
+            .any(|tab| tab.tile_ids.contains(&captain_id)));
+
+        close_terminal(&context, &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn stale_report_is_rejected_and_answers_with_the_snapshot() {
         // Headless-org acceptance for requirement 2: a server-side move_tile must
         // survive a UI report that predates it (the exact lost-update repro: three
@@ -18909,10 +22193,12 @@ mod tests {
             },
         ]);
         let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
-        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["count"], 3);
         assert_eq!(tabs["tabs"][0]["id"], "t1");
         assert_eq!(tabs["tabs"][0]["tileIds"][1], "b");
         assert_eq!(tabs["tabs"][1]["name"], "Side");
+        assert_eq!(tabs["tabs"][2]["kind"], "captain");
+        assert_eq!(tabs["tabs"][2]["name"], CAPTAIN_WORKSPACE_NAME);
     }
 
     #[test]
@@ -19196,7 +22482,7 @@ mod tests {
             ("close_tab", json!({"tabId": "nope"})),
         ] {
             let err = dispatch(&ctx, cmd, &args).unwrap_err();
-            assert!(err.contains("unknown tabId"), "{cmd}: {err}");
+            assert!(err.contains("unknown"), "{cmd}: {err}");
         }
     }
 
@@ -19496,14 +22782,15 @@ mod tests {
         assert_eq!(v["reported"], 2);
 
         let tabs = dispatch(&ctx, "list_tabs", &json!({})).unwrap();
-        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["count"], 3);
         assert_eq!(tabs["tabs"][0]["id"], "t1");
         assert_eq!(tabs["tabs"][0]["tileIds"], json!(["aa", "bb"]));
         assert_eq!(tabs["tabs"][1]["name"], "ops");
+        assert_eq!(tabs["tabs"][2]["id"], CAPTAIN_WORKSPACE_ID);
 
         // A later report REPLACES wholesale (last writer wins, webview parity).
         dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": []})).unwrap();
-        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 0);
+        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 1);
 
         // Malformed shapes are a clear error, not a partial replace.
         let err = dispatch(&ctx, "report_workspace_tabs", &json!({})).unwrap_err();
@@ -20332,6 +23619,88 @@ mod tests {
     }
 
     #[test]
+    fn project_bound_same_terminal_redesignation_is_rejected_without_identity_drift() {
+        let path = captains_tmp("project-bound-redesignation");
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-alpha".into(),
+                name: "Alpha Project".into(),
+                repo_root: "/tmp/project-alpha".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry
+            .bind_ship_context("alpha", "project-alpha", "Own Alpha", "codex")
+            .unwrap();
+        registry
+            .rename_captain(Some("captain-a"), None, "Alpha Lead")
+            .unwrap();
+        registry.record_crew("captain-a", "crew-a").unwrap();
+        let before = registry.snapshot();
+
+        let error = registry
+            .claim_provider(
+                "captain-a",
+                Some("beta"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec!["work-b".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap_err();
+        assert!(error.contains("project-bound"), "got: {error}");
+        let after = registry.snapshot();
+        assert_eq!(after.seq, before.seq);
+        assert_eq!(after.captains, before.captains);
+        let restarted = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restarted.seq, before.seq);
+        assert_eq!(restarted.captains, before.captains);
+
+        registry.release("captain-a").unwrap();
+        let reused = registry
+            .claim_provider(
+                "captain-b",
+                Some("alpha"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec!["work-a".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        assert_eq!(reused.record.ship_slug, "alpha");
+        assert_eq!(reused.record.terminal_id.as_deref(), Some("captain-b"));
+        assert_eq!(reused.record.project_id.as_deref(), Some("project-alpha"));
+        assert_eq!(
+            reused.record.assignment_id,
+            "assignment:project-alpha:alpha"
+        );
+        assert_eq!(reused.record.display_name, "Alpha Lead");
+        assert_eq!(crew_tiles(&reused.record), vec!["crew-a"]);
+        let reused_after_restart = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(reused_after_restart.captains.len(), 1);
+        assert_eq!(
+            reused_after_restart.captains[0].terminal_id.as_deref(),
+            Some("captain-b")
+        );
+        assert_eq!(reused_after_restart.captains[0].ship_slug, "alpha");
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn claim_defaults_slug_and_a_live_ship_is_never_seized() {
         // The double-claim RACE / wedged-not-dead guard: a DIFFERENT terminal claiming
         // a slug held by a LIVE incumbent is REJECTED (a bypass - seizing a live ship
@@ -20861,7 +24230,1002 @@ mod tests {
             FleetRole::Captain,
             "a normal ship stays a Captain"
         );
+        assert_eq!(cap.assignment_id, "assignment:unbound:t-hub-app");
+        assert_eq!(cap.display_name, "t-hub-app");
+        assert_eq!(cap.workspace_tab_ids, vec!["t1"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn captain_identity_and_multiple_project_captains_survive_restart() {
+        let path = captains_tmp("multiple-captains-one-project");
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.upsert_project(ProjectRecord {
+            project_id: "project-shared".into(),
+            name: "Shared".into(),
+            repo_root: dispatch_test_repo_root(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+        reg.claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        reg.claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        reg.bind_ship_context("alpha", "project-shared", "Assignment A", "codex")
+            .unwrap();
+        reg.bind_ship_context("beta", "project-shared", "Assignment B", "claude")
+            .unwrap();
+        reg.rename_captain(Some("captain-a"), None, "  Alpha Lead  ")
+            .unwrap();
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 2);
+        let alpha = restored
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some("captain-a"))
+            .unwrap();
+        let beta = restored
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some("captain-b"))
+            .unwrap();
+        assert_eq!(alpha.assignment_id, "assignment:project-shared:alpha");
+        assert_eq!(alpha.display_name, "Alpha Lead");
+        assert_eq!(beta.assignment_id, "assignment:project-shared:beta");
+        assert_ne!(alpha.assignment_id, beta.assignment_id);
+        assert!(reg
+            .rename_captain(Some("captain-a"), None, &"x".repeat(121))
+            .unwrap_err()
+            .contains("at most 120 bytes"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workspace_kind_migrates_and_reserved_workspace_is_canonical() {
+        let legacy: TabRecord = serde_json::from_value(json!({
+            "id": CAPTAIN_WORKSPACE_ID,
+            "name": "Captains",
+            "order": ["captain-a"]
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(wire["schemaVersion"], WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(wire["kind"], "captain");
+        assert_eq!(wire["name"], CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(wire["tileIds"], json!(["captain-a"]));
+
+        let tabs = TabRegistry::new();
+        tabs.replace(vec![
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: "Captains".into(),
+                tile_ids: vec!["captain-a".into()],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: "duplicate".into(),
+                tile_ids: vec!["captain-a".into(), "captain-b".into()],
+            },
+        ]);
+        let snapshot = tabs.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name, CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(snapshot[0].tile_ids, vec!["captain-a", "captain-b"]);
+        assert!(tabs
+            .rename_tab(CAPTAIN_WORKSPACE_ID, "Other")
+            .unwrap_err()
+            .contains("cannot be renamed"));
+        assert!(tabs
+            .remove_tab(CAPTAIN_WORKSPACE_ID, true)
+            .unwrap_err()
+            .contains("cannot be closed"));
+        assert!(serde_json::from_value::<TabRecord>(json!({
+            "schemaVersion": 1,
+            "id": "work-a",
+            "name": "Work A",
+            "kind": "captain",
+            "tileIds": []
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("conflicts"));
+    }
+
+    #[test]
+    fn legacy_crew_workspace_reconciliation_is_exact_or_needs_assignment() {
+        let reg = CaptainsRegistry::new();
+        reg.claim_test(
+            "captain-a",
+            Some("alpha"),
+            vec!["work-a".into(), "work-b".into()],
+        )
+        .unwrap();
+        reg.record_crew("captain-a", "crew-exact").unwrap();
+        reg.record_crew("captain-a", "crew-ambiguous").unwrap();
+        let mut tabs = vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["crew-exact".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec!["captain-a".into(), "crew-ambiguous".into()],
+            },
+        ];
+        assert!(reg.reconcile_crew_workspaces(&mut tabs).unwrap());
+        let captain = &reg.snapshot().captains[0];
+        let exact = captain
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == "crew-exact")
+            .unwrap();
+        assert_eq!(exact.workspace_tab_id.as_deref(), Some("work-a"));
+        assert_eq!(exact.state, CrewState::Active);
+        let ambiguous = captain
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == "crew-ambiguous")
+            .unwrap();
+        assert!(matches!(ambiguous.state, CrewState::NeedsAssignment { .. }));
+        assert!(tabs
+            .iter()
+            .all(|tab| !tab.tile_ids.iter().any(|id| id == "crew-ambiguous")));
+        assert!(!reg.reconcile_crew_workspaces(&mut tabs).unwrap());
+    }
+
+    #[test]
+    fn dispatch_workspace_resolution_is_owned_exact_and_bounded() {
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test(
+            "captain-a",
+            Some("alpha"),
+            vec!["work-a".into(), "work-b".into(), "foreign".into()],
+        )
+        .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Shared".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Shared".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let ctx = test_ctx("dispatch-workspace")
+            .with_captains_registry(reg.clone())
+            .with_tab_registry(tabs);
+        let captain = reg.snapshot().captains[0].clone();
+        let error = resolve_dispatch_workspace(&ctx, &json!({}), &captain).unwrap_err();
+        assert!(error.starts_with("workspace_required:"));
+        assert!(error.contains("work-a"));
+        assert!(error.contains("work-b"));
+        assert!(!error.contains("foreign"));
+        assert!(resolve_dispatch_workspace(
+            &ctx,
+            &json!({"workspaceTabId": CAPTAIN_WORKSPACE_ID}),
+            &captain
+        )
+        .unwrap_err()
+        .contains("Crew cannot"));
+        assert_eq!(
+            resolve_dispatch_workspace(&ctx, &json!({"workspaceTabId": "work-a"}), &captain)
+                .unwrap()
+                .id,
+            "work-a"
+        );
+        assert!(
+            resolve_dispatch_workspace(&ctx, &json!({"tabName": "Shared"}), &captain)
+                .unwrap_err()
+                .starts_with("workspace_required:")
+        );
+    }
+
+    #[test]
+    fn work_workspace_ownership_is_globally_exclusive_sequentially_and_concurrently() {
+        let sequential = CaptainsRegistry::new();
+        sequential
+            .claim_test("captain-a", Some("alpha"), vec!["shared-work".into()])
+            .unwrap();
+        let before = sequential.snapshot();
+        let error = sequential
+            .claim_test("captain-b", Some("beta"), vec!["shared-work".into()])
+            .unwrap_err();
+        assert!(error.contains("already owned"), "got: {error}");
+        assert_eq!(sequential.snapshot().seq, before.seq);
+        assert_eq!(sequential.snapshot().captains, before.captains);
+
+        let concurrent = Arc::new(CaptainsRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let joins = [("captain-a", "alpha"), ("captain-b", "beta")]
+            .into_iter()
+            .map(|(terminal, ship)| {
+                let registry = Arc::clone(&concurrent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.claim_test(terminal, Some(ship), vec!["shared-work".into()])
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let snapshot = concurrent.snapshot();
+        assert_eq!(snapshot.captains.len(), 1);
+        assert_eq!(snapshot.captains[0].workspace_tab_ids, vec!["shared-work"]);
+    }
+
+    #[test]
+    fn schema_load_rejects_duplicate_global_workspace_ownership() {
+        let path = captains_tmp("duplicate-global-workspace-owner");
+        let source = CaptainsRegistry::load(path.clone());
+        source
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        source
+            .claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        let mut invalid = source.snapshot();
+        invalid.captains[1].workspace_tab_ids = vec!["work-a".into()];
+        std::fs::write(&path, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert!(
+            restored.captains.is_empty(),
+            "ambiguous persisted ownership must fail closed instead of selecting an owner"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cross_project_workspace_reports_and_moves_are_rejected_without_effect() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
+            registry
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.into(),
+                    name: name.into(),
+                    repo_root: format!("/tmp/{project_id}"),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        registry
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry
+            .claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        registry
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        registry
+            .bind_ship_context("beta", "project-b", "Assignment B", "codex")
+            .unwrap();
+        registry.record_crew("captain-b", "crew-b").unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: vec!["crew-b".into()],
+            },
+        ]);
+        let ctx = test_ctx("cross-project-workspace")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_tab_registry(Arc::clone(&tabs));
+        let before_tabs = tabs.snapshot_full();
+        let before_captains = registry.snapshot();
+
+        let report_error = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": before_tabs.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["crew-b"]},
+                    {"id": "work-b", "name": "Work B", "tileIds": []},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a", "captain-b"]}
+                ]
+            }),
+        )
+        .unwrap_err();
+        assert!(report_error.contains("not owned"), "got: {report_error}");
+        let after_report_tabs = tabs.snapshot_full();
+        assert_eq!(after_report_tabs.seq, before_tabs.seq);
+        assert_eq!(after_report_tabs.active_tab_id, before_tabs.active_tab_id);
+        assert_eq!(
+            serde_json::to_value(after_report_tabs.tabs).unwrap(),
+            serde_json::to_value(&before_tabs.tabs).unwrap()
+        );
+        assert_eq!(registry.snapshot().seq, before_captains.seq);
+        assert_eq!(registry.snapshot().captains, before_captains.captains);
+
+        let move_error = dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": "crew-b", "tabId": "work-a"}),
+        )
+        .unwrap_err();
+        assert!(move_error.contains("not owned"), "got: {move_error}");
+        let after_move_tabs = tabs.snapshot_full();
+        assert_eq!(after_move_tabs.seq, before_tabs.seq);
+        assert_eq!(after_move_tabs.active_tab_id, before_tabs.active_tab_id);
+        assert_eq!(
+            serde_json::to_value(after_move_tabs.tabs).unwrap(),
+            serde_json::to_value(&before_tabs.tabs).unwrap()
+        );
+        assert_eq!(registry.snapshot().seq, before_captains.seq);
+    }
+
+    #[test]
+    fn authenticated_workspace_mutations_are_scoped_to_exact_caller_assignment() {
+        let captains = Arc::new(CaptainsRegistry::new());
+        for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
+            captains
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.into(),
+                    name: name.into(),
+                    repo_root: format!("/tmp/{project_id}"),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        for (terminal, ship, project, workspace) in [
+            ("captain-a", "alpha", "project-a", "work-a"),
+            ("captain-b", "beta", "project-b", "work-b"),
+        ] {
+            captains
+                .claim_test(terminal, Some(ship), vec![workspace.into()])
+                .unwrap();
+            captains
+                .bind_ship_context(ship, project, &format!("Assignment {ship}"), "codex")
+                .unwrap();
+        }
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain_a = mint_session(
+            &identities,
+            crate::identity::Role::Captain,
+            "alpha",
+            "captain-a",
+        );
+        let context = test_ctx("workspace-project-auth")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_identity_store(identities);
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+
+        for (command, args) in [
+            (
+                "move_tile",
+                json!({"terminalId": "ordinary-b", "tabId": "work-b"}),
+            ),
+            ("rename_tab", json!({"tabId": "work-b", "name": "Stolen"})),
+            ("close_tab", json!({"tabId": "work-b"})),
+            (
+                "new_tab",
+                json!({"name": "Foreign", "projectId": "project-b", "shipSlug": "beta"}),
+            ),
+            (
+                "report_workspace_tabs",
+                json!({"baseSeq": before_tabs.seq, "tabs": before_tabs.tabs}),
+            ),
+        ] {
+            let response = dispatch_authenticated(
+                &context,
+                req_session("workspace-project-auth", &captain_a, command, args),
+            );
+            assert!(!response.ok, "{command} unexpectedly crossed Project scope");
+            assert!(response.error.unwrap_or_default().contains("acl:"));
+        }
+        for (command, args) in [
+            (
+                "rename_tab",
+                json!({"tabId": "work-b", "name": "No Session"}),
+            ),
+            ("close_tab", json!({"tabId": "work-b"})),
+        ] {
+            let response = dispatch_authenticated(
+                &context,
+                req_untrusted("workspace-project-auth", "", command, args),
+            );
+            assert!(
+                !response.ok,
+                "unattributed {command} unexpectedly succeeded"
+            );
+            assert!(response
+                .error
+                .unwrap_or_default()
+                .contains("terminal-bound"));
+        }
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().workspaces, before_captains.workspaces);
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+
+        let created = dispatch_authenticated(
+            &context,
+            req_session(
+                "workspace-project-auth",
+                &captain_a,
+                "new_tab",
+                json!({"name": "Owned A"}),
+            ),
+        );
+        assert!(created.ok, "{:?}", created.error);
+        let tab_id = created.result.unwrap()["tabId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let durable = captains.snapshot();
+        let workspace = durable
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == tab_id)
+            .unwrap();
+        assert_eq!(
+            workspace.owner.as_ref().unwrap(),
+            &FleetWorkspaceOwner {
+                project_id: "project-a".into(),
+                assignment_id: "assignment:project-a:alpha".into(),
+                ship_slug: "alpha".into(),
+            }
+        );
+    }
+
+    fn report_reconciliation_fixture(
+        tag: &str,
+    ) -> (ControlContext, Arc<CaptainsRegistry>, Arc<TabRegistry>) {
+        let captains = Arc::new(CaptainsRegistry::load(captains_tmp(tag)));
+        captains
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        captains.record_crew("captain-a", "crew-a").unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: vec!["crew-a".into()],
+        }]);
+        let context = test_ctx(tag)
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        (context, captains, tabs)
+    }
+
+    #[test]
+    fn workspace_reports_require_organization_capability_before_mutation() {
+        let (base, captains, tabs) = report_reconciliation_fixture("report-read-tier");
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(&identities, crate::identity::Role::Crew, "alpha", "crew-a");
+        let context = base.with_identity_store(identities);
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        let response = dispatch_authenticated(
+            &context,
+            req_session(
+                "read-report-read-tier",
+                &crew,
+                "report_workspace_tabs",
+                json!({
+                    "baseSeq": before_tabs.seq,
+                    "tabs": [
+                        {"id": "work-a", "name": "Work A", "tileIds": ["crew-a"]},
+                        {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                    ]
+                }),
+            ),
+        );
+        assert!(!response.ok, "a read Crew must not mutate Workspace state");
+        assert!(!response.error.unwrap_or_default().is_empty());
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+    }
+
+    #[test]
+    fn invalid_workspace_reports_leave_tabs_captains_and_sequences_unchanged() {
+        for (tag, report) in [
+            (
+                "invalid-occupant",
+                json!({"tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": []}
+                ]}),
+            ),
+            (
+                "duplicate-id",
+                json!({"tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["crew-a"]},
+                    {"id": "work-a", "name": "Duplicate", "tileIds": []},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                ]}),
+            ),
+            (
+                "future-schema",
+                json!({"tabs": [
+                    {"schemaVersion": WORKSPACE_SCHEMA_VERSION + 1, "id": "work-a", "name": "Work A", "kind": "work", "tileIds": ["crew-a"]}
+                ]}),
+            ),
+        ] {
+            let (context, captains, tabs) = report_reconciliation_fixture(tag);
+            let before_captains = captains.snapshot();
+            let before_tabs = tabs.snapshot_full();
+            let mut report = report;
+            report["baseSeq"] = json!(before_tabs.seq);
+            assert!(dispatch(&context, "report_workspace_tabs", &report).is_err());
+            let after_captains = captains.snapshot();
+            let after_tabs = tabs.snapshot_full();
+            assert_eq!(after_captains.seq, before_captains.seq, "case {tag}");
+            assert_eq!(
+                after_captains.captains, before_captains.captains,
+                "case {tag}"
+            );
+            assert_eq!(after_tabs.seq, before_tabs.seq, "case {tag}");
+            assert_eq!(
+                serde_json::to_value(after_tabs.tabs).unwrap(),
+                serde_json::to_value(before_tabs.tabs).unwrap(),
+                "case {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_workspace_report_cas_cannot_commit_crew_reconciliation() {
+        let (context, captains, tabs) = report_reconciliation_fixture("report-stale-cas");
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        tabs.insert_tab("racing-work", "Racing Work");
+
+        let response = dispatch(
+            &context,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": before_tabs.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["crew-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["stale"], true);
+        let after_captains = captains.snapshot();
+        assert_eq!(after_captains.seq, before_captains.seq);
+        assert_eq!(after_captains.captains, before_captains.captains);
+        let after_tabs = tabs.snapshot_full();
+        assert_eq!(after_tabs.seq, before_tabs.seq + 1);
+        assert!(after_tabs.tabs.iter().any(|tab| tab.id == "racing-work"));
+    }
+
+    #[test]
+    fn workspace_report_persistence_failure_rolls_back_both_registries() {
+        let (context, captains, tabs) = report_reconciliation_fixture("report-persist-fail");
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        captains.fail_next_persist("workspace report persistence failure");
+        let error = dispatch(
+            &context,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": before_tabs.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["crew-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                ]
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("workspace report persistence failure"));
+        let after_captains = captains.snapshot();
+        let after_tabs = tabs.snapshot_full();
+        assert_eq!(after_captains.seq, before_captains.seq);
+        assert_eq!(after_captains.captains, before_captains.captains);
+        assert_eq!(after_tabs.seq, before_tabs.seq);
+        assert_eq!(
+            serde_json::to_value(after_tabs.tabs).unwrap(),
+            serde_json::to_value(before_tabs.tabs).unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_backend_restart_report_reconciles_a_durable_captain_from_stale_work_placement() {
+        let path = captains_tmp("captain-relocation-crash");
+        CaptainsRegistry::load(path.clone())
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("captain-relocation-crash")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let startup = tabs.snapshot_full();
+        assert!(
+            startup.tabs.is_empty(),
+            "production starts with no backend tabs"
+        );
+
+        let response = dispatch(
+            &context,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": startup.seq,
+                "tabs": [
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": []}
+                ],
+                "activeTabId": "work-a"
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["stale"], true);
+        assert_eq!(
+            response["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tab| tab["id"] == CAPTAIN_WORKSPACE_ID)
+                .unwrap()["tileIds"],
+            json!(["captain-a"])
+        );
+        let converged = tabs.snapshot_full();
+        assert!(!converged.tabs[0].tile_ids.contains(&"captain-a".into()));
+        assert_eq!(
+            converged
+                .tabs
+                .iter()
+                .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+                .unwrap()
+                .tile_ids,
+            vec!["captain-a".to_string()]
+        );
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sync_captains");
+        assert!(calls[0].1["sync"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|workspace| workspace["id"] == "work-a"));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_backend_restart_rejects_foreign_or_duplicate_supervisor_placement_without_effect() {
+        for (tag, reported_tabs) in [
+            (
+                "foreign",
+                json!([
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["foreign-captain"]}
+                ]),
+            ),
+            (
+                "duplicate",
+                json!([
+                    {"id": "work-a", "name": "Work A", "tileIds": ["captain-a"]},
+                    {"id": CAPTAIN_WORKSPACE_ID, "name": CAPTAIN_WORKSPACE_NAME, "tileIds": ["captain-a"]}
+                ]),
+            ),
+        ] {
+            let path = captains_tmp(&format!("empty-restart-{tag}"));
+            CaptainsRegistry::load(path.clone())
+                .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+                .unwrap();
+            let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+            let tabs = Arc::new(TabRegistry::new());
+            let context = test_ctx(&format!("empty-restart-{tag}"))
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs));
+            let before_captains = captains.snapshot();
+            let before_tabs = tabs.snapshot_full();
+
+            assert!(dispatch(
+                &context,
+                "report_workspace_tabs",
+                &json!({"baseSeq": 0, "tabs": reported_tabs}),
+            )
+            .is_err());
+            assert_eq!(captains.snapshot().seq, before_captains.seq, "case {tag}");
+            assert_eq!(
+                captains.snapshot().captains,
+                before_captains.captains,
+                "case {tag}"
+            );
+            assert_eq!(tabs.snapshot_full().seq, before_tabs.seq, "case {tag}");
+            assert_eq!(
+                serde_json::to_value(tabs.snapshot_full().tabs).unwrap(),
+                serde_json::to_value(before_tabs.tabs).unwrap(),
+                "case {tag}"
+            );
+
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn durable_fleet_workspaces_seed_list_tabs_before_the_first_frontend_report() {
+        let path = captains_tmp("durable-workspace-projection");
+        let initial = CaptainsRegistry::load(path.clone());
+        initial
+            .upsert_project(ProjectRecord {
+                project_id: "project-a".into(),
+                name: "Project A".into(),
+                repo_root: "/tmp/project-a".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        initial
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        initial
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        initial.record_crew("captain-a", "crew-a").unwrap();
+        initial
+            .bind_crew_context_exact(
+                "captain-a",
+                "crew-a",
+                "durable placement",
+                "codex",
+                None,
+                None,
+                Some("work-a"),
+                PowderWorkBinding {
+                    card_id: "card-a".into(),
+                    run_id: "run-a".into(),
+                    agent: Some("agent-a".into()),
+                    claim_expires_at: Some(1),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        drop(initial);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let context = test_ctx("durable-workspace-projection")
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(Arc::clone(&tabs));
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().any(|workspace| {
+            workspace["id"] == "work-a" && workspace["tileIds"] == json!(["crew-a"])
+        }));
+        assert!(listed["tabs"].as_array().unwrap().iter().any(|workspace| {
+            workspace["id"] == CAPTAIN_WORKSPACE_ID
+                && workspace["name"] == CAPTAIN_WORKSPACE_NAME
+                && workspace["tileIds"] == json!(["captain-a"])
+        }));
+        let durable = restarted.snapshot();
+        let owner = durable
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .owner
+            .as_ref()
+            .unwrap();
+        assert_eq!(owner.project_id, "project-a");
+        assert_eq!(owner.assignment_id, "assignment:project-a:alpha");
+        assert_eq!(owner.ship_slug, "alpha");
+        assert!(durable.pending_fleet_operations.is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn durable_close_workspace_fixture(
+        tag: &str,
+        workspace_ids: &[&str],
+    ) -> (
+        PathBuf,
+        Arc<CaptainsRegistry>,
+        Arc<TabRegistry>,
+        ControlContext,
+    ) {
+        let path = captains_tmp(tag);
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-a".into(),
+                name: "Project A".into(),
+                repo_root: "/tmp/project-a".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        captains
+            .claim_test(
+                "captain-a",
+                Some("alpha"),
+                workspace_ids.iter().map(|id| (*id).to_string()).collect(),
+            )
+            .unwrap();
+        captains
+            .bind_ship_context("alpha", "project-a", "Assignment A", "codex")
+            .unwrap();
+        captains.record_crew("captain-a", "crew-a").unwrap();
+        captains
+            .bind_crew_context_exact(
+                "captain-a",
+                "crew-a",
+                "close Workspace recovery",
+                "codex",
+                None,
+                None,
+                Some("work-a"),
+                PowderWorkBinding {
+                    card_id: "card-a".into(),
+                    run_id: "run-a".into(),
+                    agent: Some("agent-a".into()),
+                    claim_expires_at: Some(1),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let context = test_ctx(tag)
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        (path, captains, tabs, context)
+    }
+
+    #[test]
+    fn force_close_atomically_rehomes_crew_and_restart_projects_the_committed_state() {
+        let (path, captains, tabs, context) =
+            durable_close_workspace_fixture("force-close-rehome", &["work-a", "work-b"]);
+        let before_projection = tabs.snapshot_full();
+
+        let error = dispatch(
+            &context,
+            "close_tab",
+            &json!({
+                "tabId": "work-a",
+                "force": true,
+                "testCrashAfterFleetCommit": true,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected crash"));
+        assert_eq!(tabs.snapshot_full().seq, before_projection.seq);
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .any(|workspace| workspace.id == "work-a"));
+
+        let committed = captains.snapshot();
+        assert!(committed
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != "work-a"));
+        let crew = &committed.captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id.as_deref(), Some("work-b"));
+        assert!(matches!(crew.state, CrewState::Active));
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        let restarted = CaptainsRegistry::load(path.clone());
+        let restarted_tabs = TabRegistry::new();
+        restarted_tabs.replace(restarted.workspace_projection());
+        let projected = restarted_tabs.snapshot();
+        assert!(projected.iter().all(|workspace| workspace.id != "work-a"));
+        let work_b = projected
+            .iter()
+            .find(|workspace| workspace.id == "work-b")
+            .unwrap();
+        assert_eq!(work_b.tile_ids, vec!["crew-a"]);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn force_close_with_ambiguous_rehome_persists_needs_assignment_and_rolls_back_on_failure() {
+        let (path, captains, tabs, context) = durable_close_workspace_fixture(
+            "force-close-ambiguous",
+            &["work-a", "work-b", "work-c"],
+        );
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        captains.fail_next_persist("force close persistence failure");
+        let error = dispatch(
+            &context,
+            "close_tab",
+            &json!({"tabId": "work-a", "force": true}),
+        )
+        .unwrap_err();
+        assert!(error.contains("force close persistence failure"));
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().workspaces, before_captains.workspaces);
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+
+        dispatch(
+            &context,
+            "close_tab",
+            &json!({"tabId": "work-a", "force": true}),
+        )
+        .unwrap();
+        let committed = captains.snapshot();
+        let crew = &committed.captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id, None);
+        assert!(matches!(crew.state, CrewState::NeedsAssignment { .. }));
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .all(|workspace| !workspace.tile_ids.contains(&"crew-a".to_string())));
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        let restarted = CaptainsRegistry::load(path.clone());
+        let crew = &restarted.snapshot().captains[0].crew[0];
+        assert_eq!(crew.workspace_tab_id, None);
+        assert!(matches!(crew.state, CrewState::NeedsAssignment { .. }));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -20882,6 +25246,52 @@ mod tests {
         assert!(reg.prune_tab("tab-2").unwrap());
         // Zero controlled tabs is a valid claim state.
         assert_eq!(reg.snapshot().captains.len(), 1);
+    }
+
+    #[test]
+    fn close_tab_persistence_failure_preserves_both_registries_and_projection() {
+        let path = captains_tmp("close-tab-transaction");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("close-tab-transaction")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let before_captains = captains.snapshot();
+        let before_tabs = tabs.snapshot_full();
+        captains.fail_next_persist("close tab prune persistence failure");
+
+        let error = dispatch(&context, "close_tab", &json!({"tabId": "work-a"})).unwrap_err();
+        assert!(error.contains("close tab prune persistence failure"));
+        assert_eq!(captains.snapshot().captains, before_captains.captains);
+        assert_eq!(captains.snapshot().seq, before_captains.seq);
+        assert_eq!(
+            serde_json::to_value(tabs.snapshot_full().tabs).unwrap(),
+            serde_json::to_value(before_tabs.tabs).unwrap()
+        );
+        assert_eq!(tabs.snapshot_full().seq, before_tabs.seq);
+        assert!(sink.calls.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -20954,7 +25364,7 @@ mod tests {
     }
 
     #[test]
-    fn project_binding_is_unique_under_concurrent_distinct_ship_claims() {
+    fn concurrent_distinct_ship_claims_create_distinct_project_captains() {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.upsert_project(ProjectRecord {
             project_id: "project-one".into(),
@@ -20980,20 +25390,29 @@ mod tests {
             }));
         }
         barrier.wait();
-        let successes = joins
+        let results = joins
             .into_iter()
             .map(|join| join.join().unwrap())
-            .filter(Result::is_ok)
-            .count();
-        assert_eq!(successes, 1);
-        assert_eq!(
-            reg.snapshot()
-                .captains
-                .iter()
-                .filter(|captain| captain.project_id.as_deref() == Some("project-one"))
-                .count(),
-            1
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok));
+
+        let snapshot = reg.snapshot();
+        let project_captains = snapshot
+            .captains
+            .iter()
+            .filter(|captain| captain.project_id.as_deref() == Some("project-one"))
+            .collect::<Vec<_>>();
+        assert_eq!(project_captains.len(), 2);
+        assert_ne!(
+            project_captains[0].assignment_id,
+            project_captains[1].assignment_id
         );
+        let mut ship_slugs = project_captains
+            .iter()
+            .map(|captain| captain.ship_slug.as_str())
+            .collect::<Vec<_>>();
+        ship_slugs.sort_unstable();
+        assert_eq!(ship_slugs, vec!["alpha", "beta"]);
     }
 
     #[test]
@@ -21159,6 +25578,9 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![],
+            pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -21552,6 +25974,9 @@ mod tests {
             seq: 4,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -21646,6 +26071,9 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         };
@@ -21677,6 +26105,12 @@ mod tests {
             "seq": 1,
             "captains": [],
             "projects": [],
+            "workspaces": [{
+                "id": CAPTAIN_WORKSPACE_ID,
+                "name": CAPTAIN_WORKSPACE_NAME,
+                "kind": "captain",
+                "tileIds": []
+            }],
         });
         let cases = [
             (
@@ -21895,11 +26329,18 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("secret").with_apply_sink(sink);
-        ctx.tab_registry().replace(vec![TabRecord {
-            id: "captains-reserved".into(),
-            name: "Captains".into(),
-            tile_ids: vec![],
-        }]);
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "project-tab".into(),
+                name: "Commission Crew".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            },
+        ]);
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-e2e".into(),
@@ -21934,6 +26375,7 @@ mod tests {
         assert_eq!(first["captain"]["harness"], "codex");
         assert_eq!(first["captain"]["workspaceTabIds"][0], "project-tab");
         assert_eq!(first["project"]["powder"]["repository"], "commission-e2e");
+        assert!(ctx.captains.snapshot().pending_fleet_operations.is_empty());
         let terminal_id = first["captain"]["terminalId"].as_str().unwrap().to_string();
         assert!(tmux::has_session(&tmux_target(&terminal_id)));
 
@@ -21970,12 +26412,225 @@ mod tests {
     }
 
     #[test]
+    fn commission_binding_failure_never_projects_a_ghost_captain_or_placement() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("commission-projection-rollback");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-commission-fail".into(),
+                name: "Commission Failure".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "commission-failure".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "commission-work".into(),
+            name: "Commission Work".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("commission-projection-rollback")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let sessions_before = tmux::list_sessions().unwrap_or_default();
+        let identities_before = context.identity.len();
+
+        let error = dispatch(
+            &context,
+            "commission_captain",
+            &json!({
+                "projectId": "project-commission-fail",
+                "assignment": "Own failure",
+                "harness": "codex",
+                "shipSlug": "commission-failure",
+                "workspaceTabIds": ["commission-work"],
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true,
+                "testFailCommitPersist": true
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("commission binding persistence failure"));
+        assert!(captains.snapshot().captains.is_empty());
+        assert!(captains.snapshot().pending_fleet_operations.is_empty());
+        assert_eq!(context.identity.len(), identities_before);
+        assert_eq!(tmux::list_sessions().unwrap_or_default(), sessions_before);
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .is_empty());
+        let projected_commands: Vec<String> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(command, _)| command.clone())
+            .collect();
+        assert!(!projected_commands.iter().any(|command| {
+            matches!(
+                command.as_str(),
+                "spawn_terminal" | "move_tile" | "sync_captains"
+            )
+        }));
+
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn commission_crash_recovery_reaps_exact_tmux_identity_and_unprojected_intent() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("commission-crash-recovery");
+        let identity_path = path.with_extension("identities.json");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-commission-crash".into(),
+                name: "Commission Crash".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "commission-crash".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = Arc::new(
+            test_ctx("commission-crash-recovery")
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs))
+                .with_identity_store(Arc::clone(&identities))
+                .with_apply_sink(sink.clone()),
+        );
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "commission_effect_applied",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let commissioning_context = Arc::clone(&context);
+        let commissioning = std::thread::spawn(move || {
+            dispatch(
+                &commissioning_context,
+                "commission_captain",
+                &json!({
+                "projectId": "project-commission-crash",
+                "assignment": "Own crash recovery",
+                "harness": "codex",
+                "shipSlug": "commission-crash",
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true,
+                "testCrashAfterTmux": true
+                }),
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "commission_effect_applied"
+        );
+        let during_effect = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(during_effect["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|workspace| workspace["tileIds"].as_array().unwrap().is_empty()));
+        assert!(dispatch(&context, "list_captains", &Value::Null).is_ok());
+        resume_tx.send(()).unwrap();
+        let error = commissioning.join().unwrap().unwrap_err();
+        assert!(error.contains("injected commission crash"));
+        let durable = captains.snapshot();
+        assert!(durable.captains.is_empty());
+        assert_eq!(durable.pending_fleet_operations.len(), 1);
+        let PendingFleetOperationPayload::CommissionCaptain {
+            terminal_id,
+            identity_id,
+            ..
+        } = &durable.pending_fleet_operations[0].payload
+        else {
+            panic!("expected pending commission operation")
+        };
+        assert!(tmux::has_session(&tmux_target(terminal_id)));
+        assert!(identity_id.is_some());
+        assert_eq!(identities.len(), 1);
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().all(|workspace| {
+            workspace["tileIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tile| tile != terminal_id)
+        }));
+        assert!(sink.calls.lock().unwrap().is_empty());
+        let terminal_id = terminal_id.clone();
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        drop(identities);
+        let restarted_captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let restarted_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let restarted_tabs = Arc::new(TabRegistry::new());
+        restarted_tabs.replace(restarted_captains.workspace_projection());
+        let restarted = test_ctx("commission-crash-recovery-restart")
+            .with_captains_registry(Arc::clone(&restarted_captains))
+            .with_tab_registry(Arc::clone(&restarted_tabs))
+            .with_identity_store(Arc::clone(&restarted_identities));
+        recover_pending_fleet_operations(&restarted);
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert_eq!(restarted_identities.len(), 0);
+        assert!(restarted_captains
+            .snapshot()
+            .pending_fleet_operations
+            .is_empty());
+        assert!(restarted_captains.snapshot().captains.is_empty());
+
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(identity_path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(identity_path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn captain_bootstrap_uses_the_wsl_runtime_root_without_mutating_the_project() {
         let canonical_repo_root =
             "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\projects\\tools\\t-hub\\t-hub-app";
         let runtime_repo_root = "/home/natkins/projects/tools/t-hub/t-hub-app";
         let captain = CaptainRecord {
             ship_slug: "t-hub-app".into(),
+            assignment_id: "assignment:project-1:t-hub-app".into(),
+            display_name: "t-hub-app".into(),
             role: FleetRole::Captain,
             claude_uuid: None,
             provider: Some("codex".into()),
@@ -22098,10 +26753,15 @@ mod tests {
                 updated_at: 0,
             })
             .unwrap();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "attach-work".into(),
+            name: "Attach Work".into(),
+            tile_ids: Vec::new(),
+        }]);
         let read_id = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({ "cwd": "/tmp", "capability": "read" }),
+            &json!({ "cwd": "/tmp", "capability": "read", "tabId": "attach-work" }),
         )
         .unwrap()["id"]
             .as_str()
@@ -22131,6 +26791,7 @@ mod tests {
             &json!({
                 "cwd": "/tmp",
                 "capability": "control",
+                "tabId": "attach-work",
                 "startupCommand": harness_command,
             }),
         )
@@ -22156,6 +26817,37 @@ mod tests {
         assert_eq!(attached["captain"]["provider"], "codex");
         assert!(attached["captain"].get("providerSessionId").is_none());
         assert!(attached["captain"].get("claudeUuid").is_none());
+        let attached_tabs = ctx.tabs.snapshot_full();
+        assert!(!attached_tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&control_id));
+        assert_eq!(
+            attached_tabs
+                .tabs
+                .iter()
+                .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+                .unwrap()
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &control_id)
+                .count(),
+            1
+        );
+        let unchanged_report = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": attached_tabs.seq,
+                "tabs": attached_tabs.tabs,
+                "activeTabId": attached_tabs.active_tab_id
+            }),
+        )
+        .unwrap();
+        assert!(unchanged_report.get("reported").is_some());
 
         let checkpoint = dispatch(
             &ctx,
@@ -22178,6 +26870,187 @@ mod tests {
     }
 
     #[test]
+    fn attach_captain_binding_failure_restores_placement_and_retry_is_durable() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("attach-relocation-rollback");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-attach-rollback".into(),
+                name: "Attach Rollback".into(),
+                repo_root: "/tmp/attach-rollback".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "attach-rollback".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "attach-work".into(),
+            name: "Attach Work".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("attach-relocation-rollback")
+            .with_apply_sink(sink.clone())
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        ctx.addr = "127.0.0.1:4242".into();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({
+                "cwd": "/tmp",
+                "capability": "control",
+                "tabId": "attach-work",
+                "startupCommand": harness_command
+            }),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        sink.calls.lock().unwrap().clear();
+        captains.fail_next_persist("attach bind persistence failure");
+
+        let error = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("attach bind persistence failure"),
+            "got: {error}"
+        );
+        assert!(captains.snapshot().captains.is_empty());
+        let rolled_back = tabs.snapshot_full();
+        assert_eq!(
+            rolled_back
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        assert!(rolled_back
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        let failed_projection = serde_json::to_string(&*sink.calls.lock().unwrap()).unwrap();
+        assert!(
+            !failed_projection.contains(&captain_id),
+            "failed attachment must never project a ghost Captain or placement: {failed_projection}"
+        );
+
+        let retry = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(retry["accepted"], "attach_captain");
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 1);
+        assert_eq!(
+            restored.captains[0].project_id.as_deref(),
+            Some("project-attach-rollback")
+        );
+        let final_tabs = tabs.snapshot_full();
+        assert_eq!(
+            final_tabs
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        assert!(final_tabs
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+
+        dispatch(
+            &ctx,
+            "release_captain",
+            &json!({"captainSessionId": captain_id}),
+        )
+        .unwrap();
+        dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": captain_id, "tabId": "attach-work"}),
+        )
+        .unwrap();
+        let before_bootstrap_failure = captains.snapshot();
+        sink.calls.lock().unwrap().clear();
+        let bootstrap_error = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "projectId": "project-attach-rollback",
+                "assignment": "Own rollback",
+                "provider": "codex",
+                "testSkipPowderHealth": true,
+                "testFailBootstrapDelivery": true
+            }),
+        )
+        .unwrap_err();
+        assert!(bootstrap_error.contains("injected bootstrap delivery failure"));
+        assert_eq!(
+            captains.snapshot().captains,
+            before_bootstrap_failure.captains
+        );
+        assert!(tabs
+            .snapshot()
+            .iter()
+            .find(|tab| tab.id == "attach-work")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(
+            sink.calls.lock().unwrap().is_empty(),
+            "bootstrap rollback must occur before any Captain or Workspace projection"
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn crew_rollback_requires_a_confirmed_powder_release() {
         let failed = json!({
             "powderRelease": {
@@ -22194,7 +27067,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_close_retains_cleanup_pending_crew_when_powder_release_fails() {
+    fn close_terminal_refuses_before_tmux_when_powder_scope_cannot_be_frozen() {
         if !std::process::Command::new("tmux")
             .arg("-V")
             .output()
@@ -22260,28 +27133,20 @@ mod tests {
             .unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
-        let closed =
-            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None).unwrap();
+        let before = registry.snapshot();
+        let error = close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None)
+            .unwrap_err();
 
-        assert_eq!(closed["powderRelease"]["released"], false);
-        assert_eq!(closed["crewBindingRetained"], true);
-        let snapshot = registry.snapshot();
-        let crew = &snapshot.captains[0].crew[0];
-        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
-        assert!(crew.powder_work.is_some());
-        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
-
-        let retried = close_terminal(&ctx, &json!({ "sessionId": crew_id })).unwrap();
-        assert_eq!(retried["outcome"], "already_gone");
-        assert_eq!(retried["powderRelease"]["released"], false);
-        assert_eq!(retried["crewBindingRetained"], true);
-        let retried_snapshot = registry.snapshot();
-        let retried_crew = &retried_snapshot.captains[0].crew[0];
-        assert!(matches!(
-            retried_crew.state,
-            CrewState::CleanupPending { .. }
-        ));
-        assert!(retried_crew.powder_work.is_some());
+        assert!(error.contains("exact agent identity"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
     }
 
     #[test]
@@ -22728,14 +27593,14 @@ mod tests {
             .to_string();
         wait_for_harness_started(&cap_id, "codex").unwrap();
 
-        // Claim with NO explicit workspaceTabIds: defaults to the tab holding
-        // the captain's tile (the UI pin path sends exactly this shape).
+        // Claim with no explicit workspaceTabIds does not infer Work Workspace
+        // ownership from the Captain terminal's current placement.
         let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": cap_id})).unwrap();
         assert_eq!(v["accepted"], "claim_captain");
         assert_eq!(v["audited"], true);
         assert_eq!(v["applied"], true);
         assert_eq!(v["captain"]["shipSlug"], format!("ship-{cap_id}"));
-        assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
+        assert_eq!(v["captain"]["workspaceTabIds"], json!([]));
         assert_eq!(v["captain"]["terminalId"], cap_id);
 
         let v = dispatch(
@@ -22763,6 +27628,167 @@ mod tests {
         assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+    }
+
+    #[test]
+    fn claim_captain_relocates_the_tile_atomically_and_survives_retry_and_restart() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("claim-relocation-restart");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let ctx = test_ctx("claim-relocation")
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "work-a", "startupCommand": harness_command}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+
+        let claimed = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "shipSlug": "alpha",
+                "workspaceTabIds": ["work-a"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(claimed["accepted"], "claim_captain");
+        let snapshot = tabs.snapshot_full();
+        let work = snapshot.tabs.iter().find(|tab| tab.id == "work-a").unwrap();
+        let captain_workspace = snapshot
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap();
+        assert!(!work.tile_ids.contains(&captain_id));
+        assert_eq!(
+            captain_workspace
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+
+        let unchanged = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": snapshot.seq,
+                "tabs": snapshot.tabs,
+                "activeTabId": snapshot.active_tab_id
+            }),
+        )
+        .unwrap();
+        assert!(unchanged.get("reported").is_some());
+        dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": captain_id,
+                "shipSlug": "alpha",
+                "workspaceTabIds": ["work-a"]
+            }),
+        )
+        .unwrap();
+        let after_retry = tabs.snapshot_full();
+        assert_eq!(
+            after_retry
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.tile_ids.iter())
+                .filter(|tile| *tile == &captain_id)
+                .count(),
+            1
+        );
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 1);
+        assert_eq!(
+            restored.captains[0].terminal_id.as_deref(),
+            Some(captain_id.as_str())
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_claim_captain_persistence_keeps_the_original_work_placement() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let captains = Arc::new(CaptainsRegistry::load(captains_tmp(
+            "claim-relocation-fail",
+        )));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: Vec::new(),
+        }]);
+        let ctx = test_ctx("claim-relocation-fail")
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let captain_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "work-a", "startupCommand": harness_command}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&captain_id, "codex").unwrap();
+        let before = tabs.snapshot_full();
+        captains.fail_next_persist("claim relocation persistence failure");
+        let error = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": captain_id, "shipSlug": "alpha"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("claim relocation persistence failure"));
+        assert!(captains.snapshot().captains.is_empty());
+        let after = tabs.snapshot_full();
+        assert_eq!(after.seq, before.seq);
+        assert!(after
+            .tabs
+            .iter()
+            .find(|tab| tab.id == "work-a")
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+        assert!(!after
+            .tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .unwrap()
+            .tile_ids
+            .contains(&captain_id));
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": captain_id})).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
@@ -22829,6 +27855,13 @@ mod tests {
         assert!(value["captain"].get("providerSessionId").is_none());
         assert!(value["captain"].get("conversationId").is_none());
         assert!(value["captain"].get("claudeUuid").is_none());
+        let tabs = ctx.tab_registry().snapshot();
+        let captain_workspace = tabs
+            .iter()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .expect("claim creates the durable Captain Workspace when boot starts headless");
+        assert_eq!(captain_workspace.name, CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(captain_workspace.tile_ids, vec![terminal_id.clone()]);
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
@@ -23083,6 +28116,775 @@ mod tests {
             ClaimState::Orphaned { .. }
         ));
         assert!(snap.captains[0].terminal_id.is_none(), "un-pointed");
+    }
+
+    #[test]
+    fn close_terminal_releases_fleet_lock_during_external_effects() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry.record_crew("cap-1", "crew-1").unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(registry.workspace_projection());
+        let context = Arc::new(
+            test_ctx("close-effect-lock")
+                .with_captains_registry(Arc::clone(&registry))
+                .with_tab_registry(Arc::clone(&tabs)),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_effect",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let closing_context = Arc::clone(&context);
+        let closing = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &closing_context,
+                &json!({"sessionId": "crew-1"}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "close_terminal_effect"
+        );
+        assert_eq!(registry.snapshot().pending_fleet_operations.len(), 1);
+
+        let (listed_tx, listed_rx) = std::sync::mpsc::sync_channel(1);
+        let listing_context = Arc::clone(&context);
+        std::thread::spawn(move || {
+            listed_tx
+                .send((
+                    dispatch(&listing_context, "list_captains", &Value::Null),
+                    dispatch(&listing_context, "list_tabs", &Value::Null),
+                ))
+                .unwrap();
+        });
+        let (captains, listed_tabs) = listed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("Fleet readers must remain prompt during terminal effects");
+        captains.unwrap();
+        listed_tabs.unwrap();
+        resume_tx.send(()).unwrap();
+        closing.join().unwrap().unwrap();
+        assert!(registry.snapshot().pending_fleet_operations.is_empty());
+        assert!(matches!(
+            registry.snapshot().captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+    }
+
+    #[test]
+    fn close_terminal_project_rebind_after_scope_capture_has_zero_effects() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "close_terminal_project_rebind_after_scope_capture_has_zero_effects: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-rebind-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Close with frozen Project authority",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context =
+            Arc::new(test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry)));
+        let before = registry.snapshot();
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_scope_frozen",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let close_context = Arc::clone(&context);
+        let close_crew = crew_id.clone();
+        let close = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &close_context,
+                &json!({"sessionId": close_crew}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "close_terminal_scope_frozen"
+        );
+        let mut rebound = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-powder-lifecycle")
+            .unwrap();
+        rebound.powder.as_mut().unwrap().repository = "foreign-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        resume_tx.send(()).unwrap();
+
+        let error = close.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("authority changed after scope capture"),
+            "{error}"
+        );
+        let after = registry.snapshot();
+        assert!(after.pending_fleet_operations.is_empty());
+        assert!(after.pending_dispatch_releases.is_empty());
+        assert_eq!(after.captains[0].crew[0], before.captains[0].crew[0]);
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+    }
+
+    #[test]
+    fn close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-agent-mismatch-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let before = registry.snapshot();
+
+        let error =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap_err();
+
+        assert!(error.contains("configured agent"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        tmux::kill_session_tree(&target).unwrap();
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+        assert_eq!(powder.card_evidence_gets, 0);
+        assert_eq!(powder.run_evidence_gets, 0);
+    }
+
+    #[test]
+    fn released_terminal_close_crash_restarts_to_one_removed_history_record() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "released_terminal_close_crash_restarts_to_one_removed_history_record: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(7);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let profile_name = format!("close-crash-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let path = captains_tmp("close-terminal-release-crash");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            &crew_id,
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Crash after exact release",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context =
+            Arc::new(test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry)));
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (_resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "close_terminal_release_applied",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let close_context = Arc::clone(&context);
+        let close_crew = crew_id.clone();
+        let close = std::thread::spawn(move || {
+            close_terminal_with_policy(
+                &close_context,
+                &json!({"sessionId": close_crew}),
+                false,
+                None,
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "close_terminal_release_applied"
+        );
+        drop(_resume_tx);
+        let error = close.join().unwrap().unwrap_err();
+        assert!(error.contains("test crash occurred after remote release"));
+        let crashed = registry.snapshot();
+        assert_eq!(crashed.pending_fleet_operations.len(), 1);
+        assert_eq!(crashed.pending_dispatch_releases.len(), 1);
+        assert!(matches!(
+            crashed.captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        drop(context);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let restart_context = test_ctx(&profile_name)
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(tabs);
+        recover_pending_fleet_operations(&restart_context);
+
+        let recovered = restarted.snapshot();
+        assert!(recovered.pending_fleet_operations.is_empty());
+        assert!(recovered.pending_dispatch_releases.is_empty());
+        assert_eq!(recovered.captains[0].crew.len(), 1);
+        assert!(matches!(
+            recovered.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(recovered.captains[0].crew[0].powder_work.is_none());
+        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_close_response_loss_retries_the_same_durable_operation() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "terminal_close_response_loss_retries_the_same_durable_operation: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(7);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
+        let profile_name = format!("close-retry-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Retry exact close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+
+        let first =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+        assert_eq!(first["powderRelease"]["outcome"], "recovery_pending");
+        let pending = registry.snapshot();
+        assert_eq!(pending.pending_fleet_operations.len(), 1);
+        assert_eq!(pending.pending_dispatch_releases.len(), 1);
+        let operation_id = pending.pending_fleet_operations[0].operation_id.clone();
+        let recovery_id = pending.pending_dispatch_releases[0].operation_id.clone();
+
+        let second =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+        assert_eq!(second["powderRelease"]["released"], true);
+        let finalized = registry.snapshot();
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert_eq!(finalized.captains[0].crew.len(), 1);
+        assert!(matches!(
+            finalized.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(finalized.captains[0].crew[0].powder_work.is_none());
+        assert_ne!(operation_id, recovery_id);
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+    }
+
+    #[test]
+    fn ambiguous_terminal_close_publishes_cleanup_pending_without_retiring_tile_or_identity() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "ambiguous_terminal_close_publishes_cleanup_pending_without_retiring_tile_or_identity: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+        }
+        let profile_name = format!("close-pending-sync-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let target = tmux_target(&crew_id);
+        create_test_tmux_session(&target).unwrap();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Publish pending close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        registry
+            .create_workspace("work-close", "Close Work", None)
+            .unwrap();
+        registry
+            .move_workspace_tile(&crew_id, "work-close")
+            .unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity_secret = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            &crew_id,
+        );
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx(&profile_name)
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities))
+            .with_apply_sink(sink.clone());
+
+        let closed =
+            close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
+                .unwrap();
+
+        assert_eq!(closed["powderRelease"]["outcome"], "recovery_pending");
+        let pending = registry.snapshot();
+        assert!(matches!(
+            pending.captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        assert!(pending
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == "work-close")
+            .unwrap()
+            .tile_ids
+            .contains(&crew_id));
+        assert!(!pending.retired_fleet_tile_ids.contains(&crew_id));
+        assert!(identities.resolve(&identity_secret).is_some());
+        let calls = sink.calls.lock().unwrap();
+        assert!(calls.iter().any(|(command, args)| {
+            command == "sync_captains"
+                && args["sync"]["captains"][0]["crew"][0]["state"]["kind"] == "cleanupPending"
+        }));
+        assert!(calls.iter().all(|(command, _)| command != "sync_tabs"));
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 1);
+    }
+
+    #[test]
+    fn periodic_reconcile_finalizes_a_persisted_close_owned_release_atomically() {
+        let server = LoopbackPowderServer::start(3);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let profile_name = format!("close-periodic-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp("close-terminal-periodic-reconcile");
+        let crew_id = uuid::Uuid::new_v4().simple().to_string();
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            &crew_id,
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Periodically recover exact close",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let (expected_seq, recovery) =
+            freeze_close_terminal_powder_release(&context, &crew_id).unwrap();
+        let recovery = recovery.unwrap();
+        registry
+            .prepare_close_terminal_operation(&crew_id, expected_seq, Some(recovery.clone()))
+            .unwrap();
+        registry
+            .transition_dispatch_release(
+                &recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )
+            .unwrap();
+        drop(context);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let restart_context =
+            test_ctx(&profile_name).with_captains_registry(Arc::clone(&restarted));
+        reconcile_pending_dispatch_releases(&restart_context);
+
+        let finalized = restarted.snapshot();
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert_eq!(finalized.captains[0].crew.len(), 1);
+        assert!(matches!(
+            finalized.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        assert!(finalized.captains[0].crew[0].powder_work.is_none());
+        let powder = server.finish().unwrap();
+        assert_eq!(powder.release_posts, 0);
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_terminal_close_recovers_before_first_list_after_restart() {
+        let path = captains_tmp("close-terminal-wal-restart");
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .claim_test("cap-1", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        registry.record_crew("cap-1", "crew-1").unwrap();
+        let expected_seq = registry.snapshot().seq;
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-1", expected_seq, None)
+            .unwrap();
+        assert_eq!(prepared.phase, PendingFleetOperationPhase::Prepared);
+        drop(registry);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        assert_eq!(
+            restarted.snapshot().pending_fleet_operations,
+            vec![prepared]
+        );
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(restarted.workspace_projection());
+        let context = test_ctx("close-terminal-wal-restart")
+            .with_captains_registry(Arc::clone(&restarted))
+            .with_tab_registry(Arc::clone(&tabs));
+        recover_pending_fleet_operations(&context);
+
+        let durable = restarted.snapshot();
+        assert!(durable.pending_fleet_operations.is_empty());
+        assert!(matches!(
+            durable.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().all(|workspace| {
+            workspace["tileIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tile| tile != "crew-1")
+        }));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepared_terminal_close_freezes_exact_powder_scope_in_the_durable_intent() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("frozen-close-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp("close-terminal-frozen-powder");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            &profile_name,
+            "crew-powder",
+        );
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                "crew-powder",
+                "Implement Powder lifecycle",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let (expected_seq, recovery) =
+            freeze_close_terminal_powder_release(&context, "crew-powder").unwrap();
+        let recovery = recovery.unwrap();
+        assert_eq!(recovery.connection_profile, profile_name);
+        assert_eq!(recovery.project_id, "project-powder-lifecycle");
+        assert_eq!(recovery.repository, "t-hub");
+        assert_eq!(recovery.agent, "t-hub");
+        assert!(recovery
+            .connection_endpoint_identity
+            .starts_with("hmac-sha256:"));
+
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
+            .unwrap();
+        drop(registry);
+
+        let restarted = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            restarted.snapshot().pending_dispatch_releases,
+            vec![recovery.clone()]
+        );
+        assert!(matches!(
+            &prepared.payload,
+            PendingFleetOperationPayload::CloseTerminal {
+                powder_release: Some(frozen),
+                ..
+            } if frozen == &recovery
+        ));
+        let crew = &restarted.snapshot().captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+        assert!(crew
+            .powder_work
+            .as_ref()
+            .is_some_and(|work| work.dispatch_release_recovery));
+
+        server.finish().unwrap();
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn released_terminal_close_finalizes_history_recovery_and_wal_atomically() {
+        let path = captains_tmp("close-terminal-atomic-finalize");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "atomic-close-profile",
+            "crew-powder",
+        );
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "crew-powder".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "atomic-close-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "powder-agent".into(),
+            operation_id: "close-terminal:atomic-finalize".into(),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        let expected_seq = registry.snapshot().seq;
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
+            .unwrap();
+        registry
+            .transition_dispatch_release(
+                &recovery,
+                PendingDispatchReleaseState::Prepared,
+                PendingDispatchReleaseState::InFlight,
+            )
+            .unwrap();
+        let before_finalize = registry.snapshot();
+        registry.fail_next_persist("injected atomic finalization failure");
+        assert!(registry
+            .commit_close_terminal_operation(&prepared, false, Some(&recovery))
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before_finalize).unwrap()
+        );
+
+        registry
+            .commit_close_terminal_operation(&prepared, false, Some(&recovery))
+            .unwrap();
+        let finalized = registry.snapshot();
+        let crew = &finalized.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_none());
+        assert!(finalized.pending_dispatch_releases.is_empty());
+        assert!(finalized.pending_fleet_operations.is_empty());
+        assert!(finalized
+            .workspaces
+            .iter()
+            .all(|workspace| !workspace.tile_ids.contains(&"crew-powder".to_string())));
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_close_reuses_an_exact_orphaned_pending_release() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "retry-close-profile",
+            "crew-powder",
+        );
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "crew-powder".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "retry-close-profile".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "powder-agent".into(),
+            operation_id: "close-terminal:original-retry".into(),
+            created_at: now_ms(),
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        let expected_seq = registry.snapshot().seq;
+
+        let prepared = registry
+            .prepare_close_terminal_operation("crew-powder", expected_seq, Some(recovery.clone()))
+            .unwrap();
+
+        assert!(matches!(
+            prepared.payload,
+            PendingFleetOperationPayload::CloseTerminal {
+                powder_release: Some(ref frozen),
+                ..
+            } if frozen == &recovery
+        ));
+        assert_eq!(
+            registry.snapshot().pending_dispatch_releases,
+            vec![recovery]
+        );
+    }
+
+    #[test]
+    fn removed_crew_binding_cannot_prepare_a_live_terminal_close() {
+        let registry = powder_lifecycle_registry(None);
+        registry.remove_session("crew-powder").unwrap();
+        let context = test_ctx("removed-close").with_captains_registry(Arc::clone(&registry));
+        let before = registry.snapshot();
+
+        let error = freeze_close_terminal_powder_release(&context, "crew-powder").unwrap_err();
+
+        assert!(error.contains("historically Removed"), "{error}");
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 
     #[test]
@@ -25531,6 +31333,9 @@ mod tests {
             seq: 0,
             captains: vec![],
             projects: vec![],
+            workspaces: vec![],
+            pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
         })
@@ -27164,7 +32969,11 @@ mod tests {
             })
             .unwrap();
         registry
-            .claim_test(captain_session_id, Some("dispatch-attestation"), vec![])
+            .claim_test(
+                captain_session_id,
+                Some("dispatch-attestation"),
+                vec!["dispatch-workspace".into()],
+            )
             .unwrap();
         registry
             .bind_ship_context(
@@ -27183,8 +32992,15 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "dispatch-workspace".into(),
+            name: "Dispatch Crew".into(),
+            tile_ids: Vec::new(),
+        }]);
         let ctx = test_ctx("dispatch-attestation")
             .with_captains_registry(registry)
+            .with_tab_registry(tabs)
             .with_apply_sink(sink.clone());
         (ctx, sink)
     }
@@ -28119,13 +33935,37 @@ mod tests {
             );
             return;
         }
-        let server = LoopbackPowderServer::start(3);
+        let server = LoopbackPowderServer::start(4);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.evidence_claim_agent = Some("t-hub".into());
+            state.evidence_run_agent = Some("t-hub".into());
+        }
         let profile_name = format!("attestation-rollback-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let registry =
             powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        registry
+            .bind_crew_context(
+                "captain-powder",
+                &crew_id,
+                "Roll back exact attestation claim",
+                "codex",
+                Some("/tmp/powder-lifecycle"),
+                Some("feat/powder-lifecycle"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
         let target = tmux_target(&crew_id);
         create_test_tmux_session(&target).unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
@@ -30979,6 +36819,9 @@ mod tests {
             );
             return;
         }
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let captain = FakeHarnessSession::start(Harness::Codex);
         let fixture = tempfile::tempdir().unwrap();
         let hostile_pane = fixture.path().join("hostile-pane");
@@ -31000,9 +36843,6 @@ mod tests {
         let provider =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
 
-        let server = LoopbackPowderServer::start(3);
-        let profile_name = format!("dispatch-hostile-shell-{}", uuid::Uuid::new_v4().simple());
-        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
         let (ctx, sink) = dispatch_test_context(registry.clone());
         let (reached, wait_for_respawn) = std::sync::mpsc::sync_channel(1);
@@ -33921,9 +39761,9 @@ mod tests {
             );
             return;
         }
-        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
-        let server = LoopbackPowderServer::start(5);
+        let server = LoopbackPowderServer::start(3);
         let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
         create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
         assert!(matches!(
@@ -33956,6 +39796,18 @@ mod tests {
             }]
         });
         let expected_digest = parse_completion_proof(&args).unwrap().digest();
+        registry
+            .begin_crew_powder_completion(&crew_session_id, &expected_digest)
+            .unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.completed = true;
+            state.proof = Some("commit close-race".into());
+            state.proof_url = Some("https://example.test/close-race".into());
+            state.recovery_succeeds = true;
+            state.recovery_operation_id = Some("completion:close-race".into());
+            state.pause_run_evidence = true;
+        }
         let (wait_tx, wait_rx) = mpsc::sync_channel(2);
         registry.set_powder_operation_wait_hook(Some(wait_tx));
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
@@ -33974,7 +39826,7 @@ mod tests {
                 .unwrap();
         });
         server
-            .post_started
+            .run_evidence_started
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
 
@@ -34011,7 +39863,7 @@ mod tests {
             PowderWorkState::CompletionPending { request_digest, .. }
                 if request_digest == &expected_digest
         ));
-        server.release_post.send(()).unwrap();
+        server.resume_run_evidence.send(()).unwrap();
 
         let completion_result = completion_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(completion_result.ok, "{:?}", completion_result.error);
@@ -34043,7 +39895,8 @@ mod tests {
                 if request_digest == &expected_digest
         ));
         let state = server.finish().unwrap();
-        assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 1);
+        assert_eq!(state.completion_posts.len(), 0);
         assert_eq!(state.release_posts, 0);
     }
 

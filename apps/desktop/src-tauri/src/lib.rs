@@ -231,35 +231,30 @@ fn report_workspace_tabs(
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
-    match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted {
-            seq,
-            removed_tab_ids,
-        } => {
-            // Captain-chat phase 2: the webview's normal tab-close lands here (not
-            // the socket close_tab), so a closed tab must be pruned from every
-            // captain's workspaceTabIds here too - else it lingers as a phantom
-            // controlled-workspace in the persistent captains.json. Forward a
-            // captains snapshot (webview + socket clients) when anything changed.
-            let mut pruned = false;
-            for tab_id in &removed_tab_ids {
-                match captains.prune_tab(tab_id) {
-                    Ok(changed) => pruned |= changed,
-                    Err(error) => {
-                        eprintln!("t-hub: Captain tab pruning failed for '{tab_id}': {error}")
-                    }
-                }
-            }
-            if pruned {
+    match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
+        Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
+            if captains_changed {
                 commands::forward_captains_sync(&app, &captains, &fanout);
             }
-            serde_json::json!({ "seq": seq })
+            let snapshot = registry.snapshot_full();
+            serde_json::json!({
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            })
         }
-        control::ReportOutcome::Stale(snap) => serde_json::json!({
+        Ok((control::ReportOutcome::Stale(snap), _, _)) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
             "activeTabId": snap.active_tab_id,
             "tabs": snap.tabs,
+        }),
+        Err(error) => serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
         }),
     }
 }
@@ -353,6 +348,7 @@ fn start_control_listener(
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz);
+    control::recover_pending_fleet_operations(&ctx);
     control::start_powder_reconciler(ctx.clone());
     match control::start(ctx) {
         Ok(h) => {
@@ -589,13 +585,17 @@ pub fn run() {
             // between the control listener (which reads it for list_tabs and updates
             // it on new_tab/move_tile/named placement) and the managed state the
             // `report_workspace_tabs` command writes the frontend's up-sync into.
-            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
-            app.manage(tab_registry.clone());
             // Captain-chat phase 2: the captains registry, loaded from its
-            // persistence file so claims survive app restarts (unlike tabs, whose
-            // layout the frontend re-seeds on boot).
+            // persistence file so claims and Fleet Workspace authority survive
+            // app restarts.
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Fleet Workspace identity is durable in the same registry as its
+            // Captain/Assignment owner. TabRegistry is only the live projection
+            // cache and is seeded before the listener or UI can call list_tabs.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
+            tab_registry.replace(captains_registry.workspace_projection());
+            app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
             // via that command, not the control socket, so without this a killed

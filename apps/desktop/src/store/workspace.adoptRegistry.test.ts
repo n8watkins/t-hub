@@ -114,11 +114,13 @@ describe("adoptRegistry (server-authoritative snapshot)", () => {
   });
 
   it("is a no-op (same tabs identity) for a deep-equal snapshot", () => {
-    const before = useWorkspace.getState().tabs;
-    useWorkspace.getState().adoptRegistry([
+    const snapshot = [
       { id: "t1", name: "Workspace 1", tileIds: ["a", "b"] },
       { id: "t2", name: "hidden", tileIds: [] },
-    ]);
+    ];
+    useWorkspace.getState().adoptRegistry(snapshot);
+    const before = useWorkspace.getState().tabs;
+    useWorkspace.getState().adoptRegistry(snapshot);
     expect(useWorkspace.getState().tabs).toBe(before);
   });
 
@@ -378,6 +380,35 @@ describe("adoptRegistry never duplicates the reserved Captains tab (stray-placeh
       .getState()
       .tabs.filter((t) => t.id === CAPTAINS_TAB_ID);
     expect(reserved).toHaveLength(1);
+  });
+
+  it("migrates the legacy label and rejects a conflicting Workspace kind", () => {
+    seed([{ id: "t1", name: "Workspace 1", order: [] }], "t1", null);
+    useWorkspace.getState().adoptRegistry([
+      {
+        schemaVersion: 1,
+        id: CAPTAINS_TAB_ID,
+        name: "Captains",
+        kind: "captain",
+        tileIds: [],
+      },
+      {
+        schemaVersion: 1,
+        id: "foreign",
+        name: "Foreign",
+        kind: "captain",
+        tileIds: [],
+      },
+      { id: "t1", name: "Workspace 1", kind: "work", tileIds: [] },
+    ]);
+    const state = useWorkspace.getState();
+    const captainWorkspace = state.tabs.find((tab) => tab.id === CAPTAINS_TAB_ID);
+    expect(captainWorkspace).toMatchObject({
+      schemaVersion: 1,
+      kind: "captain",
+      name: "Captain Workspace",
+    });
+    expect(state.tabs.some((tab) => tab.id === "foreign")).toBe(false);
   });
 });
 
