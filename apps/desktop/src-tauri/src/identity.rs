@@ -553,6 +553,18 @@ impl IdentityStore {
                     ),
                     watermark,
                 ),
+                (
+                    Ok(Some((_snapshot, IdentitySnapshotSource::VersionedLegacy))),
+                    Ok(Some(watermark)),
+                ) if watermark.identities_schema_version == IDENTITIES_SCHEMA_VERSION => (
+                    IdentitiesSnapshot::default(),
+                    false,
+                    Some(
+                        "identity generation watermark proves identities.json was downgraded to schema v1 and may have erased operation allocation ownership"
+                            .to_string(),
+                    ),
+                    watermark,
+                ),
                 (Ok(Some((snapshot, _source))), Ok(Some(watermark)))
                     if snapshot.generation != watermark.generation_high_water =>
                 {
@@ -1464,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_with_anchor_first_crash_recovery_and_no_invented_allocation() {
+    fn schema_v1_migrates_with_matching_v1_anchor_and_no_invented_allocation() {
         let v1 = serde_json::json!({
             "schemaVersion": 1,
             "generation": 4,
@@ -1481,39 +1493,101 @@ mod tests {
             },
             "revoked": []
         });
-        for (label, anchor_schema) in [("normal", 1_u32), ("anchor-first-crash", 2_u32)] {
-            let path = temp_path();
-            let watermark_path = generation_watermark_path(&path);
-            std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
-            let watermark = IdentityGenerationWatermark {
-                schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
-                format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.into(),
-                identities_schema_version: anchor_schema,
-                generation_high_water: 4,
-            };
-            std::fs::write(
-                &watermark_path,
-                serde_json::to_vec_pretty(&watermark).unwrap(),
-            )
-            .unwrap();
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+        let watermark = IdentityGenerationWatermark {
+            schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+            format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.into(),
+            identities_schema_version: LEGACY_IDENTITIES_SCHEMA_VERSION,
+            generation_high_water: 4,
+        };
+        std::fs::write(
+            &watermark_path,
+            serde_json::to_vec_pretty(&watermark).unwrap(),
+        )
+        .unwrap();
 
+        let store = IdentityStore::load(path.clone());
+        assert!(store.write_blocked.is_none());
+        let identity = store.get("identity-four").unwrap();
+        assert_eq!(identity.generation, 4);
+        assert!(identity.allocation_key.is_none());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], IDENTITIES_SCHEMA_VERSION);
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .identities_schema_version,
+            IDENTITIES_SCHEMA_VERSION
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn schema_v1_after_v2_watermark_is_a_byte_preserving_blocked_downgrade() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let (operation_identity, retired_generation) = {
             let store = IdentityStore::load(path.clone());
-            assert!(store.write_blocked.is_none(), "{label} was blocked");
-            let identity = store.get("identity-four").unwrap();
-            assert_eq!(identity.generation, 4);
-            assert!(identity.allocation_key.is_none());
-            let persisted: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(persisted["schemaVersion"], IDENTITIES_SCHEMA_VERSION);
-            assert_eq!(
-                read_generation_watermark(&watermark_path)
-                    .unwrap()
-                    .identities_schema_version,
-                IDENTITIES_SCHEMA_VERSION
-            );
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(watermark_path);
+            let operation_identity = store
+                .mint_for_operation(
+                    Role::Cortana,
+                    Some("cortana".into()),
+                    "cortana:ensure:schema-v1-downgrade",
+                )
+                .unwrap();
+            let retired = store.mint(Role::Crew).unwrap();
+            assert!(store.retire(&retired.id).unwrap());
+            (operation_identity, retired.generation)
+        };
+        let watermark_bytes = std::fs::read(&watermark_path).unwrap();
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .identities_schema_version,
+            IDENTITIES_SCHEMA_VERSION
+        );
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .generation_high_water,
+            retired_generation
+        );
+
+        let mut old_writer_document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old_writer_document["schemaVersion"] =
+            serde_json::Value::from(LEGACY_IDENTITIES_SCHEMA_VERSION);
+        for identity in old_writer_document["identities"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            identity.as_object_mut().unwrap().remove("allocationKey");
         }
+        let downgraded_bytes = serde_json::to_vec_pretty(&old_writer_document).unwrap();
+        std::fs::write(&path, &downgraded_bytes).unwrap();
+
+        let downgraded = IdentityStore::load(path.clone());
+        assert!(downgraded.write_blocked.as_deref().is_some_and(|reason| {
+            reason.contains("downgraded to schema v1")
+                && reason.contains("operation allocation ownership")
+        }));
+        assert!(downgraded
+            .mint(Role::Crew)
+            .unwrap_err()
+            .contains("writes are blocked"));
+        assert!(downgraded
+            .revoke(&operation_identity.id)
+            .unwrap_err()
+            .contains("writes are blocked"));
+        assert_eq!(std::fs::read(&path).unwrap(), downgraded_bytes);
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
     }
 
     #[test]
