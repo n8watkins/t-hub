@@ -654,6 +654,42 @@ No independent invocation identifier or no-rerun proof was retained.
 The `th send` attempt to Captain session `0c7b7560` from evidence head `86aa719e417604961ddb116ad93ccce322a6d61b` and its gated read-only rejection were operator-observed terminal output, not evidence embedded in either Cargo log.
 No Captain message delivery is claimed.
 
+## Criterion Reviewer Identity Recovery Remediation
+
+General identified an already-successful schema-18 criterion-review operation for card `thub-wave0-control-integration`, run `run-odTeCbFC1-Gz`, criterion `0`, and operation `wave0-e2ab7e3-review-criterion-0`.
+Its authoritative Powder receipt carries immutable reviewer identity `actor-fQAMYbhaEOkN`.
+Installed 0.3.104 durable intent metadata can retain the historical caller-facing label `t-hub`, and the former parser incorrectly compared that label to the authoritative receipt.
+
+Commit `7819d8a` changes criterion-review receipt validation to compare only the protected Powder profile's stable `operationIdentity` with the returned `reviewer_identity`.
+The caller-facing `expectedReviewerIdentity` remains bounded and retained only to reproduce the existing local durable-intent payload digest.
+It is never used to authorize a returned receipt.
+The canonical Powder request digest remains bound to protected `operationIdentity`, card, run, criterion, decision, proof, and operation identity, and does not include that caller label.
+
+The new client recovery regression uses legacy label `t-hub` and protected operation identity `actor-fQAMYbhaEOkN`.
+It accepts only the exact successful card, run, criterion, operation, request digest, decision, and proof receipt with that profile identity.
+The counterpart confused-deputy regression supplies caller label `actor-foreign-reviewer` and a receipt from that actor, while the protected profile expects `actor-fQAMYbhaEOkN`.
+It fails closed as an invalid response before any repeat mutation.
+
+The control recovery regression persists a schema-v3 durable criterion-review intent, reloads the registry, and recovers the exact operation without a criterion-review POST.
+It proves compatibility with the installed durable representation while clearing only the matching exact intent after authoritative success.
+The fixture records one recovery GET, zero criterion-review POSTs, and no changed operation id, request digest, card, run, criterion, decision, or proof.
+No protected configured profile was opened for this remediation, and no live Powder operation, claim, receipt, or operator state was read or mutated.
+
+Commit `3227aaf` keeps the existing CLI flag and MCP property for compatible callers, but identifies both as a legacy caller-facing label rather than authoritative reviewer identity.
+The MCP schema explicitly says receipt authority comes from the protected Powder profile `operationIdentity`.
+Commit `13bbf89` aligns hermetic criterion fixtures with their configured profile identity so their receipt assertions exercise the same production contract.
+
+From `apps/desktop/src-tauri`, the serial `cargo test -p t-hub powder::tests:: -- --test-threads=1` filter passed 38 tests.
+The serial `cargo test -p t-hub control::tests::powder_ -- --test-threads=1` filter passed 64 tests.
+The CLI `cargo test --manifest-path ../../cli/Cargo.toml --test powder_contract -- --test-threads=1` filter passed 10 tests.
+The MCP `cargo test -p t-hub-mcp -- --test-threads=1` suite passed 16 library tests and 75 binary tests.
+`cargo fmt --all -- --check`, the CLI format check, targeted all-target Clippy with `-D warnings` for `t-hub`, `t-hub-mcp`, and `t-hub-cli`, and `git diff --check` passed.
+No broad control or workspace aggregate was rerun for this focused remediation.
+
+The code is ready for an authorized installed-runtime reconciliation of the existing exact T-Hub intent.
+This Crew session intentionally did not attempt that live reconciliation because the task forbids reading the protected profile or mutating the installed runtime, and its authenticated Captain plane is read-only.
+Accordingly, this packet does not claim that the live local intent has already been cleared or that a Captain report was delivered.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
