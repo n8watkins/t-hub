@@ -133,6 +133,12 @@ pub struct RunBoundCriterionReview {
     pub criterion_text: String,
     pub decision: CriterionReviewDecision,
     pub proof: Option<String>,
+    /// Historical caller-facing label retained to reproduce persisted local
+    /// mutation-intent digests.
+    ///
+    /// This value is never authoritative for receipt validation.
+    /// Criterion-review receipts must match the protected profile's stable
+    /// `operationIdentity` instead.
     pub expected_reviewer_identity: String,
 }
 
@@ -1038,6 +1044,7 @@ impl Client {
         card_id: &str,
         review: &RunBoundCriterionReview,
     ) -> Result<OperationOutcome<RunCriterionReview>, PowderError> {
+        let authoritative_reviewer_identity = self.require_operation_identity()?;
         validate_id("card id", card_id)?;
         validate_id("expected run id", &review.expected_run_id)?;
         validate_operation_id(&review.operation_id)?;
@@ -1082,7 +1089,14 @@ impl Client {
             &review.operation_id,
             Some(&request_digest),
             false,
-            |result| parse_exact_run_criterion_review(result, card_id, review),
+            |result| {
+                parse_exact_run_criterion_review(
+                    result,
+                    card_id,
+                    review,
+                    authoritative_reviewer_identity,
+                )
+            },
         )
     }
 
@@ -1195,6 +1209,7 @@ impl Client {
         card_id: &str,
         review: &RunBoundCriterionReview,
     ) -> Result<OperationOutcome<RunCriterionReview>, PowderError> {
+        let authoritative_reviewer_identity = self.require_operation_identity()?;
         let request_digest = self.criterion_review_request_digest(card_id, review)?;
         self.recover_operation(
             "criterion_review",
@@ -1202,7 +1217,14 @@ impl Client {
             &review.expected_run_id,
             &review.operation_id,
             &request_digest,
-            |result| parse_exact_run_criterion_review(result, card_id, review),
+            |result| {
+                parse_exact_run_criterion_review(
+                    result,
+                    card_id,
+                    review,
+                    authoritative_reviewer_identity,
+                )
+            },
         )
     }
 
@@ -2292,6 +2314,7 @@ fn parse_exact_run_criterion_review(
     value: Value,
     expected_card_id: &str,
     expected: &RunBoundCriterionReview,
+    authoritative_reviewer_identity: &str,
 ) -> Result<RunCriterionReview, PowderError> {
     let review = parse_run_criterion_review(
         &value,
@@ -2311,7 +2334,7 @@ fn parse_exact_run_criterion_review(
             "criterion review returned a different decision",
         ));
     }
-    if review.reviewer_identity != expected.expected_reviewer_identity {
+    if review.reviewer_identity != authoritative_reviewer_identity {
         return Err(invalid_response(
             "criterion review returned a different reviewer identity",
         ));
@@ -3685,7 +3708,7 @@ mod tests {
                             "criterion_text": "tests pass",
                             "decision": "approved",
                             "reviewer": "captain-powder",
-                            "reviewer_identity": "actor-captain-powder",
+                            "reviewer_identity": "actor-t-hub",
                             "proof": "[scrubbed review proof]",
                             "created_at": 19
                             })),
@@ -3895,13 +3918,13 @@ mod tests {
                     criterion_text: "tests pass".into(),
                     decision: CriterionReviewDecision::Approved,
                     proof: Some("raw secret-shaped review proof".into()),
-                    expected_reviewer_identity: "actor-captain-powder".into(),
+                    expected_reviewer_identity: "t-hub".into(),
                 },
             )
             .unwrap();
         let review = reviewed.result.unwrap();
         assert_eq!(review.operation_id, "criterion:one");
-        assert_eq!(review.reviewer_identity, "actor-captain-powder");
+        assert_eq!(review.reviewer_identity, "actor-t-hub");
         assert_eq!(review.proof.as_deref(), Some("[scrubbed review proof]"));
 
         let completed = client
@@ -3932,6 +3955,163 @@ mod tests {
             .criterion_proofs
             .iter()
             .all(|proof| proof.url == "https://example.test/proof"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn criterion_recovery_uses_profile_operation_identity_not_legacy_reviewer_label() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let review = RunBoundCriterionReview {
+            expected_run_id: "run-authoritative".into(),
+            operation_id: "wave0-e2ab7e3-review-criterion-0".into(),
+            criterion_index: 0,
+            criterion_id: test_criterion_id("reviewer identity recovery", 0),
+            criterion_text: "reviewer identity recovery".into(),
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("independent review proof".into()),
+            // This historical caller-facing display label is intentionally not
+            // the authenticated Powder operation identity.
+            expected_reviewer_identity: "t-hub".into(),
+        };
+        let request_digest = criterion_review_operation_request_digest(
+            "actor-fQAMYbhaEOkN",
+            "thub-wave0-control-integration",
+            &review,
+        )
+        .unwrap();
+        let expected_operation = review.operation_id.clone();
+        let expected_criterion_id = review.criterion_id.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with(&format!(
+                "GET /api/v1/operations/{} HTTP/1.1",
+                encode_path(&expected_operation)
+            )));
+            let response = with_request_digest(
+                operation_status(
+                    &expected_operation,
+                    "criterion_review",
+                    "thub-wave0-control-integration",
+                    "run-authoritative",
+                    "succeeded",
+                    Some(json!({
+                        "id": "review-authoritative",
+                        "operation_id": expected_operation,
+                        "card_id": "thub-wave0-control-integration",
+                        "run_id": "run-authoritative",
+                        "criterion_index": 0,
+                        "criterion_id": expected_criterion_id,
+                        "criterion_text": "reviewer identity recovery",
+                        "decision": "approved",
+                        "reviewer": "t-hub",
+                        "reviewer_identity": "actor-fQAMYbhaEOkN",
+                        "proof": "independent review proof",
+                        "created_at": 126,
+                    })),
+                    None,
+                ),
+                request_digest,
+            );
+            write_json_response(&mut stream, "200 OK", &response.to_string());
+        });
+        let client = Client::new(ProfileConfig {
+            base_url: format!("http://{addr}"),
+            agent_name: "t-hub".into(),
+            operation_identity: Some("actor-fQAMYbhaEOkN".into()),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+
+        let outcome = client
+            .recover_criterion_review_operation("thub-wave0-control-integration", &review)
+            .unwrap();
+
+        assert_eq!(outcome.state, OperationState::Succeeded);
+        assert_eq!(
+            outcome.result.unwrap().reviewer_identity,
+            "actor-fQAMYbhaEOkN"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn criterion_recovery_rejects_a_receipt_matching_only_the_caller_label() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let review = RunBoundCriterionReview {
+            expected_run_id: "run-authoritative".into(),
+            operation_id: "criterion:confused-deputy".into(),
+            criterion_index: 0,
+            criterion_id: test_criterion_id("confused deputy", 0),
+            criterion_text: "confused deputy".into(),
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("independent review proof".into()),
+            // An untrusted caller can name this actor, but it must not make a
+            // receipt from that actor acceptable.
+            expected_reviewer_identity: "actor-foreign-reviewer".into(),
+        };
+        let request_digest = criterion_review_operation_request_digest(
+            "actor-fQAMYbhaEOkN",
+            "thub-wave0-control-integration",
+            &review,
+        )
+        .unwrap();
+        let expected_operation = review.operation_id.clone();
+        let expected_criterion_id = review.criterion_id.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with(&format!(
+                "GET /api/v1/operations/{} HTTP/1.1",
+                encode_path(&expected_operation)
+            )));
+            let response = with_request_digest(
+                operation_status(
+                    &expected_operation,
+                    "criterion_review",
+                    "thub-wave0-control-integration",
+                    "run-authoritative",
+                    "succeeded",
+                    Some(json!({
+                        "id": "review-foreign",
+                        "operation_id": expected_operation,
+                        "card_id": "thub-wave0-control-integration",
+                        "run_id": "run-authoritative",
+                        "criterion_index": 0,
+                        "criterion_id": expected_criterion_id,
+                        "criterion_text": "confused deputy",
+                        "decision": "approved",
+                        "reviewer": "foreign reviewer",
+                        "reviewer_identity": "actor-foreign-reviewer",
+                        "proof": "independent review proof",
+                        "created_at": 126,
+                    })),
+                    None,
+                ),
+                request_digest,
+            );
+            write_json_response(&mut stream, "200 OK", &response.to_string());
+        });
+        let client = Client::new(ProfileConfig {
+            base_url: format!("http://{addr}"),
+            agent_name: "t-hub".into(),
+            operation_identity: Some("actor-fQAMYbhaEOkN".into()),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+
+        let error = client
+            .recover_criterion_review_operation("thub-wave0-control-integration", &review)
+            .unwrap_err();
+
+        assert_eq!(error.kind, PowderErrorKind::InvalidResponse);
+        assert!(error.message.contains("different reviewer identity"));
         server.join().unwrap();
     }
 

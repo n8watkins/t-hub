@@ -654,6 +654,70 @@ No independent invocation identifier or no-rerun proof was retained.
 The `th send` attempt to Captain session `0c7b7560` from evidence head `86aa719e417604961ddb116ad93ccce322a6d61b` and its gated read-only rejection were operator-observed terminal output, not evidence embedded in either Cargo log.
 No Captain message delivery is claimed.
 
+## Criterion Reviewer Identity Recovery Remediation
+
+General identified an already-successful schema-18 criterion-review operation for card `thub-wave0-control-integration`, run `run-odTeCbFC1-Gz`, criterion `0`, and operation `wave0-e2ab7e3-review-criterion-0`.
+Its authoritative Powder receipt carries immutable reviewer identity `actor-fQAMYbhaEOkN`.
+Installed 0.3.104 durable intent metadata can retain the historical caller-facing label `t-hub`, and the former parser incorrectly compared that label to the authoritative receipt.
+
+Commit `7819d8a` changes criterion-review receipt validation to compare only the protected Powder profile's stable `operationIdentity` with the returned `reviewer_identity`.
+The caller-facing `expectedReviewerIdentity` remains bounded and retained only to reproduce the existing local durable-intent payload digest.
+It is never used to authorize a returned receipt.
+The canonical Powder request digest remains bound to protected `operationIdentity`, card, run, criterion, decision, proof, and operation identity, and does not include that caller label.
+
+The new client recovery regression uses legacy label `t-hub` and protected operation identity `actor-fQAMYbhaEOkN`.
+It accepts only the exact successful card, run, criterion, operation, request digest, decision, and proof receipt with that profile identity.
+The counterpart confused-deputy regression supplies caller label `actor-foreign-reviewer` and a receipt from that actor, while the protected profile expects `actor-fQAMYbhaEOkN`.
+It fails closed as an invalid response before any repeat mutation.
+
+The control recovery regression persists a schema-v3 durable criterion-review intent, reloads the registry, and recovers the exact operation without a criterion-review POST.
+It proves compatibility with the installed durable representation while clearing only the matching exact intent after authoritative success.
+The fixture records one recovery GET, zero criterion-review POSTs, and no changed operation id, request digest, card, run, criterion, decision, or proof.
+No protected configured profile was opened for this remediation, and no live Powder operation, claim, receipt, or operator state was read or mutated.
+
+Commit `3227aaf` keeps the existing CLI flag and MCP property for compatible callers, but identifies both as a legacy caller-facing label rather than authoritative reviewer identity.
+The MCP schema explicitly says receipt authority comes from the protected Powder profile `operationIdentity`.
+Commit `13bbf89` aligns hermetic criterion fixtures with their configured profile identity so their receipt assertions exercise the same production contract.
+
+From `apps/desktop/src-tauri`, the serial `cargo test -p t-hub powder::tests:: -- --test-threads=1` filter passed 38 tests.
+The serial `cargo test -p t-hub control::tests::powder_ -- --test-threads=1` filter passed 64 tests.
+The CLI `cargo test --manifest-path ../../cli/Cargo.toml --test powder_contract -- --test-threads=1` filter passed 10 tests.
+The MCP `cargo test -p t-hub-mcp -- --test-threads=1` suite passed 16 library tests and 75 binary tests.
+`cargo fmt --all -- --check`, the CLI format check, targeted all-target Clippy with `-D warnings` for `t-hub`, `t-hub-mcp`, and `t-hub-cli`, and `git diff --check` passed.
+No broad control or workspace aggregate was rerun for this focused remediation.
+
+The code is ready for an authorized installed-runtime reconciliation of the existing exact T-Hub intent.
+This Crew session intentionally did not attempt that live reconciliation because the task forbids reading the protected profile or mutating the installed runtime, and its authenticated Captain plane is read-only.
+Accordingly, this packet does not claim that the live local intent has already been cleared or that a Captain report was delivered.
+An authenticated `th send` report to Captain session `0c7b7560` was attempted from evidence head `2c4e3c042dd4388c01191961c296ac3960f566a6`.
+The installed control plane rejected it with gated exit code `5` because `send_text` requires control capability and this Crew token is read-only.
+No Captain message delivery is claimed.
+
+## MCP Dispatcher Fixture and Frozen Legacy Intent Follow-Up
+
+Independent pre-review reproduced `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test mcp_e2e powder_tools_reach_real_authenticated_dispatcher -- --nocapture` at prior evidence head `48153e6836026471a9d4f957645dc5fe0548e6fb`.
+The real authenticated dispatcher test failed at `tests/mcp_e2e.rs:1450` because its fixture profile used `operationIdentity` `actor-t-hub`, while both authoritative criterion receipt projections used `actor-mcp-owned-captain`.
+The caller also supplied `actor-mcp-owned-captain` as the legacy label, so the production profile-identity validation correctly rejected the fixture receipt and the MCP response data was null.
+
+Commit `d42af13` changes only the two fixture authoritative receipt identities to `actor-t-hub`.
+It intentionally retains the distinct legacy caller label `actor-mcp-owned-captain` in the real authenticated MCP dispatcher request.
+The passing E2E therefore proves that the caller label is not receipt authority.
+
+Commit `b802bc1` hardens the durable recovery regression with a frozen literal schema-v3 intent representing the installed 0.3.104 form.
+The fixture persists and reloads fixed operation id `wave0-e2ab7e3-review-criterion-0`, payload digest `609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a`, Powder request digest `sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8`, exact repository, card, run, mutation kind, requester, and creation timestamp.
+It asserts those frozen fields after registry restart, uses the unchanged legacy review payload, performs exactly one operation-recovery GET, makes zero criterion-review POSTs, and clears only the exact intent after validating the successful receipt.
+
+At head `b802bc183b23b50e10bbbb33c4ca91a7c64edace`, the exact MCP dispatcher E2E passed.
+The frozen schema-v3 restart and zero-POST recovery test passed.
+The profile-identity acceptance and caller-label confused-deputy rejection tests passed.
+The durable mutation-intent restart and changed-payload rejection test passed.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+No broad aggregate was rerun.
+No live Powder operation, protected profile, credential, installed runtime, or card state was read or mutated.
+An authenticated `th send` report to Captain session `0c7b7560` was attempted from code head `b802bc183b23b50e10bbbb33c4ca91a7c64edace`.
+The installed control plane rejected it with gated exit code `5` because `send_text` requires control capability and this Crew token is read-only.
+No Captain message delivery is claimed.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.

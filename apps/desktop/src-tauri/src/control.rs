@@ -26786,10 +26786,26 @@ mod tests {
 
     impl PowderProfileEnv {
         fn install(profile: &str, addr: SocketAddr) -> Self {
-            Self::install_profiles(&[(profile, addr)])
+            Self::install_with_operation_identity(profile, addr, "actor-t-hub")
+        }
+
+        fn install_with_operation_identity(
+            profile: &str,
+            addr: SocketAddr,
+            operation_identity: &str,
+        ) -> Self {
+            Self::install_profiles_with_operation_identity(&[(profile, addr, operation_identity)])
         }
 
         fn install_profiles(profiles: &[(&str, SocketAddr)]) -> Self {
+            let profiles: Vec<_> = profiles
+                .iter()
+                .map(|(profile, addr)| (*profile, *addr, "actor-t-hub"))
+                .collect();
+            Self::install_profiles_with_operation_identity(&profiles)
+        }
+
+        fn install_profiles_with_operation_identity(profiles: &[(&str, SocketAddr, &str)]) -> Self {
             static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
             let lock = LOCK
                 .get_or_init(|| StdMutex::new(()))
@@ -26801,13 +26817,13 @@ mod tests {
                 uuid::Uuid::new_v4().simple()
             ));
             let mut configured_profiles = serde_json::Map::new();
-            for (profile, addr) in profiles {
+            for (profile, addr, operation_identity) in profiles {
                 configured_profiles.insert(
                     (*profile).to_string(),
                     json!({
                         "baseUrl": format!("http://{addr}"),
                         "agentName": "t-hub",
-                        "operationIdentity": "actor-t-hub",
+                        "operationIdentity": operation_identity,
                         "apiKey": "test-key"
                     }),
                 );
@@ -27709,7 +27725,7 @@ mod tests {
                 "criterion_text": criterion_text,
                 "decision": "approved",
                 "reviewer": "captain-powder",
-                "reviewer_identity": "actor-captain-powder",
+                "reviewer_identity": "actor-t-hub",
                 "proof": "review proof",
                 "supersedes_review_id": null,
                 "created_at": 123
@@ -28056,7 +28072,7 @@ mod tests {
                 "criterion_text": "Criterion 0",
                 "decision": body["decision"],
                 "reviewer": "captain-powder",
-                "reviewer_identity": "actor-captain-powder",
+                "reviewer_identity": "actor-t-hub",
                 "proof": body["proof"].as_str().map(|_| "[scrubbed review proof]"),
                 "supersedes_review_id": "review-0",
                 "created_at": 126,
@@ -31843,14 +31859,14 @@ mod tests {
                     "criterionId": criterion_id,
                     "decision": "approved",
                     "proof": "raw secret-shaped review proof",
-                    "expectedReviewerIdentity": "actor-captain-powder",
+                    "expectedReviewerIdentity": "t-hub",
                 }),
             ),
         );
         assert!(response.ok, "{:?}", response.error);
         let result = response.result.unwrap();
         assert_eq!(result["operationId"], "criterion:authoritative");
-        assert_eq!(result["review"]["reviewerIdentity"], "actor-captain-powder");
+        assert_eq!(result["review"]["reviewerIdentity"], "actor-t-hub");
         assert_eq!(result["review"]["proof"], "[scrubbed review proof]");
         assert!(registry.snapshot().captains[0].crew[0]
             .powder_work
@@ -31868,6 +31884,160 @@ mod tests {
         assert_eq!(posted["proof"], "raw secret-shaped review proof");
         assert!(posted.get("reviewer").is_none());
         assert!(posted.get("reviewer_identity").is_none());
+    }
+
+    #[test]
+    fn powder_criterion_review_recovery_converges_frozen_schema_v3_legacy_display_reviewer_intent()
+    {
+        let server = LoopbackPowderServer::start(3);
+        let profile = "loopback-criterion-legacy-reviewer-recovery";
+        let path = captains_tmp("criterion-legacy-reviewer-recovery");
+        let _ = std::fs::remove_file(&path);
+        let _profile = PowderProfileEnv::install_with_operation_identity(
+            profile,
+            server.addr,
+            "actor-fQAMYbhaEOkN",
+        );
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(Some(path.clone()), profile);
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities.clone())
+            .with_captains_registry(registry.clone());
+        let criterion_id = loopback_run_criterion("run-authoritative")["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let operation_id = "wave0-e2ab7e3-review-criterion-0";
+        let legacy_reviewer_label = "t-hub";
+        let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        let review = powder::RunBoundCriterionReview {
+            expected_run_id: scope.work.run_id.clone(),
+            operation_id: operation_id.into(),
+            criterion_index: 0,
+            criterion_id: criterion_id.clone(),
+            criterion_text: "Criterion 0".into(),
+            decision: powder::CriterionReviewDecision::Approved,
+            proof: Some("independent review proof".into()),
+            expected_reviewer_identity: legacy_reviewer_label.into(),
+        };
+        let client = powder::Client::from_profile(profile).unwrap();
+        let powder_request_digest = client
+            .criterion_review_request_digest(&scope.work.card_id, &review)
+            .unwrap();
+        let payload = json!({
+            "criterion": 0,
+            "criterionId": criterion_id,
+            "criterionText": "Criterion 0",
+            "decision": "approved",
+            "proof": "independent review proof",
+            "expectedReviewerIdentity": legacy_reviewer_label,
+        });
+        assert_eq!(
+            powder_request_digest,
+            "sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8"
+        );
+        let mut intent = powder_mutation_intent_with_request_digest(
+            PowderMutationKind::CriterionReview,
+            &scope,
+            operation_id,
+            "captain-powder",
+            &payload,
+            powder_request_digest.clone(),
+        );
+        intent.created_at = 42;
+        assert_eq!(
+            intent.payload_digest,
+            "609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a"
+        );
+        registry.begin_crew_powder_mutation(&scope, intent).unwrap();
+        let frozen_v3_intent = json!({
+            "schemaVersion": 3,
+            "operationId": "wave0-e2ab7e3-review-criterion-0",
+            "payloadDigest": "609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a",
+            "powderRequestDigest": "sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8",
+            "repository": "t-hub",
+            "cardId": "thub-powder-control-lifecycle",
+            "expectedRunId": "run-authoritative",
+            "mutationKind": "criterion_review",
+            "requestedBy": "captain-powder",
+            "createdAt": 42,
+        });
+        let mut persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        persisted["captains"][0]["crew"][0]["powderWork"]["mutationIntent"] =
+            frozen_v3_intent.clone();
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        drop(ctx);
+        drop(registry);
+        let registry = Arc::new(CaptainsRegistry::load(path.clone()));
+        let loaded_snapshot = registry.snapshot();
+        let loaded_intent = loaded_snapshot.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded_intent).unwrap(),
+            frozen_v3_intent
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let post_body = json!({
+            "operation_id": operation_id,
+            "criterion": 0,
+            "criterion_id": review.criterion_id,
+            "decision": "approved",
+            "proof": "independent review proof",
+        });
+        let mut recovered = loopback_criterion_review_outcome(&post_body);
+        recovered["request_digest"] = json!(powder_request_digest);
+        recovered["result"]["reviewer_identity"] = json!("actor-fQAMYbhaEOkN");
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(recovered);
+        }
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &captain,
+                "review_crew_powder_criterion",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": operation_id,
+                    "criterion": 0,
+                    "criterionId": criterion_id,
+                    "decision": "approved",
+                    "proof": "independent review proof",
+                    "expectedReviewerIdentity": legacy_reviewer_label,
+                }),
+            ),
+        );
+
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.criterion_review_posts.is_empty());
+        drop(ctx);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn review_criterion(args: &[String]) -> Result<(), CliError> {
             "--proof is required for approved or rejected reviews",
         ));
     }
-    let reviewer = required_bounded_option(
+    let legacy_reviewer_label = required_bounded_option(
         &flags,
         "--expected-reviewer-identity",
         "th powder criterion review",
@@ -171,7 +171,7 @@ fn review_criterion(args: &[String]) -> Result<(), CliError> {
             "criterionId": criterion_id,
             "decision": decision,
             "proof": proof,
-            "expectedReviewerIdentity": reviewer,
+            "expectedReviewerIdentity": legacy_reviewer_label,
         }),
     )?;
     if flags.json {
@@ -485,7 +485,9 @@ fn print_criterion_help() {
         "usage: th powder criterion review <crew-session> --operation-id <id> --criterion <index> --criterion-id <id> --decision <approved|rejected|cleared> [--proof <text>] --expected-reviewer-identity <id> [--json]\n\
 \n\
 Record one exact run-scoped criterion review. Approved and rejected decisions require proof.\n\
-Cleared decisions must omit proof."
+Cleared decisions must omit proof.\n\
+--expected-reviewer-identity is a legacy caller-facing label retained for durable-intent compatibility.\n\
+T-Hub verifies the authoritative receipt against the protected Powder profile operationIdentity, not this caller-supplied label."
     );
 }
 
