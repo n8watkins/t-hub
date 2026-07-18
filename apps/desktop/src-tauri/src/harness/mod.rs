@@ -238,6 +238,14 @@ impl HarnessProcessEvidence {
     fn executable_identity(&self) -> (u64, u64) {
         (self.executable_device, self.executable_inode)
     }
+
+    fn matches_pane_generation(&self, pane: &crate::tmux::PaneGeneration) -> bool {
+        self.terminal.session_id == pane.session_id
+            && self.terminal.session_created == pane.session_created
+            && self.terminal.window_id == pane.window_id
+            && self.terminal.pane_id == pane.pane_id
+            && self.terminal.pane_pid == pane.pane_pid
+    }
 }
 
 /// Credential-safe failure classes for fail-closed launch attestation.
@@ -352,6 +360,38 @@ pub fn attest_launch_permissions(
     }
     if before.identity() == after.identity()
         && before.executable_identity() == after.executable_identity()
+    {
+        return Err(LaunchAttestationError::StaleEvidence);
+    }
+    adapter.attest_permissions(after, expected)
+}
+
+/// Authorize a private dormant-pane to provider-pane respawn.
+///
+/// A respawn intentionally replaces `pane_pid`, unlike the normal shell-to-exec
+/// launch path.  This verifier therefore requires the exact pre/post tmux
+/// transition, preserves the session/window/pane tuple, rejects an unchanged
+/// process generation, and delegates provider-native posture validation only
+/// after that provenance check succeeds.
+pub fn attest_respawn_launch_permissions(
+    adapter: &dyn HarnessAdapter,
+    before: &HarnessProcessEvidence,
+    transition: &crate::tmux::RespawnPaneTransition,
+    after: &HarnessProcessEvidence,
+    expected: PermMode,
+) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
+    if !before.matches_pane_generation(&transition.before)
+        || !after.matches_pane_generation(&transition.after)
+        || transition.before.session_id != transition.after.session_id
+        || transition.before.session_created != transition.after.session_created
+        || transition.before.window_id != transition.after.window_id
+        || transition.before.pane_id != transition.after.pane_id
+    {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    if transition.before.pane_pid == transition.after.pane_pid
+        || before.identity() == after.identity()
+        || before.executable_identity() == after.executable_identity()
     {
         return Err(LaunchAttestationError::StaleEvidence);
     }
@@ -848,6 +888,134 @@ mod tests {
                 "work",
             ],
         )
+    }
+
+    fn respawn_transition(
+        before_pane_pid: u32,
+        after_pane_pid: u32,
+    ) -> crate::tmux::RespawnPaneTransition {
+        crate::tmux::RespawnPaneTransition {
+            before: crate::tmux::PaneGeneration {
+                session_id: 17,
+                session_created: 123_456,
+                window_id: 9,
+                pane_id: 42,
+                pane_pid: before_pane_pid,
+            },
+            after: crate::tmux::PaneGeneration {
+                session_id: 17,
+                session_created: 123_456,
+                window_id: 9,
+                pane_id: 42,
+                pane_pid: after_pane_pid,
+            },
+        }
+    }
+
+    fn respawn_provider_evidence() -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_with_context(
+            77,
+            901,
+            77,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            123_456,
+            77,
+            &[(77, 901)],
+        )
+    }
+
+    #[test]
+    fn respawn_attestation_requires_exact_new_pane_generation_and_provider_posture() {
+        let before = shell_evidence();
+        let after = respawn_provider_evidence();
+        let transition = respawn_transition(42, 77);
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap()
+            .permission,
+            PermMode::BypassPermissions
+        );
+
+        let mut substituted = transition;
+        substituted.after.window_id = 10;
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &substituted,
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::TerminalChanged
+        );
+
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &respawn_transition(42, 42),
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::TerminalChanged
+        );
+
+        let stale_after = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            42,
+            100,
+            &["zsh"],
+            123_456,
+            77,
+            &[(42, 900)],
+        );
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &stale_after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::StaleEvidence
+        );
+
+        let wrapper = HarnessProcessEvidence::test_with_context(
+            77,
+            901,
+            77,
+            200,
+            &["sh", "/tmp/codex-wrapper"],
+            123_456,
+            77,
+            &[(77, 901)],
+        );
+        assert_eq!(
+            attest_respawn_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &transition,
+                &wrapper,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::WrapperObscured
+        );
     }
 
     #[test]
