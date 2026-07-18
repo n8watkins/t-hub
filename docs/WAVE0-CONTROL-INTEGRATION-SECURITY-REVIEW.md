@@ -528,6 +528,10 @@ No push, protected-branch merge, install, restart, deploy, publish, release, or 
 Three independent reviewers approved code head `ef3a893877ab7e84dbf0b0800e58f010e5befd18` with no remaining code findings before the final-gate execution documented above.
 The failed current-head workspace gate blocks completion and requires diagnosis despite that code-review approval.
 
+An authenticated `th send` report of the final-gate results was attempted from evidence head `90113eef630436cbba54519f8eee1f45eaded457`.
+The installed control plane rejected it because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
