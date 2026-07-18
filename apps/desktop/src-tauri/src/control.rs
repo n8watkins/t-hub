@@ -963,14 +963,7 @@ impl TabRegistry {
         }
     }
 
-    /// Close a tab (headless tab lifecycle). Policy:
-    ///   - unknown tab → error;
-    ///   - the LAST tab is never closed (mirrors the UI's guard) → error;
-    ///   - a NON-EMPTY tab is refused unless `force` (close its terminals first
-    ///     via `close_terminal`, or pass `force: true` - the tab record is dropped
-    ///     and any still-live sessions are re-adopted into the UI's active tab by
-    ///     its reconciler, so nothing is orphaned).
-    /// Returns the closed tab's tile ids.
+    #[cfg(test)]
     fn remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
         self.validate_remove_tab(tab_id, force)?;
         let mut g = self.lock();
@@ -991,6 +984,7 @@ impl TabRegistry {
         Ok(removed.tile_ids)
     }
 
+    #[cfg(test)]
     fn validate_remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
         if tab_id == CAPTAIN_WORKSPACE_ID {
             return Err("close_tab: Captain Workspace cannot be closed".into());
