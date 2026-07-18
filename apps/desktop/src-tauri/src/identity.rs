@@ -1432,9 +1432,40 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = HSTRING::from(parent.as_os_str().to_string_lossy().as_ref());
+    let handle = unsafe {
+        CreateFileW(
+            &parent,
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    let flush = unsafe { FlushFileBuffers(handle) }.map_err(std::io::Error::other);
+    let close = unsafe { CloseHandle(handle) }.map_err(std::io::Error::other);
+    flush.and(close)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable parent-directory synchronization is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
