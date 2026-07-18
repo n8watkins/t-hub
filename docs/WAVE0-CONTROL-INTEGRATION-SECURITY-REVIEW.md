@@ -506,6 +506,24 @@ The exact-run work-log append was attempted once with stable operation identity 
 The sanctioned CLI returned `unsupported` because deployed run-bound capability verification failed before any mutation.
 No work-log append is claimed as delivered.
 
+Final-gate preflight at approved code head `ef3a893877ab7e84dbf0b0800e58f010e5befd18` confirmed the exact HEAD, no tracked or indexed changes, only protected untracked `CLAUDE.md`, and no active Cargo or `t_hub_lib` test process.
+From `apps/desktop/src-tauri`, `export T_HUB_TMUX_SOCKET=t-hub-wave0-ef3a893-$PPID` followed by `timeout 180s "$BIN" 'tmux::tests::' --nocapture --test-threads=1`, with `BIN=target/debug/deps/t_hub_lib-4e9da78cd4dbc996`, passed 11 serial tests.
+The same fresh-socket setup with `timeout 240s "$BIN" 'process_level_permission_attestation' --nocapture --test-threads=1` passed 4 serial tests.
+The same fresh-socket setup with `timeout 120s "$BIN" --exact control::tests::dispatch_release_inflight_before_post_survives_restart_without_blind_repost --nocapture --test-threads=1` passed 1 test.
+The same fresh-socket setup with `timeout 180s "$BIN" --exact control::tests::dispatch_restart_rejects_contender_without_releasing_successful_winner --nocapture --test-threads=1` passed 1 test.
+`node_modules` was absent, so local build setup ran `pnpm install --frozen-lockfile` only.
+It accepted the current lockfile, reused all 395 packages without downloads, and did not modify tracked package metadata or lockfiles.
+`pnpm --filter t-hub-desktop typecheck` passed.
+`pnpm --filter t-hub-desktop test` passed 57 files and 480 tests.
+The one permitted current-head workspace gate ran once from `apps/desktop/src-tauri` with `export T_HUB_TMUX_SOCKET=t-hub-wave0-workspace-ef3a893-$PPID` and `RUST_TEST_THREADS=1 timeout --signal=TERM --kill-after=30s 30m cargo test --workspace`.
+It did not pass.
+The `t_hub_lib` target began its 880-test run and reported failures in `apply_forwards_are_broadcast_to_event_subscribers`, `attach_captain_refuses_read_only_and_preserves_existing_control_capability`, `claim_and_release_are_audited_and_forward_the_captains_snapshot`, `claim_conflicts_liveness_and_bad_release_are_dispatch_errors`, `codex_claim_never_inherits_a_stale_claude_session_id`, and `commission_captain_spawns_binds_bootstraps_and_deduplicates`.
+The command's execution-output cell detached while that single process continued, so its final aggregate pass, fail, and later-test counts are not recoverable from the local output channel.
+After the process exited, no Cargo or `t_hub_lib` process remained.
+This gate was not rerun.
+No production code was changed because the observed broad-gate failures were not reproduced or attributed to the approved HMAC endpoint-verification remediation.
+The failed current-head workspace gate remains a release-blocking residual requiring diagnosis before any completion decision.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
