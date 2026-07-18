@@ -1095,6 +1095,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 pub const CAPTAINS_SCHEMA_VERSION: u32 = 18;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 2;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 17 && CORTANA_RUNTIME_SCHEMA_VERSION > 1);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -2774,7 +2775,7 @@ impl std::fmt::Display for SnapshotReadError {
             ),
             Self::IncompatibleRecovery { path } => write!(
                 f,
-                "'{}' contains dispatch release recovery state incompatible with this T-Hub version",
+                "'{}' contains persisted recovery state incompatible with this T-Hub version",
                 path.display()
             ),
         }
@@ -26254,6 +26255,116 @@ mod tests {
     }
 
     #[test]
+    fn exact_b5_schema_17_runtime_1_is_incompatible_recovery_not_backup_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("captains.json");
+        let backup = path.with_extension("json.bak");
+        let mut b5_captain = cortana_ready_fixture();
+        b5_captain.cortana_runtime = None;
+        let mut b5_document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 17,
+            seq: 17,
+            captains: vec![b5_captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        b5_document["captains"][0]["cortanaRuntime"] = json!({
+            "schemaVersion": 1,
+            "identityId": "cortana:v1",
+            "generation": 1,
+            "lifecycle": "ready",
+            "provenance": {
+                "source": "runtimeAttested",
+                "identity": "runtime-attested:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "policy": {
+                "workProfile": "coordination",
+                "profileCatalogVersion": 1,
+                "provider": "codex",
+                "harness": "codex",
+                "model": "gpt-5.6-terra",
+                "reasoningEffort": "medium",
+                "harnessPermission": "bypassPermissions",
+                "tHubCapability": "control"
+            },
+            "observedProvider": "codex",
+            "observedHarness": "codex",
+            "providerSessionId": "provider-session-1",
+            "conversationId": "conversation-1",
+            "checkpoint": "checkpoint-1",
+            "lineage": [{
+                "generation": 1,
+                "harness": "codex",
+                "provider": "codex",
+                "providerSessionId": "provider-session-1",
+                "conversationId": "conversation-1",
+                "terminalId": "cor-runtime-1",
+                "runtimeIdentityId": "candidate:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "state": "current",
+                "recordedAt": 99
+            }],
+            "ensureIntent": {
+                "schemaVersion": 1,
+                "operationId": "ensure-cortana-b5",
+                "requestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "expectedIdentityId": "cortana:v1",
+                "expectedGeneration": 0,
+                "candidateTerminalId": "cor-runtime-1",
+                "desiredRuntime": {
+                    "workProfile": "coordination",
+                    "profileCatalogVersion": 1,
+                    "provider": "codex",
+                    "harness": "codex",
+                    "model": "gpt-5.6-terra",
+                    "reasoningEffort": "medium",
+                    "harnessPermission": "bypassPermissions",
+                    "tHubCapability": "control"
+                },
+                "phase": "committed",
+                "candidateIdentityId": "candidate:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "createdAt": 90,
+                "updatedAt": 99
+            },
+            "updatedAt": 100
+        });
+        let b5_bytes = serde_json::to_vec_pretty(&b5_document).unwrap();
+        std::fs::write(&path, &b5_bytes).unwrap();
+
+        let supported_backup = serde_json::to_vec_pretty(&CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 18,
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        std::fs::write(&backup, &supported_backup).unwrap();
+
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry
+            .write_blocked
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recovery state incompatible")));
+        assert!(registry.snapshot().captains.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b5_bytes);
+        assert_eq!(std::fs::read(&backup).unwrap(), supported_backup);
+        assert!(!temp.path().join("captains.json.corrupt").exists());
+    }
+
+    #[test]
     fn cortana_pre_v15_migration_validates_full_current_schema_before_writing() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pre-v15-malformed.json");
@@ -28043,7 +28154,7 @@ mod tests {
         let error = CaptainsRegistry::read_snapshot(&path).unwrap_err();
         assert!(error
             .to_string()
-            .contains("dispatch release recovery state incompatible"));
+            .contains("persisted recovery state incompatible"));
         let _ = std::fs::remove_file(path);
     }
 
