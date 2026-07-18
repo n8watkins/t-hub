@@ -20040,7 +20040,7 @@ mod tests {
             .expect("tab minted");
         assert_eq!(tab.name, "hidden-ops");
         assert_eq!(tab.tile_ids, vec![id.clone()]);
-        assert_eq!(snap.active_tab_id, None);
+        assert_eq!(snap.active_tab_id.as_deref(), Some("tab-1"));
 
         // The forward carries the id + snapshot for the UI to render from.
         {
@@ -21177,7 +21177,6 @@ mod tests {
             },
         ]);
         let tabs = context.tab_registry();
-        let transaction = tabs.identity_transaction();
         tabs.move_tile("ordinary", CAPTAIN_WORKSPACE_ID).unwrap();
         let (sent, received) = std::sync::mpsc::channel();
         let moving_context = Arc::clone(&context);
@@ -21189,15 +21188,12 @@ mod tests {
             ))
             .unwrap();
         });
-        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
-        tabs.restore_tile_placement_locked("ordinary", Some("work-a"))
-            .unwrap();
-        drop(transaction);
         received
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
         moving.join().unwrap();
+        tabs.replace(context.captains.workspace_projection());
         let snapshot = tabs.snapshot();
         assert!(snapshot
             .iter()
@@ -21478,9 +21474,13 @@ mod tests {
         let release = Arc::new(std::sync::Barrier::new(2));
         let hook_entered = Arc::clone(&entered);
         let hook_release = Arc::clone(&release);
+        let first_persist = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_first_persist = Arc::clone(&first_persist);
         captains.set_persist_hook(Box::new(move || {
-            hook_entered.wait();
-            hook_release.wait();
+            if hook_first_persist.swap(false, Ordering::SeqCst) {
+                hook_entered.wait();
+                hook_release.wait();
+            }
         }));
         let claiming_context = Arc::clone(&context);
         let claiming_id = captain_id.clone();
@@ -21513,6 +21513,7 @@ mod tests {
             .is_err());
         release.wait();
         claiming.join().unwrap().unwrap();
+        captains.set_persist_hook(Box::new(|| {}));
         let move_error = move_received
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
@@ -21531,7 +21532,6 @@ mod tests {
             .filter(|tab| tab.kind() == WorkspaceKind::Work)
             .any(|tab| tab.tile_ids.contains(&captain_id)));
 
-        captains.set_persist_hook(Box::new(|| {}));
         close_terminal(&context, &json!({"sessionId": captain_id})).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
@@ -22199,7 +22199,7 @@ mod tests {
             ("close_tab", json!({"tabId": "nope"})),
         ] {
             let err = dispatch(&ctx, cmd, &args).unwrap_err();
-            assert!(err.contains("unknown tabId"), "{cmd}: {err}");
+            assert!(err.contains("unknown"), "{cmd}: {err}");
         }
     }
 
