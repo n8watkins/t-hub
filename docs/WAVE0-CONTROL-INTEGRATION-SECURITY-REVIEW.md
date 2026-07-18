@@ -288,7 +288,7 @@ That Crew's normal restart cleanup could then resolve the replacement Captain Pr
 Commit `2e4a332` introduced the initial distinct `PendingDispatchRelease` recovery record with the original Project, protected profile name, repository, card, run, agent, initial operation identity, and transaction Crew terminal.
 The profile-name-only recovery description in this historical section is superseded by the later durability remediation below.
 It was not sufficient to defend a protected profile endpoint remap, release preparation before terminal teardown, or concurrent recovery cleanup.
-Current recovery retains a frozen credential-free endpoint identity digest and repository identity, prepares its exact CleanupPending Crew before teardown, and serializes periodic and ordinary cleanup through one per-Crew guard.
+Current recovery retains a frozen keyed endpoint identity and repository identity, prepares its exact CleanupPending Crew before teardown, and serializes periodic and ordinary cleanup through one per-Crew guard.
 Confirmed recovery removes a record only with its exact transaction-owned CleanupPending Crew.
 It does not retire a reused terminal identity when that Crew is absent or replaced.
 The newer remap and response-loss regressions replace the older claim of a second release POST.
@@ -303,15 +303,16 @@ If that ambiguity persistence fails, the prior durable `InFlight` state remains 
 No release success clears either record until an exact trusted release receipt or authoritative released-run evidence is observed.
 Recovery never reconstructs the original scope from the current Captain Project binding.
 It uses only the frozen connection profile, repository, card, run, agent, and operation identity.
-For `InFlight` or `Ambiguous` recovery, it validates the protected profile, exact endpoint digest, frozen repository, and current card before reading authoritative exact-run evidence.
+For `InFlight` or `Ambiguous` recovery, it validates the protected profile, exact keyed endpoint identity, frozen repository, and current card before reading authoritative exact-run evidence.
 If Powder already reports the exact run released after response loss, recovery clears local transaction-owned state without a second release POST.
 If the run remains active with the exact card and agent, recovery may perform one exact release using the frozen scope.
 `Prepared` recovery first validates frozen profile, repository, current card claim, and exact run evidence, ensures its transaction terminal is gone, then atomically advances to `InFlight` before any exact release POST.
 If that recovery-side POST has an ambiguous response, the durable `InFlight` record remains authoritative for the next reconciliation.
 
 Schema version 11 made the endpoint-pinned recovery shape incompatible with an older binary that could silently discard it.
-Schema version 12 replaces its raw endpoint field with a credential-free endpoint identity digest and makes a version 11 release recovery fail closed before any recovery or network call.
-Version 11 snapshots without a release recovery load and upgrade on their next write.
+Schema version 12 replaced its raw endpoint field with an unsalted endpoint digest.
+Schema version 13 replaces that credential-derived value with a standard HMAC-SHA-256 endpoint identity keyed by the protected client credential and makes a version 12 release recovery fail closed before any recovery or network call.
+Version 12 snapshots without a release recovery load and upgrade on their next write.
 Snapshot validation requires each release recovery to map to exactly one `CleanupPending` Crew under the exact Project with matching terminal, card, run, agent, and frozen-scope marker.
 The reciprocal marker check rejects orphaned Crew recovery state, mismatched or foreign records, and duplicate recovery state before any remote release.
 
@@ -390,15 +391,16 @@ The serialized control Powder filter passed 63 tests, the Powder client filter p
 No post-remediation workspace-wide test result is claimed.
 
 Commit `0fd0faa` closes the credential-safety review finding for frozen dispatch-release recovery scope.
-`PendingDispatchRelease` now stores only `connectionEndpointDigest`, a canonical lowercase SHA-256 digest computed from the validated and normalized protected profile base URL.
-It no longer persists the profile URL, path, query, or fragment, so `captains_sync_apply` cannot forward those values in a registry snapshot.
-Recovery reconstructs the protected profile locally and exact-compares the recomputed digest before repository, card, run-evidence, terminal, or release network I/O.
+`PendingDispatchRelease` initially stored only `connectionEndpointDigest`, an unsalted SHA-256 value computed from the validated and normalized protected profile base URL.
+That historical representation is superseded by the keyed identity remediation below.
+It did not persist the profile URL, path, query, or fragment, so `captains_sync_apply` could not forward those values in a registry snapshot.
+Recovery reconstructed the protected profile locally and exact-compared the prior digest before repository, card, run-evidence, terminal, or release network I/O.
 An endpoint or profile remap retains the durable original recovery with a generic error and makes zero original- or replacement-scope requests.
 Snapshot schema version 12 accepts a version 11 snapshot with no release recovery and stamps version 12 on its next write.
 Any version 11 snapshot carrying a recovery fails closed before network use.
 A legacy raw `connectionEndpoint` recovery document also fails deserialization before recovery can construct a client.
 The deterministic gateway-secret regression uses token-like path, query, and fragment values in both the original and remapped protected profile URLs.
-It proves registry JSON, `sync_captains` payloads, `Debug` output, and endpoint-remap errors contain none of those values, while the persisted digest remains present.
+It proves registry JSON, `sync_captains` payloads, `Debug` output, and endpoint-remap errors contain none of those values, while the historical persisted digest remains present.
 It also proves zero card evidence, run evidence, or release requests reach either scope after the remap.
 At `0fd0faa`, the focused endpoint secrecy regression, schema upgrade and legacy raw-state regressions, and the serialized dispatch-release filter with 10 tests passed.
 A broader serial dispatch command selected 34 tests but did not return a complete aggregate summary after printing its first 28 progress markers, so it is not counted as a completed 34-test gate.
@@ -412,12 +414,25 @@ One attempted `cargo test -p t-hub-agent --lib` invocation was rejected before t
 One attempted nonexistent `codex_permission_e2e` target was likewise rejected before test execution.
 No post-remediation workspace-wide test result is claimed.
 
+Commit `5dc37df` replaces the prior unsalted endpoint digest with a standard HMAC-SHA-256 endpoint identity.
+The HMAC key is the protected client API credential and is never persisted, synchronized, logged, or returned by the board surface.
+`PendingDispatchRelease` stores only `connectionEndpointIdentity`, while recovery recomputes the same keyed identity from the protected profile before repository, card, run, terminal, or release I/O.
+If the protected credential is unavailable, the identity cannot be recomputed and dispatch or recovery fails closed before remote work.
+Schema version 13 rejects every version 12 release recovery, including the prior `connectionEndpointDigest` shape, as incompatible state that remains preserved and write-blocked.
+This does not describe the keyed value as categorically credential-free.
+The endpoint remap regression continues to prove exact change detection and zero wrong-scope I/O.
+The new board snapshot regression uses a token-bearing protected path, query, and fragment and proves `external.url` contains only the public origin plus `/board`.
+The matching-endpoint transport regression now uses the keyed identity and still proves error, periodic reconciliation, registry, sync payload, and `Debug` output contain no secret.
+At `5dc37df`, five production-load regressions, eleven dispatch-release regressions, 32 Powder client regressions, four board-snapshot regressions, the serial 63-test control Powder filter, and the 15-test Harness filter passed.
+`cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 Commit `b359faf` closes matching-endpoint transport-error endpoint disclosure.
 `ureq::Error::Transport` now preserves the typed `Unreachable` classification while returning the bounded endpoint-free message `Powder transport failure`.
 This prevents `ureq`'s full failing URL rendering from entering recovery errors or periodic reconciliation logs.
 `external_board_url` now emits only the validated scheme and authority followed by `/board`, excluding protected profile path, query, and fragment material from board sync output.
 The Powder client transport regression uses a matching loopback endpoint with token-like path, query, and fragment values and proves the error and `Debug` rendering contain none of them while retaining `Unreachable`.
-The dispatch-release recovery regression uses the same matching-digest transport failure, invokes periodic reconciliation, and proves the recovery error, registry JSON, sync payload, and recovery `Debug` output contain no endpoint or API-key token.
+The dispatch-release recovery regression uses the same matching-identity transport failure, invokes periodic reconciliation, and proves the recovery error, registry JSON, sync payload, and recovery `Debug` output contain no endpoint or API-key token.
 At `b359faf`, the four production-load regressions, eleven dispatch-release regressions, 31 Powder client regressions, and serial 63-test control Powder filter passed.
 `cargo clippy -p t-hub --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed.
 No post-remediation workspace-wide test result is claimed.
@@ -426,7 +441,7 @@ Commit `698955e` closes the production-load fail-open for incompatible dispatch-
 `SnapshotReadError` now distinguishes incompatible recovery from generic corrupt state.
 Loading either a primary or backup with nonempty pre-v12 recovery, unknown release fields, or a release record that cannot deserialize or validate preserves both files byte-for-byte, starts with no actionable registry state, and blocks every write until explicit safe handling.
 It does not fall back to a stale backup and does not quarantine either file.
-`PendingDispatchRelease` now uses `deny_unknown_fields`, and the pre-deserialization classifier recognizes a schema-12 raw `connectionEndpoint` alongside a valid digest without including that raw value in the error.
+`PendingDispatchRelease` uses `deny_unknown_fields`, and the pre-deserialization classifier recognizes a schema-13 raw `connectionEndpoint` alongside a valid keyed identity without including that raw value in the error.
 Production-load regressions cover a schema-11 release primary without a backup, the same primary beside an older clean backup, an incompatible release recovery in backup beside a current primary, and a schema-12 release record with a token-bearing raw endpoint field.
 Each proves registry writes and redispatch fail, reconciliation performs zero card evidence, run evidence, or release requests, no apply event is emitted, no fallback overwrite or quarantine occurs, and the primary and backup bytes remain unchanged.
 At `698955e`, the four production-load regressions, two schema regressions, ten dispatch-release regressions, the serial 63-test control Powder filter, 30-test Powder client filter, and 15-test Harness filter passed.
@@ -477,5 +492,6 @@ No independent reviewer has approved this integration yet.
 22. Verify initial Powder claim receipts match the requested card and configured profile agent before dispatch persists any Crew binding.
 23. Verify any ambiguous initial claim retains a trusted durable recovery intent, attempts no untrusted release, survives restart, and blocks duplicate redispatch until authoritative reconciliation.
 24. Verify incompatible pending-release recovery in either primary or backup blocks writes and redispatch, preserves both files without fallback or quarantine, and exposes no actionable cleanup state.
-25. Verify a schema-12 recovery rejects unknown or raw endpoint fields before client construction and cannot emit credential-bearing bytes through registry, sync, errors, or logs.
+25. Verify a schema-13 recovery rejects unknown or raw endpoint fields before client construction and cannot emit credential-bearing bytes through registry, sync, errors, or logs.
 26. Verify matching-endpoint transport failures retain only an endpoint-free typed classification and external board links omit protected profile path, query, and fragment data.
+27. Verify the persisted endpoint identity is standard HMAC-SHA-256 keyed only by the protected client credential, never described as credential-free, and fails closed when it cannot be recomputed.
