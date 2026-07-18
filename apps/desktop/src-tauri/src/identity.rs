@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// The env var carrying the per-session token into a spawned session, ALONGSIDE the
@@ -35,6 +35,8 @@ use std::sync::Mutex;
 /// the app can resolve the calling session's identity.
 pub const SESSION_TOKEN_ENV: &str = "T_HUB_SESSION_TOKEN";
 const IDENTITIES_SCHEMA_VERSION: u32 = 1;
+const IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION: u32 = 1;
+const IDENTITY_GENERATION_WATERMARK_FORMAT: &str = "t-hub:identity-generation-watermark:v1";
 
 /// Best-effort org role captured at mint. Durable role-keying is item 2 (see the
 /// module note); this is enough for the plane to record "in what role" alongside the
@@ -203,6 +205,66 @@ impl Default for IdentitiesSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityGenerationWatermark {
+    schema_version: u32,
+    format_identity: String,
+    identities_schema_version: u32,
+    generation_high_water: u64,
+}
+
+impl IdentityGenerationWatermark {
+    fn current(generation_high_water: u64) -> Self {
+        Self {
+            schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+            format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.to_string(),
+            identities_schema_version: IDENTITIES_SCHEMA_VERSION,
+            generation_high_water,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION
+            || self.format_identity != IDENTITY_GENERATION_WATERMARK_FORMAT
+            || self.identities_schema_version != IDENTITIES_SCHEMA_VERSION
+        {
+            return Err("identity generation watermark is malformed or unsupported".into());
+        }
+        Ok(())
+    }
+}
+
+fn generation_watermark_path(identity_path: &Path) -> PathBuf {
+    identity_path.with_extension("generations.json")
+}
+
+fn read_generation_watermark(path: &PathBuf) -> Result<IdentityGenerationWatermark, String> {
+    let source = std::fs::read(path).map_err(|error| {
+        format!(
+            "identity generation watermark '{}' could not be read: {error}",
+            path.display()
+        )
+    })?;
+    let watermark: IdentityGenerationWatermark =
+        serde_json::from_slice(&source).map_err(|error| {
+            format!(
+                "identity generation watermark '{}' is malformed: {error}",
+                path.display()
+            )
+        })?;
+    watermark.validate()?;
+    Ok(watermark)
+}
+
+fn write_generation_watermark(
+    path: &PathBuf,
+    watermark: &IdentityGenerationWatermark,
+) -> std::io::Result<()> {
+    watermark.validate().map_err(std::io::Error::other)?;
+    write_private_atomic(path, &serde_json::to_vec_pretty(watermark)?)
+}
+
 fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), String> {
     if snapshot.schema_version != IDENTITIES_SCHEMA_VERSION {
         return Err(format!(
@@ -345,10 +407,14 @@ fn identity_ttl_ms() -> u64 {
 /// and the enqueue/ack path (resolve).
 pub struct IdentityStore {
     path: Option<PathBuf>,
+    watermark_path: Option<PathBuf>,
     inner: Mutex<IdentitiesSnapshot>,
+    generation_watermark: Mutex<IdentityGenerationWatermark>,
     write_blocked: Option<String>,
     #[cfg(test)]
     persist_fail_after: Mutex<Option<usize>>,
+    #[cfg(test)]
+    fail_identity_write_after_watermark: Mutex<bool>,
 }
 
 impl IdentityStore {
@@ -358,17 +424,83 @@ impl IdentityStore {
     /// secret is UNSEALED on load (DPAPI on Windows; a legacy/plaintext secret reads
     /// verbatim), so the in-memory secret is always the plaintext `resolve` compares.
     pub fn load(path: PathBuf) -> Self {
-        let (mut inner, schema_upgraded, write_blocked) = if path.exists() {
+        let watermark_path = generation_watermark_path(&path);
+        let identity_source_exists = path.exists();
+        let watermark_source_exists = watermark_path.exists();
+        let identity_read = if identity_source_exists {
             match read_identities_snapshot(&path) {
-                Ok((snapshot, upgraded)) => (snapshot, upgraded, None),
-                Err(error) => {
-                    eprintln!("t-hub-identity: writes blocked: {error}");
-                    (IdentitiesSnapshot::default(), false, Some(error))
-                }
+                Ok(result) => Ok(Some(result)),
+                Err(error) => Err(error),
             }
         } else {
-            (IdentitiesSnapshot::default(), false, None)
+            Ok(None)
         };
+        let watermark_read = if watermark_source_exists {
+            read_generation_watermark(&watermark_path).map(Some)
+        } else {
+            Ok(None)
+        };
+        let (mut inner, schema_upgraded, write_blocked, watermark) =
+            match (identity_read, watermark_read) {
+                (Err(error), _) | (_, Err(error)) => (
+                    IdentitiesSnapshot::default(),
+                    false,
+                    Some(error),
+                    IdentityGenerationWatermark::current(0),
+                ),
+                (Ok(None), Ok(Some(watermark))) => (
+                    IdentitiesSnapshot::default(),
+                    false,
+                    Some(
+                        "identity generation watermark exists but identities.json is missing"
+                            .to_string(),
+                    ),
+                    watermark,
+                ),
+                (Ok(Some((_snapshot, true))), Ok(Some(watermark))) => (
+                    IdentitiesSnapshot::default(),
+                    false,
+                    Some(
+                        "identity generation watermark proves identities.json was downgraded to an unversioned shape"
+                            .to_string(),
+                    ),
+                    watermark,
+                ),
+                (Ok(Some((snapshot, false))), Ok(Some(watermark)))
+                    if snapshot.generation != watermark.generation_high_water =>
+                {
+                    (
+                        IdentitiesSnapshot::default(),
+                        false,
+                        Some(
+                            "identity generation watermark does not match identities.json"
+                                .to_string(),
+                        ),
+                        watermark,
+                    )
+                }
+                (Ok(Some((snapshot, upgraded))), Ok(Some(watermark))) => {
+                    (snapshot, upgraded, None, watermark)
+                }
+                (Ok(Some((snapshot, upgraded))), Ok(None)) => {
+                    let generation = snapshot.generation;
+                    (
+                        snapshot,
+                        upgraded,
+                        None,
+                        IdentityGenerationWatermark::current(generation),
+                    )
+                }
+                (Ok(None), Ok(None)) => (
+                    IdentitiesSnapshot::default(),
+                    false,
+                    None,
+                    IdentityGenerationWatermark::current(0),
+                ),
+            };
+        if let Some(error) = write_blocked.as_deref() {
+            eprintln!("t-hub-identity: writes blocked: {error}");
+        }
         for ident in inner.identities.values_mut() {
             if let Some(plain) = crate::secret_seal::unseal_str(&ident.secret) {
                 ident.secret = plain;
@@ -378,12 +510,19 @@ impl IdentityStore {
         }
         let mut store = IdentityStore {
             path: Some(path),
+            watermark_path: Some(watermark_path),
             inner: Mutex::new(inner),
+            generation_watermark: Mutex::new(watermark),
             write_blocked,
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
+            #[cfg(test)]
+            fail_identity_write_after_watermark: Mutex::new(false),
         };
-        if schema_upgraded && store.write_blocked.is_none() {
+        let watermark_missing = !watermark_source_exists;
+        if (schema_upgraded || (identity_source_exists && watermark_missing))
+            && store.write_blocked.is_none()
+        {
             let persist_result = {
                 let snapshot = store.lock();
                 store.persist(&snapshot)
@@ -407,10 +546,14 @@ impl IdentityStore {
     pub fn ephemeral() -> Self {
         IdentityStore {
             path: None,
+            watermark_path: None,
             inner: Mutex::new(IdentitiesSnapshot::default()),
+            generation_watermark: Mutex::new(IdentityGenerationWatermark::current(0)),
             write_blocked: None,
             #[cfg(test)]
             persist_fail_after: Mutex::new(None),
+            #[cfg(test)]
+            fail_identity_write_after_watermark: Mutex::new(false),
         }
     }
 
@@ -438,8 +581,50 @@ impl IdentityStore {
             }
         }
         let Some(path) = &self.path else {
+            self.generation_watermark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation_high_water = snap.generation;
             return Ok(());
         };
+        let watermark_path = self
+            .watermark_path
+            .as_ref()
+            .ok_or("identity generation watermark path is unavailable")?;
+        {
+            let mut watermark = self
+                .generation_watermark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if snap.generation < watermark.generation_high_water {
+                return Err(
+                    "identity store generation would regress below its durable watermark".into(),
+                );
+            }
+            if snap.generation > watermark.generation_high_water || !watermark_path.exists() {
+                let advanced = IdentityGenerationWatermark::current(snap.generation);
+                write_generation_watermark(watermark_path, &advanced).map_err(|error| {
+                    format!(
+                        "identity generation watermark persist to '{}' failed: {error}",
+                        watermark_path.display()
+                    )
+                })?;
+                *watermark = advanced;
+            }
+        }
+        #[cfg(test)]
+        {
+            let mut fail = self
+                .fail_identity_write_after_watermark
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *fail {
+                *fail = false;
+                return Err(
+                    "identity store failure after watermark persistence injected by test".into(),
+                );
+            }
+        }
         write_atomic(path, snap).map_err(|error| {
             format!(
                 "identity store persist to '{}' failed: {error}",
@@ -461,8 +646,14 @@ impl IdentityStore {
     /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
     pub fn mint_for(&self, role: Role, ship: Option<String>) -> Result<SessionIdentity, String> {
         let mut snap = self.lock();
+        let durable_high_water = self
+            .generation_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation_high_water;
         let generation = snap
             .generation
+            .max(durable_high_water)
             .checked_add(1)
             .ok_or("identity store generation exhausted")?;
         let identity = SessionIdentity {
@@ -661,6 +852,14 @@ impl IdentityStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(successful_writes);
     }
+
+    #[cfg(test)]
+    pub fn fail_identity_write_after_watermark(&self) {
+        *self
+            .fail_identity_write_after_watermark
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    }
 }
 
 fn default_identities_path() -> PathBuf {
@@ -690,8 +889,15 @@ fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> std::io::Result<()
         ident.secret = crate::secret_seal::seal_str(&ident.secret);
     }
     let body = serde_json::to_vec_pretty(&sealed)?;
+    write_private_atomic(path, &body)
+}
+
+fn write_private_atomic(path: &PathBuf, body: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &body)?;
+    std::fs::write(&tmp, body)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1021,6 +1227,202 @@ mod tests {
             serde_json::Value::from(IDENTITIES_SCHEMA_VERSION)
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_writer_round_trip_after_v1_is_detected_and_never_reuses_retired_generation() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let (survivor, retired_high_water) = {
+            let store = IdentityStore::load(path.clone());
+            let survivor = store.mint(Role::Cortana).unwrap();
+            let retired = store.mint(Role::Crew).unwrap();
+            assert!(store.retire(&retired.id).unwrap());
+            (survivor, retired.generation)
+        };
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .generation_high_water,
+            retired_high_water
+        );
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(&watermark_path).unwrap())
+                .contains(&survivor.secret)
+        );
+
+        let mut old_writer_document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let object = old_writer_document.as_object_mut().unwrap();
+        object.remove("schemaVersion");
+        object.remove("generation");
+        for identity in object["identities"].as_object_mut().unwrap().values_mut() {
+            identity.as_object_mut().unwrap().remove("generation");
+        }
+        let downgraded_bytes = serde_json::to_vec_pretty(&old_writer_document).unwrap();
+        std::fs::write(&path, &downgraded_bytes).unwrap();
+
+        let downgraded = IdentityStore::load(path.clone());
+        assert!(downgraded
+            .write_blocked
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("downgraded to an unversioned shape") }));
+        assert!(downgraded
+            .mint(Role::Crew)
+            .unwrap_err()
+            .contains("writes are blocked"));
+        assert!(downgraded
+            .revoke(&survivor.id)
+            .unwrap_err()
+            .contains("writes are blocked"));
+        assert_eq!(std::fs::read(&path).unwrap(), downgraded_bytes);
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .generation_high_water,
+            retired_high_water
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn watermark_future_malformed_and_mismatch_states_fail_closed_byte_preserving() {
+        let cases = [
+            (
+                "future",
+                serde_json::json!({
+                    "schemaVersion": IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION + 1,
+                    "formatIdentity": IDENTITY_GENERATION_WATERMARK_FORMAT,
+                    "identitiesSchemaVersion": IDENTITIES_SCHEMA_VERSION,
+                    "generationHighWater": 1
+                }),
+            ),
+            (
+                "malformed",
+                serde_json::json!({
+                    "schemaVersion": IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+                    "formatIdentity": "wrong-format",
+                    "identitiesSchemaVersion": IDENTITIES_SCHEMA_VERSION,
+                    "generationHighWater": 1
+                }),
+            ),
+            (
+                "mismatch",
+                serde_json::json!({
+                    "schemaVersion": IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+                    "formatIdentity": IDENTITY_GENERATION_WATERMARK_FORMAT,
+                    "identitiesSchemaVersion": IDENTITIES_SCHEMA_VERSION,
+                    "generationHighWater": 9
+                }),
+            ),
+        ];
+
+        for (name, watermark_document) in cases {
+            let path = temp_path();
+            let watermark_path = generation_watermark_path(&path);
+            let secret = {
+                let store = IdentityStore::load(path.clone());
+                store.mint(Role::Crew).unwrap().secret
+            };
+            let identity_bytes = std::fs::read(&path).unwrap();
+            let watermark_bytes = serde_json::to_vec_pretty(&watermark_document).unwrap();
+            assert!(!String::from_utf8_lossy(&watermark_bytes).contains(&secret));
+            std::fs::write(&watermark_path, &watermark_bytes).unwrap();
+
+            let blocked = IdentityStore::load(path.clone());
+            assert!(blocked.write_blocked.is_some(), "case {name}");
+            assert!(
+                blocked
+                    .mint(Role::Crew)
+                    .unwrap_err()
+                    .contains("writes are blocked"),
+                "case {name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), identity_bytes, "case {name}");
+            assert_eq!(
+                std::fs::read(&watermark_path).unwrap(),
+                watermark_bytes,
+                "case {name}"
+            );
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(watermark_path);
+        }
+    }
+
+    #[test]
+    fn watermark_first_crash_ordering_blocks_restart_without_identity_bytes() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        {
+            let store = IdentityStore::load(path.clone());
+            store.fail_identity_write_after_watermark();
+            assert!(store.mint(Role::Crew).is_err());
+            assert!(store.is_empty());
+        }
+        assert!(!path.exists());
+        let watermark_bytes = std::fs::read(&watermark_path).unwrap();
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .generation_high_water,
+            1
+        );
+
+        let restarted = IdentityStore::load(path.clone());
+        assert!(restarted.write_blocked.is_some());
+        assert!(restarted.mint(Role::Crew).is_err());
+        assert_eq!(std::fs::read(&watermark_path).unwrap(), watermark_bytes);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[test]
+    fn watermark_rollback_retires_failed_generation_before_same_process_retry() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let store = IdentityStore::load(path.clone());
+        store.fail_identity_write_after_watermark();
+        assert!(store.mint(Role::Crew).is_err());
+        assert!(store.is_empty());
+
+        let replacement = store.mint(Role::Crew).unwrap();
+        assert_eq!(replacement.generation, 2);
+        assert_eq!(
+            read_generation_watermark(&watermark_path)
+                .unwrap()
+                .generation_high_water,
+            2
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["generation"], 2);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_and_generation_watermark_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let store = IdentityStore::load(path.clone());
+        store.mint(Role::Crew).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&watermark_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(watermark_path);
     }
 
     #[test]

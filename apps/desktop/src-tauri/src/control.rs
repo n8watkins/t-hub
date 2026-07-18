@@ -32273,16 +32273,16 @@ mod tests {
 
     #[test]
     fn socket_spawn_fails_before_tmux_when_identity_mint_is_not_durable() {
-        let blocker = captains_tmp("identity-mint-blocker");
-        std::fs::write(&blocker, b"not a directory").unwrap();
-        let store = Arc::new(crate::identity::IdentityStore::load(
-            blocker.join("identities.json"),
-        ));
+        let path = captains_tmp("identity-mint-after-watermark-failure");
+        let watermark_path = path.with_extension("generations.json");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        store.fail_identity_write_after_watermark();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
         let mut ctx = test_ctx("ctrl")
             .with_identity_store(store.clone())
-            .with_apply_sink(Arc::new(RecordingSink {
-                calls: StdMutex::new(Vec::new()),
-            }));
+            .with_apply_sink(sink.clone());
         ctx.addr = "127.0.0.1:4242".to_string();
 
         let response = dispatch_authenticated(
@@ -32299,11 +32299,14 @@ mod tests {
             response
                 .error
                 .unwrap_or_default()
-                .contains("identity store persist"),
+                .contains("after watermark persistence"),
             "spawn must surface the durability failure"
         );
         assert!(store.is_empty());
-        std::fs::remove_file(blocker).unwrap();
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(watermark_path.exists());
+        std::fs::remove_file(watermark_path).unwrap();
     }
 
     #[test]
