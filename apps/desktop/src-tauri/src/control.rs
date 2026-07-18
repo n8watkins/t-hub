@@ -3991,6 +3991,77 @@ impl CaptainsRegistry {
         Ok(operation)
     }
 
+    fn prepare_commission_operation(
+        &self,
+        terminal_id: &str,
+        project_id: &str,
+        assignment: &str,
+        ship_slug: &str,
+        harness: &str,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current.pending_fleet_operations.iter().any(|operation| {
+            matches!(
+                operation.payload,
+                PendingFleetOperationPayload::CommissionCaptain { .. }
+            )
+        }) {
+            return Err(
+                "commission_captain: another Captain commission is pending recovery".into(),
+            );
+        }
+        let previous = current.clone();
+        let operation = PendingFleetOperation {
+            operation_id: format!("commission-captain:{}", uuid::Uuid::new_v4().simple()),
+            expected_seq: current.seq,
+            phase: PendingFleetOperationPhase::Prepared,
+            created_at: now_ms(),
+            payload: PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id: terminal_id.to_string(),
+                project_id: project_id.to_string(),
+                assignment: assignment.to_string(),
+                ship_slug: ship_slug.to_string(),
+                harness: harness.to_string(),
+                identity_id: None,
+            },
+        };
+        current.pending_fleet_operations.push(operation.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(operation)
+    }
+
+    fn bind_commission_operation_identity(
+        &self,
+        operation_id: &str,
+        identity_id: &str,
+    ) -> Result<PendingFleetOperation, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let operation = current
+            .pending_fleet_operations
+            .iter_mut()
+            .find(|operation| operation.operation_id == operation_id)
+            .ok_or("commission_captain: durable commission intent disappeared")?;
+        let PendingFleetOperationPayload::CommissionCaptain {
+            identity_id: pending_identity,
+            ..
+        } = &mut operation.payload
+        else {
+            return Err("commission_captain: durable intent has the wrong kind".into());
+        };
+        if pending_identity.is_some() {
+            return Err("commission_captain: durable identity reservation already exists".into());
+        }
+        *pending_identity = Some(identity_id.to_string());
+        let result = operation.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     fn abort_close_terminal_operation(&self, operation_id: &str) -> Result<(), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
@@ -5782,8 +5853,50 @@ impl CaptainsRegistry {
         previous: CaptainsInner,
         record: FleetIdentity,
         disposition: ClaimDisposition,
-        changed: bool,
+        mut changed: bool,
     ) -> Result<ClaimOutcome, String> {
+        if let Some(position) = g.pending_fleet_operations.iter().position(|operation| {
+            matches!(
+                &operation.payload,
+                PendingFleetOperationPayload::CommissionCaptain { terminal_id, .. }
+                    if record.terminal_id.as_deref() == Some(terminal_id.as_str())
+            )
+        }) {
+            let PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id,
+                project_id,
+                assignment,
+                ship_slug,
+                harness,
+                identity_id,
+            } = g.pending_fleet_operations[position].payload.clone()
+            else {
+                unreachable!("position matched a commission operation")
+            };
+            if identity_id.is_none()
+                || record.terminal_id.as_deref() != Some(terminal_id.as_str())
+                || record.project_id.as_deref() != Some(project_id.as_str())
+                || record.assignment.as_deref() != Some(assignment.as_str())
+                || record.ship_slug != ship_slug
+                || record.harness.as_deref() != Some(harness.as_str())
+            {
+                return Err(
+                    "commission_captain: claimed identity does not match its durable intent".into(),
+                );
+            }
+            for workspace in &mut g.workspaces {
+                workspace.tile_ids.retain(|tile| tile != &terminal_id);
+            }
+            g.workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+                .expect("durable registry always has Captain Workspace")
+                .tile_ids
+                .push(terminal_id.clone());
+            g.retired_fleet_tile_ids.retain(|tile| tile != &terminal_id);
+            g.pending_fleet_operations.remove(position);
+            changed = true;
+        }
         if changed {
             g.seq += 1;
             self.commit_mutation(g, previous)?;
@@ -11836,19 +11949,97 @@ fn commission_captain(
         "capability": "control",
         "tabId": CAPTAIN_WORKSPACE_ID,
     });
-    ctx.tabs
-        .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
-    let spawned =
-        spawn_terminal_with_private_pane_command(ctx, &spawn_args, None, true, true, false)?;
-    let terminal_id = spawned["id"]
-        .as_str()
-        .ok_or("commission_captain: spawn returned no terminal id")?
-        .to_string();
+    if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
+        return Err(
+            "commission_captain: no UI is connected to adopt the commissioned Captain".into(),
+        );
+    }
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let terminal_id = suffix[..8].to_string();
+    let operation = ctx.captains.prepare_commission_operation(
+        &terminal_id,
+        &project.project_id,
+        &assignment,
+        &ship_slug,
+        harness.as_provider(),
+    )?;
+    let mut elevation = elevation_env(ctx, &spawn_args);
+    if spawn_capability(&spawn_args) == Capability::Full {
+        audit_control_spawn(ctx, "commission_captain", &spawn_args);
+    }
+    let identity = match ctx
+        .identity
+        .mint_for(crate::identity::Role::Captain, Some(ship_slug.clone()))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = ctx
+                .captains
+                .abort_close_terminal_operation(&operation.operation_id);
+            return Err(error);
+        }
+    };
+    elevation.push((
+        crate::identity::SESSION_TOKEN_ENV.to_string(),
+        identity.secret.clone(),
+    ));
+    if let Err(error) = ctx
+        .captains
+        .bind_commission_operation_identity(&operation.operation_id, &identity.id)
+    {
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
+        return Err(error);
+    }
+    if let Err(error) = ctx.identity.bind_tile(&identity.id, &terminal_id) {
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
+        return Err(format!(
+            "commission_captain: identity binding failed before tmux startup: {error}"
+        ));
+    }
+    let tmux_cwd = files::posix_form(&project.repo_root);
+    let pane = crate::commands::pane_command(None, Some(&startup_command));
+    let (_, tmux_session) = match spawn_tmux_terminal_with_id(
+        &terminal_id,
+        &tmux_cwd,
+        pane.as_deref(),
+        &elevation,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = ctx.identity.retire(&identity.id);
+            let _ = ctx
+                .captains
+                .abort_close_terminal_operation(&operation.operation_id);
+            return Err(format!(
+                "commission_captain: terminal startup failed and reserved artifacts were rolled back: {error}"
+            ));
+        }
+    };
     if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
-        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
         return Err(format!(
             "commission_captain: harness startup failed and the terminal was rolled back: {error}"
         ));
+    }
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("commission_effect_applied");
+    #[cfg(test)]
+    if args
+        .get("testCrashAfterTmux")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("injected commission crash after tmux and identity effects".into());
     }
     let claim_args = json!({
         "captainSessionId": terminal_id,
@@ -11856,6 +12047,15 @@ fn commission_captain(
         "provider": harness.as_provider(),
         "workspaceTabIds": workspace_tab_ids,
     });
+    #[cfg(test)]
+    if args
+        .get("testFailCommitPersist")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        ctx.captains
+            .fail_next_persist("commission binding persistence failure");
+    }
     let claim = {
         let _identity_transaction = ctx.tabs.identity_transaction();
         claim_captain_locked(
@@ -11868,7 +12068,11 @@ fn commission_captain(
         )
     };
     if let Err(error) = claim {
-        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = ctx.identity.retire(&identity.id);
+        let _ = ctx
+            .captains
+            .abort_close_terminal_operation(&operation.operation_id);
         return Err(format!(
             "commission_captain: terminal was spawned but its Captain claim failed and was rolled back: {error}"
         ));
@@ -11877,6 +12081,17 @@ fn commission_captain(
         .captains
         .captain_for_session(&terminal_id)
         .ok_or("commission_captain: bound Captain disappeared before projection")?;
+    let spawned = json!({
+        "accepted": "spawn_terminal",
+        "id": terminal_id,
+        "tmuxSession": tmux_session,
+        "cwd": project.repo_root,
+        "name": format!("Captain - {}", project.name),
+        "startupCommand": startup_command,
+        "tabId": CAPTAIN_WORKSPACE_ID,
+        "placed": true,
+        "audited": true,
+    });
     let _ = forward_apply(ctx, "spawn_terminal", &with_sync(ctx, spawned));
     let _ = captains_sync_apply(ctx);
     Ok(commissioned_response(captain, project, false))
@@ -15933,11 +16148,24 @@ pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
                     );
                 }
             }
-            PendingFleetOperationPayload::CommissionCaptain { .. } => {
-                eprintln!(
-                    "t-hub-fleet: pending commission operation '{}' awaits commission recovery",
-                    operation.operation_id
-                );
+            PendingFleetOperationPayload::CommissionCaptain {
+                terminal_id,
+                identity_id,
+                ..
+            } => {
+                let _ = tmux::kill_session_tree(&tmux_target(terminal_id));
+                if let Some(identity_id) = identity_id {
+                    let _ = ctx.identity.retire(identity_id);
+                }
+                if let Err(error) = ctx
+                    .captains
+                    .abort_close_terminal_operation(&operation.operation_id)
+                {
+                    eprintln!(
+                        "t-hub-fleet: pending commission operation '{}' remains for retry: {error}",
+                        operation.operation_id
+                    );
+                }
             }
         }
     }
@@ -18376,6 +18604,15 @@ fn spawn_tmux_terminal(
 ) -> Result<(String, String), String> {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let id = suffix[..8].to_string();
+    spawn_tmux_terminal_with_id(&id, cwd, command, env)
+}
+
+fn spawn_tmux_terminal_with_id(
+    id: &str,
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+) -> Result<(String, String), String> {
     let tmux_session = format!("th_{id}");
     // Phase 2b: `env` carries the capability token (+ addr) for the new session, set
     // via tmux `-e` so it is present BEFORE the first pane execs and never lands in
@@ -18412,7 +18649,7 @@ fn spawn_tmux_terminal(
              was registered)"
         ));
     }
-    Ok((id, tmux_session))
+    Ok((id.to_string(), tmux_session))
 }
 
 /// comms-plane Phase 1: mark a BREAK-GLASS use of the demoted direct writers
@@ -25855,6 +26092,7 @@ mod tests {
         assert_eq!(first["captain"]["harness"], "codex");
         assert_eq!(first["captain"]["workspaceTabIds"][0], "project-tab");
         assert_eq!(first["project"]["powder"]["repository"], "commission-e2e");
+        assert!(ctx.captains.snapshot().pending_fleet_operations.is_empty());
         let terminal_id = first["captain"]["terminalId"].as_str().unwrap().to_string();
         assert!(tmux::has_session(&tmux_target(&terminal_id)));
 
@@ -25925,7 +26163,8 @@ mod tests {
             .with_tab_registry(Arc::clone(&tabs))
             .with_apply_sink(sink.clone());
         let (harness_bin_dir, harness_command) = test_harness_command("codex");
-        captains.fail_next_persist("commission binding persistence failure");
+        let sessions_before = tmux::list_sessions().unwrap_or_default();
+        let identities_before = context.identity.len();
 
         let error = dispatch(
             &context,
@@ -25937,12 +26176,16 @@ mod tests {
                 "shipSlug": "commission-failure",
                 "workspaceTabIds": ["commission-work"],
                 "testStartupCommand": harness_command,
-                "testSkipPowderHealth": true
+                "testSkipPowderHealth": true,
+                "testFailCommitPersist": true
             }),
         )
         .unwrap_err();
         assert!(error.contains("commission binding persistence failure"));
         assert!(captains.snapshot().captains.is_empty());
+        assert!(captains.snapshot().pending_fleet_operations.is_empty());
+        assert_eq!(context.identity.len(), identities_before);
+        assert_eq!(tmux::list_sessions().unwrap_or_default(), sessions_before);
         assert!(tabs
             .snapshot()
             .iter()
@@ -25965,6 +26208,133 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn commission_crash_recovery_reaps_exact_tmux_identity_and_unprojected_intent() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("commission-crash-recovery");
+        let identity_path = path.with_extension("identities.json");
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-commission-crash".into(),
+                name: "Commission Crash".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "commission-crash".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(captains.workspace_projection());
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = Arc::new(
+            test_ctx("commission-crash-recovery")
+                .with_captains_registry(Arc::clone(&captains))
+                .with_tab_registry(Arc::clone(&tabs))
+                .with_identity_store(Arc::clone(&identities))
+                .with_apply_sink(sink.clone()),
+        );
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "commission_effect_applied",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let commissioning_context = Arc::clone(&context);
+        let commissioning = std::thread::spawn(move || {
+            dispatch(
+                &commissioning_context,
+                "commission_captain",
+                &json!({
+                "projectId": "project-commission-crash",
+                "assignment": "Own crash recovery",
+                "harness": "codex",
+                "shipSlug": "commission-crash",
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true,
+                "testCrashAfterTmux": true
+                }),
+            )
+        });
+        assert_eq!(
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "commission_effect_applied"
+        );
+        let during_effect = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(during_effect["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|workspace| workspace["tileIds"].as_array().unwrap().is_empty()));
+        assert!(dispatch(&context, "list_captains", &Value::Null).is_ok());
+        resume_tx.send(()).unwrap();
+        let error = commissioning.join().unwrap().unwrap_err();
+        assert!(error.contains("injected commission crash"));
+        let durable = captains.snapshot();
+        assert!(durable.captains.is_empty());
+        assert_eq!(durable.pending_fleet_operations.len(), 1);
+        let PendingFleetOperationPayload::CommissionCaptain {
+            terminal_id,
+            identity_id,
+            ..
+        } = &durable.pending_fleet_operations[0].payload
+        else {
+            panic!("expected pending commission operation")
+        };
+        assert!(tmux::has_session(&tmux_target(terminal_id)));
+        assert!(identity_id.is_some());
+        assert_eq!(identities.len(), 1);
+        let listed = dispatch(&context, "list_tabs", &Value::Null).unwrap();
+        assert!(listed["tabs"].as_array().unwrap().iter().all(|workspace| {
+            workspace["tileIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tile| tile != terminal_id)
+        }));
+        assert!(sink.calls.lock().unwrap().is_empty());
+        let terminal_id = terminal_id.clone();
+
+        drop(context);
+        drop(tabs);
+        drop(captains);
+        drop(identities);
+        let restarted_captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let restarted_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let restarted_tabs = Arc::new(TabRegistry::new());
+        restarted_tabs.replace(restarted_captains.workspace_projection());
+        let restarted = test_ctx("commission-crash-recovery-restart")
+            .with_captains_registry(Arc::clone(&restarted_captains))
+            .with_tab_registry(Arc::clone(&restarted_tabs))
+            .with_identity_store(Arc::clone(&restarted_identities));
+        recover_pending_fleet_operations(&restarted);
+        assert!(!tmux::has_session(&tmux_target(&terminal_id)));
+        assert_eq!(restarted_identities.len(), 0);
+        assert!(restarted_captains
+            .snapshot()
+            .pending_fleet_operations
+            .is_empty());
+        assert!(restarted_captains.snapshot().captains.is_empty());
+
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_file(identity_path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(identity_path);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
     }
