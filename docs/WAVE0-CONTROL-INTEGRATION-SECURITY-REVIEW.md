@@ -587,6 +587,31 @@ An authenticated `th send` report for this remediation was attempted from eviden
 The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+## Fresh-Server and Private Spawn Follow-Up
+
+Review rejected prior evidence head `16f8a5efe3a7e89bd9efdc68d01d552e48e2b424` because the respawn pane-generation parser rejected valid fresh-server tmux identifiers `$0`, `@0`, and `%0`.
+The same review found that an empty `pane_command` result after claim and durable binding returned directly instead of invoking exact transaction rollback.
+It also rejected the hostile dispatch fixture because it mutated tmux's global `default-shell` option and exposed the dormant command through public spawn fields.
+
+Commit `9176a90` accepts zero-valued session, window, and pane identifiers while retaining positive `session_created` and pane process-id requirements.
+It extracts a pure pane-generation parser test for `$0|<positive>|@0|%0|<positive>` and gives both live respawn fixtures RAII session cleanup plus `tempfile::tempdir` ownership.
+On distinct fresh sockets, the exact dormant-pane respawn test and the exact hostile-pane respawn test each passed once.
+
+Commit `dab4c51` routes public `spawn_terminal` through an internal helper that accepts an optional raw private pane command only for in-process dispatch.
+Dispatch now supplies `exec /bin/sleep 2147483647` privately without `startupCommand`, so the dormant command and provider launch are absent from public spawn responses, forwards, and snapshots.
+The cfg(test) dormant-pane override is consumed only by dispatch's internal test path and is not a public control field.
+The empty private Claude launch regression proves terminal removal, Crew removal, exact run release, empty pending claim and release collections, and credential-safe rollback error handling.
+The hostile dormant-pane regression uses `tempfile::tempdir`, a test-only internal raw dormant command, and RAII terminal cleanup.
+It pauses before respawn to prove the hostile pane started, the provider has not run, and the forwarded public spawn payload contains neither private command, then proves provider launch succeeds only after respawn.
+
+From `apps/desktop/src-tauri`, the current fixed head passed `cargo test -p t-hub 'control::tests::dispatch_' -- --nocapture --test-threads=1` with 40 passed and 1 intentionally ignored test.
+The current fixed head passed `cargo test -p t-hub tmux::tests:: -- --test-threads=1` with 14 tests.
+The current fixed head passed `cargo test -p t-hub harness::tests:: -- --test-threads=1` with 16 tests.
+The current fixed head passed the exact Codex marker test and the 4-test process-level permission-attestation filter.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+No full control aggregate or workspace aggregate was run for this follow-up.
+The prior workspace aggregate residual remains unresolved and is not claimed as fixed.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
