@@ -31887,7 +31887,8 @@ mod tests {
     }
 
     #[test]
-    fn powder_criterion_review_recovery_converges_legacy_display_reviewer_intent() {
+    fn powder_criterion_review_recovery_converges_frozen_schema_v3_legacy_display_reviewer_intent()
+    {
         let server = LoopbackPowderServer::start(3);
         let profile = "loopback-criterion-legacy-reviewer-recovery";
         let path = captains_tmp("criterion-legacy-reviewer-recovery");
@@ -31937,7 +31938,11 @@ mod tests {
             "proof": "independent review proof",
             "expectedReviewerIdentity": legacy_reviewer_label,
         });
-        let intent = powder_mutation_intent_with_request_digest(
+        assert_eq!(
+            powder_request_digest,
+            "sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8"
+        );
+        let mut intent = powder_mutation_intent_with_request_digest(
             PowderMutationKind::CriterionReview,
             &scope,
             operation_id,
@@ -31945,21 +31950,43 @@ mod tests {
             &payload,
             powder_request_digest.clone(),
         );
-        registry.begin_crew_powder_mutation(&scope, intent).unwrap();
+        intent.created_at = 42;
         assert_eq!(
-            registry.snapshot().captains[0].crew[0]
-                .powder_work
-                .as_ref()
-                .unwrap()
-                .mutation_intent
-                .as_ref()
-                .unwrap()
-                .schema_version,
-            3
+            intent.payload_digest,
+            "609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a"
         );
+        registry.begin_crew_powder_mutation(&scope, intent).unwrap();
+        let frozen_v3_intent = json!({
+            "schemaVersion": 3,
+            "operationId": "wave0-e2ab7e3-review-criterion-0",
+            "payloadDigest": "609df7f0d38e5d5adf64989baf4e841eb40f1be5635edce72f062d69dbe06b9a",
+            "powderRequestDigest": "sha256:995e85c48c4fa931cf1054035bc76d4fd8aab758c83cc2a6b81dca91c2482cd8",
+            "repository": "t-hub",
+            "cardId": "thub-powder-control-lifecycle",
+            "expectedRunId": "run-authoritative",
+            "mutationKind": "criterion_review",
+            "requestedBy": "captain-powder",
+            "createdAt": 42,
+        });
+        let mut persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        persisted["captains"][0]["crew"][0]["powderWork"]["mutationIntent"] =
+            frozen_v3_intent.clone();
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         drop(ctx);
         drop(registry);
         let registry = Arc::new(CaptainsRegistry::load(path.clone()));
+        let loaded_snapshot = registry.snapshot();
+        let loaded_intent = loaded_snapshot.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded_intent).unwrap(),
+            frozen_v3_intent
+        );
         let ctx = test_ctx(profile)
             .with_identity_store(identities)
             .with_captains_registry(registry.clone());
