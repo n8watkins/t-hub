@@ -19326,6 +19326,7 @@ mod tests {
 
     #[test]
     fn apply_forwards_are_broadcast_to_event_subscribers() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // T12: every accepted Organization forward ALSO reaches event
         // subscribers on `control://apply`, while the webview sink keeps
         // receiving exactly what it always did.
@@ -21829,6 +21830,7 @@ mod tests {
 
     #[test]
     fn commission_captain_spawns_binds_bootstraps_and_deduplicates() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -22015,6 +22017,7 @@ mod tests {
 
     #[test]
     fn attach_captain_refuses_read_only_and_preserves_existing_control_capability() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let mut ctx = test_ctx("control-secret").with_apply_sink(Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         }));
@@ -22638,6 +22641,7 @@ mod tests {
 
     #[test]
     fn claim_and_release_are_audited_and_forward_the_captains_snapshot() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -22704,6 +22708,7 @@ mod tests {
 
     #[test]
     fn codex_claim_never_inherits_a_stale_claude_session_id() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let terminal_id = format!("codex{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let status = Arc::new(StatusBridge::new());
         status.ingest(
@@ -22771,6 +22776,7 @@ mod tests {
 
     #[test]
     fn claim_conflicts_liveness_and_bad_release_are_dispatch_errors() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("t").with_apply_sink(Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         }));
