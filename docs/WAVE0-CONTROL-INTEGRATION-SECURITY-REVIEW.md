@@ -303,7 +303,7 @@ If that ambiguity persistence fails, the prior durable `InFlight` state remains 
 No release success clears either record until an exact trusted release receipt or authoritative released-run evidence is observed.
 Recovery never reconstructs the original scope from the current Captain Project binding.
 It uses only the frozen connection profile, repository, card, run, agent, and operation identity.
-For `InFlight` or `Ambiguous` recovery, it first reads authoritative exact-run evidence.
+For `InFlight` or `Ambiguous` recovery, it validates the protected profile, exact endpoint digest, frozen repository, and current card before reading authoritative exact-run evidence.
 If Powder already reports the exact run released after response loss, recovery clears local transaction-owned state without a second release POST.
 If the run remains active with the exact card and agent, recovery may perform one exact release using the frozen scope.
 `Prepared` recovery first validates frozen profile, repository, current card claim, and exact run evidence, ensures its transaction terminal is gone, then atomically advances to `InFlight` before any exact release POST.
