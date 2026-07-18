@@ -31222,6 +31222,7 @@ mod tests {
 
     #[test]
     fn get_request_status_command_resolves_a_completed_spawn() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         // The queryable half of ask #1: after a spawn with a requestId, a caller
         // whose response leg failed can learn the outcome (and the real id) without
         // guessing. An unknown id reports unknown (safe to retry).
