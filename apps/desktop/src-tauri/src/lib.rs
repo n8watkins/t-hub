@@ -224,18 +224,44 @@ impl control::ApplySink for AppHandleApplySink {
 #[tauri::command]
 fn report_workspace_tabs(
     app: tauri::AppHandle,
-    tabs: Vec<control::TabRecord>,
+    mut tabs: Vec<control::TabRecord>,
     active_tab_id: Option<String>,
     base_seq: Option<u64>,
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
+    let current_seq = registry.snapshot_full().seq;
+    let reconciled = if base_seq.is_none_or(|seq| seq == current_seq) {
+        match captains.reconcile_crew_workspaces(&mut tabs) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let snapshot = registry.snapshot_full();
+                return serde_json::json!({
+                    "stale": true,
+                    "seq": snapshot.seq,
+                    "tabs": snapshot.tabs,
+                    "error": error,
+                });
+            }
+        }
+    } else {
+        false
+    };
+    if let Err(error) = control::validate_workspace_report(&tabs, &captains) {
+        let snapshot = registry.snapshot_full();
+        return serde_json::json!({
+            "stale": true,
+            "seq": snapshot.seq,
+            "tabs": snapshot.tabs,
+            "error": error,
+        });
+    }
     match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted {
+        Ok(control::ReportOutcome::Accepted {
             seq,
             removed_tab_ids,
-        } => {
+        }) => {
             // Captain-chat phase 2: the webview's normal tab-close lands here (not
             // the socket close_tab), so a closed tab must be pruned from every
             // captain's workspaceTabIds here too - else it lingers as a phantom
@@ -250,16 +276,22 @@ fn report_workspace_tabs(
                     }
                 }
             }
-            if pruned {
+            if pruned || reconciled {
                 commands::forward_captains_sync(&app, &captains, &fanout);
             }
             serde_json::json!({ "seq": seq })
         }
-        control::ReportOutcome::Stale(snap) => serde_json::json!({
+        Ok(control::ReportOutcome::Stale(snap)) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
             "activeTabId": snap.active_tab_id,
             "tabs": snap.tabs,
+        }),
+        Err(error) => serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
         }),
     }
 }

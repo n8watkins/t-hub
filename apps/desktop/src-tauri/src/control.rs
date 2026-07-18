@@ -421,15 +421,119 @@ impl EventFanout {
 ///
 /// Serialized camelCase (`{id, name, tileIds}`) in BOTH directions: the frontend
 /// reports its tabs up as this shape, and `list_tabs` returns it verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub const CAPTAIN_WORKSPACE_ID: &str = "captains-reserved";
+pub const CAPTAIN_WORKSPACE_NAME: &str = "Captain Workspace";
+const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum WorkspaceKind {
+    Work,
+    Captain,
+}
+
+#[derive(Debug, Clone)]
 pub struct TabRecord {
     pub id: String,
     pub name: String,
-    /// Tile ids in this tab, in order. Accepts the frontend's `order` field as an
-    /// alias so either spelling deserializes.
-    #[serde(default, alias = "order")]
+    /// Tile ids in this Workspace, in order.
     pub tile_ids: Vec<String>,
+}
+
+impl TabRecord {
+    pub fn kind(&self) -> WorkspaceKind {
+        if self.id == CAPTAIN_WORKSPACE_ID {
+            WorkspaceKind::Captain
+        } else {
+            WorkspaceKind::Work
+        }
+    }
+
+    fn canonicalize(mut self) -> Result<Self, String> {
+        if self.id.trim().is_empty() {
+            return Err("workspace id must not be empty".into());
+        }
+        if self.kind() == WorkspaceKind::Captain {
+            self.name = CAPTAIN_WORKSPACE_NAME.to_string();
+        } else if self.name.trim().is_empty() {
+            return Err(format!("work Workspace '{}' has an empty name", self.id));
+        }
+        Ok(self)
+    }
+}
+
+impl Serialize for TabRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            schema_version: u32,
+            id: &'a str,
+            name: &'a str,
+            kind: WorkspaceKind,
+            tile_ids: &'a [String],
+        }
+        let canonical_name = if self.kind() == WorkspaceKind::Captain {
+            CAPTAIN_WORKSPACE_NAME
+        } else {
+            &self.name
+        };
+        Wire {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            id: &self.id,
+            name: canonical_name,
+            kind: self.kind(),
+            tile_ids: &self.tile_ids,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TabRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            schema_version: u32,
+            id: String,
+            name: String,
+            #[serde(default)]
+            kind: Option<WorkspaceKind>,
+            #[serde(default, alias = "order")]
+            tile_ids: Vec<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version > WORKSPACE_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported Workspace schemaVersion {}",
+                wire.schema_version
+            )));
+        }
+        let derived = if wire.id == CAPTAIN_WORKSPACE_ID {
+            WorkspaceKind::Captain
+        } else {
+            WorkspaceKind::Work
+        };
+        if wire.kind.is_some_and(|kind| kind != derived) {
+            return Err(serde::de::Error::custom(
+                "Workspace kind conflicts with its canonical id",
+            ));
+        }
+        TabRecord {
+            id: wire.id,
+            name: wire.name,
+            tile_ids: wire.tile_ids,
+        }
+        .canonicalize()
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A full, versioned copy of the registry: what `list_tabs` returns and what every
@@ -505,9 +609,37 @@ impl TabRegistry {
 
     /// Replace the whole registry (legacy up-sync; no staleness check). Kept for
     /// reporters that predate `baseSeq` (native cockpit) and for tests.
+    fn normalize_tabs(tabs: Vec<TabRecord>) -> Result<Vec<TabRecord>, String> {
+        let mut normalized = Vec::with_capacity(tabs.len().saturating_add(1));
+        let mut ids = std::collections::HashSet::new();
+        let mut captain_tiles = Vec::new();
+        for tab in tabs {
+            let tab = tab.canonicalize()?;
+            if tab.kind() == WorkspaceKind::Captain {
+                for tile in tab.tile_ids {
+                    if !captain_tiles.contains(&tile) {
+                        captain_tiles.push(tile);
+                    }
+                }
+                continue;
+            }
+            if !ids.insert(tab.id.clone()) {
+                return Err(format!("duplicate work Workspace id '{}'", tab.id));
+            }
+            normalized.push(tab);
+        }
+        normalized.push(TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.to_string(),
+            name: CAPTAIN_WORKSPACE_NAME.to_string(),
+            tile_ids: captain_tiles,
+        });
+        Ok(normalized)
+    }
+
     pub fn replace(&self, tabs: Vec<TabRecord>) {
         let mut g = self.lock();
-        g.tabs = tabs;
+        g.tabs = Self::normalize_tabs(tabs)
+            .expect("internal tab fixtures must contain valid Workspace records");
         g.seq += 1;
     }
 
@@ -519,15 +651,16 @@ impl TabRegistry {
         tabs: Vec<TabRecord>,
         active_tab_id: Option<String>,
         base_seq: Option<u64>,
-    ) -> ReportOutcome {
+    ) -> Result<ReportOutcome, String> {
+        let tabs = Self::normalize_tabs(tabs)?;
         let mut g = self.lock();
         if let Some(base) = base_seq {
             if base != g.seq {
-                return ReportOutcome::Stale(RegistrySnapshot {
+                return Ok(ReportOutcome::Stale(RegistrySnapshot {
                     seq: g.seq,
                     active_tab_id: g.active_tab_id.clone(),
                     tabs: g.tabs.clone(),
-                });
+                }));
             }
         }
         // Which tabs is this report dropping? Computed atomically under the lock
@@ -553,10 +686,10 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
-        ReportOutcome::Accepted {
+        Ok(ReportOutcome::Accepted {
             seq: g.seq,
             removed_tab_ids,
-        }
+        })
     }
 
     /// A clone of the current tab list (for tests / callers that only need tabs).
@@ -588,14 +721,20 @@ impl TabRegistry {
         self.lock().tabs.iter().any(|t| t.id == id)
     }
 
-    /// The tab currently holding `tile_id`, if any (captains: a claim with no
-    /// explicit `workspaceTabIds` defaults to the tab the captain's tile lives in).
-    fn tab_for_tile(&self, tile_id: &str) -> Option<String> {
+    fn kind_for_id(&self, id: &str) -> Option<WorkspaceKind> {
         self.lock()
             .tabs
             .iter()
-            .find(|t| t.tile_ids.iter().any(|x| x == tile_id))
-            .map(|t| t.id.clone())
+            .find(|tab| tab.id == id)
+            .map(TabRecord::kind)
+    }
+
+    fn work_workspace(&self, id: &str) -> Option<TabRecord> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id && tab.kind() == WorkspaceKind::Work)
+            .cloned()
     }
 
     /// Record a new (empty) tab so its id is addressable immediately. No-op (no
@@ -605,7 +744,11 @@ impl TabRegistry {
         if !g.tabs.iter().any(|t| t.id == id) {
             g.tabs.push(TabRecord {
                 id: id.to_string(),
-                name: name.to_string(),
+                name: if id == CAPTAIN_WORKSPACE_ID {
+                    CAPTAIN_WORKSPACE_NAME.to_string()
+                } else {
+                    name.to_string()
+                },
                 tile_ids: Vec::new(),
             });
             g.seq += 1;
@@ -667,14 +810,25 @@ impl TabRegistry {
     fn place_tile_with_fallback(&self, tile_id: &str, tab_id: Option<&str>) -> Option<String> {
         let mut g = self.lock();
         let target = tab_id
-            .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+            .filter(|id| {
+                g.tabs
+                    .iter()
+                    .any(|tab| &tab.id == id && tab.kind() == WorkspaceKind::Work)
+            })
             .map(str::to_string)
             .or_else(|| {
-                g.active_tab_id
-                    .clone()
-                    .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+                g.active_tab_id.clone().filter(|id| {
+                    g.tabs
+                        .iter()
+                        .any(|tab| &tab.id == id && tab.kind() == WorkspaceKind::Work)
+                })
             })
-            .or_else(|| g.tabs.first().map(|t| t.id.clone()))?;
+            .or_else(|| {
+                g.tabs
+                    .iter()
+                    .find(|tab| tab.kind() == WorkspaceKind::Work)
+                    .map(|tab| tab.id.clone())
+            })?;
         for t in g.tabs.iter_mut() {
             t.tile_ids.retain(|x| x != tile_id);
         }
@@ -683,6 +837,29 @@ impl TabRegistry {
         }
         g.seq += 1;
         Some(target)
+    }
+
+    /// Place a new tile only if the exact target still exists.
+    /// This is used by durable identity transactions where fallback would silently
+    /// change ownership after authority was validated.
+    fn place_tile_exact(&self, tile_id: &str, tab_id: &str) -> Result<String, String> {
+        let mut g = self.lock();
+        if !g.tabs.iter().any(|tab| tab.id == tab_id) {
+            return Err(format!(
+                "Workspace '{tab_id}' closed before exact terminal placement"
+            ));
+        }
+        for tab in &mut g.tabs {
+            tab.tile_ids.retain(|candidate| candidate != tile_id);
+        }
+        let target = g
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .expect("target existence checked under the same lock");
+        target.tile_ids.push(tile_id.to_string());
+        g.seq = g.seq.saturating_add(1);
+        Ok(tab_id.to_string())
     }
 
     /// Drop a tile from every tab (a terminal was closed). Returns true (and bumps
@@ -703,6 +880,9 @@ impl TabRegistry {
 
     /// Rename a tab. Errors when the tab is unknown.
     fn rename_tab(&self, tab_id: &str, name: &str) -> Result<(), String> {
+        if tab_id == CAPTAIN_WORKSPACE_ID {
+            return Err("rename_tab: Captain Workspace cannot be renamed".into());
+        }
         let mut g = self.lock();
         match g.tabs.iter_mut().find(|t| t.id == tab_id) {
             Some(t) => {
@@ -723,12 +903,22 @@ impl TabRegistry {
     ///     its reconciler, so nothing is orphaned).
     /// Returns the closed tab's tile ids.
     fn remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
+        if tab_id == CAPTAIN_WORKSPACE_ID {
+            return Err("close_tab: Captain Workspace cannot be closed".into());
+        }
         let mut g = self.lock();
         let Some(idx) = g.tabs.iter().position(|t| t.id == tab_id) else {
             return Err(format!("close_tab: unknown tabId '{tab_id}'"));
         };
-        if g.tabs.len() <= 1 {
-            return Err("close_tab: refusing to close the last tab".to_string());
+        if g.tabs
+            .iter()
+            .filter(|tab| tab.kind() == WorkspaceKind::Work)
+            .count()
+            <= 1
+        {
+            return Err(
+                "close_tab: refusing to close the last tab (the final Work Workspace)".to_string(),
+            );
         }
         if !g.tabs[idx].tile_ids.is_empty() && !force {
             return Err(format!(
@@ -831,8 +1021,30 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 13;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 14;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
+const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
+
+fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
+    format!(
+        "assignment:{}:{}",
+        project_id.unwrap_or("unbound"),
+        ship_slug
+    )
+}
+
+fn normalize_captain_display_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Captain displayName must not be empty".into());
+    }
+    if value.len() > MAX_CAPTAIN_DISPLAY_NAME_BYTES {
+        return Err(format!(
+            "Captain displayName must be at most {MAX_CAPTAIN_DISPLAY_NAME_BYTES} bytes"
+        ));
+    }
+    Ok(value.to_string())
+}
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
 /// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
@@ -901,6 +1113,9 @@ pub enum CrewState {
     /// The Crew terminal is stopped, but its Powder claim could not be released.
     /// Keep the binding addressable until a later cleanup confirms the release.
     CleanupPending { since: u64 },
+    /// A live legacy Crew terminal whose owning Work Workspace cannot be resolved
+    /// without guessing. It remains visible but cannot be treated as assigned.
+    NeedsAssignment { since: u64 },
     /// The crew's OWN tile died: a terminal marker (NOT re-adoptable - the worker is
     /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
     /// epoch-ms.
@@ -952,6 +1167,9 @@ pub struct CrewRef {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Exact durable Work Workspace selected by the owning Captain before launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_tab_id: Option<String>,
     /// Powder work claimed by this Crew member. T-Hub owns the terminal binding;
     /// Powder remains authoritative for the claim and run lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -975,6 +1193,7 @@ impl CrewRef {
             t_hub_capability: None,
             worktree_path: None,
             branch: None,
+            workspace_tab_id: None,
             powder_work: None,
             state: CrewState::Active,
         }
@@ -1446,6 +1665,14 @@ pub struct FleetIdentity {
     /// The DURABLE primary key (item-2 §2.1): every registry lookup for a captain
     /// keys on this. For a Cortana claim it is the reserved [`CORTANA_SLUG`].
     pub ship_slug: String,
+    /// Durable Assignment key. This is independent of the current terminal,
+    /// Harness conversation, cwd, and Workspace placement.
+    #[serde(default)]
+    pub assignment_id: String,
+    /// Durable user-facing Captain name. Legacy records are deterministically
+    /// seeded from `ship_slug` during load and persisted on the next mutation.
+    #[serde(default)]
+    pub display_name: String,
     /// The first-class role (D1). Cortana is the registry-wide singleton.
     #[serde(default)]
     pub role: FleetRole,
@@ -1583,6 +1810,48 @@ impl ShipMembership {
     }
 }
 
+fn terminal_requires_captain_workspace(captains: &CaptainsRegistry, terminal_id: &str) -> bool {
+    matches!(
+        captains.ship_of(terminal_id),
+        Some(ShipMembership::Supervisor { .. })
+    )
+}
+
+fn validate_workspace_occupant(
+    captains: &CaptainsRegistry,
+    terminal_id: &str,
+    kind: WorkspaceKind,
+) -> Result<(), String> {
+    let supervisor = terminal_requires_captain_workspace(captains, terminal_id);
+    match (kind, supervisor) {
+        (WorkspaceKind::Captain, true) | (WorkspaceKind::Work, false) => Ok(()),
+        (WorkspaceKind::Captain, false) => Err(format!(
+            "Workspace placement denied: terminal '{terminal_id}' is not a durable Cortana or Captain identity"
+        )),
+        (WorkspaceKind::Work, true) => Err(format!(
+            "Workspace placement denied: Captain terminal '{terminal_id}' belongs to Captain Workspace"
+        )),
+    }
+}
+
+pub fn validate_workspace_report(
+    tabs: &[TabRecord],
+    captains: &CaptainsRegistry,
+) -> Result<(), String> {
+    let mut placed = std::collections::HashSet::new();
+    for tab in tabs {
+        for terminal_id in &tab.tile_ids {
+            if !placed.insert(terminal_id.as_str()) {
+                return Err(format!(
+                    "Workspace report assigns terminal '{terminal_id}' more than once"
+                ));
+            }
+            validate_workspace_occupant(captains, terminal_id, tab.kind())?;
+        }
+    }
+    Ok(())
+}
+
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
 /// what every `sync_captains` forward carries down to the UI (the UI renders FROM
 /// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
@@ -1618,6 +1887,8 @@ pub struct CaptainsSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CaptainAuthorityProjection {
     ship_slug: String,
+    assignment_id: String,
+    display_name: String,
     role: FleetRole,
     claude_uuid: Option<String>,
     provider: Option<String>,
@@ -1636,6 +1907,8 @@ impl From<&CaptainRecord> for CaptainAuthorityProjection {
     fn from(captain: &CaptainRecord) -> Self {
         Self {
             ship_slug: captain.ship_slug.clone(),
+            assignment_id: captain.assignment_id.clone(),
+            display_name: captain.display_name.clone(),
             role: captain.role,
             claude_uuid: captain.claude_uuid.clone(),
             provider: captain.provider.clone(),
@@ -2375,11 +2648,21 @@ impl CaptainsRegistry {
         }
         let mut ships = std::collections::HashSet::new();
         let mut terminals = std::collections::HashSet::new();
-        let mut bound_projects = std::collections::HashSet::new();
+        let mut assignment_ids = std::collections::HashSet::new();
         let mut cortana_count = 0;
         for captain in &snapshot.captains {
             if captain.ship_slug.trim().is_empty() || !ships.insert(captain.ship_slug.as_str()) {
                 return Err("captains registry contains an empty or duplicate shipSlug".into());
+            }
+            if snapshot.schema_version >= 14 {
+                if captain.assignment_id.trim().is_empty()
+                    || !assignment_ids.insert(captain.assignment_id.as_str())
+                {
+                    return Err(
+                        "captains registry contains an empty or duplicate assignmentId".into(),
+                    );
+                }
+                normalize_captain_display_name(&captain.display_name)?;
             }
             if captain.role == FleetRole::Cortana {
                 cortana_count += 1;
@@ -2438,9 +2721,6 @@ impl CaptainsRegistry {
                     return Err(format!(
                         "Captain references unknown projectId '{project_id}'"
                     ));
-                }
-                if !bound_projects.insert(project_id) {
-                    return Err(format!("project '{project_id}' has multiple Captains"));
                 }
                 if captain
                     .assignment
@@ -2663,6 +2943,16 @@ impl CaptainsRegistry {
     fn reconcile_on_load(caps: &mut [FleetIdentity]) {
         let mut seen_cortana = false;
         for c in caps.iter_mut() {
+            if c.assignment_id.trim().is_empty() {
+                c.assignment_id = assignment_id_for(c.project_id.as_deref(), &c.ship_slug);
+            }
+            if c.display_name.trim().is_empty() {
+                c.display_name = c.ship_slug.clone();
+            }
+            c.workspace_tab_ids.retain(|id| id != CAPTAIN_WORKSPACE_ID);
+            let mut seen_workspaces = std::collections::HashSet::new();
+            c.workspace_tab_ids
+                .retain(|id| seen_workspaces.insert(id.clone()));
             reconcile_legacy_runtime_identity(
                 &mut c.harness,
                 &mut c.provider,
@@ -3239,20 +3529,13 @@ impl CaptainsRegistry {
         if !g.projects.iter().any(|p| p.project_id == project_id) {
             return Err(format!("unknown projectId '{project_id}'"));
         }
-        if let Some(existing) = g.captains.iter().find(|candidate| {
-            candidate.ship_slug != ship_slug && candidate.project_id.as_deref() == Some(project_id)
-        }) {
-            return Err(format!(
-                "project '{project_id}' is already captained by ship '{}'",
-                existing.ship_slug
-            ));
-        }
         let captain = g
             .captains
             .iter_mut()
             .find(|c| c.ship_slug == ship_slug)
             .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
         captain.project_id = Some(project_id.to_string());
+        captain.assignment_id = assignment_id_for(Some(project_id), ship_slug);
         captain.assignment = Some(assignment.to_string());
         captain.harness = Some(harness.to_string());
         let provider_changed = captain.provider.as_deref() != Some(harness);
@@ -3268,6 +3551,129 @@ impl CaptainsRegistry {
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
         Ok(result)
+    }
+
+    /// Rename one durable Captain identity without changing its Assignment,
+    /// terminal binding, Harness, or Workspace ownership.
+    pub fn rename_captain(
+        &self,
+        captain_session_id: Option<&str>,
+        ship_slug: Option<&str>,
+        display_name: &str,
+    ) -> Result<CaptainRecord, String> {
+        if captain_session_id.is_none() && ship_slug.is_none() {
+            return Err("rename_captain requires 'captainSessionId' or 'shipSlug'".into());
+        }
+        let display_name = normalize_captain_display_name(display_name)?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain = g
+            .captains
+            .iter_mut()
+            .find(|captain| {
+                captain_session_id.is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                    || ship_slug.is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+            })
+            .ok_or("rename_captain: no matching Captain is registered")?;
+        if captain.display_name == display_name {
+            return Ok(captain.clone());
+        }
+        captain.display_name = display_name;
+        let result = captain.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
+    /// Reconcile legacy and stale Crew placement against one authoritative
+    /// Workspace report. Exact owned placement is retained, one unambiguous owned
+    /// destination is rehomed, and every other case fails closed as
+    /// `needsAssignment` without selecting a foreign Workspace.
+    pub fn reconcile_crew_workspaces(&self, tabs: &mut [TabRecord]) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let work_ids: std::collections::HashSet<String> = tabs
+            .iter()
+            .filter(|tab| tab.kind() == WorkspaceKind::Work)
+            .map(|tab| tab.id.clone())
+            .collect();
+        let mut changed = false;
+        for captain in &mut g.captains {
+            let owned: Vec<String> = captain
+                .workspace_tab_ids
+                .iter()
+                .filter(|id| work_ids.contains(*id))
+                .cloned()
+                .collect();
+            for crew in &mut captain.crew {
+                if !matches!(
+                    crew.state,
+                    CrewState::Active | CrewState::NeedsAssignment { .. }
+                ) {
+                    continue;
+                }
+                let placements: Vec<String> = tabs
+                    .iter()
+                    .filter(|tab| tab.tile_ids.iter().any(|id| id == &crew.terminal_id))
+                    .map(|tab| tab.id.clone())
+                    .collect();
+                let durable_is_exact = crew.workspace_tab_id.as_ref().is_some_and(|id| {
+                    owned.iter().any(|owned_id| owned_id == id)
+                        && placements.len() == 1
+                        && placements[0] == *id
+                });
+                if durable_is_exact {
+                    if matches!(crew.state, CrewState::NeedsAssignment { .. }) {
+                        crew.state = CrewState::Active;
+                        changed = true;
+                    }
+                    continue;
+                }
+                let legacy_exact = crew.workspace_tab_id.is_none()
+                    && placements.len() == 1
+                    && owned.iter().any(|id| id == &placements[0]);
+                let destination = if legacy_exact {
+                    Some(placements[0].clone())
+                } else if crew.workspace_tab_id.is_none() && owned.len() == 1 {
+                    Some(owned[0].clone())
+                } else {
+                    None
+                };
+                if let Some(destination) = destination {
+                    for tab in tabs.iter_mut() {
+                        tab.tile_ids.retain(|id| id != &crew.terminal_id);
+                    }
+                    let target = tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == destination)
+                        .ok_or_else(|| {
+                            format!(
+                                "owned Workspace '{destination}' disappeared during reconciliation"
+                            )
+                        })?;
+                    target.tile_ids.push(crew.terminal_id.clone());
+                    crew.workspace_tab_id = Some(destination);
+                    crew.state = CrewState::Active;
+                    changed = true;
+                } else {
+                    for tab in tabs.iter_mut() {
+                        tab.tile_ids.retain(|id| id != &crew.terminal_id);
+                    }
+                    crew.workspace_tab_id = None;
+                    if !matches!(crew.state, CrewState::NeedsAssignment { .. }) {
+                        crew.state = CrewState::NeedsAssignment { since: now_ms() };
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            self.commit_mutation(g, previous)?;
+        }
+        Ok(changed)
     }
 
     /// Enrich a spawned Crew reference with its durable task, harness, checkout,
@@ -3289,6 +3695,7 @@ impl CaptainsRegistry {
             harness,
             worktree_path,
             branch,
+            None,
             powder_work,
             None,
             None,
@@ -3303,6 +3710,7 @@ impl CaptainsRegistry {
         harness: &str,
         worktree_path: Option<&str>,
         branch: Option<&str>,
+        workspace_tab_id: Option<&str>,
         powder_work: PowderWorkBinding,
         expected_dispatch: Option<&DispatchAuthority>,
         expected_bind: Option<DispatchBindAuthority>,
@@ -3372,6 +3780,7 @@ impl CaptainsRegistry {
         }
         crew.worktree_path = worktree_path.map(str::to_string);
         crew.branch = branch.map(str::to_string);
+        crew.workspace_tab_id = workspace_tab_id.map(str::to_string);
         crew.powder_work = Some(powder_work);
         let result = crew.clone();
         g.seq = g.seq.saturating_add(1);
@@ -4295,6 +4704,8 @@ impl CaptainsRegistry {
                     }
                     let rec = FleetIdentity {
                         ship_slug: slug.clone(),
+                        assignment_id: assignment_id_for(None, &slug),
+                        display_name: slug.clone(),
                         role,
                         claude_uuid: (provider == Some("claude"))
                             .then(|| provider_session_id.map(str::to_string))
@@ -6875,7 +7286,7 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
-        | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
+        | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "watch_fleet"
         | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
@@ -8054,7 +8465,12 @@ fn reprobe_reaped_request(
                 .projects()
                 .into_iter()
                 .find(|project| project.project_id == project_id)?;
-            match existing_project_captain(ctx, &project_id) {
+            let ship_slug = arg_str(args, "shipSlug")
+                .or_else(|| arg_str(args, "ship_slug"))
+                .map(|value| slugify_ship(&value))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| slugify_ship(&project.name));
+            match existing_project_captain(ctx, &project_id, &ship_slug) {
                 Ok(Some(captain)) => Some(Ok(commissioned_response(captain, project, true))),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
@@ -8311,6 +8727,7 @@ fn dispatch_with_caller(
         // and every mutation forwards the authoritative captains snapshot.
         "claim_captain" => claim_captain(ctx, args, caller, trusted_internal),
         "release_captain" => release_captain(ctx, args, caller, trusted_internal),
+        "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
@@ -9762,13 +10179,16 @@ fn captain_bootstrap(ctx: &ControlContext, args: &Value) -> Result<Value, String
 fn existing_project_captain(
     ctx: &ControlContext,
     project_id: &str,
+    ship_slug: &str,
 ) -> Result<Option<CaptainRecord>, String> {
     let existing = ctx
         .captains
         .snapshot()
         .captains
         .into_iter()
-        .find(|captain| captain.project_id.as_deref() == Some(project_id));
+        .find(|captain| {
+            captain.project_id.as_deref() == Some(project_id) && captain.ship_slug == ship_slug
+        });
     let Some(captain) = existing else {
         return Ok(None);
     };
@@ -9952,16 +10372,19 @@ fn commission_captain(
                 )
             })?;
     }
+    let ship_slug = arg_str(args, "shipSlug")
+        .or_else(|| arg_str(args, "ship_slug"))
+        .map(|value| slugify_ship(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slugify_ship(&project.name));
+    if ship_slug.is_empty() {
+        return Err("commission_captain: could not derive a non-empty shipSlug".into());
+    }
     let _provision = ctx.captains.provision_guard();
-    if let Some(captain) = existing_project_captain(ctx, &project.project_id)? {
-        let requested_slug = arg_str(args, "shipSlug")
-            .or_else(|| arg_str(args, "ship_slug"))
-            .map(|value| slugify_ship(&value));
+    if let Some(captain) = existing_project_captain(ctx, &project.project_id, &ship_slug)? {
         let same_contract = captain.assignment.as_deref() == Some(assignment.as_str())
             && captain.harness.as_deref() == Some(harness.as_provider())
-            && requested_slug
-                .as_deref()
-                .is_none_or(|slug| slug == captain.ship_slug);
+            && captain.ship_slug == ship_slug;
         if !same_contract {
             return Err(format!(
                 "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
@@ -9971,16 +10394,10 @@ fn commission_captain(
         return Ok(commissioned_response(captain, project, true));
     }
 
-    let ship_slug = arg_str(args, "shipSlug")
-        .or_else(|| arg_str(args, "ship_slug"))
-        .map(|value| slugify_ship(&value))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| slugify_ship(&project.name));
-    if ship_slug.is_empty() {
-        return Err("commission_captain: could not derive a non-empty shipSlug".into());
-    }
     let provisional = CaptainRecord {
         ship_slug: ship_slug.clone(),
+        assignment_id: assignment_id_for(Some(&project.project_id), &ship_slug),
+        display_name: ship_slug.clone(),
         role: FleetRole::Captain,
         claude_uuid: None,
         provider: Some(harness.as_provider().to_string()),
@@ -10013,18 +10430,16 @@ fn commission_captain(
                 .collect()
         })
         .unwrap_or_default();
-    let mut spawn_args = json!({
+    let spawn_args = json!({
         "cwd": project.repo_root,
         "name": format!("Captain - {}", project.name),
         "startupCommand": startup_command,
         "capability": "control",
+        "tabId": CAPTAIN_WORKSPACE_ID,
     });
-    if ctx.tabs.has_tab("captains-reserved") {
-        spawn_args["tabId"] = json!("captains-reserved");
-    } else {
-        spawn_args["tabName"] = json!("Captains");
-    }
-    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    ctx.tabs
+        .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
+    let spawned = spawn_terminal_with_private_pane_command(ctx, &spawn_args, None, true, true)?;
     let terminal_id = spawned["id"]
         .as_str()
         .ok_or("commission_captain: spawn returned no terminal id")?
@@ -10226,7 +10641,7 @@ fn attach_captain(
             })?;
     }
     let _provision = ctx.captains.provision_guard();
-    if let Some(existing) = existing_project_captain(ctx, &project_id)? {
+    if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
             return Err(format!(
                 "attach_captain: project '{}' already has live Captain '{}'",
@@ -10402,6 +10817,100 @@ fn captain_and_project_for_dispatch(
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("dispatch_crew: unknown projectId '{project_id}'"))?;
     Ok((captain, project))
+}
+
+fn dispatch_workspace_candidates(ctx: &ControlContext, captain: &CaptainRecord) -> Vec<TabRecord> {
+    let mut seen = std::collections::HashSet::new();
+    captain
+        .workspace_tab_ids
+        .iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .filter_map(|id| ctx.tabs.work_workspace(id))
+        .collect()
+}
+
+fn workspace_required_error(candidates: &[TabRecord]) -> String {
+    let candidates: Vec<Value> = candidates
+        .iter()
+        .take(20)
+        .map(|tab| json!({ "id": tab.id, "name": tab.name }))
+        .collect();
+    format!(
+        "workspace_required: select one owned Work Workspace from {}",
+        Value::Array(candidates)
+    )
+}
+
+fn resolve_dispatch_workspace(
+    ctx: &ControlContext,
+    args: &Value,
+    captain: &CaptainRecord,
+) -> Result<TabRecord, String> {
+    let explicit_workspace =
+        arg_str(args, "workspaceTabId").or_else(|| arg_str(args, "workspace_tab_id"));
+    let compatibility_tab = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id"));
+    if explicit_workspace.is_some()
+        && compatibility_tab.is_some()
+        && explicit_workspace != compatibility_tab
+    {
+        return Err("dispatch_crew: workspaceTabId conflicts with tabId".into());
+    }
+    let requested_id = explicit_workspace.or(compatibility_tab);
+    let requested_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    if requested_id.is_some() && requested_name.is_some() {
+        return Err("dispatch_crew: select a Workspace by id or name, not both".into());
+    }
+    let candidates = dispatch_workspace_candidates(ctx, captain);
+    if let Some(id) = requested_id {
+        if id == CAPTAIN_WORKSPACE_ID {
+            return Err("dispatch_crew: Crew cannot be placed in Captain Workspace".into());
+        }
+        return candidates
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "dispatch_crew: Workspace '{id}' is not an existing Work Workspace owned by Captain '{}'",
+                    captain.ship_slug
+                )
+            });
+    }
+    if let Some(name) = requested_name {
+        let matching: Vec<TabRecord> = candidates
+            .into_iter()
+            .filter(|tab| tab.name == name)
+            .collect();
+        return match matching.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(format!(
+                "dispatch_crew: no owned Work Workspace is named '{name}'"
+            )),
+            _ => Err(workspace_required_error(&matching)),
+        };
+    }
+    match candidates.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(workspace_required_error(&candidates)),
+    }
+}
+
+fn revalidate_dispatch_workspace(
+    ctx: &ControlContext,
+    captain: &CaptainRecord,
+    workspace_tab_id: &str,
+) -> Result<(), String> {
+    if !captain
+        .workspace_tab_ids
+        .iter()
+        .any(|id| id == workspace_tab_id)
+        || ctx.tabs.work_workspace(workspace_tab_id).is_none()
+    {
+        return Err(format!(
+            "Workspace '{workspace_tab_id}' is stale, closed, foreign, or no longer owned by Captain '{}'",
+            captain.ship_slug
+        ));
+    }
+    Ok(())
 }
 
 fn revalidate_dispatch_authority(
@@ -10906,6 +11415,9 @@ fn dispatch_crew_with_observer_inner(
         &project,
         arg_str(args, "worktreePath").or_else(|| arg_str(args, "worktree_path")),
     )?;
+    // Resolve the exact durable destination before reservations, Powder reads,
+    // claims, terminal creation, or any other side effect.
+    let workspace = resolve_dispatch_workspace(ctx, args, &captain)?;
     let branch = arg_str(args, "branch");
     let ttl_seconds = args
         .get("ttlSeconds")
@@ -10959,17 +11471,13 @@ fn dispatch_crew_with_observer_inner(
     ctx.captains.pause_dispatch("after_preflight");
     revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
 
-    let mut spawn_args = json!({
+    let spawn_args = json!({
         "cwd": checkout,
         "name": format!("Crew - {}", card_id),
         "spawnedBy": captain_session_id,
         "capability": "read",
+        "tabId": workspace.id,
     });
-    if let Some(tab_id) = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")) {
-        spawn_args["tabId"] = json!(tab_id);
-    } else if let Some(tab_name) = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name")) {
-        spawn_args["tabName"] = json!(tab_name);
-    }
     let pending_claim = PendingDispatchClaim {
         project_id: project.project_id.clone(),
         connection_profile: binding.connection_profile.clone(),
@@ -10992,6 +11500,8 @@ fn dispatch_crew_with_observer_inner(
         ctx,
         &spawn_args,
         Some(&private_dormant_pane_command),
+        false,
+        true,
     ) {
         Ok(spawned) => spawned,
         Err(error) => {
@@ -11007,6 +11517,14 @@ fn dispatch_crew_with_observer_inner(
         .as_str()
         .ok_or("dispatch_crew: spawn returned no terminal id")?
         .to_string();
+    if let Err(error) = revalidate_dispatch_workspace(ctx, &captain, &workspace.id) {
+        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, None, None);
+        let clear = ctx.captains.clear_pending_dispatch_claim(&pending_claim);
+        return Err(dispatch_rollback_error(
+            format!("dispatch_crew: {error}"),
+            rollback.and(clear.map(|_| ())),
+        ));
+    }
     let claim = match client.claim(&card_id, ttl_seconds) {
         Ok(claim) => claim,
         Err(error) => {
@@ -11059,6 +11577,18 @@ fn dispatch_crew_with_observer_inner(
     #[cfg(test)]
     ctx.captains.pause_dispatch("after_claim");
     revalidate_or_rollback!("after claim before durable Crew binding");
+    if let Err(error) = revalidate_dispatch_workspace(ctx, &captain, &workspace.id) {
+        return Err(rollback_dispatch_authority_failure(
+            ctx,
+            &crew_session_id,
+            &client,
+            &claim,
+            &pending_claim,
+            release_recovery.as_ref(),
+            "after Workspace validation",
+            error,
+        ));
+    }
     let (_, bind_generations, _) = ctx.captains.snapshot_with_authority_generations();
     let bind_authority = DispatchBindAuthority {
         crew_generation: bind_generations
@@ -11076,6 +11606,7 @@ fn dispatch_crew_with_observer_inner(
         harness.as_provider(),
         Some(&checkout),
         branch.as_deref(),
+        Some(&workspace.id),
         PowderWorkBinding {
             card_id: claim.card_id.clone(),
             run_id: claim.run_id.clone(),
@@ -14434,19 +14965,26 @@ fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, e
 /// unconditionally. Args: `tabs`: `[{id, name, tileIds}]`; `activeTabId`
 /// (optional); `baseSeq` (optional).
 fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let tabs: Vec<TabRecord> = serde_json::from_value(
+    let mut tabs: Vec<TabRecord> = serde_json::from_value(
         args.get("tabs")
             .cloned()
             .ok_or("report_workspace_tabs requires a 'tabs' array")?,
     )
     .map_err(|e| format!("report_workspace_tabs: bad 'tabs' shape: {e}"))?;
-    let count = tabs.len();
     let active = arg_str(args, "activeTabId").or_else(|| arg_str(args, "active_tab_id"));
     let base_seq = args
         .get("baseSeq")
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
-    match ctx.tabs.report(tabs, active, base_seq) {
+    let current_seq = ctx.tabs.snapshot_full().seq;
+    let reconciled = if base_seq.is_none_or(|seq| seq == current_seq) {
+        ctx.captains.reconcile_crew_workspaces(&mut tabs)?
+    } else {
+        false
+    };
+    validate_workspace_report(&tabs, &ctx.captains)?;
+    let count = tabs.len();
+    match ctx.tabs.report(tabs, active, base_seq)? {
         ReportOutcome::Accepted {
             seq,
             removed_tab_ids,
@@ -14459,7 +14997,7 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
             for tab_id in &removed_tab_ids {
                 pruned |= ctx.captains.prune_tab(tab_id)?;
             }
-            if pruned {
+            if pruned || reconciled {
                 let _ = captains_sync_apply(ctx);
             }
             Ok(json!({ "reported": count, "seq": seq }))
@@ -15390,6 +15928,9 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ctx.tabs.auto_name());
+    if name == CAPTAIN_WORKSPACE_NAME || name == "Captains" {
+        return Err("new_tab: Captain Workspace is reserved and already exists".into());
+    }
     let id = uuid::Uuid::new_v4().to_string();
     ctx.tabs.insert_tab(&id, &name);
     let mut res = organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
@@ -15507,6 +16048,46 @@ fn captain_checkpoint(
     }))
 }
 
+fn rename_captain(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "rename_captain")?;
+    let captain_session_id =
+        arg_str(args, "captainSessionId").or_else(|| arg_str(args, "captain_session_id"));
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain_session_id
+                .as_deref()
+                .is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                || ship_slug
+                    .as_deref()
+                    .is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+        })
+        .ok_or("rename_captain: no matching Captain is registered")?;
+    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    let display_name = arg_str(args, "displayName")
+        .or_else(|| arg_str(args, "display_name"))
+        .ok_or("rename_captain requires a 'displayName' argument")?;
+    let captain = ctx.captains.rename_captain(
+        captain_session_id.as_deref(),
+        ship_slug.as_deref(),
+        &display_name,
+    )?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "rename_captain",
+        "audited": true,
+        "captain": captain,
+    }))
+}
+
 /// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
 /// of a ship. This is a durable authority mutation, separate from the UI's visual
 /// overlay pin. It is registry-first (strict: a ship already captained by another
@@ -15620,15 +16201,20 @@ fn claim_captain(
                 .filter_map(|t| t.as_str().map(str::to_string))
                 .collect()
         })
-        .filter(|tabs: &Vec<String>| !tabs.is_empty())
-        .unwrap_or_else(|| {
-            // No explicit tabs: default to the tab the captain's tile lives in
-            // (the same lookup the UI's liveness check does, but server-side).
-            ctx.tabs
-                .tab_for_tile(&captain_session_id)
-                .into_iter()
-                .collect()
-        });
+        .unwrap_or_default();
+    let mut unique_workspace_ids = std::collections::HashSet::new();
+    for workspace_id in &workspace_tab_ids {
+        if !unique_workspace_ids.insert(workspace_id.as_str()) {
+            return Err(format!(
+                "claim_captain: duplicate workspaceTabId '{workspace_id}'"
+            ));
+        }
+        if ctx.tabs.work_workspace(workspace_id).is_none() {
+            return Err(format!(
+                "claim_captain: workspaceTabId '{workspace_id}' is not an existing Work Workspace"
+            ));
+        }
+    }
     let before_seq = ctx.captains.snapshot().seq;
     // The transfer-grade liveness predicate (R1): the SOLE signal that may auto-release
     // an incumbent's slug to this claimant is its tmux session being DEFINITIVELY gone.
@@ -15874,6 +16460,11 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tab = arg_str(args, "tabId");
     match (tile, tab) {
         (Some(tile), Some(tab)) => {
+            let kind = ctx
+                .tabs
+                .kind_for_id(&tab)
+                .ok_or_else(|| format!("move_tile: unknown tabId '{tab}'"))?;
+            validate_workspace_occupant(&ctx.captains, &tile, kind)?;
             ctx.tabs.move_tile(&tile, &tab)?;
             organization_sync_apply(
                 ctx,
@@ -15908,7 +16499,7 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    spawn_terminal_with_private_pane_command(ctx, args, None)
+    spawn_terminal_with_private_pane_command(ctx, args, None, false, false)
 }
 
 /// Internal spawn variant for an already-formed private pane command.
@@ -15919,6 +16510,8 @@ fn spawn_terminal_with_private_pane_command(
     ctx: &ControlContext,
     args: &Value,
     private_pane_command: Option<&str>,
+    allow_captain_workspace: bool,
+    require_exact_tab: bool,
 ) -> Result<Value, String> {
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
@@ -15966,7 +16559,24 @@ fn spawn_terminal_with_private_pane_command(
             if !ctx.tabs.has_tab(&id) {
                 return Err(format!("spawn_terminal: unknown tabId '{id}'"));
             }
+            if id == CAPTAIN_WORKSPACE_ID && !allow_captain_workspace {
+                return Err(
+                    "spawn_terminal: only durable Cortana or Captain identities may target Captain Workspace"
+                        .into(),
+                );
+            }
             Some(id)
+        }
+        (None, Some(name)) if name == CAPTAIN_WORKSPACE_NAME || name == "Captains" => {
+            if !allow_captain_workspace {
+                return Err(
+                    "spawn_terminal: only durable Cortana or Captain identities may target Captain Workspace"
+                        .into(),
+                );
+            }
+            ctx.tabs
+                .insert_tab(CAPTAIN_WORKSPACE_ID, CAPTAIN_WORKSPACE_NAME);
+            Some(CAPTAIN_WORKSPACE_ID.to_string())
         }
         (None, Some(name)) => Some(match ctx.tabs.id_for_name(name) {
             Some(id) => id,
@@ -16031,7 +16641,25 @@ fn spawn_terminal_with_private_pane_command(
     // window between spawn and placement, the tile lands in the active (else
     // first) tab instead - never orphaned outside the registry. The response
     // carries the ACTUAL placement.
-    let placed_tab = ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref());
+    let placed_tab = if require_exact_tab {
+        let exact = tab_id.as_deref().ok_or_else(|| {
+            "spawn_terminal: exact placement requires an explicit tabId".to_string()
+        });
+        match exact.and_then(|tab_id| ctx.tabs.place_tile_exact(&id, tab_id)) {
+            Ok(tab_id) => Some(tab_id),
+            Err(error) => {
+                let _ = tmux::kill_session_tree(&tmux_session);
+                if let Some(identity) = &minted_identity {
+                    let _ = ctx.identity.retire(&identity.id);
+                }
+                return Err(format!(
+                    "spawn_terminal: exact Workspace placement failed and the terminal was rolled back: {error}"
+                ));
+            }
+        }
+    } else {
+        ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref())
+    };
 
     // Captain-chat phase 2: record the crew link under the spawning captain.
     // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
@@ -18909,10 +19537,12 @@ mod tests {
             },
         ]);
         let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
-        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["count"], 3);
         assert_eq!(tabs["tabs"][0]["id"], "t1");
         assert_eq!(tabs["tabs"][0]["tileIds"][1], "b");
         assert_eq!(tabs["tabs"][1]["name"], "Side");
+        assert_eq!(tabs["tabs"][2]["kind"], "captain");
+        assert_eq!(tabs["tabs"][2]["name"], CAPTAIN_WORKSPACE_NAME);
     }
 
     #[test]
@@ -19496,14 +20126,15 @@ mod tests {
         assert_eq!(v["reported"], 2);
 
         let tabs = dispatch(&ctx, "list_tabs", &json!({})).unwrap();
-        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["count"], 3);
         assert_eq!(tabs["tabs"][0]["id"], "t1");
         assert_eq!(tabs["tabs"][0]["tileIds"], json!(["aa", "bb"]));
         assert_eq!(tabs["tabs"][1]["name"], "ops");
+        assert_eq!(tabs["tabs"][2]["id"], CAPTAIN_WORKSPACE_ID);
 
         // A later report REPLACES wholesale (last writer wins, webview parity).
         dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": []})).unwrap();
-        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 0);
+        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 1);
 
         // Malformed shapes are a clear error, not a partial replace.
         let err = dispatch(&ctx, "report_workspace_tabs", &json!({})).unwrap_err();
@@ -20861,7 +21492,210 @@ mod tests {
             FleetRole::Captain,
             "a normal ship stays a Captain"
         );
+        assert_eq!(cap.assignment_id, "assignment:unbound:t-hub-app");
+        assert_eq!(cap.display_name, "t-hub-app");
+        assert_eq!(cap.workspace_tab_ids, vec!["t1"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn captain_identity_and_multiple_project_captains_survive_restart() {
+        let path = captains_tmp("multiple-captains-one-project");
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.upsert_project(ProjectRecord {
+            project_id: "project-shared".into(),
+            name: "Shared".into(),
+            repo_root: dispatch_test_repo_root(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+        reg.claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        reg.claim_test("captain-b", Some("beta"), vec!["work-b".into()])
+            .unwrap();
+        reg.bind_ship_context("alpha", "project-shared", "Assignment A", "codex")
+            .unwrap();
+        reg.bind_ship_context("beta", "project-shared", "Assignment B", "claude")
+            .unwrap();
+        reg.rename_captain(Some("captain-a"), None, "  Alpha Lead  ")
+            .unwrap();
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.captains.len(), 2);
+        let alpha = restored
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some("captain-a"))
+            .unwrap();
+        let beta = restored
+            .captains
+            .iter()
+            .find(|captain| captain.terminal_id.as_deref() == Some("captain-b"))
+            .unwrap();
+        assert_eq!(alpha.assignment_id, "assignment:project-shared:alpha");
+        assert_eq!(alpha.display_name, "Alpha Lead");
+        assert_eq!(beta.assignment_id, "assignment:project-shared:beta");
+        assert_ne!(alpha.assignment_id, beta.assignment_id);
+        assert!(reg
+            .rename_captain(Some("captain-a"), None, &"x".repeat(121))
+            .unwrap_err()
+            .contains("at most 120 bytes"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workspace_kind_migrates_and_reserved_workspace_is_canonical() {
+        let legacy: TabRecord = serde_json::from_value(json!({
+            "id": CAPTAIN_WORKSPACE_ID,
+            "name": "Captains",
+            "order": ["captain-a"]
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(wire["schemaVersion"], WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(wire["kind"], "captain");
+        assert_eq!(wire["name"], CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(wire["tileIds"], json!(["captain-a"]));
+
+        let tabs = TabRegistry::new();
+        tabs.replace(vec![
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: "Captains".into(),
+                tile_ids: vec!["captain-a".into()],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: "duplicate".into(),
+                tile_ids: vec!["captain-a".into(), "captain-b".into()],
+            },
+        ]);
+        let snapshot = tabs.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name, CAPTAIN_WORKSPACE_NAME);
+        assert_eq!(snapshot[0].tile_ids, vec!["captain-a", "captain-b"]);
+        assert!(tabs
+            .rename_tab(CAPTAIN_WORKSPACE_ID, "Other")
+            .unwrap_err()
+            .contains("cannot be renamed"));
+        assert!(tabs
+            .remove_tab(CAPTAIN_WORKSPACE_ID, true)
+            .unwrap_err()
+            .contains("cannot be closed"));
+        assert!(serde_json::from_value::<TabRecord>(json!({
+            "schemaVersion": 1,
+            "id": "work-a",
+            "name": "Work A",
+            "kind": "captain",
+            "tileIds": []
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("conflicts"));
+    }
+
+    #[test]
+    fn legacy_crew_workspace_reconciliation_is_exact_or_needs_assignment() {
+        let reg = CaptainsRegistry::new();
+        reg.claim_test(
+            "captain-a",
+            Some("alpha"),
+            vec!["work-a".into(), "work-b".into()],
+        )
+        .unwrap();
+        reg.record_crew("captain-a", "crew-exact").unwrap();
+        reg.record_crew("captain-a", "crew-ambiguous").unwrap();
+        let mut tabs = vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["crew-exact".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec!["captain-a".into(), "crew-ambiguous".into()],
+            },
+        ];
+        assert!(reg.reconcile_crew_workspaces(&mut tabs).unwrap());
+        let captain = &reg.snapshot().captains[0];
+        let exact = captain
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == "crew-exact")
+            .unwrap();
+        assert_eq!(exact.workspace_tab_id.as_deref(), Some("work-a"));
+        assert_eq!(exact.state, CrewState::Active);
+        let ambiguous = captain
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == "crew-ambiguous")
+            .unwrap();
+        assert!(matches!(ambiguous.state, CrewState::NeedsAssignment { .. }));
+        assert!(tabs
+            .iter()
+            .all(|tab| !tab.tile_ids.iter().any(|id| id == "crew-ambiguous")));
+        assert!(!reg.reconcile_crew_workspaces(&mut tabs).unwrap());
+    }
+
+    #[test]
+    fn dispatch_workspace_resolution_is_owned_exact_and_bounded() {
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test(
+            "captain-a",
+            Some("alpha"),
+            vec!["work-a".into(), "work-b".into(), "foreign".into()],
+        )
+        .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "work-a".into(),
+                name: "Shared".into(),
+                tile_ids: Vec::new(),
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Shared".into(),
+                tile_ids: Vec::new(),
+            },
+        ]);
+        let ctx = test_ctx("dispatch-workspace")
+            .with_captains_registry(reg.clone())
+            .with_tab_registry(tabs);
+        let captain = reg.snapshot().captains[0].clone();
+        let error = resolve_dispatch_workspace(&ctx, &json!({}), &captain).unwrap_err();
+        assert!(error.starts_with("workspace_required:"));
+        assert!(error.contains("work-a"));
+        assert!(error.contains("work-b"));
+        assert!(!error.contains("foreign"));
+        assert!(resolve_dispatch_workspace(
+            &ctx,
+            &json!({"workspaceTabId": CAPTAIN_WORKSPACE_ID}),
+            &captain
+        )
+        .unwrap_err()
+        .contains("Crew cannot"));
+        assert_eq!(
+            resolve_dispatch_workspace(&ctx, &json!({"workspaceTabId": "work-a"}), &captain)
+                .unwrap()
+                .id,
+            "work-a"
+        );
+        assert!(
+            resolve_dispatch_workspace(&ctx, &json!({"tabName": "Shared"}), &captain)
+                .unwrap_err()
+                .starts_with("workspace_required:")
+        );
     }
 
     #[test]
@@ -21895,11 +22729,18 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("secret").with_apply_sink(sink);
-        ctx.tab_registry().replace(vec![TabRecord {
-            id: "captains-reserved".into(),
-            name: "Captains".into(),
-            tile_ids: vec![],
-        }]);
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "project-tab".into(),
+                name: "Commission Crew".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            },
+        ]);
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-e2e".into(),
@@ -21976,6 +22817,8 @@ mod tests {
         let runtime_repo_root = "/home/natkins/projects/tools/t-hub/t-hub-app";
         let captain = CaptainRecord {
             ship_slug: "t-hub-app".into(),
+            assignment_id: "assignment:project-1:t-hub-app".into(),
+            display_name: "t-hub-app".into(),
             role: FleetRole::Captain,
             claude_uuid: None,
             provider: Some("codex".into()),
@@ -22728,14 +23571,14 @@ mod tests {
             .to_string();
         wait_for_harness_started(&cap_id, "codex").unwrap();
 
-        // Claim with NO explicit workspaceTabIds: defaults to the tab holding
-        // the captain's tile (the UI pin path sends exactly this shape).
+        // Claim with no explicit workspaceTabIds does not infer Work Workspace
+        // ownership from the Captain terminal's current placement.
         let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": cap_id})).unwrap();
         assert_eq!(v["accepted"], "claim_captain");
         assert_eq!(v["audited"], true);
         assert_eq!(v["applied"], true);
         assert_eq!(v["captain"]["shipSlug"], format!("ship-{cap_id}"));
-        assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
+        assert_eq!(v["captain"]["workspaceTabIds"], json!([]));
         assert_eq!(v["captain"]["terminalId"], cap_id);
 
         let v = dispatch(
@@ -27164,7 +28007,11 @@ mod tests {
             })
             .unwrap();
         registry
-            .claim_test(captain_session_id, Some("dispatch-attestation"), vec![])
+            .claim_test(
+                captain_session_id,
+                Some("dispatch-attestation"),
+                vec!["dispatch-workspace".into()],
+            )
             .unwrap();
         registry
             .bind_ship_context(
@@ -27183,8 +28030,15 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "dispatch-workspace".into(),
+            name: "Dispatch Crew".into(),
+            tile_ids: Vec::new(),
+        }]);
         let ctx = test_ctx("dispatch-attestation")
             .with_captains_registry(registry)
+            .with_tab_registry(tabs)
             .with_apply_sink(sink.clone());
         (ctx, sink)
     }
