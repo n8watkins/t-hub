@@ -1926,6 +1926,93 @@ fn validate_workspace_report_records(
     Ok(())
 }
 
+fn validate_unique_workspace_placements(tabs: &[TabRecord]) -> Result<(), String> {
+    let mut placed = std::collections::HashSet::new();
+    for tab in tabs {
+        for terminal_id in &tab.tile_ids {
+            if !placed.insert(terminal_id.as_str()) {
+                return Err(format!(
+                    "Workspace report assigns terminal '{terminal_id}' more than once"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_supervisor_workspace_candidates(
+    captains: &[CaptainRecord],
+    tabs: &mut [TabRecord],
+) -> Result<bool, String> {
+    let supervisors = captains
+        .iter()
+        .filter(|captain| captain.state == ClaimState::Active)
+        .filter_map(|captain| captain.terminal_id.as_ref())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for terminal_id in supervisors {
+        let exact = tabs.iter().all(|tab| {
+            let occurrences = tab
+                .tile_ids
+                .iter()
+                .filter(|tile| *tile == &terminal_id)
+                .count();
+            if tab.id == CAPTAIN_WORKSPACE_ID {
+                occurrences == 1
+            } else {
+                occurrences == 0
+            }
+        });
+        if exact {
+            continue;
+        }
+        for tab in tabs.iter_mut() {
+            tab.tile_ids.retain(|tile| tile != &terminal_id);
+        }
+        tabs.iter_mut()
+            .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+            .ok_or("Captain Workspace disappeared during startup reconciliation")?
+            .tile_ids
+            .push(terminal_id);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn startup_supervisor_reconciliation_required(
+    captains: &[CaptainRecord],
+    current_tabs: &[TabRecord],
+    reported_tabs: &[TabRecord],
+) -> Result<bool, String> {
+    let placements = |tabs: &[TabRecord], terminal_id: &str| {
+        tabs.iter()
+            .filter(|tab| tab.tile_ids.iter().any(|tile| tile == terminal_id))
+            .map(|tab| tab.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut required = false;
+    for terminal_id in captains
+        .iter()
+        .filter(|captain| captain.state == ClaimState::Active)
+        .filter_map(|captain| captain.terminal_id.as_deref())
+    {
+        let reported = placements(reported_tabs, terminal_id);
+        if reported == [CAPTAIN_WORKSPACE_ID.to_string()] {
+            continue;
+        }
+        let current = placements(current_tabs, terminal_id);
+        if reported != current {
+            validate_workspace_report_records(reported_tabs, captains)?;
+            return Err(format!(
+                "Workspace report attempted to redesignate Captain terminal '{terminal_id}' outside startup reconciliation"
+            ));
+        }
+        required = true;
+    }
+    Ok(required)
+}
+
 fn reconcile_crew_workspace_candidates(
     captains: &mut [CaptainRecord],
     tabs: &mut [TabRecord],
@@ -2012,9 +2099,10 @@ pub fn apply_workspace_report(
     tabs: Vec<TabRecord>,
     active_tab_id: Option<String>,
     base_seq: Option<u64>,
-) -> Result<(ReportOutcome, bool), String> {
+) -> Result<(ReportOutcome, bool, bool), String> {
     let _identity_transaction = tabs_registry.identity_transaction();
     let mut tabs = TabRegistry::normalize_tabs(tabs)?;
+    validate_unique_workspace_placements(&tabs)?;
     let _mutation = captains_registry
         .mutation
         .lock()
@@ -2028,15 +2116,23 @@ pub fn apply_workspace_report(
                 tabs: current_tabs.tabs.clone(),
             }),
             false,
+            false,
         ));
     }
 
     let current_captains = captains_registry.lock();
-    validate_workspace_report_records(&tabs, &current_captains.captains)?;
     let previous_captains = current_captains.clone();
     let mut candidate_captains = current_captains.clone();
-    let reconciled =
+    let supervisor_reconciled =
+        startup_supervisor_reconciliation_required(
+            &candidate_captains.captains,
+            &current_tabs.tabs,
+            &tabs,
+        )? && reconcile_supervisor_workspace_candidates(&candidate_captains.captains, &mut tabs)?;
+    validate_workspace_report_records(&tabs, &current_captains.captains)?;
+    let crew_reconciled =
         reconcile_crew_workspace_candidates(&mut candidate_captains.captains, &mut tabs)?;
+    let reconciled = supervisor_reconciled || crew_reconciled;
     validate_workspace_report_records(&tabs, &candidate_captains.captains)?;
     let removed_tab_ids = current_tabs
         .tabs
@@ -2052,7 +2148,7 @@ pub fn apply_workspace_report(
             .retain(|id| !removed_tab_ids.contains(id));
         pruned |= captain.workspace_tab_ids.len() != before;
     }
-    let captains_changed = reconciled || pruned;
+    let captains_changed = crew_reconciled || pruned;
     if captains_changed {
         candidate_captains.seq = candidate_captains.seq.saturating_add(1);
         let changes = AuthorityGenerationChanges::between(&previous_captains, &candidate_captains);
@@ -2090,6 +2186,7 @@ pub fn apply_workspace_report(
             removed_tab_ids,
         },
         captains_changed,
+        reconciled,
     ))
 }
 
@@ -15241,13 +15338,20 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .and_then(|v| v.as_u64());
 
     match apply_workspace_report(&ctx.tabs, &ctx.captains, tabs, active, base_seq)? {
-        (ReportOutcome::Accepted { seq, .. }, captains_changed) => {
+        (ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled) => {
             if captains_changed {
                 let _ = captains_sync_apply(ctx);
             }
-            Ok(json!({ "reported": count, "seq": seq }))
+            let snapshot = ctx.tabs.snapshot_full();
+            Ok(json!({
+                "reported": count,
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            }))
         }
-        (ReportOutcome::Stale(snapshot), _) => Ok(json!({
+        (ReportOutcome::Stale(snapshot), _, _) => Ok(json!({
             "stale": true,
             "seq": snapshot.seq,
             "activeTabId": snapshot.active_tab_id,
@@ -22432,6 +22536,65 @@ mod tests {
             serde_json::to_value(after_tabs.tabs).unwrap(),
             serde_json::to_value(before_tabs.tabs).unwrap()
         );
+    }
+
+    #[test]
+    fn restart_report_reconciles_a_durable_captain_from_stale_work_placement() {
+        let path = captains_tmp("captain-relocation-crash");
+        CaptainsRegistry::load(path.clone())
+            .claim_test("captain-a", Some("alpha"), vec!["work-a".into()])
+            .unwrap();
+        let captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![TabRecord {
+            id: "work-a".into(),
+            name: "Work A".into(),
+            tile_ids: vec!["captain-a".into()],
+        }]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let context = test_ctx("captain-relocation-crash")
+            .with_captains_registry(Arc::clone(&captains))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_apply_sink(sink.clone());
+        let stale = tabs.snapshot_full();
+
+        let response = dispatch(
+            &context,
+            "report_workspace_tabs",
+            &json!({
+                "baseSeq": stale.seq,
+                "tabs": stale.tabs,
+                "activeTabId": stale.active_tab_id
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["stale"], true);
+        assert_eq!(
+            response["tabs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tab| tab["id"] == CAPTAIN_WORKSPACE_ID)
+                .unwrap()["tileIds"],
+            json!(["captain-a"])
+        );
+        let converged = tabs.snapshot_full();
+        assert!(!converged.tabs[0].tile_ids.contains(&"captain-a".into()));
+        assert_eq!(
+            converged
+                .tabs
+                .iter()
+                .find(|tab| tab.id == CAPTAIN_WORKSPACE_ID)
+                .unwrap()
+                .tile_ids,
+            vec!["captain-a".to_string()]
+        );
+        assert!(sink.calls.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

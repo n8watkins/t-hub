@@ -232,13 +232,19 @@ fn report_workspace_tabs(
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
     match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
-        Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed)) => {
+        Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
             if captains_changed {
                 commands::forward_captains_sync(&app, &captains, &fanout);
             }
-            serde_json::json!({ "seq": seq })
+            let snapshot = registry.snapshot_full();
+            serde_json::json!({
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            })
         }
-        Ok((control::ReportOutcome::Stale(snap), _)) => serde_json::json!({
+        Ok((control::ReportOutcome::Stale(snap), _, _)) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
             "activeTabId": snap.active_tab_id,
