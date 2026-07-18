@@ -689,6 +689,9 @@ No broad control or workspace aggregate was rerun for this focused remediation.
 The code is ready for an authorized installed-runtime reconciliation of the existing exact T-Hub intent.
 This Crew session intentionally did not attempt that live reconciliation because the task forbids reading the protected profile or mutating the installed runtime, and its authenticated Captain plane is read-only.
 Accordingly, this packet does not claim that the live local intent has already been cleared or that a Captain report was delivered.
+An authenticated `th send` report to Captain session `0c7b7560` was attempted from evidence head `2c4e3c042dd4388c01191961c296ac3960f566a6`.
+The installed control plane rejected it with gated exit code `5` because `send_text` requires control capability and this Crew token is read-only.
+No Captain message delivery is claimed.
 
 ## Independent Reviewer Checklist
 
