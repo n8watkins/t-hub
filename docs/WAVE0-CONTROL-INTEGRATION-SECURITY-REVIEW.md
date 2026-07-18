@@ -637,6 +637,21 @@ An authenticated `th send` report for this follow-up was attempted from evidence
 The installed control plane rejected it with gated exit code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+## Retained Aggregate Gates
+
+At exact approved head `01acc1c28b9e0be9ce6c20dbcbc3480cec182750`, a single serial control aggregate ran from `apps/desktop/src-tauri` with `RUST_TEST_THREADS=1`, `--test-threads=1`, `pipefail`, and `timeout --signal=TERM --kill-after=30s 15m`.
+It used the fresh socket `t-hub-wave0-control-final-804346-1784343227`, which was absent before launch and explicitly removed after the aggregate completed.
+The complete control log is `/tmp/wave0-control-aggregate-01acc1c28b9e-20260717T195347.log`.
+The control aggregate passed 369 tests with 1 ignored test and zero failures in 84.15 seconds.
+The retained log elapsed time from launch timestamp to final write was 84 seconds.
+
+After that successful control gate, a single serial workspace aggregate ran from the same directory with `RUST_TEST_THREADS=1`, `--test-threads=1`, `pipefail`, and `timeout --signal=TERM --kill-after=30s 30m`.
+It used the new fresh socket `t-hub-wave0-workspace-final-804346-1784343342`, which was absent before launch and explicitly removed after completion.
+The complete workspace log is `/tmp/wave0-workspace-aggregate-01acc1c28b9e-20260717T195542.log`.
+The workspace gate passed with zero failures across `t_hub_lib` at 888 passed and 2 ignored, MCP E2E at 2 passed and 1 ignored, `t_hub_agent` at 55 passed plus 3 and 1 E2E tests, `t_hub_mcp` at 16 and 75 passed, and `t_hub_protocol` at 8 passed.
+The workspace log elapsed time from launch timestamp to final write was 124 seconds.
+No aggregate was rerun.
+
 ## Independent Reviewer Checklist
 
 1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
