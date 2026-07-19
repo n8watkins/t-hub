@@ -403,6 +403,42 @@ pub(crate) fn set_session_environment_exact(
     Ok(())
 }
 
+/// Remove private environment values from one exact existing session.
+///
+/// Every requested key is attempted even if an earlier removal fails, so one
+/// malformed or transiently unreadable entry cannot leave the remaining bearer
+/// values behind without an error.
+pub(crate) fn unset_session_environment_exact(
+    name: &str,
+    keys: &[String],
+) -> Result<(), TmuxError> {
+    let target = format!("={name}");
+    let mut first_error = None;
+    for key in keys {
+        let result = if key.is_empty()
+            || key.contains('=')
+            || key.chars().any(char::is_whitespace)
+            || key.chars().any(char::is_control)
+        {
+            Err(TmuxError {
+                op: "set-environment",
+                code: None,
+                message: "session environment key is malformed".into(),
+            })
+        } else {
+            run(
+                "set-environment",
+                &["set-environment", "-u", "-t", &target, key],
+            )
+            .map(|_| ())
+        };
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
 /// per-session environment variables via tmux `-e` (socket-gate Phase 2b).
 ///
@@ -1425,6 +1461,33 @@ mod tests {
             ExactGenerationKill::GenerationMismatch
         );
         assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
+    }
+
+    #[test]
+    fn exact_session_environment_scrub_removes_every_credential_key() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let env = vec![
+            ("T_HUB_CONTROL_ADDR".to_string(), "127.0.0.1:1".to_string()),
+            (
+                "T_HUB_CONTROL_TOKEN".to_string(),
+                "control-secret".to_string(),
+            ),
+            (
+                "T_HUB_SESSION_TOKEN".to_string(),
+                "session-secret".to_string(),
+            ),
+        ];
+        set_session_environment_exact(&target.name, &env).unwrap();
+        let keys = env.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        unset_session_environment_exact(&target.name, &keys).unwrap();
+        for key in keys {
+            assert_eq!(session_environment_exact(&target.name, &key).unwrap(), None);
+        }
     }
 
     #[test]

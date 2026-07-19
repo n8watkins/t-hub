@@ -236,6 +236,40 @@ pub(crate) struct OpenedHarnessProviderLaunch {
     opened_path: PathBuf,
 }
 
+struct TmuxCredentialEnvironmentGuard {
+    target: String,
+    keys: Vec<String>,
+    scrubbed: bool,
+}
+
+impl TmuxCredentialEnvironmentGuard {
+    fn new(target: &str, env: &[(String, String)]) -> Self {
+        let mut keys = env.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        Self {
+            target: target.to_string(),
+            keys,
+            scrubbed: false,
+        }
+    }
+
+    fn scrub(&mut self) -> Result<(), LaunchAttestationError> {
+        crate::tmux::unset_session_environment_exact(&self.target, &self.keys)
+            .map_err(|_| LaunchAttestationError::CredentialScrubFailed)?;
+        self.scrubbed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TmuxCredentialEnvironmentGuard {
+    fn drop(&mut self) {
+        if !self.scrubbed {
+            let _ = crate::tmux::unset_session_environment_exact(&self.target, &self.keys);
+        }
+    }
+}
+
 impl OpenedHarnessProviderLaunch {
     #[cfg(test)]
     pub(crate) fn test_receipt(&self) -> VerifiedHarnessProviderLaunch {
@@ -286,15 +320,28 @@ impl OpenedHarnessProviderLaunch {
         for binding in &self.provenance {
             binding.revalidate()?;
         }
-        crate::tmux::set_session_environment_exact(tmux_target, env)
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let mut credential_guard = TmuxCredentialEnvironmentGuard::new(tmux_target, env);
+        if crate::tmux::set_session_environment_exact(tmux_target, env).is_err() {
+            return match credential_guard.scrub() {
+                Ok(()) => Err(LaunchAttestationError::UnreadableEvidence),
+                Err(error) => Err(error),
+            };
+        }
         let launch_command = format!(
             "exec {}{}",
             sh_single_quote(&alias.to_string_lossy()),
             command_tail
         );
-        let respawn = crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command)
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let respawn = match crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command) {
+            Ok(respawn) => respawn,
+            Err(_) => {
+                return match credential_guard.scrub() {
+                    Ok(()) => Err(LaunchAttestationError::UnreadableEvidence),
+                    Err(error) => Err(error),
+                };
+            }
+        };
+        credential_guard.scrub()?;
         let mut observed = None;
         for _ in 0..20 {
             match observe_harness_process(tmux_target) {
@@ -538,6 +585,7 @@ pub enum LaunchAttestationError {
     ProcessChanged,
     AncestryChanged,
     UntrustedUserInstall,
+    CredentialScrubFailed,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -566,6 +614,9 @@ impl std::fmt::Display for LaunchAttestationError {
             }
             Self::UntrustedUserInstall => {
                 "user-managed provider install is not launch authority; provision a protected package snapshot and root-owned /etc/t-hub/provider-catalog.json mapping"
+            }
+            Self::CredentialScrubFailed => {
+                "provider launch credentials could not be scrubbed from the exact tmux session environment"
             }
         };
         f.write_str(message)
@@ -3655,8 +3706,95 @@ mod tests {
             provider_arguments(launch.evidence(), Harness::Codex).unwrap()[0],
             "--proof"
         );
+        assert_eq!(
+            crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN").unwrap(),
+            None
+        );
         drop(launch);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_tmux_handoff_scrubs_credentials_on_partial_set_and_process_rejection() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("tmux is unavailable - skipping credential scrub fixture");
+            return;
+        }
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::kill_session(&self.0);
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let provider = package_bin.join("codex.js");
+        std::fs::write(&provider, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&provider, &launcher).unwrap();
+        let mut guards = Vec::new();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let partial_target = format!("th_scrub_partial_{}", &suffix[..8]);
+        crate::tmux::new_session_with_env(&partial_target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        guards.push(SessionGuard(partial_target.clone()));
+        let opened =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        assert!(matches!(
+            opened.launch_in_exact_tmux_pane(
+                Harness::Codex,
+                &partial_target,
+                "/tmp",
+                "codex",
+                &[
+                    ("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into()),
+                    ("MALFORMED KEY".into(), "never-authoritative".into()),
+                ],
+            ),
+            Err(LaunchAttestationError::CredentialScrubFailed)
+        ));
+        assert_eq!(
+            crate::tmux::session_environment_exact(&partial_target, "T_HUB_SESSION_TOKEN").unwrap(),
+            None
+        );
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let rejected_target = format!("th_scrub_reject_{}", &suffix[..8]);
+        crate::tmux::new_session_with_env(&rejected_target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        guards.push(SessionGuard(rejected_target.clone()));
+        let opened =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        assert!(opened
+            .launch_in_exact_tmux_pane(
+                Harness::Codex,
+                &rejected_target,
+                "/tmp",
+                "codex",
+                &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+            )
+            .is_err());
+        assert_eq!(
+            crate::tmux::session_environment_exact(&rejected_target, "T_HUB_SESSION_TOKEN")
+                .unwrap(),
+            None
+        );
+        drop(guards);
     }
 
     #[cfg(unix)]

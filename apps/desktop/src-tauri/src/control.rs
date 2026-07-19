@@ -19132,11 +19132,33 @@ fn record_cortana_worker_failure(
     tmux_session_id: &str,
     error: &str,
 ) -> Result<(), String> {
-    let _ = tmux::kill_session_tree(tmux_session_id);
-    let gone = matches!(
-        tmux::session_liveness(tmux_session_id),
-        tmux::SessionLiveness::Gone
-    );
+    record_cortana_worker_failure_with_cleanup(
+        ctx,
+        operation_id,
+        request_digest,
+        tmux_session_id,
+        error,
+        &|target| tmux::kill_session_tree(target).map_err(|failure| failure.to_string()),
+        &tmux::session_liveness,
+    )
+}
+
+#[cfg(unix)]
+fn record_cortana_worker_failure_with_cleanup<K, L>(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+    tmux_session_id: &str,
+    error: &str,
+    kill: &K,
+    liveness: &L,
+) -> Result<(), String>
+where
+    K: Fn(&str) -> Result<(), String>,
+    L: Fn(&str) -> tmux::SessionLiveness,
+{
+    let _ = kill(tmux_session_id);
+    let gone = matches!(liveness(tmux_session_id), tmux::SessionLiveness::Gone);
     let guidance = if gone {
         "The exact Cortana candidate failed launch attestation and was removed; replay recovery after inspecting provider installation provenance."
     } else {
@@ -25301,6 +25323,89 @@ mod tests {
         assert!(replacement.generation > allocated.generation);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_scrub_failure_stays_cleanup_pending_until_candidate_is_gone() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let prepared = registry
+            .prepare_cortana_ensure(
+                "ensure-credential-scrub-failure",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap()
+            .0;
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let (_, identity) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                1,
+                101,
+            )
+            .unwrap();
+        let target = format!(
+            "th_{}",
+            cortana_candidate_terminal_id(&intent.request_digest).unwrap()
+        );
+        let error = record_cortana_worker_failure_with_cleanup(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &target,
+            &crate::harness::LaunchAttestationError::CredentialScrubFailed.to_string(),
+            &|_| Err("injected exact cleanup failure".into()),
+            &|_| tmux::SessionLiveness::Alive,
+        )
+        .unwrap_err();
+        assert!(error.contains("credential"));
+        assert!(error.contains("confirmed gone: false"));
+        let pending = registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(pending.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(
+            pending.ensure_intent.unwrap().phase,
+            CortanaEnsurePhase::CleanupPending
+        );
+        assert!(identities.resolve(&identity.secret).is_some());
+
+        let gone = record_cortana_worker_failure_with_cleanup(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &target,
+            &crate::harness::LaunchAttestationError::CredentialScrubFailed.to_string(),
+            &|_| Ok(()),
+            &|_| tmux::SessionLiveness::Gone,
+        )
+        .unwrap_err();
+        assert!(gone.contains("confirmed gone: true"));
+        let failed = registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(failed.lifecycle, CortanaRuntimeLifecycle::Failed);
+        assert_eq!(
+            failed.ensure_intent.unwrap().phase,
+            CortanaEnsurePhase::Failed
+        );
+        assert!(identities.resolve(&identity.secret).is_none());
+    }
+
     #[test]
     fn cortana_candidate_journal_rolls_back_persist_failures_and_replays_each_phase() {
         let path = captains_tmp("cortana-phase-persist-rollback");
@@ -26176,6 +26281,17 @@ mod tests {
                 .lifecycle,
             CortanaRuntimeLifecycle::Ready
         );
+        for key in [
+            "T_HUB_CONTROL_ADDR",
+            "T_HUB_CONTROL_TOKEN",
+            crate::identity::SESSION_TOKEN_ENV,
+        ] {
+            assert_eq!(
+                tmux::session_environment_exact(&_session.0, key).unwrap(),
+                None,
+                "credential key {key} remained in the tmux session environment"
+            );
+        }
         let replayed = run_cortana_worker_once_with_provider(&ctx, |_| {
             panic!("committed replay must not resolve or relaunch a provider")
         })
