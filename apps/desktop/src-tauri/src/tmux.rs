@@ -322,6 +322,30 @@ exit 0
         expected: PaneGeneration,
         process_cgroup: &ProcessCgroupGeneration,
     ) -> Result<(), TmuxError> {
+        self.validate_candidate_membership(name, expected, process_cgroup, true)
+    }
+
+    /// Revalidate the exact candidate after the guardian has reaped its anchor.
+    ///
+    /// The durable callback and guardian shutdown are complete before this
+    /// snapshot, so state introduced during either interval cannot evade the
+    /// final credential-release precondition.
+    pub(crate) fn validate_candidate_after_disarm(
+        &self,
+        name: &str,
+        expected: PaneGeneration,
+        process_cgroup: &ProcessCgroupGeneration,
+    ) -> Result<(), TmuxError> {
+        self.validate_candidate_membership(name, expected, process_cgroup, false)
+    }
+
+    fn validate_candidate_membership(
+        &self,
+        name: &str,
+        expected: PaneGeneration,
+        process_cgroup: &ProcessCgroupGeneration,
+        include_anchor: bool,
+    ) -> Result<(), TmuxError> {
         use std::os::unix::fs::MetadataExt;
 
         let metadata = std::fs::metadata(&process_cgroup.path).map_err(|error| TmuxError {
@@ -376,7 +400,10 @@ exit 0
         .filter_map(|task| task.trim().parse::<u32>().ok())
         .collect::<Vec<_>>();
         tasks.sort_unstable();
-        let mut expected_tasks = [expected.pane_pid, self.anchor_pid];
+        let mut expected_tasks = vec![expected.pane_pid];
+        if include_anchor {
+            expected_tasks.push(self.anchor_pid);
+        }
         expected_tasks.sort_unstable();
         if !self.owns(metadata.dev(), metadata.ino())
             || metadata.dev() != process_cgroup.device
