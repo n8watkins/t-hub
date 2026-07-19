@@ -1096,10 +1096,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 23;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 24;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 7;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 22 && CORTANA_RUNTIME_SCHEMA_VERSION > 6);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 8;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 23 && CORTANA_RUNTIME_SCHEMA_VERSION > 7);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1648,6 +1648,7 @@ fn validate_cortana_attestation(
         Some(&provider_session.conversation_id),
         "receiptConversationId",
     )?;
+    validate_cortana_process_cgroup(receipt.terminal.process_cgroup.as_ref())?;
     if attestation.session_identity_generation == 0
         || attestation.tmux_session_id != format!("th_{}", attestation.terminal_id)
         || attestation.authority_generation != expected_authority_generation
@@ -1731,6 +1732,7 @@ fn validate_cortana_candidate(
         if spawn_generation.tmux_target != candidate.tmux_session_id
             || spawn_generation.session_created == 0
             || spawn_generation.pane_pid == 0
+            || validate_cortana_process_cgroup(spawn_generation.process_cgroup.as_ref()).is_err()
         {
             return Err("Cortana spawn evidence is not for the reserved tmux target".into());
         }
@@ -1744,6 +1746,9 @@ fn validate_cortana_candidate(
         if cleanup_generation.tmux_target != candidate.tmux_session_id
             || cleanup_generation.session_created == 0
             || cleanup_generation.pane_pid == 0
+            || (candidate.spawned_at.is_some()
+                && validate_cortana_process_cgroup(cleanup_generation.process_cgroup.as_ref())
+                    .is_err())
         {
             return Err("Cortana cleanup evidence is not for the reserved tmux target".into());
         }
@@ -1793,6 +1798,45 @@ fn validate_cortana_candidate(
         {
             return Err("Cortana candidate attestation does not match its spawned identity".into());
         }
+    }
+    Ok(())
+}
+
+fn validate_cortana_process_cgroup(
+    receipt: Option<&crate::harness::HarnessProcessCgroupReceipt>,
+) -> Result<(), String> {
+    let receipt = receipt.ok_or("Cortana process cgroup evidence is missing")?;
+    validate_cortana_optional_text(Some(&receipt.path), "processCgroupPath")?;
+    let path = Path::new(&receipt.path);
+    let canonical_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("t-hub-cortana-"))
+        .is_some_and(|identity| {
+            identity.len() == 32
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        });
+    if !path.is_absolute()
+        || !path.starts_with("/sys/fs/cgroup/user.slice/")
+        || !receipt.path.contains("/app.slice/app-tmux.slice/")
+        || !path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|parent| parent.to_str())
+            .is_some_and(|parent| parent.starts_with("tmux-spawn-") && parent.ends_with(".scope"))
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+        || !canonical_name
+        || receipt.device == 0
+        || receipt.inode == 0
+    {
+        return Err("Cortana process cgroup evidence is malformed".into());
     }
     Ok(())
 }
@@ -3034,6 +3078,91 @@ fn migrate_cortana_runtime_v6_document(document: &mut Value) -> Result<(), Strin
             intent.insert("requestDigest".into(), Value::from(digest));
         }
         runtime.insert("schemaVersion".into(), Value::from(7));
+    }
+    Ok(())
+}
+
+/// Lift schema-23/runtime-7 only when no persisted launch or Ready evidence
+/// would require inventing the private cgroup identity introduced by runtime
+/// schema 8. Pre-launch intents retain their immutable request and receive a
+/// recomputed schema-8 digest. Any spawned generation remains byte-preserved
+/// behind incompatible recovery for operator inspection.
+fn migrate_cortana_runtime_v7_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-23 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-23 Cortana runtime is not an object")?;
+        if runtime.get("schemaVersion").and_then(Value::as_u64) != Some(7) {
+            return Err("schema-23 Cortana runtime has an unsupported nested version".into());
+        }
+        if runtime
+            .get("runtimeAttestation")
+            .is_some_and(|attestation| !attestation.is_null())
+        {
+            return Err("schema-23 Ready evidence lacks a private process cgroup identity".into());
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        {
+            let intent = intent
+                .as_object_mut()
+                .ok_or("schema-23 Cortana ensure intent is not an object")?;
+            if intent.get("schemaVersion").and_then(Value::as_u64) != Some(7) {
+                return Err("schema-23 Cortana ensure intent has an unsupported version".into());
+            }
+            let operation_id = intent
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or("schema-23 Cortana ensure intent lacks operationId")?
+                .to_string();
+            let request = intent
+                .get("request")
+                .ok_or("schema-23 Cortana ensure intent lacks request")?
+                .clone();
+            let stored_digest = intent
+                .get("requestDigest")
+                .and_then(Value::as_str)
+                .ok_or("schema-23 Cortana ensure intent lacks requestDigest")?;
+            if stored_digest != cortana_ensure_request_digest_parts(7, &operation_id, &request)? {
+                return Err(
+                    "schema-23 Cortana ensure request digest does not match schema 7".into(),
+                );
+            }
+            if intent
+                .get("candidate")
+                .and_then(Value::as_object)
+                .is_some_and(|candidate| {
+                    candidate
+                        .get("spawnGeneration")
+                        .is_some_and(|generation| !generation.is_null())
+                        || candidate
+                            .get("spawnedAt")
+                            .is_some_and(|spawned_at| !spawned_at.is_null())
+                        || candidate
+                            .get("runtimeAttestation")
+                            .is_some_and(|attestation| !attestation.is_null())
+                })
+            {
+                return Err(
+                    "schema-23 spawned evidence lacks a private process cgroup identity".into(),
+                );
+            }
+            let digest = cortana_ensure_request_digest_parts(8, &operation_id, &request)?;
+            intent.insert("schemaVersion".into(), Value::from(8));
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        runtime.insert("schemaVersion".into(), Value::from(8));
     }
     Ok(())
 }
@@ -4794,7 +4923,7 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_prior_cortana_recovery = matches!(schema_version, 18..=22)
+        let has_prior_cortana_recovery = matches!(schema_version, 18..=23)
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -4835,6 +4964,13 @@ impl CaptainsRegistry {
         }
         if matches!(schema_version, 18..=22) {
             migrate_cortana_runtime_v6_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        if matches!(schema_version, 18..=23) {
+            migrate_cortana_runtime_v7_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -19273,6 +19409,7 @@ fn record_cortana_worker_failure(
     cleanup_generation: &HarnessTerminalGenerationReceipt,
     error: &str,
 ) -> Result<(), String> {
+    let process_cgroup = process_cgroup_generation(cleanup_generation);
     record_cortana_worker_failure_with_effects(
         ctx,
         operation_id,
@@ -19281,7 +19418,7 @@ fn record_cortana_worker_failure(
         cleanup_generation,
         error,
         |target, expected| {
-            tmux::kill_session_tree_exact_generation(target, expected)
+            tmux::kill_session_tree_exact_generation(target, expected, process_cgroup.as_ref())
                 .map_err(|cleanup_error| cleanup_error.to_string())
         },
         tmux::session_liveness,
@@ -19405,8 +19542,13 @@ fn reconcile_cortana_incumbent(
         request_digest,
         &observe_incumbent_terminal,
         &|target, expected| {
-            tmux::kill_session_tree_exact_generation(target, expected)
-                .map_err(|error| error.to_string())
+            let process_cgroup = process_cgroup_generation(expected);
+            tmux::kill_session_tree_exact_generation(
+                target,
+                incumbent_pane_generation(expected),
+                process_cgroup.as_ref(),
+            )
+            .map_err(|error| error.to_string())
         },
     )
 }
@@ -19429,6 +19571,20 @@ fn incumbent_pane_generation(receipt: &HarnessTerminalGenerationReceipt) -> tmux
         pane_id: receipt.pane_id,
         pane_pid: receipt.pane_pid,
     }
+}
+
+#[cfg(unix)]
+fn process_cgroup_generation(
+    receipt: &HarnessTerminalGenerationReceipt,
+) -> Option<tmux::ProcessCgroupGeneration> {
+    receipt
+        .process_cgroup
+        .as_ref()
+        .map(|process_cgroup| tmux::ProcessCgroupGeneration {
+            path: process_cgroup.path.clone(),
+            device: process_cgroup.device,
+            inode: process_cgroup.inode,
+        })
 }
 
 #[cfg(unix)]
@@ -19487,7 +19643,7 @@ fn reconcile_cortana_incumbent_with_terminal_effects<O, K>(
 ) -> Result<bool, String>
 where
     O: Fn(&str, &HarnessTerminalGenerationReceipt) -> IncumbentTerminalObservation,
-    K: Fn(&str, tmux::PaneGeneration) -> Result<tmux::ExactGenerationKill, String>,
+    K: Fn(&str, &HarnessTerminalGenerationReceipt) -> Result<tmux::ExactGenerationKill, String>,
 {
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
@@ -19677,10 +19833,7 @@ where
             );
         }
         IncumbentTerminalObservation::ExactGenerationAlive => {
-            match kill_exact(
-                tmux_target,
-                incumbent_pane_generation(&attestation.runtime_policy_receipt.terminal),
-            )? {
+            match kill_exact(tmux_target, &attestation.runtime_policy_receipt.terminal)? {
                 tmux::ExactGenerationKill::GenerationMismatch => {
                     return block_cortana_replacement(
                         ctx,
@@ -23782,10 +23935,11 @@ mod tests {
     }
 
     fn cortana_terminal_generation_receipt() -> HarnessTerminalGenerationReceipt {
-        crate::harness::terminal_generation_receipt(
+        crate::harness::test_verified_terminal_generation(
             "th_cor-candidate-2",
             &cortana_process_evidence(),
         )
+        .into_persisted()
     }
 
     fn cortana_verified_terminal_generation_for(
@@ -24025,6 +24179,39 @@ mod tests {
         attestation.provider_session_receipt.terminal =
             attestation.runtime_policy_receipt.terminal.clone();
         validate_cortana_attestation(attestation, &cortana_catalog_policy(), 1, 101).unwrap();
+    }
+
+    #[test]
+    fn cortana_candidate_rejects_missing_forged_or_unbounded_cgroup_identity() {
+        let policy = cortana_catalog_policy();
+        for (label, mutation) in [
+            ("missing", 0_u8),
+            ("foreign-path", 1),
+            ("traversal", 2),
+            ("zero-inode", 3),
+            ("unbounded", 4),
+        ] {
+            let mut candidate = cortana_candidate_fixture(1, false);
+            let generation = candidate.spawn_generation.as_mut().unwrap();
+            match mutation {
+                0 => generation.process_cgroup = None,
+                1 => generation.process_cgroup.as_mut().unwrap().path =
+                    "/sys/fs/cgroup/user.slice/test/app.slice/foreign-runtime".into(),
+                2 => generation.process_cgroup.as_mut().unwrap().path =
+                    "/sys/fs/cgroup/user.slice/../app.slice/t-hub-cortana-0123456789abcdef0123456789abcdef"
+                        .into(),
+                3 => generation.process_cgroup.as_mut().unwrap().inode = 0,
+                4 => generation.process_cgroup.as_mut().unwrap().path = format!(
+                    "/sys/fs/cgroup/user.slice/{}/app.slice/t-hub-cortana-0123456789abcdef0123456789abcdef",
+                    "x".repeat(MAX_CORTANA_GUIDANCE_BYTES)
+                ),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_cortana_candidate(&candidate, &policy, 1, 101).is_err(),
+                "{label} cgroup evidence was accepted"
+            );
+        }
     }
 
     fn cortana_ensure_request(captain: Option<&CaptainRecord>) -> CortanaEnsureRequestPayload {
@@ -24372,6 +24559,74 @@ mod tests {
             }
             let digest = cortana_ensure_request_digest_parts(
                 6,
+                intent["operationId"].as_str().unwrap(),
+                &intent["request"],
+            )
+            .unwrap();
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        document
+    }
+
+    fn schema_23_runtime_7_document(captain: CaptainRecord) -> Value {
+        let mut document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 23,
+            seq: 23,
+            captains: vec![captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let runtime = document["captains"][0]["cortanaRuntime"]
+            .as_object_mut()
+            .unwrap();
+        runtime.insert("schemaVersion".into(), Value::from(7));
+        if let Some(attestation) = runtime
+            .get_mut("runtimeAttestation")
+            .and_then(Value::as_object_mut)
+        {
+            attestation["runtimePolicyReceipt"]["terminal"]
+                .as_object_mut()
+                .unwrap()
+                .remove("processCgroup");
+            attestation["providerSessionReceipt"]["terminal"]
+                .as_object_mut()
+                .unwrap()
+                .remove("processCgroup");
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .and_then(Value::as_object_mut)
+        {
+            intent.insert("schemaVersion".into(), Value::from(7));
+            if let Some(candidate) = intent.get_mut("candidate").and_then(Value::as_object_mut) {
+                for generation in ["spawnGeneration", "cleanupGeneration"] {
+                    if let Some(generation) =
+                        candidate.get_mut(generation).and_then(Value::as_object_mut)
+                    {
+                        generation.remove("processCgroup");
+                    }
+                }
+                if let Some(attestation) = candidate
+                    .get_mut("runtimeAttestation")
+                    .and_then(Value::as_object_mut)
+                {
+                    attestation["runtimePolicyReceipt"]["terminal"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("processCgroup");
+                    attestation["providerSessionReceipt"]["terminal"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("processCgroup");
+                }
+            }
+            let digest = cortana_ensure_request_digest_parts(
+                7,
                 intent["operationId"].as_str().unwrap(),
                 &intent["request"],
             )
@@ -26638,7 +26893,7 @@ mod tests {
             .unwrap()
             .request_digest;
         let terminal_id = cortana_candidate_terminal_id(request_digest).unwrap();
-        let _session = CortanaWorkerSessionGuard(format!("th_{terminal_id}"));
+        let session = CortanaWorkerSessionGuard(format!("th_{terminal_id}"));
 
         let temp = tempfile::tempdir().unwrap();
         let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
@@ -26733,7 +26988,7 @@ mod tests {
             crate::identity::SESSION_TOKEN_ENV,
         ] {
             assert!(
-                tmux::session_environment_exact(&_session.0, key)
+                tmux::session_environment_exact(&session.0, key)
                     .unwrap()
                     .is_none_or(|value| value.is_empty()),
                 "credential key {key} retained a bearer in the tmux session environment"
@@ -26787,6 +27042,28 @@ mod tests {
         assert_eq!(identities.len(), 1);
         assert!(caller_is_apex(&ctx, Some(&resolved), false));
         assert!(!attacker_proof.exists());
+        let process_cgroup_path = recovered_runtime
+            .runtime_attestation
+            .as_ref()
+            .unwrap()
+            .runtime_policy_receipt
+            .terminal
+            .process_cgroup
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let session_name = session.0.clone();
+        drop(session);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tmux::session_liveness(&session_name) != tmux::SessionLiveness::Gone
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if Path::new(&process_cgroup_path).exists() {
+            std::fs::remove_dir(process_cgroup_path).unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -26983,6 +27260,7 @@ mod tests {
             window_id: generation.window_id,
             pane_id: generation.pane_id,
             pane_pid: generation.pane_pid,
+            process_cgroup: None,
         };
         tmux::new_session_with_env(
             &foreign,
@@ -32879,10 +33157,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_21_runtime_5_migrates_digest_and_malformed_source_is_byte_preserved() {
+    fn schema_21_runtime_5_migrates_prelaunch_digest_and_preserves_malformed_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("schema-21-valid.json");
-        let legacy = schema_21_runtime_5_document(cortana_committed_intent_fixture());
+        let legacy = schema_21_runtime_5_document(cortana_prepared_fixture(1));
         let old_digest = legacy["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"]
             .as_str()
             .unwrap()
@@ -32914,10 +33192,9 @@ mod tests {
         malformed["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"] =
             Value::from("0".repeat(64));
         let source = serde_json::to_vec_pretty(&malformed).unwrap();
-        let backup_source = serde_json::to_vec_pretty(&schema_21_runtime_5_document(
-            cortana_committed_intent_fixture(),
-        ))
-        .unwrap();
+        let backup_source =
+            serde_json::to_vec_pretty(&schema_21_runtime_5_document(cortana_prepared_fixture(1)))
+                .unwrap();
         std::fs::write(&malformed_path, &source).unwrap();
         std::fs::write(&backup, &backup_source).unwrap();
         let blocked = CaptainsRegistry::load(malformed_path.clone());
@@ -32927,7 +33204,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_22_runtime_6_migrates_generation_bound_cleanup_or_preserves_bytes() {
+    fn schema_22_runtime_6_migrates_prelaunch_or_preserves_spawned_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let prepared_path = temp.path().join("schema-22-prepared.json");
         let prepared_source = schema_22_runtime_6_document(cortana_prepared_fixture(1));
@@ -32975,36 +33252,7 @@ mod tests {
             candidate.cleanup_generation = candidate.spawn_generation.clone();
             intent.candidate = Some(candidate);
         }
-        let cleanup_path = temp.path().join("schema-22-cleanup.json");
         let cleanup_source = schema_22_runtime_6_document(cleanup.clone());
-        let mut migrated_document = cleanup_source.clone();
-        migrate_cortana_runtime_v6_document(&mut migrated_document).unwrap();
-        let mut migrated_snapshot: CaptainsSnapshot =
-            serde_json::from_value(migrated_document).unwrap();
-        migrated_snapshot.schema_version = CAPTAINS_SCHEMA_VERSION;
-        CaptainsRegistry::validate_snapshot(&migrated_snapshot).unwrap();
-        std::fs::write(
-            &cleanup_path,
-            serde_json::to_vec_pretty(&cleanup_source).unwrap(),
-        )
-        .unwrap();
-        let migrated = CaptainsRegistry::load(cleanup_path);
-        assert!(migrated.write_blocked.is_none());
-        let migrated_candidate = migrated.snapshot().captains[0]
-            .cortana_runtime
-            .as_ref()
-            .unwrap()
-            .ensure_intent
-            .as_ref()
-            .unwrap()
-            .candidate
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            migrated_candidate.cleanup_generation,
-            migrated_candidate.spawn_generation
-        );
 
         let backup_source = serde_json::to_vec_pretty(&CaptainsSnapshot {
             schema_version: CAPTAINS_SCHEMA_VERSION,
@@ -33019,6 +33267,7 @@ mod tests {
         })
         .unwrap();
         for (label, mutation) in [
+            ("spawned-without-cgroup", 4_u8),
             ("digest-mismatch", 0_u8),
             ("pre-spawn-cleanup", 1),
             ("future-cleanup-generation", 2),
@@ -33039,6 +33288,7 @@ mod tests {
                     intent["candidate"]["cleanupGeneration"] = spawn;
                 }
                 3 => intent["candidate"]["spawnGeneration"]["panePid"] = Value::from(0),
+                4 => {}
                 _ => unreachable!(),
             }
             let path = temp.path().join(format!("schema-22-{label}.json"));
@@ -33055,6 +33305,94 @@ mod tests {
             assert!(blocked.snapshot().captains.is_empty());
             assert_eq!(std::fs::read(&path).unwrap(), source);
             assert_eq!(std::fs::read(&backup).unwrap(), backup_source);
+        }
+    }
+
+    #[test]
+    fn schema_23_runtime_7_migrates_only_prelaunch_and_preserves_unprovable_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared_path = temp.path().join("schema-23-prepared.json");
+        let prepared_source = schema_23_runtime_7_document(cortana_prepared_fixture(1));
+        let source_bytes = serde_json::to_vec_pretty(&prepared_source).unwrap();
+        std::fs::write(&prepared_path, &source_bytes).unwrap();
+        let migrated = CaptainsRegistry::load(prepared_path.clone());
+        assert!(migrated.write_blocked.is_none());
+        let runtime = migrated.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        let intent = runtime.ensure_intent.unwrap();
+        assert_eq!(runtime.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_eq!(intent.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_eq!(
+            intent.request_digest,
+            cortana_ensure_request_digest(&intent).unwrap()
+        );
+        let restarted = CaptainsRegistry::load(prepared_path.clone());
+        assert!(restarted.write_blocked.is_none());
+        assert_eq!(
+            serde_json::to_value(restarted.snapshot()).unwrap(),
+            serde_json::to_value(migrated.snapshot()).unwrap()
+        );
+
+        let backup_bytes = serde_json::to_vec_pretty(&CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 99,
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let mut spawned = cortana_prepared_fixture(1);
+        {
+            let runtime = spawned.cortana_runtime.as_mut().unwrap();
+            runtime.lifecycle = CortanaRuntimeLifecycle::Starting;
+            let intent = runtime.ensure_intent.as_mut().unwrap();
+            intent.phase = CortanaEnsurePhase::CandidateSpawned;
+            intent.candidate = Some(cortana_candidate_fixture(2, false));
+        }
+        let cases = [
+            ("spawned", schema_23_runtime_7_document(spawned)),
+            (
+                "ready",
+                schema_23_runtime_7_document(cortana_ready_fixture()),
+            ),
+            ("hybrid-runtime-8", {
+                let mut value = schema_23_runtime_7_document(cortana_prepared_fixture(1));
+                value["captains"][0]["cortanaRuntime"]["schemaVersion"] = Value::from(8);
+                value
+            }),
+            ("digest-mismatch", {
+                let mut value = schema_23_runtime_7_document(cortana_prepared_fixture(1));
+                value["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"] =
+                    Value::from("0".repeat(64));
+                value
+            }),
+            ("unknown-runtime-field", {
+                let mut value = schema_23_runtime_7_document(cortana_prepared_fixture(1));
+                value["captains"][0]["cortanaRuntime"]["futureCgroupAuthority"] = Value::from(true);
+                value
+            }),
+        ];
+        for (label, document) in cases {
+            let path = temp.path().join(format!("schema-23-{label}.json"));
+            let backup = path.with_extension("json.bak");
+            let primary_bytes = serde_json::to_vec_pretty(&document).unwrap();
+            std::fs::write(&path, &primary_bytes).unwrap();
+            std::fs::write(&backup, &backup_bytes).unwrap();
+            assert!(matches!(
+                CaptainsRegistry::read_snapshot(&path),
+                Err(SnapshotReadError::IncompatibleRecovery { .. })
+            ));
+            let blocked = CaptainsRegistry::load(path.clone());
+            assert!(blocked.write_blocked.is_some(), "{label} was not blocked");
+            assert!(blocked.snapshot().captains.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), primary_bytes);
+            assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
         }
     }
 

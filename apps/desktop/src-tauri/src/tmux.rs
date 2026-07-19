@@ -96,6 +96,83 @@ pub(crate) struct PaneGeneration {
     pub(crate) pane_pid: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessCgroupGeneration {
+    pub(crate) path: String,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PrivateProcessCgroup {
+    generation: ProcessCgroupGeneration,
+    remove_on_drop: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct ProcessCgroupConfinementError {
+    pub(crate) error: TmuxError,
+    pub(crate) process_cgroup: Option<PrivateProcessCgroup>,
+}
+
+#[cfg(target_os = "linux")]
+impl PrivateProcessCgroup {
+    pub(crate) fn generation(&self) -> &ProcessCgroupGeneration {
+        &self.generation
+    }
+
+    pub(crate) fn retain(mut self) -> ProcessCgroupGeneration {
+        self.remove_on_drop = false;
+        self.generation.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PrivateProcessCgroup {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_dir(&self.generation.path);
+        }
+    }
+}
+
+fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(identity) = name.strip_prefix("t-hub-cortana-") else {
+        return false;
+    };
+    identity.len() == 32
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|parent| parent.to_str())
+            .is_some_and(|parent| {
+                parent == "app.slice"
+                    || parent.starts_with("tmux-spawn-") && parent.ends_with(".scope")
+            })
+        && path.starts_with("/sys/fs/cgroup/user.slice/")
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
+fn frozen_process_identity_matches(
+    before: (u32, u64),
+    after: (u32, u64),
+    exact_cgroup_membership: bool,
+) -> bool {
+    before == after && exact_cgroup_membership
+}
+
 /// Evidence for a private dormant-pane to provider-pane transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RespawnPaneTransition {
@@ -108,6 +185,33 @@ pub(crate) enum ExactGenerationKill {
     Killed,
     Gone,
     GenerationMismatch,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupCleanupTestPoint {
+    BeforeFreeze,
+    AfterFreeze,
+    AfterFirstSnapshot,
+    AfterIdentityValidation,
+    BeforeKill,
+    AfterKill,
+    BeforeThaw,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CGROUP_CLEANUP_TEST_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(CgroupCleanupTestPoint) -> Result<(), TmuxError>>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_cgroup_cleanup_test_hook(point: CgroupCleanupTestPoint) -> Result<(), TmuxError> {
+    CGROUP_CLEANUP_TEST_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        hook.as_mut().map_or(Ok(()), |hook| hook(point))
+    })
 }
 
 impl std::fmt::Display for TmuxError {
@@ -961,21 +1065,336 @@ tmux -L {sock} kill-session -t '{name}'",
     })
 }
 
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn create_private_process_cgroup() -> Result<PrivateProcessCgroup, TmuxError> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| TmuxError {
+        op: "create-process-cgroup",
+        code: error.raw_os_error(),
+        message: "current cgroup membership is unreadable".into(),
+    })?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| TmuxError {
+            op: "create-process-cgroup",
+            code: None,
+            message: "a unified cgroup v2 membership is unavailable".into(),
+        })?;
+    let app_slice = relative
+        .find("/app.slice")
+        .map(|end| &relative[..end + "/app.slice".len()])
+        .ok_or_else(|| TmuxError {
+            op: "create-process-cgroup",
+            code: None,
+            message: "the application has no delegated cgroup app.slice".into(),
+        })?;
+    let parent = std::path::Path::new("/sys/fs/cgroup").join(app_slice.trim_start_matches('/'));
+    create_private_process_cgroup_under(&parent)
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_process_cgroup_under(
+    parent: &std::path::Path,
+) -> Result<PrivateProcessCgroup, TmuxError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    struct Cleanup(Option<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = std::fs::remove_dir(path);
+            }
+        }
+    }
+
+    let path = parent.join(format!("t-hub-cortana-{}", uuid::Uuid::new_v4().simple()));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&path).map_err(|error| TmuxError {
+        op: "create-process-cgroup",
+        code: error.raw_os_error(),
+        message: "private Cortana cgroup could not be created".into(),
+    })?;
+    let mut cleanup = Cleanup(Some(path.clone()));
+    for control in [
+        "cgroup.procs",
+        "cgroup.events",
+        "cgroup.freeze",
+        "cgroup.kill",
+    ] {
+        if !path.join(control).exists() {
+            return Err(TmuxError {
+                op: "create-process-cgroup",
+                code: None,
+                message: "private Cortana cgroup lacks required v2 controls".into(),
+            });
+        }
+    }
+    let metadata = std::fs::metadata(&path).map_err(|error| TmuxError {
+        op: "create-process-cgroup",
+        code: error.raw_os_error(),
+        message: "private Cortana cgroup identity is unreadable".into(),
+    })?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(TmuxError {
+            op: "create-process-cgroup",
+            code: None,
+            message: "private Cortana cgroup permissions are not private".into(),
+        });
+    }
+    cleanup.0 = None;
+    Ok(PrivateProcessCgroup {
+        generation: ProcessCgroupGeneration {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        remove_on_drop: true,
+    })
+}
+
+/// Move an exact credential-free gate-blocked pane into a private child of its
+/// settled tmux/systemd scope. The caller must prove its anonymous launch gate
+/// is engaged and must not release credentials until this returns.
+#[cfg(target_os = "linux")]
+pub(crate) fn confine_blocked_pane_to_private_cgroup(
+    name: &str,
+    expected: PaneGeneration,
+) -> Result<PrivateProcessCgroup, ProcessCgroupConfinementError> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    fn error(message: &str, code: Option<i32>) -> TmuxError {
+        TmuxError {
+            op: "confine-stopped-pane",
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn process_state_start(pid: u32) -> Result<(char, u64), TmuxError> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|failure| {
+            error(
+                "stopped candidate process identity is unreadable",
+                failure.raw_os_error(),
+            )
+        })?;
+        let suffix = stat
+            .rsplit_once(')')
+            .map(|(_, suffix)| suffix.trim())
+            .ok_or_else(|| error("stopped candidate process identity is malformed", None))?;
+        let fields = suffix.split_whitespace().collect::<Vec<_>>();
+        let state = fields
+            .first()
+            .and_then(|value| value.chars().next())
+            .ok_or_else(|| error("stopped candidate process state is malformed", None))?;
+        let start_ticks = fields
+            .get(19)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| error("stopped candidate process generation is malformed", None))?;
+        Ok((state, start_ticks))
+    }
+
+    fn process_membership(pid: u32) -> Result<String, TmuxError> {
+        let membership =
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|failure| {
+                error(
+                    "stopped candidate cgroup membership is unreadable",
+                    failure.raw_os_error(),
+                )
+            })?;
+        membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+            .ok_or_else(|| error("stopped candidate has no unified cgroup membership", None))
+    }
+
+    fn open_pidfd(pid: u32) -> Result<OwnedFd, TmuxError> {
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if descriptor < 0 {
+            let failure = std::io::Error::last_os_error();
+            return Err(error(
+                "stopped candidate pidfd could not be opened",
+                failure.raw_os_error(),
+            ));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor as i32) })
+    }
+
+    let fail = |error, process_cgroup| ProcessCgroupConfinementError {
+        error,
+        process_cgroup,
+    };
+    match pane_generation_exact(name) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => {
+            return Err(fail(
+                error("stopped candidate tmux generation changed", None),
+                None,
+            ));
+        }
+        Err(failure) => return Err(fail(failure, None)),
+    }
+    let _pidfd = open_pidfd(expected.pane_pid).map_err(|error| fail(error, None))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let (settled_membership, blocked_start_ticks) = loop {
+        let first = process_state_start(expected.pane_pid).map_err(|error| fail(error, None))?;
+        let first_membership =
+            process_membership(expected.pane_pid).map_err(|error| fail(error, None))?;
+        std::thread::sleep(Duration::from_millis(10));
+        let second = process_state_start(expected.pane_pid).map_err(|error| fail(error, None))?;
+        let second_membership =
+            process_membership(expected.pane_pid).map_err(|error| fail(error, None))?;
+        if !matches!(first.0, 'Z' | 'X' | 'x')
+            && first == second
+            && first_membership == second_membership
+            && pane_generation_exact(name).ok() == Some(expected)
+        {
+            break (first_membership, first.1);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(fail(
+                error(
+                    "credential-free candidate did not block in a stable tmux scope",
+                    None,
+                ),
+                None,
+            ));
+        }
+    };
+    let parent =
+        std::path::Path::new("/sys/fs/cgroup").join(settled_membership.trim_start_matches('/'));
+    let parent_name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !parent.starts_with("/sys/fs/cgroup/user.slice/")
+        || !settled_membership.contains("/app.slice/app-tmux.slice/")
+        || !parent_name.starts_with("tmux-spawn-")
+        || !parent_name.ends_with(".scope")
+    {
+        return Err(fail(
+            error(
+                "candidate tmux scope is not a delegated private launch scope",
+                None,
+            ),
+            None,
+        ));
+    }
+    let process_cgroup =
+        create_private_process_cgroup_under(&parent).map_err(|error| fail(error, None))?;
+    if let Err(failure) = std::fs::write(
+        std::path::Path::new(&process_cgroup.generation.path).join("cgroup.procs"),
+        format!("{}\n", expected.pane_pid),
+    ) {
+        return Err(fail(
+            error(
+                "stopped candidate could not enter its private cgroup",
+                failure.raw_os_error(),
+            ),
+            Some(process_cgroup),
+        ));
+    }
+    let still_exact = pane_generation_exact(name).ok() == Some(expected)
+        && process_state_start(expected.pane_pid).is_ok_and(|identity| {
+            identity.1 == blocked_start_ticks && !matches!(identity.0, 'Z' | 'X' | 'x')
+        })
+        && process_is_in_exact_cgroup(expected.pane_pid, process_cgroup.generation())
+            .unwrap_or(false);
+    if !still_exact {
+        return Err(fail(
+            error(
+                "candidate generation changed during private cgroup confinement",
+                None,
+            ),
+            Some(process_cgroup),
+        ));
+    }
+    if pane_generation_exact(name).ok() != Some(expected)
+        || !process_is_in_exact_cgroup(expected.pane_pid, process_cgroup.generation())
+            .unwrap_or(false)
+    {
+        return Err(fail(
+            error(
+                "candidate generation changed after private cgroup resume",
+                None,
+            ),
+            Some(process_cgroup),
+        ));
+    }
+    Ok(process_cgroup)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_is_in_exact_cgroup(
+    pid: u32,
+    expected: &ProcessCgroupGeneration,
+) -> Result<bool, TmuxError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !is_canonical_private_process_cgroup_path(&expected.path) {
+        return Err(TmuxError {
+            op: "validate-process-cgroup",
+            code: None,
+            message: "private Cortana cgroup path is malformed".into(),
+        });
+    }
+    let metadata = std::fs::metadata(&expected.path).map_err(|error| TmuxError {
+        op: "validate-process-cgroup",
+        code: error.raw_os_error(),
+        message: "private Cortana cgroup identity is unreadable".into(),
+    })?;
+    if metadata.dev() != expected.device || metadata.ino() != expected.inode {
+        return Ok(false);
+    }
+    let procs = std::fs::read_to_string(std::path::Path::new(&expected.path).join("cgroup.procs"))
+        .map_err(|error| TmuxError {
+            op: "validate-process-cgroup",
+            code: error.raw_os_error(),
+            message: "private Cortana cgroup membership is unreadable".into(),
+        })?;
+    if !procs.lines().any(|value| value.trim() == pid.to_string()) {
+        return Ok(false);
+    }
+    let relative = expected
+        .path
+        .strip_prefix("/sys/fs/cgroup")
+        .ok_or_else(|| TmuxError {
+            op: "validate-process-cgroup",
+            code: None,
+            message: "private Cortana cgroup path is outside cgroup v2".into(),
+        })?;
+    let membership =
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|error| TmuxError {
+            op: "validate-process-cgroup",
+            code: error.raw_os_error(),
+            message: "candidate process cgroup membership is unreadable".into(),
+        })?;
+    Ok(membership
+        .lines()
+        .any(|line| line.strip_prefix("0::") == Some(relative)))
+}
+
 /// Kill only the exact tmux generation previously attested for `name`.
 ///
-/// Linux pidfds pin the observed pane process and each discovered descendant
-/// before any signal is sent. No destructive operation targets the tmux name
-/// after the generation can disappear or rebind.
+/// A provider-bearing Linux generation must carry its launch-time private
+/// cgroup identity. Cleanup pins the cgroup and pane, freezes the complete
+/// bounded subtree, validates stable PID, start-tick, membership, and ancestry
+/// evidence, then uses `cgroup.kill` and proves the subtree empty. A dormant,
+/// credential-free pane uses only its exact pidfd. No destructive operation
+/// targets the tmux name after the generation can disappear or rebind.
 pub(crate) fn kill_session_tree_exact_generation(
     name: &str,
     expected: PaneGeneration,
+    process_cgroup: Option<&ProcessCgroupGeneration>,
 ) -> Result<ExactGenerationKill, TmuxError> {
-    kill_session_tree_exact_generation_with_post_reap(name, expected, || {})
+    kill_session_tree_exact_generation_with_post_reap(name, expected, process_cgroup, || {})
 }
 
 fn kill_session_tree_exact_generation_with_post_reap<F>(
     name: &str,
     expected: PaneGeneration,
+    process_cgroup: Option<&ProcessCgroupGeneration>,
     post_reap: F,
 ) -> Result<ExactGenerationKill, TmuxError>
 where
@@ -995,11 +1414,11 @@ where
     }
     #[cfg(target_os = "linux")]
     {
-        kill_linux_process_generation(name, expected, post_reap)
+        kill_linux_process_generation(name, expected, process_cgroup, post_reap)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (name, expected, post_reap);
+        let _ = (name, expected, process_cgroup, post_reap);
         Err(TmuxError {
             op: "kill-session-tree-generation",
             code: None,
@@ -1012,6 +1431,7 @@ where
 fn kill_linux_process_generation<F>(
     name: &str,
     expected: PaneGeneration,
+    process_cgroup: Option<&ProcessCgroupGeneration>,
     post_reap: F,
 ) -> Result<ExactGenerationKill, TmuxError>
 where
@@ -1058,6 +1478,450 @@ where
         Ok(())
     }
 
+    fn kill_frozen_cgroup_generation<F>(
+        name: &str,
+        expected: PaneGeneration,
+        process_cgroup: &ProcessCgroupGeneration,
+        root: OwnedFd,
+        post_reap: F,
+    ) -> Result<ExactGenerationKill, TmuxError>
+    where
+        F: FnOnce(),
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        const MAX_CGROUPS: usize = 64;
+        const MAX_TASKS: usize = 256;
+        const POLL_LIMIT: usize = 200;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct FrozenCgroupSnapshot {
+            groups: Vec<FrozenCgroupNode>,
+            tasks: Vec<(u32, String)>,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct FrozenCgroupNode {
+            relative_path: String,
+            device: u64,
+            inode: u64,
+        }
+
+        fn process_identity(pid: u32) -> Result<(u32, u64), TmuxError> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+                TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "frozen candidate process identity is unreadable".into(),
+                }
+            })?;
+            let suffix = stat
+                .rsplit_once(')')
+                .map(|(_, suffix)| suffix.trim())
+                .ok_or_else(|| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate process identity is malformed".into(),
+                })?;
+            let fields = suffix.split_whitespace().collect::<Vec<_>>();
+            let parent = fields
+                .get(1)
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate parent identity is malformed".into(),
+                })?;
+            let start_ticks = fields
+                .get(19)
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate start identity is malformed".into(),
+                })?;
+            Ok((parent, start_ticks))
+        }
+
+        fn read_cgroup_snapshot(root: &std::path::Path) -> Result<FrozenCgroupSnapshot, TmuxError> {
+            let mut pending = vec![(root.to_path_buf(), String::new())];
+            let mut groups = Vec::new();
+            let mut tasks = Vec::new();
+            while let Some((path, relative_path)) = pending.pop() {
+                if groups.len() >= MAX_CGROUPS {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate cgroup exceeds the bounded subtree limit".into(),
+                    });
+                }
+                let metadata = std::fs::metadata(&path).map_err(|error| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "frozen candidate cgroup subtree identity is unreadable".into(),
+                })?;
+                if !metadata.is_dir() {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate cgroup subtree contains a non-directory node"
+                            .into(),
+                    });
+                }
+                groups.push(FrozenCgroupNode {
+                    relative_path: relative_path.clone(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                });
+                let values =
+                    std::fs::read_to_string(path.join("cgroup.procs")).map_err(|error| {
+                        TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: error.raw_os_error(),
+                            message: "frozen candidate cgroup tasks are unreadable".into(),
+                        }
+                    })?;
+                for value in values
+                    .lines()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let pid = value.parse::<u32>().map_err(|_| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate cgroup contains a malformed task".into(),
+                    })?;
+                    tasks.push((pid, relative_path.clone()));
+                    if tasks.len() > MAX_TASKS {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "frozen candidate cgroup exceeds the bounded task limit"
+                                .into(),
+                        });
+                    }
+                }
+                let entries = std::fs::read_dir(&path).map_err(|error| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "frozen candidate cgroup subtree is unreadable".into(),
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|error| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "frozen candidate cgroup subtree entry is unreadable".into(),
+                    })?;
+                    let file_type = entry.file_type().map_err(|error| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "frozen candidate cgroup subtree entry type is unreadable".into(),
+                    })?;
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let name = name.to_str().filter(|name| {
+                        !name.is_empty()
+                            && name.len() <= 128
+                            && name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                            })
+                    });
+                    let Some(name) = name else {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "frozen candidate cgroup has an unsafe child name".into(),
+                        });
+                    };
+                    let child_relative = if relative_path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{relative_path}/{name}")
+                    };
+                    pending.push((entry.path(), child_relative));
+                }
+            }
+            groups.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            tasks.sort_unstable();
+            if tasks.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate task appears in multiple cgroups".into(),
+                });
+            }
+            Ok(FrozenCgroupSnapshot { groups, tasks })
+        }
+
+        fn process_has_exact_cgroup_membership(
+            pid: u32,
+            root_relative: &str,
+            child_relative: &str,
+        ) -> Result<bool, TmuxError> {
+            let expected = if child_relative.is_empty() {
+                root_relative.to_string()
+            } else {
+                format!("{root_relative}/{child_relative}")
+            };
+            let membership =
+                std::fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|error| {
+                    TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "frozen candidate task cgroup membership is unreadable".into(),
+                    }
+                })?;
+            Ok(membership
+                .lines()
+                .any(|line| line.strip_prefix("0::") == Some(expected.as_str())))
+        }
+
+        fn thaw(path: &std::path::Path) -> Result<(), TmuxError> {
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforeThaw)?;
+            std::fs::write(path.join("cgroup.freeze"), b"0").map_err(|error| TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: "failed candidate cgroup could not be thawed".into(),
+            })
+        }
+
+        fn pidfd_has_exited(descriptor: &std::os::fd::OwnedFd) -> bool {
+            use std::os::fd::AsRawFd;
+
+            let mut poll = libc::pollfd {
+                fd: descriptor.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            (unsafe { libc::poll(&mut poll, 1, 0) }) == 1 && poll.revents & libc::POLLIN != 0
+        }
+
+        let path = std::path::Path::new(&process_cgroup.path);
+        let directory = std::fs::File::open(path).map_err(|error| TmuxError {
+            op: "kill-session-tree-generation",
+            code: error.raw_os_error(),
+            message: "exact candidate cgroup could not be opened".into(),
+        })?;
+        let metadata = directory.metadata().map_err(|error| TmuxError {
+            op: "kill-session-tree-generation",
+            code: error.raw_os_error(),
+            message: "exact candidate cgroup identity is unreadable".into(),
+        })?;
+        if metadata.dev() != process_cgroup.device || metadata.ino() != process_cgroup.inode {
+            return Ok(ExactGenerationKill::GenerationMismatch);
+        }
+        let control_path = std::path::PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&directory)
+        ));
+        if !process_is_in_exact_cgroup(expected.pane_pid, process_cgroup)? {
+            return Ok(ExactGenerationKill::GenerationMismatch);
+        }
+        match pane_generation_exact(name) {
+            Ok(actual) if actual == expected => {}
+            Ok(_) => return Ok(ExactGenerationKill::GenerationMismatch),
+            Err(_) => return unavailable(name),
+        }
+
+        #[cfg(test)]
+        run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforeFreeze)?;
+        std::fs::write(control_path.join("cgroup.freeze"), b"1").map_err(|error| TmuxError {
+            op: "kill-session-tree-generation",
+            code: error.raw_os_error(),
+            message: "exact candidate cgroup could not be frozen".into(),
+        })?;
+        let frozen = (0..POLL_LIMIT).any(|_| {
+            let observed = std::fs::read_to_string(control_path.join("cgroup.events"))
+                .is_ok_and(|events| events.lines().any(|line| line == "frozen 1"));
+            if !observed {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            observed
+        });
+        if !frozen {
+            let _ = thaw(&control_path);
+            return Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: None,
+                message: "exact candidate cgroup freeze did not converge".into(),
+            });
+        }
+        #[cfg(test)]
+        if let Err(error) = run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::AfterFreeze) {
+            let thaw_error = thaw(&control_path).err();
+            return Err(thaw_error.unwrap_or(error));
+        }
+
+        let result = (|| {
+            let first = read_cgroup_snapshot(&control_path)?;
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::AfterFirstSnapshot)?;
+            std::thread::yield_now();
+            let second = read_cgroup_snapshot(&control_path)?;
+            if first != second || !first.tasks.iter().any(|task| task.0 == expected.pane_pid) {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate cgroup did not reach a stable complete generation"
+                        .into(),
+                });
+            }
+            let mut identities = std::collections::HashMap::new();
+            let mut pinned = Vec::with_capacity(first.tasks.len());
+            let mut root = Some(root);
+            let root_relative = process_cgroup
+                .path
+                .strip_prefix("/sys/fs/cgroup")
+                .ok_or_else(|| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "exact candidate cgroup path is outside cgroup v2".into(),
+                })?;
+            for (pid, relative_cgroup) in &first.tasks {
+                let before = process_identity(*pid)?;
+                let descriptor = if *pid == expected.pane_pid {
+                    root.take().ok_or_else(|| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate root identity was duplicated".into(),
+                    })?
+                } else {
+                    open_pidfd(*pid).map_err(|error| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "frozen candidate pidfd could not be opened".into(),
+                    })?
+                };
+                let after = process_identity(*pid)?;
+                if !frozen_process_identity_matches(
+                    before,
+                    after,
+                    process_has_exact_cgroup_membership(*pid, root_relative, relative_cgroup)?,
+                ) {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate PID identity or cgroup membership changed"
+                            .into(),
+                    });
+                }
+                identities.insert(*pid, before);
+                pinned.push((*pid, descriptor));
+            }
+            if root.is_some() {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate root identity was absent".into(),
+                });
+            }
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::AfterIdentityValidation)?;
+            for (pid, _) in &first.tasks {
+                if *pid == expected.pane_pid {
+                    continue;
+                }
+                let mut current = *pid;
+                let mut depth = 0;
+                loop {
+                    let parent = identities
+                        .get(&current)
+                        .map(|identity| identity.0)
+                        .ok_or_else(|| TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "frozen candidate ancestry is incomplete".into(),
+                        })?;
+                    if parent == expected.pane_pid {
+                        break;
+                    }
+                    if !identities.contains_key(&parent) || depth >= MAX_TASKS {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "frozen candidate contains a foreign or unbounded ancestry"
+                                .into(),
+                        });
+                    }
+                    current = parent;
+                    depth += 1;
+                }
+            }
+            if read_cgroup_snapshot(&control_path)? != first {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate cgroup changed after PID identity validation".into(),
+                });
+            }
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforeKill)?;
+            if read_cgroup_snapshot(&control_path)? != first {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "frozen candidate cgroup changed at its final kill boundary".into(),
+                });
+            }
+            for (pid, relative_cgroup) in &first.tasks {
+                if !frozen_process_identity_matches(
+                    identities[pid],
+                    process_identity(*pid)?,
+                    process_has_exact_cgroup_membership(*pid, root_relative, relative_cgroup)?,
+                ) {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "frozen candidate identity changed at its final kill boundary"
+                            .into(),
+                    });
+                }
+            }
+            std::fs::write(control_path.join("cgroup.kill"), b"1").map_err(|error| TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: "exact candidate cgroup kill failed".into(),
+            })?;
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::AfterKill)?;
+            let empty = (0..POLL_LIMIT).any(|_| {
+                let explicit_empty = std::fs::read_to_string(control_path.join("cgroup.events"))
+                    .is_ok_and(|events| events.lines().any(|line| line == "populated 0"))
+                    && read_cgroup_snapshot(&control_path)
+                        .is_ok_and(|snapshot| snapshot.tasks.is_empty());
+                let removed_after_empty = !path.exists()
+                    && pinned
+                        .iter()
+                        .all(|(_, descriptor)| pidfd_has_exited(descriptor))
+                    && session_liveness(name) == SessionLiveness::Gone;
+                let observed = explicit_empty || removed_after_empty;
+                if !observed {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                observed
+            });
+            if !empty {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "exact candidate cgroup did not become empty after kill".into(),
+                });
+            }
+            drop(pinned);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let thaw_error = thaw(&control_path).err();
+            return Err(thaw_error.unwrap_or(error));
+        }
+        post_reap();
+        Ok(ExactGenerationKill::Killed)
+    }
+
     match pane_generation_exact(name) {
         Ok(actual) if actual == expected => {}
         Ok(_) => return Ok(ExactGenerationKill::GenerationMismatch),
@@ -1080,42 +1944,14 @@ where
         Err(_) => return unavailable(name),
     }
 
-    let mut pinned = vec![(expected.pane_pid, root)];
-    let mut seen = std::collections::HashSet::from([expected.pane_pid]);
-    let mut cursor = 0;
-    while cursor < pinned.len() {
-        let pid = pinned[cursor].0;
-        cursor += 1;
-        let children =
-            std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
-        for child in children
-            .split_whitespace()
-            .filter_map(|value| value.parse::<u32>().ok())
-        {
-            if seen.insert(child) {
-                match open_pidfd(child) {
-                    Ok(descriptor) => pinned.push((child, descriptor)),
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                    Err(error) => {
-                        return Err(TmuxError {
-                            op: "kill-session-tree-generation",
-                            code: error.raw_os_error(),
-                            message: format!(
-                                "candidate descendant pidfd could not be opened: {error}"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
+    if let Some(process_cgroup) = process_cgroup {
+        return kill_frozen_cgroup_generation(name, expected, process_cgroup, root, post_reap);
     }
-    for (_, descriptor) in pinned.iter().rev() {
-        signal_pidfd(descriptor).map_err(|error| TmuxError {
-            op: "kill-session-tree-generation",
-            code: error.raw_os_error(),
-            message: format!("exact candidate pidfd signal failed: {error}"),
-        })?;
-    }
+    signal_pidfd(&root).map_err(|error| TmuxError {
+        op: "kill-session-tree-generation",
+        code: error.raw_os_error(),
+        message: format!("exact credential-free pane pidfd signal failed: {error}"),
+    })?;
     post_reap();
     Ok(ExactGenerationKill::Killed)
 }
@@ -1402,6 +2238,96 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 mod tests {
     use super::*;
 
+    struct CgroupCleanupHookGuard;
+
+    impl CgroupCleanupHookGuard {
+        fn install(
+            hook: impl FnMut(CgroupCleanupTestPoint) -> Result<(), TmuxError> + 'static,
+        ) -> Self {
+            CGROUP_CLEANUP_TEST_HOOK.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "cgroup cleanup hook was already set"
+                );
+                *slot.borrow_mut() = Some(Box::new(hook));
+            });
+            Self
+        }
+    }
+
+    impl Drop for CgroupCleanupHookGuard {
+        fn drop(&mut self) {
+            CGROUP_CLEANUP_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn injected_cgroup_cleanup_error(message: &str) -> TmuxError {
+        TmuxError {
+            op: "kill-session-tree-generation",
+            code: None,
+            message: message.to_string(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_exact_cgroup_member(pid: u32, cgroup: &ProcessCgroupGeneration) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if process_is_in_exact_cgroup(pid, cgroup).unwrap_or(false) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process did not join its private cgroup: process_membership={:?} cgroup_tasks={:?} cmdline={:?}",
+                std::fs::read_to_string(format!("/proc/{pid}/cgroup")),
+                std::fs::read_to_string(
+                    std::path::Path::new(&cgroup.path).join("cgroup.procs")
+                ),
+                std::fs::read(format!("/proc/{pid}/cmdline")),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn force_cleanup_test_cgroup(cgroup: &ProcessCgroupGeneration) {
+        let path = std::path::Path::new(&cgroup.path);
+        let _ = std::fs::write(path.join("cgroup.kill"), b"1");
+        let _ = std::fs::write(path.join("cgroup.freeze"), b"0");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut directories = vec![path.to_path_buf()];
+            let mut cursor = 0;
+            while cursor < directories.len() {
+                if let Ok(entries) = std::fs::read_dir(&directories[cursor]) {
+                    directories.extend(entries.flatten().filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .filter(|kind| kind.is_dir())
+                            .map(|_| entry.path())
+                    }));
+                }
+                cursor += 1;
+            }
+            directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+            for directory in &directories {
+                let _ = std::fs::remove_dir(directory);
+            }
+            if !path.exists() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test private cgroup cleanup did not remove {}: events={:?} procs={:?}",
+                path.display(),
+                std::fs::read_to_string(path.join("cgroup.events")),
+                std::fs::read_to_string(path.join("cgroup.procs")),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// True when a real `tmux` binary is reachable for the tests below. These
     /// tests drive a live tmux server on the isolated socket, so they can only
     /// pass where tmux is installed (the WSL2 dev shell) — NOT on the Windows CI
@@ -1618,18 +2544,23 @@ mod tests {
         let incumbent = pane_generation_exact(&target.name).unwrap();
         let replacement = std::cell::Cell::new(None);
         assert_eq!(
-            kill_session_tree_exact_generation_with_post_reap(&target.name, incumbent, || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                while session_liveness(&target.name) != SessionLiveness::Gone {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "old exact generation did not disappear before replacement barrier"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                create_shell_session_after_final_teardown(&target.name);
-                replacement.set(Some(pane_generation_exact(&target.name).unwrap()));
-            })
+            kill_session_tree_exact_generation_with_post_reap(
+                &target.name,
+                incumbent,
+                None,
+                || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while session_liveness(&target.name) != SessionLiveness::Gone {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "old exact generation did not disappear before replacement barrier"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    create_shell_session_after_final_teardown(&target.name);
+                    replacement.set(Some(pane_generation_exact(&target.name).unwrap()));
+                },
+            )
             .unwrap(),
             ExactGenerationKill::Killed
         );
@@ -1637,10 +2568,346 @@ mod tests {
         assert_ne!(replacement, incumbent);
         assert_eq!(pane_generation_exact(&target.name).unwrap(), replacement);
         assert_eq!(
-            kill_session_tree_exact_generation(&target.name, incumbent).unwrap(),
+            kill_session_tree_exact_generation(&target.name, incumbent, None).unwrap(),
             ExactGenerationKill::GenerationMismatch
         );
         assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
+    }
+
+    #[test]
+    fn frozen_process_identity_rejects_exit_reuse_and_membership_substitution() {
+        assert!(frozen_process_identity_matches((41, 900), (41, 900), true));
+        assert!(!frozen_process_identity_matches((41, 900), (41, 901), true));
+        assert!(!frozen_process_identity_matches((41, 900), (42, 900), true));
+        assert!(!frozen_process_identity_matches(
+            (41, 900),
+            (41, 900),
+            false
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frozen_private_cgroup_cleanup_contains_late_nested_forks_and_bearer_descendants() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let cgroup = create_private_process_cgroup().unwrap();
+        let nested = std::path::Path::new(&cgroup.generation().path).join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let trigger = tempfile::NamedTempFile::new().unwrap();
+        let trigger_path = trigger.path().to_path_buf();
+        drop(trigger);
+        let script_dir = tempfile::tempdir().unwrap();
+        let script = script_dir.path().join("nested-provider.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"${1:-}\" = nested ]; then\n\
+               printf '%s\\n' \"$$\" > \"$CGROUP_ROOT/nested/cgroup.procs\" || exit 125\n\
+               sh -c 'sleep 30' &\n\
+               while [ ! -e \"$FORK_TRIGGER\" ]; do sleep 0.01; done\n\
+               sh -c 'sleep 30' &\n\
+               wait\n\
+             fi\n\
+             printf '%s\\n' \"$$\" > \"$CGROUP_ROOT/cgroup.procs\" || exit 124\n\
+             export T_HUB_SESSION_TOKEN=escaped-bearer-marker\n\
+             \"$0\" nested &\n\
+             wait\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = format!(
+            "CGROUP_ROOT='{root}' FORK_TRIGGER='{trigger}' exec '{script}'",
+            root = cgroup.generation().path,
+            trigger = trigger_path.display(),
+            script = script.display(),
+        );
+        let transition = respawn_pane_exact(&target.name, "/tmp", &command).unwrap();
+        let expected = transition.after;
+        wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(nested.join("cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nested provider descendants were not created"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut observed_pids = std::fs::read_to_string(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+        )
+        .unwrap()
+        .lines()
+        .chain(
+            std::fs::read_to_string(nested.join("cgroup.procs"))
+                .unwrap()
+                .lines(),
+        )
+        .filter_map(|pid| pid.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+        observed_pids.sort_unstable();
+        observed_pids.dedup();
+        let replacement = std::rc::Rc::new(std::cell::Cell::new(None));
+        let replacement_from_hook = replacement.clone();
+        let trigger_from_hook = trigger_path.clone();
+        let _hook = CgroupCleanupHookGuard::install(move |point| {
+            if point == CgroupCleanupTestPoint::AfterFirstSnapshot {
+                std::fs::write(&trigger_from_hook, b"fork-now").unwrap();
+            }
+            Ok(())
+        });
+        assert_eq!(
+            kill_session_tree_exact_generation_with_post_reap(
+                &target.name,
+                expected,
+                Some(cgroup.generation()),
+                || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while session_liveness(&target.name) != SessionLiveness::Gone {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "killed cgroup generation did not leave tmux"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    create_shell_session_after_final_teardown(&target.name);
+                    replacement_from_hook.set(Some(pane_generation_exact(&target.name).unwrap()));
+                },
+            )
+            .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert_ne!(replacement.get(), Some(expected));
+        assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
+        for pid in observed_pids {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "bearer-bearing descendant {pid} escaped private cgroup cleanup"
+            );
+        }
+        assert!(std::fs::read_to_string(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs")
+        )
+        .unwrap()
+        .trim()
+        .is_empty());
+        assert!(std::fs::read_to_string(nested.join("cgroup.procs"))
+            .unwrap()
+            .trim()
+            .is_empty());
+        force_cleanup_test_cgroup(cgroup.generation());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_cgroup_cleanup_fails_closed_on_foreign_task_or_freeze_thaw_failure() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+
+        let run_fixture = || {
+            let target = TestSession::new();
+            create_shell_session_after_final_teardown(&target.name);
+            let cgroup = create_private_process_cgroup().unwrap();
+            let expected = pane_generation_exact(&target.name).unwrap();
+            std::fs::write(
+                std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+                format!("{}\n", expected.pane_pid),
+            )
+            .unwrap();
+            wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+            (target, cgroup, expected)
+        };
+
+        let (foreign_target, foreign_cgroup, foreign_expected) = run_fixture();
+        let foreign_child = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let foreign_child_from_hook = foreign_child.clone();
+        let foreign_path = foreign_cgroup.generation().path.clone();
+        let hook = CgroupCleanupHookGuard::install(move |point| {
+            if point == CgroupCleanupTestPoint::BeforeKill {
+                let child = Command::new("sleep").arg("30").spawn().unwrap();
+                let pid = child.id();
+                std::fs::write(
+                    std::path::Path::new(&foreign_path).join("cgroup.procs"),
+                    format!("{pid}\n"),
+                )
+                .unwrap();
+                *foreign_child_from_hook.borrow_mut() = Some(child);
+            }
+            Ok(())
+        });
+        assert!(kill_session_tree_exact_generation(
+            &foreign_target.name,
+            foreign_expected,
+            Some(foreign_cgroup.generation())
+        )
+        .is_err());
+        drop(hook);
+        assert_eq!(
+            session_liveness(&foreign_target.name),
+            SessionLiveness::Alive
+        );
+        let mut foreign_child = foreign_child.borrow_mut().take().unwrap();
+        assert!(foreign_child.try_wait().unwrap().is_none());
+        foreign_child.kill().unwrap();
+        let _ = foreign_child.wait();
+        force_cleanup_test_cgroup(foreign_cgroup.generation());
+        let foreign_name = foreign_target.name.clone();
+        drop(foreign_target);
+        drop(foreign_cgroup);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while session_liveness(&foreign_name) != SessionLiveness::Gone {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (freeze_target, freeze_cgroup, freeze_expected) = run_fixture();
+        let hook = CgroupCleanupHookGuard::install(|point| {
+            if point == CgroupCleanupTestPoint::BeforeFreeze {
+                return Err(injected_cgroup_cleanup_error("injected freeze failure"));
+            }
+            Ok(())
+        });
+        assert!(kill_session_tree_exact_generation(
+            &freeze_target.name,
+            freeze_expected,
+            Some(freeze_cgroup.generation())
+        )
+        .is_err());
+        drop(hook);
+        assert_eq!(
+            session_liveness(&freeze_target.name),
+            SessionLiveness::Alive
+        );
+        force_cleanup_test_cgroup(freeze_cgroup.generation());
+        let freeze_name = freeze_target.name.clone();
+        drop(freeze_target);
+        drop(freeze_cgroup);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while session_liveness(&freeze_name) != SessionLiveness::Gone {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (thaw_target, thaw_cgroup, thaw_expected) = run_fixture();
+        let hook = CgroupCleanupHookGuard::install(|point| match point {
+            CgroupCleanupTestPoint::AfterFreeze => {
+                Err(injected_cgroup_cleanup_error("injected frozen failure"))
+            }
+            CgroupCleanupTestPoint::BeforeThaw => {
+                Err(injected_cgroup_cleanup_error("injected thaw failure"))
+            }
+            _ => Ok(()),
+        });
+        let error = kill_session_tree_exact_generation(
+            &thaw_target.name,
+            thaw_expected,
+            Some(thaw_cgroup.generation()),
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "injected thaw failure");
+        drop(hook);
+        force_cleanup_test_cgroup(thaw_cgroup.generation());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_cgroup_cleanup_rejects_bounded_subtree_overflow_without_killing() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let cgroup = create_private_process_cgroup().unwrap();
+        for index in 0..64 {
+            std::fs::create_dir(
+                std::path::Path::new(&cgroup.generation().path).join(format!("child-{index}")),
+            )
+            .unwrap();
+        }
+        let expected = pane_generation_exact(&target.name).unwrap();
+        std::fs::write(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+            format!("{}\n", expected.pane_pid),
+        )
+        .unwrap();
+        wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        let error =
+            kill_session_tree_exact_generation(&target.name, expected, Some(cgroup.generation()))
+                .unwrap_err();
+        assert!(error.message.contains("bounded subtree limit"));
+        assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
+        force_cleanup_test_cgroup(cgroup.generation());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persisted_private_cgroup_generation_replays_exact_cleanup_after_restart() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let cgroup = create_private_process_cgroup().unwrap();
+        let expected = pane_generation_exact(&target.name).unwrap();
+        std::fs::write(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+            format!("{}\n", expected.pane_pid),
+        )
+        .unwrap();
+        wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        let receipt = crate::harness::HarnessTerminalGenerationReceipt {
+            tmux_target: target.name.clone(),
+            session_id: expected.session_id,
+            session_created: expected.session_created,
+            window_id: expected.window_id,
+            pane_id: expected.pane_id,
+            pane_pid: expected.pane_pid,
+            process_cgroup: Some(crate::harness::HarnessProcessCgroupReceipt {
+                path: cgroup.generation().path.clone(),
+                device: cgroup.generation().device,
+                inode: cgroup.generation().inode,
+            }),
+        };
+        let persisted = serde_json::to_vec(&receipt).unwrap();
+        let retained = cgroup.retain();
+        let reloaded: crate::harness::HarnessTerminalGenerationReceipt =
+            serde_json::from_slice(&persisted).unwrap();
+        let reloaded_cgroup = reloaded.process_cgroup.unwrap();
+        let reloaded_cgroup = ProcessCgroupGeneration {
+            path: reloaded_cgroup.path,
+            device: reloaded_cgroup.device,
+            inode: reloaded_cgroup.inode,
+        };
+        assert_eq!(reloaded_cgroup, retained);
+        assert_eq!(
+            kill_session_tree_exact_generation(&target.name, expected, Some(&reloaded_cgroup))
+                .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while session_liveness(&target.name) != SessionLiveness::Gone {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replayed exact cgroup cleanup did not converge"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        force_cleanup_test_cgroup(&reloaded_cgroup);
+        let _ = std::fs::remove_dir(&reloaded_cgroup.path);
     }
 
     #[test]

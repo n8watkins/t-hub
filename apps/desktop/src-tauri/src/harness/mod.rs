@@ -175,6 +175,16 @@ pub struct HarnessTerminalGenerationReceipt {
     pub window_id: u64,
     pub pane_id: u64,
     pub pane_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_cgroup: Option<HarnessProcessCgroupReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProcessCgroupReceipt {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// Exact provider file selected before launch. For a node-style provider this
@@ -246,6 +256,109 @@ struct AnonymousCredentialHandoff {
 }
 
 #[cfg(unix)]
+struct AnonymousLaunchGate {
+    _release_reader: std::fs::File,
+    release_writer: std::fs::File,
+    ready_reader: std::fs::File,
+    _ready_writer: std::fs::File,
+    release_path: PathBuf,
+    ready_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl AnonymousLaunchGate {
+    fn pipe() -> Result<(std::fs::File, std::fs::File), LaunchAttestationError> {
+        use std::os::fd::FromRawFd;
+
+        let mut descriptors = [-1_i32; 2];
+        let result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+        if result != 0 {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        Ok(unsafe {
+            (
+                std::fs::File::from_raw_fd(descriptors[0]),
+                std::fs::File::from_raw_fd(descriptors[1]),
+            )
+        })
+    }
+
+    fn create() -> Result<Self, LaunchAttestationError> {
+        use std::os::fd::AsRawFd;
+
+        let (release_reader, release_writer) = Self::pipe()?;
+        let (ready_reader, ready_writer) = Self::pipe()?;
+        let release_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            release_reader.as_raw_fd()
+        ));
+        let ready_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            ready_writer.as_raw_fd()
+        ));
+        for path in [&release_path, &ready_path] {
+            let target = std::fs::read_link(path)
+                .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+            if !target.to_string_lossy().starts_with("pipe:[") {
+                return Err(LaunchAttestationError::CredentialHandoffFailed);
+            }
+        }
+        Ok(Self {
+            _release_reader: release_reader,
+            release_writer,
+            ready_reader,
+            _ready_writer: ready_writer,
+            release_path,
+            ready_path,
+        })
+    }
+
+    fn shell_prefix(&self) -> String {
+        format!(
+            "printf 'ready\\n' > {} || exit 123; IFS= read -r launch_gate < {} || exit 124; [ \"$launch_gate\" = launch ] || exit 124; ",
+            sh_single_quote(&self.ready_path.to_string_lossy()),
+            sh_single_quote(&self.release_path.to_string_lossy()),
+        )
+    }
+
+    fn wait_ready(&mut self) -> Result<(), LaunchAttestationError> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let mut descriptor = libc::pollfd {
+            fd: self.ready_reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 2_000) };
+        if result != 1 || descriptor.revents & libc::POLLIN == 0 {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        let mut ready = [0_u8; 6];
+        self.ready_reader
+            .read_exact(&mut ready)
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        if &ready != b"ready\n" {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<(), LaunchAttestationError> {
+        use std::io::Write;
+
+        self.release_writer
+            .write_all(b"launch\n")
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        self.release_writer
+            .flush()
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)
+    }
+}
+
+#[cfg(unix)]
 impl AnonymousCredentialHandoff {
     fn create(env: &[(String, String)]) -> Result<Self, LaunchAttestationError> {
         use std::io::Write;
@@ -312,13 +425,20 @@ impl AnonymousCredentialHandoff {
         })
     }
 
-    fn launch_command(&self, provider_alias: &std::path::Path, command_tail: &str) -> String {
-        format!(
-            "exec 3<{} || exit 125; . /proc/self/fd/3 || exit 126; exec 3<&-; exec {}{}",
+    fn launch_command(
+        &self,
+        provider_alias: &std::path::Path,
+        command_tail: &str,
+        launch_gate: Option<&AnonymousLaunchGate>,
+    ) -> String {
+        let handoff = format!(
+            "{}exec 3<{} || exit 125; . /proc/self/fd/3 || exit 126; exec 3<&-; exec {}{}",
+            launch_gate.map_or_else(String::new, AnonymousLaunchGate::shell_prefix),
             sh_single_quote(&self.descriptor_path.to_string_lossy()),
             sh_single_quote(&provider_alias.to_string_lossy()),
             command_tail,
-        )
+        );
+        format!("exec /bin/sh -c {}", sh_single_quote(&handoff))
     }
 }
 
@@ -390,12 +510,47 @@ impl OpenedHarnessProviderLaunch {
             binding.revalidate()?;
         }
         let credential_handoff = AnonymousCredentialHandoff::create(env)?;
-        let launch_command = credential_handoff.launch_command(&alias, command_tail);
+        // The credential-free bootstrap announces that it is blocked on this
+        // anonymous gate. T-Hub then waits for tmux/systemd scope settlement,
+        // moves the exact pidfd generation into a private child cgroup, and only
+        // then releases the gate. A parent crash closes both pipes, so the
+        // bootstrap exits without ever opening the credential pipe.
+        let mut launch_gate = AnonymousLaunchGate::create()?;
+        let launch_command =
+            credential_handoff.launch_command(&alias, command_tail, Some(&launch_gate));
         let respawn = match crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command) {
             Ok(respawn) => respawn,
             Err(_) => return Err(LaunchAttestationError::UnreadableEvidence),
         };
         *failure_generation = terminal_generation_receipt_from_pane(tmux_target, respawn.after);
+        launch_gate.wait_ready()?;
+        #[cfg(target_os = "linux")]
+        let process_cgroup =
+            match crate::tmux::confine_blocked_pane_to_private_cgroup(tmux_target, respawn.after) {
+                Ok(process_cgroup) => process_cgroup,
+                Err(failure) => {
+                    if let Some(process_cgroup) = failure.process_cgroup {
+                        failure_generation.process_cgroup = Some(HarnessProcessCgroupReceipt {
+                            path: process_cgroup.generation().path.clone(),
+                            device: process_cgroup.generation().device,
+                            inode: process_cgroup.generation().inode,
+                        });
+                        let _ = process_cgroup.retain();
+                    }
+                    let _ = failure.error;
+                    return Err(LaunchAttestationError::ProcessChanged);
+                }
+            };
+        #[cfg(not(target_os = "linux"))]
+        return Err(LaunchAttestationError::UnreadableEvidence);
+        let process_cgroup_receipt = HarnessProcessCgroupReceipt {
+            path: process_cgroup.generation().path.clone(),
+            device: process_cgroup.generation().device,
+            inode: process_cgroup.generation().inode,
+        };
+        failure_generation.process_cgroup = Some(process_cgroup_receipt.clone());
+        launch_gate.release()?;
+        let stable_launch_generation = respawn.after;
         let mut observed = None;
         for _ in 0..20 {
             match observe_harness_process(tmux_target) {
@@ -414,11 +569,11 @@ impl OpenedHarnessProviderLaunch {
         let stable = confirm_stable_launch_baseline(&first, &second)?;
         let terminal = &stable.terminal;
         if terminal.session_name != tmux_target
-            || terminal.session_id != respawn.after.session_id
-            || terminal.session_created != respawn.after.session_created
-            || terminal.window_id != respawn.after.window_id
-            || terminal.pane_id != respawn.after.pane_id
-            || terminal.pane_pid != respawn.after.pane_pid
+            || terminal.session_id != stable_launch_generation.session_id
+            || terminal.session_created != stable_launch_generation.session_created
+            || terminal.window_id != stable_launch_generation.window_id
+            || terminal.pane_id != stable_launch_generation.pane_id
+            || terminal.pane_pid != stable_launch_generation.pane_pid
             || provider_file_identity(&alias)?
                 != provider_file_identity_from_open_file(&self.executable)?
         {
@@ -427,9 +582,20 @@ impl OpenedHarnessProviderLaunch {
         for binding in &self.provenance {
             binding.revalidate()?;
         }
+        let mut terminal = terminal_generation_receipt(tmux_target, &stable);
+        if terminal.session_id != stable_launch_generation.session_id
+            || terminal.session_created != stable_launch_generation.session_created
+            || terminal.window_id != stable_launch_generation.window_id
+            || terminal.pane_id != stable_launch_generation.pane_id
+            || terminal.pane_pid != stable_launch_generation.pane_pid
+        {
+            return Err(LaunchAttestationError::ProcessChanged);
+        }
+        terminal.process_cgroup = failure_generation.process_cgroup.clone();
+        let _retained_cgroup = process_cgroup.retain();
         Ok(VerifiedHarnessProviderProcessLaunch {
             provider: self.receipt,
-            terminal: terminal_generation_receipt(tmux_target, &stable),
+            terminal,
             evidence: stable,
             _executable: self.executable,
             _provenance: self.provenance,
@@ -465,6 +631,7 @@ pub(crate) fn terminal_generation_receipt_from_pane(
         window_id: pane.window_id,
         pane_id: pane.pane_id,
         pane_pid: pane.pane_pid,
+        process_cgroup: None,
     }
 }
 
@@ -638,6 +805,7 @@ pub fn terminal_generation_receipt(
         window_id: evidence.terminal.window_id,
         pane_id: evidence.terminal.pane_id,
         pane_pid: evidence.terminal.pane_pid,
+        process_cgroup: None,
     }
 }
 
@@ -656,7 +824,19 @@ pub(crate) fn test_verified_terminal_generation(
 ) -> VerifiedHarnessTerminalGeneration {
     let mut evidence = evidence.clone();
     evidence.terminal.session_name = tmux_target.to_string();
-    VerifiedHarnessTerminalGeneration(terminal_generation_receipt(tmux_target, &evidence))
+    let mut receipt = terminal_generation_receipt(tmux_target, &evidence);
+    receipt.process_cgroup = Some(test_process_cgroup_receipt(tmux_target));
+    VerifiedHarnessTerminalGeneration(receipt)
+}
+
+#[cfg(test)]
+fn test_process_cgroup_receipt(tmux_target: &str) -> HarnessProcessCgroupReceipt {
+    let _ = tmux_target;
+    HarnessProcessCgroupReceipt {
+        path: "/sys/fs/cgroup/user.slice/test/app.slice/app-tmux.slice/tmux-spawn-test.scope/t-hub-cortana-0123456789abcdef0123456789abcdef".into(),
+        device: 42,
+        inode: 900,
+    }
 }
 
 /// Credential-safe failure classes for fail-closed launch attestation.
@@ -2060,6 +2240,22 @@ pub(crate) fn observe_runtime_policy_receipt_from_spawn(
     {
         return Err(LaunchAttestationError::TerminalChanged);
     }
+    let process_cgroup = spawn_terminal
+        .process_cgroup
+        .as_ref()
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    if !crate::tmux::process_is_in_exact_cgroup(
+        spawn_terminal.pane_pid,
+        &crate::tmux::ProcessCgroupGeneration {
+            path: process_cgroup.path.clone(),
+            device: process_cgroup.device,
+            inode: process_cgroup.inode,
+        },
+    )
+    .map_err(|_| LaunchAttestationError::UnreadableEvidence)?
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
     expected
         .adapter()
         .attest_permissions(&accepted, expected_permission)?;
@@ -2087,7 +2283,7 @@ pub(crate) fn observe_runtime_policy_receipt_from_spawn(
         observe_harness_process(tmux_target),
         expected_permission,
     )?;
-    seal_runtime_policy_receipt(
+    let mut receipt = seal_runtime_policy_receipt(
         tmux_target,
         &stable,
         expected,
@@ -2097,7 +2293,9 @@ pub(crate) fn observe_runtime_policy_receipt_from_spawn(
         expected_file,
         &version,
         Some(&provider_path),
-    )
+    )?;
+    receipt.0.terminal.process_cgroup = spawn_terminal.process_cgroup.clone();
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -2112,7 +2310,7 @@ pub(crate) fn test_verified_runtime_receipt(
 ) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
     let mut evidence = evidence.clone();
     evidence.terminal.session_name = tmux_target.to_string();
-    seal_runtime_policy_receipt(
+    let mut receipt = seal_runtime_policy_receipt(
         tmux_target,
         &evidence,
         expected,
@@ -2125,7 +2323,9 @@ pub(crate) fn test_verified_runtime_receipt(
         },
         executable_version,
         None,
-    )
+    )?;
+    receipt.0.terminal.process_cgroup = Some(test_process_cgroup_receipt(tmux_target));
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -2142,7 +2342,7 @@ pub(crate) fn test_verified_runtime_receipt_from_observed_file(
     evidence.terminal.session_name = tmux_target.to_string();
     let executable = resolved_provider_executable_path(&evidence, expected)?;
     let provider_file = provider_file_identity(&executable)?;
-    seal_runtime_policy_receipt(
+    let mut receipt = seal_runtime_policy_receipt(
         tmux_target,
         &evidence,
         expected,
@@ -2152,7 +2352,9 @@ pub(crate) fn test_verified_runtime_receipt_from_observed_file(
         provider_file,
         executable_version,
         None,
-    )
+    )?;
+    receipt.0.terminal.process_cgroup = Some(test_process_cgroup_receipt(tmux_target));
+    Ok(receipt)
 }
 
 fn unique_option_value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<&'a str>, ()> {
@@ -3819,12 +4021,21 @@ mod tests {
             )
             .unwrap();
         let (provider_receipt, terminal_receipt) = launch.spawn_receipts();
+        let terminal_receipt = terminal_receipt.into_persisted();
+        let process_cgroup_path = terminal_receipt
+            .process_cgroup
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert!(process_cgroup_path.contains("/app.slice/app-tmux.slice/tmux-spawn-"));
+        assert!(process_cgroup_path.contains(".scope/t-hub-cortana-"));
         assert_eq!(std::fs::read_to_string(&proof).unwrap(), "trusted-received");
         assert_eq!(
             provider_receipt.into_persisted().provider_executable_inode,
             provider_file_identity(&provider).unwrap().inode
         );
-        assert_eq!(terminal_receipt.into_persisted().tmux_target, target);
+        assert_eq!(terminal_receipt.tmux_target, target);
         assert_eq!(
             provider_arguments(launch.evidence(), Harness::Codex).unwrap()[0],
             "--proof"
@@ -3866,8 +4077,39 @@ mod tests {
                 .unwrap()
                 .is_none_or(|value| value.is_empty())
         );
+        let exact_generation = crate::tmux::PaneGeneration {
+            session_id: terminal_receipt.session_id,
+            session_created: terminal_receipt.session_created,
+            window_id: terminal_receipt.window_id,
+            pane_id: terminal_receipt.pane_id,
+            pane_pid: terminal_receipt.pane_pid,
+        };
+        let process_cgroup = terminal_receipt.process_cgroup.as_ref().unwrap();
+        let process_cgroup = crate::tmux::ProcessCgroupGeneration {
+            path: process_cgroup.path.clone(),
+            device: process_cgroup.device,
+            inode: process_cgroup.inode,
+        };
+        assert_eq!(
+            crate::tmux::kill_session_tree_exact_generation(
+                &target,
+                exact_generation,
+                Some(&process_cgroup),
+            )
+            .unwrap(),
+            crate::tmux::ExactGenerationKill::Killed
+        );
         drop(launch);
         drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::tmux::session_liveness(&target) != crate::tmux::SessionLiveness::Gone
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if std::path::Path::new(&process_cgroup_path).exists() {
+            std::fs::remove_dir(process_cgroup_path).unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -3876,12 +4118,23 @@ mod tests {
         if std::env::var_os("T_HUB_CREDENTIAL_PARENT_CRASH_HELPER").is_none() {
             return;
         }
+        let provider =
+            PathBuf::from(std::env::var_os("T_HUB_CREDENTIAL_PARENT_CRASH_PROVIDER").unwrap());
+        let child_pid_path =
+            PathBuf::from(std::env::var_os("T_HUB_CREDENTIAL_PARENT_CRASH_CHILD_PID").unwrap());
         let handoff = AnonymousCredentialHandoff::create(&[(
             "T_HUB_SESSION_TOKEN".into(),
             "parent-crash-secret".into(),
         )])
         .unwrap();
-        assert!(handoff.descriptor_path.exists());
+        let mut gate = AnonymousLaunchGate::create().unwrap();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(handoff.launch_command(&provider, "", Some(&gate)))
+            .spawn()
+            .unwrap();
+        gate.wait_ready().unwrap();
+        std::fs::write(child_pid_path, child.id().to_string()).unwrap();
         std::process::exit(91);
     }
 
@@ -3894,6 +4147,17 @@ mod tests {
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| name.starts_with("t-hub-provider-credentials-"))
             .collect::<std::collections::BTreeSet<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("provider.sh");
+        let proof = temp.path().join("provider-ran");
+        let child_pid_path = temp.path().join("child-pid");
+        std::fs::write(
+            &provider,
+            format!("#!/bin/sh\nprintf leaked > '{}'\n", proof.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -3901,9 +4165,21 @@ mod tests {
                 "--nocapture",
             ])
             .env("T_HUB_CREDENTIAL_PARENT_CRASH_HELPER", "1")
+            .env("T_HUB_CREDENTIAL_PARENT_CRASH_PROVIDER", &provider)
+            .env("T_HUB_CREDENTIAL_PARENT_CRASH_CHILD_PID", &child_pid_path)
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(91));
+        let child_pid = std::fs::read_to_string(&child_pid_path).unwrap();
+        let child_pid = child_pid.parse::<u32>().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{child_pid}")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!std::path::Path::new(&format!("/proc/{child_pid}")).exists());
+        assert!(!proof.exists(), "parent crash released the provider gate");
         let after = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .flatten()
@@ -3918,7 +4194,7 @@ mod tests {
                 "no-exec-secret".into(),
             )])
             .unwrap();
-            handoff.launch_command(std::path::Path::new("/bin/false"), "")
+            handoff.launch_command(std::path::Path::new("/bin/false"), "", None)
         };
         let no_exec = Command::new("sh").arg("-c").arg(command).status().unwrap();
         assert!(!no_exec.success());
@@ -3931,7 +4207,7 @@ mod tests {
         let credential_target = handoff.descriptor_target.clone();
         let child = Command::new("sh")
             .arg("-c")
-            .arg(handoff.launch_command(std::path::Path::new("/bin/false"), ""))
+            .arg(handoff.launch_command(std::path::Path::new("/bin/false"), "", None))
             .spawn()
             .unwrap();
         let child_pid = child.id();
@@ -4048,6 +4324,12 @@ mod tests {
             )
             .is_err());
         assert_ne!(failure_generation, dormant_generation);
+        let failed_cgroup_path = failure_generation
+            .process_cgroup
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
         assert_eq!(
             incumbent_terminal_generation(&failure_generation),
             crate::tmux::pane_generation_exact(&rejected_target).unwrap()
@@ -4075,6 +4357,15 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&inheritance_proof).unwrap(), "none");
         drop(guards);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::tmux::session_liveness(&rejected_target) != crate::tmux::SessionLiveness::Gone
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if std::path::Path::new(&failed_cgroup_path).exists() {
+            std::fs::remove_dir(&failed_cgroup_path).unwrap();
+        }
     }
 
     #[cfg(unix)]
