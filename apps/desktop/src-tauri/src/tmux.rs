@@ -311,6 +311,7 @@ enum CgroupCleanupTestPoint {
     AfterFirstSnapshot,
     AfterIdentityValidation,
     BeforeKill,
+    BeforePinnedSignals,
     AfterKill,
     BeforeThaw,
     BeforeRemove,
@@ -1251,12 +1252,7 @@ fn create_private_process_cgroup_at(
         message: "private Cortana cgroup could not be created".into(),
     })?;
     let mut cleanup = Cleanup(Some(path.to_path_buf()));
-    for control in [
-        "cgroup.procs",
-        "cgroup.events",
-        "cgroup.freeze",
-        "cgroup.kill",
-    ] {
+    for control in ["cgroup.procs", "cgroup.events", "cgroup.freeze"] {
         if !path.join(control).exists() {
             return Err(TmuxError {
                 op: "create-process-cgroup",
@@ -1535,7 +1531,8 @@ pub(crate) fn process_is_in_exact_cgroup(
 /// A provider-bearing Linux generation must carry its launch-time private
 /// cgroup identity. Cleanup pins the cgroup and pane, freezes the complete
 /// bounded subtree, validates stable PID, start-tick, membership, and ancestry
-/// evidence, then uses `cgroup.kill` and proves the subtree empty. A dormant,
+/// evidence, then signals only the validated pinned pidfds and proves the
+/// subtree empty. A dormant,
 /// credential-free pane uses only its exact pidfd. No destructive operation
 /// targets the tmux name after the generation can disappear or rebind.
 pub(crate) fn kill_session_tree_exact_generation(
@@ -2201,11 +2198,15 @@ where
                     });
                 }
             }
-            std::fs::write(control_path.join("cgroup.kill"), b"1").map_err(|error| TmuxError {
-                op: "kill-session-tree-generation",
-                code: error.raw_os_error(),
-                message: "exact candidate cgroup kill failed".into(),
-            })?;
+            #[cfg(test)]
+            run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforePinnedSignals)?;
+            for (_, descriptor) in pinned.iter().rev() {
+                signal_pidfd(descriptor).map_err(|error| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "validated candidate pidfd signal failed".into(),
+                })?;
+            }
             #[cfg(test)]
             run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::AfterKill)?;
             let empty = (0..POLL_LIMIT).any(|_| {
@@ -3095,6 +3096,60 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        let (boundary_target, boundary_cgroup, boundary_expected) = run_fixture();
+        let boundary_foreign = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let boundary_foreign_from_hook = boundary_foreign.clone();
+        let boundary_path = boundary_cgroup.generation().path.clone();
+        let hook = CgroupCleanupHookGuard::install(move |point| {
+            if point == CgroupCleanupTestPoint::BeforePinnedSignals {
+                let child = Command::new("sleep").arg("30").spawn().unwrap();
+                let pid = child.id();
+                let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+                    .unwrap();
+                std::fs::write(
+                    std::path::Path::new(&boundary_path).join("cgroup.procs"),
+                    format!("{pid}\n"),
+                )
+                .unwrap();
+                *boundary_foreign_from_hook.borrow_mut() = Some((child, membership));
+            }
+            Ok(())
+        });
+        let error = kill_session_tree_exact_generation(
+            &boundary_target.name,
+            boundary_expected,
+            Some(boundary_cgroup.generation()),
+        )
+        .unwrap_err();
+        drop(hook);
+        assert!(error.message.contains("did not become empty"));
+        assert_eq!(
+            session_liveness(&boundary_target.name),
+            SessionLiveness::Gone
+        );
+        let (mut boundary_foreign, original_membership) =
+            boundary_foreign.borrow_mut().take().unwrap();
+        assert!(boundary_foreign.try_wait().unwrap().is_none());
+        let original_procs = std::path::Path::new("/sys/fs/cgroup")
+            .join(original_membership.trim_start_matches('/'))
+            .join("cgroup.procs");
+        std::fs::write(original_procs, format!("{}\n", boundary_foreign.id())).unwrap();
+        boundary_foreign.kill().unwrap();
+        boundary_foreign.wait().unwrap();
+        assert_eq!(
+            kill_session_tree_exact_generation(
+                &boundary_target.name,
+                boundary_expected,
+                Some(boundary_cgroup.generation())
+            )
+            .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&boundary_cgroup.generation().path).exists());
 
         let (freeze_target, freeze_cgroup, freeze_expected) = run_fixture();
         let hook = CgroupCleanupHookGuard::install(|point| {
