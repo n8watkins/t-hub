@@ -135,7 +135,7 @@ Resetting context preserves the Captain, Assignment, Workspaces, Crew, and Powde
 User-managed launchers such as `~/.bun/bin/codex` and `~/.npm-global/bin/claude` are discovery hints rather than runtime launch authority.
 An installer may make one of those launchers usable by copying the complete provider package into a root-owned, non-group-writable, non-world-writable snapshot and writing a root-owned `/etc/t-hub/provider-catalog.json` mapping.
 T-Hub launches only the protected snapshot through its exact opened file descriptor and keeps the catalog, manifest, executable, and every protected path component bound through launch attestation.
-T-Hub removes control and session credentials from the exact tmux session environment immediately after the child inherits them, and a scrub failure blocks launch convergence until that candidate is definitively gone.
+T-Hub never writes control or session credentials into persistent tmux session state and instead uses a private one-shot handoff that the exact child opens and unlinks before provider execution.
 T-Hub fails closed without modifying the user installation when the catalog is absent, malformed, ambiguous, oversized, writable, version-skewed, or points at an unprotected package.
 
 The version 1 catalog shape is:

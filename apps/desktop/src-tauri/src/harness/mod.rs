@@ -236,37 +236,94 @@ pub(crate) struct OpenedHarnessProviderLaunch {
     opened_path: PathBuf,
 }
 
-struct TmuxCredentialEnvironmentGuard {
-    target: String,
-    keys: Vec<String>,
-    scrubbed: bool,
+struct OneShotCredentialHandoff {
+    directory: PathBuf,
+    wrapper: PathBuf,
+    credentials: PathBuf,
 }
 
-impl TmuxCredentialEnvironmentGuard {
-    fn new(target: &str, env: &[(String, String)]) -> Self {
-        let mut keys = env.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-        keys.sort();
-        keys.dedup();
-        Self {
-            target: target.to_string(),
-            keys,
-            scrubbed: false,
+impl OneShotCredentialHandoff {
+    #[cfg(unix)]
+    fn create(
+        provider_alias: &std::path::Path,
+        command_tail: &str,
+        env: &[(String, String)],
+    ) -> Result<Self, LaunchAttestationError> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let directory = std::env::temp_dir().join(format!(
+            "t-hub-provider-credentials-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&directory).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let wrapper = directory.join("launch");
+        let credentials = directory.join("credentials");
+        let handoff = Self {
+            directory,
+            wrapper,
+            credentials,
+        };
+        std::fs::set_permissions(&handoff.directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let mut credential_body = String::new();
+        let mut keys = std::collections::HashSet::new();
+        for (key, value) in env {
+            if key.is_empty()
+                || key.contains('=')
+                || key.chars().any(char::is_whitespace)
+                || key.chars().any(char::is_control)
+                || !keys.insert(key.as_str())
+            {
+                return Err(LaunchAttestationError::CredentialHandoffFailed);
+            }
+            credential_body.push_str("export ");
+            credential_body.push_str(key);
+            credential_body.push('=');
+            credential_body.push_str(&sh_single_quote(value));
+            credential_body.push('\n');
         }
+        let mut credential_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&handoff.credentials)
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        credential_file
+            .write_all(credential_body.as_bytes())
+            .and_then(|_| credential_file.sync_all())
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        let wrapper_body = format!(
+            "#!/bin/sh\nexec 3<{} || exit 125\nrm -f -- {} {} || exit 126\n. /proc/self/fd/3 || exit 127\nexec {}{}\n",
+            sh_single_quote(&handoff.credentials.to_string_lossy()),
+            sh_single_quote(&handoff.credentials.to_string_lossy()),
+            sh_single_quote(&handoff.wrapper.to_string_lossy()),
+            sh_single_quote(&provider_alias.to_string_lossy()),
+            command_tail,
+        );
+        let mut wrapper_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&handoff.wrapper)
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        wrapper_file
+            .write_all(wrapper_body.as_bytes())
+            .and_then(|_| wrapper_file.sync_all())
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        Ok(handoff)
     }
 
-    fn scrub(&mut self) -> Result<(), LaunchAttestationError> {
-        crate::tmux::unset_session_environment_exact(&self.target, &self.keys)
-            .map_err(|_| LaunchAttestationError::CredentialScrubFailed)?;
-        self.scrubbed = true;
-        Ok(())
+    fn consumed(&self) -> bool {
+        !self.wrapper.exists() && !self.credentials.exists()
     }
 }
 
-impl Drop for TmuxCredentialEnvironmentGuard {
+impl Drop for OneShotCredentialHandoff {
     fn drop(&mut self) {
-        if !self.scrubbed {
-            let _ = crate::tmux::unset_session_environment_exact(&self.target, &self.keys);
-        }
+        let _ = std::fs::remove_file(&self.wrapper);
+        let _ = std::fs::remove_file(&self.credentials);
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -320,28 +377,27 @@ impl OpenedHarnessProviderLaunch {
         for binding in &self.provenance {
             binding.revalidate()?;
         }
-        let mut credential_guard = TmuxCredentialEnvironmentGuard::new(tmux_target, env);
-        if crate::tmux::set_session_environment_exact(tmux_target, env).is_err() {
-            return match credential_guard.scrub() {
-                Ok(()) => Err(LaunchAttestationError::UnreadableEvidence),
-                Err(error) => Err(error),
-            };
-        }
+        let credential_handoff = OneShotCredentialHandoff::create(&alias, command_tail, env)?;
         let launch_command = format!(
-            "exec {}{}",
-            sh_single_quote(&alias.to_string_lossy()),
-            command_tail
+            "exec {}",
+            sh_single_quote(&credential_handoff.wrapper.to_string_lossy())
         );
         let respawn = match crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command) {
             Ok(respawn) => respawn,
-            Err(_) => {
-                return match credential_guard.scrub() {
-                    Ok(()) => Err(LaunchAttestationError::UnreadableEvidence),
-                    Err(error) => Err(error),
-                };
-            }
+            Err(_) => return Err(LaunchAttestationError::UnreadableEvidence),
         };
-        credential_guard.scrub()?;
+        let consumed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !credential_handoff.consumed() {
+            if crate::tmux::pane_generation_exact(tmux_target)
+                .is_ok_and(|generation| generation != respawn.after)
+            {
+                return Err(LaunchAttestationError::TerminalChanged);
+            }
+            if std::time::Instant::now() >= consumed_deadline {
+                return Err(LaunchAttestationError::CredentialHandoffFailed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let mut observed = None;
         for _ in 0..20 {
             match observe_harness_process(tmux_target) {
@@ -585,7 +641,7 @@ pub enum LaunchAttestationError {
     ProcessChanged,
     AncestryChanged,
     UntrustedUserInstall,
-    CredentialScrubFailed,
+    CredentialHandoffFailed,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -615,8 +671,8 @@ impl std::fmt::Display for LaunchAttestationError {
             Self::UntrustedUserInstall => {
                 "user-managed provider install is not launch authority; provision a protected package snapshot and root-owned /etc/t-hub/provider-catalog.json mapping"
             }
-            Self::CredentialScrubFailed => {
-                "provider launch credentials could not be scrubbed from the exact tmux session environment"
+            Self::CredentialHandoffFailed => {
+                "provider launch credentials were not consumed by the exact one-shot child handoff"
             }
         };
         f.write_str(message)
@@ -2400,6 +2456,14 @@ pub(crate) fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn empty_candidate_session_credentials() -> Vec<(String, String)> {
+        vec![
+            ("T_HUB_CONTROL_ADDR".into(), String::new()),
+            ("T_HUB_CONTROL_TOKEN".into(), String::new()),
+            ("T_HUB_SESSION_TOKEN".into(), String::new()),
+        ]
+    }
+
     fn shell_evidence() -> HarnessProcessEvidence {
         HarnessProcessEvidence::test_after_exec(42, 900, 100, &["zsh"])
     }
@@ -3450,7 +3514,13 @@ mod tests {
             }
             let suffix = uuid::Uuid::new_v4().simple().to_string();
             let target = format!("th_catalog_swap_{}", &suffix[..8]);
-            crate::tmux::new_session_with_env(&target, "/tmp", Some("sleep 30"), &[]).unwrap();
+            crate::tmux::new_session_with_env(
+                &target,
+                "/tmp",
+                Some("sleep 30"),
+                &empty_candidate_session_credentials(),
+            )
+            .unwrap();
             let _guard = SessionGuard(target.clone());
             assert!(matches!(
                 opened.launch_in_exact_tmux_pane(
@@ -3462,9 +3532,10 @@ mod tests {
                 ),
                 Err(LaunchAttestationError::ProcessChanged)
             ));
-            assert_eq!(
-                crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN").unwrap(),
-                None
+            assert!(
+                crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN")
+                    .unwrap()
+                    .is_none_or(|value| value.is_empty())
             );
         }
 
@@ -3680,7 +3751,13 @@ mod tests {
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let target = format!("th_exact_handoff_{}", &suffix[..8]);
-        crate::tmux::new_session_with_env(&target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        crate::tmux::new_session_with_env(
+            &target,
+            "/tmp",
+            Some("sleep 30"),
+            &empty_candidate_session_credentials(),
+        )
+        .unwrap();
         let guard = SessionGuard(target.clone());
         let command = format!(
             "codex --proof {}",
@@ -3706,9 +3783,10 @@ mod tests {
             provider_arguments(launch.evidence(), Harness::Codex).unwrap()[0],
             "--proof"
         );
-        assert_eq!(
-            crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN").unwrap(),
-            None
+        assert!(
+            crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN")
+                .unwrap()
+                .is_none_or(|value| value.is_empty())
         );
         drop(launch);
         drop(guard);
@@ -3752,8 +3830,19 @@ mod tests {
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let partial_target = format!("th_scrub_partial_{}", &suffix[..8]);
-        crate::tmux::new_session_with_env(&partial_target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        crate::tmux::new_session_with_env(
+            &partial_target,
+            "/tmp",
+            Some("sleep 30"),
+            &empty_candidate_session_credentials(),
+        )
+        .unwrap();
         guards.push(SessionGuard(partial_target.clone()));
+        assert!(crate::tmux::unset_session_environment_exact(
+            &format!("{partial_target}_missing"),
+            &["T_HUB_SESSION_TOKEN".to_string()],
+        )
+        .is_err());
         let opened =
             test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
         assert!(matches!(
@@ -3767,16 +3856,23 @@ mod tests {
                     ("MALFORMED KEY".into(), "never-authoritative".into()),
                 ],
             ),
-            Err(LaunchAttestationError::CredentialScrubFailed)
+            Err(LaunchAttestationError::CredentialHandoffFailed)
         ));
-        assert_eq!(
-            crate::tmux::session_environment_exact(&partial_target, "T_HUB_SESSION_TOKEN").unwrap(),
-            None
+        assert!(
+            crate::tmux::session_environment_exact(&partial_target, "T_HUB_SESSION_TOKEN")
+                .unwrap()
+                .is_none_or(|value| value.is_empty())
         );
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let rejected_target = format!("th_scrub_reject_{}", &suffix[..8]);
-        crate::tmux::new_session_with_env(&rejected_target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        crate::tmux::new_session_with_env(
+            &rejected_target,
+            "/tmp",
+            Some("sleep 30"),
+            &empty_candidate_session_credentials(),
+        )
+        .unwrap();
         guards.push(SessionGuard(rejected_target.clone()));
         let opened =
             test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
@@ -3789,11 +3885,28 @@ mod tests {
                 &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
             )
             .is_err());
-        assert_eq!(
+        assert!(
             crate::tmux::session_environment_exact(&rejected_target, "T_HUB_SESSION_TOKEN")
-                .unwrap(),
-            None
+                .unwrap()
+                .is_none_or(|value| value.is_empty())
         );
+        let inheritance_proof = temp.path().join("later-respawn-environment");
+        let proof_command = format!(
+            "if [ -z \"${{T_HUB_SESSION_TOKEN}}\" ]; then printf none > {}; else printf inherited > {}; fi; sleep 30",
+            sh_single_quote(&inheritance_proof.to_string_lossy()),
+            sh_single_quote(&inheritance_proof.to_string_lossy()),
+        );
+        crate::tmux::respawn_pane_exact(
+            &rejected_target,
+            "/tmp",
+            &format!("sh -c {}", sh_single_quote(&proof_command)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !inheritance_proof.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&inheritance_proof).unwrap(), "none");
         drop(guards);
     }
 

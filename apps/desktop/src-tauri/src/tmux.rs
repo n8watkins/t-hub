@@ -378,6 +378,7 @@ pub(crate) fn session_environment_exact(
 /// been opened and provenance-bound. Values are argv to the local tmux client,
 /// are never returned or logged, and become visible only to subsequently
 /// respawned children in this exact session.
+#[cfg(test)]
 pub(crate) fn set_session_environment_exact(
     name: &str,
     env: &[(String, String)],
@@ -408,6 +409,7 @@ pub(crate) fn set_session_environment_exact(
 /// Every requested key is attempted even if an earlier removal fails, so one
 /// malformed or transiently unreadable entry cannot leave the remaining bearer
 /// values behind without an error.
+#[cfg(test)]
 pub(crate) fn unset_session_environment_exact(
     name: &str,
     keys: &[String],

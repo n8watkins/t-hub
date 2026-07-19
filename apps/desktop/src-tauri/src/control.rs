@@ -19907,7 +19907,14 @@ where
         &candidate.tmux_session_id,
         &cwd,
         Some(CREW_DORMANT_PANE_COMMAND),
-        &[],
+        &[
+            ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+            ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
+            (
+                crate::identity::SESSION_TOKEN_ENV.to_string(),
+                String::new(),
+            ),
+        ],
     ) {
         return record_cortana_worker_failure(
             ctx,
@@ -25365,7 +25372,7 @@ mod tests {
             &intent.operation_id,
             &intent.request_digest,
             &target,
-            &crate::harness::LaunchAttestationError::CredentialScrubFailed.to_string(),
+            &crate::harness::LaunchAttestationError::CredentialHandoffFailed.to_string(),
             &|_| Err("injected exact cleanup failure".into()),
             &|_| tmux::SessionLiveness::Alive,
         )
@@ -25388,7 +25395,7 @@ mod tests {
             &intent.operation_id,
             &intent.request_digest,
             &target,
-            &crate::harness::LaunchAttestationError::CredentialScrubFailed.to_string(),
+            &crate::harness::LaunchAttestationError::CredentialHandoffFailed.to_string(),
             &|_| Ok(()),
             &|_| tmux::SessionLiveness::Gone,
         )
@@ -26286,10 +26293,11 @@ mod tests {
             "T_HUB_CONTROL_TOKEN",
             crate::identity::SESSION_TOKEN_ENV,
         ] {
-            assert_eq!(
-                tmux::session_environment_exact(&_session.0, key).unwrap(),
-                None,
-                "credential key {key} remained in the tmux session environment"
+            assert!(
+                tmux::session_environment_exact(&_session.0, key)
+                    .unwrap()
+                    .is_none_or(|value| value.is_empty()),
+                "credential key {key} retained a bearer in the tmux session environment"
             );
         }
         let replayed = run_cortana_worker_once_with_provider(&ctx, |_| {
