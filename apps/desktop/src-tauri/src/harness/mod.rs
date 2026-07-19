@@ -339,7 +339,9 @@ impl AnonymousLaunchGate {
 
     fn shell_prefix(&self) -> String {
         format!(
-            "printf 'ready\\n' > {} || exit 123; IFS= read -r launch_gate < {} || exit 124; [ \"$launch_gate\" = launch ] || exit 124; ",
+            "printf 'ready\\n' > {} || exit 123; IFS= read -r cgroup_path < {} || exit 124; case \"$cgroup_path\" in /sys/fs/cgroup/user.slice/*/app.slice/t-hub-cortana-[0-9a-f]*.scope) ;; *) exit 124 ;; esac; printf '0\\n' > \"$cgroup_path/cgroup.procs\" || exit 124; printf 'confined\\n' > {} || exit 123; IFS= read -r launch_gate < {} || exit 124; [ \"$launch_gate\" = launch ] || exit 124; ",
+            sh_single_quote(&self.ready_path.to_string_lossy()),
+            sh_single_quote(&self.release_path.to_string_lossy()),
             sh_single_quote(&self.ready_path.to_string_lossy()),
             sh_single_quote(&self.release_path.to_string_lossy()),
         )
@@ -363,6 +365,39 @@ impl AnonymousLaunchGate {
             .read_exact(&mut ready)
             .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
         if &ready != b"ready\n" {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        Ok(())
+    }
+
+    fn confine(&mut self, path: &std::path::Path) -> Result<(), LaunchAttestationError> {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        let path = path
+            .to_str()
+            .filter(|path| !path.contains(['\n', '\r']))
+            .ok_or(LaunchAttestationError::CredentialHandoffFailed)?;
+        self.release_writer
+            .write_all(format!("{path}\n").as_bytes())
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        self.release_writer
+            .flush()
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        let mut descriptor = libc::pollfd {
+            fd: self.ready_reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 2_000) };
+        if result != 1 || descriptor.revents & libc::POLLIN == 0 {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        let mut confined = [0_u8; 9];
+        self.ready_reader
+            .read_exact(&mut confined)
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
+        if &confined != b"confined\n" {
             return Err(LaunchAttestationError::CredentialHandoffFailed);
         }
         Ok(())
@@ -549,7 +584,19 @@ impl OpenedHarnessProviderLaunch {
         launch_gate.wait_ready()?;
         #[cfg(target_os = "linux")]
         let (process_cgroup, containment_guardian) =
-            match crate::tmux::confine_blocked_pane_to_private_cgroup(tmux_target, respawn.after) {
+            match crate::tmux::confine_blocked_pane_to_private_cgroup(
+                tmux_target,
+                respawn.after,
+                |path| {
+                    launch_gate
+                        .confine(path)
+                        .map_err(|_| crate::tmux::TmuxError {
+                            op: "self-confine-candidate",
+                            code: None,
+                            message: "candidate bootstrap could not self-confine".into(),
+                        })
+                },
+            ) {
                 Ok(result) => result,
                 Err(failure) => {
                     if let Some(process_cgroup) = failure.process_cgroup {
@@ -642,8 +689,24 @@ impl PreparedHarnessProviderProcessLaunch {
         if self.persistence_confirmed {
             return Ok(());
         }
+        #[cfg(target_os = "linux")]
+        self.containment_guardian
+            .validate_candidate(
+                &self.tmux_target,
+                self.stable_launch_generation,
+                self.process_cgroup.generation(),
+            )
+            .map_err(|error| error.message)?;
         let (provider, terminal) = self.spawn_receipts();
         persist(provider, terminal)?;
+        #[cfg(target_os = "linux")]
+        self.containment_guardian
+            .validate_candidate(
+                &self.tmux_target,
+                self.stable_launch_generation,
+                self.process_cgroup.generation(),
+            )
+            .map_err(|error| error.message)?;
         #[cfg(target_os = "linux")]
         self.containment_guardian
             .disarm()
@@ -4373,7 +4436,11 @@ mod tests {
             let suffix = uuid::Uuid::new_v4().simple().to_string();
             let stage_target = format!("th_guardian_crash_{}", &suffix[..8]);
             let stage_receipt = temp.path().join(format!("{stage}-path"));
-            let status = Command::new(std::env::current_exe().unwrap())
+            let eof_ready = temp.path().join(format!("{stage}-eof-ready"));
+            let eof_release = temp.path().join(format!("{stage}-eof-release"));
+            let eof_done = temp.path().join(format!("{stage}-eof-done"));
+            let mut helper = Command::new(std::env::current_exe().unwrap());
+            helper
                 .args([
                     "--exact",
                     "harness::tests::contained_launch_parent_crash_helper",
@@ -4385,9 +4452,14 @@ mod tests {
                 .env("T_HUB_CONTAINED_TARGET", &stage_target)
                 .env("T_HUB_CONTAINED_RECEIPT", temp.path().join("unused.json"))
                 .env("T_HUB_CGROUP_CONFINEMENT_CRASH_STAGE", stage)
-                .env("T_HUB_CGROUP_CONFINEMENT_PATH_RECEIPT", &stage_receipt)
-                .status()
-                .unwrap();
+                .env("T_HUB_CGROUP_CONFINEMENT_PATH_RECEIPT", &stage_receipt);
+            if stage == "after-guardian-confirm" {
+                helper
+                    .env("T_HUB_CGROUP_GUARDIAN_EOF_READY", &eof_ready)
+                    .env("T_HUB_CGROUP_GUARDIAN_EOF_RELEASE", &eof_release)
+                    .env("T_HUB_CGROUP_GUARDIAN_EOF_DONE", &eof_done);
+            }
+            let status = helper.status().unwrap();
             assert_eq!(status.code(), Some(93), "unexpected {stage} helper status");
             let stage_cgroup = std::fs::read_to_string(&stage_receipt).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4408,15 +4480,167 @@ mod tests {
                 "{stage} left an unowned private cgroup"
             );
             if stage == "after-guardian-confirm" {
-                std::fs::create_dir(&stage_cgroup).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !eof_ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "guardian did not reach its exact EOF observation boundary"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let unit = std::path::Path::new(&stage_cgroup)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let mut replacement = Command::new("sleep").arg("30").spawn().unwrap();
+                let replacement_pid = replacement.id().to_string();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    let status = Command::new("busctl")
+                        .args([
+                            "--user",
+                            "call",
+                            "org.freedesktop.systemd1",
+                            "/org/freedesktop/systemd1",
+                            "org.freedesktop.systemd1.Manager",
+                            "StartTransientUnit",
+                            "ssa(sv)a(sa(sv))",
+                            &unit,
+                            "fail",
+                            "2",
+                            "PIDs",
+                            "au",
+                            "1",
+                            &replacement_pid,
+                            "CollectMode",
+                            "s",
+                            "inactive-or-failed",
+                            "0",
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .unwrap();
+                    if status.success() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "same-name systemd replacement could not start"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::fs::write(&eof_release, b"release").unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !eof_done.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "guardian did not finish exact-generation observation"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&eof_done).unwrap().trim(),
+                    "substituted"
+                );
+                assert!(replacement.try_wait().unwrap().is_none());
                 assert!(
                     std::path::Path::new(&stage_cgroup).exists(),
-                    "systemd removed a same-name post-confirm replacement"
+                    "guardian mutated a same-named replacement systemd unit"
                 );
-                std::fs::remove_dir(&stage_cgroup).unwrap();
+                let cleanup = Command::new("systemctl")
+                    .args(["--user", "stop", &unit])
+                    .status()
+                    .unwrap();
+                assert!(cleanup.success());
+                let _ = replacement.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::path::Path::new(&stage_cgroup).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "replacement systemd scope did not collect after exact child exit"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             assert!(!proof.exists(), "{stage} released provider credentials");
+        }
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let foreign_target = format!("th_guardian_foreign_{}", &suffix[..8]);
+        let foreign_cgroup_receipt = temp.path().join("foreign-cgroup-path");
+        let foreign_pid_receipt = temp.path().join("foreign-pid");
+        let foreign_done = temp.path().join("foreign-guardian-done");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "harness::tests::contained_launch_parent_crash_helper",
+                "--nocapture",
+            ])
+            .env("T_HUB_CONTAINED_PARENT_CRASH_HELPER", "1")
+            .env("T_HUB_CONTAINED_ROOT", temp.path())
+            .env("T_HUB_CONTAINED_LAUNCHER", &launcher)
+            .env("T_HUB_CONTAINED_TARGET", &foreign_target)
+            .env(
+                "T_HUB_CONTAINED_RECEIPT",
+                temp.path().join("unused-foreign.json"),
+            )
+            .env(
+                "T_HUB_CGROUP_CONFINEMENT_CRASH_STAGE",
+                "after-guardian-confirm",
+            )
+            .env(
+                "T_HUB_CGROUP_CONFINEMENT_PATH_RECEIPT",
+                &foreign_cgroup_receipt,
+            )
+            .env("T_HUB_CGROUP_FOREIGN_PID_RECEIPT", &foreign_pid_receipt)
+            .env("T_HUB_CGROUP_GUARDIAN_EOF_DONE", &foreign_done)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(93));
+        let foreign_cgroup = std::fs::read_to_string(&foreign_cgroup_receipt).unwrap();
+        let foreign_pid = std::fs::read_to_string(&foreign_pid_receipt)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !foreign_done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guardian did not classify the post-confirm foreign task"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&foreign_done).unwrap().trim(),
+            "nonempty"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{foreign_pid}")).exists());
+        assert!(std::path::Path::new(&foreign_cgroup).exists());
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&foreign_cgroup).join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            foreign_pid.to_string()
+        );
+        assert!(!proof.exists());
+        let unit = std::path::Path::new(&foreign_cgroup)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cleanup = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status()
+            .unwrap();
+        assert!(cleanup.success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::path::Path::new(&format!("/proc/{foreign_pid}")).exists()
+            || std::path::Path::new(&foreign_cgroup).exists()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();

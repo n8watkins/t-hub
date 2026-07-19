@@ -112,6 +112,9 @@ pub(crate) struct PrivateProcessCgroup {
 pub(crate) struct SystemdProcessScopeGuardian {
     writer: Option<std::process::ChildStdin>,
     child: Option<std::process::Child>,
+    device: u64,
+    inode: u64,
+    anchor_pid: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -133,30 +136,112 @@ impl PrivateProcessCgroup {
 
 #[cfg(target_os = "linux")]
 impl SystemdProcessScopeGuardian {
-    fn create(unit: &str, pid: u32, path: &std::path::Path) -> Result<Self, TmuxError> {
+    fn create(unit: &str, path: &std::path::Path) -> Result<Self, TmuxError> {
         use std::io::BufRead;
         use std::process::Stdio;
 
+        // The only numeric PID given to systemd is this guardian's direct child.
+        // The guardian keeps that child unreaped, so its PID cannot be reused before systemd consumes it or before exact anchor cleanup completes.
+        // The candidate PID is never sent to systemd and instead moves itself atomically by writing zero to cgroup.procs.
         const GUARDIAN: &str = r#"
-[ ! -e "$3" ] || exit 72
-/usr/bin/busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' "$1" fail 2 PIDs au 1 "$2" Delegate b true 0 >/dev/null || exit 73
-printf 'owned\n'
+[ ! -e "$2" ] || exit 72
+/bin/sleep 2147483647 &
+anchor_pid=$!
+cleanup_anchor() {
+  /bin/kill -KILL "$anchor_pid" >/dev/null 2>&1 || true
+  wait "$anchor_pid" >/dev/null 2>&1 || true
+}
+trap cleanup_anchor EXIT
+/usr/bin/busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' "$1" fail 3 PIDs au 1 "$anchor_pid" Delegate b true CollectMode s inactive-or-failed 0 >/dev/null || exit 73
+i=0
+while [ ! -e "$2" ] && [ "$i" -lt 200 ]; do
+  i=$((i + 1))
+  /bin/sleep 0.01
+done
+owned_identity=$(/usr/bin/stat -c '%d:%i' -- "$2") || exit 74
+printf 'owned %s:%s\n' "$owned_identity" "$anchor_pid"
 if IFS= read -r state; then
   [ "$state" = persisted ] && exit 0
 fi
-/usr/bin/systemctl --user stop "$1" >/dev/null 2>&1 || true
-/usr/bin/systemctl --user reset-failed "$1" >/dev/null 2>&1 || true
+result=nonempty
+i=0
+while [ "$i" -lt 300 ]; do
+  tasks=$(/usr/bin/cat "$2/cgroup.procs" 2>/dev/null) || break
+  remaining=$(printf '%s\n' "$tasks" | /usr/bin/awk -v anchor="$anchor_pid" 'NF && $1 != anchor { count += 1 } END { print count + 0 }')
+  if [ "$remaining" = 0 ]; then
+    result=empty
+    break
+  fi
+  i=$((i + 1))
+  /bin/sleep 0.01
+done
+cleanup_anchor
+trap - EXIT
+if [ "$result" = empty ]; then
+  i=0
+  result=timeout
+  while [ "$i" -lt 300 ]; do
+    if [ ! -e "$2" ]; then
+      result=gone
+      break
+    fi
+    identity=$(/usr/bin/stat -c '%d:%i' -- "$2" 2>/dev/null) || {
+      if [ ! -e "$2" ]; then
+        result=gone
+        break
+      fi
+      exit 76
+    }
+    if [ "$identity" != "$owned_identity" ]; then
+      result=substituted
+      break
+    fi
+    i=$((i + 1))
+    /bin/sleep 0.01
+  done
+fi
+if [ -n "$3" ]; then
+  printf 'ready\n' > "$3" || exit 75
+  i=0
+  while [ ! -e "$4" ] && [ "$i" -lt 300 ]; do
+    i=$((i + 1))
+    /bin/sleep 0.01
+  done
+fi
+if [ -e "$2" ]; then
+  identity=$(/usr/bin/stat -c '%d:%i' -- "$2" 2>/dev/null) || exit 76
+  if [ "$identity" != "$owned_identity" ]; then
+    result=substituted
+  fi
+fi
+if [ -n "$5" ]; then
+  printf '%s\n' "$result" > "$5" || exit 77
+fi
 exit 0
 "#;
+        #[cfg(test)]
+        let eof_ready = std::env::var_os("T_HUB_CGROUP_GUARDIAN_EOF_READY").unwrap_or_default();
+        #[cfg(not(test))]
+        let eof_ready = std::ffi::OsString::new();
+        #[cfg(test)]
+        let eof_release = std::env::var_os("T_HUB_CGROUP_GUARDIAN_EOF_RELEASE").unwrap_or_default();
+        #[cfg(not(test))]
+        let eof_release = std::ffi::OsString::new();
+        #[cfg(test)]
+        let eof_done = std::env::var_os("T_HUB_CGROUP_GUARDIAN_EOF_DONE").unwrap_or_default();
+        #[cfg(not(test))]
+        let eof_done = std::ffi::OsString::new();
         let mut child = Command::new("/bin/sh")
             .args([
                 "-c",
                 GUARDIAN,
                 "t-hub-systemd-scope-guardian",
                 unit,
-                &pid.to_string(),
                 path.to_string_lossy().as_ref(),
             ])
+            .arg(eof_ready)
+            .arg(eof_release)
+            .arg(eof_done)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -183,17 +268,86 @@ exit 0
             code: error.raw_os_error(),
             message: "systemd scope guardian receipt is unreadable".into(),
         })?;
-        if receipt.trim() != "owned" {
+        let identity = receipt
+            .trim()
+            .strip_prefix("owned ")
+            .and_then(|identity| {
+                let mut fields = identity.split(':');
+                Some((
+                    fields.next()?.parse::<u64>().ok()?,
+                    fields.next()?.parse::<u64>().ok()?,
+                    fields.next()?.parse::<u32>().ok()?,
+                    fields.next().is_none(),
+                ))
+            })
+            .filter(|(device, inode, anchor_pid, complete)| {
+                *device > 0 && *inode > 0 && *anchor_pid > 0 && *complete
+            });
+        let Some((device, inode, anchor_pid, _)) = identity else {
             return Err(TmuxError {
                 op: "create-systemd-scope",
                 code: None,
                 message: "systemd scope guardian did not prove creation".into(),
             });
-        }
+        };
         Ok(Self {
             writer: Some(writer),
             child: Some(child),
+            device,
+            inode,
+            anchor_pid,
         })
+    }
+
+    fn owns(&self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
+
+    fn anchor_pid(&self) -> u32 {
+        self.anchor_pid
+    }
+
+    pub(crate) fn validate_candidate(
+        &self,
+        name: &str,
+        expected: PaneGeneration,
+        process_cgroup: &ProcessCgroupGeneration,
+    ) -> Result<(), TmuxError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(&process_cgroup.path).map_err(|error| TmuxError {
+            op: "validate-systemd-scope-guardian",
+            code: error.raw_os_error(),
+            message: "candidate systemd scope is unreadable".into(),
+        })?;
+        let mut tasks = std::fs::read_to_string(
+            std::path::Path::new(&process_cgroup.path).join("cgroup.procs"),
+        )
+        .map_err(|error| TmuxError {
+            op: "validate-systemd-scope-guardian",
+            code: error.raw_os_error(),
+            message: "candidate systemd scope membership is unreadable".into(),
+        })?
+        .lines()
+        .filter_map(|task| task.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+        tasks.sort_unstable();
+        let mut expected_tasks = [expected.pane_pid, self.anchor_pid];
+        expected_tasks.sort_unstable();
+        if !self.owns(metadata.dev(), metadata.ino())
+            || metadata.dev() != process_cgroup.device
+            || metadata.ino() != process_cgroup.inode
+            || pane_generation_exact(name).ok() != Some(expected)
+            || tasks != expected_tasks
+            || !process_is_in_exact_cgroup(expected.pane_pid, process_cgroup).unwrap_or(false)
+        {
+            return Err(TmuxError {
+                op: "validate-systemd-scope-guardian",
+                code: None,
+                message: "candidate systemd scope contains ambiguous or foreign state".into(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn disarm(&mut self) -> Result<(), TmuxError> {
@@ -445,12 +599,20 @@ enum CgroupCleanupTestPoint {
 }
 
 #[cfg(all(target_os = "linux", test))]
+#[allow(clippy::zombie_processes)]
 fn cgroup_confinement_crash_boundary(stage: &str, path: &std::path::Path) {
     if std::env::var("T_HUB_CGROUP_CONFINEMENT_CRASH_STAGE").as_deref() != Ok(stage) {
         return;
     }
     if let Some(receipt) = std::env::var_os("T_HUB_CGROUP_CONFINEMENT_PATH_RECEIPT") {
         let _ = std::fs::write(receipt, path.to_string_lossy().as_bytes());
+    }
+    if let Some(receipt) = std::env::var_os("T_HUB_CGROUP_FOREIGN_PID_RECEIPT") {
+        // The helper exits immediately below so the adversarial process is
+        // intentionally reparented and remains available to the outer test.
+        let foreign = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        std::fs::write(path.join("cgroup.procs"), format!("{}\n", foreign.id())).unwrap();
+        std::fs::write(receipt, foreign.id().to_string()).unwrap();
     }
     std::process::exit(93);
 }
@@ -1414,10 +1576,14 @@ fn create_private_process_cgroup_at(
 /// transient scope. The caller must prove its anonymous launch gate is engaged
 /// and must not release credentials until this returns.
 #[cfg(target_os = "linux")]
-pub(crate) fn confine_blocked_pane_to_private_cgroup(
+pub(crate) fn confine_blocked_pane_to_private_cgroup<F>(
     name: &str,
     expected: PaneGeneration,
-) -> Result<(PrivateProcessCgroup, SystemdProcessScopeGuardian), ProcessCgroupConfinementError> {
+    move_candidate: F,
+) -> Result<(PrivateProcessCgroup, SystemdProcessScopeGuardian), ProcessCgroupConfinementError>
+where
+    F: FnOnce(&std::path::Path) -> Result<(), TmuxError>,
+{
     use std::os::fd::{FromRawFd, OwnedFd};
 
     fn error(message: &str, code: Option<i32>) -> TmuxError {
@@ -1569,18 +1735,44 @@ pub(crate) fn confine_blocked_pane_to_private_cgroup(
             None,
         ));
     }
-    let guardian =
-        SystemdProcessScopeGuardian::create(&unit, expected.pane_pid, &process_cgroup_path)
-            .map_err(|error| fail(error, None))?;
+    let guardian = SystemdProcessScopeGuardian::create(&unit, &process_cgroup_path)
+        .map_err(|error| fail(error, None))?;
     #[cfg(test)]
     cgroup_confinement_crash_boundary("after-create", &process_cgroup_path);
+    let metadata = std::fs::metadata(&process_cgroup_path).map_err(|error| {
+        fail(
+            TmuxError {
+                op: "confine-stopped-pane",
+                code: error.raw_os_error(),
+                message: "systemd scope creator receipt became unreadable".into(),
+            },
+            None,
+        )
+    })?;
+    use std::os::unix::fs::MetadataExt;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || !guardian.owns(metadata.dev(), metadata.ino())
+    {
+        return Err(fail(
+            error("systemd scope creator receipt was substituted", None),
+            None,
+        ));
+    }
+    let process_cgroup = PrivateProcessCgroup {
+        generation: ProcessCgroupGeneration {
+            path: process_cgroup_path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    };
+    if let Err(error) = move_candidate(&process_cgroup_path) {
+        return Err(fail(error, Some(process_cgroup)));
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let process_cgroup = loop {
+    loop {
         let metadata = std::fs::metadata(&process_cgroup_path);
         let membership = process_membership(expected.pane_pid);
         if let (Ok(metadata), Ok(membership)) = (metadata, membership) {
-            use std::os::unix::fs::MetadataExt;
-
             let expected_membership = process_cgroup_path
                 .strip_prefix("/sys/fs/cgroup")
                 .ok()
@@ -1588,23 +1780,21 @@ pub(crate) fn confine_blocked_pane_to_private_cgroup(
                 .map(|relative| format!("/{relative}"));
             let tasks = std::fs::read_to_string(process_cgroup_path.join("cgroup.procs"));
             let exact_task = tasks.is_ok_and(|tasks| {
-                let tasks = tasks
+                let mut tasks = tasks
                     .lines()
                     .filter_map(|task| task.trim().parse::<u32>().ok())
                     .collect::<Vec<_>>();
-                tasks == [expected.pane_pid]
+                tasks.sort_unstable();
+                let mut expected_tasks = [expected.pane_pid, guardian.anchor_pid()];
+                expected_tasks.sort_unstable();
+                tasks == expected_tasks
             });
             if expected_membership.as_deref() == Some(membership.as_str())
                 && exact_task
                 && metadata.uid() == unsafe { libc::geteuid() }
+                && guardian.owns(metadata.dev(), metadata.ino())
             {
-                break PrivateProcessCgroup {
-                    generation: ProcessCgroupGeneration {
-                        path: process_cgroup_path.to_string_lossy().into_owned(),
-                        device: metadata.dev(),
-                        inode: metadata.ino(),
-                    },
-                };
+                break;
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -1614,7 +1804,7 @@ pub(crate) fn confine_blocked_pane_to_private_cgroup(
             ));
         }
         std::thread::sleep(Duration::from_millis(10));
-    };
+    }
     #[cfg(test)]
     cgroup_confinement_crash_boundary("after-guardian-confirm", &process_cgroup_path);
     let still_exact = pane_generation_exact(name).ok() == Some(expected)
@@ -3702,7 +3892,14 @@ mod tests {
         let target = TestSession::new();
         create_shell_session_after_final_teardown(&target.name);
         let expected = pane_generation_exact(&target.name).unwrap();
-        let (cgroup, mut guardian) = confine_blocked_pane_to_private_cgroup(&target.name, expected)
+        let (cgroup, mut guardian) =
+            confine_blocked_pane_to_private_cgroup(&target.name, expected, |path| {
+                send_text(
+                    &target.name,
+                    &format!("printf '0\\n' > {}/cgroup.procs", path.display()),
+                    true,
+                )
+            })
             .unwrap_or_else(|failure| {
                 panic!("scope confinement failed: {}", failure.error.message)
             });
@@ -3747,6 +3944,57 @@ mod tests {
         drop(cgroup);
         assert!(std::path::Path::new(&original.path).exists());
         std::fs::remove_dir(&original.path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_creation_never_consumes_a_reusable_candidate_pid() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let expected = pane_generation_exact(&target.name).unwrap();
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let foreign_from_move = foreign.clone();
+        let failure = match confine_blocked_pane_to_private_cgroup(&target.name, expected, |path| {
+            let tasks = std::fs::read_to_string(path.join("cgroup.procs"))
+                .unwrap()
+                .lines()
+                .filter_map(|task| task.parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            assert_eq!(tasks.len(), 1, "scope creator admitted an unproved task");
+            assert_ne!(tasks[0], expected.pane_pid);
+            let status = Command::new("kill")
+                .args(["-KILL", &expected.pane_pid.to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let child = Command::new("sleep").arg("30").spawn().unwrap();
+            *foreign_from_move.borrow_mut() = Some(child);
+            Err(injected_cgroup_cleanup_error(
+                "candidate exited before exact self-confinement",
+            ))
+        }) {
+            Ok(_) => panic!("dead candidate unexpectedly self-confined"),
+            Err(failure) => failure,
+        };
+        let generation = failure.process_cgroup.unwrap().generation().clone();
+        let mut foreign = foreign.borrow_mut().take().unwrap();
+        assert!(foreign.try_wait().unwrap().is_none());
+        assert!(!process_is_in_exact_cgroup(foreign.id(), &generation).unwrap_or(false));
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::path::Path::new(&generation.path).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guardian did not collect the anchor-only failed scope"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session_liveness(&target.name), SessionLiveness::Gone);
     }
 
     #[cfg(target_os = "linux")]
