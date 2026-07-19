@@ -1622,6 +1622,7 @@ fn seal_runtime_policy_receipt(
     expected_permission: PermMode,
     provider_file: ProviderFileIdentity,
     executable_version: &str,
+    proven_provider_path: Option<&std::path::Path>,
 ) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
     if evidence.terminal.session_name != tmux_target {
         return Err(LaunchAttestationError::TerminalChanged);
@@ -1635,7 +1636,10 @@ fn seal_runtime_policy_receipt(
         expected_model,
         expected_reasoning_effort,
     )?;
-    let executable = resolved_provider_executable_path(evidence, expected)?;
+    let executable = match proven_provider_path {
+        Some(path) => path.to_path_buf(),
+        None => resolved_provider_executable_path(evidence, expected)?,
+    };
     let (_, provider_index) = process_provider(&evidence.argv)
         .filter(|(provider, _)| *provider == expected)
         .ok_or(LaunchAttestationError::WrongProvider)?;
@@ -1710,6 +1714,7 @@ fn verify_probed_runtime_policy_receipt(
         expected_permission,
         provider_file_after,
         executable_version,
+        None,
     )
 }
 
@@ -1747,6 +1752,73 @@ pub(crate) fn observe_runtime_policy_receipt(
     )
 }
 
+/// Re-observe a provider whose exact script inode and pane generation were
+/// already proven by the durable spawn journal.
+///
+/// This restart path never resolves the now-expired private launch alias. It
+/// requires the same pane generation, reopens the canonical installed path from
+/// the spawn receipt, verifies its exact inode, probes version through that
+/// opened identity, and brackets the probe with stable process observations.
+pub(crate) fn observe_runtime_policy_receipt_from_spawn(
+    tmux_target: &str,
+    spawn_terminal: &HarnessTerminalGenerationReceipt,
+    spawn_provider: &HarnessProviderLaunchReceipt,
+    expected: Harness,
+    expected_model: &str,
+    expected_reasoning_effort: &str,
+    expected_permission: PermMode,
+) -> Result<VerifiedHarnessRuntimeReceipt, LaunchAttestationError> {
+    let accepted = observe_harness_process(tmux_target)?;
+    if spawn_terminal.tmux_target != tmux_target
+        || accepted.terminal.session_name != tmux_target
+        || accepted.terminal.session_id != spawn_terminal.session_id
+        || accepted.terminal.session_created != spawn_terminal.session_created
+        || accepted.terminal.window_id != spawn_terminal.window_id
+        || accepted.terminal.pane_id != spawn_terminal.pane_id
+        || accepted.terminal.pane_pid != spawn_terminal.pane_pid
+    {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    expected
+        .adapter()
+        .attest_permissions(&accepted, expected_permission)?;
+    attest_runtime_policy(
+        &accepted,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+    )?;
+    let provider_path = PathBuf::from(&spawn_provider.resolved_provider_executable);
+    let expected_file = ProviderFileIdentity {
+        device: spawn_provider.provider_executable_device,
+        inode: spawn_provider.provider_executable_inode,
+    };
+    if provider_file_identity(&provider_path)? != expected_file {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    let (version, probed_file) = probe_provider_version(&provider_path)?;
+    if probed_file != expected_file || provider_file_identity(&provider_path)? != expected_file {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    let (_, stable) = attest_final_launch_permissions(
+        expected.adapter(),
+        &accepted,
+        observe_harness_process(tmux_target),
+        expected_permission,
+    )?;
+    seal_runtime_policy_receipt(
+        tmux_target,
+        &stable,
+        expected,
+        expected_model,
+        expected_reasoning_effort,
+        expected_permission,
+        expected_file,
+        &version,
+        Some(&provider_path),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn test_verified_runtime_receipt(
     tmux_target: &str,
@@ -1771,6 +1843,7 @@ pub(crate) fn test_verified_runtime_receipt(
             inode: evidence.executable_inode,
         },
         executable_version,
+        None,
     )
 }
 
@@ -1797,6 +1870,7 @@ pub(crate) fn test_verified_runtime_receipt_from_observed_file(
         expected_permission,
         provider_file,
         executable_version,
+        None,
     )
 }
 
@@ -2691,6 +2765,7 @@ mod tests {
                 inode: evidence.executable_inode,
             },
             "codex-cli 1.2.3",
+            None,
         )
         .unwrap()
         .into_persisted();
@@ -2748,6 +2823,7 @@ mod tests {
                         inode: evidence.executable_inode,
                     },
                     version,
+                    None,
                 )
                 .map(VerifiedHarnessRuntimeReceipt::into_persisted),
                 Err(expected)
@@ -2868,6 +2944,7 @@ mod tests {
             PermMode::BypassPermissions,
             provider_file,
             "codex-cli 1.2.3",
+            None,
         )
         .unwrap()
         .into_persisted();

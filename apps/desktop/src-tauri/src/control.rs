@@ -58,10 +58,11 @@ use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
     attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
-    confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
+    confirm_stable_launch_baseline, observe_harness_process,
+    observe_runtime_policy_receipt_from_spawn, Harness, HarnessPermissionAttestation,
     HarnessProcessEvidence, HarnessProviderLaunchReceipt, HarnessRuntimePolicyReceipt,
-    HarnessTerminalGenerationReceipt, LaunchAttestationError, PermMode,
-    VerifiedHarnessProviderLaunch, VerifiedHarnessRuntimeReceipt,
+    HarnessTerminalGenerationReceipt, LaunchAttestationError, OpenedHarnessProviderLaunch,
+    PermMode, VerifiedHarnessProviderLaunch, VerifiedHarnessRuntimeReceipt,
     VerifiedHarnessTerminalGeneration, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
@@ -1659,10 +1660,7 @@ fn validate_cortana_attestation(
         || receipt.process_executable_inode == 0
         || receipt.provider_executable_inode == 0
         || receipt.terminal.tmux_target != attestation.tmux_session_id
-        || receipt.terminal.session_id == 0
         || receipt.terminal.session_created == 0
-        || receipt.terminal.window_id == 0
-        || receipt.terminal.pane_id == 0
         || receipt.terminal.pane_pid == 0
         || !Path::new(&receipt.resolved_provider_executable).is_absolute()
         || receipt.resolved_provider_executable != attestation.installed_runtime.resolved_executable
@@ -1728,10 +1726,7 @@ fn validate_cortana_candidate(
             MAX_CORTANA_IDENTIFIER_BYTES,
         )?;
         if spawn_generation.tmux_target != candidate.tmux_session_id
-            || spawn_generation.session_id == 0
             || spawn_generation.session_created == 0
-            || spawn_generation.window_id == 0
-            || spawn_generation.pane_id == 0
             || spawn_generation.pane_pid == 0
         {
             return Err("Cortana spawn evidence is not for the reserved tmux target".into());
@@ -9900,6 +9895,9 @@ pub struct ControlContext {
     /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
     /// Own empty in-memory one in headless tests.
     captains: Arc<CaptainsRegistry>,
+    /// Dedicated Cortana effect serializer. No registry, identity, tab, or
+    /// persistence lock is held while this guard spans tmux and provider probes.
+    cortana_effect: Arc<Mutex<()>>,
     /// Serializes dispatch for each protected Powder profile and card pair so a
     /// failed launch can never release a same-run claim owned by a sibling
     /// dispatch. The reservation spans all Powder reads, spawn, claim,
@@ -10395,10 +10393,14 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     // heal after launch is never rate-limited.
     let stop = Arc::new(AtomicBool::new(false));
     ctx.rebind.set_initial_stop(stop.clone());
-    std::thread::Builder::new()
+    let worker_ctx = ctx.clone();
+    let listener_started = std::thread::Builder::new()
         .name("t-hub-control".into())
         .spawn(move || serve(listener, ctx, stop))
-        .ok();
+        .is_ok();
+    if listener_started {
+        start_cortana_recovery_worker(worker_ctx);
+    }
 
     Ok(handshake)
 }
@@ -18705,6 +18707,550 @@ pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
     }
 }
 
+#[cfg(unix)]
+fn cortana_authority_generation(ctx: &ControlContext) -> u64 {
+    let (_, generations, _) = ctx.captains.snapshot_with_authority_generations();
+    generations.captains.get(CORTANA_SLUG).copied().unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn resolve_protected_provider_launch(
+    harness: Harness,
+) -> Result<OpenedHarnessProviderLaunch, String> {
+    let provider = harness.as_provider();
+    let mut command = std::process::Command::new("sh");
+    command.arg("-lc").arg(format!("command -v -- {provider}"));
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
+        .map_err(|_| "Cortana provider launch token could not be resolved".to_string())?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err("Cortana provider launch token could not be resolved".into());
+    }
+    let path = std::str::from_utf8(&output.stdout)
+        .ok()
+        .map(str::trim)
+        .filter(|value| value.starts_with('/') && !value.contains('\n'))
+        .map(PathBuf::from)
+        .ok_or("Cortana provider launch token is malformed")?;
+    crate::harness::observe_provider_launch_receipt(&path, harness)
+        .map_err(|error| format!("Cortana provider provenance is unavailable: {error}"))
+}
+
+#[cfg(unix)]
+fn record_cortana_worker_failure(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+    tmux_session_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let _ = tmux::kill_session_tree(tmux_session_id);
+    let gone = matches!(
+        tmux::session_liveness(tmux_session_id),
+        tmux::SessionLiveness::Gone
+    );
+    let guidance = if gone {
+        "The exact Cortana candidate failed launch attestation and was removed; replay recovery after inspecting provider installation provenance."
+    } else {
+        "The exact Cortana candidate could not be confirmed gone; inspect its tmux session before retrying recovery."
+    };
+    ctx.captains.fail_cortana_candidate(
+        &ctx.identity,
+        operation_id,
+        request_digest,
+        gone,
+        guidance,
+        now_ms(),
+    )?;
+    Err(format!("{error}; candidate cleanup confirmed gone: {gone}"))
+}
+
+#[cfg(unix)]
+fn reject_cortana_candidate_before_spawn(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+    tmux_session_id: &str,
+    error: &str,
+) -> Result<bool, String> {
+    if matches!(
+        tmux::session_liveness(tmux_session_id),
+        tmux::SessionLiveness::Gone
+    ) {
+        ctx.captains.fail_cortana_candidate(
+            &ctx.identity,
+            operation_id,
+            request_digest,
+            true,
+            "The reserved Cortana candidate identity or authority generation was stale before launch; the absent candidate was revoked.",
+            now_ms(),
+        )?;
+    }
+    Err(error.to_string())
+}
+
+#[cfg(unix)]
+fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, String> {
+    let snapshot = ctx.captains.snapshot();
+    let runtime = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .and_then(|captain| captain.cortana_runtime.as_ref())
+        .ok_or("Cortana durable runtime disappeared during recovery")?;
+    let intent = runtime
+        .ensure_intent
+        .as_ref()
+        .ok_or("Cortana ensure intent disappeared during recovery")?;
+    if !matches!(
+        intent.phase,
+        CortanaEnsurePhase::CandidateSpawned
+            | CortanaEnsurePhase::Attested
+            | CortanaEnsurePhase::Committed
+    ) {
+        return Ok(false);
+    }
+    let candidate = intent
+        .candidate
+        .as_ref()
+        .ok_or("Cortana post-spawn journal lost its candidate")?;
+    let policy = &intent.request.desired_runtime;
+    let harness = Harness::from_provider(&policy.harness);
+    if harness.as_provider() != policy.harness {
+        return Err("Cortana post-spawn Harness is unsupported".into());
+    }
+    match tmux::session_liveness(&candidate.tmux_session_id) {
+        tmux::SessionLiveness::Unknown => {
+            return Err(
+                "Cortana post-spawn liveness is ambiguous; refusing cleanup, commit, or replacement"
+                    .into(),
+            );
+        }
+        tmux::SessionLiveness::Gone if intent.phase == CortanaEnsurePhase::Committed => {
+            let generation = intent
+                .request
+                .expected_generation
+                .checked_add(1)
+                .ok_or("Cortana runtime generation is exhausted")?;
+            ctx.captains.block_cortana_incumbent(
+                generation,
+                &candidate.terminal_id,
+                CortanaRecoveryReason::RuntimeAttestationFailed,
+                "The committed Cortana runtime is definitively gone; inspect durable checkpoint state before starting a replacement.",
+                now_ms(),
+            )?;
+            return Err("Cortana committed runtime is definitively gone and was degraded".into());
+        }
+        tmux::SessionLiveness::Gone => {
+            return record_cortana_worker_failure(
+                ctx,
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.tmux_session_id,
+                "Cortana post-spawn candidate died before commit",
+            )
+            .map(|_| false);
+        }
+        tmux::SessionLiveness::Alive => {}
+    }
+    let spawn_terminal = candidate
+        .spawn_generation
+        .as_ref()
+        .ok_or("Cortana post-spawn journal lost terminal generation evidence")?;
+    let spawn_provider = candidate
+        .spawn_provider
+        .as_ref()
+        .ok_or("Cortana post-spawn journal lost provider launch evidence")?;
+    let runtime_receipt = match observe_runtime_policy_receipt_from_spawn(
+        &candidate.tmux_session_id,
+        spawn_terminal,
+        spawn_provider,
+        harness,
+        &policy.model,
+        &policy.reasoning_effort,
+        policy.harness_permission,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) if intent.phase == CortanaEnsurePhase::Committed => {
+            let generation = intent
+                .request
+                .expected_generation
+                .checked_add(1)
+                .ok_or("Cortana runtime generation is exhausted")?;
+            ctx.captains.block_cortana_incumbent(
+                generation,
+                &candidate.terminal_id,
+                CortanaRecoveryReason::RuntimeAttestationFailed,
+                "The committed Cortana runtime failed fresh process or installed-runtime observation; inspect it without replacement or retirement.",
+                now_ms(),
+            )?;
+            return Err(format!(
+                "Cortana committed runtime failed fresh observation and was degraded: {error}"
+            ));
+        }
+        Err(error) => {
+            return record_cortana_worker_failure(
+                ctx,
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.tmux_session_id,
+                &format!("Cortana fresh runtime observation failed: {error}"),
+            )
+            .map(|_| false);
+        }
+    };
+    if intent.phase == CortanaEnsurePhase::CandidateSpawned {
+        let verified = observe_cortana_candidate_attestation(
+            &ctx.status,
+            &candidate.terminal_id,
+            runtime_receipt,
+        )?;
+        let identity = match ctx.identity.get(&candidate.control_identity_id) {
+            Some(identity) => identity,
+            None => {
+                return record_cortana_worker_failure(
+                    ctx,
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    &candidate.tmux_session_id,
+                    "Cortana candidate identity disappeared before attestation",
+                )
+                .map(|_| false);
+            }
+        };
+        if let Err(error) = ctx.captains.attest_cortana_candidate(
+            &intent.operation_id,
+            &intent.request_digest,
+            verified,
+            &identity,
+            cortana_authority_generation(ctx),
+            now_ms(),
+        ) {
+            return record_cortana_worker_failure(
+                ctx,
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.tmux_session_id,
+                &format!("Cortana attestation CAS failed: {error}"),
+            )
+            .map(|_| false);
+        }
+    }
+    if intent.phase != CortanaEnsurePhase::Committed {
+        let identity = match ctx.identity.get(&candidate.control_identity_id) {
+            Some(identity) => identity,
+            None => {
+                return record_cortana_worker_failure(
+                    ctx,
+                    &intent.operation_id,
+                    &intent.request_digest,
+                    &candidate.tmux_session_id,
+                    "Cortana candidate identity disappeared before commit",
+                )
+                .map(|_| false);
+            }
+        };
+        if let Err(error) = ctx.captains.commit_cortana_candidate(
+            &intent.operation_id,
+            &intent.request_digest,
+            &identity,
+            cortana_authority_generation(ctx),
+            now_ms(),
+        ) {
+            return record_cortana_worker_failure(
+                ctx,
+                &intent.operation_id,
+                &intent.request_digest,
+                &candidate.tmux_session_id,
+                &format!("Cortana commit CAS failed: {error}"),
+            )
+            .map(|_| false);
+        }
+        if let Err(error) = observe_runtime_policy_receipt_from_spawn(
+            &candidate.tmux_session_id,
+            spawn_terminal,
+            spawn_provider,
+            harness,
+            &policy.model,
+            &policy.reasoning_effort,
+            policy.harness_permission,
+        ) {
+            let generation = intent
+                .request
+                .expected_generation
+                .checked_add(1)
+                .ok_or("Cortana runtime generation is exhausted")?;
+            ctx.captains.block_cortana_incumbent(
+                generation,
+                &candidate.terminal_id,
+                CortanaRecoveryReason::RuntimeAttestationFailed,
+                "The committed Cortana runtime failed its final fresh observation; inspect it without replacement or retirement.",
+                now_ms(),
+            )?;
+            return Err(format!(
+                "Cortana committed runtime failed final observation and was degraded: {error}"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn run_cortana_worker_once_with_provider<F>(
+    ctx: &ControlContext,
+    observe_provider: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(Harness) -> Result<OpenedHarnessProviderLaunch, String>,
+{
+    let _effect = ctx
+        .cortana_effect
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = ctx.captains.snapshot();
+    let Some(runtime) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .and_then(|captain| captain.cortana_runtime.as_ref())
+    else {
+        return Ok(false);
+    };
+    let Some(intent) = runtime.ensure_intent.as_ref() else {
+        return Ok(false);
+    };
+    let operation_id = intent.operation_id.clone();
+    let request_digest = intent.request_digest.clone();
+    let policy = intent.request.desired_runtime.clone();
+    if intent.phase == CortanaEnsurePhase::Prepared {
+        let authority = cortana_authority_generation(ctx);
+        ctx.captains.reserve_cortana_candidate_identity(
+            &ctx.identity,
+            &operation_id,
+            &request_digest,
+            authority,
+            now_ms(),
+        )?;
+        drop(_effect);
+        return run_cortana_worker_once_with_provider(ctx, observe_provider);
+    }
+    if matches!(
+        intent.phase,
+        CortanaEnsurePhase::CandidateSpawned
+            | CortanaEnsurePhase::Attested
+            | CortanaEnsurePhase::Committed
+    ) {
+        return resume_cortana_candidate_after_spawn(ctx);
+    }
+    if intent.phase != CortanaEnsurePhase::CandidateReserved {
+        return Ok(false);
+    }
+    let candidate = intent
+        .candidate
+        .as_ref()
+        .ok_or("Cortana CandidateReserved journal lost its candidate")?
+        .clone();
+    let identity = match ctx.identity.get(&candidate.control_identity_id) {
+        Some(identity) => identity,
+        None => {
+            return reject_cortana_candidate_before_spawn(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                "Cortana candidate control identity is unavailable",
+            );
+        }
+    };
+    let authority = cortana_authority_generation(ctx);
+    if let Err(error) = validate_cortana_session_identity(
+        &candidate.control_identity_id,
+        candidate.session_identity_generation,
+        candidate.authority_generation,
+        authority,
+        &candidate.terminal_id,
+        &identity,
+    ) {
+        return reject_cortana_candidate_before_spawn(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            &error,
+        );
+    }
+    match tmux::session_liveness(&candidate.tmux_session_id) {
+        tmux::SessionLiveness::Alive => {
+            return Err(
+                "Cortana reserved candidate terminal is already alive without durable spawn evidence; refusing to inject credentials or seize it"
+                    .into(),
+            );
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(
+                "Cortana reserved candidate liveness is ambiguous; refusing to spawn or inject credentials"
+                    .into(),
+            );
+        }
+        tmux::SessionLiveness::Gone => {}
+    }
+    if !matches!(
+        tmux::session_liveness(&candidate.tmux_session_id),
+        tmux::SessionLiveness::Gone
+    ) {
+        return Err("Cortana candidate liveness changed before spawn; refusing effects".into());
+    }
+    if ctx.addr.is_empty() || ctx.token.is_empty() || identity.secret.is_empty() {
+        return Err("Cortana candidate credential handoff is unavailable".into());
+    }
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    if let Err(error) = tmux::new_session_with_env(
+        &candidate.tmux_session_id,
+        &cwd,
+        Some(CREW_DORMANT_PANE_COMMAND),
+        &[],
+    ) {
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            &format!("Cortana dormant candidate spawn failed: {error}"),
+        )
+        .map(|_| false);
+    }
+    let harness = Harness::from_provider(&policy.harness);
+    if harness.as_provider() != policy.harness {
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            "Cortana desired Harness is unsupported",
+        )
+        .map(|_| false);
+    }
+    let opened = match observe_provider(harness) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return record_cortana_worker_failure(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                &error,
+            )
+            .map(|_| false);
+        }
+    };
+    let prompt = "You are Cortana, the lightweight permanent T-Hub fleet coordinator. Preserve role boundaries, coordinate Captains, and do not implement Crew work.";
+    let command = harness.adapter().interactive_argv_with_runtime_policy(
+        prompt,
+        runtime.conversation_id.as_deref(),
+        &policy.model,
+        &policy.reasoning_effort,
+        policy.harness_permission,
+    );
+    let env = vec![
+        ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
+        ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone()),
+        (
+            crate::identity::SESSION_TOKEN_ENV.to_string(),
+            identity.secret.clone(),
+        ),
+    ];
+    let launched = match opened.launch_in_exact_tmux_pane(
+        harness,
+        &candidate.tmux_session_id,
+        &cwd,
+        &command,
+        &env,
+    ) {
+        Ok(launched) => launched,
+        Err(error) => {
+            return record_cortana_worker_failure(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                &format!("Cortana exact provider handoff failed: {error}"),
+            )
+            .map(|_| false);
+        }
+    };
+    let identity = match ctx.identity.get(&candidate.control_identity_id) {
+        Some(identity) => identity,
+        None => {
+            return record_cortana_worker_failure(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                "Cortana candidate identity disappeared after launch",
+            )
+            .map(|_| false);
+        }
+    };
+    let authority = cortana_authority_generation(ctx);
+    if let Err(error) = validate_cortana_session_identity(
+        &candidate.control_identity_id,
+        candidate.session_identity_generation,
+        candidate.authority_generation,
+        authority,
+        &candidate.terminal_id,
+        &identity,
+    ) {
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            &error,
+        )
+        .map(|_| false);
+    }
+    let (provider_receipt, terminal_receipt) = launched.spawn_receipts();
+    if let Err(error) = ctx.captains.record_cortana_candidate_spawn(
+        &operation_id,
+        &request_digest,
+        &candidate.terminal_id,
+        now_ms(),
+        terminal_receipt,
+        provider_receipt,
+        now_ms(),
+    ) {
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            &format!("Cortana spawn journal CAS failed: {error}"),
+        )
+        .map(|_| false);
+    }
+    resume_cortana_candidate_after_spawn(ctx)
+}
+
+#[cfg(unix)]
+fn start_cortana_recovery_worker(ctx: ControlContext) {
+    std::thread::Builder::new()
+        .name("t-hub-cortana-recovery".into())
+        .spawn(move || {
+            if let Err(error) =
+                run_cortana_worker_once_with_provider(&ctx, resolve_protected_provider_launch)
+            {
+                eprintln!("t-hub-cortana: startup recovery paused: {error}");
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(unix))]
+fn start_cortana_recovery_worker(_ctx: ControlContext) {
+    eprintln!(
+        "t-hub-cortana: startup recovery paused: exact opened-inode launch is unavailable on this host"
+    );
+}
+
 /// Reuse a resolved Powder profile across event polls. A profile command may
 /// cross the Windows-to-WSL boundary to retrieve a credential, so rebuilding a
 /// client every 15 seconds creates needless process churn. Entries expire to
@@ -22020,6 +22566,7 @@ impl ControlContext {
             metrics: None,
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
+            cortana_effect: Arc::new(Mutex::new(())),
             dispatch_reservations: Arc::new(DispatchReservations::default()),
             fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
@@ -22443,6 +22990,26 @@ mod tests {
             CORTANA_WORK_PROFILE,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cortana_candidate_accepts_native_zero_tmux_object_ids() {
+        let mut candidate = cortana_candidate_fixture(1, false);
+        let generation = candidate.spawn_generation.as_mut().unwrap();
+        generation.session_id = 0;
+        generation.window_id = 0;
+        generation.pane_id = 0;
+
+        validate_cortana_candidate(&candidate, &cortana_catalog_policy(), 1, 101).unwrap();
+
+        let mut attested = cortana_candidate_fixture(1, true);
+        let attestation = attested.runtime_attestation.as_mut().unwrap();
+        attestation.runtime_policy_receipt.terminal.session_id = 0;
+        attestation.runtime_policy_receipt.terminal.window_id = 0;
+        attestation.runtime_policy_receipt.terminal.pane_id = 0;
+        attestation.provider_session_receipt.terminal =
+            attestation.runtime_policy_receipt.terminal.clone();
+        validate_cortana_attestation(attestation, &cortana_catalog_policy(), 1, 101).unwrap();
     }
 
     fn cortana_ensure_request(captain: Option<&CaptainRecord>) -> CortanaEnsureRequestPayload {
@@ -24081,6 +24648,302 @@ mod tests {
                 .unwrap()
                 .phase,
             CortanaEnsurePhase::CandidateSpawned
+        );
+    }
+
+    #[cfg(unix)]
+    struct CortanaWorkerSessionGuard(String);
+
+    #[cfg(unix)]
+    impl Drop for CortanaWorkerSessionGuard {
+        fn drop(&mut self) {
+            let _ = tmux::kill_session_tree(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_worker_uses_exact_opened_inode_and_never_leaks_token_to_swapped_launcher() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("tmux or node is unavailable - skipping Cortana worker launch fixture");
+            return;
+        }
+        let registry = Arc::new(CaptainsRegistry::new());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let mut ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        ctx.addr = "127.0.0.1:43123".into();
+        let prepared = registry
+            .prepare_cortana_ensure(
+                "ensure-worker-exact-handoff",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap()
+            .0;
+        let request_digest = &prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .request_digest;
+        let terminal_id = cortana_candidate_terminal_id(request_digest).unwrap();
+        let _session = CortanaWorkerSessionGuard(format!("th_{terminal_id}"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let trusted_proof = temp.path().join("trusted-proof");
+        let argv_proof = temp.path().join("argv-proof");
+        let attacker_proof = temp.path().join("attacker-proof");
+        let provider = package_bin.join("codex.js");
+        let attacker = temp.path().join("attacker.js");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/usr/bin/env node\nif (process.argv.includes('--version')) {{ console.log('codex-cli 1.2.3'); process.exit(0); }} require('fs').writeFileSync({}, JSON.stringify(process.argv)); require('child_process').execFileSync('tmux', ['set-environment', '-t', process.env.TMUX_PANE, 'CODEX_THREAD_ID', 'worker-thread-1']); require('fs').writeFileSync({}, process.env.T_HUB_SESSION_TOKEN || 'missing'); setInterval(()=>{{}}, 1000);\n",
+                serde_json::to_string(&argv_proof.to_string_lossy()).unwrap(),
+                serde_json::to_string(&trusted_proof.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &attacker,
+            format!(
+                "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, process.env.T_HUB_SESSION_TOKEN || 'missing'); setInterval(()=>{{}}, 1000);\n",
+                serde_json::to_string(&attacker_proof.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&attacker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&provider, &launcher).unwrap();
+        let worker_result = run_cortana_worker_once_with_provider(&ctx, |harness| {
+            let opened = crate::harness::test_observe_provider_launch_receipt(
+                &launcher,
+                harness,
+                temp.path(),
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::remove_file(&launcher).unwrap();
+            symlink(&attacker, &launcher).unwrap();
+            Ok(opened)
+        });
+        if let Err(error) = &worker_result {
+            panic!(
+                "{error}; argv={}",
+                std::fs::read_to_string(&argv_proof).unwrap_or_default()
+            );
+        }
+        let ran = worker_result.unwrap();
+        assert!(ran);
+        assert!(!attacker_proof.exists());
+        let current = registry.snapshot();
+        let intent = current.captains[0]
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(intent.phase, CortanaEnsurePhase::Committed);
+        let candidate = intent.candidate.as_ref().unwrap();
+        let identity = identities.get(&candidate.control_identity_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&trusted_proof).unwrap(),
+            identity.secret
+        );
+        let observed_argv: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(&argv_proof).unwrap()).unwrap();
+        assert!(observed_argv
+            .iter()
+            .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(observed_argv
+            .iter()
+            .any(|argument| argument == "model_reasoning_effort=\"medium\""));
+        assert_eq!(
+            current.captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            CortanaRuntimeLifecycle::Ready
+        );
+        let replayed = run_cortana_worker_once_with_provider(&ctx, |_| {
+            panic!("committed replay must not resolve or relaunch a provider")
+        })
+        .unwrap();
+        assert!(replayed);
+        assert!(!attacker_proof.exists());
+        assert_eq!(
+            std::fs::read_to_string(&trusted_proof).unwrap(),
+            identity.secret
+        );
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::Committed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_worker_refuses_live_reserved_candidate_before_provider_or_token_handoff() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let mut ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        ctx.addr = "127.0.0.1:43124".into();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-worker-live-reserved",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let authority = cortana_authority_generation(&ctx);
+        let (_, identity) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                authority,
+                101,
+            )
+            .unwrap();
+        let candidate = registry.snapshot().captains[0]
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .clone();
+        let _session = CortanaWorkerSessionGuard(candidate.tmux_session_id.clone());
+        tmux::new_session_with_env(&candidate.tmux_session_id, "/tmp", Some("sleep 30"), &[])
+            .unwrap();
+        let error = run_cortana_worker_once_with_provider(&ctx, |_| {
+            panic!("provider observer must not run for an ambiguous live reservation")
+        })
+        .unwrap_err();
+        assert!(error.contains("already alive"));
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::CandidateReserved
+        );
+        assert_eq!(
+            identities.resolve(&identity.secret).unwrap().id,
+            identity.id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_worker_revokes_absent_candidate_after_authority_generation_stales() {
+        let registry = Arc::new(CaptainsRegistry::new());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let mut ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        ctx.addr = "127.0.0.1:43125".into();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-worker-stale-authority",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let authority = cortana_authority_generation(&ctx);
+        let (_, identity) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                authority,
+                101,
+            )
+            .unwrap();
+        {
+            let mut current = registry.lock();
+            current.authority_generations.clock += 1;
+            let next = current.authority_generations.clock;
+            current
+                .authority_generations
+                .captains
+                .insert(CORTANA_SLUG.into(), next);
+        }
+
+        let error = run_cortana_worker_once_with_provider(&ctx, |_| {
+            panic!("stale authority must be rejected before provider observation")
+        })
+        .unwrap_err();
+        assert!(error.contains("exact IdentityStore session generation"));
+        assert!(identities.resolve(&identity.secret).is_none());
+        assert!(identities.is_revoked(&identity.id));
+        assert_eq!(
+            registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::Failed
         );
     }
 

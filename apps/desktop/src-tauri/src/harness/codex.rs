@@ -59,14 +59,17 @@ impl HarnessAdapter for CodexHarness {
         reasoning_effort: &str,
         perm: PermMode,
     ) -> String {
-        let mut arguments = vec![
-            "codex".to_string(),
+        let mut arguments = vec!["codex".to_string()];
+        // Permission attestation reads the provider's leading option region.
+        // Keep the protected permission posture before model values and prompts,
+        // which legitimately terminate that region.
+        arguments.extend(self.permission_map(perm));
+        arguments.extend([
             "--model".to_string(),
             sh_single_quote(model),
             "-c".to_string(),
             sh_single_quote(&format!("model_reasoning_effort=\"{reasoning_effort}\"")),
-        ];
-        arguments.extend(self.permission_map(perm));
+        ]);
         if let Some(session_id) = resume {
             arguments.push("resume".to_string());
             arguments.push(sh_single_quote(session_id));
@@ -216,7 +219,7 @@ mod tests {
                 "medium",
                 PermMode::BypassPermissions,
             ),
-            "codex --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"medium\"' --dangerously-bypass-approvals-and-sandbox 'coordinate'"
+            "codex --dangerously-bypass-approvals-and-sandbox --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"medium\"' 'coordinate'"
         );
         assert_eq!(
             adapter.interactive_argv_with_runtime_policy(
@@ -226,7 +229,7 @@ mod tests {
                 "high",
                 PermMode::Default,
             ),
-            "codex --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"high\"' --sandbox read-only resume 'thread-1'"
+            "codex --sandbox read-only --model 'gpt-5.6-terra' -c 'model_reasoning_effort=\"high\"' resume 'thread-1'"
         );
     }
 
