@@ -169,7 +169,12 @@ while [ "$i" -lt 300 ]; do
   tasks=$(/usr/bin/cat "$2/cgroup.procs" 2>/dev/null) || break
   remaining=$(printf '%s\n' "$tasks" | /usr/bin/awk -v anchor="$anchor_pid" 'NF && $1 != anchor { count += 1 } END { print count + 0 }')
   if [ "$remaining" = 0 ]; then
-    result=empty
+    child=$(/usr/bin/find "$2" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null) || break
+    if [ -n "$child" ]; then
+      result=nonempty
+    else
+      result=empty
+    fi
     break
   fi
   i=$((i + 1))
@@ -177,6 +182,10 @@ while [ "$i" -lt 300 ]; do
 done
 cleanup_anchor
 trap - EXIT
+if [ "$result" = empty ]; then
+  child=$(/usr/bin/find "$2" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null) || result=nonempty
+  [ -z "$child" ] || result=nonempty
+fi
 if [ "$result" = empty ]; then
   i=0
   result=timeout
@@ -320,6 +329,41 @@ exit 0
             code: error.raw_os_error(),
             message: "candidate systemd scope is unreadable".into(),
         })?;
+        let mut entries = 0_usize;
+        for entry in std::fs::read_dir(&process_cgroup.path).map_err(|error| TmuxError {
+            op: "validate-systemd-scope-guardian",
+            code: error.raw_os_error(),
+            message: "candidate systemd scope subtree is unreadable".into(),
+        })? {
+            entries = entries.saturating_add(1);
+            if entries > 64 {
+                return Err(TmuxError {
+                    op: "validate-systemd-scope-guardian",
+                    code: None,
+                    message: "candidate systemd scope subtree is unbounded".into(),
+                });
+            }
+            let entry = entry.map_err(|error| TmuxError {
+                op: "validate-systemd-scope-guardian",
+                code: error.raw_os_error(),
+                message: "candidate systemd scope subtree entry is unreadable".into(),
+            })?;
+            if entry
+                .file_type()
+                .map_err(|error| TmuxError {
+                    op: "validate-systemd-scope-guardian",
+                    code: error.raw_os_error(),
+                    message: "candidate systemd scope subtree type is unreadable".into(),
+                })?
+                .is_dir()
+            {
+                return Err(TmuxError {
+                    op: "validate-systemd-scope-guardian",
+                    code: None,
+                    message: "candidate systemd scope contains a delegated child cgroup".into(),
+                });
+            }
+        }
         let mut tasks = std::fs::read_to_string(
             std::path::Path::new(&process_cgroup.path).join("cgroup.procs"),
         )
@@ -611,7 +655,18 @@ fn cgroup_confinement_crash_boundary(stage: &str, path: &std::path::Path) {
         // The helper exits immediately below so the adversarial process is
         // intentionally reparented and remains available to the outer test.
         let foreign = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        std::fs::write(path.join("cgroup.procs"), format!("{}\n", foreign.id())).unwrap();
+        let destination = if std::env::var_os("T_HUB_CGROUP_FOREIGN_CHILD").is_some() {
+            let child = path.join("foreign-child");
+            std::fs::create_dir(&child).unwrap();
+            child
+        } else {
+            path.to_path_buf()
+        };
+        std::fs::write(
+            destination.join("cgroup.procs"),
+            format!("{}\n", foreign.id()),
+        )
+        .unwrap();
         std::fs::write(receipt, foreign.id().to_string()).unwrap();
     }
     std::process::exit(93);

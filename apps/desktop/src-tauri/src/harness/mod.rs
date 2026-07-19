@@ -4288,6 +4288,128 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn nested_foreign_cgroup_blocks_persistence_release_and_survives_guardian_cleanup() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::kill_session(&self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let proof = temp.path().join("nested-foreign-provider-proof");
+        let provider = package_bin.join("codex.js");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, 'released'); setInterval(()=>{{}}, 1000);\n",
+                serde_json::to_string(&proof.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&provider, &launcher).unwrap();
+        let opened =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let target = format!("th_nested_foreign_{}", &suffix[..8]);
+        crate::tmux::new_session_with_env(
+            &target,
+            "/tmp",
+            Some("sleep 30"),
+            &empty_candidate_session_credentials(),
+        )
+        .unwrap();
+        let guard = SessionGuard(target.clone());
+        let mut failure_generation = observed_terminal_generation(&target);
+        let mut prepared = opened
+            .prepare_launch_in_exact_tmux_pane(
+                Harness::Codex,
+                &target,
+                "/tmp",
+                "codex",
+                &[("T_HUB_SESSION_TOKEN".into(), "never-released".into())],
+                &mut failure_generation,
+            )
+            .unwrap();
+        let (_, terminal) = prepared.spawn_receipts();
+        let process_cgroup = terminal.into_persisted().process_cgroup.unwrap();
+        let nested = std::path::Path::new(&process_cgroup.path).join("foreign-child");
+        let foreign = std::cell::RefCell::new(None);
+        let callback_ran = std::cell::Cell::new(false);
+        let error = prepared
+            .persist_before_release(|_, _| {
+                callback_ran.set(true);
+                std::fs::create_dir(&nested).unwrap();
+                let child = Command::new("sleep").arg("30").spawn().unwrap();
+                std::fs::write(nested.join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+                *foreign.borrow_mut() = Some(child);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(callback_ran.get());
+        assert!(error.contains("delegated child cgroup"));
+        assert!(!proof.exists());
+        drop(prepared);
+        let mut foreign = foreign.into_inner().unwrap();
+        let foreign_pid = foreign.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::tmux::session_liveness(&target) != crate::tmux::SessionLiveness::Gone {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(foreign.try_wait().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(nested.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            foreign_pid.to_string()
+        );
+        assert!(!proof.exists());
+        let unit = std::path::Path::new(&process_cgroup.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status()
+            .unwrap()
+            .success());
+        let _ = foreign.wait();
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::path::Path::new(&process_cgroup.path).exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn anonymous_credential_parent_crash_helper() {
         if std::env::var_os("T_HUB_CREDENTIAL_PARENT_CRASH_HELPER").is_none() {
             return;
@@ -4595,6 +4717,7 @@ mod tests {
                 &foreign_cgroup_receipt,
             )
             .env("T_HUB_CGROUP_FOREIGN_PID_RECEIPT", &foreign_pid_receipt)
+            .env("T_HUB_CGROUP_FOREIGN_CHILD", "1")
             .env("T_HUB_CGROUP_GUARDIAN_EOF_DONE", &foreign_done)
             .status()
             .unwrap();
@@ -4618,8 +4741,9 @@ mod tests {
         );
         assert!(std::path::Path::new(&format!("/proc/{foreign_pid}")).exists());
         assert!(std::path::Path::new(&foreign_cgroup).exists());
+        let foreign_child = std::path::Path::new(&foreign_cgroup).join("foreign-child");
         assert_eq!(
-            std::fs::read_to_string(std::path::Path::new(&foreign_cgroup).join("cgroup.procs"))
+            std::fs::read_to_string(foreign_child.join("cgroup.procs"))
                 .unwrap()
                 .trim(),
             foreign_pid.to_string()
