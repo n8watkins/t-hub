@@ -19129,12 +19129,62 @@ fn reconcile_cortana_incumbent(
     operation_id: &str,
     request_digest: &str,
 ) -> Result<bool, String> {
-    reconcile_cortana_incumbent_with_liveness(ctx, operation_id, request_digest, &|target| {
-        tmux::session_liveness(target)
-    })
+    reconcile_cortana_incumbent_with_terminal_effects(
+        ctx,
+        operation_id,
+        request_digest,
+        &observe_incumbent_terminal,
+        &|target, expected| {
+            tmux::kill_session_tree_exact_generation(target, expected)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncumbentTerminalObservation {
+    Gone,
+    Unknown,
+    ExactGenerationAlive,
+    DifferentGenerationAlive,
+}
+
+#[cfg(unix)]
+fn incumbent_pane_generation(receipt: &HarnessTerminalGenerationReceipt) -> tmux::PaneGeneration {
+    tmux::PaneGeneration {
+        session_id: receipt.session_id,
+        session_created: receipt.session_created,
+        window_id: receipt.window_id,
+        pane_id: receipt.pane_id,
+        pane_pid: receipt.pane_pid,
+    }
+}
+
+#[cfg(unix)]
+fn observe_incumbent_terminal(
+    target: &str,
+    expected: &HarnessTerminalGenerationReceipt,
+) -> IncumbentTerminalObservation {
+    match tmux::session_liveness(target) {
+        tmux::SessionLiveness::Gone => IncumbentTerminalObservation::Gone,
+        tmux::SessionLiveness::Unknown => IncumbentTerminalObservation::Unknown,
+        tmux::SessionLiveness::Alive => match tmux::pane_generation_exact(target) {
+            Ok(observed) if observed == incumbent_pane_generation(expected) => {
+                IncumbentTerminalObservation::ExactGenerationAlive
+            }
+            Ok(_) => IncumbentTerminalObservation::DifferentGenerationAlive,
+            Err(_) => match tmux::session_liveness(target) {
+                tmux::SessionLiveness::Gone => IncumbentTerminalObservation::Gone,
+                tmux::SessionLiveness::Alive | tmux::SessionLiveness::Unknown => {
+                    IncumbentTerminalObservation::Unknown
+                }
+            },
+        },
+    }
+}
+
+#[cfg(all(unix, test))]
 fn reconcile_cortana_incumbent_with_liveness<F>(
     ctx: &ControlContext,
     operation_id: &str,
@@ -19143,6 +19193,31 @@ fn reconcile_cortana_incumbent_with_liveness<F>(
 ) -> Result<bool, String>
 where
     F: Fn(&str) -> tmux::SessionLiveness,
+{
+    reconcile_cortana_incumbent_with_terminal_effects(
+        ctx,
+        operation_id,
+        request_digest,
+        &|target, _| match liveness(target) {
+            tmux::SessionLiveness::Gone => IncumbentTerminalObservation::Gone,
+            tmux::SessionLiveness::Unknown => IncumbentTerminalObservation::Unknown,
+            tmux::SessionLiveness::Alive => IncumbentTerminalObservation::ExactGenerationAlive,
+        },
+        &|_, _| Ok(tmux::ExactGenerationKill::Killed),
+    )
+}
+
+#[cfg(unix)]
+fn reconcile_cortana_incumbent_with_terminal_effects<O, K>(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+    observe_terminal: &O,
+    kill_exact: &K,
+) -> Result<bool, String>
+where
+    O: Fn(&str, &HarnessTerminalGenerationReceipt) -> IncumbentTerminalObservation,
+    K: Fn(&str, tmux::PaneGeneration) -> Result<tmux::ExactGenerationKill, String>,
 {
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
@@ -19180,8 +19255,8 @@ where
     let identity = ctx.identity.get(&attestation.control_identity_id);
     let identity_revoked = ctx.identity.is_revoked(&attestation.control_identity_id);
 
-    match liveness(tmux_target) {
-        tmux::SessionLiveness::Unknown => {
+    match observe_terminal(tmux_target, &attestation.runtime_policy_receipt.terminal) {
+        IncumbentTerminalObservation::Unknown => {
             return block_cortana_replacement(
                 ctx,
                 runtime.generation,
@@ -19190,19 +19265,16 @@ where
                 "Cortana incumbent liveness is ambiguous; refusing replacement or revocation",
             );
         }
-        tmux::SessionLiveness::Alive if identity_revoked => {
-            let _ = tmux::kill_session_tree(tmux_target);
-            if !matches!(liveness(tmux_target), tmux::SessionLiveness::Gone) {
-                return block_cortana_replacement(
-                    ctx,
-                    runtime.generation,
-                    terminal_id,
-                    "The incumbent Cortana bearer is fenced but its exact terminal could not be confirmed gone; inspect it before retrying replacement.",
-                    "Cortana revoked incumbent terminal cleanup is unresolved",
-                );
-            }
+        IncumbentTerminalObservation::DifferentGenerationAlive => {
+            return block_cortana_replacement(
+                ctx,
+                runtime.generation,
+                terminal_id,
+                "The revoked incumbent tmux name was recreated with a different generation; that terminal remains untouched and replacement is blocked for inspection.",
+                "Cortana incumbent tmux target was recreated before registry fencing",
+            );
         }
-        tmux::SessionLiveness::Alive => {
+        IncumbentTerminalObservation::ExactGenerationAlive if !identity_revoked => {
             let Some(identity) = identity else {
                 return block_cortana_replacement(
                     ctx,
@@ -19296,7 +19368,8 @@ where
             )?;
             return Ok(true);
         }
-        tmux::SessionLiveness::Gone => {}
+        IncumbentTerminalObservation::ExactGenerationAlive | IncumbentTerminalObservation::Gone => {
+        }
     }
 
     if !identity_revoked {
@@ -19312,6 +19385,58 @@ where
             &identity,
         )?;
         ctx.identity.revoke(&attestation.control_identity_id)?;
+    }
+    match observe_terminal(tmux_target, &attestation.runtime_policy_receipt.terminal) {
+        IncumbentTerminalObservation::Gone => {}
+        IncumbentTerminalObservation::Unknown => {
+            return block_cortana_replacement(
+                ctx,
+                runtime.generation,
+                terminal_id,
+                "The revoked incumbent Cortana terminal could not be re-probed immediately before its registry fence; replacement remains blocked for inspection.",
+                "Cortana revoked incumbent liveness became ambiguous before registry fencing",
+            );
+        }
+        IncumbentTerminalObservation::DifferentGenerationAlive => {
+            return block_cortana_replacement(
+                ctx,
+                runtime.generation,
+                terminal_id,
+                "The revoked incumbent tmux name was recreated with a different generation; that terminal remains untouched and replacement is blocked for inspection.",
+                "Cortana incumbent tmux target was recreated before registry fencing",
+            );
+        }
+        IncumbentTerminalObservation::ExactGenerationAlive => {
+            match kill_exact(
+                tmux_target,
+                incumbent_pane_generation(&attestation.runtime_policy_receipt.terminal),
+            )? {
+                tmux::ExactGenerationKill::GenerationMismatch => {
+                    return block_cortana_replacement(
+                        ctx,
+                        runtime.generation,
+                        terminal_id,
+                        "The revoked incumbent tmux generation changed at its cleanup boundary; no terminal was killed and replacement is blocked for inspection.",
+                        "Cortana incumbent tmux generation changed during exact cleanup",
+                    );
+                }
+                tmux::ExactGenerationKill::Killed | tmux::ExactGenerationKill::Gone => {}
+            }
+            match observe_terminal(tmux_target, &attestation.runtime_policy_receipt.terminal) {
+                IncumbentTerminalObservation::Gone => {}
+                IncumbentTerminalObservation::Unknown
+                | IncumbentTerminalObservation::ExactGenerationAlive
+                | IncumbentTerminalObservation::DifferentGenerationAlive => {
+                    return block_cortana_replacement(
+                        ctx,
+                        runtime.generation,
+                        terminal_id,
+                        "The revoked incumbent terminal cleanup did not converge to definitive absence; replacement remains blocked for inspection.",
+                        "Cortana revoked incumbent terminal cleanup is unresolved",
+                    );
+                }
+            }
+        }
     }
     ctx.captains.fence_cortana_incumbent(
         &ctx.identity,
@@ -24620,6 +24745,150 @@ mod tests {
                 112,
             )
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreated_incumbent_generation_is_preserved_after_revocation_and_fence_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(temp.path().join("captains.json")));
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-recreated-incumbent",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let observations = std::sync::Mutex::new(std::collections::VecDeque::from([
+            IncumbentTerminalObservation::Gone,
+            IncumbentTerminalObservation::DifferentGenerationAlive,
+        ]));
+        let kill_calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = reconcile_cortana_incumbent_with_terminal_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_, _| observations.lock().unwrap().pop_front().unwrap(),
+            &|_, _| {
+                kill_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(tmux::ExactGenerationKill::Killed)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("recreated"));
+        assert_eq!(kill_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(identities.is_revoked(&identity.id));
+        let blocked = registry.snapshot().captains[0].clone();
+        assert_eq!(blocked.terminal_id.as_deref(), Some("cor-runtime-1"));
+        let runtime = blocked.cortana_runtime.as_ref().unwrap();
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
+        assert_eq!(
+            runtime.ensure_intent.as_ref().unwrap().phase,
+            CortanaEnsurePhase::Prepared
+        );
+
+        let replay = reconcile_cortana_incumbent_with_terminal_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_, _| IncumbentTerminalObservation::DifferentGenerationAlive,
+            &|_, _| {
+                kill_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(tmux::ExactGenerationKill::Killed)
+            },
+        )
+        .unwrap_err();
+        assert!(replay.contains("recreated"));
+        assert_eq!(kill_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreated_generation_after_fence_persist_failure_blocks_replay_without_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(temp.path().join("captains.json")));
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-recreated-after-rollback",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        registry.fail_next_persist("injected incumbent fence persistence failure");
+        let first = reconcile_cortana_incumbent_with_terminal_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_, _| IncumbentTerminalObservation::Gone,
+            &|_, _| Ok(tmux::ExactGenerationKill::Gone),
+        )
+        .unwrap_err();
+        assert!(first.contains("persistence failure"));
+        assert!(identities.is_revoked(&identity.id));
+
+        let kill_calls = std::sync::atomic::AtomicUsize::new(0);
+        let replay = reconcile_cortana_incumbent_with_terminal_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_, _| IncumbentTerminalObservation::DifferentGenerationAlive,
+            &|_, _| {
+                kill_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(tmux::ExactGenerationKill::Killed)
+            },
+        )
+        .unwrap_err();
+        assert!(replay.contains("recreated"));
+        assert_eq!(kill_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let blocked = registry.snapshot().captains[0].clone();
+        assert_eq!(blocked.terminal_id.as_deref(), Some("cor-runtime-1"));
+        assert_eq!(
+            blocked.cortana_runtime.as_ref().unwrap().lineage[0].state,
+            CortanaLineageState::Current
+        );
     }
 
     #[cfg(unix)]

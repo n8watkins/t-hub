@@ -103,6 +103,13 @@ pub(crate) struct RespawnPaneTransition {
     pub(crate) after: PaneGeneration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactGenerationKill {
+    Killed,
+    Gone,
+    GenerationMismatch,
+}
+
 impl std::fmt::Display for TmuxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.code {
@@ -833,6 +840,82 @@ tmux -L {sock} kill-session -t '{name}'",
     })
 }
 
+/// Kill only the exact tmux generation previously attested for `name`.
+///
+/// The generation comparison and process-tree reap run in one shell command.
+/// A same-named replacement cannot be created while the matched session still
+/// exists, and a replacement already present fails the comparison before any
+/// signal is sent.
+pub(crate) fn kill_session_tree_exact_generation(
+    name: &str,
+    expected: PaneGeneration,
+) -> Result<ExactGenerationKill, TmuxError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(TmuxError {
+            op: "kill-session-tree-generation",
+            code: None,
+            message: "exact tmux session name is malformed".into(),
+        });
+    }
+    let expected = format!(
+        "${}|{}|@{}|%{}|{}",
+        expected.session_id,
+        expected.session_created,
+        expected.window_id,
+        expected.pane_id,
+        expected.pane_pid
+    );
+    let script = format!(
+        "actual=$(tmux -L {sock} list-panes -t '={name}:' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}' 2>/dev/null) || exit 42; \
+[ \"$actual\" = '{expected}' ] || exit 43; \
+for pid in $(tmux -L {sock} list-panes -t '={name}:' -F '#{{pane_pid}}'); do \
+l1=$(pgrep -P \"$pid\" 2>/dev/null); \
+l2=$(for k in $l1; do pgrep -P \"$k\" 2>/dev/null; done); \
+l3=$(for k in $l2; do pgrep -P \"$k\" 2>/dev/null; done); \
+kill -9 $pid $l1 $l2 $l3 2>/dev/null; \
+done; \
+tmux -L {sock} kill-session -t '={name}'",
+        sock = socket(),
+        name = name,
+        expected = expected,
+    );
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
+            TmuxError {
+                op: "kill-session-tree-generation",
+                code: None,
+                message: format!("failed to spawn tmux: {error}"),
+            }
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_already_gone(&stderr) {
+        return Ok(ExactGenerationKill::Killed);
+    }
+    match output.status.code() {
+        Some(0) => Ok(ExactGenerationKill::Killed),
+        Some(42) => match session_liveness(name) {
+            SessionLiveness::Gone => Ok(ExactGenerationKill::Gone),
+            SessionLiveness::Alive => Ok(ExactGenerationKill::GenerationMismatch),
+            SessionLiveness::Unknown => Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: Some(42),
+                message: "exact tmux generation became unreadable".into(),
+            }),
+        },
+        Some(43) => Ok(ExactGenerationKill::GenerationMismatch),
+        code => Err(TmuxError {
+            op: "kill-session-tree-generation",
+            code,
+            message: stderr.trim().to_string(),
+        }),
+    }
+}
+
 /// List all session names on the `t-hub` socket.
 ///
 /// Tolerates the "no server running" case (no sessions have ever been created,
@@ -1316,6 +1399,32 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    #[test]
+    fn exact_generation_cleanup_never_kills_a_same_named_replacement() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let mut target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let incumbent = pane_generation_exact(&target.name).unwrap();
+        assert_eq!(
+            kill_session_tree_exact_generation(&target.name, incumbent).unwrap(),
+            ExactGenerationKill::Killed
+        );
+        target.closed = true;
+
+        create_shell_session_after_final_teardown(&target.name);
+        target.closed = false;
+        let replacement = pane_generation_exact(&target.name).unwrap();
+        assert_ne!(replacement, incumbent);
+        assert_eq!(
+            kill_session_tree_exact_generation(&target.name, incumbent).unwrap(),
+            ExactGenerationKill::GenerationMismatch
+        );
+        assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
     }
 
     #[test]
