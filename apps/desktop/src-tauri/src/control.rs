@@ -1096,10 +1096,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 21;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 22;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 5;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 20 && CORTANA_RUNTIME_SCHEMA_VERSION > 4);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 6;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 21 && CORTANA_RUNTIME_SCHEMA_VERSION > 5);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1229,6 +1229,7 @@ impl CortanaRuntimePolicy {
 #[serde(rename_all = "camelCase")]
 pub enum CortanaEnsurePhase {
     Prepared,
+    IncumbentRecovered,
     CandidateReserved,
     CandidateSpawned,
     Attested,
@@ -2082,7 +2083,14 @@ fn validate_cortana_runtime(
             intent.request.incumbent_terminal_id.as_deref(),
             "incumbentTerminalId",
         )?;
-        if runtime.policy.as_ref() != Some(&intent.request.desired_runtime)
+        let preserves_incumbent = intent.phase == CortanaEnsurePhase::Prepared
+            && intent.request.expected_generation > 0
+            && matches!(
+                runtime.lifecycle,
+                CortanaRuntimeLifecycle::Ready | CortanaRuntimeLifecycle::NeedsAttention
+            );
+        if (!preserves_incumbent
+            && runtime.policy.as_ref() != Some(&intent.request.desired_runtime))
             || (intent.request.expected_generation == 0)
                 != intent.request.incumbent_terminal_id.is_none()
         {
@@ -2094,10 +2102,21 @@ fn validate_cortana_runtime(
                 "incumbentTerminalId",
                 MAX_CORTANA_IDENTIFIER_BYTES,
             )?;
+            let expected_state = if matches!(
+                intent.phase,
+                CortanaEnsurePhase::Prepared | CortanaEnsurePhase::IncumbentRecovered
+            ) && matches!(
+                runtime.lifecycle,
+                CortanaRuntimeLifecycle::Ready | CortanaRuntimeLifecycle::NeedsAttention
+            ) {
+                CortanaLineageState::Current
+            } else {
+                CortanaLineageState::Replaced
+            };
             if !runtime.lineage.iter().any(|entry| {
                 entry.generation == intent.request.expected_generation
                     && entry.terminal_id == incumbent_terminal_id
-                    && entry.state == CortanaLineageState::Replaced
+                    && entry.state == expected_state
             }) {
                 return Err(
                     "Cortana ensure incumbent is not bound to its durable generation".into(),
@@ -2124,15 +2143,32 @@ fn validate_cortana_runtime(
             CortanaEnsurePhase::Prepared => {
                 if intent.request.expected_generation != runtime.generation
                     || intent.candidate.is_some()
-                    || runtime.lifecycle
-                        != if runtime.generation == 0 {
-                            CortanaRuntimeLifecycle::Starting
-                        } else {
-                            CortanaRuntimeLifecycle::Restoring
-                        }
+                    || if runtime.generation == 0 {
+                        runtime.lifecycle != CortanaRuntimeLifecycle::Starting
+                    } else {
+                        !matches!(
+                            runtime.lifecycle,
+                            CortanaRuntimeLifecycle::Ready
+                                | CortanaRuntimeLifecycle::NeedsAttention
+                                | CortanaRuntimeLifecycle::Restoring
+                        )
+                    }
                 {
                     return Err(
                         "Cortana pre-commit intent does not match its lifecycle and generation"
+                            .into(),
+                    );
+                }
+            }
+            CortanaEnsurePhase::IncumbentRecovered => {
+                if intent.request.expected_generation == 0
+                    || intent.request.expected_generation != runtime.generation
+                    || intent.candidate.is_some()
+                    || runtime.lifecycle != CortanaRuntimeLifecycle::Ready
+                    || current_lineage != 1
+                {
+                    return Err(
+                        "Cortana recovered incumbent does not match its durable Ready identity"
                             .into(),
                     );
                 }
@@ -2841,6 +2877,63 @@ fn migrate_cortana_runtime_v4_document(document: &mut Value) -> Result<(), Strin
             intent.insert("requestDigest".into(), Value::from(digest));
         }
         runtime.insert("schemaVersion".into(), Value::from(5));
+    }
+    Ok(())
+}
+
+/// Lift schema-21/runtime-5 by recomputing the immutable ensure digest for
+/// runtime schema 6. The persisted evidence shape is unchanged; schema 6 adds
+/// the terminal incumbent-recovered phase and stricter pre-replacement state
+/// invariants.
+fn migrate_cortana_runtime_v5_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-21 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-21 Cortana runtime is not an object")?;
+        if runtime.get("schemaVersion").and_then(Value::as_u64) != Some(5) {
+            return Err("schema-21 Cortana runtime has an unsupported nested version".into());
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        {
+            let intent = intent
+                .as_object_mut()
+                .ok_or("schema-21 Cortana ensure intent is not an object")?;
+            if intent.get("schemaVersion").and_then(Value::as_u64) != Some(5) {
+                return Err("schema-21 Cortana ensure intent has an unsupported version".into());
+            }
+            let operation_id = intent
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or("schema-21 Cortana ensure intent lacks operationId")?;
+            let request = intent
+                .get("request")
+                .ok_or("schema-21 Cortana ensure intent lacks request")?;
+            let stored_digest = intent
+                .get("requestDigest")
+                .and_then(Value::as_str)
+                .ok_or("schema-21 Cortana ensure intent lacks requestDigest")?;
+            if stored_digest != cortana_ensure_request_digest_parts(5, operation_id, request)? {
+                return Err(
+                    "schema-21 Cortana ensure request digest does not match schema 5".into(),
+                );
+            }
+            let digest = cortana_ensure_request_digest_parts(6, operation_id, request)?;
+            intent.insert("schemaVersion".into(), Value::from(6));
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        runtime.insert("schemaVersion".into(), Value::from(6));
     }
     Ok(())
 }
@@ -4601,7 +4694,7 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_prior_cortana_recovery = matches!(schema_version, 18..=20)
+        let has_prior_cortana_recovery = matches!(schema_version, 18..=21)
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -4628,6 +4721,13 @@ impl CaptainsRegistry {
         }
         if matches!(schema_version, 18..=20) {
             migrate_cortana_runtime_v4_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        if matches!(schema_version, 18..=21) {
+            migrate_cortana_runtime_v5_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -6626,34 +6726,17 @@ impl CaptainsRegistry {
         requested_intent.created_at = timestamp;
         requested_intent.updated_at = timestamp;
         requested_intent.request_digest = cortana_ensure_request_digest(&requested_intent)?;
-        for lineage in &mut runtime.lineage {
-            if lineage.state == CortanaLineageState::Current {
-                lineage.state = CortanaLineageState::Replaced;
-            }
+        if runtime.generation == 0 {
+            captain.state = ClaimState::Vacant;
+            runtime.lifecycle = CortanaRuntimeLifecycle::Starting;
+            runtime.provenance = CortanaRuntimeProvenance {
+                source: CortanaRuntimeProvenanceSource::ProfileCatalog,
+                identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
+            };
+            runtime.policy = Some(requested_intent.request.desired_runtime.clone());
+            runtime.reason_code = None;
+            runtime.guidance = None;
         }
-        captain.state = ClaimState::Vacant;
-        captain.provider = None;
-        captain.harness = None;
-        captain.provider_session_id = None;
-        captain.conversation_id = None;
-        captain.terminal_id = None;
-        runtime.lifecycle = if runtime.generation == 0 {
-            CortanaRuntimeLifecycle::Starting
-        } else {
-            CortanaRuntimeLifecycle::Restoring
-        };
-        runtime.provenance = CortanaRuntimeProvenance {
-            source: CortanaRuntimeProvenanceSource::ProfileCatalog,
-            identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
-        };
-        runtime.policy = Some(requested_intent.request.desired_runtime.clone());
-        runtime.observed_provider = None;
-        runtime.observed_harness = None;
-        runtime.provider_session_id = None;
-        runtime.conversation_id = None;
-        runtime.runtime_attestation = None;
-        runtime.reason_code = None;
-        runtime.guidance = None;
         runtime.ensure_intent = Some(requested_intent);
         runtime.updated_at = timestamp;
         let result = captain.clone();
@@ -7067,6 +7150,171 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    /// Record that the exact incumbent remains healthy after fresh unlocked
+    /// runtime observation. This is a terminal replay result and does not change
+    /// the permanent runtime generation or its current lineage identity.
+    fn mark_cortana_incumbent_recovered(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        identity: &crate::identity::SessionIdentity,
+        observed_authority_generation: u64,
+        verified: &VerifiedCortanaCandidateAttestation,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let runtime_receipt = verified.runtime.persisted();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id || intent.request_digest != request_digest {
+            return Err("Cortana incumbent recovery does not match the immutable request".into());
+        }
+        if intent.phase == CortanaEnsurePhase::IncumbentRecovered {
+            return Ok(captain.clone());
+        }
+        let attestation = runtime
+            .runtime_attestation
+            .as_ref()
+            .filter(|_| intent.phase == CortanaEnsurePhase::Prepared)
+            .ok_or("Cortana ensure has no Ready incumbent to recover")?;
+        validate_cortana_session_identity(
+            &attestation.control_identity_id,
+            attestation.session_identity_generation,
+            attestation.authority_generation,
+            observed_authority_generation,
+            &attestation.terminal_id,
+            identity,
+        )?;
+        if !matches!(
+            runtime.lifecycle,
+            CortanaRuntimeLifecycle::Ready | CortanaRuntimeLifecycle::NeedsAttention
+        ) || runtime.policy.as_ref() != Some(&intent.request.desired_runtime)
+            || runtime_receipt.terminal != attestation.runtime_policy_receipt.terminal
+            || runtime_receipt.observed_provider != attestation.observed_provider
+            || runtime_receipt.observed_harness != attestation.observed_harness
+            || runtime_receipt.observed_model != intent.request.desired_runtime.model
+            || runtime_receipt.observed_reasoning_effort
+                != intent.request.desired_runtime.reasoning_effort
+            || runtime_receipt.observed_permission
+                != intent.request.desired_runtime.harness_permission
+            || runtime_receipt.resolved_provider_executable
+                != attestation.installed_runtime.resolved_executable
+            || runtime_receipt.executable_version
+                != attestation.installed_runtime.executable_version
+            || verified.provider_session.terminal != runtime_receipt.terminal
+            || verified.provider_session.provider_session_id != attestation.provider_session_id
+            || verified.provider_session.conversation_id != attestation.conversation_id
+        {
+            return Err(
+                "Cortana incumbent fresh evidence does not match its Ready identity".into(),
+            );
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        intent.phase = CortanaEnsurePhase::IncumbentRecovered;
+        intent.updated_at = timestamp;
+        runtime.lifecycle = CortanaRuntimeLifecycle::Ready;
+        runtime.reason_code = None;
+        runtime.guidance = None;
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    /// Publish the replacement boundary only after the exact incumbent bearer is
+    /// durably revoked and its terminal is definitively gone. The projection
+    /// change advances the Cortana authority generation before any candidate is
+    /// reserved or launched.
+    fn fence_cortana_incumbent(
+        &self,
+        identities: &crate::identity::IdentityStore,
+        operation_id: &str,
+        request_digest: &str,
+        expected_control_identity_id: &str,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        if !identities.is_revoked(expected_control_identity_id) {
+            return Err("Cortana incumbent bearer is not durably revoked".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id
+            || intent.request_digest != request_digest
+            || intent.phase != CortanaEnsurePhase::Prepared
+            || runtime.generation == 0
+            || intent.request.expected_generation != runtime.generation
+            || captain.terminal_id.as_deref() != intent.request.incumbent_terminal_id.as_deref()
+            || runtime
+                .runtime_attestation
+                .as_ref()
+                .is_none_or(|attestation| {
+                    attestation.control_identity_id != expected_control_identity_id
+                        || Some(attestation.terminal_id.as_str()) != captain.terminal_id.as_deref()
+                })
+        {
+            return Err("Cortana incumbent changed before its authority fence committed".into());
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        for lineage in &mut runtime.lineage {
+            if lineage.state == CortanaLineageState::Current {
+                lineage.state = CortanaLineageState::Replaced;
+            }
+        }
+        captain.state = ClaimState::Vacant;
+        captain.provider = None;
+        captain.harness = None;
+        captain.provider_session_id = None;
+        captain.conversation_id = None;
+        captain.terminal_id = None;
+        runtime.lifecycle = CortanaRuntimeLifecycle::Restoring;
+        runtime.provenance = CortanaRuntimeProvenance {
+            source: CortanaRuntimeProvenanceSource::ProfileCatalog,
+            identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
+        };
+        runtime.policy = Some(intent.request.desired_runtime.clone());
+        runtime.observed_provider = None;
+        runtime.observed_harness = None;
+        runtime.provider_session_id = None;
+        runtime.conversation_id = None;
+        runtime.runtime_attestation = None;
+        runtime.reason_code = None;
+        runtime.guidance = None;
+        intent.updated_at = timestamp;
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     /// Downgrade an incumbent after a fresh probe cannot prove the exact Ready
     /// contract. The terminal pointer and lineage remain published so no caller
     /// can mistake uncertainty for permission to seize or retire it.
@@ -7258,7 +7506,7 @@ impl CaptainsRegistry {
                 CortanaEnsurePhase::Failed => {
                     revoke.insert(key);
                 }
-                CortanaEnsurePhase::Committed => {}
+                CortanaEnsurePhase::Committed | CortanaEnsurePhase::IncumbentRecovered => {}
                 CortanaEnsurePhase::Prepared
                 | CortanaEnsurePhase::CandidateReserved
                 | CortanaEnsurePhase::CandidateSpawned
@@ -11509,24 +11757,58 @@ fn enforce_session_access(
     })
 }
 
-fn caller_is_apex(caller: Option<&ResolvedIdentity>, trusted_internal: bool) -> bool {
+fn caller_is_apex(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> bool {
     if trusted_internal {
         return true;
     }
     let Some(caller) = caller else { return false };
-    caller.fleet_role == Some(FleetRole::Cortana)
-        || matches!(
-            caller.mint_role,
-            crate::identity::Role::General | crate::identity::Role::Cortana
+    if caller.mint_role == crate::identity::Role::General {
+        return true;
+    }
+    if caller.mint_role != crate::identity::Role::Cortana
+        || caller.fleet_role != Some(FleetRole::Cortana)
+    {
+        return false;
+    }
+    let snapshot = ctx.captains.snapshot();
+    let Some(captain) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+    else {
+        return false;
+    };
+    let Some(runtime) = captain.cortana_runtime.as_ref() else {
+        return false;
+    };
+    let Some(attestation) = runtime.runtime_attestation.as_ref() else {
+        return false;
+    };
+    let recovery_authorized = runtime.ensure_intent.as_ref().is_none_or(|intent| {
+        matches!(
+            intent.phase,
+            CortanaEnsurePhase::Committed | CortanaEnsurePhase::IncumbentRecovered
         )
+    });
+    runtime.lifecycle == CortanaRuntimeLifecycle::Ready
+        && recovery_authorized
+        && caller.session_id == attestation.control_identity_id
+        && caller.tile.as_deref() == Some(attestation.terminal_id.as_str())
+        && captain.terminal_id.as_deref() == Some(attestation.terminal_id.as_str())
+        && attestation.authority_generation == runtime.generation
 }
 
 fn enforce_ship_authority(
+    ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     ship_slug: &str,
 ) -> Result<(), String> {
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(());
     }
     let caller = caller.expect("non-apex caller must be identified");
@@ -11541,12 +11823,13 @@ fn enforce_ship_authority(
 }
 
 fn enforce_attach_authority(
+    ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     target_terminal: &str,
     role: FleetRole,
 ) -> Result<(), String> {
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(());
     }
     if role == FleetRole::Cortana {
@@ -11592,7 +11875,7 @@ fn enforce_target_lifecycle_authority(
     trusted_internal: bool,
     target_terminal: &str,
 ) -> Result<Option<TargetLifecycleAuthority>, String> {
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(None);
     }
     let caller = caller.ok_or("acl: lifecycle mutation requires a session identity")?;
@@ -11785,7 +12068,7 @@ fn enforce_project_authority(
     trusted_internal: bool,
     project_id: Option<&str>,
 ) -> Result<(), String> {
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(());
     }
     let caller = caller.ok_or("acl: project mutation requires a session identity")?;
@@ -14348,7 +14631,7 @@ fn commission_captain(
     trusted_internal: bool,
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "commission_captain")?;
-    if !caller_is_apex(caller, trusted_internal) {
+    if !caller_is_apex(ctx, caller, trusted_internal) {
         return Err("acl: only General/Cortana may commission a project Captain".into());
     }
     let project_id = arg_str(args, "projectId")
@@ -14651,7 +14934,7 @@ fn attach_captain(
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("attach_captain requires a 'captainSessionId' argument")?;
-    if !caller_is_apex(caller, trusted_internal)
+    if !caller_is_apex(ctx, caller, trusted_internal)
         && caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str())
     {
         return Err("acl: only General/Cortana may attach a different terminal as Captain".into());
@@ -14721,7 +15004,13 @@ fn attach_captain(
         .map(|value| slugify_ship(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
-    enforce_attach_authority(caller, trusted_internal, &terminal_id, FleetRole::Captain)?;
+    enforce_attach_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        &terminal_id,
+        FleetRole::Captain,
+    )?;
     let powder_binding = project.powder.as_ref().ok_or_else(|| {
         format!(
             "attach_captain: project '{}' must be bound to Powder before attachment",
@@ -15080,7 +15369,7 @@ fn revalidate_dispatch_authority(
     {
         return Err("acl: dispatch authority changed; retry from the current Captain".into());
     }
-    enforce_ship_authority(caller, trusted_internal, &expected.captain.ship_slug).map_err(
+    enforce_ship_authority(ctx, caller, trusted_internal, &expected.captain.ship_slug).map_err(
         |_| "acl: dispatch authority changed; retry from the current Captain".to_string(),
     )?;
     Ok(())
@@ -15556,7 +15845,7 @@ fn dispatch_crew_with_observer_inner(
         generation: dispatch_generation,
         caller: caller.cloned(),
     };
-    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    enforce_ship_authority(ctx, caller, trusted_internal, &captain.ship_slug)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
         format!(
@@ -16206,7 +16495,7 @@ fn authorize_crew_heartbeat_target(
 ) -> Result<CrewHeartbeatAuthorizationSnapshot, String> {
     let (snapshot, generations, registry_epoch) =
         ctx.captains.snapshot_with_authority_generations();
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(CrewHeartbeatAuthorizationSnapshot {
             snapshot,
             generations,
@@ -18098,6 +18387,7 @@ fn heartbeat_crew_powder(
     let authorization_scope =
         resolve_crew_powder_scope_from_heartbeat_authorization(authorization, &crew_session_id)?;
     require_crew_heartbeat_authority(
+        ctx,
         &authorization_scope,
         caller,
         trusted_internal,
@@ -18127,6 +18417,7 @@ fn heartbeat_crew_powder(
         "heartbeat_crew_powder",
     )?;
     require_crew_heartbeat_authority(
+        ctx,
         &current_scope,
         caller,
         trusted_internal,
@@ -18148,12 +18439,13 @@ fn heartbeat_crew_powder(
 }
 
 fn require_crew_heartbeat_authority(
+    ctx: &ControlContext,
     scope: &CrewPowderScope,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     command: &str,
 ) -> Result<(), String> {
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(ctx, caller, trusted_internal) {
         return Ok(());
     }
     let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a session identity"))?;
@@ -18709,8 +19001,30 @@ pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
 
 #[cfg(unix)]
 fn cortana_authority_generation(ctx: &ControlContext) -> u64 {
-    let (_, generations, _) = ctx.captains.snapshot_with_authority_generations();
-    generations.captains.get(CORTANA_SLUG).copied().unwrap_or(0)
+    let snapshot = ctx.captains.snapshot();
+    let Some(runtime) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .and_then(|captain| captain.cortana_runtime.as_ref())
+    else {
+        return 0;
+    };
+    match runtime.ensure_intent.as_ref() {
+        Some(intent)
+            if matches!(
+                runtime.lifecycle,
+                CortanaRuntimeLifecycle::Starting | CortanaRuntimeLifecycle::Restoring
+            ) =>
+        {
+            intent
+                .request
+                .expected_generation
+                .checked_add(1)
+                .unwrap_or(0)
+        }
+        _ => runtime.generation,
+    }
 }
 
 #[cfg(unix)]
@@ -18786,6 +19100,227 @@ fn reject_cortana_candidate_before_spawn(
         )?;
     }
     Err(error.to_string())
+}
+
+#[cfg(unix)]
+fn block_cortana_replacement(
+    ctx: &ControlContext,
+    generation: u64,
+    terminal_id: &str,
+    guidance: &str,
+    error: &str,
+) -> Result<bool, String> {
+    ctx.captains.block_cortana_incumbent(
+        generation,
+        terminal_id,
+        CortanaRecoveryReason::RuntimeAttestationFailed,
+        guidance,
+        now_ms(),
+    )?;
+    Err(error.to_string())
+}
+
+/// Resolve a Ready incumbent before replacement effects. `Ok(true)` is a
+/// terminal healthy replay. `Ok(false)` means the exact old bearer was revoked,
+/// the terminal was confirmed gone, and the registry authority fence committed.
+#[cfg(unix)]
+fn reconcile_cortana_incumbent(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+) -> Result<bool, String> {
+    reconcile_cortana_incumbent_with_liveness(ctx, operation_id, request_digest, &|target| {
+        tmux::session_liveness(target)
+    })
+}
+
+#[cfg(unix)]
+fn reconcile_cortana_incumbent_with_liveness<F>(
+    ctx: &ControlContext,
+    operation_id: &str,
+    request_digest: &str,
+    liveness: &F,
+) -> Result<bool, String>
+where
+    F: Fn(&str) -> tmux::SessionLiveness,
+{
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .ok_or("Cortana incumbent disappeared during recovery")?;
+    let runtime = captain
+        .cortana_runtime
+        .as_ref()
+        .ok_or("Cortana incumbent runtime disappeared during recovery")?;
+    let intent = runtime
+        .ensure_intent
+        .as_ref()
+        .filter(|intent| {
+            intent.operation_id == operation_id
+                && intent.request_digest == request_digest
+                && intent.phase == CortanaEnsurePhase::Prepared
+        })
+        .ok_or("Cortana incumbent recovery journal changed before observation")?;
+    if runtime.generation == 0 {
+        return Ok(false);
+    }
+    let attestation = runtime
+        .runtime_attestation
+        .as_ref()
+        .ok_or("Cortana Ready incumbent lacks exact runtime evidence")?;
+    let terminal_id = intent
+        .request
+        .incumbent_terminal_id
+        .as_deref()
+        .filter(|terminal| *terminal == attestation.terminal_id)
+        .ok_or("Cortana incumbent terminal does not match the immutable request")?;
+    let tmux_target = &attestation.tmux_session_id;
+    let identity = ctx.identity.get(&attestation.control_identity_id);
+    let identity_revoked = ctx.identity.is_revoked(&attestation.control_identity_id);
+
+    match liveness(tmux_target) {
+        tmux::SessionLiveness::Unknown => {
+            return block_cortana_replacement(
+                ctx,
+                runtime.generation,
+                terminal_id,
+                "The incumbent Cortana terminal liveness is ambiguous; its authority is blocked while the terminal and durable identity remain preserved for inspection.",
+                "Cortana incumbent liveness is ambiguous; refusing replacement or revocation",
+            );
+        }
+        tmux::SessionLiveness::Alive if identity_revoked => {
+            let _ = tmux::kill_session_tree(tmux_target);
+            if !matches!(liveness(tmux_target), tmux::SessionLiveness::Gone) {
+                return block_cortana_replacement(
+                    ctx,
+                    runtime.generation,
+                    terminal_id,
+                    "The incumbent Cortana bearer is fenced but its exact terminal could not be confirmed gone; inspect it before retrying replacement.",
+                    "Cortana revoked incumbent terminal cleanup is unresolved",
+                );
+            }
+        }
+        tmux::SessionLiveness::Alive => {
+            let Some(identity) = identity else {
+                return block_cortana_replacement(
+                    ctx,
+                    runtime.generation,
+                    terminal_id,
+                    "The live incumbent Cortana identity is missing from the authoritative IdentityStore; replacement is blocked without revoking or seizing the terminal.",
+                    "Cortana live incumbent identity is unavailable",
+                );
+            };
+            if let Err(error) = validate_cortana_session_identity(
+                &attestation.control_identity_id,
+                attestation.session_identity_generation,
+                attestation.authority_generation,
+                cortana_authority_generation(ctx),
+                terminal_id,
+                &identity,
+            ) {
+                return block_cortana_replacement(
+                    ctx,
+                    runtime.generation,
+                    terminal_id,
+                    "The live incumbent Cortana authority generation or IdentityStore binding mismatched; replacement is blocked without revocation or seizure.",
+                    &error,
+                );
+            }
+            if runtime.policy.as_ref() != Some(&intent.request.desired_runtime) {
+                return block_cortana_replacement(
+                    ctx,
+                    runtime.generation,
+                    terminal_id,
+                    "The live incumbent Cortana policy differs from the protected desired profile; explicit operator action is required before replacement.",
+                    "Cortana live incumbent policy does not match the desired protected profile",
+                );
+            }
+            let spawn_provider = HarnessProviderLaunchReceipt {
+                resolved_provider_executable: attestation
+                    .runtime_policy_receipt
+                    .resolved_provider_executable
+                    .clone(),
+                provider_executable_device: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_device,
+                provider_executable_inode: attestation
+                    .runtime_policy_receipt
+                    .provider_executable_inode,
+            };
+            let harness = Harness::from_provider(&intent.request.desired_runtime.harness);
+            let receipt = match observe_runtime_policy_receipt_from_spawn(
+                tmux_target,
+                &attestation.runtime_policy_receipt.terminal,
+                &spawn_provider,
+                harness,
+                &intent.request.desired_runtime.model,
+                &intent.request.desired_runtime.reasoning_effort,
+                intent.request.desired_runtime.harness_permission,
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return block_cortana_replacement(
+                        ctx,
+                        runtime.generation,
+                        terminal_id,
+                        "The live incumbent Cortana runtime failed fresh tmux, process, provider, version, or policy observation; replacement is blocked without revocation or seizure.",
+                        &format!("Cortana live incumbent observation failed: {error}"),
+                    );
+                }
+            };
+            let verified = match observe_cortana_candidate_attestation(
+                &ctx.status,
+                terminal_id,
+                receipt,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return block_cortana_replacement(
+                        ctx,
+                        runtime.generation,
+                        terminal_id,
+                        "The live incumbent Cortana provider session identity is unreadable or mismatched; replacement is blocked without revocation or seizure.",
+                        &error,
+                    );
+                }
+            };
+            ctx.captains.mark_cortana_incumbent_recovered(
+                operation_id,
+                request_digest,
+                &identity,
+                cortana_authority_generation(ctx),
+                &verified,
+                now_ms(),
+            )?;
+            return Ok(true);
+        }
+        tmux::SessionLiveness::Gone => {}
+    }
+
+    if !identity_revoked {
+        let identity = identity.ok_or(
+            "Cortana gone incumbent identity is missing without a durable revocation tombstone",
+        )?;
+        validate_cortana_session_identity(
+            &attestation.control_identity_id,
+            attestation.session_identity_generation,
+            attestation.authority_generation,
+            cortana_authority_generation(ctx),
+            terminal_id,
+            &identity,
+        )?;
+        ctx.identity.revoke(&attestation.control_identity_id)?;
+    }
+    ctx.captains.fence_cortana_incumbent(
+        &ctx.identity,
+        operation_id,
+        request_digest,
+        &attestation.control_identity_id,
+        now_ms(),
+    )?;
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -19021,7 +19556,21 @@ where
     let operation_id = intent.operation_id.clone();
     let request_digest = intent.request_digest.clone();
     let policy = intent.request.desired_runtime.clone();
+    if intent.phase == CortanaEnsurePhase::IncumbentRecovered {
+        return Ok(true);
+    }
     if intent.phase == CortanaEnsurePhase::Prepared {
+        if runtime.generation > 0
+            && matches!(
+                runtime.lifecycle,
+                CortanaRuntimeLifecycle::Ready | CortanaRuntimeLifecycle::NeedsAttention
+            )
+        {
+            let recovered = reconcile_cortana_incumbent(ctx, &operation_id, &request_digest)?;
+            if recovered {
+                return Ok(true);
+            }
+        }
         let authority = cortana_authority_generation(ctx);
         ctx.captains.reserve_cortana_candidate_identity(
             &ctx.identity,
@@ -20934,7 +21483,7 @@ fn rename_captain(
                     .is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
         })
         .ok_or("rename_captain: no matching Captain is registered")?;
-    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    enforce_ship_authority(ctx, caller, trusted_internal, &captain.ship_slug)?;
     let display_name = arg_str(args, "displayName")
         .or_else(|| arg_str(args, "display_name"))
         .ok_or("rename_captain requires a 'displayName' argument")?;
@@ -20998,7 +21547,7 @@ fn claim_captain_locked(
         }
         _ => FleetRole::Captain,
     };
-    enforce_attach_authority(caller, trusted_internal, &captain_session_id, role)?;
+    enforce_attach_authority(ctx, caller, trusted_internal, &captain_session_id, role)?;
     // Liveness: refuse a claim for a session with no live terminal, so a bogus
     // or raced id can never be persisted into captains.json to linger forever.
     // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` rejects; an `Unknown`
@@ -21272,7 +21821,7 @@ fn release_captain(
                 || captain.ship_slug == slugify_ship(&target)
         })
         .ok_or_else(|| format!("release_captain: no claim matches '{target}'"))?;
-    enforce_ship_authority(caller, trusted_internal, &record.ship_slug)?;
+    enforce_ship_authority(ctx, caller, trusted_internal, &record.ship_slug)?;
     let released = ctx.captains.release(&target)?;
     let applied = captains_sync_apply(ctx);
     let snap = ctx.captains.snapshot();
@@ -23030,6 +23579,84 @@ mod tests {
         registry
     }
 
+    fn cortana_ready_fixture_for_identity(
+        identity: &crate::identity::SessionIdentity,
+    ) -> CaptainRecord {
+        let mut captain = cortana_ready_fixture();
+        let runtime = captain.cortana_runtime.as_mut().unwrap();
+        let attestation = runtime.runtime_attestation.as_mut().unwrap();
+        attestation.control_identity_id = identity.id.clone();
+        attestation.session_identity_generation = identity.generation;
+        let current = runtime
+            .lineage
+            .iter_mut()
+            .find(|entry| entry.state == CortanaLineageState::Current)
+            .unwrap();
+        current.control_identity_id = identity.id.clone();
+        current.session_identity_generation = identity.generation;
+        runtime.provenance.identity = cortana_runtime_attestation_identity(
+            runtime,
+            runtime.policy.as_ref().unwrap(),
+            runtime.runtime_attestation.as_ref().unwrap(),
+        )
+        .unwrap();
+        captain
+    }
+
+    fn install_cortana_fixture(
+        registry: &CaptainsRegistry,
+        captain: CaptainRecord,
+    ) -> Result<(), String> {
+        let _mutation = registry
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = registry.lock();
+        let previous = current.clone();
+        current.captains.push(captain);
+        current.seq = current.seq.saturating_add(1);
+        registry.commit_mutation(current, previous)
+    }
+
+    fn test_publish_cortana_incumbent_fence(registry: &CaptainsRegistry) {
+        let mut current = registry.lock();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .unwrap();
+        let runtime = captain.cortana_runtime.as_mut().unwrap();
+        let desired = runtime
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .request
+            .desired_runtime
+            .clone();
+        for lineage in &mut runtime.lineage {
+            if lineage.state == CortanaLineageState::Current {
+                lineage.state = CortanaLineageState::Replaced;
+            }
+        }
+        captain.state = ClaimState::Vacant;
+        captain.provider = None;
+        captain.harness = None;
+        captain.provider_session_id = None;
+        captain.conversation_id = None;
+        captain.terminal_id = None;
+        runtime.lifecycle = CortanaRuntimeLifecycle::Restoring;
+        runtime.provenance = CortanaRuntimeProvenance {
+            source: CortanaRuntimeProvenanceSource::ProfileCatalog,
+            identity: CORTANA_PROFILE_CATALOG_ID.to_string(),
+        };
+        runtime.policy = Some(desired);
+        runtime.observed_provider = None;
+        runtime.observed_harness = None;
+        runtime.provider_session_id = None;
+        runtime.conversation_id = None;
+        runtime.runtime_attestation = None;
+    }
+
     fn cortana_committed_intent_fixture() -> CaptainRecord {
         let mut captain = cortana_ready_fixture();
         let runtime = captain.cortana_runtime.as_mut().unwrap();
@@ -23218,6 +23845,39 @@ mod tests {
         document
     }
 
+    fn schema_21_runtime_5_document(captain: CaptainRecord) -> Value {
+        let mut document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 21,
+            seq: 21,
+            captains: vec![captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let runtime = document["captains"][0]["cortanaRuntime"]
+            .as_object_mut()
+            .unwrap();
+        runtime.insert("schemaVersion".into(), Value::from(5));
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .and_then(Value::as_object_mut)
+        {
+            intent.insert("schemaVersion".into(), Value::from(5));
+            let digest = cortana_ensure_request_digest_parts(
+                5,
+                intent["operationId"].as_str().unwrap(),
+                &intent["request"],
+            )
+            .unwrap();
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        document
+    }
+
     #[test]
     fn cortana_ensure_prepare_is_durable_idempotent_and_rejects_changed_replay() {
         let path = captains_tmp("cortana-ensure-prepare");
@@ -23314,6 +23974,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
+        test_publish_cortana_incumbent_fence(&registry);
         let identities = crate::identity::IdentityStore::ephemeral();
         let identity = identities
             .mint_for(
@@ -23714,6 +24375,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
+        test_publish_cortana_incumbent_fence(&registry);
         let identities = crate::identity::IdentityStore::ephemeral();
         let identity = identities
             .mint_for(
@@ -23793,6 +24455,303 @@ mod tests {
         assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cortana_replacement_ambiguity_preserves_incumbent_but_fences_apex_authority() {
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::new());
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-ambiguous-incumbent",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let resolved = resolve_identity(&ctx, &identity.secret).unwrap();
+        assert!(!caller_is_apex(&ctx, Some(&resolved), false));
+
+        let error = reconcile_cortana_incumbent_with_liveness(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_| tmux::SessionLiveness::Unknown,
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
+        let blocked = registry.snapshot().captains[0].clone();
+        let runtime = blocked.cortana_runtime.as_ref().unwrap();
+        assert_eq!(blocked.terminal_id.as_deref(), Some("cor-runtime-1"));
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
+        assert!(runtime.ensure_intent.as_ref().unwrap().candidate.is_none());
+        assert!(identities.resolve(&identity.secret).is_some());
+        assert!(!caller_is_apex(&ctx, Some(&resolved), false));
+
+        let verified_runtime = cortana_verified_runtime_receipt_for("th_cor-runtime-1");
+        let verified = VerifiedCortanaCandidateAttestation {
+            provider_session: CortanaProviderSessionReceipt {
+                terminal: verified_runtime.persisted().terminal.clone(),
+                observed_provider: "codex".into(),
+                provider_session_id: "provider-session-1".into(),
+                conversation_id: "conversation-1".into(),
+                observed_at: 111,
+            },
+            runtime: verified_runtime,
+        };
+        registry
+            .mark_cortana_incumbent_recovered(
+                &intent.operation_id,
+                &intent.request_digest,
+                &identities.get(&identity.id).unwrap(),
+                1,
+                &verified,
+                now_ms(),
+            )
+            .unwrap();
+        let recovered = registry.snapshot().captains[0].clone();
+        assert_eq!(
+            recovered.cortana_runtime.as_ref().unwrap().lifecycle,
+            CortanaRuntimeLifecycle::Ready
+        );
+        assert_eq!(
+            recovered
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::IncumbentRecovered
+        );
+        assert!(caller_is_apex(&ctx, Some(&resolved), false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_gone_incumbent_is_revoked_and_generation_fenced_before_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(temp.path().join("captains.json")));
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-gone-incumbent",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        registry.fail_next_persist("injected incumbent fence persistence failure");
+        let error = reconcile_cortana_incumbent_with_liveness(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_| tmux::SessionLiveness::Gone,
+        )
+        .unwrap_err();
+        assert!(error.contains("injected incumbent fence persistence failure"));
+        assert!(identities.resolve(&identity.secret).is_none());
+        assert!(identities.is_revoked(&identity.id));
+        let uncommitted = registry.snapshot().captains[0].clone();
+        assert_eq!(uncommitted.terminal_id.as_deref(), Some("cor-runtime-1"));
+        assert_eq!(
+            uncommitted.cortana_runtime.as_ref().unwrap().lineage[0].state,
+            CortanaLineageState::Current
+        );
+        assert!(!reconcile_cortana_incumbent_with_liveness(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_| tmux::SessionLiveness::Gone,
+        )
+        .unwrap());
+        let fenced = registry.snapshot().captains[0].clone();
+        let runtime = fenced.cortana_runtime.as_ref().unwrap();
+        assert!(fenced.terminal_id.is_none());
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::Restoring);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Replaced);
+        let authority = cortana_authority_generation(&ctx);
+        assert_eq!(authority, 2);
+        registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                authority,
+                112,
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_incumbent_with_unreadable_fresh_evidence_is_never_replaced_or_revoked() {
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::new());
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let ctx = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-live-unreadable-incumbent",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let error = reconcile_cortana_incumbent_with_liveness(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &|_| tmux::SessionLiveness::Alive,
+        )
+        .unwrap_err();
+        assert!(error.contains("observation failed"));
+        let blocked = registry.snapshot().captains[0].clone();
+        let runtime = blocked.cortana_runtime.as_ref().unwrap();
+        assert_eq!(blocked.terminal_id.as_deref(), Some("cor-runtime-1"));
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
+        assert!(runtime.ensure_intent.as_ref().unwrap().candidate.is_none());
+        assert!(identities.resolve(&identity.secret).is_some());
+        assert!(!identities.is_revoked(&identity.id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_incumbent_fence_survives_restart_and_concurrent_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let captains_path = temp.path().join("captains.json");
+        let identities_path = temp.path().join("identities.json");
+        let identities = Arc::new(crate::identity::IdentityStore::load(
+            identities_path.clone(),
+        ));
+        let identity = identities
+            .mint_for(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+            )
+            .unwrap();
+        identities.bind_tile(&identity.id, "cor-runtime-1").unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(captains_path.clone()));
+        install_cortana_fixture(&registry, cortana_ready_fixture_for_identity(&identity)).unwrap();
+        let incumbent = registry.snapshot().captains[0].clone();
+        let (prepared, _) = registry
+            .prepare_cortana_ensure(
+                "ensure-ambiguous-restart",
+                cortana_ensure_request(Some(&incumbent)),
+                110,
+            )
+            .unwrap();
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let ctx = Arc::new(
+            test_ctx("control-token")
+                .with_captains_registry(Arc::clone(&registry))
+                .with_identity_store(Arc::clone(&identities)),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let ctx = Arc::clone(&ctx);
+            let barrier = Arc::clone(&barrier);
+            let operation_id = intent.operation_id.clone();
+            let request_digest = intent.request_digest.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                reconcile_cortana_incumbent_with_liveness(
+                    &ctx,
+                    &operation_id,
+                    &request_digest,
+                    &|_| tmux::SessionLiveness::Unknown,
+                )
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap().unwrap_err().contains("ambiguous"));
+        }
+        drop(ctx);
+        drop(registry);
+        drop(identities);
+
+        let restarted_identities = Arc::new(crate::identity::IdentityStore::load(identities_path));
+        let restarted_registry = Arc::new(CaptainsRegistry::load(captains_path));
+        let restarted = test_ctx("control-token")
+            .with_captains_registry(Arc::clone(&restarted_registry))
+            .with_identity_store(Arc::clone(&restarted_identities));
+        let runtime = restarted_registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(runtime.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(runtime.lineage[0].state, CortanaLineageState::Current);
+        assert!(runtime.ensure_intent.unwrap().candidate.is_none());
+        let resolved = resolve_identity(&restarted, &identity.secret).unwrap();
+        assert!(!caller_is_apex(&restarted, Some(&resolved), false));
+    }
+
     #[test]
     fn cortana_candidate_cleanup_ambiguity_blocks_spawn_until_exact_gone() {
         let incumbent = cortana_ready_fixture();
@@ -23813,6 +24772,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
+        test_publish_cortana_incumbent_fence(&registry);
         let allocation_key = cortana_identity_allocation_key(&intent.request_digest).unwrap();
         let allocated = identities
             .mint_for_operation(
@@ -24811,6 +25771,33 @@ mod tests {
                 .phase,
             CortanaEnsurePhase::Committed
         );
+
+        let incumbent = registry.snapshot().captains[0].clone();
+        registry
+            .prepare_cortana_ensure(
+                "ensure-worker-recover-live-incumbent",
+                cortana_ensure_request(Some(&incumbent)),
+                now_ms(),
+            )
+            .unwrap();
+        let resolved = resolve_identity(&ctx, &identity.secret).unwrap();
+        assert!(!caller_is_apex(&ctx, Some(&resolved), false));
+        let recovered = run_cortana_worker_once_with_provider(&ctx, |_| {
+            panic!("healthy incumbent recovery must not resolve or launch a candidate provider")
+        })
+        .unwrap();
+        assert!(recovered);
+        let recovered = registry.snapshot().captains[0].clone();
+        let recovered_runtime = recovered.cortana_runtime.as_ref().unwrap();
+        assert_eq!(recovered.terminal_id, incumbent.terminal_id);
+        assert_eq!(recovered_runtime.generation, 1);
+        assert_eq!(
+            recovered_runtime.ensure_intent.as_ref().unwrap().phase,
+            CortanaEnsurePhase::IncumbentRecovered
+        );
+        assert_eq!(identities.len(), 1);
+        assert!(caller_is_apex(&ctx, Some(&resolved), false));
+        assert!(!attacker_proof.exists());
     }
 
     #[cfg(unix)]
@@ -24885,7 +25872,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cortana_worker_revokes_absent_candidate_after_authority_generation_stales() {
+    fn cortana_worker_revokes_absent_candidate_after_session_identity_disappears() {
         let registry = Arc::new(CaptainsRegistry::new());
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let mut ctx = test_ctx("control-token")
@@ -24917,21 +25904,30 @@ mod tests {
                 101,
             )
             .unwrap();
-        {
-            let mut current = registry.lock();
-            current.authority_generations.clock += 1;
-            let next = current.authority_generations.clock;
-            current
-                .authority_generations
-                .captains
-                .insert(CORTANA_SLUG.into(), next);
-        }
+        let candidate = registry.snapshot().captains[0]
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .clone();
+        let _session = CortanaWorkerSessionGuard(candidate.tmux_session_id.clone());
+        let _ = tmux::kill_session_tree(&candidate.tmux_session_id);
+        assert!(matches!(
+            tmux::session_liveness(&candidate.tmux_session_id),
+            tmux::SessionLiveness::Gone
+        ));
+        identities.revoke(&identity.id).unwrap();
 
         let error = run_cortana_worker_once_with_provider(&ctx, |_| {
-            panic!("stale authority must be rejected before provider observation")
+            panic!("missing session identity must be rejected before provider observation")
         })
         .unwrap_err();
-        assert!(error.contains("exact IdentityStore session generation"));
+        assert!(error.contains("control identity is unavailable"));
         assert!(identities.resolve(&identity.secret).is_none());
         assert!(identities.is_revoked(&identity.id));
         assert_eq!(
@@ -29597,6 +30593,27 @@ mod tests {
 
     #[test]
     fn cortana_intent_phases_require_exact_lifecycle_generation_and_candidate_binding() {
+        let mut recovered = cortana_ready_fixture();
+        let runtime = recovered.cortana_runtime.as_mut().unwrap();
+        runtime.ensure_intent = Some(CortanaEnsureIntent {
+            schema_version: CORTANA_RUNTIME_SCHEMA_VERSION,
+            operation_id: "ensure-incumbent-recovered".into(),
+            request_digest: String::new(),
+            request: CortanaEnsureRequestPayload {
+                expected_identity_id: CORTANA_IDENTITY_ID.into(),
+                expected_generation: 1,
+                incumbent_terminal_id: recovered.terminal_id.clone(),
+                desired_runtime: runtime.policy.clone().unwrap(),
+            },
+            phase: CortanaEnsurePhase::IncumbentRecovered,
+            candidate: None,
+            created_at: 100,
+            updated_at: 100,
+        });
+        let intent = runtime.ensure_intent.as_mut().unwrap();
+        intent.request_digest = cortana_ensure_request_digest(intent).unwrap();
+        validate_cortana_runtime(&recovered, recovered.cortana_runtime.as_ref().unwrap()).unwrap();
+
         let valid = cortana_prepared_fixture(1);
         validate_cortana_runtime(&valid, valid.cortana_runtime.as_ref().unwrap()).unwrap();
         let mut reserved = valid.clone();
@@ -30866,6 +31883,54 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), source);
             assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
         }
+    }
+
+    #[test]
+    fn schema_21_runtime_5_migrates_digest_and_malformed_source_is_byte_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("schema-21-valid.json");
+        let legacy = schema_21_runtime_5_document(cortana_committed_intent_fixture());
+        let old_digest = legacy["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry.write_blocked.is_none());
+        let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["schemaVersion"].as_u64(),
+            Some(CAPTAINS_SCHEMA_VERSION as u64)
+        );
+        let runtime = registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        let intent = runtime.ensure_intent.unwrap();
+        assert_eq!(runtime.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_eq!(intent.schema_version, CORTANA_RUNTIME_SCHEMA_VERSION);
+        assert_ne!(intent.request_digest, old_digest);
+        assert_eq!(
+            intent.request_digest,
+            cortana_ensure_request_digest(&intent).unwrap()
+        );
+
+        let malformed_path = temp.path().join("schema-21-malformed.json");
+        let backup = malformed_path.with_extension("json.bak");
+        let mut malformed = legacy;
+        malformed["captains"][0]["cortanaRuntime"]["ensureIntent"]["requestDigest"] =
+            Value::from("0".repeat(64));
+        let source = serde_json::to_vec_pretty(&malformed).unwrap();
+        let backup_source = serde_json::to_vec_pretty(&schema_21_runtime_5_document(
+            cortana_committed_intent_fixture(),
+        ))
+        .unwrap();
+        std::fs::write(&malformed_path, &source).unwrap();
+        std::fs::write(&backup, &backup_source).unwrap();
+        let blocked = CaptainsRegistry::load(malformed_path.clone());
+        assert!(blocked.write_blocked.is_some());
+        assert_eq!(std::fs::read(&malformed_path).unwrap(), source);
+        assert_eq!(std::fs::read(&backup).unwrap(), backup_source);
     }
 
     #[test]
@@ -37131,14 +38196,23 @@ mod tests {
             .with_captains_registry(reg);
 
         let promoted = resolve_identity(&ctx, &promoted).unwrap();
-        assert!(
-            enforce_attach_authority(Some(&promoted), false, "new-cap", FleetRole::Captain).is_ok()
-        );
-        assert!(
-            enforce_attach_authority(Some(&promoted), false, "other", FleetRole::Captain)
-                .unwrap_err()
-                .contains("attach a different terminal")
-        );
+        assert!(enforce_attach_authority(
+            &ctx,
+            Some(&promoted),
+            false,
+            "new-cap",
+            FleetRole::Captain,
+        )
+        .is_ok());
+        assert!(enforce_attach_authority(
+            &ctx,
+            Some(&promoted),
+            false,
+            "other",
+            FleetRole::Captain,
+        )
+        .unwrap_err()
+        .contains("attach a different terminal"));
 
         let foreign = dispatch_authenticated(
             &ctx,
