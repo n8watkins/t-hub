@@ -236,36 +236,22 @@ pub(crate) struct OpenedHarnessProviderLaunch {
     opened_path: PathBuf,
 }
 
-struct OneShotCredentialHandoff {
-    directory: PathBuf,
-    wrapper: PathBuf,
-    credentials: PathBuf,
+#[cfg(unix)]
+struct AnonymousCredentialHandoff {
+    reader: Option<std::process::ChildStdout>,
+    writer: std::process::Child,
+    descriptor_path: PathBuf,
+    #[cfg(test)]
+    descriptor_target: String,
 }
 
-impl OneShotCredentialHandoff {
-    #[cfg(unix)]
-    fn create(
-        provider_alias: &std::path::Path,
-        command_tail: &str,
-        env: &[(String, String)],
-    ) -> Result<Self, LaunchAttestationError> {
+#[cfg(unix)]
+impl AnonymousCredentialHandoff {
+    fn create(env: &[(String, String)]) -> Result<Self, LaunchAttestationError> {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::fd::AsRawFd;
+        use std::process::Stdio;
 
-        let directory = std::env::temp_dir().join(format!(
-            "t-hub-provider-credentials-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir(&directory).map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        let wrapper = directory.join("launch");
-        let credentials = directory.join("credentials");
-        let handoff = Self {
-            directory,
-            wrapper,
-            credentials,
-        };
-        std::fs::set_permissions(&handoff.directory, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
         let mut credential_body = String::new();
         let mut keys = std::collections::HashSet::new();
         for (key, value) in env {
@@ -282,48 +268,65 @@ impl OneShotCredentialHandoff {
             credential_body.push('=');
             credential_body.push_str(&sh_single_quote(value));
             credential_body.push('\n');
+            if credential_body.len() > 64 * 1024 {
+                return Err(LaunchAttestationError::CredentialHandoffFailed);
+            }
         }
-        let mut credential_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&handoff.credentials)
+        let mut writer = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
-        credential_file
+        let mut input = writer
+            .stdin
+            .take()
+            .ok_or(LaunchAttestationError::CredentialHandoffFailed)?;
+        input
             .write_all(credential_body.as_bytes())
-            .and_then(|_| credential_file.sync_all())
             .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
-        let wrapper_body = format!(
-            "#!/bin/sh\nexec 3<{} || exit 125\nrm -f -- {} {} || exit 126\n. /proc/self/fd/3 || exit 127\nexec {}{}\n",
-            sh_single_quote(&handoff.credentials.to_string_lossy()),
-            sh_single_quote(&handoff.credentials.to_string_lossy()),
-            sh_single_quote(&handoff.wrapper.to_string_lossy()),
-            sh_single_quote(&provider_alias.to_string_lossy()),
-            command_tail,
-        );
-        let mut wrapper_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o700)
-            .open(&handoff.wrapper)
-            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
-        wrapper_file
-            .write_all(wrapper_body.as_bytes())
-            .and_then(|_| wrapper_file.sync_all())
-            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?;
-        Ok(handoff)
+        drop(input);
+        let reader = writer
+            .stdout
+            .take()
+            .ok_or(LaunchAttestationError::CredentialHandoffFailed)?;
+        let descriptor_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            reader.as_raw_fd()
+        ));
+        let descriptor_target = std::fs::read_link(&descriptor_path)
+            .map_err(|_| LaunchAttestationError::CredentialHandoffFailed)?
+            .to_string_lossy()
+            .into_owned();
+        if !descriptor_target.starts_with("pipe:[") {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        Ok(Self {
+            reader: Some(reader),
+            writer,
+            descriptor_path,
+            #[cfg(test)]
+            descriptor_target,
+        })
     }
 
-    fn consumed(&self) -> bool {
-        !self.wrapper.exists() && !self.credentials.exists()
+    fn launch_command(&self, provider_alias: &std::path::Path, command_tail: &str) -> String {
+        format!(
+            "exec 3<{} || exit 125; . /proc/self/fd/3 || exit 126; exec 3<&-; exec {}{}",
+            sh_single_quote(&self.descriptor_path.to_string_lossy()),
+            sh_single_quote(&provider_alias.to_string_lossy()),
+            command_tail,
+        )
     }
 }
 
-impl Drop for OneShotCredentialHandoff {
+#[cfg(unix)]
+impl Drop for AnonymousCredentialHandoff {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.wrapper);
-        let _ = std::fs::remove_file(&self.credentials);
-        let _ = std::fs::remove_dir(&self.directory);
+        drop(self.reader.take());
+        let _ = self.writer.kill();
+        let _ = self.writer.wait();
     }
 }
 
@@ -385,28 +388,13 @@ impl OpenedHarnessProviderLaunch {
         for binding in &self.provenance {
             binding.revalidate()?;
         }
-        let credential_handoff = OneShotCredentialHandoff::create(&alias, command_tail, env)?;
-        let launch_command = format!(
-            "exec {}",
-            sh_single_quote(&credential_handoff.wrapper.to_string_lossy())
-        );
+        let credential_handoff = AnonymousCredentialHandoff::create(env)?;
+        let launch_command = credential_handoff.launch_command(&alias, command_tail);
         let respawn = match crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command) {
             Ok(respawn) => respawn,
             Err(_) => return Err(LaunchAttestationError::UnreadableEvidence),
         };
         *failure_generation = terminal_generation_receipt_from_pane(tmux_target, respawn.after);
-        let consumed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !credential_handoff.consumed() {
-            if crate::tmux::pane_generation_exact(tmux_target)
-                .is_ok_and(|generation| generation != respawn.after)
-            {
-                return Err(LaunchAttestationError::TerminalChanged);
-            }
-            if std::time::Instant::now() >= consumed_deadline {
-                return Err(LaunchAttestationError::CredentialHandoffFailed);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
         let mut observed = None;
         for _ in 0..20 {
             match observe_harness_process(tmux_target) {
@@ -445,6 +433,8 @@ impl OpenedHarnessProviderLaunch {
             _executable: self.executable,
             _provenance: self.provenance,
             _alias: alias_guard,
+            #[cfg(test)]
+            credential_descriptor_target: credential_handoff.descriptor_target.clone(),
         })
     }
 }
@@ -504,6 +494,8 @@ pub(crate) struct VerifiedHarnessProviderProcessLaunch {
     _executable: std::fs::File,
     _provenance: Vec<ProviderPathBinding>,
     _alias: ProviderLaunchAlias,
+    #[cfg(test)]
+    credential_descriptor_target: String,
 }
 
 #[cfg(unix)]
@@ -522,6 +514,11 @@ impl VerifiedHarnessProviderProcessLaunch {
 
     pub(crate) fn evidence(&self) -> &HarnessProcessEvidence {
         &self.evidence
+    }
+
+    #[cfg(test)]
+    fn credential_descriptor_target(&self) -> &str {
+        &self.credential_descriptor_target
     }
 }
 
@@ -3773,7 +3770,7 @@ mod tests {
         let proof = temp.path().join("proof.txt");
         std::fs::write(
             &provider,
-            "#!/usr/bin/env node\nconst fs=require('fs'); const p=process.argv[process.argv.indexOf('--proof')+1]; fs.writeFileSync(p, process.env.T_HUB_SESSION_TOKEN === 'candidate-secret' ? 'trusted-received' : 'trusted-missing'); setInterval(()=>{}, 1000);\n",
+            "#!/usr/bin/env node\nconst fs=require('fs'); const cp=require('child_process'); const p=process.argv[process.argv.indexOf('--proof')+1]; cp.spawn(process.execPath, ['-e', 'setInterval(()=>{}, 1000)'], {stdio:'ignore'}); fs.writeFileSync(p, process.env.T_HUB_SESSION_TOKEN === 'candidate-secret' ? 'trusted-received' : 'trusted-missing'); setInterval(()=>{}, 1000);\n",
         )
         .unwrap();
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3831,6 +3828,38 @@ mod tests {
             provider_arguments(launch.evidence(), Harness::Codex).unwrap()[0],
             "--proof"
         );
+        let credential_pipe = launch.credential_descriptor_target().to_string();
+        let mut process_tree = vec![launch.evidence().pid];
+        let mut cursor = 0;
+        while cursor < process_tree.len() {
+            let pid = process_tree[cursor];
+            cursor += 1;
+            let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                .unwrap_or_default();
+            process_tree.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|value| value.parse::<u32>().ok()),
+            );
+        }
+        assert!(
+            process_tree.len() >= 2,
+            "provider descendant was not observed"
+        );
+        for pid in process_tree {
+            let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    assert_ne!(
+                        target.to_string_lossy(),
+                        credential_pipe,
+                        "provider process tree retained the credential-bearing pipe"
+                    );
+                }
+            }
+        }
         assert!(
             crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN")
                 .unwrap()
@@ -3838,6 +3867,83 @@ mod tests {
         );
         drop(launch);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anonymous_credential_parent_crash_helper() {
+        if std::env::var_os("T_HUB_CREDENTIAL_PARENT_CRASH_HELPER").is_none() {
+            return;
+        }
+        let handoff = AnonymousCredentialHandoff::create(&[(
+            "T_HUB_SESSION_TOKEN".into(),
+            "parent-crash-secret".into(),
+        )])
+        .unwrap();
+        assert!(handoff.descriptor_path.exists());
+        std::process::exit(91);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anonymous_credential_handoff_leaves_no_restart_artifact_after_parent_or_child_crash() {
+        let before = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("t-hub-provider-credentials-"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "harness::tests::anonymous_credential_parent_crash_helper",
+                "--nocapture",
+            ])
+            .env("T_HUB_CREDENTIAL_PARENT_CRASH_HELPER", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(91));
+        let after = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("t-hub-provider-credentials-"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after, before);
+
+        let command = {
+            let handoff = AnonymousCredentialHandoff::create(&[(
+                "T_HUB_SESSION_TOKEN".into(),
+                "no-exec-secret".into(),
+            )])
+            .unwrap();
+            handoff.launch_command(std::path::Path::new("/bin/false"), "")
+        };
+        let no_exec = Command::new("sh").arg("-c").arg(command).status().unwrap();
+        assert!(!no_exec.success());
+
+        let handoff = AnonymousCredentialHandoff::create(&[(
+            "T_HUB_SESSION_TOKEN".into(),
+            "child-crash-secret".into(),
+        )])
+        .unwrap();
+        let credential_target = handoff.descriptor_target.clone();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(handoff.launch_command(std::path::Path::new("/bin/false"), ""))
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        assert!(!child.wait_with_output().unwrap().status.success());
+        assert!(!std::path::Path::new(&format!("/proc/{child_pid}")).exists());
+        drop(handoff);
+
+        let restarted = AnonymousCredentialHandoff::create(&[(
+            "T_HUB_SESSION_TOKEN".into(),
+            "restart-secret".into(),
+        )])
+        .unwrap();
+        assert_ne!(restarted.descriptor_target, credential_target);
     }
 
     #[cfg(unix)]
