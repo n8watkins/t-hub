@@ -129,6 +129,8 @@ Cortana may receive event-driven notifications when:
 
 A context reset recommendation should follow a safe turn boundary and require a durable checkpoint.
 Resetting context preserves the Captain, Assignment, Workspaces, Crew, and Powder bindings.
+Cortana candidate cleanup is journaled with the complete canonical tmux session and pane generation before any cleanup effect runs.
+A same-named replacement, unreadable generation, ambiguous liveness, cleanup error, or persistence failure leaves recovery in CleanupPending and never authorizes a name-only kill or allocation revocation.
 
 ## Protected Provider Provisioning
 

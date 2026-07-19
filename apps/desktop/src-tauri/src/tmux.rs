@@ -330,8 +330,34 @@ pub(crate) fn respawn_pane_exact(
         args.extend(["-c", cwd]);
     }
     args.push(command);
-    run("respawn-pane", &args)?;
-    let after = pane_generation(&exact_pane)?;
+    args.extend([
+        ";",
+        "display-message",
+        "-p",
+        "-t",
+        &exact_pane,
+        "#{session_id}|#{session_created}|#{window_id}|#{pane_id}|#{pane_pid}",
+    ]);
+    let output = run("respawn-pane", &args)?;
+    let value = String::from_utf8_lossy(&output.stdout);
+    let mut lines = value.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next().ok_or_else(|| TmuxError {
+        op: "respawn-pane",
+        code: None,
+        message: "respawned pane generation is unavailable".into(),
+    })?;
+    if lines.next().is_some() {
+        return Err(TmuxError {
+            op: "respawn-pane",
+            code: None,
+            message: "respawned pane returned multiple generations".into(),
+        });
+    }
+    let after = parse_pane_generation(line).ok_or_else(|| TmuxError {
+        op: "respawn-pane",
+        code: None,
+        message: "respawned pane generation is malformed".into(),
+    })?;
     if before.session_id != after.session_id
         || before.session_created != after.session_created
         || before.window_id != after.window_id
@@ -464,6 +490,18 @@ pub fn new_session_with_env(
     command: Option<&str>,
     env: &[(String, String)],
 ) -> Result<(), TmuxError> {
+    new_session_with_env_generation(name, cwd, command, env).map(|_| ())
+}
+
+/// Create one session and return the canonical tmux generation emitted by that
+/// same `new-session` operation. A caller never has to rediscover a created
+/// candidate by name before it can journal generation-bound cleanup evidence.
+pub(crate) fn new_session_with_env_generation(
+    name: &str,
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+) -> Result<PaneGeneration, TmuxError> {
     // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
     // default is empty so the pane starts in wsl.exe's launch dir rather than an
     // invalid Windows path.
@@ -474,7 +512,21 @@ pub fn new_session_with_env(
     // any `startupCommand` booting in it, e.g. `claude --resume`) started life in
     // a 2-column pane until the first attach resized it. 80x24 is the classic
     // fallback; the first real attach reflows to the tile's true geometry anyway.
-    let mut args: Vec<&str> = vec!["new-session", "-d", "-x", "80", "-y", "24", "-s", name];
+    let generation_format =
+        "#{session_name}|#{session_id}|#{session_created}|#{window_id}|#{pane_id}|#{pane_pid}";
+    let mut args: Vec<&str> = vec![
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        generation_format,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "-s",
+        name,
+    ];
     // Session environment (`-e KEY=VALUE`, socket-gate Phase 2b). Pre-format so the
     // backing strings outlive `args`. tmux ≥3.2 supports `-e`; this codebase already
     // targets ≥3.4 (see the geometry note above).
@@ -513,7 +565,38 @@ pub fn new_session_with_env(
         ";",
     ];
     seq.extend_from_slice(&args);
-    run("new-session", &seq)?;
+    let created = run("new-session", &seq)?;
+    let value = String::from_utf8_lossy(&created.stdout);
+    let mut lines = value.lines().filter(|line| !line.trim().is_empty());
+    let line = lines.next().ok_or_else(|| TmuxError {
+        op: "new-session",
+        code: None,
+        message: "created session generation is unavailable".into(),
+    })?;
+    if lines.next().is_some() {
+        return Err(TmuxError {
+            op: "new-session",
+            code: None,
+            message: "created session returned multiple generations".into(),
+        });
+    }
+    let (canonical_name, generation) = line.split_once('|').ok_or_else(|| TmuxError {
+        op: "new-session",
+        code: None,
+        message: "created session generation is malformed".into(),
+    })?;
+    if canonical_name != name {
+        return Err(TmuxError {
+            op: "new-session",
+            code: None,
+            message: "created session canonical name does not match its request".into(),
+        });
+    }
+    let generation = parse_pane_generation(generation).ok_or_else(|| TmuxError {
+        op: "new-session",
+        code: None,
+        message: "created session generation is malformed".into(),
+    })?;
 
     // Post-create tuning, batched into one more tmux call. All best-effort — the
     // session already exists, so never fail the spawn over these:
@@ -546,7 +629,7 @@ pub fn new_session_with_env(
     ];
     post.extend_from_slice(GLOBAL_KEYBIND_ARGS);
     let _ = run("set-option", &post);
-    Ok(())
+    Ok(generation)
 }
 
 /// Test-only: pin a window to a deterministic geometry. `resize-window` flips
@@ -1422,9 +1505,11 @@ mod tests {
         // Clean slate in case a previous run leaked this name (it shouldn't).
         let _ = kill_session(&name);
 
-        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
+        let created = new_session_with_env_generation(&name, "/tmp", None, &[])
+            .expect("new_session should succeed");
 
         assert!(has_session(&name), "session should exist after creation");
+        assert_eq!(pane_generation_exact(&name).unwrap(), created);
 
         let sessions = list_sessions().expect("list_sessions should succeed");
         assert!(

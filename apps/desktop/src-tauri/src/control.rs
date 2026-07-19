@@ -1096,10 +1096,10 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 22;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 23;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
-const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 6;
-const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 21 && CORTANA_RUNTIME_SCHEMA_VERSION > 5);
+const CORTANA_RUNTIME_SCHEMA_VERSION: u32 = 7;
+const _: () = assert!(CAPTAINS_SCHEMA_VERSION > 22 && CORTANA_RUNTIME_SCHEMA_VERSION > 6);
 const CORTANA_IDENTITY_ID: &str = "cortana:v1";
 const CORTANA_WORK_PROFILE: &str = "coordination";
 const CORTANA_PROFILE_CATALOG_VERSION: u32 = 1;
@@ -1292,6 +1292,8 @@ pub struct CortanaCandidateRuntimeEvidence {
     pub spawn_generation: Option<HarnessTerminalGenerationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_provider: Option<HarnessProviderLaunchReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_generation: Option<HarnessTerminalGenerationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_attestation: Option<CortanaRuntimeAttestation>,
 }
@@ -1731,6 +1733,19 @@ fn validate_cortana_candidate(
             || spawn_generation.pane_pid == 0
         {
             return Err("Cortana spawn evidence is not for the reserved tmux target".into());
+        }
+    }
+    if let Some(cleanup_generation) = candidate.cleanup_generation.as_ref() {
+        validate_cortana_canonical_id(
+            &cleanup_generation.tmux_target,
+            "cleanupTmuxTarget",
+            MAX_CORTANA_IDENTIFIER_BYTES,
+        )?;
+        if cleanup_generation.tmux_target != candidate.tmux_session_id
+            || cleanup_generation.session_created == 0
+            || cleanup_generation.pane_pid == 0
+        {
+            return Err("Cortana cleanup evidence is not for the reserved tmux target".into());
         }
     }
     if let Some(spawn_provider) = candidate.spawn_provider.as_ref() {
@@ -2176,7 +2191,9 @@ fn validate_cortana_runtime(
             CortanaEnsurePhase::CandidateReserved => {
                 if intent.request.expected_generation != runtime.generation
                     || intent.candidate.as_ref().is_none_or(|candidate| {
-                        candidate.spawned_at.is_some() || candidate.runtime_attestation.is_some()
+                        candidate.spawned_at.is_some()
+                            || candidate.cleanup_generation.is_some()
+                            || candidate.runtime_attestation.is_some()
                     })
                     || runtime.lifecycle
                         != if runtime.generation == 0 {
@@ -2193,7 +2210,9 @@ fn validate_cortana_runtime(
             CortanaEnsurePhase::CandidateSpawned => {
                 if intent.request.expected_generation != runtime.generation
                     || intent.candidate.as_ref().is_none_or(|candidate| {
-                        candidate.spawned_at.is_none() || candidate.runtime_attestation.is_some()
+                        candidate.spawned_at.is_none()
+                            || candidate.cleanup_generation.is_some()
+                            || candidate.runtime_attestation.is_some()
                     })
                     || runtime.lifecycle
                         != if runtime.generation == 0 {
@@ -2210,7 +2229,9 @@ fn validate_cortana_runtime(
             CortanaEnsurePhase::Attested => {
                 if intent.request.expected_generation != runtime.generation
                     || intent.candidate.as_ref().is_none_or(|candidate| {
-                        candidate.spawned_at.is_none() || candidate.runtime_attestation.is_none()
+                        candidate.spawned_at.is_none()
+                            || candidate.cleanup_generation.is_some()
+                            || candidate.runtime_attestation.is_none()
                     })
                     || runtime.lifecycle
                         != if runtime.generation == 0 {
@@ -2230,6 +2251,7 @@ fn validate_cortana_runtime(
                     || candidate.map(|candidate| candidate.terminal_id.as_str())
                         != captain.terminal_id.as_deref()
                     || candidate.is_none_or(|candidate| candidate.runtime_attestation.is_none())
+                    || candidate.is_some_and(|candidate| candidate.cleanup_generation.is_some())
                     || runtime.lifecycle != CortanaRuntimeLifecycle::Ready
                     || !runtime.lineage.iter().any(|entry| {
                         entry.generation == runtime.generation
@@ -2250,6 +2272,10 @@ fn validate_cortana_runtime(
             CortanaEnsurePhase::CleanupPending => {
                 if intent.request.expected_generation != runtime.generation
                     || intent.candidate.is_none()
+                    || intent
+                        .candidate
+                        .as_ref()
+                        .is_none_or(|candidate| candidate.cleanup_generation.is_none())
                     || runtime.lifecycle != CortanaRuntimeLifecycle::NeedsAttention
                     || runtime.reason_code != Some(CortanaRecoveryReason::CandidateCleanupPending)
                     || current_lineage != 0
@@ -2934,6 +2960,80 @@ fn migrate_cortana_runtime_v5_document(document: &mut Value) -> Result<(), Strin
             intent.insert("requestDigest".into(), Value::from(digest));
         }
         runtime.insert("schemaVersion".into(), Value::from(6));
+    }
+    Ok(())
+}
+
+/// Lift schema-22/runtime-6 to the generation-complete candidate cleanup
+/// journal. A valid cleanup intent inherits its exact spawned generation;
+/// pre-spawn cleanup cannot be migrated safely and fails closed. The immutable
+/// request digest is recomputed for runtime schema 7.
+fn migrate_cortana_runtime_v6_document(document: &mut Value) -> Result<(), String> {
+    let captains = document
+        .get_mut("captains")
+        .and_then(Value::as_array_mut)
+        .ok_or("schema-22 captains registry is missing captains")?;
+    for captain in captains {
+        let Some(runtime) = captain
+            .get_mut("cortanaRuntime")
+            .filter(|runtime| !runtime.is_null())
+        else {
+            continue;
+        };
+        let runtime = runtime
+            .as_object_mut()
+            .ok_or("schema-22 Cortana runtime is not an object")?;
+        if runtime.get("schemaVersion").and_then(Value::as_u64) != Some(6) {
+            return Err("schema-22 Cortana runtime has an unsupported nested version".into());
+        }
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .filter(|intent| !intent.is_null())
+        {
+            let intent = intent
+                .as_object_mut()
+                .ok_or("schema-22 Cortana ensure intent is not an object")?;
+            if intent.get("schemaVersion").and_then(Value::as_u64) != Some(6) {
+                return Err("schema-22 Cortana ensure intent has an unsupported version".into());
+            }
+            let operation_id = intent
+                .get("operationId")
+                .and_then(Value::as_str)
+                .ok_or("schema-22 Cortana ensure intent lacks operationId")?
+                .to_string();
+            let request = intent
+                .get("request")
+                .ok_or("schema-22 Cortana ensure intent lacks request")?
+                .clone();
+            let stored_digest = intent
+                .get("requestDigest")
+                .and_then(Value::as_str)
+                .ok_or("schema-22 Cortana ensure intent lacks requestDigest")?;
+            if stored_digest != cortana_ensure_request_digest_parts(6, &operation_id, &request)? {
+                return Err(
+                    "schema-22 Cortana ensure request digest does not match schema 6".into(),
+                );
+            }
+            if intent.get("phase").and_then(Value::as_str) == Some("cleanupPending") {
+                let candidate = intent
+                    .get_mut("candidate")
+                    .and_then(Value::as_object_mut)
+                    .ok_or("schema-22 cleanup intent lacks its candidate")?;
+                if candidate.contains_key("cleanupGeneration") {
+                    return Err(
+                        "schema-22 cleanup candidate contains a future generation field".into(),
+                    );
+                }
+                let cleanup_generation = candidate.get("spawnGeneration").cloned().ok_or(
+                    "schema-22 pre-spawn cleanup has no safely migratable tmux generation",
+                )?;
+                candidate.insert("cleanupGeneration".into(), cleanup_generation);
+            }
+            let digest = cortana_ensure_request_digest_parts(7, &operation_id, &request)?;
+            intent.insert("schemaVersion".into(), Value::from(7));
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        runtime.insert("schemaVersion".into(), Value::from(7));
     }
     Ok(())
 }
@@ -4694,7 +4794,7 @@ impl CaptainsRegistry {
             .get("pendingDispatchReleases")
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
-        let has_prior_cortana_recovery = matches!(schema_version, 18..=21)
+        let has_prior_cortana_recovery = matches!(schema_version, 18..=22)
             && document
                 .get("captains")
                 .and_then(Value::as_array)
@@ -4728,6 +4828,13 @@ impl CaptainsRegistry {
         }
         if matches!(schema_version, 18..=21) {
             migrate_cortana_runtime_v5_document(&mut document).map_err(|_| {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            })?;
+        }
+        if matches!(schema_version, 18..=22) {
+            migrate_cortana_runtime_v6_document(&mut document).map_err(|_| {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
                 }
@@ -6814,6 +6921,7 @@ impl CaptainsRegistry {
             spawned_at: None,
             spawn_generation: None,
             spawn_provider: None,
+            cleanup_generation: None,
             runtime_attestation: None,
         };
         let captain =
@@ -6863,6 +6971,7 @@ impl CaptainsRegistry {
             || candidate.spawned_at.is_some()
             || candidate.spawn_generation.is_some()
             || candidate.spawn_provider.is_some()
+            || candidate.cleanup_generation.is_some()
             || candidate.runtime_attestation.is_some()
         {
             return Err("Cortana ensure is not prepared for candidate reservation".into());
@@ -7393,6 +7502,7 @@ impl CaptainsRegistry {
         operation_id: &str,
         request_digest: &str,
         cleanup_confirmed_gone: bool,
+        cleanup_generation: Option<&HarnessTerminalGenerationReceipt>,
         guidance: &str,
         observed_at: u64,
     ) -> Result<CaptainRecord, String> {
@@ -7424,6 +7534,11 @@ impl CaptainsRegistry {
         }
         if (!cleanup_confirmed_gone
             && intent.phase == CortanaEnsurePhase::CleanupPending
+            && intent
+                .candidate
+                .as_ref()
+                .and_then(|candidate| candidate.cleanup_generation.as_ref())
+                == cleanup_generation
             && runtime.guidance.as_deref() == Some(guidance))
             || (cleanup_confirmed_gone
                 && intent.phase == CortanaEnsurePhase::Failed
@@ -7432,14 +7547,36 @@ impl CaptainsRegistry {
         {
             return Ok(captain.clone());
         }
-        if !matches!(
+        if cleanup_confirmed_gone {
+            let never_spawned = intent.phase == CortanaEnsurePhase::CandidateReserved
+                && intent.candidate.as_ref().is_some_and(|candidate| {
+                    candidate.spawned_at.is_none()
+                        && candidate.spawn_generation.is_none()
+                        && candidate.cleanup_generation.is_none()
+                });
+            let generation_bound_cleanup = intent.phase == CortanaEnsurePhase::CleanupPending
+                && intent
+                    .candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.cleanup_generation.as_ref())
+                    .is_some();
+            if !never_spawned && !generation_bound_cleanup {
+                return Err(
+                    "Cortana candidate cannot finalize cleanup without a durable exact generation"
+                        .into(),
+                );
+            }
+        } else if !matches!(
             intent.phase,
             CortanaEnsurePhase::CandidateReserved
                 | CortanaEnsurePhase::CandidateSpawned
                 | CortanaEnsurePhase::Attested
                 | CortanaEnsurePhase::CleanupPending
-        ) {
-            return Err("Cortana ensure has no candidate failure to record".into());
+        ) || cleanup_generation.is_none()
+        {
+            return Err(
+                "Cortana ensure has no generation-bound candidate failure to record".into(),
+            );
         }
         let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
         if cleanup_confirmed_gone {
@@ -7449,6 +7586,7 @@ impl CaptainsRegistry {
             runtime.reason_code = Some(CortanaRecoveryReason::RuntimeStartFailed);
         } else {
             intent.phase = CortanaEnsurePhase::CleanupPending;
+            intent.candidate.as_mut().unwrap().cleanup_generation = cleanup_generation.cloned();
             runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
             runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
         }
@@ -7471,6 +7609,7 @@ impl CaptainsRegistry {
         operation_id: &str,
         request_digest: &str,
         cleanup_confirmed_gone: bool,
+        cleanup_generation: Option<&HarnessTerminalGenerationReceipt>,
         guidance: &str,
         observed_at: u64,
     ) -> Result<CaptainRecord, String> {
@@ -7478,6 +7617,7 @@ impl CaptainsRegistry {
             operation_id,
             request_digest,
             cleanup_confirmed_gone,
+            cleanup_generation,
             guidance,
             observed_at,
         )?;
@@ -19130,49 +19270,81 @@ fn record_cortana_worker_failure(
     operation_id: &str,
     request_digest: &str,
     tmux_session_id: &str,
+    cleanup_generation: &HarnessTerminalGenerationReceipt,
     error: &str,
 ) -> Result<(), String> {
-    record_cortana_worker_failure_with_cleanup(
+    record_cortana_worker_failure_with_effects(
         ctx,
         operation_id,
         request_digest,
         tmux_session_id,
+        cleanup_generation,
         error,
-        &|target| tmux::kill_session_tree(target).map_err(|failure| failure.to_string()),
-        &tmux::session_liveness,
+        |target, expected| {
+            tmux::kill_session_tree_exact_generation(target, expected)
+                .map_err(|cleanup_error| cleanup_error.to_string())
+        },
+        tmux::session_liveness,
     )
 }
 
 #[cfg(unix)]
-fn record_cortana_worker_failure_with_cleanup<K, L>(
+fn record_cortana_worker_failure_with_effects<K, L>(
     ctx: &ControlContext,
     operation_id: &str,
     request_digest: &str,
     tmux_session_id: &str,
+    cleanup_generation: &HarnessTerminalGenerationReceipt,
     error: &str,
-    kill: &K,
-    liveness: &L,
+    kill_exact_generation: K,
+    observe_liveness: L,
 ) -> Result<(), String>
 where
-    K: Fn(&str) -> Result<(), String>,
-    L: Fn(&str) -> tmux::SessionLiveness,
+    K: FnOnce(&str, tmux::PaneGeneration) -> Result<tmux::ExactGenerationKill, String>,
+    L: FnOnce(&str) -> tmux::SessionLiveness,
 {
-    let _ = kill(tmux_session_id);
-    let gone = matches!(liveness(tmux_session_id), tmux::SessionLiveness::Gone);
-    let guidance = if gone {
-        "The exact Cortana candidate failed launch attestation and was removed; replay recovery after inspecting provider installation provenance."
-    } else {
-        "The exact Cortana candidate could not be confirmed gone; inspect its tmux session before retrying recovery."
-    };
     ctx.captains.fail_cortana_candidate(
         &ctx.identity,
         operation_id,
         request_digest,
-        gone,
-        guidance,
+        false,
+        Some(cleanup_generation),
+        "The exact Cortana candidate generation is pending cleanup; replacement is blocked until that generation is definitively gone.",
         now_ms(),
     )?;
-    Err(format!("{error}; candidate cleanup confirmed gone: {gone}"))
+    let cleanup = kill_exact_generation(
+        tmux_session_id,
+        incumbent_pane_generation(cleanup_generation),
+    );
+    let gone = matches!(
+        &cleanup,
+        Ok(tmux::ExactGenerationKill::Gone | tmux::ExactGenerationKill::Killed)
+    ) && matches!(
+        observe_liveness(tmux_session_id),
+        tmux::SessionLiveness::Gone
+    );
+    if !gone {
+        let cleanup_state = match &cleanup {
+            Ok(tmux::ExactGenerationKill::GenerationMismatch) => "generation mismatch",
+            Ok(tmux::ExactGenerationKill::Killed | tmux::ExactGenerationKill::Gone) => {
+                "post-cleanup liveness was not definitively gone"
+            }
+            Err(_) => "exact-generation cleanup failed",
+        };
+        return Err(format!(
+            "{error}; candidate cleanup remains pending: {cleanup_state}"
+        ));
+    }
+    ctx.captains.fail_cortana_candidate(
+        &ctx.identity,
+        operation_id,
+        request_digest,
+        true,
+        None,
+        "The exact Cortana candidate generation failed launch attestation and is definitively gone; its allocation was revoked for safe retry.",
+        now_ms(),
+    )?;
+    Err(format!("{error}; candidate cleanup confirmed gone: true"))
 }
 
 #[cfg(unix)]
@@ -19192,6 +19364,7 @@ fn reject_cortana_candidate_before_spawn(
             operation_id,
             request_digest,
             true,
+            None,
             "The reserved Cortana candidate identity or authority generation was stale before launch; the absent candidate was revoked.",
             now_ms(),
         )?;
@@ -19570,6 +19743,10 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
         .candidate
         .as_ref()
         .ok_or("Cortana post-spawn journal lost its candidate")?;
+    let spawn_terminal = candidate
+        .spawn_generation
+        .as_ref()
+        .ok_or("Cortana post-spawn journal lost terminal generation evidence")?;
     let policy = &intent.request.desired_runtime;
     let harness = Harness::from_provider(&policy.harness);
     if harness.as_provider() != policy.harness {
@@ -19603,16 +19780,13 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                 &intent.operation_id,
                 &intent.request_digest,
                 &candidate.tmux_session_id,
+                spawn_terminal,
                 "Cortana post-spawn candidate died before commit",
             )
             .map(|_| false);
         }
         tmux::SessionLiveness::Alive => {}
     }
-    let spawn_terminal = candidate
-        .spawn_generation
-        .as_ref()
-        .ok_or("Cortana post-spawn journal lost terminal generation evidence")?;
     let spawn_provider = candidate
         .spawn_provider
         .as_ref()
@@ -19650,6 +19824,7 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                 &intent.operation_id,
                 &intent.request_digest,
                 &candidate.tmux_session_id,
+                spawn_terminal,
                 &format!("Cortana fresh runtime observation failed: {error}"),
             )
             .map(|_| false);
@@ -19669,6 +19844,7 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                     &intent.operation_id,
                     &intent.request_digest,
                     &candidate.tmux_session_id,
+                    spawn_terminal,
                     "Cortana candidate identity disappeared before attestation",
                 )
                 .map(|_| false);
@@ -19687,6 +19863,7 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                 &intent.operation_id,
                 &intent.request_digest,
                 &candidate.tmux_session_id,
+                spawn_terminal,
                 &format!("Cortana attestation CAS failed: {error}"),
             )
             .map(|_| false);
@@ -19701,6 +19878,7 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                     &intent.operation_id,
                     &intent.request_digest,
                     &candidate.tmux_session_id,
+                    spawn_terminal,
                     "Cortana candidate identity disappeared before commit",
                 )
                 .map(|_| false);
@@ -19718,6 +19896,7 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
                 &intent.operation_id,
                 &intent.request_digest,
                 &candidate.tmux_session_id,
+                spawn_terminal,
                 &format!("Cortana commit CAS failed: {error}"),
             )
             .map(|_| false);
@@ -19778,6 +19957,25 @@ where
     let operation_id = intent.operation_id.clone();
     let request_digest = intent.request_digest.clone();
     let policy = intent.request.desired_runtime.clone();
+    if intent.phase == CortanaEnsurePhase::CleanupPending {
+        let candidate = intent
+            .candidate
+            .as_ref()
+            .ok_or("Cortana cleanup journal lost its exact candidate")?;
+        let cleanup_generation = candidate
+            .cleanup_generation
+            .as_ref()
+            .ok_or("Cortana cleanup journal lost its exact tmux generation")?;
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            cleanup_generation,
+            "Cortana candidate cleanup replay",
+        )
+        .map(|_| false);
+    }
     if intent.phase == CortanaEnsurePhase::Failed {
         let candidate_terminal_id = cortana_candidate_terminal_id(&request_digest)?;
         let candidate_tmux_target = format!("th_{candidate_terminal_id}");
@@ -19903,7 +20101,7 @@ where
         return Err("Cortana candidate credential handoff is unavailable".into());
     }
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    if let Err(error) = tmux::new_session_with_env(
+    let dormant_generation = match tmux::new_session_with_env_generation(
         &candidate.tmux_session_id,
         &cwd,
         Some(CREW_DORMANT_PANE_COMMAND),
@@ -19916,15 +20114,17 @@ where
             ),
         ],
     ) {
-        return record_cortana_worker_failure(
-            ctx,
-            &operation_id,
-            &request_digest,
-            &candidate.tmux_session_id,
-            &format!("Cortana dormant candidate spawn failed: {error}"),
-        )
-        .map(|_| false);
-    }
+        Ok(generation) => generation,
+        Err(error) => {
+            return Err(format!(
+                "Cortana dormant candidate spawn failed without a completed tmux creation receipt: {error}"
+            ));
+        }
+    };
+    let mut failure_generation = crate::harness::terminal_generation_receipt_from_pane(
+        &candidate.tmux_session_id,
+        dormant_generation,
+    );
     let harness = Harness::from_provider(&policy.harness);
     if harness.as_provider() != policy.harness {
         return record_cortana_worker_failure(
@@ -19932,6 +20132,7 @@ where
             &operation_id,
             &request_digest,
             &candidate.tmux_session_id,
+            &failure_generation,
             "Cortana desired Harness is unsupported",
         )
         .map(|_| false);
@@ -19944,6 +20145,7 @@ where
                 &operation_id,
                 &request_digest,
                 &candidate.tmux_session_id,
+                &failure_generation,
                 &error,
             )
             .map(|_| false);
@@ -19971,6 +20173,7 @@ where
         &cwd,
         &command,
         &env,
+        &mut failure_generation,
     ) {
         Ok(launched) => launched,
         Err(error) => {
@@ -19979,6 +20182,7 @@ where
                 &operation_id,
                 &request_digest,
                 &candidate.tmux_session_id,
+                &failure_generation,
                 &format!("Cortana exact provider handoff failed: {error}"),
             )
             .map(|_| false);
@@ -19992,6 +20196,7 @@ where
                 &operation_id,
                 &request_digest,
                 &candidate.tmux_session_id,
+                &failure_generation,
                 "Cortana candidate identity disappeared after launch",
             )
             .map(|_| false);
@@ -20011,6 +20216,7 @@ where
             &operation_id,
             &request_digest,
             &candidate.tmux_session_id,
+            &failure_generation,
             &error,
         )
         .map(|_| false);
@@ -20030,6 +20236,7 @@ where
             &operation_id,
             &request_digest,
             &candidate.tmux_session_id,
+            &failure_generation,
             &format!("Cortana spawn journal CAS failed: {error}"),
         )
         .map(|_| false);
@@ -23766,6 +23973,7 @@ mod tests {
             spawned_at: Some(95),
             spawn_generation: Some(cortana_terminal_generation_receipt()),
             spawn_provider: Some(cortana_verified_provider_launch().into_persisted()),
+            cleanup_generation: None,
             runtime_attestation: with_attestation.then(|| CortanaRuntimeAttestation {
                 terminal_id: "cor-candidate-2".to_string(),
                 tmux_session_id: "th_cor-candidate-2".to_string(),
@@ -23940,6 +24148,7 @@ mod tests {
                     .runtime_policy_receipt
                     .provider_executable_inode,
             }),
+            cleanup_generation: None,
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -24136,6 +24345,42 @@ mod tests {
         document
     }
 
+    fn schema_22_runtime_6_document(captain: CaptainRecord) -> Value {
+        let mut document = serde_json::to_value(CaptainsSnapshot {
+            schema_version: 22,
+            seq: 22,
+            captains: vec![captain],
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        let runtime = document["captains"][0]["cortanaRuntime"]
+            .as_object_mut()
+            .unwrap();
+        runtime.insert("schemaVersion".into(), Value::from(6));
+        if let Some(intent) = runtime
+            .get_mut("ensureIntent")
+            .and_then(Value::as_object_mut)
+        {
+            intent.insert("schemaVersion".into(), Value::from(6));
+            if let Some(candidate) = intent.get_mut("candidate").and_then(Value::as_object_mut) {
+                candidate.remove("cleanupGeneration");
+            }
+            let digest = cortana_ensure_request_digest_parts(
+                6,
+                intent["operationId"].as_str().unwrap(),
+                &intent["request"],
+            )
+            .unwrap();
+            intent.insert("requestDigest".into(), Value::from(digest));
+        }
+        document
+    }
+
     #[test]
     fn cortana_ensure_prepare_is_durable_idempotent_and_rejects_changed_replay() {
         let path = captains_tmp("cortana-ensure-prepare");
@@ -24253,6 +24498,7 @@ mod tests {
             spawned_at: None,
             spawn_generation: None,
             spawn_provider: None,
+            cleanup_generation: None,
             runtime_attestation: None,
         };
         registry
@@ -24535,6 +24781,7 @@ mod tests {
                 &intent.operation_id,
                 &intent.request_digest,
                 true,
+                None,
                 "Candidate is confirmed gone before identity revocation persisted.",
                 102,
             )
@@ -25218,6 +25465,7 @@ mod tests {
                 &intent.operation_id,
                 &intent.request_digest,
                 false,
+                Some(&cortana_terminal_generation_receipt()),
                 "Candidate cleanup is unresolved. Do not retry startup until it is confirmed gone.",
                 112,
             )
@@ -25243,6 +25491,7 @@ mod tests {
                 &intent.operation_id,
                 &intent.request_digest,
                 true,
+                None,
                 "Candidate was confirmed gone. A new operation may be reviewed and retried.",
                 114,
             )
@@ -25266,6 +25515,7 @@ mod tests {
                 &intent.operation_id,
                 &intent.request_digest,
                 true,
+                None,
                 "Candidate was confirmed gone. A new operation may be reviewed and retried.",
                 999,
             )
@@ -25332,12 +25582,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn credential_scrub_failure_stays_cleanup_pending_until_candidate_is_gone() {
+    fn generation_bound_candidate_cleanup_stays_pending_until_definitive_gone() {
         let registry = Arc::new(CaptainsRegistry::new());
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
-        let ctx = test_ctx("control-token")
-            .with_captains_registry(Arc::clone(&registry))
-            .with_identity_store(Arc::clone(&identities));
         let prepared = registry
             .prepare_cortana_ensure(
                 "ensure-credential-scrub-failure",
@@ -25367,40 +25614,53 @@ mod tests {
             "th_{}",
             cortana_candidate_terminal_id(&intent.request_digest).unwrap()
         );
-        let error = record_cortana_worker_failure_with_cleanup(
-            &ctx,
-            &intent.operation_id,
-            &intent.request_digest,
-            &target,
-            &crate::harness::LaunchAttestationError::CredentialHandoffFailed.to_string(),
-            &|_| Err("injected exact cleanup failure".into()),
-            &|_| tmux::SessionLiveness::Alive,
-        )
-        .unwrap_err();
-        assert!(error.contains("credential"));
-        assert!(error.contains("confirmed gone: false"));
+        let mut cleanup_generation = cortana_terminal_generation_receipt();
+        cleanup_generation.tmux_target = target.clone();
+        registry
+            .fail_cortana_candidate(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                false,
+                Some(&cleanup_generation),
+                "The exact candidate generation remains live and blocks replacement.",
+                102,
+            )
+            .unwrap();
         let pending = registry.snapshot().captains[0]
             .cortana_runtime
             .clone()
             .unwrap();
         assert_eq!(pending.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
         assert_eq!(
-            pending.ensure_intent.unwrap().phase,
+            pending.ensure_intent.as_ref().unwrap().phase,
             CortanaEnsurePhase::CleanupPending
         );
         assert!(identities.resolve(&identity.secret).is_some());
 
-        let gone = record_cortana_worker_failure_with_cleanup(
-            &ctx,
-            &intent.operation_id,
-            &intent.request_digest,
-            &target,
-            &crate::harness::LaunchAttestationError::CredentialHandoffFailed.to_string(),
-            &|_| Ok(()),
-            &|_| tmux::SessionLiveness::Gone,
-        )
-        .unwrap_err();
-        assert!(gone.contains("confirmed gone: true"));
+        assert_eq!(
+            pending
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .cleanup_generation
+                .as_ref(),
+            Some(&cleanup_generation)
+        );
+        registry
+            .fail_cortana_candidate(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                true,
+                None,
+                "The exact candidate generation is definitively gone.",
+                103,
+            )
+            .unwrap();
         let failed = registry.snapshot().captains[0]
             .cortana_runtime
             .clone()
@@ -25411,6 +25671,178 @@ mod tests {
             CortanaEnsurePhase::Failed
         );
         assert!(identities.resolve(&identity.secret).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_cleanup_persists_before_effect_and_replays_exact_generation_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let captains_path = temp.path().join("captains.json");
+        let identities_path = temp.path().join("identities.json");
+        let registry = Arc::new(CaptainsRegistry::load(captains_path.clone()));
+        let identities = Arc::new(crate::identity::IdentityStore::load(
+            identities_path.clone(),
+        ));
+        let prepared = registry
+            .prepare_cortana_ensure(
+                "ensure-generation-cleanup-restart",
+                cortana_ensure_request(None),
+                100,
+            )
+            .unwrap()
+            .0;
+        let intent = prepared
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .clone();
+        let (_, identity) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                1,
+                101,
+            )
+            .unwrap();
+        let candidate = registry.snapshot().captains[0]
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut cleanup_generation = cortana_terminal_generation_receipt();
+        cleanup_generation.tmux_target = candidate.tmux_session_id.clone();
+        cleanup_generation.session_created = 701;
+        cleanup_generation.pane_pid = 702;
+        let ctx = test_ctx("candidate-generation-cleanup")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(Arc::clone(&identities));
+
+        let before = serde_json::to_value(registry.snapshot()).unwrap();
+        let before_bytes = std::fs::read(&captains_path).unwrap();
+        registry.fail_next_persist("injected cleanup journal persistence failure");
+        let kill_called = std::sync::atomic::AtomicBool::new(false);
+        let error = record_cortana_worker_failure_with_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &candidate.tmux_session_id,
+            &cleanup_generation,
+            "candidate launch failed",
+            |_, _| {
+                kill_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(tmux::ExactGenerationKill::Killed)
+            },
+            |_| tmux::SessionLiveness::Gone,
+        )
+        .unwrap_err();
+        assert!(error.contains("persistence failure"));
+        assert!(!kill_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+        assert_eq!(std::fs::read(&captains_path).unwrap(), before_bytes);
+
+        let error = record_cortana_worker_failure_with_effects(
+            &ctx,
+            &intent.operation_id,
+            &intent.request_digest,
+            &candidate.tmux_session_id,
+            &cleanup_generation,
+            "candidate launch failed",
+            |target, generation| {
+                assert_eq!(target, candidate.tmux_session_id);
+                assert_eq!(generation, incumbent_pane_generation(&cleanup_generation));
+                Ok(tmux::ExactGenerationKill::GenerationMismatch)
+            },
+            |_| panic!("generation mismatch must not be reclassified by name-only liveness"),
+        )
+        .unwrap_err();
+        assert!(error.contains("generation mismatch"));
+        let pending = registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(pending.lifecycle, CortanaRuntimeLifecycle::NeedsAttention);
+        assert_eq!(
+            pending
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .cleanup_generation
+                .as_ref(),
+            Some(&cleanup_generation)
+        );
+        assert!(identities.resolve(&identity.secret).is_some());
+        drop(ctx);
+        drop(registry);
+        drop(identities);
+
+        let restarted_registry = Arc::new(CaptainsRegistry::load(captains_path));
+        let restarted_identities = Arc::new(crate::identity::IdentityStore::load(identities_path));
+        let restarted = test_ctx("candidate-generation-cleanup-restart")
+            .with_captains_registry(Arc::clone(&restarted_registry))
+            .with_identity_store(Arc::clone(&restarted_identities));
+        let error = record_cortana_worker_failure_with_effects(
+            &restarted,
+            &intent.operation_id,
+            &intent.request_digest,
+            &candidate.tmux_session_id,
+            &cleanup_generation,
+            "candidate cleanup replay",
+            |_, generation| {
+                assert_eq!(generation, incumbent_pane_generation(&cleanup_generation));
+                Err("tmux generation probe was unreadable".into())
+            },
+            |_| panic!("an unreadable exact kill must remain ambiguous"),
+        )
+        .unwrap_err();
+        assert!(error.contains("exact-generation cleanup failed"));
+        assert!(restarted_identities.resolve(&identity.secret).is_some());
+
+        let error = record_cortana_worker_failure_with_effects(
+            &restarted,
+            &intent.operation_id,
+            &intent.request_digest,
+            &candidate.tmux_session_id,
+            &cleanup_generation,
+            "candidate cleanup replay",
+            |_, _| Ok(tmux::ExactGenerationKill::Gone),
+            |_| tmux::SessionLiveness::Unknown,
+        )
+        .unwrap_err();
+        assert!(error.contains("not definitively gone"));
+        assert!(restarted_identities.resolve(&identity.secret).is_some());
+
+        let error = record_cortana_worker_failure_with_effects(
+            &restarted,
+            &intent.operation_id,
+            &intent.request_digest,
+            &candidate.tmux_session_id,
+            &cleanup_generation,
+            "candidate cleanup replay",
+            |_, _| Ok(tmux::ExactGenerationKill::Gone),
+            |_| tmux::SessionLiveness::Gone,
+        )
+        .unwrap_err();
+        assert!(error.contains("cleanup confirmed gone"));
+        let failed = restarted_registry.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        assert_eq!(failed.lifecycle, CortanaRuntimeLifecycle::Failed);
+        assert!(failed.ensure_intent.unwrap().candidate.is_none());
+        assert!(restarted_identities.resolve(&identity.secret).is_none());
     }
 
     #[test]
@@ -25680,6 +26112,7 @@ mod tests {
                 &cleanup_intent.operation_id,
                 &cleanup_intent.request_digest,
                 false,
+                Some(&cortana_terminal_generation_receipt()),
                 "Candidate cleanup is not yet definitive.",
                 203,
             )
@@ -25695,6 +26128,7 @@ mod tests {
                 &cleanup_intent.operation_id,
                 &cleanup_intent.request_digest,
                 false,
+                Some(&cortana_terminal_generation_receipt()),
                 "Candidate cleanup is not yet definitive.",
                 203,
             )
@@ -25707,6 +26141,7 @@ mod tests {
                     &cleanup_intent.operation_id,
                     &cleanup_intent.request_digest,
                     false,
+                    Some(&cortana_terminal_generation_receipt()),
                     "Candidate cleanup is not yet definitive.",
                     999,
                 )
@@ -25749,6 +26184,7 @@ mod tests {
                     &operation_id,
                     &request_digest,
                     false,
+                    Some(&cortana_terminal_generation_receipt()),
                     "Candidate cleanup remains unresolved and blocks replacement.",
                     101,
                 )
@@ -25759,6 +26195,7 @@ mod tests {
                     &operation_id,
                     &request_digest,
                     false,
+                    Some(&cortana_terminal_generation_receipt()),
                     "Candidate cleanup remains unresolved and blocks replacement.",
                     999,
                 )
@@ -25770,6 +26207,7 @@ mod tests {
                     &operation_id,
                     &request_digest,
                     true,
+                    None,
                     "Exact candidate cleanup is confirmed gone.",
                     102,
                 )
@@ -25787,6 +26225,7 @@ mod tests {
                     &operation_id,
                     &request_digest,
                     true,
+                    None,
                     "Exact candidate cleanup is confirmed gone.",
                     999,
                 )
@@ -31314,6 +31753,7 @@ mod tests {
                     .runtime_policy_receipt
                     .provider_executable_inode,
             }),
+            cleanup_generation: None,
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -31342,7 +31782,9 @@ mod tests {
         runtime.guidance = Some("Resolve the exact candidate cleanup before retrying.".into());
         let intent = runtime.ensure_intent.as_mut().unwrap();
         intent.phase = CortanaEnsurePhase::CleanupPending;
-        intent.candidate = Some(cortana_candidate_fixture(2, false));
+        let mut candidate = cortana_candidate_fixture(2, false);
+        candidate.cleanup_generation = candidate.spawn_generation.clone();
+        intent.candidate = Some(candidate);
         validate_cortana_runtime(&cleanup, cleanup.cortana_runtime.as_ref().unwrap()).unwrap();
 
         let mut failed = cortana_prepared_fixture(1);
@@ -32135,6 +32577,7 @@ mod tests {
                     .runtime_policy_receipt
                     .provider_executable_inode,
             }),
+            cleanup_generation: None,
             runtime_attestation: Some(attestation),
         };
         runtime.ensure_intent = Some(CortanaEnsureIntent {
@@ -32481,6 +32924,138 @@ mod tests {
         assert!(blocked.write_blocked.is_some());
         assert_eq!(std::fs::read(&malformed_path).unwrap(), source);
         assert_eq!(std::fs::read(&backup).unwrap(), backup_source);
+    }
+
+    #[test]
+    fn schema_22_runtime_6_migrates_generation_bound_cleanup_or_preserves_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let prepared_path = temp.path().join("schema-22-prepared.json");
+        let prepared_source = schema_22_runtime_6_document(cortana_prepared_fixture(1));
+        let old_digest = prepared_source["captains"][0]["cortanaRuntime"]["ensureIntent"]
+            ["requestDigest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            &prepared_path,
+            serde_json::to_vec_pretty(&prepared_source).unwrap(),
+        )
+        .unwrap();
+        let prepared = CaptainsRegistry::load(prepared_path);
+        assert!(prepared.write_blocked.is_none());
+        let prepared_runtime = prepared.snapshot().captains[0]
+            .cortana_runtime
+            .clone()
+            .unwrap();
+        let prepared_intent = prepared_runtime.ensure_intent.unwrap();
+        assert_eq!(
+            prepared_runtime.schema_version,
+            CORTANA_RUNTIME_SCHEMA_VERSION
+        );
+        assert_eq!(
+            prepared_intent.schema_version,
+            CORTANA_RUNTIME_SCHEMA_VERSION
+        );
+        assert_ne!(prepared_intent.request_digest, old_digest);
+        assert_eq!(
+            prepared_intent.request_digest,
+            cortana_ensure_request_digest(&prepared_intent).unwrap()
+        );
+
+        let mut cleanup = cortana_prepared_fixture(1);
+        {
+            let runtime = cleanup.cortana_runtime.as_mut().unwrap();
+            runtime.lifecycle = CortanaRuntimeLifecycle::NeedsAttention;
+            runtime.reason_code = Some(CortanaRecoveryReason::CandidateCleanupPending);
+            runtime.guidance =
+                Some("Resolve the exact candidate generation before retrying.".into());
+            let intent = runtime.ensure_intent.as_mut().unwrap();
+            intent.phase = CortanaEnsurePhase::CleanupPending;
+            let mut candidate = cortana_candidate_fixture(2, false);
+            candidate.cleanup_generation = candidate.spawn_generation.clone();
+            intent.candidate = Some(candidate);
+        }
+        let cleanup_path = temp.path().join("schema-22-cleanup.json");
+        let cleanup_source = schema_22_runtime_6_document(cleanup.clone());
+        let mut migrated_document = cleanup_source.clone();
+        migrate_cortana_runtime_v6_document(&mut migrated_document).unwrap();
+        let mut migrated_snapshot: CaptainsSnapshot =
+            serde_json::from_value(migrated_document).unwrap();
+        migrated_snapshot.schema_version = CAPTAINS_SCHEMA_VERSION;
+        CaptainsRegistry::validate_snapshot(&migrated_snapshot).unwrap();
+        std::fs::write(
+            &cleanup_path,
+            serde_json::to_vec_pretty(&cleanup_source).unwrap(),
+        )
+        .unwrap();
+        let migrated = CaptainsRegistry::load(cleanup_path);
+        assert!(migrated.write_blocked.is_none());
+        let migrated_candidate = migrated.snapshot().captains[0]
+            .cortana_runtime
+            .as_ref()
+            .unwrap()
+            .ensure_intent
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            migrated_candidate.cleanup_generation,
+            migrated_candidate.spawn_generation
+        );
+
+        let backup_source = serde_json::to_vec_pretty(&CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 99,
+            captains: Vec::new(),
+            projects: Vec::new(),
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: Vec::new(),
+            retired_fleet_tile_ids: Vec::new(),
+            pending_dispatch_claims: Vec::new(),
+            pending_dispatch_releases: Vec::new(),
+        })
+        .unwrap();
+        for (label, mutation) in [
+            ("digest-mismatch", 0_u8),
+            ("pre-spawn-cleanup", 1),
+            ("future-cleanup-generation", 2),
+            ("invalid-cleanup-generation", 3),
+        ] {
+            let mut malformed = cleanup_source.clone();
+            let intent = &mut malformed["captains"][0]["cortanaRuntime"]["ensureIntent"];
+            match mutation {
+                0 => intent["requestDigest"] = Value::from("0".repeat(64)),
+                1 => {
+                    intent["candidate"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("spawnGeneration");
+                }
+                2 => {
+                    let spawn = intent["candidate"]["spawnGeneration"].clone();
+                    intent["candidate"]["cleanupGeneration"] = spawn;
+                }
+                3 => intent["candidate"]["spawnGeneration"]["panePid"] = Value::from(0),
+                _ => unreachable!(),
+            }
+            let path = temp.path().join(format!("schema-22-{label}.json"));
+            let backup = path.with_extension("json.bak");
+            let source = serde_json::to_vec_pretty(&malformed).unwrap();
+            std::fs::write(&path, &source).unwrap();
+            std::fs::write(&backup, &backup_source).unwrap();
+            assert!(matches!(
+                CaptainsRegistry::read_snapshot(&path),
+                Err(SnapshotReadError::IncompatibleRecovery { .. })
+            ));
+            let blocked = CaptainsRegistry::load(path.clone());
+            assert!(blocked.write_blocked.is_some(), "{label} was promoted");
+            assert!(blocked.snapshot().captains.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            assert_eq!(std::fs::read(&backup).unwrap(), backup_source);
+        }
     }
 
     #[test]

@@ -346,10 +346,18 @@ impl OpenedHarnessProviderLaunch {
         cwd: &str,
         trusted_provider_command: &str,
         env: &[(String, String)],
+        failure_generation: &mut HarnessTerminalGenerationReceipt,
     ) -> Result<VerifiedHarnessProviderProcessLaunch, LaunchAttestationError> {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let provider = expected.as_provider();
+        let initial_generation = crate::tmux::pane_generation_exact(tmux_target)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        if failure_generation.tmux_target != tmux_target
+            || incumbent_terminal_generation(failure_generation) != initial_generation
+        {
+            return Err(LaunchAttestationError::TerminalChanged);
+        }
         let command_tail = trusted_provider_command
             .strip_prefix(provider)
             .filter(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
@@ -386,6 +394,7 @@ impl OpenedHarnessProviderLaunch {
             Ok(respawn) => respawn,
             Err(_) => return Err(LaunchAttestationError::UnreadableEvidence),
         };
+        *failure_generation = terminal_generation_receipt_from_pane(tmux_target, respawn.after);
         let consumed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !credential_handoff.consumed() {
             if crate::tmux::pane_generation_exact(tmux_target)
@@ -437,6 +446,34 @@ impl OpenedHarnessProviderLaunch {
             _provenance: self.provenance,
             _alias: alias_guard,
         })
+    }
+}
+
+#[cfg(unix)]
+fn incumbent_terminal_generation(
+    receipt: &HarnessTerminalGenerationReceipt,
+) -> crate::tmux::PaneGeneration {
+    crate::tmux::PaneGeneration {
+        session_id: receipt.session_id,
+        session_created: receipt.session_created,
+        window_id: receipt.window_id,
+        pane_id: receipt.pane_id,
+        pane_pid: receipt.pane_pid,
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn terminal_generation_receipt_from_pane(
+    tmux_target: &str,
+    pane: crate::tmux::PaneGeneration,
+) -> HarnessTerminalGenerationReceipt {
+    HarnessTerminalGenerationReceipt {
+        tmux_target: tmux_target.to_string(),
+        session_id: pane.session_id,
+        session_created: pane.session_created,
+        window_id: pane.window_id,
+        pane_id: pane.pane_id,
+        pane_pid: pane.pane_pid,
     }
 }
 
@@ -2464,6 +2501,13 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
+    fn observed_terminal_generation(target: &str) -> HarnessTerminalGenerationReceipt {
+        observe_terminal_generation_receipt(target)
+            .unwrap()
+            .into_persisted()
+    }
+
     fn shell_evidence() -> HarnessProcessEvidence {
         HarnessProcessEvidence::test_after_exec(42, 900, 100, &["zsh"])
     }
@@ -3522,6 +3566,7 @@ mod tests {
             )
             .unwrap();
             let _guard = SessionGuard(target.clone());
+            let mut failure_generation = observed_terminal_generation(&target);
             assert!(matches!(
                 opened.launch_in_exact_tmux_pane(
                     Harness::Codex,
@@ -3529,6 +3574,7 @@ mod tests {
                     "/tmp",
                     "codex",
                     &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+                    &mut failure_generation,
                 ),
                 Err(LaunchAttestationError::ProcessChanged)
             ));
@@ -3763,6 +3809,7 @@ mod tests {
             "codex --proof {}",
             sh_single_quote(&proof.to_string_lossy())
         );
+        let mut failure_generation = observed_terminal_generation(&target);
         let launch = opened
             .launch_in_exact_tmux_pane(
                 Harness::Codex,
@@ -3770,6 +3817,7 @@ mod tests {
                 "/tmp",
                 &command,
                 &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+                &mut failure_generation,
             )
             .unwrap();
         let (provider_receipt, terminal_receipt) = launch.spawn_receipts();
@@ -3794,7 +3842,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exact_tmux_handoff_scrubs_credentials_on_partial_set_and_process_rejection() {
+    fn exact_tmux_handoff_preserves_failure_generation_and_never_persists_credentials() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         if !Command::new("tmux")
@@ -3845,6 +3893,8 @@ mod tests {
         .is_err());
         let opened =
             test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        let mut failure_generation = observed_terminal_generation(&partial_target);
+        let dormant_generation = failure_generation.clone();
         assert!(matches!(
             opened.launch_in_exact_tmux_pane(
                 Harness::Codex,
@@ -3855,9 +3905,11 @@ mod tests {
                     ("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into()),
                     ("MALFORMED KEY".into(), "never-authoritative".into()),
                 ],
+                &mut failure_generation,
             ),
             Err(LaunchAttestationError::CredentialHandoffFailed)
         ));
+        assert_eq!(failure_generation, dormant_generation);
         assert!(
             crate::tmux::session_environment_exact(&partial_target, "T_HUB_SESSION_TOKEN")
                 .unwrap()
@@ -3876,6 +3928,8 @@ mod tests {
         guards.push(SessionGuard(rejected_target.clone()));
         let opened =
             test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        let mut failure_generation = observed_terminal_generation(&rejected_target);
+        let dormant_generation = failure_generation.clone();
         assert!(opened
             .launch_in_exact_tmux_pane(
                 Harness::Codex,
@@ -3883,8 +3937,14 @@ mod tests {
                 "/tmp",
                 "codex",
                 &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+                &mut failure_generation,
             )
             .is_err());
+        assert_ne!(failure_generation, dormant_generation);
+        assert_eq!(
+            incumbent_terminal_generation(&failure_generation),
+            crate::tmux::pane_generation_exact(&rejected_target).unwrap()
+        );
         assert!(
             crate::tmux::session_environment_exact(&rejected_target, "T_HUB_SESSION_TOKEN")
                 .unwrap()
