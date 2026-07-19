@@ -4231,6 +4231,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "t-hub-cortana-broker"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "t-hub-cortana-broker-protocol",
+]
+
+[[package]]
 name = "t-hub-cortana-broker-protocol"
 version = "0.1.0"
 dependencies = [
