@@ -20084,12 +20084,36 @@ fn resume_cortana_candidate_after_spawn(ctx: &ControlContext) -> Result<bool, St
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CortanaLaunchTransactionPoint {
+    ContainedBeforePersistence,
+    PersistedBeforeCredentialRelease,
+    ReleasedBeforeAttestation,
+}
+
+#[cfg(unix)]
 fn run_cortana_worker_once_with_provider<F>(
     ctx: &ControlContext,
     observe_provider: F,
 ) -> Result<bool, String>
 where
     F: FnOnce(Harness) -> Result<OpenedHarnessProviderLaunch, String>,
+{
+    run_cortana_worker_once_with_provider_and_launch_hook(ctx, observe_provider, |_, _| Ok(()))
+}
+
+#[cfg(unix)]
+fn run_cortana_worker_once_with_provider_and_launch_hook<F, H>(
+    ctx: &ControlContext,
+    observe_provider: F,
+    mut launch_hook: H,
+) -> Result<bool, String>
+where
+    F: FnOnce(Harness) -> Result<OpenedHarnessProviderLaunch, String>,
+    H: FnMut(
+        CortanaLaunchTransactionPoint,
+        &HarnessTerminalGenerationReceipt,
+    ) -> Result<(), String>,
 {
     let _effect = ctx
         .cortana_effect
@@ -20156,7 +20180,11 @@ where
             now_ms(),
         )?;
         drop(_effect);
-        return run_cortana_worker_once_with_provider(ctx, observe_provider);
+        return run_cortana_worker_once_with_provider_and_launch_hook(
+            ctx,
+            observe_provider,
+            launch_hook,
+        );
     }
     if intent.phase == CortanaEnsurePhase::IncumbentRecovered {
         return Ok(true);
@@ -20182,7 +20210,11 @@ where
             now_ms(),
         )?;
         drop(_effect);
-        return run_cortana_worker_once_with_provider(ctx, observe_provider);
+        return run_cortana_worker_once_with_provider_and_launch_hook(
+            ctx,
+            observe_provider,
+            launch_hook,
+        );
     }
     if matches!(
         intent.phase,
@@ -20320,7 +20352,7 @@ where
             identity.secret.clone(),
         ),
     ];
-    let launched = match opened.launch_in_exact_tmux_pane(
+    let mut prepared = match opened.prepare_launch_in_exact_tmux_pane(
         harness,
         &candidate.tmux_session_id,
         &cwd,
@@ -20328,7 +20360,7 @@ where
         &env,
         &mut failure_generation,
     ) {
-        Ok(launched) => launched,
+        Ok(prepared) => prepared,
         Err(error) => {
             return record_cortana_worker_failure(
                 ctx,
@@ -20341,6 +20373,13 @@ where
             .map(|_| false);
         }
     };
+    if let Err(error) = launch_hook(
+        CortanaLaunchTransactionPoint::ContainedBeforePersistence,
+        &failure_generation,
+    ) {
+        drop(prepared);
+        return Err(error);
+    }
     let identity = match ctx.identity.get(&candidate.control_identity_id) {
         Some(identity) => identity,
         None => {
@@ -20350,7 +20389,7 @@ where
                 &request_digest,
                 &candidate.tmux_session_id,
                 &failure_generation,
-                "Cortana candidate identity disappeared after launch",
+                "Cortana candidate identity disappeared before contained launch persistence",
             )
             .map(|_| false);
         }
@@ -20374,15 +20413,80 @@ where
         )
         .map(|_| false);
     }
-    let (provider_receipt, terminal_receipt) = launched.spawn_receipts();
-    if let Err(error) = ctx.captains.record_cortana_candidate_spawn(
-        &operation_id,
-        &request_digest,
+    if let Err(error) = prepared.persist_before_release(|provider_receipt, terminal_receipt| {
+        ctx.captains
+            .record_cortana_candidate_spawn(
+                &operation_id,
+                &request_digest,
+                &candidate.terminal_id,
+                now_ms(),
+                terminal_receipt,
+                provider_receipt,
+                now_ms(),
+            )
+            .map(|_| ())
+    }) {
+        drop(prepared);
+        return record_cortana_worker_failure(
+            ctx,
+            &operation_id,
+            &request_digest,
+            &candidate.tmux_session_id,
+            &failure_generation,
+            &format!("Cortana contained spawn persistence failed: {error}"),
+        )
+        .map(|_| false);
+    }
+    if let Err(error) = launch_hook(
+        CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease,
+        &failure_generation,
+    ) {
+        drop(prepared);
+        return Err(error);
+    }
+    let launched = match prepared.release() {
+        Ok(launched) => launched,
+        Err(error) => {
+            return record_cortana_worker_failure(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                &failure_generation,
+                &format!("Cortana durable provider handoff failed: {error}"),
+            )
+            .map(|_| false);
+        }
+    };
+    if let Err(error) = launch_hook(
+        CortanaLaunchTransactionPoint::ReleasedBeforeAttestation,
+        &failure_generation,
+    ) {
+        drop(launched);
+        return Err(error);
+    }
+    let identity = match ctx.identity.get(&candidate.control_identity_id) {
+        Some(identity) => identity,
+        None => {
+            return record_cortana_worker_failure(
+                ctx,
+                &operation_id,
+                &request_digest,
+                &candidate.tmux_session_id,
+                &failure_generation,
+                "Cortana candidate identity disappeared after credential handoff",
+            )
+            .map(|_| false);
+        }
+    };
+    let authority = cortana_authority_generation(ctx);
+    if let Err(error) = validate_cortana_session_identity(
+        &candidate.control_identity_id,
+        candidate.session_identity_generation,
+        candidate.authority_generation,
+        authority,
         &candidate.terminal_id,
-        now_ms(),
-        terminal_receipt,
-        provider_receipt,
-        now_ms(),
+        &identity,
     ) {
         return record_cortana_worker_failure(
             ctx,
@@ -20390,10 +20494,11 @@ where
             &request_digest,
             &candidate.tmux_session_id,
             &failure_generation,
-            &format!("Cortana spawn journal CAS failed: {error}"),
+            &error,
         )
         .map(|_| false);
     }
+    let _ = launched;
     resume_cortana_candidate_after_spawn(ctx)
 }
 
@@ -26931,17 +27036,53 @@ mod tests {
         .unwrap();
         let launcher = launcher_bin.join("codex");
         symlink(&provider, &launcher).unwrap();
-        let worker_result = run_cortana_worker_once_with_provider(&ctx, |harness| {
-            let opened = crate::harness::test_observe_provider_launch_receipt(
-                &launcher,
-                harness,
-                temp.path(),
-            )
-            .map_err(|error| error.to_string())?;
-            std::fs::remove_file(&launcher).unwrap();
-            symlink(&attacker, &launcher).unwrap();
-            Ok(opened)
-        });
+        let launch_points = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let launch_points_from_hook = launch_points.clone();
+        let registry_from_hook = Arc::clone(&registry);
+        let trusted_proof_from_hook = trusted_proof.clone();
+        let worker_result = run_cortana_worker_once_with_provider_and_launch_hook(
+            &ctx,
+            |harness| {
+                let opened = crate::harness::test_observe_provider_launch_receipt(
+                    &launcher,
+                    harness,
+                    temp.path(),
+                )
+                .map_err(|error| error.to_string())?;
+                std::fs::remove_file(&launcher).unwrap();
+                symlink(&attacker, &launcher).unwrap();
+                Ok(opened)
+            },
+            move |point, terminal| {
+                let snapshot = registry_from_hook.snapshot();
+                let phase = snapshot.captains[0]
+                    .cortana_runtime
+                    .as_ref()
+                    .unwrap()
+                    .ensure_intent
+                    .as_ref()
+                    .unwrap()
+                    .phase;
+                match point {
+                    CortanaLaunchTransactionPoint::ContainedBeforePersistence => {
+                        assert_eq!(phase, CortanaEnsurePhase::CandidateReserved);
+                        assert!(!trusted_proof_from_hook.exists());
+                    }
+                    CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease => {
+                        assert_eq!(phase, CortanaEnsurePhase::CandidateSpawned);
+                        assert!(!trusted_proof_from_hook.exists());
+                        let process_cgroup = terminal.process_cgroup.as_ref().unwrap();
+                        assert!(Path::new(&process_cgroup.path).exists());
+                    }
+                    CortanaLaunchTransactionPoint::ReleasedBeforeAttestation => {
+                        assert_eq!(phase, CortanaEnsurePhase::CandidateSpawned);
+                        assert!(trusted_proof_from_hook.exists());
+                    }
+                }
+                launch_points_from_hook.borrow_mut().push(point);
+                Ok(())
+            },
+        );
         if let Err(error) = &worker_result {
             panic!(
                 "{error}; argv={}",
@@ -26950,6 +27091,14 @@ mod tests {
         }
         let ran = worker_result.unwrap();
         assert!(ran);
+        assert_eq!(
+            *launch_points.borrow(),
+            vec![
+                CortanaLaunchTransactionPoint::ContainedBeforePersistence,
+                CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease,
+                CortanaLaunchTransactionPoint::ReleasedBeforeAttestation,
+            ]
+        );
         assert!(!attacker_proof.exists());
         let current = registry.snapshot();
         let intent = current.captains[0]
@@ -27042,27 +27191,263 @@ mod tests {
         assert_eq!(identities.len(), 1);
         assert!(caller_is_apex(&ctx, Some(&resolved), false));
         assert!(!attacker_proof.exists());
-        let process_cgroup_path = recovered_runtime
+        let terminal_receipt = recovered_runtime
             .runtime_attestation
             .as_ref()
             .unwrap()
             .runtime_policy_receipt
             .terminal
-            .process_cgroup
-            .as_ref()
-            .unwrap()
-            .path
             .clone();
-        let session_name = session.0.clone();
+        let process_cgroup = process_cgroup_generation(&terminal_receipt).unwrap();
+        let process_cgroup_path = process_cgroup.path.clone();
+        assert_eq!(
+            tmux::kill_session_tree_exact_generation(
+                &session.0,
+                incumbent_pane_generation(&terminal_receipt),
+                Some(&process_cgroup),
+            )
+            .unwrap(),
+            tmux::ExactGenerationKill::Killed
+        );
+        assert!(!Path::new(&process_cgroup_path).exists());
         drop(session);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while tmux::session_liveness(&session_name) != tmux::SessionLiveness::Gone
-            && Instant::now() < deadline
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_worker_persists_containment_before_release_and_replays_every_crash_boundary() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
         {
-            std::thread::sleep(Duration::from_millis(10));
+            eprintln!("tmux or node is unavailable - skipping Cortana transaction fixture");
+            return;
         }
-        if Path::new(&process_cgroup_path).exists() {
-            std::fs::remove_dir(process_cgroup_path).unwrap();
+
+        let wait_for = |mut predicate: Box<dyn FnMut() -> bool>, message: &str| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !predicate() {
+                assert!(Instant::now() < deadline, "{message}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        for (label, interruption, fail_persistence) in [
+            (
+                "before-persistence",
+                Some(CortanaLaunchTransactionPoint::ContainedBeforePersistence),
+                false,
+            ),
+            (
+                "after-persistence",
+                Some(CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease),
+                false,
+            ),
+            (
+                "after-release",
+                Some(CortanaLaunchTransactionPoint::ReleasedBeforeAttestation),
+                false,
+            ),
+            ("persistence-failure", None, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let registry_path = temp.path().join("captains.json");
+            let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let mut ctx = test_ctx(&format!("transaction-{label}"))
+                .with_captains_registry(Arc::clone(&registry))
+                .with_identity_store(Arc::clone(&identities));
+            ctx.addr = "127.0.0.1:43126".into();
+            let prepared = registry
+                .prepare_cortana_ensure(
+                    &format!("ensure-worker-{label}"),
+                    cortana_ensure_request(None),
+                    100,
+                )
+                .unwrap()
+                .0;
+            let digest = prepared
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .request_digest
+                .clone();
+            let terminal_id = cortana_candidate_terminal_id(&digest).unwrap();
+            let session = CortanaWorkerSessionGuard(format!("th_{terminal_id}"));
+
+            let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+            let launcher_bin = temp.path().join("bin");
+            std::fs::create_dir_all(&package_bin).unwrap();
+            std::fs::create_dir_all(&launcher_bin).unwrap();
+            let proof = temp.path().join("credential-proof");
+            let provider = package_bin.join("codex.js");
+            std::fs::write(
+                &provider,
+                format!(
+                    "#!/usr/bin/env node\nif (process.argv.includes('--version')) {{ console.log('codex-cli 1.2.3'); process.exit(0); }} require('child_process').execFileSync('tmux', ['set-environment', '-t', process.env.TMUX_PANE, 'CODEX_THREAD_ID', 'transaction-thread']); require('fs').writeFileSync({}, process.env.T_HUB_SESSION_TOKEN || 'missing'); setInterval(()=>{{}}, 1000);\n",
+                    serde_json::to_string(&proof.to_string_lossy()).unwrap()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                package_bin.parent().unwrap().join("package.json"),
+                br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+            )
+            .unwrap();
+            let launcher = launcher_bin.join("codex");
+            symlink(&provider, &launcher).unwrap();
+
+            let observed_receipt = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let receipt_from_hook = observed_receipt.clone();
+            let registry_from_hook = Arc::clone(&registry);
+            let first = run_cortana_worker_once_with_provider_and_launch_hook(
+                &ctx,
+                |harness| {
+                    crate::harness::test_observe_provider_launch_receipt(
+                        &launcher,
+                        harness,
+                        temp.path(),
+                    )
+                    .map_err(|error| error.to_string())
+                },
+                |point, terminal| {
+                    *receipt_from_hook.borrow_mut() = Some(terminal.clone());
+                    if fail_persistence
+                        && point == CortanaLaunchTransactionPoint::ContainedBeforePersistence
+                    {
+                        registry_from_hook
+                            .fail_next_persist("injected contained spawn persistence failure");
+                    }
+                    if interruption == Some(point) {
+                        return Err(format!("injected crash at {label}:{point:?}"));
+                    }
+                    Ok(())
+                },
+            );
+            assert!(first.is_err(), "{label} unexpectedly completed");
+            let receipt = observed_receipt.borrow().clone().unwrap();
+            let cgroup_path = receipt.process_cgroup.as_ref().unwrap().path.clone();
+            let phase = registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase;
+            match interruption {
+                Some(CortanaLaunchTransactionPoint::ContainedBeforePersistence) => {
+                    assert_eq!(phase, CortanaEnsurePhase::CandidateReserved);
+                    assert!(!proof.exists());
+                    let target = session.0.clone();
+                    wait_for(
+                        Box::new(move || {
+                            tmux::session_liveness(&target) == tmux::SessionLiveness::Gone
+                        }),
+                        "credential-gated pre-persistence child did not exit",
+                    );
+                    let path = cgroup_path.clone();
+                    wait_for(
+                        Box::new(move || !Path::new(&path).exists()),
+                        "pre-persistence systemd scope did not remove its empty cgroup",
+                    );
+                }
+                Some(CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease) => {
+                    assert_eq!(phase, CortanaEnsurePhase::CandidateSpawned);
+                    assert!(!proof.exists());
+                    let target = session.0.clone();
+                    wait_for(
+                        Box::new(move || {
+                            tmux::session_liveness(&target) == tmux::SessionLiveness::Gone
+                        }),
+                        "persisted credential-gated child did not exit after simulated crash",
+                    );
+                }
+                Some(CortanaLaunchTransactionPoint::ReleasedBeforeAttestation) => {
+                    assert_eq!(phase, CortanaEnsurePhase::CandidateSpawned);
+                    assert!(proof.exists());
+                }
+                None => {
+                    assert_eq!(phase, CortanaEnsurePhase::Failed);
+                    assert!(!proof.exists());
+                    assert!(!Path::new(&cgroup_path).exists());
+                }
+            }
+
+            let restarted_registry = Arc::new(CaptainsRegistry::load(registry_path));
+            let mut restarted = test_ctx(&format!("transaction-restart-{label}"))
+                .with_captains_registry(Arc::clone(&restarted_registry))
+                .with_identity_store(Arc::clone(&identities));
+            restarted.addr = ctx.addr.clone();
+            if interruption == Some(CortanaLaunchTransactionPoint::PersistedBeforeCredentialRelease)
+            {
+                let cleanup = run_cortana_worker_once_with_provider(&restarted, |_| {
+                    panic!("persisted gated replay must clean before resolving a provider")
+                });
+                assert!(cleanup.is_err());
+                assert!(!Path::new(&cgroup_path).exists());
+            }
+            let replayed = if interruption
+                == Some(CortanaLaunchTransactionPoint::ReleasedBeforeAttestation)
+            {
+                run_cortana_worker_once_with_provider(&restarted, |_| {
+                    panic!("released replay must observe the durable candidate without relaunch")
+                })
+            } else {
+                run_cortana_worker_once_with_provider(&restarted, |harness| {
+                    crate::harness::test_observe_provider_launch_receipt(
+                        &launcher,
+                        harness,
+                        temp.path(),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            };
+            assert!(replayed.unwrap(), "{label} did not converge after restart");
+            assert_eq!(
+                restarted_registry.snapshot().captains[0]
+                    .cortana_runtime
+                    .as_ref()
+                    .unwrap()
+                    .ensure_intent
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                CortanaEnsurePhase::Committed
+            );
+            let terminal = restarted_registry.snapshot().captains[0]
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .runtime_attestation
+                .as_ref()
+                .unwrap()
+                .runtime_policy_receipt
+                .terminal
+                .clone();
+            let cgroup = process_cgroup_generation(&terminal).unwrap();
+            assert_eq!(
+                tmux::kill_session_tree_exact_generation(
+                    &session.0,
+                    incumbent_pane_generation(&terminal),
+                    Some(&cgroup),
+                )
+                .unwrap(),
+                tmux::ExactGenerationKill::Killed
+            );
+            assert!(!Path::new(&cgroup.path).exists());
+            drop(session);
         }
     }
 

@@ -246,6 +246,28 @@ pub(crate) struct OpenedHarnessProviderLaunch {
     opened_path: PathBuf,
 }
 
+/// Credential-gated provider launch whose exact pane and private cgroup have
+/// been observed but whose provider has not received credentials or executed.
+/// The caller must durably journal `spawn_receipts` before calling `release`.
+#[cfg(unix)]
+pub(crate) struct PreparedHarnessProviderProcessLaunch {
+    expected: Harness,
+    tmux_target: String,
+    stable_launch_generation: crate::tmux::PaneGeneration,
+    provider: HarnessProviderLaunchReceipt,
+    terminal: HarnessTerminalGenerationReceipt,
+    credential_handoff: AnonymousCredentialHandoff,
+    launch_gate: AnonymousLaunchGate,
+    #[cfg(target_os = "linux")]
+    containment_cleanup: PrePersistenceCgroupCleanup,
+    persistence_confirmed: bool,
+    #[cfg(target_os = "linux")]
+    process_cgroup: crate::tmux::PrivateProcessCgroup,
+    executable: std::fs::File,
+    provenance: Vec<ProviderPathBinding>,
+    alias: ProviderLaunchAlias,
+}
+
 #[cfg(unix)]
 struct AnonymousCredentialHandoff {
     reader: Option<std::process::ChildStdout>,
@@ -263,6 +285,112 @@ struct AnonymousLaunchGate {
     _ready_writer: std::fs::File,
     release_path: PathBuf,
     ready_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct PrePersistenceCgroupCleanup {
+    writer: Option<std::process::ChildStdin>,
+    child: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl PrePersistenceCgroupCleanup {
+    fn arm(
+        generation: &crate::tmux::ProcessCgroupGeneration,
+    ) -> Result<Self, LaunchAttestationError> {
+        use std::process::Stdio;
+
+        const CLEANUP: &str = r#"
+if IFS= read -r state; then
+  [ "$state" = persisted ] && exit 0
+  exit 70
+fi
+i=0
+while [ "$i" -lt 300 ]; do
+  [ -d "$1" ] || exit 0
+  identity=$(/usr/bin/stat -c '%d:%i' -- "$1") || exit 71
+  [ "$identity" = "$2:$3" ] || exit 72
+  child=$(/usr/bin/find "$1" -mindepth 1 -type d -print -quit) || exit 73
+  [ -z "$child" ] || exit 74
+  tasks=$(/usr/bin/cat "$1/cgroup.procs") || exit 75
+  if [ -z "$tasks" ] && /bin/rmdir -- "$1"; then
+    exit 0
+  fi
+  i=$((i + 1))
+  /bin/sleep 0.01
+done
+exit 76
+"#;
+        let device = generation.device.to_string();
+        let inode = generation.inode.to_string();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                CLEANUP,
+                "t-hub-cgroup-sentinel",
+                &generation.path,
+                &device,
+                &inode,
+            ])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let writer = child
+            .stdin
+            .take()
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        Ok(Self {
+            writer: Some(writer),
+            child,
+        })
+    }
+
+    fn disarm(&mut self) -> Result<(), LaunchAttestationError> {
+        use std::io::Write;
+
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        writer
+            .write_all(b"persisted\n")
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        drop(writer);
+        let status = self
+            .child
+            .wait()
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        if !status.success() {
+            return Err(LaunchAttestationError::UnreadableEvidence);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PrePersistenceCgroupCleanup {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -463,7 +591,7 @@ impl OpenedHarnessProviderLaunch {
     }
 
     #[cfg(unix)]
-    pub(crate) fn launch_in_exact_tmux_pane(
+    pub(crate) fn prepare_launch_in_exact_tmux_pane(
         self,
         expected: Harness,
         tmux_target: &str,
@@ -471,7 +599,7 @@ impl OpenedHarnessProviderLaunch {
         trusted_provider_command: &str,
         env: &[(String, String)],
         failure_generation: &mut HarnessTerminalGenerationReceipt,
-    ) -> Result<VerifiedHarnessProviderProcessLaunch, LaunchAttestationError> {
+    ) -> Result<PreparedHarnessProviderProcessLaunch, LaunchAttestationError> {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let provider = expected.as_provider();
@@ -549,12 +677,101 @@ impl OpenedHarnessProviderLaunch {
             inode: process_cgroup.generation().inode,
         };
         failure_generation.process_cgroup = Some(process_cgroup_receipt.clone());
-        launch_gate.release()?;
-        let stable_launch_generation = respawn.after;
+        #[cfg(target_os = "linux")]
+        let containment_cleanup = PrePersistenceCgroupCleanup::arm(process_cgroup.generation())?;
+        Ok(PreparedHarnessProviderProcessLaunch {
+            expected,
+            tmux_target: tmux_target.to_string(),
+            stable_launch_generation: respawn.after,
+            provider: self.receipt,
+            terminal: failure_generation.clone(),
+            credential_handoff,
+            launch_gate,
+            #[cfg(target_os = "linux")]
+            containment_cleanup,
+            persistence_confirmed: false,
+            #[cfg(target_os = "linux")]
+            process_cgroup,
+            executable: self.executable,
+            provenance: self.provenance,
+            alias: alias_guard,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn launch_in_exact_tmux_pane(
+        self,
+        expected: Harness,
+        tmux_target: &str,
+        cwd: &str,
+        trusted_provider_command: &str,
+        env: &[(String, String)],
+        failure_generation: &mut HarnessTerminalGenerationReceipt,
+    ) -> Result<VerifiedHarnessProviderProcessLaunch, LaunchAttestationError> {
+        let mut prepared = self.prepare_launch_in_exact_tmux_pane(
+            expected,
+            tmux_target,
+            cwd,
+            trusted_provider_command,
+            env,
+            failure_generation,
+        )?;
+        prepared
+            .persist_before_release(|_, _| Ok(()))
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        prepared.release()
+    }
+}
+
+#[cfg(unix)]
+impl PreparedHarnessProviderProcessLaunch {
+    pub(crate) fn spawn_receipts(
+        &self,
+    ) -> (
+        VerifiedHarnessProviderLaunch,
+        VerifiedHarnessTerminalGeneration,
+    ) {
+        (
+            VerifiedHarnessProviderLaunch(self.provider.clone()),
+            VerifiedHarnessTerminalGeneration(self.terminal.clone()),
+        )
+    }
+
+    /// Give the trusted worker the non-forgeable receipts and disarm the crash
+    /// sentinel only after its durable journal callback succeeds.
+    pub(crate) fn persist_before_release<F>(&mut self, persist: F) -> Result<(), String>
+    where
+        F: FnOnce(
+            VerifiedHarnessProviderLaunch,
+            VerifiedHarnessTerminalGeneration,
+        ) -> Result<(), String>,
+    {
+        if self.persistence_confirmed {
+            return Ok(());
+        }
+        let (provider, terminal) = self.spawn_receipts();
+        persist(provider, terminal)?;
+        #[cfg(target_os = "linux")]
+        self.containment_cleanup
+            .disarm()
+            .map_err(|error| error.to_string())?;
+        #[cfg(not(target_os = "linux"))]
+        return Err("durable contained launch is unsupported on this host".into());
+        self.persistence_confirmed = true;
+        Ok(())
+    }
+
+    pub(crate) fn release(
+        mut self,
+    ) -> Result<VerifiedHarnessProviderProcessLaunch, LaunchAttestationError> {
+        if !self.persistence_confirmed {
+            return Err(LaunchAttestationError::CredentialHandoffFailed);
+        }
+        self.launch_gate.release()?;
         let mut observed = None;
         for _ in 0..20 {
-            match observe_harness_process(tmux_target) {
-                Ok(evidence) if provider_arguments(&evidence, expected).is_ok() => {
+            match observe_harness_process(&self.tmux_target) {
+                Ok(evidence) if provider_arguments(&evidence, self.expected).is_ok() => {
                     observed = Some(evidence);
                     break;
                 }
@@ -565,16 +782,16 @@ impl OpenedHarnessProviderLaunch {
             }
         }
         let first = observed.ok_or(LaunchAttestationError::UnreadableEvidence)?;
-        let second = observe_harness_process(tmux_target)?;
+        let second = observe_harness_process(&self.tmux_target)?;
         let stable = confirm_stable_launch_baseline(&first, &second)?;
         let terminal = &stable.terminal;
-        if terminal.session_name != tmux_target
-            || terminal.session_id != stable_launch_generation.session_id
-            || terminal.session_created != stable_launch_generation.session_created
-            || terminal.window_id != stable_launch_generation.window_id
-            || terminal.pane_id != stable_launch_generation.pane_id
-            || terminal.pane_pid != stable_launch_generation.pane_pid
-            || provider_file_identity(&alias)?
+        if terminal.session_name != self.tmux_target
+            || terminal.session_id != self.stable_launch_generation.session_id
+            || terminal.session_created != self.stable_launch_generation.session_created
+            || terminal.window_id != self.stable_launch_generation.window_id
+            || terminal.pane_id != self.stable_launch_generation.pane_id
+            || terminal.pane_pid != self.stable_launch_generation.pane_pid
+            || provider_file_identity(&self.alias.alias)?
                 != provider_file_identity_from_open_file(&self.executable)?
         {
             return Err(LaunchAttestationError::TerminalChanged);
@@ -582,26 +799,29 @@ impl OpenedHarnessProviderLaunch {
         for binding in &self.provenance {
             binding.revalidate()?;
         }
-        let mut terminal = terminal_generation_receipt(tmux_target, &stable);
-        if terminal.session_id != stable_launch_generation.session_id
-            || terminal.session_created != stable_launch_generation.session_created
-            || terminal.window_id != stable_launch_generation.window_id
-            || terminal.pane_id != stable_launch_generation.pane_id
-            || terminal.pane_pid != stable_launch_generation.pane_pid
+        let mut terminal = terminal_generation_receipt(&self.tmux_target, &stable);
+        if terminal.session_id != self.stable_launch_generation.session_id
+            || terminal.session_created != self.stable_launch_generation.session_created
+            || terminal.window_id != self.stable_launch_generation.window_id
+            || terminal.pane_id != self.stable_launch_generation.pane_id
+            || terminal.pane_pid != self.stable_launch_generation.pane_pid
         {
             return Err(LaunchAttestationError::ProcessChanged);
         }
-        terminal.process_cgroup = failure_generation.process_cgroup.clone();
-        let _retained_cgroup = process_cgroup.retain();
+        terminal.process_cgroup = self.terminal.process_cgroup.clone();
+        #[cfg(target_os = "linux")]
+        let _retained_cgroup = self.process_cgroup.retain();
+        #[cfg(not(target_os = "linux"))]
+        return Err(LaunchAttestationError::UnreadableEvidence);
         Ok(VerifiedHarnessProviderProcessLaunch {
-            provider: self.receipt,
+            provider: self.provider,
             terminal,
             evidence: stable,
             _executable: self.executable,
             _provenance: self.provenance,
-            _alias: alias_guard,
+            _alias: self.alias,
             #[cfg(test)]
-            credential_descriptor_target: credential_handoff.descriptor_target.clone(),
+            credential_descriptor_target: self.credential_handoff.descriptor_target.clone(),
         })
     }
 }
@@ -4107,9 +4327,7 @@ mod tests {
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        if std::path::Path::new(&process_cgroup_path).exists() {
-            std::fs::remove_dir(process_cgroup_path).unwrap();
-        }
+        assert!(!std::path::Path::new(&process_cgroup_path).exists());
     }
 
     #[cfg(unix)]
@@ -4136,6 +4354,115 @@ mod tests {
         gate.wait_ready().unwrap();
         std::fs::write(child_pid_path, child.id().to_string()).unwrap();
         std::process::exit(91);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_launch_parent_crash_helper() {
+        if std::env::var_os("T_HUB_CONTAINED_PARENT_CRASH_HELPER").is_none() {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("T_HUB_CONTAINED_ROOT").unwrap());
+        let launcher = PathBuf::from(std::env::var_os("T_HUB_CONTAINED_LAUNCHER").unwrap());
+        let target = std::env::var("T_HUB_CONTAINED_TARGET").unwrap();
+        let receipt_path = PathBuf::from(std::env::var_os("T_HUB_CONTAINED_RECEIPT").unwrap());
+        let opened =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, &root).unwrap();
+        crate::tmux::new_session_with_env(
+            &target,
+            "/tmp",
+            Some("sleep 30"),
+            &empty_candidate_session_credentials(),
+        )
+        .unwrap();
+        let mut failure_generation = observed_terminal_generation(&target);
+        let prepared = opened
+            .prepare_launch_in_exact_tmux_pane(
+                Harness::Codex,
+                &target,
+                "/tmp",
+                "codex",
+                &[("T_HUB_SESSION_TOKEN".into(), "never-released".into())],
+                &mut failure_generation,
+            )
+            .unwrap();
+        let (_, terminal) = prepared.spawn_receipts();
+        std::fs::write(
+            receipt_path,
+            serde_json::to_vec(&terminal.into_persisted()).unwrap(),
+        )
+        .unwrap();
+        std::process::exit(92);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_launch_parent_crash_removes_unjournaled_cgroup_without_credentials() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let proof = temp.path().join("provider-proof");
+        let provider = package_bin.join("codex.js");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/bin/sh\nprintf credentialed > {}\nexec sleep 30\n",
+                sh_single_quote(&proof.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&provider, &launcher).unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let target = format!("th_contained_crash_{}", &suffix[..8]);
+        let receipt_path = temp.path().join("receipt.json");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "harness::tests::contained_launch_parent_crash_helper",
+                "--nocapture",
+            ])
+            .env("T_HUB_CONTAINED_PARENT_CRASH_HELPER", "1")
+            .env("T_HUB_CONTAINED_ROOT", temp.path())
+            .env("T_HUB_CONTAINED_LAUNCHER", &launcher)
+            .env("T_HUB_CONTAINED_TARGET", &target)
+            .env("T_HUB_CONTAINED_RECEIPT", &receipt_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(92));
+        let receipt: HarnessTerminalGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        let cgroup_path = receipt.process_cgroup.unwrap().path;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while (crate::tmux::session_liveness(&target) != crate::tmux::SessionLiveness::Gone
+            || std::path::Path::new(&cgroup_path).exists())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            crate::tmux::session_liveness(&target),
+            crate::tmux::SessionLiveness::Gone
+        );
+        assert!(!std::path::Path::new(&cgroup_path).exists());
+        assert!(!proof.exists());
     }
 
     #[cfg(unix)]
@@ -4339,16 +4666,33 @@ mod tests {
                 .unwrap()
                 .is_none_or(|value| value.is_empty())
         );
+        let failed_cgroup = failure_generation.process_cgroup.as_ref().unwrap();
+        let failed_cgroup = crate::tmux::ProcessCgroupGeneration {
+            path: failed_cgroup.path.clone(),
+            device: failed_cgroup.device,
+            inode: failed_cgroup.inode,
+        };
+        assert_eq!(
+            crate::tmux::kill_session_tree_exact_generation(
+                &rejected_target,
+                incumbent_terminal_generation(&failure_generation),
+                Some(&failed_cgroup),
+            )
+            .unwrap(),
+            crate::tmux::ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&failed_cgroup_path).exists());
         let inheritance_proof = temp.path().join("later-respawn-environment");
         let proof_command = format!(
             "if [ -z \"${{T_HUB_SESSION_TOKEN}}\" ]; then printf none > {}; else printf inherited > {}; fi; sleep 30",
             sh_single_quote(&inheritance_proof.to_string_lossy()),
             sh_single_quote(&inheritance_proof.to_string_lossy()),
         );
-        crate::tmux::respawn_pane_exact(
+        crate::tmux::new_session_with_env(
             &rejected_target,
             "/tmp",
-            &format!("sh -c {}", sh_single_quote(&proof_command)),
+            Some(&format!("sh -c {}", sh_single_quote(&proof_command))),
+            &empty_candidate_session_credentials(),
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -4357,15 +4701,6 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&inheritance_proof).unwrap(), "none");
         drop(guards);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::tmux::session_liveness(&rejected_target) != crate::tmux::SessionLiveness::Gone
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        if std::path::Path::new(&failed_cgroup_path).exists() {
-            std::fs::remove_dir(&failed_cgroup_path).unwrap();
-        }
     }
 
     #[cfg(unix)]

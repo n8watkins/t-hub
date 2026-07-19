@@ -197,6 +197,7 @@ enum CgroupCleanupTestPoint {
     BeforeKill,
     AfterKill,
     BeforeThaw,
+    BeforeRemove,
 }
 
 #[cfg(test)]
@@ -1391,6 +1392,140 @@ pub(crate) fn kill_session_tree_exact_generation(
     kill_session_tree_exact_generation_with_post_reap(name, expected, process_cgroup, || {})
 }
 
+#[cfg(target_os = "linux")]
+fn remove_empty_cgroup_after_root_gone(
+    name: &str,
+    process_cgroup: &ProcessCgroupGeneration,
+) -> Result<ExactGenerationKill, TmuxError> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_CGROUPS: usize = 64;
+    const POLL_LIMIT: usize = 200;
+
+    match session_liveness(name) {
+        SessionLiveness::Alive => return Ok(ExactGenerationKill::GenerationMismatch),
+        SessionLiveness::Unknown => {
+            return Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: None,
+                message: "gone candidate liveness became ambiguous before cgroup removal".into(),
+            });
+        }
+        SessionLiveness::Gone => {}
+    }
+    if !is_canonical_private_process_cgroup_path(&process_cgroup.path) {
+        return Err(TmuxError {
+            op: "kill-session-tree-generation",
+            code: None,
+            message: "gone candidate cgroup path is not canonical".into(),
+        });
+    }
+    let root = std::path::Path::new(&process_cgroup.path);
+    for _ in 0..POLL_LIMIT {
+        let root_metadata = match std::fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExactGenerationKill::Gone);
+            }
+            Err(error) => {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "gone candidate cgroup identity is unreadable".into(),
+                });
+            }
+        };
+        if root_metadata.dev() != process_cgroup.device
+            || root_metadata.ino() != process_cgroup.inode
+        {
+            return Ok(ExactGenerationKill::GenerationMismatch);
+        }
+        let mut pending = vec![root.to_path_buf()];
+        let mut groups = Vec::new();
+        while let Some(path) = pending.pop() {
+            if groups.len() >= MAX_CGROUPS {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "gone candidate cgroup exceeds the bounded subtree limit".into(),
+                });
+            }
+            let metadata = std::fs::metadata(&path).map_err(|error| TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: "gone candidate cgroup subtree identity is unreadable".into(),
+            })?;
+            let tasks =
+                std::fs::read_to_string(path.join("cgroup.procs")).map_err(|error| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "gone candidate cgroup tasks are unreadable".into(),
+                })?;
+            if !tasks.trim().is_empty() {
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "gone candidate cgroup still contains unprovable tasks".into(),
+                });
+            }
+            groups.push((path.clone(), metadata.dev(), metadata.ino()));
+            for entry in std::fs::read_dir(&path).map_err(|error| TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: "gone candidate cgroup subtree is unreadable".into(),
+            })? {
+                let entry = entry.map_err(|error| TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: error.raw_os_error(),
+                    message: "gone candidate cgroup subtree entry is unreadable".into(),
+                })?;
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        groups.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
+        for (path, device, inode) in groups {
+            let metadata = std::fs::metadata(&path).map_err(|error| TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: "gone candidate cgroup changed before removal".into(),
+            })?;
+            if metadata.dev() != device || metadata.ino() != inode {
+                return Ok(ExactGenerationKill::GenerationMismatch);
+            }
+            match std::fs::remove_dir(&path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EBUSY) | Some(libc::ENOTEMPTY)
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "gone candidate cgroup could not be removed".into(),
+                    });
+                }
+            }
+        }
+        if !root.exists() {
+            return Ok(ExactGenerationKill::Gone);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(TmuxError {
+        op: "kill-session-tree-generation",
+        code: None,
+        message: "gone candidate cgroup removal did not converge".into(),
+    })
+}
+
 fn kill_session_tree_exact_generation_with_post_reap<F>(
     name: &str,
     expected: PaneGeneration,
@@ -1700,6 +1835,106 @@ where
             (unsafe { libc::poll(&mut poll, 1, 0) }) == 1 && poll.revents & libc::POLLIN != 0
         }
 
+        fn remove_empty_exact_cgroup(
+            path: &std::path::Path,
+            control_path: &std::path::Path,
+            expected: &ProcessCgroupGeneration,
+        ) -> Result<(), TmuxError> {
+            use std::os::unix::fs::MetadataExt;
+
+            for _ in 0..POLL_LIMIT {
+                let root_metadata = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: error.raw_os_error(),
+                            message: "empty candidate cgroup identity is unreadable".into(),
+                        });
+                    }
+                };
+                if root_metadata.dev() != expected.device || root_metadata.ino() != expected.inode {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "empty candidate cgroup identity changed before removal".into(),
+                    });
+                }
+                let snapshot = read_cgroup_snapshot(control_path)?;
+                if !snapshot.tasks.is_empty() {
+                    return Err(TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: None,
+                        message: "candidate cgroup repopulated before exact removal".into(),
+                    });
+                }
+                let mut children = snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| !group.relative_path.is_empty())
+                    .collect::<Vec<_>>();
+                children.sort_by_key(|group| {
+                    std::cmp::Reverse(group.relative_path.matches('/').count())
+                });
+                for child in children {
+                    let child_path = path.join(&child.relative_path);
+                    let metadata = std::fs::metadata(&child_path).map_err(|error| TmuxError {
+                        op: "kill-session-tree-generation",
+                        code: error.raw_os_error(),
+                        message: "empty candidate child cgroup identity is unreadable".into(),
+                    })?;
+                    if metadata.dev() != child.device || metadata.ino() != child.inode {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "empty candidate child cgroup identity changed before removal"
+                                .into(),
+                        });
+                    }
+                    match std::fs::remove_dir(&child_path) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::EBUSY) | Some(libc::ENOTEMPTY)
+                            ) => {}
+                        Err(error) => {
+                            return Err(TmuxError {
+                                op: "kill-session-tree-generation",
+                                code: error.raw_os_error(),
+                                message: "empty candidate child cgroup could not be removed".into(),
+                            });
+                        }
+                    }
+                }
+                match std::fs::remove_dir(path) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::EBUSY) | Some(libc::ENOTEMPTY)
+                        ) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: error.raw_os_error(),
+                            message: "empty candidate cgroup could not be removed".into(),
+                        });
+                    }
+                }
+            }
+            Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: None,
+                message: "empty candidate cgroup removal did not converge".into(),
+            })
+        }
+
         let path = std::path::Path::new(&process_cgroup.path);
         let directory = std::fs::File::open(path).map_err(|error| TmuxError {
             op: "kill-session-tree-generation",
@@ -1912,6 +2147,12 @@ where
                 });
             }
             drop(pinned);
+            if path.exists() {
+                thaw(&control_path)?;
+                #[cfg(test)]
+                run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforeRemove)?;
+                remove_empty_exact_cgroup(path, &control_path, process_cgroup)?;
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -1925,11 +2166,25 @@ where
     match pane_generation_exact(name) {
         Ok(actual) if actual == expected => {}
         Ok(_) => return Ok(ExactGenerationKill::GenerationMismatch),
-        Err(_) => return unavailable(name),
+        Err(_) => {
+            if let Some(process_cgroup) = process_cgroup {
+                if session_liveness(name) == SessionLiveness::Gone {
+                    return remove_empty_cgroup_after_root_gone(name, process_cgroup);
+                }
+            }
+            return unavailable(name);
+        }
     }
     let root = match open_pidfd(expected.pane_pid) {
         Ok(root) => root,
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return unavailable(name),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            if let Some(process_cgroup) = process_cgroup {
+                if session_liveness(name) == SessionLiveness::Gone {
+                    return remove_empty_cgroup_after_root_gone(name, process_cgroup);
+                }
+            }
+            return unavailable(name);
+        }
         Err(error) => {
             return Err(TmuxError {
                 op: "kill-session-tree-generation",
@@ -2289,45 +2544,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn force_cleanup_test_cgroup(cgroup: &ProcessCgroupGeneration) {
-        let path = std::path::Path::new(&cgroup.path);
-        let _ = std::fs::write(path.join("cgroup.kill"), b"1");
-        let _ = std::fs::write(path.join("cgroup.freeze"), b"0");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let mut directories = vec![path.to_path_buf()];
-            let mut cursor = 0;
-            while cursor < directories.len() {
-                if let Ok(entries) = std::fs::read_dir(&directories[cursor]) {
-                    directories.extend(entries.flatten().filter_map(|entry| {
-                        entry
-                            .file_type()
-                            .ok()
-                            .filter(|kind| kind.is_dir())
-                            .map(|_| entry.path())
-                    }));
-                }
-                cursor += 1;
-            }
-            directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-            for directory in &directories {
-                let _ = std::fs::remove_dir(directory);
-            }
-            if !path.exists() {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "test private cgroup cleanup did not remove {}: events={:?} procs={:?}",
-                path.display(),
-                std::fs::read_to_string(path.join("cgroup.events")),
-                std::fs::read_to_string(path.join("cgroup.procs")),
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     /// True when a real `tmux` binary is reachable for the tests below. These
     /// tests drive a live tmux server on the isolated socket, so they can only
     /// pass where tmux is installed (the WSL2 dev shell) — NOT on the Windows CI
@@ -2601,6 +2817,7 @@ mod tests {
         let trigger = tempfile::NamedTempFile::new().unwrap();
         let trigger_path = trigger.path().to_path_buf();
         drop(trigger);
+        let ready_path = trigger_path.with_extension("ready");
         let script_dir = tempfile::tempdir().unwrap();
         let script = script_dir.path().join("nested-provider.sh");
         std::fs::write(
@@ -2613,8 +2830,8 @@ mod tests {
                sh -c 'sleep 30' &\n\
                wait\n\
              fi\n\
-             printf '%s\\n' \"$$\" > \"$CGROUP_ROOT/cgroup.procs\" || exit 124\n\
              export T_HUB_SESSION_TOKEN=escaped-bearer-marker\n\
+             while [ ! -e \"$CGROUP_READY\" ]; do sleep 0.01; done\n\
              \"$0\" nested &\n\
              wait\n",
         )
@@ -2622,14 +2839,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let command = format!(
-            "CGROUP_ROOT='{root}' FORK_TRIGGER='{trigger}' exec '{script}'",
+            "CGROUP_ROOT='{root}' CGROUP_READY='{ready}' FORK_TRIGGER='{trigger}' exec '{script}'",
             root = cgroup.generation().path,
+            ready = ready_path.display(),
             trigger = trigger_path.display(),
             script = script.display(),
         );
         let transition = respawn_pane_exact(&target.name, "/tmp", &command).unwrap();
         let expected = transition.after;
+        std::fs::write(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+            format!("{}\n", expected.pane_pid),
+        )
+        .unwrap();
         wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        std::fs::write(&ready_path, b"ready").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::fs::read_to_string(nested.join("cgroup.procs"))
             .unwrap_or_default()
@@ -2695,17 +2919,7 @@ mod tests {
                 "bearer-bearing descendant {pid} escaped private cgroup cleanup"
             );
         }
-        assert!(std::fs::read_to_string(
-            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs")
-        )
-        .unwrap()
-        .trim()
-        .is_empty());
-        assert!(std::fs::read_to_string(nested.join("cgroup.procs"))
-            .unwrap()
-            .trim()
-            .is_empty());
-        force_cleanup_test_cgroup(cgroup.generation());
+        assert!(!std::path::Path::new(&cgroup.generation().path).exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -2762,7 +2976,16 @@ mod tests {
         assert!(foreign_child.try_wait().unwrap().is_none());
         foreign_child.kill().unwrap();
         let _ = foreign_child.wait();
-        force_cleanup_test_cgroup(foreign_cgroup.generation());
+        assert_eq!(
+            kill_session_tree_exact_generation(
+                &foreign_target.name,
+                foreign_expected,
+                Some(foreign_cgroup.generation())
+            )
+            .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&foreign_cgroup.generation().path).exists());
         let foreign_name = foreign_target.name.clone();
         drop(foreign_target);
         drop(foreign_cgroup);
@@ -2790,7 +3013,16 @@ mod tests {
             session_liveness(&freeze_target.name),
             SessionLiveness::Alive
         );
-        force_cleanup_test_cgroup(freeze_cgroup.generation());
+        assert_eq!(
+            kill_session_tree_exact_generation(
+                &freeze_target.name,
+                freeze_expected,
+                Some(freeze_cgroup.generation())
+            )
+            .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&freeze_cgroup.generation().path).exists());
         let freeze_name = freeze_target.name.clone();
         drop(freeze_target);
         drop(freeze_cgroup);
@@ -2818,7 +3050,44 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.message, "injected thaw failure");
         drop(hook);
-        force_cleanup_test_cgroup(thaw_cgroup.generation());
+        assert_eq!(
+            kill_session_tree_exact_generation(
+                &thaw_target.name,
+                thaw_expected,
+                Some(thaw_cgroup.generation())
+            )
+            .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&thaw_cgroup.generation().path).exists());
+
+        let (remove_target, remove_cgroup, remove_expected) = run_fixture();
+        let hook = CgroupCleanupHookGuard::install(|point| {
+            if point == CgroupCleanupTestPoint::BeforeRemove {
+                return Err(injected_cgroup_cleanup_error("injected removal failure"));
+            }
+            Ok(())
+        });
+        let error = kill_session_tree_exact_generation(
+            &remove_target.name,
+            remove_expected,
+            Some(remove_cgroup.generation()),
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "injected removal failure");
+        assert!(std::path::Path::new(&remove_cgroup.generation().path).exists());
+        assert_eq!(session_liveness(&remove_target.name), SessionLiveness::Gone);
+        drop(hook);
+        assert_eq!(
+            kill_session_tree_exact_generation(
+                &remove_target.name,
+                remove_expected,
+                Some(remove_cgroup.generation())
+            )
+            .unwrap(),
+            ExactGenerationKill::Gone
+        );
+        assert!(!std::path::Path::new(&remove_cgroup.generation().path).exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -2849,7 +3118,18 @@ mod tests {
                 .unwrap_err();
         assert!(error.message.contains("bounded subtree limit"));
         assert_eq!(session_liveness(&target.name), SessionLiveness::Alive);
-        force_cleanup_test_cgroup(cgroup.generation());
+        for index in 0..64 {
+            std::fs::remove_dir(
+                std::path::Path::new(&cgroup.generation().path).join(format!("child-{index}")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            kill_session_tree_exact_generation(&target.name, expected, Some(cgroup.generation()))
+                .unwrap(),
+            ExactGenerationKill::Killed
+        );
+        assert!(!std::path::Path::new(&cgroup.generation().path).exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -2906,8 +3186,43 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        force_cleanup_test_cgroup(&reloaded_cgroup);
-        let _ = std::fs::remove_dir(&reloaded_cgroup.path);
+        assert!(!std::path::Path::new(&reloaded_cgroup.path).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persisted_empty_cgroup_is_removed_after_exact_root_is_already_gone() {
+        if !tmux_available() {
+            return;
+        }
+        let _anchor = TmuxTestsAnchorGuard::new();
+        let target = TestSession::new();
+        create_shell_session_after_final_teardown(&target.name);
+        let cgroup = create_private_process_cgroup().unwrap();
+        let expected = pane_generation_exact(&target.name).unwrap();
+        std::fs::write(
+            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
+            format!("{}\n", expected.pane_pid),
+        )
+        .unwrap();
+        wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        let status = Command::new("kill")
+            .args(["-KILL", &expected.pane_pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while session_liveness(&target.name) != SessionLiveness::Gone {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(std::path::Path::new(&cgroup.generation().path).exists());
+        assert_eq!(
+            kill_session_tree_exact_generation(&target.name, expected, Some(cgroup.generation()))
+                .unwrap(),
+            ExactGenerationKill::Gone
+        );
+        assert!(!std::path::Path::new(&cgroup.generation().path).exists());
     }
 
     #[test]
