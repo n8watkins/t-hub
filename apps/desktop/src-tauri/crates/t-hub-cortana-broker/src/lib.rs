@@ -3,6 +3,8 @@ use t_hub_cortana_broker_protocol::{
     ObservedPeer, ProtectedBrokerPolicy, ProtectedPolicy, ValidatedBrokerRequest,
 };
 
+pub mod store;
+
 /// Kernel placement authority for one Cortana candidate.
 ///
 /// Production implementations run as root and retain ownership of the exact

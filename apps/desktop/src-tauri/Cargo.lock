@@ -4234,8 +4234,10 @@ dependencies = [
 name = "t-hub-cortana-broker"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "t-hub-cortana-broker-protocol",
+ "tempfile",
 ]
 
 [[package]]

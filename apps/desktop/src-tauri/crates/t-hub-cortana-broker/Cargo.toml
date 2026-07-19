@@ -6,7 +6,8 @@ rust-version = "1.89"
 
 [dependencies]
 t-hub-cortana-broker-protocol = { path = "../t-hub-cortana-broker-protocol" }
-
-[dev-dependencies]
+libc = "0.2"
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
