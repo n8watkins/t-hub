@@ -272,7 +272,8 @@ impl AnonymousCredentialHandoff {
                 return Err(LaunchAttestationError::CredentialHandoffFailed);
             }
         }
-        let mut writer = Command::new("cat")
+        let mut writer = Command::new("/bin/cat")
+            .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
