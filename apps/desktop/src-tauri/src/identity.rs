@@ -35,7 +35,8 @@ use std::sync::Mutex;
 /// existing tier token (`T_HUB_CONTROL_TOKEN`). The in-session client presents it so
 /// the app can resolve the calling session's identity.
 pub const SESSION_TOKEN_ENV: &str = "T_HUB_SESSION_TOKEN";
-const IDENTITIES_SCHEMA_VERSION: u32 = 2;
+const IDENTITIES_SCHEMA_VERSION: u32 = 3;
+const OPERATION_ALLOCATION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_IDENTITIES_SCHEMA_VERSION: u32 = 1;
 const LEGACY_IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION: u32 = 2;
@@ -205,6 +206,10 @@ struct IdentitiesSnapshot {
     /// lifecycle cleanup); this is a deliberate "this credential is burned" act.
     #[serde(default)]
     revoked: HashSet<String>,
+    /// Durable operation keys whose bearer allocation was explicitly revoked.
+    /// A tombstoned key can never mint another identity on replay.
+    #[serde(default)]
+    revoked_allocations: HashSet<String>,
 }
 
 impl Default for IdentitiesSnapshot {
@@ -214,6 +219,7 @@ impl Default for IdentitiesSnapshot {
             generation: 0,
             identities: HashMap::new(),
             revoked: HashSet::new(),
+            revoked_allocations: HashSet::new(),
         }
     }
 }
@@ -281,7 +287,8 @@ impl IdentityGenerationWatermark {
             .expect("the empty identity snapshot has a canonical semantic digest")
     }
 
-    fn migrating_v1(
+    fn migrating(
+        from_schema_version: u32,
         generation_high_water: u64,
         source_sha256: String,
         target_semantic_sha256: String,
@@ -297,7 +304,7 @@ impl IdentityGenerationWatermark {
             }),
             migration: Some(IdentitySchemaMigrationReceipt {
                 schema_version: IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION,
-                from_schema_version: LEGACY_IDENTITIES_SCHEMA_VERSION,
+                from_schema_version,
                 to_schema_version: IDENTITIES_SCHEMA_VERSION,
                 source_sha256,
                 target_semantic_sha256,
@@ -363,7 +370,8 @@ impl IdentityGenerationWatermark {
         }
         if let Some(migration) = &self.migration {
             if migration.schema_version != IDENTITY_SCHEMA_MIGRATION_RECEIPT_VERSION
-                || migration.from_schema_version != LEGACY_IDENTITIES_SCHEMA_VERSION
+                || !matches!(migration.from_schema_version, 1 | 2)
+                || migration.from_schema_version >= IDENTITIES_SCHEMA_VERSION
                 || migration.to_schema_version != IDENTITIES_SCHEMA_VERSION
                 || !is_canonical_sha256(&migration.source_sha256)
                 || !is_canonical_sha256(&migration.target_semantic_sha256)
@@ -446,6 +454,9 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
     }
     let mut generations = HashSet::new();
     let mut allocation_keys = HashSet::new();
+    for allocation_key in &snapshot.revoked_allocations {
+        validate_allocation_key(allocation_key)?;
+    }
     let mut maximum = 0;
     for (key, identity) in &snapshot.identities {
         if key != &identity.id {
@@ -475,7 +486,10 @@ fn validate_identities_snapshot(snapshot: &IdentitiesSnapshot) -> Result<(), Str
     Ok(())
 }
 
-fn identity_snapshot_semantic_sha256(snapshot: &IdentitiesSnapshot) -> Result<String, String> {
+fn identity_snapshot_semantic_sha256_for_schema(
+    snapshot: &IdentitiesSnapshot,
+    schema_version: u32,
+) -> Result<String, String> {
     let mut identities = BTreeMap::new();
     for (id, identity) in &snapshot.identities {
         let secret = crate::secret_seal::unseal_str(&identity.secret)
@@ -496,14 +510,31 @@ fn identity_snapshot_semantic_sha256(snapshot: &IdentitiesSnapshot) -> Result<St
     }
     let mut revoked = snapshot.revoked.iter().collect::<Vec<_>>();
     revoked.sort_unstable();
-    let canonical = serde_json::to_vec(&serde_json::json!({
-        "schemaVersion": IDENTITIES_SCHEMA_VERSION,
-        "generation": snapshot.generation,
-        "identities": identities,
-        "revoked": revoked,
-    }))
-    .map_err(|error| format!("identity migration target could not be digested: {error}"))?;
+    let mut revoked_allocations = snapshot.revoked_allocations.iter().collect::<Vec<_>>();
+    revoked_allocations.sort_unstable();
+    let canonical_value = if schema_version >= IDENTITIES_SCHEMA_VERSION {
+        serde_json::json!({
+            "schemaVersion": schema_version,
+            "generation": snapshot.generation,
+            "identities": identities,
+            "revoked": revoked,
+            "revokedAllocations": revoked_allocations,
+        })
+    } else {
+        serde_json::json!({
+            "schemaVersion": schema_version,
+            "generation": snapshot.generation,
+            "identities": identities,
+            "revoked": revoked,
+        })
+    };
+    let canonical = serde_json::to_vec(&canonical_value)
+        .map_err(|error| format!("identity migration target could not be digested: {error}"))?;
     Ok(sha256_hex(&canonical))
+}
+
+fn identity_snapshot_semantic_sha256(snapshot: &IdentitiesSnapshot) -> Result<String, String> {
+    identity_snapshot_semantic_sha256_for_schema(snapshot, IDENTITIES_SCHEMA_VERSION)
 }
 
 fn validate_allocation_key(allocation_key: &str) -> Result<(), String> {
@@ -523,7 +554,7 @@ fn validate_allocation_key(allocation_key: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentitySnapshotSource {
     Current,
-    VersionedLegacy,
+    VersionedLegacy(u32),
     UnversionedLegacy,
 }
 
@@ -590,7 +621,7 @@ fn read_identities_snapshot(
                 path.display()
             ));
         }
-        if version < IDENTITIES_SCHEMA_VERSION as u64 {
+        if version == LEGACY_IDENTITIES_SCHEMA_VERSION as u64 {
             reject_legacy_allocation_fields(object, path)?;
         }
         let mut snapshot: IdentitiesSnapshot =
@@ -601,7 +632,7 @@ fn read_identities_snapshot(
                 )
             })?;
         let source = if version < IDENTITIES_SCHEMA_VERSION as u64 {
-            IdentitySnapshotSource::VersionedLegacy
+            IdentitySnapshotSource::VersionedLegacy(version as u32)
         } else {
             IdentitySnapshotSource::Current
         };
@@ -704,10 +735,23 @@ pub(crate) enum OperationAllocationDisposition {
     Unowned,
 }
 
+pub(crate) struct RevokedOperationAllocation {
+    allocation_key: String,
+}
+
+impl RevokedOperationAllocation {
+    pub(crate) fn matches(&self, allocation_key: &str) -> bool {
+        self.allocation_key == allocation_key
+    }
+}
+
 enum IdentityLoadPersistAction {
     None,
     OrdinaryUpgrade,
-    UpgradeSchemaV1 { source_sha256: String },
+    UpgradeSchemaV1 {
+        from_schema_version: u32,
+        source_sha256: String,
+    },
     FinalizeSchemaV1,
     FinalizeSnapshotCommit,
     RollBackSnapshotCommit,
@@ -786,7 +830,7 @@ impl IdentityStore {
                 (
                     Ok(Some((
                         snapshot,
-                        IdentitySnapshotSource::VersionedLegacy,
+                        IdentitySnapshotSource::VersionedLegacy(from_schema_version),
                         source_sha256,
                     ))),
                     Ok(Some(watermark)),
@@ -794,7 +838,8 @@ impl IdentityStore {
                     let target_semantic_sha256 =
                         identity_snapshot_semantic_sha256(&snapshot).ok();
                     let matching_migration = watermark.migration.as_ref().is_some_and(|receipt| {
-                        receipt.source_sha256 == source_sha256
+                        receipt.from_schema_version == from_schema_version
+                            && receipt.source_sha256 == source_sha256
                             && target_semantic_sha256.as_deref()
                                 == Some(receipt.target_semantic_sha256.as_str())
                             && snapshot.generation == watermark.generation_high_water
@@ -802,7 +847,10 @@ impl IdentityStore {
                     if matching_migration {
                         (
                             snapshot,
-                            IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 },
+                            IdentityLoadPersistAction::UpgradeSchemaV1 {
+                                from_schema_version,
+                                source_sha256,
+                            },
                             None,
                             watermark,
                         )
@@ -812,6 +860,46 @@ impl IdentityStore {
                             IdentityLoadPersistAction::None,
                             Some(
                                 "identity generation watermark proves identities.json was downgraded to schema v1 and may have erased operation allocation ownership"
+                                    .to_string(),
+                            ),
+                            watermark,
+                        )
+                    }
+                }
+                (
+                    Ok(Some((
+                        snapshot,
+                        IdentitySnapshotSource::VersionedLegacy(
+                            OPERATION_ALLOCATION_SCHEMA_VERSION,
+                        ),
+                        source_sha256,
+                    ))),
+                    Ok(Some(watermark)),
+                ) if watermark.identities_schema_version == OPERATION_ALLOCATION_SCHEMA_VERSION => {
+                    let source_digest = identity_snapshot_semantic_sha256_for_schema(
+                        &snapshot,
+                        OPERATION_ALLOCATION_SCHEMA_VERSION,
+                    )
+                    .ok();
+                    let integrity_matches = watermark.integrity.as_ref().is_some_and(|integrity| {
+                        source_digest.as_deref() == Some(integrity.semantic_sha256.as_str())
+                    });
+                    if snapshot.generation == watermark.generation_high_water && integrity_matches {
+                        (
+                            snapshot,
+                            IdentityLoadPersistAction::UpgradeSchemaV1 {
+                                from_schema_version: OPERATION_ALLOCATION_SCHEMA_VERSION,
+                                source_sha256,
+                            },
+                            None,
+                            watermark,
+                        )
+                    } else {
+                        (
+                            IdentitiesSnapshot::default(),
+                            IdentityLoadPersistAction::None,
+                            Some(
+                                "identity schema v2 snapshot does not match its durable integrity anchor"
                                     .to_string(),
                             ),
                             watermark,
@@ -903,21 +991,27 @@ impl IdentityStore {
                 (
                     Ok(Some((
                         snapshot,
-                        IdentitySnapshotSource::VersionedLegacy,
+                        IdentitySnapshotSource::VersionedLegacy(from_schema_version),
                         source_sha256,
                     ))),
                     Ok(Some(watermark)),
                 ) => (
                     snapshot,
-                    IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 },
+                    IdentityLoadPersistAction::UpgradeSchemaV1 {
+                        from_schema_version,
+                        source_sha256,
+                    },
                     None,
                     watermark,
                 ),
                 (Ok(Some((snapshot, source, source_sha256))), Ok(None)) => {
                     let action = match source {
                         IdentitySnapshotSource::Current => IdentityLoadPersistAction::None,
-                        IdentitySnapshotSource::VersionedLegacy => {
-                            IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 }
+                        IdentitySnapshotSource::VersionedLegacy(from_schema_version) => {
+                            IdentityLoadPersistAction::UpgradeSchemaV1 {
+                                from_schema_version,
+                                source_sha256,
+                            }
                         }
                         IdentitySnapshotSource::UnversionedLegacy => {
                             IdentityLoadPersistAction::OrdinaryUpgrade
@@ -970,9 +1064,14 @@ impl IdentityStore {
             let persist_result = {
                 let mut snapshot = store.lock();
                 match persist_action {
-                    IdentityLoadPersistAction::UpgradeSchemaV1 { source_sha256 } => {
-                        store.persist_schema_v1_migration(&snapshot, source_sha256)
-                    }
+                    IdentityLoadPersistAction::UpgradeSchemaV1 {
+                        from_schema_version,
+                        source_sha256,
+                    } => store.persist_schema_v1_migration(
+                        &snapshot,
+                        from_schema_version,
+                        source_sha256,
+                    ),
                     IdentityLoadPersistAction::FinalizeSchemaV1 => {
                         store.finalize_schema_v1_migration(&snapshot)
                     }
@@ -1026,6 +1125,7 @@ impl IdentityStore {
     fn persist_schema_v1_migration(
         &self,
         snapshot: &IdentitiesSnapshot,
+        from_schema_version: u32,
         source_sha256: String,
     ) -> Result<(), String> {
         validate_identities_snapshot(snapshot)?;
@@ -1037,7 +1137,8 @@ impl IdentityStore {
             .watermark_path
             .as_ref()
             .ok_or("identity generation watermark path is unavailable")?;
-        let migration = IdentityGenerationWatermark::migrating_v1(
+        let migration = IdentityGenerationWatermark::migrating(
+            from_schema_version,
             snapshot.generation,
             source_sha256,
             identity_snapshot_semantic_sha256(snapshot)?,
@@ -1278,7 +1379,7 @@ impl IdentityStore {
     /// could be resolved at spawn (a crew inherits its spawner's ship), else `None`.
     /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
     pub fn mint_for(&self, role: Role, ship: Option<String>) -> Result<SessionIdentity, String> {
-        self.mint_for_allocation(role, ship, None)
+        self.mint_for_allocation(role, ship, None, false)
     }
 
     /// Mint once for a durable operation. Replays with the exact role and ship
@@ -1290,7 +1391,17 @@ impl IdentityStore {
         allocation_key: &str,
     ) -> Result<SessionIdentity, String> {
         validate_allocation_key(allocation_key)?;
-        self.mint_for_allocation(role, ship, Some(allocation_key.to_string()))
+        self.mint_for_allocation(role, ship, Some(allocation_key.to_string()), false)
+    }
+
+    pub(crate) fn mint_for_retried_operation(
+        &self,
+        role: Role,
+        ship: Option<String>,
+        allocation_key: &str,
+    ) -> Result<SessionIdentity, String> {
+        validate_allocation_key(allocation_key)?;
+        self.mint_for_allocation(role, ship, Some(allocation_key.to_string()), true)
     }
 
     fn mint_for_allocation(
@@ -1298,9 +1409,13 @@ impl IdentityStore {
         role: Role,
         ship: Option<String>,
         allocation_key: Option<String>,
+        allow_revoked_allocation: bool,
     ) -> Result<SessionIdentity, String> {
         let mut snap = self.lock();
         if let Some(allocation_key) = allocation_key.as_deref() {
+            if snap.revoked_allocations.contains(allocation_key) && !allow_revoked_allocation {
+                return Err("identity operation allocation is durably revoked".into());
+            }
             if let Some(existing) = snap
                 .identities
                 .values()
@@ -1489,7 +1604,22 @@ impl IdentityStore {
                 None => {}
             }
         }
+        let revoke_allocations = revoke_ids
+            .iter()
+            .filter_map(|id| {
+                snap.identities
+                    .get(id)
+                    .and_then(|identity| identity.allocation_key.clone())
+            })
+            .collect::<Vec<_>>();
         for id in &revoke_ids {
+            if let Some(allocation_key) = snap
+                .identities
+                .get(id)
+                .and_then(|identity| identity.allocation_key.clone())
+            {
+                snap.revoked_allocations.insert(allocation_key);
+            }
             snap.revoked.insert(id.clone());
             snap.identities.remove(id);
         }
@@ -1508,6 +1638,7 @@ impl IdentityStore {
                     snap.revoked.insert(id.clone());
                     snap.identities.remove(id);
                 }
+                snap.revoked_allocations.extend(revoke_allocations);
                 return Err(error);
             }
         }
@@ -1517,22 +1648,33 @@ impl IdentityStore {
     /// Revoke the identity allocated by one durable operation. Exact replay after
     /// the identity is already absent is idempotent.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn revoke_operation_allocation(&self, allocation_key: &str) -> Result<bool, String> {
+    pub(crate) fn revoke_operation_allocation(
+        &self,
+        allocation_key: &str,
+    ) -> Result<RevokedOperationAllocation, String> {
         validate_allocation_key(allocation_key)?;
         let mut snap = self.lock();
-        let Some(id) = snap.identities.values().find_map(|identity| {
+        let id = snap.identities.values().find_map(|identity| {
             (identity.allocation_key.as_deref() == Some(allocation_key))
                 .then(|| identity.id.clone())
-        }) else {
-            return Ok(false);
-        };
-        snap.revoked.insert(id.clone());
-        snap.identities.remove(&id);
+        });
+        if let Some(id) = id {
+            snap.revoked.insert(id.clone());
+            snap.identities.remove(&id);
+        }
+        snap.revoked_allocations.insert(allocation_key.to_string());
         // Keep the failed operation's bearer denied in memory if persistence fails.
         // The durable registry journal remains the restart instruction that retries
         // this tombstone until persistence succeeds.
         self.persist(&snap)?;
-        Ok(true)
+        Ok(RevokedOperationAllocation {
+            allocation_key: allocation_key.to_string(),
+        })
+    }
+
+    pub(crate) fn operation_allocation_has_tombstone(&self, allocation_key: &str) -> bool {
+        validate_allocation_key(allocation_key).is_ok()
+            && self.lock().revoked_allocations.contains(allocation_key)
     }
 
     /// Explicitly REVOKE an identity by its minted id (item-3 Pillar B): record it in
@@ -1545,6 +1687,13 @@ impl IdentityStore {
         let mut snap = self.lock();
         let previous = snap.clone();
         let newly_revoked = snap.revoked.insert(id.to_string());
+        if let Some(allocation_key) = snap
+            .identities
+            .get(id)
+            .and_then(|identity| identity.allocation_key.clone())
+        {
+            snap.revoked_allocations.insert(allocation_key);
+        }
         let removed = snap.identities.remove(id).is_some();
         if newly_revoked || removed {
             if let Err(error) = self.persist(&snap) {
@@ -2169,7 +2318,8 @@ mod tests {
         let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
         std::fs::write(&path, &v1_bytes).unwrap();
         let target = read_identities_snapshot(&path).unwrap().0;
-        let migration = IdentityGenerationWatermark::migrating_v1(
+        let migration = IdentityGenerationWatermark::migrating(
+            LEGACY_IDENTITIES_SCHEMA_VERSION,
             4,
             sha256_hex(&v1_bytes),
             identity_snapshot_semantic_sha256(&target).unwrap(),
@@ -2221,8 +2371,13 @@ mod tests {
             "revoked": []
         });
         let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
-        let migration =
-            IdentityGenerationWatermark::migrating_v1(4, "0".repeat(64), "1".repeat(64)).unwrap();
+        let migration = IdentityGenerationWatermark::migrating(
+            LEGACY_IDENTITIES_SCHEMA_VERSION,
+            4,
+            "0".repeat(64),
+            "1".repeat(64),
+        )
+        .unwrap();
         let watermark_bytes = serde_json::to_vec_pretty(&migration).unwrap();
         std::fs::write(&path, &v1_bytes).unwrap();
         std::fs::write(&watermark_path, &watermark_bytes).unwrap();
@@ -2260,7 +2415,8 @@ mod tests {
         let v1_bytes = serde_json::to_vec_pretty(&v1).unwrap();
         std::fs::write(&path, &v1_bytes).unwrap();
         let target = read_identities_snapshot(&path).unwrap().0;
-        let migration = IdentityGenerationWatermark::migrating_v1(
+        let migration = IdentityGenerationWatermark::migrating(
+            LEGACY_IDENTITIES_SCHEMA_VERSION,
             4,
             sha256_hex(&v1_bytes),
             identity_snapshot_semantic_sha256(&target).unwrap(),
@@ -3054,6 +3210,103 @@ mod tests {
             .unwrap_err()
             .contains("operation-owned"));
         let _ = std::fs::remove_file(generation_watermark_path(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoked_operation_allocation_is_durable_and_can_issue_one_retry_identity() {
+        let path = temp_path();
+        let allocation_key =
+            "cortana:ensure:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let first = {
+            let store = IdentityStore::load(path.clone());
+            let identity = store
+                .mint_for_operation(Role::Cortana, Some("cortana".into()), allocation_key)
+                .unwrap();
+            store.revoke_operation_allocation(allocation_key).unwrap();
+            assert!(store.resolve(&identity.secret).is_none());
+            assert!(store.operation_allocation_has_tombstone(allocation_key));
+            identity
+        };
+
+        let store = IdentityStore::load(path.clone());
+        assert!(store.operation_allocation_has_tombstone(allocation_key));
+        assert!(store
+            .mint_for_operation(Role::Cortana, Some("cortana".into()), allocation_key)
+            .unwrap_err()
+            .contains("durably revoked"));
+        let retry = store
+            .mint_for_retried_operation(Role::Cortana, Some("cortana".into()), allocation_key)
+            .unwrap();
+        assert_ne!(retry.id, first.id);
+        assert!(retry.generation > first.generation);
+        assert_eq!(
+            store
+                .mint_for_retried_operation(Role::Cortana, Some("cortana".into()), allocation_key,)
+                .unwrap()
+                .id,
+            retry.id
+        );
+        store.revoke_operation_allocation(allocation_key).unwrap();
+        assert!(store.resolve(&retry.secret).is_none());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], IDENTITIES_SCHEMA_VERSION);
+        assert!(persisted["revokedAllocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key == allocation_key));
+        let _ = std::fs::remove_file(generation_watermark_path(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_v2_allocation_store_migrates_with_exact_integrity_anchor() {
+        let path = temp_path();
+        let watermark_path = generation_watermark_path(&path);
+        let store = IdentityStore::load(path.clone());
+        store
+            .mint_for_operation(Role::Cortana, Some("cortana".into()), "operation:schema-v2")
+            .unwrap();
+        let snapshot = store.lock().clone();
+        let source_digest = identity_snapshot_semantic_sha256_for_schema(
+            &snapshot,
+            OPERATION_ALLOCATION_SCHEMA_VERSION,
+        )
+        .unwrap();
+        drop(store);
+        let mut source: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        source["schemaVersion"] = OPERATION_ALLOCATION_SCHEMA_VERSION.into();
+        source.as_object_mut().unwrap().remove("revokedAllocations");
+        std::fs::write(&path, serde_json::to_vec_pretty(&source).unwrap()).unwrap();
+        let watermark = IdentityGenerationWatermark {
+            schema_version: IDENTITY_GENERATION_WATERMARK_SCHEMA_VERSION,
+            format_identity: IDENTITY_GENERATION_WATERMARK_FORMAT.into(),
+            identities_schema_version: OPERATION_ALLOCATION_SCHEMA_VERSION,
+            generation_high_water: snapshot.generation,
+            integrity: Some(IdentitySnapshotIntegrity {
+                schema_version: IDENTITY_SNAPSHOT_INTEGRITY_VERSION,
+                semantic_sha256: source_digest,
+            }),
+            migration: None,
+            commit_pending: None,
+        };
+        std::fs::write(
+            &watermark_path,
+            serde_json::to_vec_pretty(&watermark).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = IdentityStore::load(path.clone());
+        assert!(migrated.write_blocked.is_none());
+        assert_eq!(migrated.len(), 1);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], IDENTITIES_SCHEMA_VERSION);
+        assert_eq!(persisted["revokedAllocations"], serde_json::json!([]));
+        let _ = std::fs::remove_file(watermark_path);
         let _ = std::fs::remove_file(path);
     }
 

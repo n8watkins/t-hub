@@ -6782,11 +6782,19 @@ impl CaptainsRegistry {
         let terminal_id = cortana_candidate_terminal_id(request_digest)?;
         let tmux_session_id = format!("th_{terminal_id}");
         let allocation_key = cortana_identity_allocation_key(request_digest)?;
-        let identity = identities.mint_for_operation(
-            crate::identity::Role::Cortana,
-            Some(CORTANA_SLUG.to_string()),
-            &allocation_key,
-        )?;
+        let identity = if identities.operation_allocation_has_tombstone(&allocation_key) {
+            identities.mint_for_retried_operation(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+                &allocation_key,
+            )?
+        } else {
+            identities.mint_for_operation(
+                crate::identity::Role::Cortana,
+                Some(CORTANA_SLUG.to_string()),
+                &allocation_key,
+            )?
+        };
         identities.bind_tile_exact(&identity.id, &terminal_id)?;
         let identity = identities
             .get(&identity.id)
@@ -7477,6 +7485,73 @@ impl CaptainsRegistry {
             let allocation_key = cortana_identity_allocation_key(request_digest)?;
             identities.revoke_operation_allocation(&allocation_key)?;
         }
+        Ok(result)
+    }
+
+    /// Retry one failed immutable operation only after the deterministic prior
+    /// candidate is definitively absent and IdentityStore has durably tombstoned
+    /// its allocation key.
+    pub(crate) fn retry_failed_cortana_ensure(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        revoked_allocation: &crate::identity::RevokedOperationAllocation,
+        observed_at: u64,
+    ) -> Result<CaptainRecord, String> {
+        let allocation_key = cortana_identity_allocation_key(request_digest)?;
+        if !revoked_allocation.matches(&allocation_key) {
+            return Err("Cortana failed retry lacks its exact durable allocation tombstone".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let captain = current
+            .captains
+            .iter_mut()
+            .find(|captain| captain.role == FleetRole::Cortana)
+            .ok_or("Cortana durable identity disappeared")?;
+        let runtime = captain
+            .cortana_runtime
+            .as_mut()
+            .ok_or("Cortana durable runtime is missing")?;
+        let intent = runtime
+            .ensure_intent
+            .as_mut()
+            .ok_or("Cortana ensure intent is missing")?;
+        if intent.operation_id != operation_id || intent.request_digest != request_digest {
+            return Err("Cortana failed retry does not match the immutable request".into());
+        }
+        if intent.phase == CortanaEnsurePhase::Prepared
+            && intent.candidate.is_none()
+            && matches!(
+                runtime.lifecycle,
+                CortanaRuntimeLifecycle::Starting | CortanaRuntimeLifecycle::Restoring
+            )
+        {
+            return Ok(captain.clone());
+        }
+        if intent.phase != CortanaEnsurePhase::Failed
+            || intent.candidate.is_some()
+            || runtime.lifecycle != CortanaRuntimeLifecycle::Failed
+        {
+            return Err(
+                "Cortana ensure is not an exact failed operation eligible for retry".into(),
+            );
+        }
+        let timestamp = cortana_runtime_timestamp(runtime.updated_at, observed_at)?;
+        intent.phase = CortanaEnsurePhase::Prepared;
+        intent.updated_at = timestamp;
+        runtime.lifecycle = if runtime.generation == 0 {
+            CortanaRuntimeLifecycle::Starting
+        } else {
+            CortanaRuntimeLifecycle::Restoring
+        };
+        runtime.reason_code = None;
+        runtime.guidance = None;
+        runtime.updated_at = timestamp;
+        let result = captain.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
         Ok(result)
     }
 
@@ -19681,6 +19756,35 @@ where
     let operation_id = intent.operation_id.clone();
     let request_digest = intent.request_digest.clone();
     let policy = intent.request.desired_runtime.clone();
+    if intent.phase == CortanaEnsurePhase::Failed {
+        let candidate_terminal_id = cortana_candidate_terminal_id(&request_digest)?;
+        let candidate_tmux_target = format!("th_{candidate_terminal_id}");
+        match tmux::session_liveness(&candidate_tmux_target) {
+            tmux::SessionLiveness::Alive => {
+                return Err(
+                    "Cortana failed candidate terminal is live; refusing automatic retry or credential injection"
+                        .into(),
+                );
+            }
+            tmux::SessionLiveness::Unknown => {
+                return Err(
+                    "Cortana failed candidate liveness is ambiguous; refusing automatic retry or credential injection"
+                        .into(),
+                );
+            }
+            tmux::SessionLiveness::Gone => {}
+        }
+        let allocation_key = cortana_identity_allocation_key(&request_digest)?;
+        let revoked = ctx.identity.revoke_operation_allocation(&allocation_key)?;
+        ctx.captains.retry_failed_cortana_ensure(
+            &operation_id,
+            &request_digest,
+            &revoked,
+            now_ms(),
+        )?;
+        drop(_effect);
+        return run_cortana_worker_once_with_provider(ctx, observe_provider);
+    }
     if intent.phase == CortanaEnsurePhase::IncumbentRecovered {
         return Ok(true);
     }
@@ -25142,6 +25246,59 @@ mod tests {
         assert!(runtime.ensure_intent.unwrap().candidate.is_none());
         assert!(identities.get(&allocated.id).is_none());
         assert!(identities.resolve(&allocated.secret).is_none());
+
+        let revoked = identities
+            .revoke_operation_allocation(&allocation_key)
+            .unwrap();
+        let retried = registry
+            .retry_failed_cortana_ensure(
+                &intent.operation_id,
+                &intent.request_digest,
+                &revoked,
+                1000,
+            )
+            .unwrap();
+        let retried_runtime = retried.cortana_runtime.as_ref().unwrap();
+        assert_eq!(
+            retried_runtime.lifecycle,
+            CortanaRuntimeLifecycle::Restoring
+        );
+        assert_eq!(
+            retried_runtime.ensure_intent.as_ref().unwrap().phase,
+            CortanaEnsurePhase::Prepared
+        );
+        assert!(retried_runtime.reason_code.is_none());
+        assert!(retried_runtime.guidance.is_none());
+        let replayed = registry
+            .retry_failed_cortana_ensure(
+                &intent.operation_id,
+                &intent.request_digest,
+                &revoked,
+                1001,
+            )
+            .unwrap();
+        assert_eq!(
+            replayed
+                .cortana_runtime
+                .as_ref()
+                .unwrap()
+                .ensure_intent
+                .as_ref()
+                .unwrap()
+                .phase,
+            CortanaEnsurePhase::Prepared
+        );
+        let (_, replacement) = registry
+            .reserve_cortana_candidate_identity(
+                &identities,
+                &intent.operation_id,
+                &intent.request_digest,
+                2,
+                1002,
+            )
+            .unwrap();
+        assert_ne!(replacement.id, allocated.id);
+        assert!(replacement.generation > allocated.generation);
     }
 
     #[test]
