@@ -1807,32 +1807,7 @@ fn validate_cortana_process_cgroup(
 ) -> Result<(), String> {
     let receipt = receipt.ok_or("Cortana process cgroup evidence is missing")?;
     validate_cortana_optional_text(Some(&receipt.path), "processCgroupPath")?;
-    let path = Path::new(&receipt.path);
-    let canonical_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("t-hub-cortana-"))
-        .is_some_and(|identity| {
-            identity.len() == 32
-                && identity
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        });
-    if !path.is_absolute()
-        || !path.starts_with("/sys/fs/cgroup/user.slice/")
-        || !receipt.path.contains("/app.slice/app-tmux.slice/")
-        || !path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|parent| parent.to_str())
-            .is_some_and(|parent| parent.starts_with("tmux-spawn-") && parent.ends_with(".scope"))
-        || !path.components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
-        || !canonical_name
+    if !crate::tmux::is_canonical_private_process_cgroup_path(&receipt.path)
         || receipt.device == 0
         || receipt.inode == 0
     {

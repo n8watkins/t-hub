@@ -106,7 +106,12 @@ pub(crate) struct ProcessCgroupGeneration {
 #[cfg(target_os = "linux")]
 pub(crate) struct PrivateProcessCgroup {
     generation: ProcessCgroupGeneration,
-    remove_on_drop: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct SystemdProcessScopeGuardian {
+    writer: Option<std::process::ChildStdin>,
+    child: Option<std::process::Child>,
 }
 
 #[cfg(target_os = "linux")]
@@ -121,22 +126,130 @@ impl PrivateProcessCgroup {
         &self.generation
     }
 
-    pub(crate) fn retain(mut self) -> ProcessCgroupGeneration {
-        self.remove_on_drop = false;
+    pub(crate) fn retain(self) -> ProcessCgroupGeneration {
         self.generation.clone()
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for PrivateProcessCgroup {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = remove_exact_empty_cgroup_generation(&self.generation);
+impl SystemdProcessScopeGuardian {
+    fn create(unit: &str, pid: u32, path: &std::path::Path) -> Result<Self, TmuxError> {
+        use std::io::BufRead;
+        use std::process::Stdio;
+
+        const GUARDIAN: &str = r#"
+[ ! -e "$3" ] || exit 72
+/usr/bin/busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' "$1" fail 2 PIDs au 1 "$2" Delegate b true 0 >/dev/null || exit 73
+printf 'owned\n'
+if IFS= read -r state; then
+  [ "$state" = persisted ] && exit 0
+fi
+/usr/bin/systemctl --user stop "$1" >/dev/null 2>&1 || true
+/usr/bin/systemctl --user reset-failed "$1" >/dev/null 2>&1 || true
+exit 0
+"#;
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                GUARDIAN,
+                "t-hub-systemd-scope-guardian",
+                unit,
+                &pid.to_string(),
+                path.to_string_lossy().as_ref(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| TmuxError {
+                op: "create-systemd-scope",
+                code: error.raw_os_error(),
+                message: "systemd scope guardian could not start".into(),
+            })?;
+        let writer = child.stdin.take().ok_or_else(|| TmuxError {
+            op: "create-systemd-scope",
+            code: None,
+            message: "systemd scope guardian has no ownership channel".into(),
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| TmuxError {
+            op: "create-systemd-scope",
+            code: None,
+            message: "systemd scope guardian has no receipt channel".into(),
+        })?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut receipt = String::new();
+        reader.read_line(&mut receipt).map_err(|error| TmuxError {
+            op: "create-systemd-scope",
+            code: error.raw_os_error(),
+            message: "systemd scope guardian receipt is unreadable".into(),
+        })?;
+        if receipt.trim() != "owned" {
+            return Err(TmuxError {
+                op: "create-systemd-scope",
+                code: None,
+                message: "systemd scope guardian did not prove creation".into(),
+            });
         }
+        Ok(Self {
+            writer: Some(writer),
+            child: Some(child),
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) -> Result<(), TmuxError> {
+        use std::io::Write;
+
+        let mut writer = self.writer.take().ok_or_else(|| TmuxError {
+            op: "disarm-systemd-scope-guardian",
+            code: None,
+            message: "systemd scope guardian was already disarmed".into(),
+        })?;
+        writer
+            .write_all(b"persisted\n")
+            .map_err(|error| TmuxError {
+                op: "disarm-systemd-scope-guardian",
+                code: error.raw_os_error(),
+                message: "systemd scope guardian could not be disarmed".into(),
+            })?;
+        drop(writer);
+        let status = self
+            .child
+            .take()
+            .ok_or_else(|| TmuxError {
+                op: "disarm-systemd-scope-guardian",
+                code: None,
+                message: "systemd scope guardian process is missing".into(),
+            })?
+            .wait()
+            .map_err(|error| TmuxError {
+                op: "disarm-systemd-scope-guardian",
+                code: error.raw_os_error(),
+                message: "systemd scope guardian result is unreadable".into(),
+            })?;
+        if !status.success() {
+            return Err(TmuxError {
+                op: "disarm-systemd-scope-guardian",
+                code: status.code(),
+                message: "systemd scope guardian rejected persistence".into(),
+            });
+        }
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
+impl Drop for SystemdProcessScopeGuardian {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
 fn remove_exact_empty_cgroup_generation(
     expected: &ProcessCgroupGeneration,
 ) -> Result<bool, TmuxError> {
@@ -251,7 +364,7 @@ fn remove_exact_empty_cgroup_generation(
     })
 }
 
-fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
+pub(crate) fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
     let path = std::path::Path::new(path);
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -259,6 +372,8 @@ fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
     let Some(identity) = name.strip_prefix("t-hub-cortana-") else {
         return false;
     };
+    let managed_scope = identity.strip_suffix(".scope");
+    let identity = managed_scope.unwrap_or(identity);
     identity.len() == 32
         && identity
             .bytes()
@@ -269,7 +384,9 @@ fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
             .and_then(|parent| parent.to_str())
             .is_some_and(|parent| {
                 parent == "app.slice"
-                    || parent.starts_with("tmux-spawn-") && parent.ends_with(".scope")
+                    || managed_scope.is_none()
+                        && parent.starts_with("tmux-spawn-")
+                        && parent.ends_with(".scope")
             })
         && path.starts_with("/sys/fs/cgroup/user.slice/")
         && path.components().all(|component| {
@@ -278,6 +395,15 @@ fn is_canonical_private_process_cgroup_path(path: &str) -> bool {
                 std::path::Component::RootDir | std::path::Component::Normal(_)
             )
         })
+}
+
+fn is_systemd_owned_process_scope_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    is_canonical_private_process_cgroup_path(path.to_string_lossy().as_ref())
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".scope"))
 }
 
 #[cfg(test)]
@@ -315,6 +441,7 @@ enum CgroupCleanupTestPoint {
     AfterKill,
     BeforeThaw,
     BeforeRemove,
+    BeforeOwnedScopeRemovalWait,
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -1229,7 +1356,7 @@ fn create_private_process_cgroup_under(
     create_private_process_cgroup_at(&path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn create_private_process_cgroup_at(
     path: &std::path::Path,
 ) -> Result<PrivateProcessCgroup, TmuxError> {
@@ -1280,24 +1407,17 @@ fn create_private_process_cgroup_at(
             device: metadata.dev(),
             inode: metadata.ino(),
         },
-        remove_on_drop: true,
     })
 }
 
-/// Move an exact credential-free gate-blocked pane into a private child of its
-/// settled tmux/systemd scope. The caller must prove its anonymous launch gate
-/// is engaged and must not release credentials until this returns.
+/// Move an exact credential-free gate-blocked pane into a systemd-owned
+/// transient scope. The caller must prove its anonymous launch gate is engaged
+/// and must not release credentials until this returns.
 #[cfg(target_os = "linux")]
-pub(crate) fn confine_blocked_pane_to_private_cgroup<G, A, C>(
+pub(crate) fn confine_blocked_pane_to_private_cgroup(
     name: &str,
     expected: PaneGeneration,
-    arm_guardian: A,
-    confirm_guardian: C,
-) -> Result<(PrivateProcessCgroup, G), ProcessCgroupConfinementError>
-where
-    A: FnOnce(&std::path::Path) -> Result<G, TmuxError>,
-    C: FnOnce(&mut G, &ProcessCgroupGeneration) -> Result<(), TmuxError>,
-{
+) -> Result<(PrivateProcessCgroup, SystemdProcessScopeGuardian), ProcessCgroupConfinementError> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     fn error(message: &str, code: Option<i32>) -> TmuxError {
@@ -1418,32 +1538,85 @@ where
             None,
         ));
     }
-    let process_cgroup_path =
-        parent.join(format!("t-hub-cortana-{}", uuid::Uuid::new_v4().simple()));
-    let mut guardian = arm_guardian(&process_cgroup_path).map_err(|error| fail(error, None))?;
+    let app_slice = settled_membership
+        .find("/app.slice")
+        .map(|end| &settled_membership[..end + "/app.slice".len()])
+        .ok_or_else(|| fail(error("candidate has no systemd app slice", None), None))?;
+    let unit = format!("t-hub-cortana-{}.scope", uuid::Uuid::new_v4().simple());
+    let process_cgroup_path = std::path::Path::new("/sys/fs/cgroup")
+        .join(app_slice.trim_start_matches('/'))
+        .join(&unit);
     #[cfg(test)]
     cgroup_confinement_crash_boundary("before-create", &process_cgroup_path);
-    let process_cgroup = create_private_process_cgroup_at(&process_cgroup_path)
-        .map_err(|error| fail(error, None))?;
-    #[cfg(test)]
-    cgroup_confinement_crash_boundary("after-create", &process_cgroup_path);
-    if let Err(error) = confirm_guardian(&mut guardian, process_cgroup.generation()) {
-        return Err(fail(error, Some(process_cgroup)));
-    }
-    #[cfg(test)]
-    cgroup_confinement_crash_boundary("after-guardian-confirm", &process_cgroup_path);
-    if let Err(failure) = std::fs::write(
-        std::path::Path::new(&process_cgroup.generation.path).join("cgroup.procs"),
-        format!("{}\n", expected.pane_pid),
-    ) {
+    if process_cgroup_path.exists() {
         return Err(fail(
-            error(
-                "stopped candidate could not enter its private cgroup",
-                failure.raw_os_error(),
-            ),
-            Some(process_cgroup),
+            error("candidate scope path existed before systemd creation", None),
+            None,
         ));
     }
+    #[cfg(test)]
+    if let Some(receipt) = std::env::var_os("T_HUB_CGROUP_PRECREATE_PATH_RECEIPT") {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(&process_cgroup_path).unwrap();
+        std::fs::write(receipt, process_cgroup_path.to_string_lossy().as_bytes()).unwrap();
+    }
+    #[cfg(test)]
+    if std::env::var_os("T_HUB_CGROUP_GUARDIAN_ARM_FAILURE").is_some() {
+        return Err(fail(
+            error("injected systemd scope creation failure", None),
+            None,
+        ));
+    }
+    let guardian =
+        SystemdProcessScopeGuardian::create(&unit, expected.pane_pid, &process_cgroup_path)
+            .map_err(|error| fail(error, None))?;
+    #[cfg(test)]
+    cgroup_confinement_crash_boundary("after-create", &process_cgroup_path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let process_cgroup = loop {
+        let metadata = std::fs::metadata(&process_cgroup_path);
+        let membership = process_membership(expected.pane_pid);
+        if let (Ok(metadata), Ok(membership)) = (metadata, membership) {
+            use std::os::unix::fs::MetadataExt;
+
+            let expected_membership = process_cgroup_path
+                .strip_prefix("/sys/fs/cgroup")
+                .ok()
+                .and_then(std::path::Path::to_str)
+                .map(|relative| format!("/{relative}"));
+            let tasks = std::fs::read_to_string(process_cgroup_path.join("cgroup.procs"));
+            let exact_task = tasks.is_ok_and(|tasks| {
+                let tasks = tasks
+                    .lines()
+                    .filter_map(|task| task.trim().parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                tasks == [expected.pane_pid]
+            });
+            if expected_membership.as_deref() == Some(membership.as_str())
+                && exact_task
+                && metadata.uid() == unsafe { libc::geteuid() }
+            {
+                break PrivateProcessCgroup {
+                    generation: ProcessCgroupGeneration {
+                        path: process_cgroup_path.to_string_lossy().into_owned(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                };
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(fail(
+                error("systemd scope ownership did not become exact", None),
+                None,
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    #[cfg(test)]
+    cgroup_confinement_crash_boundary("after-guardian-confirm", &process_cgroup_path);
     let still_exact = pane_generation_exact(name).ok() == Some(expected)
         && process_state_start(expected.pane_pid).is_ok_and(|identity| {
             identity.1 == blocked_start_ticks && !matches!(identity.0, 'Z' | 'X' | 'x')
@@ -1883,6 +2056,7 @@ where
             (unsafe { libc::poll(&mut poll, 1, 0) }) == 1 && poll.revents & libc::POLLIN != 0
         }
 
+        #[cfg(test)]
         fn remove_empty_exact_cgroup(
             path: &std::path::Path,
             control_path: &std::path::Path,
@@ -1959,6 +2133,45 @@ where
             })
         }
 
+        fn wait_for_owned_scope_removal(
+            path: &std::path::Path,
+            expected: &ProcessCgroupGeneration,
+        ) -> Result<(), TmuxError> {
+            use std::os::unix::fs::MetadataExt;
+
+            for _ in 0..POLL_LIMIT {
+                match std::fs::metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Ok(metadata)
+                        if metadata.dev() == expected.device
+                            && metadata.ino() == expected.inode =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(_) => {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: None,
+                            message: "systemd-owned candidate scope identity was substituted"
+                                .into(),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: error.raw_os_error(),
+                            message: "systemd-owned candidate scope state is unreadable".into(),
+                        });
+                    }
+                }
+            }
+            Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: None,
+                message: "systemd-owned candidate scope removal did not converge".into(),
+            })
+        }
+
         if !is_canonical_private_process_cgroup_path(&process_cgroup.path) {
             return Err(TmuxError {
                 op: "kill-session-tree-generation",
@@ -1992,7 +2205,10 @@ where
         if metadata.dev() != process_cgroup.device || metadata.ino() != process_cgroup.inode {
             return Ok(ExactGenerationKill::GenerationMismatch);
         }
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        let managed_scope = is_systemd_owned_process_scope_path(&process_cgroup.path);
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || !managed_scope && metadata.mode() & 0o077 != 0
+        {
             return Err(TmuxError {
                 op: "kill-session-tree-generation",
                 code: None,
@@ -2233,14 +2449,30 @@ where
                 });
             }
             drop(pinned);
-            if path.exists() {
+            if managed_scope {
+                #[cfg(test)]
+                run_cgroup_cleanup_test_hook(CgroupCleanupTestPoint::BeforeOwnedScopeRemovalWait)?;
+                wait_for_owned_scope_removal(path, process_cgroup)?;
+            } else if path.exists() {
                 thaw(&control_path)?;
+                #[cfg(test)]
                 remove_empty_exact_cgroup(path, &control_path, process_cgroup)?;
+                #[cfg(not(test))]
+                return Err(TmuxError {
+                    op: "kill-session-tree-generation",
+                    code: None,
+                    message: "legacy candidate cgroup requires incompatible recovery".into(),
+                });
             }
             Ok(())
         })();
         if let Err(error) = result {
-            let thaw_error = thaw(&control_path).err();
+            let should_thaw = !managed_scope
+                || std::fs::metadata(path).is_ok_and(|metadata| {
+                    metadata.dev() == process_cgroup.device
+                        && metadata.ino() == process_cgroup.inode
+                });
+            let thaw_error = should_thaw.then(|| thaw(&control_path).err()).flatten();
             return Err(thaw_error.unwrap_or(error));
         }
         post_reap();
@@ -2630,12 +2862,13 @@ mod tests {
     fn wait_for_exact_cgroup_member(pid: u32, cgroup: &ProcessCgroupGeneration) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if process_is_in_exact_cgroup(pid, cgroup).unwrap_or(false) {
+            let exact_membership = process_is_in_exact_cgroup(pid, cgroup);
+            if exact_membership.as_ref().is_ok_and(|exact| *exact) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "process did not join its private cgroup: process_membership={:?} cgroup_tasks={:?} cmdline={:?}",
+                "process did not join its private cgroup: expected={cgroup:?} exact_membership={exact_membership:?} process_membership={:?} cgroup_tasks={:?} cmdline={:?}",
                 std::fs::read_to_string(format!("/proc/{pid}/cgroup")),
                 std::fs::read_to_string(
                     std::path::Path::new(&cgroup.path).join("cgroup.procs")
@@ -3468,21 +3701,26 @@ mod tests {
         let _anchor = TmuxTestsAnchorGuard::new();
         let target = TestSession::new();
         create_shell_session_after_final_teardown(&target.name);
-        let cgroup = create_private_process_cgroup().unwrap();
         let expected = pane_generation_exact(&target.name).unwrap();
-        std::fs::write(
-            std::path::Path::new(&cgroup.generation().path).join("cgroup.procs"),
-            format!("{}\n", expected.pane_pid),
-        )
-        .unwrap();
-        wait_for_exact_cgroup_member(expected.pane_pid, cgroup.generation());
+        let (cgroup, mut guardian) = confine_blocked_pane_to_private_cgroup(&target.name, expected)
+            .unwrap_or_else(|failure| {
+                panic!("scope confinement failed: {}", failure.error.message)
+            });
+        guardian.disarm().unwrap();
         let original = cgroup.generation().clone();
         let replacement_identity = std::rc::Rc::new(std::cell::RefCell::new(None));
         let replacement_from_hook = replacement_identity.clone();
         let replacement_path = original.path.clone();
         let hook = CgroupCleanupHookGuard::install(move |point| {
-            if point == CgroupCleanupTestPoint::BeforeRemove {
-                std::fs::remove_dir(&replacement_path).unwrap();
+            if point == CgroupCleanupTestPoint::BeforeOwnedScopeRemovalWait {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::path::Path::new(&replacement_path).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "systemd did not remove its exact owned scope"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 let mut builder = std::fs::DirBuilder::new();
                 builder.mode(0o700).create(&replacement_path).unwrap();
                 let metadata = std::fs::metadata(&replacement_path).unwrap();
@@ -3494,7 +3732,11 @@ mod tests {
             kill_session_tree_exact_generation(&target.name, expected, Some(cgroup.generation()))
                 .unwrap_err();
         drop(hook);
-        assert!(!error.message.is_empty());
+        assert!(
+            error.message.contains("substituted"),
+            "unexpected cleanup error: {}",
+            error.message
+        );
         let metadata = std::fs::metadata(&original.path).unwrap();
         let replacement = replacement_identity.borrow().unwrap();
         assert_eq!((metadata.dev(), metadata.ino()), replacement);

@@ -259,7 +259,7 @@ pub(crate) struct PreparedHarnessProviderProcessLaunch {
     credential_handoff: AnonymousCredentialHandoff,
     launch_gate: AnonymousLaunchGate,
     #[cfg(target_os = "linux")]
-    containment_cleanup: PrePersistenceCgroupCleanup,
+    containment_guardian: crate::tmux::SystemdProcessScopeGuardian,
     persistence_confirmed: bool,
     #[cfg(target_os = "linux")]
     process_cgroup: crate::tmux::PrivateProcessCgroup,
@@ -285,168 +285,6 @@ struct AnonymousLaunchGate {
     _ready_writer: std::fs::File,
     release_path: PathBuf,
     ready_path: PathBuf,
-}
-
-#[cfg(target_os = "linux")]
-struct PrePersistenceCgroupCleanup {
-    writer: Option<std::process::ChildStdin>,
-    reader: std::io::BufReader<std::process::ChildStdout>,
-    child: Option<std::process::Child>,
-}
-
-#[cfg(target_os = "linux")]
-impl PrePersistenceCgroupCleanup {
-    fn arm(path: &std::path::Path) -> Result<Self, LaunchAttestationError> {
-        use std::io::BufRead;
-        use std::process::Stdio;
-
-        const CLEANUP: &str = r#"
-cgroup_path=$1
-owner_pid=$2
-owner_start=$3
-printf 'ready\n'
-i=0
-while [ "$i" -lt 300 ]; do
-  if [ -d "$cgroup_path" ]; then
-    owned_identity=$(/usr/bin/stat -c '%d:%i' -- "$cgroup_path") || exit 71
-    printf 'owned %s\n' "$owned_identity"
-    break
-  fi
-  owner_stat=$(/usr/bin/cat "/proc/$owner_pid/stat" 2>/dev/null) || exit 0
-  owner_suffix=${owner_stat##*) }
-  set -- $owner_suffix
-  shift 19
-  [ "${1:-}" = "$owner_start" ] || exit 0
-  i=$((i + 1))
-  /bin/sleep 0.01
-done
-[ "$i" -lt 300 ] || exit 76
-if IFS= read -r state; then
-  [ "$state" = persisted ] && exit 0
-  exit 70
-fi
-i=0
-while [ "$i" -lt 300 ]; do
-  [ -d "$cgroup_path" ] || exit 0
-  identity=$(/usr/bin/stat -c '%d:%i' -- "$cgroup_path") || exit 71
-  [ "$identity" = "$owned_identity" ] || exit 72
-  child=$(/usr/bin/find "$cgroup_path" -mindepth 1 -type d -print -quit) || exit 73
-  [ -z "$child" ] || exit 74
-  tasks=$(/usr/bin/cat "$cgroup_path/cgroup.procs") || exit 75
-  if [ -z "$tasks" ] && /bin/rmdir -- "$cgroup_path"; then
-    exit 0
-  fi
-  i=$((i + 1))
-  /bin/sleep 0.01
-done
-exit 76
-"#;
-        let path = path.to_string_lossy().into_owned();
-        let owner_pid = std::process::id().to_string();
-        let owner_stat = std::fs::read_to_string("/proc/self/stat")
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        let owner_suffix = owner_stat
-            .rsplit_once(')')
-            .map(|(_, suffix)| suffix.trim())
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
-        let owner_start = owner_suffix
-            .split_whitespace()
-            .nth(19)
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?
-            .to_string();
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                CLEANUP,
-                "t-hub-cgroup-sentinel",
-                &path,
-                &owner_pid,
-                &owner_start,
-            ])
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        let writer = child
-            .stdin
-            .take()
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut ready = String::new();
-        reader
-            .read_line(&mut ready)
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        if ready.trim() != "ready" {
-            return Err(LaunchAttestationError::UnreadableEvidence);
-        }
-        Ok(Self {
-            writer: Some(writer),
-            reader,
-            child: Some(child),
-        })
-    }
-
-    fn confirm_created(
-        &mut self,
-        generation: &crate::tmux::ProcessCgroupGeneration,
-    ) -> Result<(), LaunchAttestationError> {
-        use std::io::BufRead;
-
-        let mut owned = String::new();
-        self.reader
-            .read_line(&mut owned)
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        let expected = format!("owned {}:{}", generation.device, generation.inode);
-        if owned.trim() != expected {
-            return Err(LaunchAttestationError::UnreadableEvidence);
-        }
-        Ok(())
-    }
-
-    fn disarm(&mut self) -> Result<(), LaunchAttestationError> {
-        use std::io::Write;
-
-        let mut writer = self
-            .writer
-            .take()
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
-        writer
-            .write_all(b"persisted\n")
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        drop(writer);
-        let status = self
-            .child
-            .take()
-            .ok_or(LaunchAttestationError::UnreadableEvidence)?
-            .wait()
-            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-        if !status.success() {
-            return Err(LaunchAttestationError::UnreadableEvidence);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for PrePersistenceCgroupCleanup {
-    fn drop(&mut self) {
-        drop(self.writer.take());
-        if let Some(mut child) = self.child.take() {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -696,9 +534,10 @@ impl OpenedHarnessProviderLaunch {
         let credential_handoff = AnonymousCredentialHandoff::create(env)?;
         // The credential-free bootstrap announces that it is blocked on this
         // anonymous gate. T-Hub then waits for tmux/systemd scope settlement,
-        // moves the exact pidfd generation into a private child cgroup, and only
-        // then releases the gate. A parent crash closes both pipes, so the
-        // bootstrap exits without ever opening the credential pipe.
+        // moves the exact pidfd generation into a systemd-owned transient scope,
+        // and only then releases the gate. A parent crash closes both pipes, so
+        // the bootstrap exits without ever opening the credential pipe and
+        // systemd removes the now-empty scope.
         let mut launch_gate = AnonymousLaunchGate::create()?;
         let launch_command =
             credential_handoff.launch_command(&alias, command_tail, Some(&launch_gate));
@@ -709,36 +548,8 @@ impl OpenedHarnessProviderLaunch {
         *failure_generation = terminal_generation_receipt_from_pane(tmux_target, respawn.after);
         launch_gate.wait_ready()?;
         #[cfg(target_os = "linux")]
-        let (process_cgroup, containment_cleanup) =
-            match crate::tmux::confine_blocked_pane_to_private_cgroup(
-                tmux_target,
-                respawn.after,
-                |path| {
-                    #[cfg(test)]
-                    if std::env::var_os("T_HUB_CGROUP_GUARDIAN_ARM_FAILURE").is_some() {
-                        return Err(crate::tmux::TmuxError {
-                            op: "arm-cgroup-guardian",
-                            code: None,
-                            message: "injected private cgroup guardian arm failure".into(),
-                        });
-                    }
-                    PrePersistenceCgroupCleanup::arm(path).map_err(|_| crate::tmux::TmuxError {
-                        op: "arm-cgroup-guardian",
-                        code: None,
-                        message: "private cgroup guardian could not be armed".into(),
-                    })
-                },
-                |guardian, generation| {
-                    guardian
-                        .confirm_created(generation)
-                        .map_err(|_| crate::tmux::TmuxError {
-                            op: "confirm-cgroup-guardian",
-                            code: None,
-                            message: "private cgroup guardian could not acquire exact ownership"
-                                .into(),
-                        })
-                },
-            ) {
+        let (process_cgroup, containment_guardian) =
+            match crate::tmux::confine_blocked_pane_to_private_cgroup(tmux_target, respawn.after) {
                 Ok(result) => result,
                 Err(failure) => {
                     if let Some(process_cgroup) = failure.process_cgroup {
@@ -770,7 +581,7 @@ impl OpenedHarnessProviderLaunch {
             credential_handoff,
             launch_gate,
             #[cfg(target_os = "linux")]
-            containment_cleanup,
+            containment_guardian,
             persistence_confirmed: false,
             #[cfg(target_os = "linux")]
             process_cgroup,
@@ -834,9 +645,9 @@ impl PreparedHarnessProviderProcessLaunch {
         let (provider, terminal) = self.spawn_receipts();
         persist(provider, terminal)?;
         #[cfg(target_os = "linux")]
-        self.containment_cleanup
+        self.containment_guardian
             .disarm()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.message)?;
         #[cfg(not(target_os = "linux"))]
         return Err("durable contained launch is unsupported on this host".into());
         self.persistence_confirmed = true;
@@ -4330,8 +4141,8 @@ mod tests {
             .unwrap()
             .path
             .clone();
-        assert!(process_cgroup_path.contains("/app.slice/app-tmux.slice/tmux-spawn-"));
-        assert!(process_cgroup_path.contains(".scope/t-hub-cortana-"));
+        assert!(process_cgroup_path.contains("/app.slice/t-hub-cortana-"));
+        assert!(process_cgroup_path.ends_with(".scope"));
         assert_eq!(std::fs::read_to_string(&proof).unwrap(), "trusted-received");
         assert_eq!(
             provider_receipt.into_persisted().provider_executable_inode,
@@ -4470,6 +4281,10 @@ mod tests {
             assert!(prepared.is_err());
             std::process::exit(94);
         }
+        if std::env::var_os("T_HUB_CGROUP_PRECREATE_PATH_RECEIPT").is_some() {
+            assert!(prepared.is_err());
+            std::process::exit(95);
+        }
         let prepared = prepared.unwrap();
         let (_, terminal) = prepared.spawn_receipts();
         std::fs::write(
@@ -4592,6 +4407,15 @@ mod tests {
                 !std::path::Path::new(&stage_cgroup).exists(),
                 "{stage} left an unowned private cgroup"
             );
+            if stage == "after-guardian-confirm" {
+                std::fs::create_dir(&stage_cgroup).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(
+                    std::path::Path::new(&stage_cgroup).exists(),
+                    "systemd removed a same-name post-confirm replacement"
+                );
+                std::fs::remove_dir(&stage_cgroup).unwrap();
+            }
             assert!(!proof.exists(), "{stage} released provider credentials");
         }
 
@@ -4626,6 +4450,37 @@ mod tests {
             crate::tmux::session_liveness(&arm_failure_target),
             crate::tmux::SessionLiveness::Gone
         );
+        assert!(!proof.exists());
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let precreate_target = format!("th_guardian_pre_{}", &suffix[..8]);
+        let precreate_receipt = temp.path().join("precreated-cgroup-path");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "harness::tests::contained_launch_parent_crash_helper",
+                "--nocapture",
+            ])
+            .env("T_HUB_CONTAINED_PARENT_CRASH_HELPER", "1")
+            .env("T_HUB_CONTAINED_ROOT", temp.path())
+            .env("T_HUB_CONTAINED_LAUNCHER", &launcher)
+            .env("T_HUB_CONTAINED_TARGET", &precreate_target)
+            .env(
+                "T_HUB_CONTAINED_RECEIPT",
+                temp.path().join("unused-precreate.json"),
+            )
+            .env("T_HUB_CGROUP_PRECREATE_PATH_RECEIPT", &precreate_receipt)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(95));
+        let precreated = std::fs::read_to_string(precreate_receipt).unwrap();
+        assert!(
+            std::path::Path::new(&precreated).exists(),
+            "failed scope creation removed a foreign precreated cgroup"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(std::path::Path::new(&precreated).exists());
+        std::fs::remove_dir(precreated).unwrap();
         assert!(!proof.exists());
     }
 
