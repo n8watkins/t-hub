@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const BROKER_SCHEMA_VERSION: u32 = 1;
+pub const BROKER_JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ID: usize = 128;
 pub const MAX_POLICY_VALUE: usize = 128;
 pub const MAX_VERSION: usize = 256;
@@ -138,16 +139,16 @@ pub struct ValidatedBrokerRequest {
     pub policy: ProtectedPolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableBrokerOperation {
-    pub request_digest: String,
-    pub scope: CortanaScopeBinding,
-    pub candidate: CandidateGeneration,
+    pub request: CortanaBrokerRequest,
     pub phase: DurableBrokerPhase,
     pub receipt: Option<BrokerLaunchReceipt>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DurableBrokerPhase {
     Prepared,
     Contained,
@@ -155,7 +156,15 @@ pub enum DurableBrokerPhase {
     CleanupPending,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrokerJournalSnapshot {
+    pub schema_version: u32,
+    pub authority_generation: u64,
+    pub operations: BTreeMap<String, DurableBrokerOperation>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FakeBrokerJournal {
     operations: BTreeMap<String, DurableBrokerOperation>,
     authority_generation: u64,
@@ -221,32 +230,30 @@ impl FakeBrokerJournal {
     ) -> Result<DurableBrokerOperation, BrokerRefusal> {
         let request = validated.request;
         if let Some(existing) = self.operations.get(&request.operation_id) {
-            if existing.request_digest != request.request_digest {
+            if existing.request.request_digest != request.request_digest {
                 return Err(BrokerRefusal::DigestConflict);
             }
             return Ok(existing.clone());
         }
         if let Some(existing) = self.operations.values().find(|existing| {
-            existing.scope.cortana_identity_id == request.scope.cortana_identity_id
-                && existing.scope.project_id == request.scope.project_id
+            existing.request.scope.cortana_identity_id == request.scope.cortana_identity_id
+                && existing.request.scope.project_id == request.scope.project_id
                 && existing.phase != DurableBrokerPhase::CleanupPending
         }) {
-            if existing.scope != request.scope {
+            if existing.request.scope != request.scope {
                 return Err(BrokerRefusal::ScopeConflict);
             }
-            if existing.candidate != request.candidate {
+            if existing.request.candidate != request.candidate {
                 return Err(BrokerRefusal::CandidateMismatch);
             }
         }
         let operation = DurableBrokerOperation {
-            request_digest: request.request_digest.clone(),
-            scope: request.scope,
-            candidate: request.candidate,
+            request,
             phase: DurableBrokerPhase::Prepared,
             receipt: None,
         };
         self.operations
-            .insert(request.operation_id, operation.clone());
+            .insert(operation.request.operation_id.clone(), operation.clone());
         Ok(operation)
     }
 
@@ -262,7 +269,7 @@ impl FakeBrokerJournal {
             .operations
             .get_mut(operation_id)
             .ok_or(BrokerRefusal::Malformed)?;
-        if operation.request_digest != request_digest {
+        if operation.request.request_digest != request_digest {
             return Err(BrokerRefusal::DigestConflict);
         }
         if let Some(receipt) = &operation.receipt {
@@ -282,8 +289,8 @@ impl FakeBrokerJournal {
             broker_generation: self.authority_generation,
             cgroup_device,
             cgroup_inode,
-            candidate_pid: operation.candidate.pid,
-            candidate_start_ticks: operation.candidate.start_ticks,
+            candidate_pid: operation.request.candidate.pid,
+            candidate_start_ticks: operation.request.candidate.start_ticks,
             executable_device: policy.executable_device,
             executable_inode: policy.executable_inode,
             executable_version: policy.executable_version.clone(),
@@ -302,7 +309,7 @@ impl FakeBrokerJournal {
             .operations
             .get_mut(operation_id)
             .ok_or(BrokerRefusal::Malformed)?;
-        if operation.request_digest != request_digest {
+        if operation.request.request_digest != request_digest {
             return Err(BrokerRefusal::DigestConflict);
         }
         match operation.phase {
@@ -326,6 +333,60 @@ impl FakeBrokerJournal {
 
     pub fn operation(&self, operation_id: &str) -> Option<&DurableBrokerOperation> {
         self.operations.get(operation_id)
+    }
+
+    pub fn snapshot(&self) -> BrokerJournalSnapshot {
+        BrokerJournalSnapshot {
+            schema_version: BROKER_JOURNAL_SCHEMA_VERSION,
+            authority_generation: self.authority_generation,
+            operations: self.operations.clone(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: BrokerJournalSnapshot) -> Result<Self, BrokerRefusal> {
+        if snapshot.schema_version != BROKER_JOURNAL_SCHEMA_VERSION {
+            return Err(BrokerRefusal::Malformed);
+        }
+        let mut max_generation = 0_u64;
+        let mut generations = std::collections::BTreeSet::new();
+        for (operation_id, operation) in &snapshot.operations {
+            if operation_id != &operation.request.operation_id
+                || operation.request.canonical_digest()? != operation.request.request_digest
+                || !valid_operation_id(operation_id)
+            {
+                return Err(BrokerRefusal::Malformed);
+            }
+            match operation.phase {
+                DurableBrokerPhase::Prepared
+                | DurableBrokerPhase::Contained
+                | DurableBrokerPhase::CleanupPending => {
+                    if operation.receipt.is_some() {
+                        return Err(BrokerRefusal::Malformed);
+                    }
+                }
+                DurableBrokerPhase::Committed => {
+                    let receipt = operation.receipt.as_ref().ok_or(BrokerRefusal::Malformed)?;
+                    if receipt.schema_version != BROKER_SCHEMA_VERSION
+                        || receipt.operation_id != *operation_id
+                        || receipt.request_digest != operation.request.request_digest
+                        || receipt.candidate_pid != operation.request.candidate.pid
+                        || receipt.candidate_start_ticks != operation.request.candidate.start_ticks
+                        || receipt.broker_generation == 0
+                        || !generations.insert(receipt.broker_generation)
+                    {
+                        return Err(BrokerRefusal::Malformed);
+                    }
+                    max_generation = max_generation.max(receipt.broker_generation);
+                }
+            }
+        }
+        if max_generation > snapshot.authority_generation {
+            return Err(BrokerRefusal::Malformed);
+        }
+        Ok(Self {
+            operations: snapshot.operations,
+            authority_generation: snapshot.authority_generation,
+        })
     }
 }
 
@@ -576,6 +637,59 @@ mod tests {
         assert_eq!(
             journal.mark_contained(&request.operation_id, &request.request_digest),
             Err(BrokerRefusal::CleanupPending)
+        );
+    }
+
+    #[test]
+    fn journal_snapshot_roundtrips_committed_response_loss_and_rejects_tampering() {
+        let (request, peer, policy) = fixture();
+        let validated = request.validate(&peer, &policy).unwrap();
+        let protected_runtime = validated.policy.clone();
+        let mut journal = FakeBrokerJournal::default();
+        journal.prepare(validated).unwrap();
+        journal
+            .mark_contained(&request.operation_id, &request.request_digest)
+            .unwrap();
+        let receipt = journal
+            .commit(
+                &request.operation_id,
+                &request.request_digest,
+                50,
+                60,
+                &protected_runtime,
+            )
+            .unwrap();
+        let encoded = serde_json::to_vec(&journal.snapshot()).unwrap();
+        let restored = FakeBrokerJournal::from_snapshot(
+            serde_json::from_slice::<BrokerJournalSnapshot>(&encoded).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .operation(&request.operation_id)
+                .unwrap()
+                .receipt
+                .as_ref(),
+            Some(&receipt)
+        );
+
+        let mut tampered = journal.snapshot();
+        tampered
+            .operations
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .request
+            .scope
+            .terminal_id = "replacement".into();
+        assert_eq!(
+            FakeBrokerJournal::from_snapshot(tampered),
+            Err(BrokerRefusal::Malformed)
+        );
+        let mut future = journal.snapshot();
+        future.schema_version += 1;
+        assert_eq!(
+            FakeBrokerJournal::from_snapshot(future),
+            Err(BrokerRefusal::Malformed)
         );
     }
 }
