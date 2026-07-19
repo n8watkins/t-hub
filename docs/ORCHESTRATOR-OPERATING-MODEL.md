@@ -131,6 +131,7 @@ A context reset recommendation should follow a safe turn boundary and require a 
 Resetting context preserves the Captain, Assignment, Workspaces, Crew, and Powder bindings.
 Cortana candidate cleanup is journaled with the complete canonical tmux session and pane generation before any cleanup effect runs.
 A same-named replacement, unreadable generation, ambiguous liveness, cleanup error, or persistence failure leaves recovery in CleanupPending and never authorizes a name-only kill or allocation revocation.
+On Linux, cleanup revalidates the tmux generation after opening exact process handles and signals only those pinned pane and descendant handles, so no destructive step can rebind to a replacement session name.
 
 ## Protected Provider Provisioning
 

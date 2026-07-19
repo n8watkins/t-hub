@@ -963,14 +963,24 @@ tmux -L {sock} kill-session -t '{name}'",
 
 /// Kill only the exact tmux generation previously attested for `name`.
 ///
-/// The generation comparison and process-tree reap run in one shell command.
-/// A same-named replacement cannot be created while the matched session still
-/// exists, and a replacement already present fails the comparison before any
-/// signal is sent.
+/// Linux pidfds pin the observed pane process and each discovered descendant
+/// before any signal is sent. No destructive operation targets the tmux name
+/// after the generation can disappear or rebind.
 pub(crate) fn kill_session_tree_exact_generation(
     name: &str,
     expected: PaneGeneration,
 ) -> Result<ExactGenerationKill, TmuxError> {
+    kill_session_tree_exact_generation_with_post_reap(name, expected, || {})
+}
+
+fn kill_session_tree_exact_generation_with_post_reap<F>(
+    name: &str,
+    expected: PaneGeneration,
+    post_reap: F,
+) -> Result<ExactGenerationKill, TmuxError>
+where
+    F: FnOnce(),
+{
     if name.is_empty()
         || name.len() > 128
         || !name
@@ -983,58 +993,131 @@ pub(crate) fn kill_session_tree_exact_generation(
             message: "exact tmux session name is malformed".into(),
         });
     }
-    let expected = format!(
-        "${}|{}|@{}|%{}|{}",
-        expected.session_id,
-        expected.session_created,
-        expected.window_id,
-        expected.pane_id,
-        expected.pane_pid
-    );
-    let script = format!(
-        "actual=$(tmux -L {sock} list-panes -t '={name}:' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}' 2>/dev/null) || exit 42; \
-[ \"$actual\" = '{expected}' ] || exit 43; \
-for pid in $(tmux -L {sock} list-panes -t '={name}:' -F '#{{pane_pid}}'); do \
-l1=$(pgrep -P \"$pid\" 2>/dev/null); \
-l2=$(for k in $l1; do pgrep -P \"$k\" 2>/dev/null; done); \
-l3=$(for k in $l2; do pgrep -P \"$k\" 2>/dev/null; done); \
-kill -9 $pid $l1 $l2 $l3 2>/dev/null; \
-done; \
-tmux -L {sock} kill-session -t '={name}'",
-        sock = socket(),
-        name = name,
-        expected = expected,
-    );
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
-            TmuxError {
-                op: "kill-session-tree-generation",
-                code: None,
-                message: format!("failed to spawn tmux: {error}"),
-            }
-        })?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if is_already_gone(&stderr) {
-        return Ok(ExactGenerationKill::Killed);
+    #[cfg(target_os = "linux")]
+    {
+        kill_linux_process_generation(name, expected, post_reap)
     }
-    match output.status.code() {
-        Some(0) => Ok(ExactGenerationKill::Killed),
-        Some(42) => match session_liveness(name) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (name, expected, post_reap);
+        Err(TmuxError {
+            op: "kill-session-tree-generation",
+            code: None,
+            message: "exact generation cleanup is unsupported on this platform".into(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_linux_process_generation<F>(
+    name: &str,
+    expected: PaneGeneration,
+    post_reap: F,
+) -> Result<ExactGenerationKill, TmuxError>
+where
+    F: FnOnce(),
+{
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn unavailable(name: &str) -> Result<ExactGenerationKill, TmuxError> {
+        match session_liveness(name) {
             SessionLiveness::Gone => Ok(ExactGenerationKill::Gone),
             SessionLiveness::Alive => Ok(ExactGenerationKill::GenerationMismatch),
             SessionLiveness::Unknown => Err(TmuxError {
                 op: "kill-session-tree-generation",
-                code: Some(42),
+                code: None,
                 message: "exact tmux generation became unreadable".into(),
             }),
-        },
-        Some(43) => Ok(ExactGenerationKill::GenerationMismatch),
-        code => Err(TmuxError {
-            op: "kill-session-tree-generation",
-            code,
-            message: stderr.trim().to_string(),
-        }),
+        }
     }
+
+    fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor as i32) })
+    }
+
+    fn signal_pidfd(descriptor: &OwnedFd) -> std::io::Result<()> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                descriptor.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    match pane_generation_exact(name) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => return Ok(ExactGenerationKill::GenerationMismatch),
+        Err(_) => return unavailable(name),
+    }
+    let root = match open_pidfd(expected.pane_pid) {
+        Ok(root) => root,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return unavailable(name),
+        Err(error) => {
+            return Err(TmuxError {
+                op: "kill-session-tree-generation",
+                code: error.raw_os_error(),
+                message: format!("exact pane pidfd could not be opened: {error}"),
+            });
+        }
+    };
+    match pane_generation_exact(name) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => return Ok(ExactGenerationKill::GenerationMismatch),
+        Err(_) => return unavailable(name),
+    }
+
+    let mut pinned = vec![(expected.pane_pid, root)];
+    let mut seen = std::collections::HashSet::from([expected.pane_pid]);
+    let mut cursor = 0;
+    while cursor < pinned.len() {
+        let pid = pinned[cursor].0;
+        cursor += 1;
+        let children =
+            std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        for child in children
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u32>().ok())
+        {
+            if seen.insert(child) {
+                match open_pidfd(child) {
+                    Ok(descriptor) => pinned.push((child, descriptor)),
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => {
+                        return Err(TmuxError {
+                            op: "kill-session-tree-generation",
+                            code: error.raw_os_error(),
+                            message: format!(
+                                "candidate descendant pidfd could not be opened: {error}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for (_, descriptor) in pinned.iter().rev() {
+        signal_pidfd(descriptor).map_err(|error| TmuxError {
+            op: "kill-session-tree-generation",
+            code: error.raw_os_error(),
+            message: format!("exact candidate pidfd signal failed: {error}"),
+        })?;
+    }
+    post_reap();
+    Ok(ExactGenerationKill::Killed)
 }
 
 /// List all session names on the `t-hub` socket.
@@ -1530,19 +1613,29 @@ mod tests {
             return;
         }
         let _anchor = TmuxTestsAnchorGuard::new();
-        let mut target = TestSession::new();
+        let target = TestSession::new();
         create_shell_session_after_final_teardown(&target.name);
         let incumbent = pane_generation_exact(&target.name).unwrap();
+        let replacement = std::cell::Cell::new(None);
         assert_eq!(
-            kill_session_tree_exact_generation(&target.name, incumbent).unwrap(),
+            kill_session_tree_exact_generation_with_post_reap(&target.name, incumbent, || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while session_liveness(&target.name) != SessionLiveness::Gone {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "old exact generation did not disappear before replacement barrier"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                create_shell_session_after_final_teardown(&target.name);
+                replacement.set(Some(pane_generation_exact(&target.name).unwrap()));
+            })
+            .unwrap(),
             ExactGenerationKill::Killed
         );
-        target.closed = true;
-
-        create_shell_session_after_final_teardown(&target.name);
-        target.closed = false;
-        let replacement = pane_generation_exact(&target.name).unwrap();
+        let replacement = replacement.get().unwrap();
         assert_ne!(replacement, incumbent);
+        assert_eq!(pane_generation_exact(&target.name).unwrap(), replacement);
         assert_eq!(
             kill_session_tree_exact_generation(&target.name, incumbent).unwrap(),
             ExactGenerationKill::GenerationMismatch

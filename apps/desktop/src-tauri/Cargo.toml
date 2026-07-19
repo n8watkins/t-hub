@@ -132,6 +132,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # The shared agent⇄core NDJSON contract (workspace member).
 t-hub-protocol = { path = "crates/t-hub-protocol" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Windows-only: direct Win32 access to subclass the frameless main window and
 # answer WM_NCHITTEST, restoring Windows 11 Snap Layouts (the hover-the-maximize
 # flyout) + native edge-resize (src/win_snap.rs). Pinned to 0.61 to unify with
