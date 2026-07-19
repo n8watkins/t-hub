@@ -130,6 +130,32 @@ Cortana may receive event-driven notifications when:
 A context reset recommendation should follow a safe turn boundary and require a durable checkpoint.
 Resetting context preserves the Captain, Assignment, Workspaces, Crew, and Powder bindings.
 
+## Protected Provider Provisioning
+
+User-managed launchers such as `~/.bun/bin/codex` and `~/.npm-global/bin/claude` are discovery hints rather than runtime launch authority.
+An installer may make one of those launchers usable by copying the complete provider package into a root-owned, non-group-writable, non-world-writable snapshot and writing a root-owned `/etc/t-hub/provider-catalog.json` mapping.
+T-Hub launches only the protected snapshot through its exact opened file descriptor and keeps the catalog, manifest, executable, and every protected path component bound through launch attestation.
+T-Hub fails closed without modifying the user installation when the catalog is absent, malformed, ambiguous, oversized, writable, version-skewed, or points at an unprotected package.
+
+The version 1 catalog shape is:
+
+```json
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "provider": "codex",
+      "sourceLauncher": "/home/operator/.bun/bin/codex",
+      "protectedLauncher": "/opt/t-hub/providers/bin/codex",
+      "protectedPackageRoot": "/opt/t-hub/providers/lib/node_modules"
+    }
+  ]
+}
+```
+
+Each provider may appear at most once, every path must be absolute, and the protected launcher must resolve to the provider-native package path declared by its protected package manifest.
+The catalog contains no credentials or provider session identifiers.
+
 ## Retirement Policy
 
 Cortana may retire a Captain when:

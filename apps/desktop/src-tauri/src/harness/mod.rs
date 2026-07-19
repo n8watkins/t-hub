@@ -565,7 +565,7 @@ impl std::fmt::Display for LaunchAttestationError {
                 "the provider-native process ancestry changed during launch acceptance"
             }
             Self::UntrustedUserInstall => {
-                "user-managed provider install requires protected catalog provenance"
+                "user-managed provider install is not launch authority; provision a protected package snapshot and root-owned /etc/t-hub/provider-catalog.json mapping"
             }
         };
         f.write_str(message)
@@ -1091,6 +1091,26 @@ struct ProviderInstallLayout {
     require_protected_ownership: bool,
 }
 
+const PROTECTED_PROVIDER_CATALOG_PATH: &str = "/etc/t-hub/provider-catalog.json";
+const MAX_PROTECTED_PROVIDER_CATALOG_BYTES: u64 = 64 * 1024;
+const MAX_PROTECTED_PROVIDER_CATALOG_ENTRIES: usize = 8;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProtectedProviderCatalog {
+    schema_version: u32,
+    providers: Vec<ProtectedProviderCatalogEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProtectedProviderCatalogEntry {
+    provider: String,
+    source_launcher: PathBuf,
+    protected_launcher: PathBuf,
+    protected_package_root: PathBuf,
+}
+
 #[cfg(unix)]
 fn provider_file_identity(
     path: &std::path::Path,
@@ -1129,12 +1149,131 @@ pub(crate) fn observe_provider_launch_receipt(
     provider_executable: &std::path::Path,
     expected: Harness,
 ) -> Result<OpenedHarnessProviderLaunch, LaunchAttestationError> {
-    observe_provider_launch_receipt_with_layouts(
+    match observe_provider_launch_receipt_with_layouts(
         provider_executable,
         expected,
         &trusted_provider_install_layouts(),
         || {},
+    ) {
+        Err(LaunchAttestationError::UntrustedUserInstall) => {
+            observe_provisioned_provider_launch_receipt(
+                provider_executable,
+                expected,
+                std::path::Path::new(PROTECTED_PROVIDER_CATALOG_PATH),
+                &std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .ok_or(LaunchAttestationError::UntrustedUserInstall)?,
+                true,
+            )
+        }
+        result => result,
+    }
+}
+
+fn observe_provisioned_provider_launch_receipt(
+    source_launcher: &std::path::Path,
+    expected: Harness,
+    catalog_path: &std::path::Path,
+    user_home: &std::path::Path,
+    require_protected_ownership: bool,
+) -> Result<OpenedHarnessProviderLaunch, LaunchAttestationError> {
+    let catalog_bindings = bind_provider_path_chain(catalog_path, require_protected_ownership)
+        .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    for binding in &catalog_bindings {
+        binding
+            .revalidate()
+            .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    }
+    let catalog_file = catalog_bindings
+        .last()
+        .ok_or(LaunchAttestationError::UntrustedUserInstall)?
+        .file
+        .try_clone()
+        .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    let catalog = read_protected_provider_catalog(&catalog_file)?;
+    let mut matching = catalog.providers.iter().filter(|entry| {
+        entry.provider == expected.as_provider() && entry.source_launcher == source_launcher
+    });
+    let entry = matching
+        .next()
+        .filter(|_| matching.next().is_none())
+        .ok_or(LaunchAttestationError::UntrustedUserInstall)?;
+    if !entry.source_launcher.is_absolute()
+        || entry
+            .source_launcher
+            .parent()
+            .is_none_or(|parent| !user_managed_provider_launcher_under(parent, user_home))
+        || entry
+            .source_launcher
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(executable_name)
+            != Some(expected.as_provider())
+        || !entry.protected_launcher.is_absolute()
+        || !entry.protected_package_root.is_absolute()
+    {
+        return Err(LaunchAttestationError::UntrustedUserInstall);
+    }
+    let launcher_directory = entry
+        .protected_launcher
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or(LaunchAttestationError::UntrustedUserInstall)?;
+    let package_root = std::fs::canonicalize(&entry.protected_package_root)
+        .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    let layout = ProviderInstallLayout {
+        launcher_directory,
+        package_root,
+        require_protected_ownership,
+    };
+    let mut opened = observe_provider_launch_receipt_with_layouts(
+        &entry.protected_launcher,
+        expected,
+        &[layout],
+        || {},
     )
+    .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    opened.provenance.extend(catalog_bindings);
+    for binding in &opened.provenance {
+        binding.revalidate()?;
+    }
+    Ok(opened)
+}
+
+fn read_protected_provider_catalog(
+    file: &std::fs::File,
+) -> Result<ProtectedProviderCatalog, LaunchAttestationError> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    file.try_clone()
+        .and_then(|mut file| {
+            file.by_ref()
+                .take(MAX_PROTECTED_PROVIDER_CATALOG_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROTECTED_PROVIDER_CATALOG_BYTES {
+        return Err(LaunchAttestationError::UntrustedUserInstall);
+    }
+    let catalog: ProtectedProviderCatalog =
+        serde_json::from_slice(&bytes).map_err(|_| LaunchAttestationError::UntrustedUserInstall)?;
+    if catalog.schema_version != 1
+        || catalog.providers.is_empty()
+        || catalog.providers.len() > MAX_PROTECTED_PROVIDER_CATALOG_ENTRIES
+    {
+        return Err(LaunchAttestationError::UntrustedUserInstall);
+    }
+    let mut providers = std::collections::HashSet::new();
+    let mut sources = std::collections::HashSet::new();
+    if catalog.providers.iter().any(|entry| {
+        !matches!(entry.provider.as_str(), "codex" | "claude")
+            || !providers.insert(entry.provider.as_str())
+            || !sources.insert(entry.source_launcher.as_path())
+    }) {
+        return Err(LaunchAttestationError::UntrustedUserInstall);
+    }
+    Ok(catalog)
 }
 
 fn observe_provider_launch_receipt_with_layouts<F>(
@@ -3103,8 +3242,206 @@ mod tests {
         ));
         assert_eq!(
             LaunchAttestationError::UntrustedUserInstall.to_string(),
-            "user-managed provider install requires protected catalog provenance"
+            "user-managed provider install is not launch authority; provision a protected package snapshot and root-owned /etc/t-hub/provider-catalog.json mapping"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_catalog_maps_authoritative_user_launchers_to_protected_snapshots() {
+        use std::os::unix::fs::symlink;
+
+        for (harness, source_directory) in [
+            (Harness::Codex, ".bun/bin"),
+            (Harness::Claude, ".npm-global/bin"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home/operator");
+            let source_bin = home.join(source_directory);
+            std::fs::create_dir_all(&source_bin).unwrap();
+            let untrusted_package = temp.path().join("untrusted/provider.js");
+            std::fs::create_dir_all(untrusted_package.parent().unwrap()).unwrap();
+            std::fs::write(&untrusted_package, "untrusted").unwrap();
+            let source_launcher = source_bin.join(harness.as_provider());
+            symlink(&untrusted_package, &source_launcher).unwrap();
+
+            let protected_root = temp.path().join("protected");
+            let protected_bin = protected_root.join("bin");
+            let package_root = protected_root.join("lib/node_modules");
+            let package = package_root.join(provider_package_relative_root(harness));
+            let executable = package.join(provider_package_bin_relative_path(harness));
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(&protected_bin).unwrap();
+            std::fs::write(&executable, "protected").unwrap();
+            std::fs::write(
+                package.join("package.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": provider_package_relative_root(harness).to_string_lossy(),
+                    "bin": {
+                        harness.as_provider(): provider_package_bin_relative_path(harness),
+                    },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let protected_launcher = protected_bin.join(harness.as_provider());
+            symlink(&executable, &protected_launcher).unwrap();
+            let catalog_path = temp.path().join("etc/t-hub/provider-catalog.json");
+            std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &catalog_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "providers": [{
+                        "provider": harness.as_provider(),
+                        "sourceLauncher": source_launcher,
+                        "protectedLauncher": protected_launcher,
+                        "protectedPackageRoot": package_root,
+                    }],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let opened = observe_provisioned_provider_launch_receipt(
+                &source_launcher,
+                harness,
+                &catalog_path,
+                &home,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                opened.receipt.resolved_provider_executable,
+                std::fs::canonicalize(&executable)
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            assert_ne!(
+                opened.receipt.resolved_provider_executable,
+                std::fs::canonicalize(&source_launcher)
+                    .unwrap()
+                    .to_string_lossy()
+            );
+            assert!(opened
+                .provenance
+                .iter()
+                .all(|binding| binding.revalidate().is_ok()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_catalog_is_bounded_exact_and_swap_detecting() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home/operator");
+        let source_bin = home.join(".bun/bin");
+        std::fs::create_dir_all(&source_bin).unwrap();
+        let source_launcher = source_bin.join("codex");
+        symlink("missing-user-provider", &source_launcher).unwrap();
+        let protected_root = temp.path().join("protected");
+        let package_root = protected_root.join("lib/node_modules");
+        let package = package_root.join("@openai/codex");
+        let executable = package.join("bin/codex.js");
+        let protected_bin = protected_root.join("bin");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&protected_bin).unwrap();
+        std::fs::write(&executable, "protected").unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let protected_launcher = protected_bin.join("codex");
+        symlink(&executable, &protected_launcher).unwrap();
+        let catalog_path = temp.path().join("etc/t-hub/provider-catalog.json");
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let catalog = serde_json::json!({
+            "schemaVersion": 1,
+            "providers": [{
+                "provider": "codex",
+                "sourceLauncher": source_launcher,
+                "protectedLauncher": protected_launcher,
+                "protectedPackageRoot": package_root,
+            }],
+        });
+        std::fs::write(&catalog_path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let opened = observe_provisioned_provider_launch_receipt(
+            &source_launcher,
+            Harness::Codex,
+            &catalog_path,
+            &home,
+            false,
+        )
+        .unwrap();
+
+        let replacement = catalog_path.with_extension("replacement");
+        std::fs::write(&replacement, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        std::fs::rename(&replacement, &catalog_path).unwrap();
+        assert!(opened.provenance.iter().any(|binding| {
+            matches!(
+                binding.revalidate(),
+                Err(LaunchAttestationError::ProcessChanged)
+            )
+        }));
+        if Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            struct SessionGuard(String);
+            impl Drop for SessionGuard {
+                fn drop(&mut self) {
+                    let _ = crate::tmux::kill_session(&self.0);
+                }
+            }
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let target = format!("th_catalog_swap_{}", &suffix[..8]);
+            crate::tmux::new_session_with_env(&target, "/tmp", Some("sleep 30"), &[]).unwrap();
+            let _guard = SessionGuard(target.clone());
+            assert!(matches!(
+                opened.launch_in_exact_tmux_pane(
+                    Harness::Codex,
+                    &target,
+                    "/tmp",
+                    "codex",
+                    &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+                ),
+                Err(LaunchAttestationError::ProcessChanged)
+            ));
+            assert_eq!(
+                crate::tmux::session_environment_exact(&target, "T_HUB_SESSION_TOKEN").unwrap(),
+                None
+            );
+        }
+
+        for malformed in [
+            serde_json::json!({"schemaVersion": 2, "providers": []}),
+            serde_json::json!({"schemaVersion": 1, "providers": []}),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "providers": [{
+                    "provider": "codex",
+                    "sourceLauncher": home.join("other/bin/codex"),
+                    "protectedLauncher": protected_bin.join("codex"),
+                    "protectedPackageRoot": protected_root.join("lib/node_modules"),
+                }],
+            }),
+        ] {
+            std::fs::write(&catalog_path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+            assert!(matches!(
+                observe_provisioned_provider_launch_receipt(
+                    &source_launcher,
+                    Harness::Codex,
+                    &catalog_path,
+                    &home,
+                    false,
+                ),
+                Err(LaunchAttestationError::UntrustedUserInstall)
+            ));
+        }
     }
 
     #[cfg(unix)]
