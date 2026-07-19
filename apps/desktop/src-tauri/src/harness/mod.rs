@@ -237,14 +237,151 @@ pub(crate) struct OpenedHarnessProviderLaunch {
 }
 
 impl OpenedHarnessProviderLaunch {
-    pub(crate) fn handoff_exact<T, E>(
+    #[cfg(test)]
+    pub(crate) fn test_receipt(&self) -> VerifiedHarnessProviderLaunch {
+        VerifiedHarnessProviderLaunch(self.receipt.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_opened_path(&self) -> &std::path::Path {
+        &self.opened_path
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn launch_in_exact_tmux_pane(
         self,
-        launch_and_wait_until_opened: impl FnOnce(&std::path::Path) -> Result<T, E>,
-    ) -> Result<(VerifiedHarnessProviderLaunch, T), E> {
-        let result = launch_and_wait_until_opened(&self.opened_path)?;
-        let _keep_open_through_handoff = self.executable;
-        let _keep_provenance_open_through_handoff = self.provenance;
-        Ok((VerifiedHarnessProviderLaunch(self.receipt), result))
+        expected: Harness,
+        tmux_target: &str,
+        cwd: &str,
+        trusted_provider_command: &str,
+        env: &[(String, String)],
+    ) -> Result<VerifiedHarnessProviderProcessLaunch, LaunchAttestationError> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let provider = expected.as_provider();
+        let command_tail = trusted_provider_command
+            .strip_prefix(provider)
+            .filter(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+            .ok_or(LaunchAttestationError::WrongProvider)?;
+        let alias_directory = std::env::temp_dir().join(format!(
+            "t-hub-provider-handoff-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&alias_directory)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        std::fs::set_permissions(&alias_directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let alias = alias_directory.join(provider);
+        symlink(&self.opened_path, &alias)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let alias_guard = ProviderLaunchAlias {
+            directory: alias_directory,
+            alias: alias.clone(),
+        };
+        if provider_file_identity(&alias)?
+            != provider_file_identity_from_open_file(&self.executable)?
+        {
+            return Err(LaunchAttestationError::ProcessChanged);
+        }
+        for binding in &self.provenance {
+            binding.revalidate()?;
+        }
+        crate::tmux::set_session_environment_exact(tmux_target, env)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let launch_command = format!(
+            "exec {}{}",
+            sh_single_quote(&alias.to_string_lossy()),
+            command_tail
+        );
+        let respawn = crate::tmux::respawn_pane_exact(tmux_target, cwd, &launch_command)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        let mut observed = None;
+        for _ in 0..20 {
+            match observe_harness_process(tmux_target) {
+                Ok(evidence) if provider_arguments(&evidence, expected).is_ok() => {
+                    observed = Some(evidence);
+                    break;
+                }
+                Ok(_) | Err(LaunchAttestationError::UnreadableEvidence) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let first = observed.ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        let second = observe_harness_process(tmux_target)?;
+        let stable = confirm_stable_launch_baseline(&first, &second)?;
+        let terminal = &stable.terminal;
+        if terminal.session_name != tmux_target
+            || terminal.session_id != respawn.after.session_id
+            || terminal.session_created != respawn.after.session_created
+            || terminal.window_id != respawn.after.window_id
+            || terminal.pane_id != respawn.after.pane_id
+            || terminal.pane_pid != respawn.after.pane_pid
+            || provider_file_identity(&alias)?
+                != provider_file_identity_from_open_file(&self.executable)?
+        {
+            return Err(LaunchAttestationError::TerminalChanged);
+        }
+        for binding in &self.provenance {
+            binding.revalidate()?;
+        }
+        Ok(VerifiedHarnessProviderProcessLaunch {
+            provider: self.receipt,
+            terminal: terminal_generation_receipt(tmux_target, &stable),
+            evidence: stable,
+            _executable: self.executable,
+            _provenance: self.provenance,
+            _alias: alias_guard,
+        })
+    }
+}
+
+#[cfg(unix)]
+struct ProviderLaunchAlias {
+    directory: PathBuf,
+    alias: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for ProviderLaunchAlias {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.alias);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+/// Non-forgeable result of the concrete provider child handoff.
+///
+/// The exact executable, provenance chain, and private argv alias remain open
+/// until the trusted runner has persisted spawn evidence and completed runtime
+/// attestation.
+#[cfg(unix)]
+pub(crate) struct VerifiedHarnessProviderProcessLaunch {
+    provider: HarnessProviderLaunchReceipt,
+    terminal: HarnessTerminalGenerationReceipt,
+    evidence: HarnessProcessEvidence,
+    _executable: std::fs::File,
+    _provenance: Vec<ProviderPathBinding>,
+    _alias: ProviderLaunchAlias,
+}
+
+#[cfg(unix)]
+impl VerifiedHarnessProviderProcessLaunch {
+    pub(crate) fn spawn_receipts(
+        &self,
+    ) -> (
+        VerifiedHarnessProviderLaunch,
+        VerifiedHarnessTerminalGeneration,
+    ) {
+        (
+            VerifiedHarnessProviderLaunch(self.provider.clone()),
+            VerifiedHarnessTerminalGeneration(self.terminal.clone()),
+        )
+    }
+
+    pub(crate) fn evidence(&self) -> &HarnessProcessEvidence {
+        &self.evidence
     }
 }
 
@@ -2771,18 +2908,14 @@ mod tests {
         symlink(&installed_script, &launch_token).unwrap();
         let expected_identity = provider_file_identity(&installed_script).unwrap();
 
-        let (receipt, ()) =
+        let opened =
             test_observe_provider_launch_receipt(&launch_token, Harness::Codex, temp.path())
-                .unwrap()
-                .handoff_exact(|opened_path| {
-                    assert_eq!(
-                        std::fs::read(opened_path).unwrap(),
-                        b"#!/usr/bin/env node\n"
-                    );
-                    Ok::<(), ()>(())
-                })
                 .unwrap();
-        let receipt = receipt.into_persisted();
+        assert_eq!(
+            std::fs::read(opened.test_opened_path()).unwrap(),
+            b"#!/usr/bin/env node\n"
+        );
+        let receipt = opened.test_receipt().into_persisted();
         assert_eq!(
             receipt.resolved_provider_executable,
             std::fs::canonicalize(&installed_script)
@@ -2982,7 +3115,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn provider_swap_after_observation_hands_credentials_only_to_opened_inode() {
+    fn provider_swap_after_observation_keeps_the_opened_inode_exact() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -3006,20 +3139,110 @@ mod tests {
 
         std::fs::remove_file(&launcher).unwrap();
         symlink(&replacement, &launcher).unwrap();
-        let credential = "candidate-secret-never-for-attacker";
-        let (verified, handed_to) = observed
-            .handoff_exact(|opened_path| {
-                assert_eq!(std::fs::read(&launcher).unwrap(), b"attacker-provider-v2");
-                assert_eq!(std::fs::read(opened_path).unwrap(), b"trusted-provider-v1");
-                Ok::<_, ()>((opened_path.to_path_buf(), credential.to_string()))
-            })
-            .unwrap();
-        assert_eq!(handed_to.1, credential);
-        assert!(handed_to.0.to_string_lossy().contains("/proc/"));
+        assert_eq!(std::fs::read(&launcher).unwrap(), b"attacker-provider-v2");
         assert_eq!(
-            verified.into_persisted().provider_executable_inode,
+            std::fs::read(observed.test_opened_path()).unwrap(),
+            b"trusted-provider-v1"
+        );
+        assert!(observed
+            .test_opened_path()
+            .to_string_lossy()
+            .contains("/proc/"));
+        assert_eq!(
+            observed
+                .test_receipt()
+                .into_persisted()
+                .provider_executable_inode,
             provider_file_identity(&accepted).unwrap().inode
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_tmux_handoff_executes_opened_inode_and_delivers_credentials_to_that_child() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("tmux or node is unavailable - skipping exact provider handoff fixture");
+            return;
+        }
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = crate::tmux::kill_session(&self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let package_bin = temp.path().join("lib/node_modules/@openai/codex/bin");
+        let launcher_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&package_bin).unwrap();
+        std::fs::create_dir_all(&launcher_bin).unwrap();
+        let provider = package_bin.join("codex.js");
+        let attacker = temp.path().join("attacker.js");
+        let proof = temp.path().join("proof.txt");
+        std::fs::write(
+            &provider,
+            "#!/usr/bin/env node\nconst fs=require('fs'); const p=process.argv[process.argv.indexOf('--proof')+1]; fs.writeFileSync(p, process.env.T_HUB_SESSION_TOKEN === 'candidate-secret' ? 'trusted-received' : 'trusted-missing'); setInterval(()=>{}, 1000);\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            &attacker,
+            "#!/usr/bin/env node\nrequire('fs').writeFileSync(process.argv[2], 'attacker'); setInterval(()=>{}, 1000);\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&attacker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            package_bin.parent().unwrap().join("package.json"),
+            br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let launcher = launcher_bin.join("codex");
+        symlink(&provider, &launcher).unwrap();
+        let opened =
+            test_observe_provider_launch_receipt(&launcher, Harness::Codex, temp.path()).unwrap();
+        std::fs::remove_file(&launcher).unwrap();
+        symlink(&attacker, &launcher).unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let target = format!("th_exact_handoff_{}", &suffix[..8]);
+        crate::tmux::new_session_with_env(&target, "/tmp", Some("sleep 30"), &[]).unwrap();
+        let guard = SessionGuard(target.clone());
+        let command = format!(
+            "codex --proof {}",
+            sh_single_quote(&proof.to_string_lossy())
+        );
+        let launch = opened
+            .launch_in_exact_tmux_pane(
+                Harness::Codex,
+                &target,
+                "/tmp",
+                &command,
+                &[("T_HUB_SESSION_TOKEN".into(), "candidate-secret".into())],
+            )
+            .unwrap();
+        let (provider_receipt, terminal_receipt) = launch.spawn_receipts();
+        assert_eq!(std::fs::read_to_string(&proof).unwrap(), "trusted-received");
+        assert_eq!(
+            provider_receipt.into_persisted().provider_executable_inode,
+            provider_file_identity(&provider).unwrap().inode
+        );
+        assert_eq!(terminal_receipt.into_persisted().tmux_target, target);
+        assert_eq!(
+            provider_arguments(launch.evidence(), Harness::Codex).unwrap()[0],
+            "--proof"
+        );
+        drop(launch);
+        drop(guard);
     }
 
     #[cfg(unix)]

@@ -23966,18 +23966,17 @@ mod tests {
         )
         .unwrap();
         symlink(&provider, &launcher).unwrap();
-        let launch = crate::harness::test_observe_provider_launch_receipt(
+        let opened = crate::harness::test_observe_provider_launch_receipt(
             &launcher,
             Harness::Codex,
             temp.path(),
         )
-        .unwrap()
-        .handoff_exact(|opened_path| {
-            assert_eq!(std::fs::read(opened_path).unwrap(), b"provider-v1");
-            Ok::<(), ()>(())
-        })
-        .unwrap()
-        .0;
+        .unwrap();
+        assert_eq!(
+            std::fs::read(opened.test_opened_path()).unwrap(),
+            b"provider-v1"
+        );
+        let launch = opened.test_receipt();
         let provider_path = launcher.to_str().unwrap();
         let evidence = crate::harness::HarnessProcessEvidence::test(
             42,

@@ -316,14 +316,15 @@ pub(crate) fn respawn_pane_exact(
     cwd: &str,
     command: &str,
 ) -> Result<RespawnPaneTransition, TmuxError> {
-    let before = pane_generation(target)?;
-    let mut args = vec!["respawn-pane", "-k", "-t", target];
+    let exact_pane = format!("={target}:");
+    let before = pane_generation(&exact_pane)?;
+    let mut args = vec!["respawn-pane", "-k", "-t", &exact_pane];
     if !cwd.is_empty() {
         args.extend(["-c", cwd]);
     }
     args.push(command);
     run("respawn-pane", &args)?;
-    let after = pane_generation(target)?;
+    let after = pane_generation(&exact_pane)?;
     if before.session_id != after.session_id
         || before.session_created != after.session_created
         || before.window_id != after.window_id
@@ -362,6 +363,37 @@ pub(crate) fn session_environment_exact(
     key: &str,
 ) -> Result<Option<String>, TmuxError> {
     session_environment(&format!("={name}"), key)
+}
+
+/// Set private environment values on one exact existing session.
+///
+/// This is used by the provider launch handoff only after its executable has
+/// been opened and provenance-bound. Values are argv to the local tmux client,
+/// are never returned or logged, and become visible only to subsequently
+/// respawned children in this exact session.
+pub(crate) fn set_session_environment_exact(
+    name: &str,
+    env: &[(String, String)],
+) -> Result<(), TmuxError> {
+    let target = format!("={name}");
+    for (key, value) in env {
+        if key.is_empty()
+            || key.contains('=')
+            || key.chars().any(char::is_whitespace)
+            || key.chars().any(char::is_control)
+        {
+            return Err(TmuxError {
+                op: "set-environment",
+                code: None,
+                message: "session environment key is malformed".into(),
+            });
+        }
+        run(
+            "set-environment",
+            &["set-environment", "-t", &target, key, value],
+        )?;
+    }
+    Ok(())
 }
 
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
