@@ -93,4 +93,16 @@ fn stage_and_limit_values_are_validated() {
         &["agents", "events", "agent-1", "--limit", "101", "--json"],
         "th agents events: --limit must be an integer from 1 to 100",
     );
+    assert_usage(
+        &[
+            "agents",
+            "list",
+            "--project",
+            "project-1",
+            "--state",
+            "archived",
+            "--json",
+        ],
+        "th agents list: --state must be active or removed",
+    );
 }

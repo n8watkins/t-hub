@@ -35,7 +35,7 @@ fn print_help() {
     println!(
         "usage: th agents <start|list|show|checkpoint|events> [flags]\n\n\
 start      --request-id ID --captain ID --directory PATH --assignment TEXT [--harness codex|claude] [--name NAME] [--tab ID]\n\
-list       --captain ID or --project ID [--cursor N] [--limit N] [--json]\n\
+list       --captain ID or --project ID [--cursor N] [--limit N] [--state active|removed] [--json]\n\
 show       <agentSessionId> [--json]\n\
 checkpoint <agentSessionId> <summary> --author ID [--stage STAGE] [--json]\n\
 events     <agentSessionId> [--cursor N] [--limit N] [--json]"
@@ -89,7 +89,7 @@ fn start(args: &[String]) -> Result<(), CliError> {
 fn list(args: &[String]) -> Result<(), CliError> {
     let flags = AgentFlags::parse(
         args,
-        &["--captain", "--project", "--cursor", "--limit"],
+        &["--captain", "--project", "--cursor", "--limit", "--state"],
         &["--json"],
     )?;
     flags.require_positionals(0, "th agents list [flags]")?;
@@ -111,6 +111,14 @@ fn list(args: &[String]) -> Result<(), CliError> {
     }
     if let Some(value) = flags.options.get("--limit") {
         input["limit"] = json!(parse_limit(value, "th agents list")?);
+    }
+    if let Some(value) = flags.options.get("--state") {
+        if !matches!(value.as_str(), "active" | "removed") {
+            return Err(CliError::usage(
+                "th agents list: --state must be active or removed",
+            ));
+        }
+        input["state"] = json!(value);
     }
     call_and_render("agents list", "list_agents", input, &flags)
 }
