@@ -1,6 +1,6 @@
 // Per-project panel state — the per-tile "workbench".
 //
-// Each project tile shows one of Terminal / Files / Run + Preview / Board, plus
+// Each project tile shows one of Terminal / Files / Run + Preview, plus
 // a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
 // the parallel panel work doesn't contend on workspace.ts.
@@ -16,7 +16,7 @@ import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
 /** The selectable views inside a project tile. */
-export type PanelTab = "terminal" | "files" | "preview" | "board";
+export type PanelTab = "terminal" | "files" | "preview";
 
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";
