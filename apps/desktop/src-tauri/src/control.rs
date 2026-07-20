@@ -7999,15 +7999,26 @@ impl RequestCache {
     /// for any future retry.
     #[cfg(test)]
     fn finish(&self, id: &str, outcome: Result<Value, String>) -> Result<Value, String> {
-        let reservation = {
+        let (reservation, signature, absent) = {
             let inner = self.lock();
             match inner.slots.get(id) {
-                Some(RequestSlot::InFlight { reservation, .. }) => Some(*reservation),
-                _ => None,
+                Some(RequestSlot::InFlight {
+                    reservation,
+                    signature,
+                    ..
+                }) => (Some(*reservation), Some(signature.clone()), false),
+                None => (None, None, true),
+                Some(RequestSlot::Done { .. }) => (None, None, false),
             }
         };
         match reservation {
-            Some(reservation) => self.finish_reserved(id, reservation, outcome),
+            Some(reservation) => self.finish_reserved(
+                id,
+                reservation,
+                signature.as_deref().expect("in-flight signature"),
+                outcome,
+            ),
+            None if absent => self.finish_reserved(id, 0, "", outcome),
             None => outcome,
         }
     }
@@ -8016,6 +8027,7 @@ impl RequestCache {
         &self,
         id: &str,
         reservation: u64,
+        original_signature: &str,
         outcome: Result<Value, String>,
     ) -> Result<Value, String> {
         let mut inner = self.lock();
@@ -8025,6 +8037,10 @@ impl RequestCache {
                 reservation: current,
                 ..
             }) if *current == reservation => signature.clone(),
+            // A status query may reap an old reservation before its legitimate
+            // handler returns. With no replacement owner, preserve that late
+            // authoritative result under its original signature.
+            None => original_signature.to_string(),
             // A reaped request may finish after a replacement reserved the same
             // id. Never let that stale completion overwrite or complete the newer
             // reservation/outcome.
@@ -10777,10 +10793,12 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         None
     };
     let mut request_reservation = None;
+    let mut request_signature_value = None;
     if let Some(id) = &request_id {
         let signature = request_signature(&req.command, &req.args);
         let (begin, reservation) = ctx.requests.begin_bound_with_reservation(id, &signature);
         request_reservation = reservation;
+        request_signature_value = Some(signature);
         match begin {
             // This exact request already completed: replay its stored outcome. Do
             // NOT re-run, re-charge, or re-audit - the side effect is already done.
@@ -10810,6 +10828,9 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     let outcome = ctx.requests.finish_reserved(
                         id,
                         request_reservation.expect("fresh reservation"),
+                        request_signature_value
+                            .as_deref()
+                            .expect("reserved request has a signature"),
                         outcome,
                     );
                     return replay_response(outcome);
@@ -10870,6 +10891,9 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         Some(id) => ctx.requests.finish_reserved(
             id,
             request_reservation.expect("reserved id reaches dispatch"),
+            request_signature_value
+                .as_deref()
+                .expect("reserved request has a signature"),
             outcome,
         ),
         None => outcome,
@@ -37921,7 +37945,12 @@ mod tests {
         assert!(matches!(replacement, BeginOutcome::FreshAfterReap));
         let replacement_reservation = replacement_reservation.unwrap();
 
-        let _ = cache.finish_reserved("x", first_reservation, Ok(json!({"id": "stale"})));
+        let _ = cache.finish_reserved(
+            "x",
+            first_reservation,
+            "resume:one",
+            Ok(json!({"id": "stale"})),
+        );
         assert!(
             matches!(cache.status("x"), RequestStatus::InFlight),
             "a stale completion must leave the replacement reservation in flight"
@@ -37932,6 +37961,7 @@ mod tests {
         let _ = cache.finish_reserved(
             "x",
             replacement_reservation,
+            "resume:one",
             Ok(json!({"id": "replacement"})),
         );
         match cache.status("x") {
@@ -37940,6 +37970,40 @@ mod tests {
             }
             _ => panic!("the replacement reservation must own the completed outcome"),
         }
+    }
+
+    #[test]
+    fn request_cache_preserves_a_late_completion_when_no_replacement_owns_the_id() {
+        let cache = RequestCache::with_bounds(
+            1,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        let (begin, reservation) = cache.begin_bound_with_reservation("late", "reconcile:one");
+        assert!(matches!(begin, BeginOutcome::Fresh));
+        let reservation = reservation.expect("fresh request reservation");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(matches!(cache.status("late"), RequestStatus::Unknown));
+        let _ = cache.finish_reserved(
+            "late",
+            reservation,
+            "reconcile:one",
+            Ok(json!({"id": "late"})),
+        );
+
+        assert!(matches!(
+            cache.begin_bound("late", "reconcile:one"),
+            BeginOutcome::Duplicate(Ok(_))
+        ));
+        assert!(matches!(
+            cache.begin_bound("late", "reconcile:other"),
+            BeginOutcome::Duplicate(Err(_))
+        ));
+
+        cache.begin("new");
+        let _ = cache.finish("new", Ok(json!({"id": "new"})));
+        assert!(matches!(cache.status("late"), RequestStatus::Unknown));
     }
 
     #[test]
