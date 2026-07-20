@@ -63,7 +63,7 @@ use crate::harness::{
 };
 use crate::supervision::Supervisor;
 use crate::{
-    agent_session::{AgentCheckpoint, AgentEvent, AgentSessionRecord},
+    agent_session::{AgentCheckpoint, AgentEvent, AgentSessionRecord, RuntimeState},
     files, git, plane, powder, pty, tmux,
 };
 
@@ -4780,6 +4780,48 @@ impl CaptainsRegistry {
         self.commit_mutation(current, previous)
     }
 
+    pub fn mark_agent_started(
+        &self,
+        agent_session_id: &str,
+        workspace_tab_id: Option<String>,
+    ) -> Result<AgentSessionRecord, String> {
+        self.update_agent_session(agent_session_id, |agent| {
+            agent.workspace_tab_id = workspace_tab_id;
+            agent.runtime_state = RuntimeState::Starting;
+            agent.updated_at = now_ms();
+        })
+    }
+
+    pub fn mark_agent_unavailable(&self, agent_session_id: &str) -> Result<(), String> {
+        self.update_agent_session(agent_session_id, |agent| {
+            agent.runtime_state = RuntimeState::Unavailable;
+            agent.work_stage = crate::agent_session::WorkStage::Stopped;
+            agent.updated_at = now_ms();
+        })
+        .map(|_| ())
+    }
+
+    fn update_agent_session(
+        &self,
+        agent_session_id: &str,
+        update: impl FnOnce(&mut AgentSessionRecord),
+    ) -> Result<AgentSessionRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let agent = current
+            .agent_sessions
+            .iter_mut()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .ok_or_else(|| format!("agent session '{agent_session_id}' was not found"))?;
+        update(agent);
+        agent.validate()?;
+        let result = agent.clone();
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     fn pending_dispatch_claim(
         &self,
         connection_profile: &str,
@@ -9035,7 +9077,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
+        "spawn_terminal" | "start_agent" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -10619,6 +10661,7 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
+        "start_agent" => start_agent(ctx, args, caller, trusted_internal),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
         "attach_captain" => attach_captain(ctx, args, caller, trusted_internal),
         "dispatch_crew" => dispatch_crew(ctx, args, caller, trusted_internal),
@@ -18913,6 +18956,161 @@ fn move_tile(
 /// existing confirmation-gate tier — same audit, same remote-peer cwd allowlist,
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
+fn start_agent(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "start_agent")?;
+    require_exact_args(
+        args,
+        "start_agent",
+        &[
+            "requestId",
+            "captainSessionId",
+            "assignment",
+            "directory",
+            "harness",
+            "name",
+            "workspaceTabId",
+        ],
+    )?;
+    let captain_session_id = arg_str(args, "captainSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'captainSessionId'")?;
+    let assignment = arg_str(args, "assignment")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'assignment'")?;
+    let directory = arg_str(args, "directory")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'directory'")?;
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.terminal_id.as_deref() == Some(captain_session_id.as_str()))
+        .cloned()
+        .ok_or_else(|| format!("start_agent: Captain '{captain_session_id}' was not found"))?;
+    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    let project_id = captain
+        .project_id
+        .clone()
+        .ok_or("start_agent: Captain is not bound to a registered Project")?;
+    let project = snapshot
+        .projects
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("start_agent: unknown projectId '{project_id}'"))?;
+    let checkout = validate_crew_checkout(&project, Some(directory))
+        .map_err(|error| error.replacen("dispatch_crew", "start_agent", 1))?;
+    let worktree = git::worktree_list(&files::posix_form(&project.repo_root))
+        .map_err(|error| format!("start_agent: could not detect worktree: {error}"))?
+        .into_iter()
+        .find(|worktree| files::posix_form(&worktree.path) == checkout);
+    let harness_name = arg_str(args, "harness")
+        .unwrap_or_else(|| captain.harness.clone().unwrap_or_else(|| "codex".into()));
+    let harness_name = harness_name.trim().to_ascii_lowercase();
+    if !matches!(harness_name.as_str(), "codex" | "claude") {
+        return Err("start_agent harness must be 'codex' or 'claude'".into());
+    }
+    let harness = Harness::from_provider(&harness_name);
+    let agent_session_id = loop {
+        let candidate = uuid::Uuid::new_v4().simple().to_string();
+        let candidate = candidate[..8].to_string();
+        if !snapshot
+            .agent_sessions
+            .iter()
+            .any(|agent| agent.agent_session_id == candidate)
+        {
+            break candidate;
+        }
+    };
+    let now = now_ms();
+    let record = AgentSessionRecord {
+        agent_session_id: agent_session_id.clone(),
+        captain_session_id: captain_session_id.clone(),
+        project_id: project.project_id.clone(),
+        assignment: assignment.clone(),
+        directory: checkout.clone(),
+        worktree_path: worktree
+            .as_ref()
+            .map(|worktree| files::posix_form(&worktree.path)),
+        branch: worktree.and_then(|worktree| worktree.branch),
+        workspace_tab_id: arg_str(args, "workspaceTabId"),
+        harness: harness_name.clone(),
+        provider: harness_name,
+        provider_conversation_id: None,
+        resume_point: None,
+        runtime_state: RuntimeState::Starting,
+        work_stage: crate::agent_session::WorkStage::Assigned,
+        created_at: now,
+        updated_at: now,
+    };
+    ctx.captains.insert_agent_session(record)?;
+
+    let launch = crew_launch_argv(harness, &assignment);
+    let mut spawn_args = json!({
+        "cwd": checkout,
+        "name": arg_str(args, "name").unwrap_or_else(|| format!("Agent - {agent_session_id}")),
+        "startupCommand": launch,
+    });
+    if let Some(tab_id) = arg_str(args, "workspaceTabId") {
+        spawn_args["tabId"] = json!(tab_id);
+    }
+    let spawned = match spawn_terminal_with_private_pane_command_and_id(
+        ctx,
+        &spawn_args,
+        None,
+        false,
+        false,
+        true,
+        Some(&agent_session_id),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let cleanup = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    format!("{error}; agent failure state could not be persisted: {cleanup_error}")
+                }
+            });
+        }
+    };
+    let workspace_tab_id = spawned
+        .get("tabId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let started = match ctx
+        .captains
+        .mark_agent_started(&agent_session_id, workspace_tab_id)
+    {
+        Ok(started) => started,
+        Err(error) => {
+            let _ = tmux::kill_session_tree(&tmux_target(&agent_session_id));
+            let _ = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            return Err(format!(
+                "start_agent: launch succeeded but durable start state could not be persisted: {error}"
+            ));
+        }
+    };
+    Ok(json!({
+        "agentSessionId": started.agent_session_id,
+        "captainSessionId": started.captain_session_id,
+        "projectId": started.project_id,
+        "directory": started.directory,
+        "worktreePath": started.worktree_path,
+        "branch": started.branch,
+        "workspaceTabId": started.workspace_tab_id,
+        "harness": started.harness,
+        "provider": started.provider,
+        "runtimeState": started.runtime_state,
+        "workStage": started.work_stage,
+        "assignmentDelivered": true,
+    }))
+}
+
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     spawn_terminal_with_private_pane_command(ctx, args, None, false, false, true)
 }
@@ -26850,6 +27048,57 @@ mod tests {
         .unwrap();
         assert_eq!(events["count"], 1);
         assert_eq!(events["events"][0]["kind"], "checkpoint");
+    }
+
+    #[test]
+    fn start_agent_persists_before_a_launch_failure_and_records_unavailable() {
+        let ctx = test_ctx("secret");
+        let repo = git::worktree_list(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test repository worktree")
+            .path;
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-start".into(),
+                name: "Start Project".into(),
+                repo_root: repo.clone(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-start", Some("captain-start"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context("captain-start", "project-start", "Assignment", "codex")
+            .unwrap();
+
+        let error = dispatch(
+            &ctx,
+            "start_agent",
+            &json!({
+                "requestId": "start-agent-test",
+                "captainSessionId": "captain-start",
+                "assignment": "Do one bounded change",
+                "directory": repo
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("no UI is connected"), "got: {error}");
+        let agent = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .next()
+            .expect("agent record persisted before launch");
+        assert_eq!(agent.runtime_state, RuntimeState::Unavailable);
+        assert_eq!(agent.work_stage, crate::agent_session::WorkStage::Stopped);
     }
 
     #[test]
