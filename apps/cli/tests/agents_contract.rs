@@ -141,6 +141,7 @@ fn stage_and_limit_values_are_validated() {
 
 #[test]
 fn dispatch_baseline_and_lane_inputs_are_validated_before_control_discovery() {
+    let source_commit = "a".repeat(40);
     assert_usage(
         &[
             "agents",
@@ -167,12 +168,45 @@ fn dispatch_baseline_and_lane_inputs_are_validated_before_control_discovery() {
             "preflight",
             "--project",
             "project-1",
+            "--source-commit",
+            &source_commit,
             "--lanes-json",
             "[]",
             "--json",
         ],
         "th agents preflight: --lanes-json must contain at least one lane",
     );
+}
+
+#[test]
+fn preflight_sends_the_exact_source_commit() {
+    let source_commit = "a".repeat(40);
+    let lanes = serde_json::json!([{
+        "laneId": "lane-1",
+        "ownerId": "owner-1",
+        "dependencies": [],
+        "mutableFiles": ["src/a.rs"],
+        "mutableSchemas": [],
+        "mutableInterfaces": []
+    }])
+    .to_string();
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "preflight",
+        "--project",
+        "project-1",
+        "--source-commit",
+        &source_commit,
+        "--lanes-json",
+        &lanes,
+        "--integration-contracts-json",
+        "[]",
+        "--json",
+    ]);
+
+    assert!(output.status.success());
+    assert_eq!(request["command"], "dispatch_preflight");
+    assert_eq!(request["args"]["sourceCommit"], source_commit);
 }
 
 #[test]

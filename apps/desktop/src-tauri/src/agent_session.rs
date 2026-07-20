@@ -82,8 +82,11 @@ pub struct ReviewEvidence {
 pub enum AcceptanceEnvironment {
     Source,
     PackagedGuiE2e {
+        #[serde(rename = "artifactId", alias = "artifact_id")]
         artifact_id: String,
+        #[serde(rename = "sourceCommit", alias = "source_commit")]
         source_commit: String,
+        #[serde(rename = "installationTarget", alias = "installation_target")]
         installation_target: String,
     },
 }
@@ -626,20 +629,6 @@ impl DeliveryProvenance {
                     "artifact.sourceBaseline must equal integration.canonicalCommit".into(),
                 );
             }
-            if let Some(AcceptanceTestEvidence {
-                environment:
-                    AcceptanceEnvironment::PackagedGuiE2e {
-                        artifact_id,
-                        source_commit: _,
-                        installation_target: _,
-                    },
-                ..
-            }) = &self.acceptance_test
-            {
-                if artifact.artifact_id != *artifact_id {
-                    return Err("artifact.artifactId must equal packaged GUI E2E artifactId".into());
-                }
-            }
             validate_reference("artifact.reference", &artifact.reference)?;
             if artifact.manifest.is_some() {
                 artifact.validate_complete_manifest(integration)?;
@@ -656,24 +645,6 @@ impl DeliveryProvenance {
                 .ok_or("delivery provenance cannot be installed before it is packaged")?;
             if installation.artifact_id != artifact.artifact_id {
                 return Err("installation.artifactId must equal artifact.artifactId".into());
-            }
-            if let Some(AcceptanceTestEvidence {
-                environment:
-                    AcceptanceEnvironment::PackagedGuiE2e {
-                        artifact_id,
-                        source_commit: _,
-                        installation_target,
-                    },
-                ..
-            }) = &self.acceptance_test
-            {
-                if installation.artifact_id != *artifact_id
-                    || installation.target != *installation_target
-                {
-                    return Err(
-                        "installation must match packaged GUI E2E artifact and target".into(),
-                    );
-                }
             }
             validate_nonempty("installation.target", &installation.target)?;
             validate_reference("installation.reference", &installation.reference)?;
@@ -1069,7 +1040,7 @@ mod tests {
             runner_identity: "tester-1".into(),
             reference: "e2e://windows/visible-flow".into(),
             environment: AcceptanceEnvironment::PackagedGuiE2e {
-                artifact_id: "candidate:result-commit".into(),
+                artifact_id: "sha256:candidate-artifact".into(),
                 source_commit: RESULT_COMMIT.into(),
                 installation_target: "Windows user installation".into(),
             },
@@ -1153,6 +1124,22 @@ mod tests {
     }
 
     #[test]
+    fn packaged_gui_environment_loads_legacy_snake_case_and_serializes_camel_case() {
+        let environment: AcceptanceEnvironment = serde_json::from_value(serde_json::json!({
+            "kind": "packagedGuiE2e",
+            "artifact_id": "candidate-legacy",
+            "source_commit": RESULT_COMMIT,
+            "installation_target": "legacy target"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(environment).unwrap();
+        assert_eq!(value["artifactId"], "candidate-legacy");
+        assert_eq!(value["sourceCommit"], RESULT_COMMIT);
+        assert_eq!(value["installationTarget"], "legacy target");
+        assert!(value.get("artifact_id").is_none());
+    }
+
+    #[test]
     fn delivery_states_remain_distinct_through_the_full_flow() {
         let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, false);
         assert_eq!(
@@ -1217,6 +1204,37 @@ mod tests {
         assert_eq!(value["artifact"]["manifest"]["branch"], "main");
         assert_eq!(value["artifact"]["manifest"]["signatureStatus"], "verified");
         assert_eq!(value["liveVerification"]["verifierKind"], "aiAgent");
+    }
+
+    #[test]
+    fn visible_gui_lifecycle_keeps_candidate_and_canonical_artifacts_distinct() {
+        let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, true);
+        delivery.record_implementation(RESULT_COMMIT).unwrap();
+        delivery.record_review(review()).unwrap();
+        delivery
+            .record_acceptance_test(packaged_gui_test())
+            .unwrap();
+        assert!(delivery.states().complete);
+
+        delivery.record_integration(integration()).unwrap();
+        delivery.record_artifact(artifact()).unwrap();
+        delivery.record_installation(installation()).unwrap();
+        delivery
+            .record_live_verification(live_verification())
+            .unwrap();
+
+        let value = serde_json::to_value(&delivery).unwrap();
+        assert_eq!(
+            value["acceptanceTest"]["environment"]["artifactId"],
+            "sha256:candidate-artifact"
+        );
+        assert_eq!(value["artifact"]["artifactId"], "sha256:release-artifact");
+        assert_eq!(
+            value["acceptanceTest"]["environment"]["sourceCommit"],
+            RESULT_COMMIT
+        );
+        assert_eq!(value["artifact"]["sourceBaseline"], CANONICAL_COMMIT);
+        assert!(delivery.states().live_verified);
     }
 
     #[test]

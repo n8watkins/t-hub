@@ -12176,7 +12176,12 @@ fn dispatch_preflight(
     require_exact_args(
         args,
         "dispatch_preflight",
-        &["projectId", "requestedLanes", "integrationContracts"],
+        &[
+            "projectId",
+            "sourceCommit",
+            "requestedLanes",
+            "integrationContracts",
+        ],
     )?;
     let project_id = arg_str(args, "projectId")
         .filter(|value| !value.trim().is_empty())
@@ -12190,6 +12195,9 @@ fn dispatch_preflight(
         "dispatch_preflight",
         false,
     )?;
+    let source_commit = arg_str(args, "sourceCommit")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("dispatch_preflight requires a non-empty 'sourceCommit'")?;
     let requested_lanes = serde_json::from_value::<Vec<crate::governor::LaneClaim>>(
         args.get("requestedLanes")
             .cloned()
@@ -12198,17 +12206,28 @@ fn dispatch_preflight(
     .map_err(|error| format!("dispatch_preflight requestedLanes are invalid: {error}"))?;
     let integration_contracts = parse_integration_contracts(args, "dispatch_preflight")?;
     let snapshot = ctx.captains.snapshot();
-    let satisfied_dependencies = snapshot
-        .agent_sessions
+    let project = snapshot
+        .projects
         .iter()
-        .filter(|agent| agent.project_id == project_id)
-        .filter(|agent| {
-            agent
-                .delivery_states()
-                .is_some_and(|states| states.complete)
-        })
-        .filter_map(|agent| agent.lane_claim.as_ref().map(|lane| lane.lane_id.clone()))
-        .collect();
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("dispatch_preflight: unknown projectId '{project_id}'"))?;
+    let repo_root = files::posix_form(&project.repo_root);
+    git::require_commit_ancestor(&repo_root, &source_commit, &source_commit)
+        .map_err(|error| format!("dispatch_preflight: sourceCommit rejected: {error}"))?;
+    let dependencies = requested_lanes
+        .iter()
+        .filter_map(|lane| lane.dependencies.as_ref())
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let satisfied_dependencies = validate_dependency_result_ancestry(
+        "dispatch_preflight",
+        &snapshot,
+        &project_id,
+        &dependencies,
+        &repo_root,
+        &source_commit,
+    )?;
     let request = crate::governor::DispatchPreflight {
         requested_lanes,
         active_lanes: active_dispatch_lanes(&snapshot, &project_id),
@@ -12375,8 +12394,22 @@ fn validate_registered_integration_inputs(
     ctx: &ControlContext,
     target_agent: &AgentSessionRecord,
     manifest: &crate::agent_session::IntegrationManifest,
+    source_commit: &str,
+    canonical_baseline: &str,
+    canonical_commit: &str,
 ) -> Result<(), String> {
     let snapshot = ctx.captains.snapshot();
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == target_agent.project_id)
+        .ok_or_else(|| {
+            format!(
+                "record_agent_delivery integrated Project '{}' is not registered",
+                target_agent.project_id
+            )
+        })?;
+    let repo_root = files::posix_form(&project.repo_root);
     for input in &manifest.inputs {
         let registered = snapshot
             .agent_sessions
@@ -12425,6 +12458,34 @@ fn validate_registered_integration_inputs(
                 input.agent_session_id
             ));
         }
+    }
+    git::require_exact_local_branch_tip(&repo_root, canonical_baseline, canonical_commit).map_err(
+        |error| format!("record_agent_delivery integrated canonical baseline rejected: {error}"),
+    )?;
+    git::require_commit_ancestor(&repo_root, source_commit, canonical_commit).map_err(|error| {
+        format!(
+            "record_agent_delivery integrated sourceCommit '{source_commit}' is not incorporated by canonicalCommit '{canonical_commit}': {error}"
+        )
+    })?;
+    for input in &manifest.inputs {
+        git::require_commit_ancestor(
+            &repo_root,
+            &input.source_baseline,
+            &input.resulting_commit,
+        )
+        .map_err(|error| {
+            format!(
+                "record_agent_delivery integrated manifest laneId '{}' resultingCommit does not descend from sourceBaseline: {error}",
+                input.lane_id
+            )
+        })?;
+        git::require_commit_ancestor(&repo_root, &input.resulting_commit, canonical_commit)
+            .map_err(|error| {
+                format!(
+                    "record_agent_delivery integrated manifest laneId '{}' is not incorporated by canonicalCommit '{}': {error}",
+                    input.lane_id, canonical_commit
+                )
+            })?;
     }
     Ok(())
 }
@@ -12530,6 +12591,8 @@ fn record_agent_delivery(
                 format!("record_agent_delivery integrated manifest is invalid: {error}")
             })?;
             let source_commit = evidence_string(evidence, "sourceCommit", &state)?;
+            let canonical_baseline = evidence_string(evidence, "canonicalBaseline", &state)?;
+            let canonical_commit = evidence_string(evidence, "canonicalCommit", &state)?;
             manifest.validate_for_source_commit(&source_commit)?;
             if manifest.integration_owner_identity != actor_identity {
                 return Err(
@@ -12537,11 +12600,18 @@ fn record_agent_delivery(
                         .into(),
                 );
             }
-            validate_registered_integration_inputs(ctx, &agent, &manifest)?;
+            validate_registered_integration_inputs(
+                ctx,
+                &agent,
+                &manifest,
+                &source_commit,
+                &canonical_baseline,
+                &canonical_commit,
+            )?;
             AgentDeliveryUpdate::Integrated(crate::agent_session::IntegrationEvidence {
                 source_commit,
-                canonical_baseline: evidence_string(evidence, "canonicalBaseline", &state)?,
-                canonical_commit: evidence_string(evidence, "canonicalCommit", &state)?,
+                canonical_baseline,
+                canonical_commit,
                 reference: evidence_string(evidence, "reference", &state)?,
                 recorded_at,
                 manifest: Some(manifest),
@@ -24290,13 +24360,7 @@ fn active_dispatch_lanes(
         .agent_sessions
         .iter()
         .filter(|agent| agent.project_id == project_id)
-        .filter(|agent| {
-            !matches!(
-                agent.work_stage,
-                crate::agent_session::WorkStage::Complete
-                    | crate::agent_session::WorkStage::Stopped
-            )
-        })
+        .filter(|agent| agent_retains_lane_ownership(agent))
         .map(|agent| {
             let mut lane = agent
                 .lane_claim
@@ -24316,6 +24380,13 @@ fn active_dispatch_lanes(
             lane
         })
         .collect()
+}
+
+fn agent_retains_lane_ownership(agent: &AgentSessionRecord) -> bool {
+    agent.work_stage != crate::agent_session::WorkStage::Stopped
+        && !agent
+            .delivery_states()
+            .is_some_and(|states| states.integrated)
 }
 
 fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (bool, usize) {
@@ -24713,13 +24784,7 @@ fn dispatch_runtime_capacity(
     let active_directories = snapshot
         .agent_sessions
         .iter()
-        .filter(|agent| {
-            !matches!(
-                agent.work_stage,
-                crate::agent_session::WorkStage::Complete
-                    | crate::agent_session::WorkStage::Stopped
-            )
-        })
+        .filter(|agent| agent_retains_lane_ownership(agent))
         .map(|agent| files::posix_form(&agent.directory))
         .collect::<BTreeSet<_>>();
     let project = snapshot
@@ -24750,6 +24815,7 @@ fn parse_integration_contracts(
 }
 
 fn validate_dependency_result_ancestry(
+    command: &str,
     snapshot: &CaptainsSnapshot,
     project_id: &str,
     dependencies: &BTreeSet<String>,
@@ -24776,7 +24842,7 @@ fn validate_dependency_result_ancestry(
             .collect::<Vec<_>>();
         if completed.is_empty() {
             return Err(format!(
-                "start_agent: dependency '{dependency}' has no complete lane in project '{project_id}'"
+                "{command}: dependency '{dependency}' has no complete lane in project '{project_id}'"
             ));
         }
 
@@ -24788,7 +24854,7 @@ fn validate_dependency_result_ancestry(
                 .and_then(|delivery| delivery.resulting_commit.as_deref())
                 .ok_or_else(|| {
                     format!(
-                        "start_agent: dependency '{dependency}' has complete delivery without an exact resulting commit"
+                        "{command}: dependency '{dependency}' has complete delivery without an exact resulting commit"
                     )
                 })?;
             result_commits.insert(resulting_commit.to_string());
@@ -24797,7 +24863,7 @@ fn validate_dependency_result_ancestry(
             git::require_commit_ancestor(checkout, &resulting_commit, source_commit).map_err(
                 |error| {
                     format!(
-                        "start_agent: dependency '{dependency}' result '{resulting_commit}' is not present in sourceCommit '{source_commit}': {error}"
+                        "{command}: dependency '{dependency}' result '{resulting_commit}' is not present in sourceCommit '{source_commit}': {error}"
                     )
                 },
             )?;
@@ -24905,10 +24971,7 @@ fn start_agent(
     git::require_clean_exact_baseline(&checkout, &source_commit)
         .map_err(|error| format!("start_agent: baseline rejected: {error}"))?;
     if snapshot.agent_sessions.iter().any(|agent| {
-        !matches!(
-            agent.work_stage,
-            crate::agent_session::WorkStage::Complete | crate::agent_session::WorkStage::Stopped
-        ) && files::posix_form(&agent.directory) == checkout
+        agent_retains_lane_ownership(agent) && files::posix_form(&agent.directory) == checkout
     }) {
         return Err(format!(
             "start_agent: checkout '{checkout}' is already owned by an active implementation lane"
@@ -24933,6 +24996,7 @@ fn start_agent(
         }
     };
     let satisfied_dependencies = validate_dependency_result_ancestry(
+        "start_agent",
         &snapshot,
         &project.project_id,
         &dependencies,
@@ -25060,6 +25124,11 @@ fn start_agent(
             ));
         }
     };
+    let started_source_baseline = started
+        .delivery
+        .as_ref()
+        .map(|delivery| delivery.source_baseline.clone())
+        .ok_or("start_agent: durable start record lost its dispatch source baseline")?;
     Ok(json!({
         "agentSessionId": started.agent_session_id,
         "captainSessionId": started.captain_session_id,
@@ -25072,6 +25141,9 @@ fn start_agent(
         "provider": started.provider,
         "runtimeState": started.runtime_state,
         "workStage": started.work_stage,
+        "sourceCommit": started_source_baseline.clone(),
+        "sourceBaseline": started_source_baseline,
+        "admissionPurpose": started.admission_purpose,
         "deliveryStates": started.delivery_states(),
         "laneClaim": started.lane_claim,
         "dispatchCapacity": dispatch_capacity,
@@ -33522,15 +33594,57 @@ mod tests {
 
     #[test]
     fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
-        const BASELINE: &str = "1111111111111111111111111111111111111111";
-        const RESULT: &str = "2222222222222222222222222222222222222222";
-        const CANONICAL: &str = "3333333333333333333333333333333333333333";
         let ctx = test_ctx("agent-delivery");
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let repo_path = repo_root.to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            let (ok, stdout, stderr) = git::run_git_for_test(&repo_path, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        run(&["branch", "-M", "main"]);
+        let baseline = exact_head(&repo_root);
+        let commit_file = |name: &str, content: &str| {
+            std::fs::write(repo_root.join(name), content).unwrap();
+            run(&["add", name]);
+            run(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                name,
+            ]);
+            exact_head(&repo_root)
+        };
+        let interface_result = commit_file("interface.txt", "shared interface\n");
+        let result = commit_file("implementation.txt", "lane result\n");
+        let incomplete_result = commit_file("incomplete.txt", "incomplete lane\n");
+        let canonical = commit_file("integration.txt", "canonical integration\n");
+        let worktree_path = worktree.to_string_lossy().to_string();
+        let run_worktree = |args: &[&str]| {
+            let (ok, stdout, stderr) = git::run_git_for_test(&worktree_path, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        std::fs::write(worktree.join("divergent.txt"), "divergent lane\n").unwrap();
+        run_worktree(&["add", "divergent.txt"]);
+        run_worktree(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "divergent lane",
+        ]);
+        let divergent_result = exact_head(&worktree);
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-delivery".into(),
                 name: "Delivery".into(),
-                repo_root: "/tmp/project-delivery".into(),
+                repo_root: repo_path,
                 remote_url: None,
                 default_branch: Some("main".into()),
                 powder: None,
@@ -33558,13 +33672,17 @@ mod tests {
         ctx.captains
             .record_crew("captain-delivery", "agent-incomplete")
             .unwrap();
-        let mut interface_delivery = crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+        ctx.captains
+            .record_crew("captain-delivery", "agent-divergent")
+            .unwrap();
+        let mut interface_delivery =
+            crate::agent_session::DeliveryProvenance::new(&baseline, false);
         interface_delivery
-            .record_implementation("4444444444444444444444444444444444444444")
+            .record_implementation(&interface_result)
             .unwrap();
         interface_delivery
             .record_review(crate::agent_session::ReviewEvidence {
-                commit: "4444444444444444444444444444444444444444".into(),
+                commit: interface_result.clone(),
                 reviewer_identity: "reviewer-interface".into(),
                 reference: "review://interface".into(),
                 recorded_at: 2,
@@ -33572,7 +33690,7 @@ mod tests {
             .unwrap();
         interface_delivery
             .record_acceptance_test(crate::agent_session::AcceptanceTestEvidence {
-                commit: "4444444444444444444444444444444444444444".into(),
+                commit: interface_result.clone(),
                 runner_identity: "tester-interface".into(),
                 reference: "test://interface".into(),
                 environment: crate::agent_session::AcceptanceEnvironment::Source,
@@ -33606,10 +33724,37 @@ mod tests {
                 updated_at: 2,
             })
             .unwrap();
+        let (divergent_lane_claim, divergent_dispatch_capacity) =
+            test_dispatch_evidence("divergent-lane", "agent-divergent");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-divergent".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Build a divergent lane".into(),
+                directory: worktree_path.clone(),
+                worktree_path: Some(files::posix_form(&worktree_path)),
+                branch: Some("wt".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Exited,
+                work_stage: crate::agent_session::WorkStage::Complete,
+                delivery: Some(completed_delivery(&baseline, &divergent_result)),
+                lane_claim: Some(divergent_lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(divergent_dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
         let mut incomplete_delivery =
-            crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+            crate::agent_session::DeliveryProvenance::new(&baseline, false);
         incomplete_delivery
-            .record_implementation("6666666666666666666666666666666666666666")
+            .record_implementation(&incomplete_result)
             .unwrap();
         let (incomplete_lane_claim, incomplete_dispatch_capacity) =
             test_dispatch_evidence("incomplete-lane", "agent-incomplete");
@@ -33657,7 +33802,7 @@ mod tests {
                 runtime_state: RuntimeState::Running,
                 work_stage: crate::agent_session::WorkStage::Working,
                 delivery: Some(crate::agent_session::DeliveryProvenance::new(
-                    BASELINE, false,
+                    &baseline, true,
                 )),
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
@@ -33694,7 +33839,7 @@ mod tests {
                 json!({
                 "agentSessionId": "agent-delivery",
                 "state": "implemented",
-                "evidence": { "commit": RESULT }
+                "evidence": { "commit": result }
                 }),
             ),
         );
@@ -33705,7 +33850,7 @@ mod tests {
             &json!({
                 "agentSessionId": "agent-delivery",
                 "state": "reviewed",
-                "evidence": { "commit": RESULT, "reference": "review://self" }
+                "evidence": { "commit": result, "reference": "review://self" }
             }),
             Some(&agent),
             false,
@@ -33718,7 +33863,7 @@ mod tests {
             &json!({
                 "agentSessionId": "agent-delivery",
                 "state": "reviewed",
-                "evidence": { "commit": RESULT, "reference": "review://captain" }
+                "evidence": { "commit": result, "reference": "review://captain" }
             }),
             Some(&captain),
             false,
@@ -33731,9 +33876,14 @@ mod tests {
                 "agentSessionId": "agent-delivery",
                 "state": "tested",
                 "evidence": {
-                    "commit": RESULT,
+                    "commit": result,
                     "reference": "test://acceptance",
-                    "environment": { "kind": "source" }
+                    "environment": {
+                        "kind": "packagedGuiE2e",
+                        "artifactId": "candidate-installer-1",
+                        "sourceCommit": result,
+                        "installationTarget": "C:\\T-Hub-Candidate"
+                    }
                 }
             }),
             Some(&agent),
@@ -33744,6 +33894,20 @@ mod tests {
         assert_eq!(complete["deliveryStates"]["integrated"], false);
         assert_eq!(complete["deliveryStates"]["installed"], false);
         assert_eq!(complete["agent"]["workStage"], "complete");
+        assert!(
+            active_dispatch_lanes(&ctx.captains.snapshot(), "project-delivery")
+                .iter()
+                .any(|lane| lane.lane_id == "lane-delivery")
+        );
+        let mut explicitly_stopped = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .find(|agent| agent.agent_session_id == "agent-delivery")
+            .unwrap();
+        explicitly_stopped.work_stage = crate::agent_session::WorkStage::Stopped;
+        assert!(!agent_retains_lane_ownership(&explicitly_stopped));
 
         let missing_manifest = dispatch_with_caller(
             &ctx,
@@ -33752,9 +33916,9 @@ mod tests {
                 "agentSessionId": "agent-delivery",
                 "state": "integrated",
                 "evidence": {
-                    "sourceCommit": RESULT,
+                    "sourceCommit": result,
                     "canonicalBaseline": "main",
-                    "canonicalCommit": CANONICAL,
+                    "canonicalCommit": canonical,
                     "reference": "git://integration"
                 }
             }),
@@ -33766,9 +33930,9 @@ mod tests {
 
         let integration_evidence = |owner: &str| {
             json!({
-                "sourceCommit": RESULT,
+                "sourceCommit": result,
                 "canonicalBaseline": "main",
-                "canonicalCommit": CANONICAL,
+                "canonicalCommit": canonical,
                 "reference": "git://integration",
                 "manifest": {
                     "integrationOwnerIdentity": owner,
@@ -33776,14 +33940,14 @@ mod tests {
                         {
                             "laneId": "shared-interface",
                             "agentSessionId": "agent-interface",
-                            "sourceBaseline": BASELINE,
-                            "resultingCommit": "4444444444444444444444444444444444444444"
+                            "sourceBaseline": baseline,
+                            "resultingCommit": interface_result
                         },
                         {
                             "laneId": "lane-delivery",
                             "agentSessionId": "agent-delivery",
-                            "sourceBaseline": BASELINE,
-                            "resultingCommit": RESULT
+                            "sourceBaseline": baseline,
+                            "resultingCommit": result
                         }
                     ]
                 }
@@ -33855,8 +34019,7 @@ mod tests {
         let mut incomplete_input = integration_evidence(&integration_owner_identity);
         incomplete_input["manifest"]["inputs"][0]["laneId"] = json!("incomplete-lane");
         incomplete_input["manifest"]["inputs"][0]["agentSessionId"] = json!("agent-incomplete");
-        incomplete_input["manifest"]["inputs"][0]["resultingCommit"] =
-            json!("6666666666666666666666666666666666666666");
+        incomplete_input["manifest"]["inputs"][0]["resultingCommit"] = json!(incomplete_result);
         let incomplete_input = dispatch_with_caller(
             &ctx,
             "record_agent_delivery",
@@ -33870,6 +34033,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(incomplete_input.contains("is not complete"));
+
+        let mut wrong_canonical_tip = integration_evidence(&integration_owner_identity);
+        wrong_canonical_tip["canonicalCommit"] = json!(result);
+        let wrong_canonical_tip = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": wrong_canonical_tip
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            wrong_canonical_tip.contains("canonical baseline rejected"),
+            "got: {wrong_canonical_tip}"
+        );
+        assert!(
+            !ctx.captains
+                .snapshot()
+                .agent_sessions
+                .iter()
+                .find(|agent| agent.agent_session_id == "agent-delivery")
+                .unwrap()
+                .delivery_states()
+                .unwrap()
+                .integrated
+        );
+
+        let mut divergent_input = integration_evidence(&integration_owner_identity);
+        divergent_input["manifest"]["inputs"][0]["laneId"] = json!("divergent-lane");
+        divergent_input["manifest"]["inputs"][0]["agentSessionId"] = json!("agent-divergent");
+        divergent_input["manifest"]["inputs"][0]["resultingCommit"] = json!(divergent_result);
+        let divergent_input = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": divergent_input
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            divergent_input.contains("not incorporated"),
+            "got: {divergent_input}"
+        );
+        assert!(
+            !ctx.captains
+                .snapshot()
+                .agent_sessions
+                .iter()
+                .find(|agent| agent.agent_session_id == "agent-delivery")
+                .unwrap()
+                .delivery_states()
+                .unwrap()
+                .integrated
+        );
 
         let integrated = dispatch_with_caller(
             &ctx,
@@ -33886,6 +34111,11 @@ mod tests {
         assert_eq!(integrated["deliveryStates"]["complete"], true);
         assert_eq!(integrated["deliveryStates"]["integrated"], true);
         assert_eq!(integrated["deliveryStates"]["packaged"], false);
+        assert!(
+            !active_dispatch_lanes(&ctx.captains.snapshot(), "project-delivery")
+                .iter()
+                .any(|lane| lane.lane_id == "lane-delivery")
+        );
         assert_eq!(
             integrated["agent"]["delivery"]["integration"]["manifest"]["inputs"][0]["laneId"],
             "shared-interface"
@@ -33902,7 +34132,7 @@ mod tests {
                 "state": "packaged",
                 "evidence": {
                     "artifactId": "installer-1",
-                    "sourceBaseline": CANONICAL,
+                    "sourceBaseline": canonical,
                     "reference": "artifact://windows/installer"
                 }
             }),
@@ -33920,11 +34150,11 @@ mod tests {
                 "state": "packaged",
                 "evidence": {
                     "artifactId": "installer-1",
-                    "sourceBaseline": CANONICAL,
+                    "sourceBaseline": canonical,
                     "reference": "artifact://windows/installer",
                     "manifest": {
                         "branch": "main",
-                        "sourceCommit": CANONICAL,
+                        "sourceCommit": canonical,
                         "gitTree": "5555555555555555555555555555555555555555",
                         "version": "0.3.107",
                         "installerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -33941,6 +34171,51 @@ mod tests {
         assert_eq!(packaged["deliveryStates"]["packaged"], true);
         assert_eq!(packaged["deliveryStates"]["installed"], false);
 
+        let installed = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "installed",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "target": "C:\\Program Files\\T-Hub",
+                    "reference": "install://windows/release"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(installed["deliveryStates"]["installed"], true);
+        assert_eq!(
+            installed["agent"]["delivery"]["acceptanceTest"]["environment"]["artifactId"],
+            "candidate-installer-1"
+        );
+        assert_eq!(
+            installed["agent"]["delivery"]["artifact"]["artifactId"],
+            "installer-1"
+        );
+
+        let live_verified = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "liveVerified",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "target": "C:\\Program Files\\T-Hub",
+                    "verifierKind": "aiAgent",
+                    "reference": "verification://windows/release"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(live_verified["deliveryStates"]["liveVerified"], true);
+
         let status = get_agent(
             &ctx,
             &json!({ "agentSessionId": "agent-delivery" }),
@@ -33951,7 +34226,7 @@ mod tests {
         assert_eq!(status["deliveryStates"]["complete"], true);
         assert_eq!(status["deliveryStates"]["integrated"], true);
         assert_eq!(status["deliveryStates"]["packaged"], true);
-        assert_eq!(status["deliveryStates"]["liveVerified"], false);
+        assert_eq!(status["deliveryStates"]["liveVerified"], true);
         let events = agent_events(
             &ctx,
             &json!({ "agentSessionId": "agent-delivery", "cursor": "0" }),
@@ -33963,6 +34238,7 @@ mod tests {
             .iter()
             .any(|event| event["kind"] == "delivery_evidence"
                 && event["deliveryStates"]["complete"] == true)));
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -34620,6 +34896,7 @@ mod tests {
         let ctx =
             test_ctx("dispatch-six").with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)));
         let (base, repo_root, _worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&repo_root);
         for index in 2..=5 {
             let branch = format!("lane-{index}");
             let path = base.join(format!("wt-{index}"));
@@ -34671,6 +34948,7 @@ mod tests {
             "dispatch_preflight",
             &json!({
                 "projectId": "project-six",
+                "sourceCommit": source_commit,
                 "requestedLanes": requested_lanes,
                 "integrationContracts": []
             }),
@@ -34785,6 +35063,7 @@ mod tests {
             Some(completed_delivery(&initial_commit, &initial_commit));
         assert_eq!(
             validate_dependency_result_ancestry(
+                "test_dependency_ancestry",
                 &ancestor_snapshot,
                 "project-dependency",
                 &BTreeSet::from(["dependency-lane".to_string()]),
@@ -34793,6 +35072,33 @@ mod tests {
             )
             .unwrap(),
             BTreeSet::from(["dependency-lane".to_string()])
+        );
+
+        let preflight_error = dispatch(
+            &ctx,
+            "dispatch_preflight",
+            &json!({
+                "projectId": "project-dependency",
+                "sourceCommit": source_commit,
+                "requestedLanes": [{
+                    "laneId": "dependent-lane",
+                    "ownerId": "dependent-owner",
+                    "dependencies": ["dependency-lane"],
+                    "mutableFiles": ["src/dependent.rs"],
+                    "mutableSchemas": [],
+                    "mutableInterfaces": []
+                }],
+                "integrationContracts": []
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            preflight_error.contains("dispatch_preflight: dependency 'dependency-lane'"),
+            "got: {preflight_error}"
+        );
+        assert!(
+            preflight_error.contains("not present in sourceCommit"),
+            "got: {preflight_error}"
         );
 
         let error = start_agent(
@@ -34927,6 +35233,9 @@ mod tests {
             "got: {second_error}"
         );
         assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        assert_eq!(first_result["sourceCommit"], source_commit);
+        assert_eq!(first_result["sourceBaseline"], source_commit);
+        assert_eq!(first_result["admissionPurpose"], "ordinary");
         let agent_session_id = first_result["agentSessionId"].as_str().unwrap();
         reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
         std::fs::remove_dir_all(base).ok();

@@ -39,7 +39,7 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "usage: th agents <preflight|start|list|show|checkpoint|delivery|events> [flags]\n\n\
-preflight  --project ID --lanes-json JSON [--integration-contracts-json JSON] [--json]\n\
+preflight  --project ID --source-commit COMMIT --lanes-json JSON [--integration-contracts-json JSON] [--json]\n\
 start      --request-id ID --captain ID --directory PATH --assignment TEXT --source-commit COMMIT --lane-id ID [ownership flags] [--admission-purpose PURPOSE]\n\
 list       --captain ID or --project ID [--cursor N] [--limit N] [--state active|removed] [--json]\n\
 show       <agentSessionId> [--json]\n\
@@ -52,11 +52,18 @@ events     <agentSessionId> [--cursor N] [--limit N] [--json]"
 fn preflight(args: &[String]) -> Result<(), CliError> {
     let flags = AgentFlags::parse(
         args,
-        &["--project", "--lanes-json", "--integration-contracts-json"],
+        &[
+            "--project",
+            "--source-commit",
+            "--lanes-json",
+            "--integration-contracts-json",
+        ],
         &["--json"],
     )?;
     flags.require_positionals(0, "th agents preflight [flags]")?;
     let project = required(&flags, "--project", "agents preflight")?;
+    let source_commit = required(&flags, "--source-commit", "agents preflight")?;
+    validate_commit(&source_commit, "th agents preflight: --source-commit")?;
     let lanes = json_array(
         &required(&flags, "--lanes-json", "agents preflight")?,
         "th agents preflight: --lanes-json",
@@ -72,6 +79,7 @@ fn preflight(args: &[String]) -> Result<(), CliError> {
         "dispatch_preflight",
         json!({
             "projectId": project,
+            "sourceCommit": source_commit,
             "requestedLanes": lanes,
             "integrationContracts": integration_contracts,
         }),

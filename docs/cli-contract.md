@@ -143,9 +143,10 @@ Endpoint discovery must remain compatible with the documented control environmen
 
 The supervisory workflow is active through the shared control operation catalog.
 
-- `th agents preflight` evaluates an exact source commit, lane identity, dependencies, mutable files, schemas, interfaces, integration contracts, and reserved runtime capacity without launching an agent.
+- `th agents preflight --source-commit COMMIT` requires an exact commit from the registered Project repository and proves every completed dependency result is its ancestor before evaluating lane identity, mutable files, schemas, interfaces, integration contracts, and reserved runtime capacity.
 - Capacity output preserves `providerSessionLimit`, `providerLiveSessions`, `providerHeadroom`, and `providerCapacityStatus` with its source, degraded state, and optional detail.
 - `th agents start` requires the same exact dispatch baseline and concurrency contract and rejects a dirty checkout, abbreviated commit, stale commit, resource collision, missing ordering contract, or exhausted reserved capacity.
+- A successful `start_agent` response returns `sourceCommit`, `sourceBaseline`, and `admissionPurpose` from the durable admitted record so callers can verify launch provenance without inferring it from their request.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
 - `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
 - `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
@@ -162,7 +163,11 @@ The CLI and MCP adapters serialize the same request and response schemas and do 
 
 Delivery output must preserve `implemented`, `reviewed`, `tested`, `complete`, `integrated`, `packaged`, `installed`, and `live-verified` as separate facts.
 Every new `integrated` evidence object must include the authenticated integration owner and the ordered, bounded, unique lane inputs whose exact baseline and resulting commits produced the canonical integration.
+The backend resolves `canonicalBaseline` as an exact local branch in the registered Project repository, requires its tip to equal `canonicalCommit`, and verifies every manifest source and result is in the recorded ancestry.
 Legacy integration evidence without a manifest remains readable but must not report the `integrated` state.
+Completed lanes retain their checkout, collision claims, and worktree ownership until valid integration evidence is recorded or the lane is explicitly stopped.
+For packaged GUI acceptance, `acceptanceTest.environment.artifactId` identifies the candidate artifact built from the lane `resultingCommit`.
+That candidate identity is independent from the final `artifact.artifactId` built from the later canonical integration commit.
 Every new `packaged` evidence object must include the branch, exact source baseline and source commit, exact Git tree, version, installer SHA-256, build time, signature status, artifact ID, and reference.
 The artifact `recordedAt` field is the server audit time, while `manifest.builtAt` is the asserted build completion time in Unix epoch milliseconds and must fall between the integration and artifact record times, inclusive.
 Legacy artifact evidence without a complete manifest remains readable but must not report the `packaged` state.

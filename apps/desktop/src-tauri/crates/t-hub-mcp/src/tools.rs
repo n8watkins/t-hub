@@ -499,6 +499,11 @@ fn schema_dispatch_preflight() -> Value {
         "type": "object",
         "properties": {
             "projectId": { "type": "string", "minLength": 1 },
+            "sourceCommit": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$",
+                "description": "Exact Project commit from which every requested lane will be dispatched."
+            },
             "requestedLanes": {
                 "type": "array",
                 "items": schema_lane_claim(),
@@ -509,7 +514,7 @@ fn schema_dispatch_preflight() -> Value {
                 "items": schema_integration_contract()
             }
         },
-        "required": ["projectId", "requestedLanes", "integrationContracts"],
+        "required": ["projectId", "sourceCommit", "requestedLanes", "integrationContracts"],
         "additionalProperties": false
     })
 }
@@ -752,9 +757,17 @@ fn schema_record_agent_delivery() -> Value {
                                         "type": "object",
                                         "properties": {
                                             "kind": { "const": "packagedGuiE2e" },
-                                            "artifactId": { "type": "string", "minLength": 1 },
+                                            "artifactId": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "description": "Candidate GUI artifact built from the lane result before canonical integration."
+                                            },
                                             "sourceCommit": commit.clone(),
-                                            "installationTarget": { "type": "string", "minLength": 1 }
+                                            "installationTarget": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "description": "Target used for candidate GUI acceptance, independent from the later release installation."
+                                            }
                                         },
                                         "required": ["kind", "artifactId", "sourceCommit", "installationTarget"],
                                         "additionalProperties": false
@@ -1995,7 +2008,12 @@ mod tests {
         let preflight_schema = (preflight.input_schema)();
         assert_eq!(
             preflight_schema["required"],
-            json!(["projectId", "requestedLanes", "integrationContracts"])
+            json!([
+                "projectId",
+                "sourceCommit",
+                "requestedLanes",
+                "integrationContracts"
+            ])
         );
         let lane = &preflight_schema["properties"]["requestedLanes"]["items"];
         assert_eq!(

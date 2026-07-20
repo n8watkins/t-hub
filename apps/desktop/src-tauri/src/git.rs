@@ -265,6 +265,53 @@ pub(crate) fn require_commit_ancestor(
     ))
 }
 
+/// Resolve one exact local branch ref and require its tip to equal an exact commit.
+///
+/// Integration evidence must name a stable local branch, not an arbitrary Git
+/// revision expression whose meaning could change between validation and audit.
+pub(crate) fn require_exact_local_branch_tip(
+    cwd: &str,
+    branch: &str,
+    expected_commit: &str,
+) -> Result<(), String> {
+    require_commit_ancestor(cwd, expected_commit, expected_commit)?;
+    let branch_name = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    if branch_name.trim().is_empty() || branch_name != branch_name.trim() {
+        return Err("canonical baseline must name a non-empty local Git branch".into());
+    }
+    let (valid, stdout, stderr) = run_git(cwd, &["check-ref-format", "--branch", branch_name])?;
+    if !valid {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!(
+            "canonical baseline '{branch}' is not a valid local Git branch: {detail}"
+        ));
+    }
+    let reference = format!("refs/heads/{branch_name}^{{commit}}");
+    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &reference])?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!(
+            "canonical baseline '{branch}' does not resolve to a local branch commit: {detail}"
+        ));
+    }
+    let resolved = first_line_opt(&stdout)
+        .ok_or_else(|| format!("Git returned no commit for canonical baseline '{branch}'"))?;
+    if !resolved.eq_ignore_ascii_case(expected_commit) {
+        return Err(format!(
+            "canonical baseline '{branch}' resolves to '{resolved}', not canonicalCommit '{expected_commit}'"
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize a new repository in an existing directory after the caller has
 /// obtained explicit user authorization. Refuses to touch an existing `.git`
 /// entry, including a malformed one, so this operation never rewrites version
@@ -1737,6 +1784,7 @@ detached
             "second",
         ]);
         let descendant = run(&["rev-parse", "HEAD"]).trim().to_string();
+        run(&["branch", "-M", "main"]);
 
         require_commit_ancestor(&cwd, &ancestor, &descendant).unwrap();
         assert!(require_commit_ancestor(&cwd, &descendant, &ancestor)
@@ -1745,6 +1793,14 @@ detached
         assert!(require_commit_ancestor(&cwd, &ancestor[..12], &descendant)
             .unwrap_err()
             .contains("exact 40- or 64-character"));
+        require_exact_local_branch_tip(&cwd, "main", &descendant).unwrap();
+        require_exact_local_branch_tip(&cwd, "refs/heads/main", &descendant).unwrap();
+        assert!(require_exact_local_branch_tip(&cwd, "main", &ancestor)
+            .unwrap_err()
+            .contains("not canonicalCommit"));
+        assert!(require_exact_local_branch_tip(&cwd, "main~1", &ancestor)
+            .unwrap_err()
+            .contains("not a valid local Git branch"));
         std::fs::remove_dir_all(root).ok();
     }
 }

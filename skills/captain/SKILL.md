@@ -102,12 +102,16 @@ Defer work and report the limiting evidence when the governor refuses capacity.
 
 1. Decompose the Assignment into independently owned lanes where the work permits safe separation.
 2. Obtain an existing clean assigned directory and any required worktree evidence from the authorized Ship Admin.
-3. Run `dispatch_preflight` with the complete lane and integration contracts.
+3. Run `dispatch_preflight` with the exact `sourceCommit`, complete lane claims, and integration contracts.
 4. Call `start_agent` with a stable `requestId`, owning Captain session, Assignment, directory, Harness, exact `sourceCommit`, `visibleProductBug`, `laneId`, `dependencies`, `mutableFiles`, `mutableSchemas`, `mutableInterfaces`, and `integrationContracts`.
 5. Treat the Assignment passed to `start_agent` as the authoritative launch brief.
 6. Verify the returned durable agent ID, directory, worktree, branch, Harness, runtime state, work stage, exact baseline, lane claim, capacity decision, and Assignment-delivery result.
 7. Use `list_agents`, `get_agent`, `agent_events`, and checkpoints as bounded supervisory summaries.
 8. Treat launch failure, unavailable state, missing Assignment acknowledgement, or stale ownership as an honest recovery state.
+
+Keep a complete lane's checkout, mutable-resource claims, and worktree ownership reserved until its exact result is integrated or the lane is explicitly stopped.
+For visible GUI scope, treat the packaged GUI E2E artifact as a candidate built from the lane result.
+Record the final release artifact separately after integration because it must be built from the canonical commit and may have a different artifact ID and installation target.
 
 Include these rules in every implementation Crew brief:
 
