@@ -619,7 +619,7 @@ impl Client {
         #[cfg(not(test))]
         {
             let _ = name;
-            return Err("powder_retired: Powder runtime access is disabled".into());
+            Err("powder_retired: Powder runtime access is disabled".into())
         }
         #[cfg(test)]
         Self::from_profile_path(name, &profiles_path())
