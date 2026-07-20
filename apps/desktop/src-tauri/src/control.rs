@@ -62,7 +62,10 @@ use crate::harness::{
     HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
-use crate::{agent_session::AgentSessionRecord, files, git, plane, powder, pty, tmux};
+use crate::{
+    agent_session::{AgentCheckpoint, AgentEvent, AgentSessionRecord},
+    files, git, plane, powder, pty, tmux,
+};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -2437,6 +2440,10 @@ pub struct CaptainsSnapshot {
     /// is complete.
     #[serde(default)]
     pub agent_sessions: Vec<AgentSessionRecord>,
+    #[serde(default)]
+    pub agent_checkpoints: Vec<AgentCheckpoint>,
+    #[serde(default)]
+    pub agent_events: Vec<AgentEvent>,
     /// Durable registered repositories. Added in schema v2; older snapshots
     /// deserialize to an empty registry.
     #[serde(default)]
@@ -2691,6 +2698,8 @@ impl AuthorityGenerations {
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     agent_sessions: Vec<AgentSessionRecord>,
+    agent_checkpoints: Vec<AgentCheckpoint>,
+    agent_events: Vec<AgentEvent>,
     projects: Vec<ProjectRecord>,
     workspaces: Vec<FleetWorkspaceRecord>,
     pending_fleet_operations: Vec<PendingFleetOperation>,
@@ -2713,6 +2722,8 @@ impl Default for CaptainsInner {
         Self {
             captains: Vec::new(),
             agent_sessions: Vec::new(),
+            agent_checkpoints: Vec::new(),
+            agent_events: Vec::new(),
             projects: Vec::new(),
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: Vec::new(),
@@ -2958,6 +2969,8 @@ impl CaptainsRegistry {
                 seq: 0,
                 captains: Vec::new(),
                 agent_sessions: Vec::new(),
+                agent_checkpoints: Vec::new(),
+                agent_events: Vec::new(),
                 projects: Vec::new(),
                 workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
                 pending_fleet_operations: Vec::new(),
@@ -3059,6 +3072,8 @@ impl CaptainsRegistry {
                 CaptainsInner {
                     captains,
                     agent_sessions: snap.agent_sessions,
+                    agent_checkpoints: snap.agent_checkpoints,
+                    agent_events: snap.agent_events,
                     projects: snap.projects,
                     workspaces,
                     pending_fleet_operations: snap.pending_fleet_operations,
@@ -3211,6 +3226,34 @@ impl CaptainsRegistry {
                     "agent session '{}' references unknown projectId '{}'",
                     agent.agent_session_id, agent.project_id
                 ));
+            }
+        }
+        let agent_ids: std::collections::HashSet<_> = snapshot
+            .agent_sessions
+            .iter()
+            .map(|agent| agent.agent_session_id.as_str())
+            .collect();
+        for checkpoint in &snapshot.agent_checkpoints {
+            checkpoint.validate()?;
+            if !agent_ids.contains(checkpoint.agent_session_id.as_str()) {
+                return Err(format!(
+                    "agent checkpoint references unknown agentSessionId '{}'",
+                    checkpoint.agent_session_id
+                ));
+            }
+        }
+        for event in &snapshot.agent_events {
+            if event.cursor == 0 || event.kind.trim().is_empty() {
+                return Err("agent event has an invalid cursor or kind".into());
+            }
+            if !agent_ids.contains(event.agent_session_id.as_str()) {
+                return Err(format!(
+                    "agent event references unknown agentSessionId '{}'",
+                    event.agent_session_id
+                ));
+            }
+            if let Some(checkpoint) = &event.checkpoint {
+                checkpoint.validate()?;
             }
         }
         let mut pending_claim_scopes = std::collections::HashSet::new();
@@ -3651,6 +3694,8 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             agent_sessions: g.agent_sessions.clone(),
+            agent_checkpoints: g.agent_checkpoints.clone(),
+            agent_events: g.agent_events.clone(),
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -4639,6 +4684,8 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             agent_sessions: g.agent_sessions.clone(),
+            agent_checkpoints: g.agent_checkpoints.clone(),
+            agent_events: g.agent_events.clone(),
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -4646,6 +4693,53 @@ impl CaptainsRegistry {
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
+    }
+
+    pub fn append_agent_checkpoint(
+        &self,
+        agent_session_id: &str,
+        author_session_id: &str,
+        summary: &str,
+    ) -> Result<AgentCheckpoint, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let agent_index = current
+            .agent_sessions
+            .iter()
+            .position(|agent| agent.agent_session_id == agent_session_id)
+            .ok_or_else(|| format!("agent_checkpoint: agent '{agent_session_id}' was not found"))?;
+        let cursor = current.seq.saturating_add(1);
+        let checkpoint = AgentCheckpoint {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            author_session_id: author_session_id.to_string(),
+            summary: summary.to_string(),
+            created_at: now_ms(),
+        };
+        checkpoint.validate()?;
+        current.agent_sessions[agent_index].updated_at = checkpoint.created_at;
+        current.agent_checkpoints.push(checkpoint.clone());
+        current.agent_events.push(AgentEvent {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            kind: "checkpoint".into(),
+            created_at: checkpoint.created_at,
+            checkpoint: Some(checkpoint.clone()),
+        });
+        if current.agent_checkpoints.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_checkpoints.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_checkpoints.drain(0..overflow);
+        }
+        if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_events.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_events.drain(0..overflow);
+        }
+        current.seq = cursor;
+        self.commit_mutation(current, previous)?;
+        Ok(checkpoint)
     }
 
     fn pending_dispatch_claim(
@@ -4945,6 +5039,8 @@ impl CaptainsRegistry {
                 seq: g.seq,
                 captains: g.captains.clone(),
                 agent_sessions: g.agent_sessions.clone(),
+                agent_checkpoints: g.agent_checkpoints.clone(),
+                agent_events: g.agent_events.clone(),
                 projects: g.projects.clone(),
                 workspaces: g.workspaces.clone(),
                 pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -8912,7 +9008,7 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
-        | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "report_workspace_tabs" | "watch_fleet"
+        | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "agent_checkpoint" | "report_workspace_tabs" | "watch_fleet"
         | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
@@ -10384,6 +10480,7 @@ fn dispatch_with_caller(
         "list_projects" => list_projects(ctx),
         "list_agents" => list_agents(ctx, args),
         "get_agent" => get_agent(ctx, args),
+        "agent_events" => agent_events(ctx, args),
         "list_powder_boards" => list_powder_boards(args),
         "project_board_snapshot" => project_board_snapshot(ctx, args),
         "read_crew_powder_evidence" => {
@@ -10452,6 +10549,7 @@ fn dispatch_with_caller(
         "release_captain" => release_captain(ctx, args, caller, trusted_internal),
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
+        "agent_checkpoint" => agent_checkpoint(ctx, args),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
         }
@@ -10678,6 +10776,70 @@ fn get_agent(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
     Ok(serde_json::to_value(agent)
         .map_err(|error| format!("get_agent serialization failed: {error}"))?)
+}
+
+fn agent_checkpoint(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "agent_checkpoint",
+        &["agentSessionId", "authorSessionId", "summary"],
+    )?;
+    let agent_session_id = arg_str(args, "agentSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("agent_checkpoint requires a non-empty 'agentSessionId'")?;
+    let author_session_id = arg_str(args, "authorSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("agent_checkpoint requires a non-empty 'authorSessionId'")?;
+    let summary = arg_str(args, "summary")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("agent_checkpoint requires a non-empty 'summary'")?;
+    let checkpoint =
+        ctx.captains
+            .append_agent_checkpoint(&agent_session_id, &author_session_id, &summary)?;
+    Ok(json!({
+        "checkpoint": checkpoint,
+        "eventCursor": checkpoint.cursor,
+    }))
+}
+
+fn agent_events(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    require_exact_args(args, "agent_events", &["agentSessionId", "cursor", "limit"])?;
+    let agent_session_id = arg_str(args, "agentSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("agent_events requires a non-empty 'agentSessionId'")?;
+    let after = agent_page_cursor(args, "agent_events")? as u64;
+    let limit = agent_page_limit(args, "agent_events")?;
+    let snapshot = ctx.captains.snapshot();
+    if !snapshot
+        .agent_sessions
+        .iter()
+        .any(|agent| agent.agent_session_id == agent_session_id)
+    {
+        return Err(format!(
+            "agent_events: agent '{agent_session_id}' was not found"
+        ));
+    }
+    let event_cursor = snapshot
+        .agent_events
+        .last()
+        .map(|event| event.cursor)
+        .unwrap_or(after);
+    let events: Vec<_> = snapshot
+        .agent_events
+        .into_iter()
+        .filter(|event| event.agent_session_id == agent_session_id && event.cursor > after)
+        .take(limit)
+        .collect();
+    let count = events.len();
+    let next_cursor = events.last().map(|event| event.cursor).unwrap_or(after);
+    Ok(json!({
+        "events": events,
+        "count": count,
+        "cursor": after.to_string(),
+        "nextCursor": next_cursor.to_string(),
+        "eventCursor": event_cursor,
+        "hasMore": next_cursor < event_cursor,
+    }))
 }
 
 /// `get_status`: FR-012 status for one session id (from the supervision reducer)
@@ -25755,6 +25917,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             agent_sessions: vec![],
+            agent_checkpoints: vec![],
+            agent_events: vec![],
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],
@@ -25789,6 +25953,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             agent_sessions: vec![],
+            agent_checkpoints: vec![],
+            agent_events: vec![],
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
@@ -26192,6 +26358,8 @@ mod tests {
             seq: 4,
             captains: vec![],
             agent_sessions: vec![],
+            agent_checkpoints: vec![],
+            agent_events: vec![],
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
@@ -26290,6 +26458,8 @@ mod tests {
             seq: 1,
             captains: vec![],
             agent_sessions: vec![],
+            agent_checkpoints: vec![],
+            agent_events: vec![],
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
@@ -26517,6 +26687,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("agent 'missing-agent' was not found"));
+    }
+
+    #[test]
+    fn checkpoint_and_event_reads_fail_closed_for_unknown_agents() {
+        let ctx = test_ctx("secret");
+        let checkpoint_error = dispatch(
+            &ctx,
+            "agent_checkpoint",
+            &json!({
+                "agentSessionId": "missing-agent",
+                "authorSessionId": "captain-1",
+                "summary": "progress"
+            }),
+        )
+        .unwrap_err();
+        assert!(checkpoint_error.contains("agent 'missing-agent' was not found"));
+
+        let events_error = dispatch(
+            &ctx,
+            "agent_events",
+            &json!({"agentSessionId": "missing-agent", "cursor": "0"}),
+        )
+        .unwrap_err();
+        assert!(events_error.contains("agent 'missing-agent' was not found"));
     }
 
     #[test]
@@ -31585,6 +31779,8 @@ mod tests {
             seq: 0,
             captains: vec![],
             agent_sessions: vec![],
+            agent_checkpoints: vec![],
+            agent_events: vec![],
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],

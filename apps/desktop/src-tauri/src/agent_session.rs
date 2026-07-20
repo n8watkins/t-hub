@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 pub const MAX_ASSIGNMENT_BYTES: usize = 16 * 1024;
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024;
 pub const MAX_EVENT_BATCH: usize = 128;
+pub const MAX_CHECKPOINT_HISTORY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeState {
