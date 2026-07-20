@@ -9675,7 +9675,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "inbox_ack"
         // comms-plane Phase 3: `authorize` records a durable governance artifact
         // (mutating, audited); only the general originates (enforced by the handler ACL).
-        | "authorize" | "appoint_admin" | "approve_admin_action" | "revoke_admin" | "record_agent_delivery" => {
+        | "authorize" | "appoint_admin" | "approve_admin_action" | "execute_admin_operation" | "revoke_admin" | "record_agent_delivery" => {
             CommandTier::Organization
         }
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
@@ -11327,6 +11327,7 @@ fn dispatch_with_caller(
         "record_agent_delivery" => record_agent_delivery(ctx, args, caller, trusted_internal),
         "appoint_admin" => appoint_admin(ctx, args, caller, trusted_internal),
         "approve_admin_action" => approve_admin_action(ctx, args, caller, trusted_internal),
+        "execute_admin_operation" => execute_admin_operation(ctx, args, caller, trusted_internal),
         "revoke_admin" => revoke_admin(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
@@ -11441,6 +11442,7 @@ fn enforce_delegated_admin_command(
             | "capture_pane"
             | "create_worktree"
             | "close_terminal"
+            | "execute_admin_operation"
             | "list_admin_grants"
     ) {
         return Ok(());
@@ -21433,6 +21435,606 @@ fn list_admin_grants(
     }))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum AdminExecutionTargetInput {
+    Fleet,
+    Ship {
+        #[serde(rename = "shipSlug")]
+        ship_slug: String,
+    },
+    Session {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    Worktree {
+        path: String,
+    },
+    GeneralReserved {
+        action: String,
+    },
+    Implementation {
+        #[serde(rename = "shipSlug")]
+        ship_slug: String,
+        #[serde(rename = "assignmentId")]
+        assignment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminExecutionResource {
+    Fleet,
+    Ship(String),
+    Session(String),
+    Worktree(String),
+    Forbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAdminExecutionTarget {
+    authorization_target: crate::delegated_admin::AdminTarget,
+    resource: AdminExecutionResource,
+}
+
+fn exact_active_captain_for_ship(
+    ctx: &ControlContext,
+    ship_slug: &str,
+) -> Result<CaptainRecord, String> {
+    if ship_slug.trim().is_empty() {
+        return Err("execute_admin_operation shipSlug must not be empty".into());
+    }
+    let matching = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .filter(|captain| {
+            captain.role == FleetRole::Captain
+                && captain.state == ClaimState::Active
+                && captain.ship_slug == ship_slug
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [captain] => Ok(captain.clone()),
+        [] => Err(format!(
+            "execute_admin_operation ship '{ship_slug}' has no active authoritative Captain"
+        )),
+        _ => Err(format!(
+            "execute_admin_operation ship '{ship_slug}' has ambiguous Captain ownership"
+        )),
+    }
+}
+
+fn resolve_admin_worktree_target(
+    ctx: &ControlContext,
+    requested_path: &str,
+) -> Result<ResolvedAdminExecutionTarget, String> {
+    let requested_path = files::posix_form(requested_path.trim());
+    if requested_path.is_empty() || !Path::new(&requested_path).is_absolute() {
+        return Err("execute_admin_operation worktree path must be absolute".into());
+    }
+    let snapshot = ctx.captains.snapshot();
+    let mut matches = Vec::new();
+    for project in &snapshot.projects {
+        let worktrees = git::worktree_list(&files::posix_form(&project.repo_root))?;
+        if let Some(worktree) = worktrees
+            .into_iter()
+            .find(|worktree| files::posix_form(&worktree.path) == requested_path)
+        {
+            for captain in snapshot.captains.iter().filter(|captain| {
+                captain.role == FleetRole::Captain
+                    && captain.state == ClaimState::Active
+                    && captain.project_id.as_deref() == Some(project.project_id.as_str())
+            }) {
+                matches.push((captain.ship_slug.clone(), worktree.path.clone()));
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [(ship_slug, path)] => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Worktree {
+                ship_slug: ship_slug.clone(),
+                worktree_id: files::posix_form(path),
+            },
+            resource: AdminExecutionResource::Worktree(files::posix_form(path)),
+        }),
+        [] => Err(format!(
+            "execute_admin_operation worktree '{requested_path}' has no active authoritative ship owner"
+        )),
+        _ => Err(format!(
+            "execute_admin_operation worktree '{requested_path}' has ambiguous ship ownership"
+        )),
+    }
+}
+
+fn resolve_admin_execution_target(
+    ctx: &ControlContext,
+    input: &AdminExecutionTargetInput,
+) -> Result<ResolvedAdminExecutionTarget, String> {
+    match input {
+        AdminExecutionTargetInput::Fleet => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Fleet,
+            resource: AdminExecutionResource::Fleet,
+        }),
+        AdminExecutionTargetInput::Ship { ship_slug } => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            Ok(ResolvedAdminExecutionTarget {
+                authorization_target: crate::delegated_admin::AdminTarget::Ship {
+                    ship_slug: captain.ship_slug.clone(),
+                },
+                resource: AdminExecutionResource::Ship(captain.ship_slug),
+            })
+        }
+        AdminExecutionTargetInput::Session { session_id } => {
+            let session_id = session_id.strip_prefix("th_").unwrap_or(session_id).trim();
+            if session_id.is_empty() {
+                return Err("execute_admin_operation sessionId must not be empty".into());
+            }
+            Ok(ResolvedAdminExecutionTarget {
+                authorization_target: delegated_admin_target_for_terminal(ctx, session_id)?,
+                resource: AdminExecutionResource::Session(session_id.to_string()),
+            })
+        }
+        AdminExecutionTargetInput::Worktree { path } => resolve_admin_worktree_target(ctx, path),
+        AdminExecutionTargetInput::GeneralReserved { action } => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::GeneralReserved {
+                action: action.clone(),
+            },
+            resource: AdminExecutionResource::Forbidden,
+        }),
+        AdminExecutionTargetInput::Implementation {
+            ship_slug,
+            assignment_id,
+        } => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Implementation {
+                ship_slug: ship_slug.clone(),
+                assignment_id: assignment_id.clone(),
+            },
+            resource: AdminExecutionResource::Forbidden,
+        }),
+    }
+}
+
+fn revalidate_admin_execution_authority(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+) -> Result<(), String> {
+    let grant = ctx
+        .delegated_admin
+        .get(&audit.grant_id)
+        .filter(|grant| {
+            grant.state.is_active()
+                && grant.grant_generation == audit.grant_generation
+                && grant.actor_identity_id == audit.actor_identity_id
+        })
+        .ok_or("delegated admin: exact grant changed before administrative execution")?;
+    let supervisor = current_delegating_supervisor(ctx, &grant);
+    let actor = current_admin_actor(ctx, &grant);
+    ctx.delegated_admin
+        .authorize(
+            &crate::delegated_admin::AdminActor {
+                identity_id: audit.actor_identity_id.clone(),
+                session_tile: audit.actor_session_tile.clone(),
+                ..actor
+            },
+            &supervisor,
+            audit.operation,
+            &audit.target,
+            &crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{}: {error}", error.code()))
+}
+
+fn revalidate_admin_execution_target(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<(), String> {
+    let current = match &target.resource {
+        AdminExecutionResource::Fleet => crate::delegated_admin::AdminTarget::Fleet,
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            crate::delegated_admin::AdminTarget::Ship {
+                ship_slug: captain.ship_slug,
+            }
+        }
+        AdminExecutionResource::Session(session_id) => {
+            delegated_admin_target_for_terminal(ctx, session_id)?
+        }
+        AdminExecutionResource::Worktree(path) => {
+            resolve_admin_worktree_target(ctx, path)?.authorization_target
+        }
+        AdminExecutionResource::Forbidden => audit.target.clone(),
+    };
+    if current != audit.target {
+        return Err(
+            "delegated admin: exact target ownership changed before administrative execution"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn revalidate_admin_effect_session(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+    session_id: &str,
+) -> Result<(), String> {
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    let current_session = delegated_admin_target_for_terminal(ctx, session_id)?;
+    match (&audit.target, &current_session) {
+        (
+            crate::delegated_admin::AdminTarget::Fleet,
+            crate::delegated_admin::AdminTarget::Captain { .. },
+        ) => Ok(()),
+        (
+            crate::delegated_admin::AdminTarget::Ship { ship_slug },
+            crate::delegated_admin::AdminTarget::Captain {
+                ship_slug: current, ..
+            }
+            | crate::delegated_admin::AdminTarget::CrewSession {
+                ship_slug: current, ..
+            },
+        ) if ship_slug == current => Ok(()),
+        (expected, current) if expected == current => Ok(()),
+        _ => Err(
+            "delegated admin: administrative session target changed ownership before mutation"
+                .into(),
+        ),
+    }
+}
+
+fn session_liveness_label(liveness: tmux::SessionLiveness) -> &'static str {
+    match liveness {
+        tmux::SessionLiveness::Alive => "alive",
+        tmux::SessionLiveness::Gone => "gone",
+        tmux::SessionLiveness::Unknown => "unknown",
+    }
+}
+
+fn admin_session_ids_for_target(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Vec<String>, String> {
+    let snapshot = ctx.captains.snapshot();
+    let mut sessions = match &target.resource {
+        AdminExecutionResource::Session(session_id) => vec![session_id.clone()],
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            let mut sessions = captain.terminal_id.into_iter().collect::<Vec<_>>();
+            if audit.delegated_role == crate::delegated_admin::DelegatedAdminRole::ShipAdmin {
+                sessions.extend(
+                    captain
+                        .crew
+                        .into_iter()
+                        .filter(|crew| !matches!(crew.state, CrewState::Removed { .. }))
+                        .map(|crew| crew.terminal_id),
+                );
+            }
+            sessions
+        }
+        AdminExecutionResource::Fleet => snapshot
+            .captains
+            .into_iter()
+            .filter(|captain| {
+                captain.role == FleetRole::Captain && captain.state == ClaimState::Active
+            })
+            .filter_map(|captain| captain.terminal_id)
+            .collect(),
+        AdminExecutionResource::Worktree(_) | AdminExecutionResource::Forbidden => Vec::new(),
+    };
+    sessions.sort();
+    sessions.dedup();
+    Ok(sessions)
+}
+
+fn maintain_admin_sessions(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Value, String> {
+    let session_ids = admin_session_ids_for_target(ctx, audit, target)?;
+    if session_ids.is_empty() {
+        return Err("execute_admin_operation target has no authoritative session resources".into());
+    }
+    let mut maintained = Vec::new();
+    let mut recovery_plan = Vec::new();
+    for session_id in session_ids {
+        let tmux_session = tmux_target(&session_id);
+        let liveness = tmux::session_liveness(&tmux_session);
+        match liveness {
+            tmux::SessionLiveness::Alive => {
+                revalidate_admin_effect_session(ctx, audit, target, &session_id)?;
+                revalidate_admin_execution_authority(ctx, audit)?;
+                tmux::maintain_session(&tmux_session).map_err(|error| {
+                    format!("session '{session_id}' maintenance failed: {error}")
+                })?;
+                maintained.push(json!({
+                    "sessionId": session_id,
+                    "tmuxSession": tmux_session,
+                    "outcome": "maintained",
+                }));
+            }
+            tmux::SessionLiveness::Gone | tmux::SessionLiveness::Unknown => {
+                recovery_plan.push(json!({
+                    "sessionId": session_id,
+                    "tmuxSession": tmux_session,
+                    "observedLiveness": session_liveness_label(liveness),
+                    "requiredSupervisorDecision": "replaceOrRetireRuntime",
+                }));
+            }
+        }
+    }
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    Ok(json!({
+        "outcome": if recovery_plan.is_empty() { "maintained" } else { "recoveryPrepared" },
+        "maintainedSessions": maintained,
+        "recoveryPlan": recovery_plan,
+    }))
+}
+
+fn recover_admin_worktree(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    path: &str,
+) -> Result<Value, String> {
+    revalidate_admin_execution_target(
+        ctx,
+        audit,
+        &ResolvedAdminExecutionTarget {
+            authorization_target: audit.target.clone(),
+            resource: AdminExecutionResource::Worktree(path.to_string()),
+        },
+    )?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let info = git::git_info_cached(path);
+    if !info.is_repo || info.worktree_root.as_deref() != Some(path) {
+        return Err(format!(
+            "execute_admin_operation worktree '{path}' no longer resolves as the exact Git worktree"
+        ));
+    }
+    let recovery_required = info.head_commit.is_none();
+    Ok(json!({
+        "outcome": if recovery_required { "recoveryPrepared" } else { "resourceReconciled" },
+        "worktree": {
+            "path": path,
+            "branch": info.branch,
+            "headCommit": info.head_commit,
+            "dirtyCount": info.dirty_count,
+            "isLinkedWorktree": info.is_linked_worktree,
+        },
+        "recoveryPlan": recovery_required.then(|| json!({
+            "requiredSupervisorDecision": "selectAuthoritativeBaseline",
+            "preserveDirtyWork": info.dirty_count > 0,
+        })),
+    }))
+}
+
+fn retirement_plan_id(
+    audit: &crate::delegated_admin::AdminAuditContext,
+    blockers: &[Value],
+) -> String {
+    let canonical = serde_json::to_vec(&json!({
+        "grantId": audit.grant_id,
+        "grantGeneration": audit.grant_generation,
+        "target": audit.target,
+        "blockers": blockers,
+    }))
+    .expect("retirement plan inputs are serializable");
+    format!("sha256:{:x}", Sha256::digest(canonical))
+}
+
+fn prepare_admin_retirement(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Value, String> {
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let mut blockers = Vec::new();
+    match &target.resource {
+        AdminExecutionResource::Session(session_id) => {
+            let liveness = tmux::session_liveness(&tmux_target(session_id));
+            if !matches!(liveness, tmux::SessionLiveness::Gone) {
+                blockers.push(json!({
+                    "kind": "sessionNotStopped",
+                    "sessionId": session_id,
+                    "liveness": session_liveness_label(liveness),
+                }));
+            }
+            if let crate::delegated_admin::AdminTarget::Captain {
+                captain_identity_id,
+                ..
+            } = &audit.target
+            {
+                let dependent_grants = ctx
+                    .delegated_admin
+                    .grants_delegated_by(captain_identity_id)
+                    .into_iter()
+                    .filter(|grant| grant.state.is_active())
+                    .count();
+                if dependent_grants > 0 {
+                    blockers.push(json!({
+                        "kind": "activeDependentGrants",
+                        "count": dependent_grants,
+                    }));
+                }
+            }
+        }
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            if let Some(session_id) = &captain.terminal_id {
+                blockers.push(json!({
+                    "kind": "activeCaptain",
+                    "sessionId": session_id,
+                }));
+            }
+            let active_crew = captain
+                .crew
+                .iter()
+                .filter(|crew| !matches!(crew.state, CrewState::Removed { .. }))
+                .count();
+            if active_crew > 0 {
+                blockers.push(json!({
+                    "kind": "activeCrew",
+                    "count": active_crew,
+                }));
+            }
+            let active_grants = ctx
+                .delegated_admin
+                .active_grants()
+                .into_iter()
+                .filter(|grant| {
+                    matches!(
+                        &grant.scope,
+                        crate::delegated_admin::AdminScope::Ship { ship_slug: scope }
+                            if scope == ship_slug
+                    )
+                })
+                .count();
+            if active_grants > 0 {
+                blockers.push(json!({
+                    "kind": "activeAdministrativeGrants",
+                    "count": active_grants,
+                }));
+            }
+        }
+        AdminExecutionResource::Worktree(path) => {
+            let info = git::git_info_cached(path);
+            if info.dirty_count > 0 {
+                blockers.push(json!({
+                    "kind": "dirtyWorktree",
+                    "dirtyCount": info.dirty_count,
+                }));
+            }
+            let leased_sessions = tmux::pane_info()
+                .map_err(|error| format!("retirement lease inspection failed: {error}"))?
+                .into_iter()
+                .filter(|pane| {
+                    pane.cwd == *path
+                        || pane
+                            .cwd
+                            .strip_prefix(path)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+                .map(|pane| pane.session)
+                .collect::<Vec<_>>();
+            if !leased_sessions.is_empty() {
+                blockers.push(json!({
+                    "kind": "liveSessionLeases",
+                    "sessions": leased_sessions,
+                }));
+            }
+        }
+        AdminExecutionResource::Fleet | AdminExecutionResource::Forbidden => {
+            return Err(
+                "execute_admin_operation target is not valid for retirement preparation".into(),
+            );
+        }
+    }
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let plan_id = retirement_plan_id(audit, &blockers);
+    Ok(json!({
+        "outcome": "retirementPrepared",
+        "planId": plan_id,
+        "ready": blockers.is_empty(),
+        "blockers": blockers,
+        "destructiveActionPerformed": false,
+    }))
+}
+
+fn execute_admin_operation(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(args, "execute_admin_operation", &["operation", "target"])?;
+    require_socket_identity(caller, trusted_internal, "execute_admin_operation")?;
+    let caller = caller
+        .ok_or("execute_admin_operation requires the exact delegated Crew session identity")?;
+    let operation = serde_json::from_value::<crate::delegated_admin::AdminOperation>(
+        args.get("operation")
+            .cloned()
+            .ok_or("execute_admin_operation requires an operation")?,
+    )
+    .map_err(|error| format!("execute_admin_operation operation is invalid: {error}"))?;
+    if !matches!(
+        operation,
+        crate::delegated_admin::AdminOperation::MaintainSession
+            | crate::delegated_admin::AdminOperation::RecoverResource
+            | crate::delegated_admin::AdminOperation::PrepareRetirement
+            | crate::delegated_admin::AdminOperation::MaintainFleetResource
+    ) {
+        return Err("execute_admin_operation supports maintainSession, recoverResource, prepareRetirement, or maintainFleetResource only".into());
+    }
+    let target_input = serde_json::from_value::<AdminExecutionTargetInput>(
+        args.get("target")
+            .cloned()
+            .ok_or("execute_admin_operation requires a target")?,
+    )
+    .map_err(|error| format!("execute_admin_operation target is invalid: {error}"))?;
+    let target = resolve_admin_execution_target(ctx, &target_input)?;
+    let audit = authorize_delegated_admin(
+        ctx,
+        caller,
+        operation,
+        target.authorization_target.clone(),
+        crate::delegated_admin::AdminSafeguards::default(),
+    )?;
+    let result = match operation {
+        crate::delegated_admin::AdminOperation::MaintainSession => {
+            if !matches!(target.resource, AdminExecutionResource::Session(_)) {
+                Err("execute_admin_operation maintainSession requires a session target".into())
+            } else {
+                maintain_admin_sessions(ctx, &audit, &target)
+            }
+        }
+        crate::delegated_admin::AdminOperation::RecoverResource => match &target.resource {
+            AdminExecutionResource::Worktree(path) => recover_admin_worktree(ctx, &audit, path),
+            AdminExecutionResource::Forbidden => {
+                Err("execute_admin_operation cannot recover a forbidden target".into())
+            }
+            _ => maintain_admin_sessions(ctx, &audit, &target),
+        },
+        crate::delegated_admin::AdminOperation::PrepareRetirement => {
+            prepare_admin_retirement(ctx, &audit, &target)
+        }
+        crate::delegated_admin::AdminOperation::MaintainFleetResource => {
+            if !matches!(
+                target.resource,
+                AdminExecutionResource::Fleet
+                    | AdminExecutionResource::Ship(_)
+                    | AdminExecutionResource::Session(_)
+            ) {
+                Err("execute_admin_operation maintainFleetResource requires a fleet, ship, or Captain session target".into())
+            } else {
+                maintain_admin_sessions(ctx, &audit, &target)
+            }
+        }
+        _ => unreachable!(),
+    }
+    .map(|outcome| {
+        json!({
+            "accepted": "execute_admin_operation",
+            "operation": operation,
+            "target": target.authorization_target,
+            "outcome": outcome,
+            "delegatedAdmin": audit,
+            "audited": true,
+        })
+    });
+    record_delegated_admin_execution_outcome(ctx, &audit, &result);
+    result
+}
+
 fn authorize_delegated_admin(
     ctx: &ControlContext,
     caller: &ResolvedIdentity,
@@ -21481,6 +22083,46 @@ fn record_delegated_admin_outcome<T>(
     let audit_value = json!({
         "authorization": audit,
         "outcome": decision,
+        "error": result.as_ref().err(),
+    });
+    ctx.audit.record(
+        "delegated_admin_operation",
+        "organization",
+        decision,
+        &audit_value,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: "delegated",
+            session: audit.actor_session_tile.as_deref(),
+            spawned_by: None,
+            error: result.as_ref().err().map(String::as_str),
+        },
+    );
+}
+
+/// Record the bounded typed result of an explicit administration command.
+///
+/// Other delegated reads intentionally use [`record_delegated_admin_outcome`]
+/// without serializing their result because terminal scrollback and status
+/// payloads may contain sensitive or unbounded user data.
+fn record_delegated_admin_execution_outcome(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    result: &Result<Value, String>,
+) {
+    let decision = if result.is_ok() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let audit_value = json!({
+        "authorization": audit,
+        "outcome": decision,
+        "result": result.as_ref().ok(),
         "error": result.as_ref().err(),
     });
     ctx.audit.record(
@@ -32955,6 +33597,292 @@ mod tests {
     }
 
     #[test]
+    fn ship_admin_executes_own_ship_operations_and_denies_foreign_or_reserved_targets() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-admin-execute-audit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx =
+            test_ctx("admin-execute-ship").with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.captains
+            .claim_test("captain-alpha", Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-beta", Some("beta"), vec![])
+            .unwrap();
+        for crew in ["admin-alpha", "peer-alpha"] {
+            ctx.captains.record_crew("captain-alpha", crew).unwrap();
+        }
+        ctx.captains
+            .record_crew("captain-beta", "peer-beta")
+            .unwrap();
+        let session_ids = ["admin-alpha", "peer-alpha", "peer-beta"];
+        for session_id in session_ids {
+            create_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-alpha")
+            .unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, "admin-alpha")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": "admin-alpha",
+                "role": "shipAdmin",
+                "permittedOperations": [
+                    "maintainSession",
+                    "recoverResource",
+                    "prepareRetirement"
+                ]
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+
+        let own = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainSession",
+                "target": { "kind": "session", "sessionId": "admin-alpha" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(own["outcome"]["outcome"], "maintained");
+        assert_eq!(
+            own["outcome"]["maintainedSessions"][0]["sessionId"],
+            "admin-alpha"
+        );
+
+        let sibling = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "session", "sessionId": "peer-alpha" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sibling["outcome"]["outcome"], "maintained");
+
+        let retirement = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "prepareRetirement",
+                "target": { "kind": "session", "sessionId": "peer-alpha" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(retirement["outcome"]["outcome"], "retirementPrepared");
+        assert_eq!(retirement["outcome"]["ready"], false);
+        assert!(retirement["outcome"]["planId"]
+            .as_str()
+            .is_some_and(|plan| plan.starts_with("sha256:")));
+
+        let foreign = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainSession",
+                "target": { "kind": "session", "sessionId": "peer-beta" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(foreign.contains("targetOutOfScope"));
+
+        let reserved = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "generalReserved", "action": "installRelease" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(reserved.contains("targetOutOfScope"));
+
+        let implementation = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": {
+                    "kind": "implementation",
+                    "shipSlug": "alpha",
+                    "assignmentId": "assignment-1"
+                }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(implementation.contains("targetOutOfScope"));
+
+        let records = read_audit(&audit_dir);
+        let operation_records = records
+            .iter()
+            .filter(|record| record["command"] == "delegated_admin_operation")
+            .collect::<Vec<_>>();
+        assert_eq!(operation_records.len(), 3);
+        assert_eq!(
+            operation_records[0]["args"]["authorization"]["actorIdentityId"],
+            admin_identity.id
+        );
+        assert_eq!(
+            operation_records[0]["args"]["authorization"]["delegatingSupervisorIdentityId"],
+            captain_identity.id
+        );
+        assert_eq!(
+            operation_records[0]["args"]["result"]["outcome"]["outcome"],
+            "maintained"
+        );
+
+        for session_id in session_ids {
+            reap_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        std::fs::remove_dir_all(audit_dir).ok();
+    }
+
+    #[test]
+    fn fleet_admin_maintains_captains_without_crossing_into_crew_or_general_authority() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let ctx = test_ctx("admin-execute-fleet");
+        ctx.captains
+            .claim_provider(
+                "cortana1",
+                None,
+                FleetRole::Cortana,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        ctx.captains
+            .claim_test("capalpha", Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .claim_test("capbeta", Some("beta"), vec![])
+            .unwrap();
+        ctx.captains.record_crew("capalpha", "fleet-admin").unwrap();
+        ctx.captains.record_crew("capbeta", "peer-beta").unwrap();
+        for session_id in ["fleet-admin", "capalpha", "capbeta", "peer-beta"] {
+            create_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        let cortana_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        ctx.identity
+            .bind_tile(&cortana_identity.id, "cortana1")
+            .unwrap();
+        ctx.captains
+            .begin_cortana_recovery("fleet-admin-test")
+            .unwrap();
+        ctx.captains
+            .commit_cortana_runtime(
+                "fleet-admin-test",
+                &cortana_identity.id,
+                1,
+                "cortana1",
+                "codex",
+                None,
+            )
+            .unwrap();
+        let fleet_admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&fleet_admin_identity.id, "fleet-admin")
+            .unwrap();
+        let cortana = resolve_identity(&ctx, &cortana_identity.secret).unwrap();
+        appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": "fleet-admin",
+                "role": "fleetAdmin",
+                "permittedOperations": [
+                    "maintainFleetResource",
+                    "recoverResource",
+                    "prepareRetirement"
+                ]
+            }),
+            Some(&cortana),
+            false,
+        )
+        .unwrap();
+        let fleet_admin = resolve_identity(&ctx, &fleet_admin_identity.secret).unwrap();
+
+        let maintained = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainFleetResource",
+                "target": { "kind": "fleet" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(maintained["outcome"]["outcome"], "maintained");
+        assert_eq!(
+            maintained["outcome"]["maintainedSessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let retirement = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "prepareRetirement",
+                "target": { "kind": "session", "sessionId": "capbeta" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(retirement["outcome"]["ready"], false);
+
+        let crew_denied = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "session", "sessionId": "peer-beta" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(crew_denied.contains("targetOutOfScope"));
+
+        let general_denied = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainFleetResource",
+                "target": { "kind": "generalReserved", "action": "approveRelease" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(general_denied.contains("targetOutOfScope"));
+
+        for session_id in ["fleet-admin", "capalpha", "capbeta", "peer-beta"] {
+            reap_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+    }
+
+    #[test]
     fn dispatch_capacity_counts_one_live_harness_backed_ship_admin_per_ship() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("admin-capacity");
@@ -33441,6 +34369,24 @@ mod tests {
         )
         .unwrap_err()
         .contains("cannot re-delegate authority"));
+
+        let maintained = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "admin-boundaries",
+                &admin_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "maintainSession",
+                    "target": { "kind": "session", "sessionId": "admin-alpha" }
+                }),
+            ),
+        );
+        assert!(
+            maintained.ok,
+            "role-authorized maintenance route failed: {:?}",
+            maintained.error
+        );
 
         let grants = dispatch_authenticated(
             &ctx,

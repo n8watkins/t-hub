@@ -36,11 +36,25 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         "approve-session" => approve_session(&args[1..]),
         "approve-worktree" => approve_worktree(&args[1..]),
         "cleanup-session" => cleanup_session(&args[1..]),
+        "maintain-session" => maintain_session(&args[1..]),
+        "recover-resource" => execute_resource_operation(
+            "admin recover-resource",
+            "recoverResource",
+            &args[1..],
+            &["session", "ship", "worktree"],
+        ),
+        "prepare-retirement" => execute_resource_operation(
+            "admin prepare-retirement",
+            "prepareRetirement",
+            &args[1..],
+            &["session", "ship", "worktree"],
+        ),
+        "maintain-fleet-resource" => maintain_fleet_resource(&args[1..]),
         "" => Err(CliError::usage(
-            "usage: th admin <list|appoint|revoke|approve-session|approve-worktree|cleanup-session> ...",
+            "usage: th admin <list|appoint|revoke|approve-session|approve-worktree|cleanup-session|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource> ...",
         )),
         other => Err(CliError::usage(format!(
-            "unknown admin subcommand '{other}' (expected list|appoint|revoke|approve-session|approve-worktree|cleanup-session)"
+            "unknown admin subcommand '{other}' (expected list|appoint|revoke|approve-session|approve-worktree|cleanup-session|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource)"
         ))),
     }
 }
@@ -53,7 +67,11 @@ appoint <crewSessionId> --role ROLE --operations CSV  appoint a durable Ship or 
 revoke <grantId> [--reason TEXT]                      revoke a grant and its active approvals\n\
 approve-session <grantId> <sessionId>                 approve one exact session cleanup\n\
 approve-worktree <grantId> <path> --ship SLUG         approve one exact worktree cleanup\n\
-cleanup-session <sessionId> --approval ID --confirm   consume approval and close the session\n\n\
+cleanup-session <sessionId> --approval ID --confirm   consume approval and close the session\n\
+maintain-session <sessionId>                          maintain one exact live session\n\
+recover-resource <KIND> <VALUE>                       reconcile or prepare recovery\n\
+prepare-retirement <KIND> <VALUE>                     prepare a fail-closed retirement plan\n\
+maintain-fleet-resource <fleet|ship|session> [VALUE]  maintain Captain infrastructure\n\n\
 ROLE is shipAdmin or fleetAdmin.\n\
 CSV operations: inspectStatus, maintainSession, cleanupSession, recoverResource,\n\
 maintainWorktree, cleanupWorktree, prepareRetirement, buildCrossCaptainReport,\n\
@@ -178,6 +196,88 @@ fn cleanup_session(args: &[String]) -> Result<(), CliError> {
             "approvalId": approval_id,
             "force": flags.booleans.contains("--force"),
         }),
+        &flags,
+    )
+}
+
+fn maintain_session(args: &[String]) -> Result<(), CliError> {
+    let flags = StrictFlags::parse(args, &[], &["--json"])?;
+    flags.require_positionals(1, "th admin maintain-session <sessionId> [--json]")?;
+    let session_id = positional(&flags, 0, "admin maintain-session", "<sessionId>")?;
+    call_and_render(
+        "admin maintain-session",
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainSession",
+            "target": { "kind": "session", "sessionId": session_id },
+        }),
+        &flags,
+    )
+}
+
+fn execute_resource_operation(
+    label: &str,
+    operation: &str,
+    args: &[String],
+    allowed_kinds: &[&str],
+) -> Result<(), CliError> {
+    let flags = StrictFlags::parse(args, &[], &["--json"])?;
+    flags.require_positionals(
+        2,
+        &format!("th {label} <{}> <value> [--json]", allowed_kinds.join("|")),
+    )?;
+    let kind = positional(&flags, 0, label, "<kind>")?;
+    if !allowed_kinds.contains(&kind.as_str()) {
+        return Err(CliError::usage(format!(
+            "th {label}: kind must be {}",
+            allowed_kinds.join(", ")
+        )));
+    }
+    let value = positional(&flags, 1, label, "<value>")?;
+    let target = match kind.as_str() {
+        "session" => json!({ "kind": "session", "sessionId": value }),
+        "ship" => json!({ "kind": "ship", "shipSlug": value }),
+        "worktree" => json!({ "kind": "worktree", "path": value }),
+        _ => unreachable!(),
+    };
+    call_and_render(
+        label,
+        "execute_admin_operation",
+        json!({ "operation": operation, "target": target }),
+        &flags,
+    )
+}
+
+fn maintain_fleet_resource(args: &[String]) -> Result<(), CliError> {
+    let flags = StrictFlags::parse(args, &[], &["--json"])?;
+    let kind = positional(&flags, 0, "admin maintain-fleet-resource", "<kind>")?;
+    let target = match kind.as_str() {
+        "fleet" => {
+            flags.require_positionals(1, "th admin maintain-fleet-resource fleet [--json]")?;
+            json!({ "kind": "fleet" })
+        }
+        "ship" | "session" => {
+            flags.require_positionals(
+                2,
+                "th admin maintain-fleet-resource <ship|session> <value> [--json]",
+            )?;
+            let value = positional(&flags, 1, "admin maintain-fleet-resource", "<value>")?;
+            if kind == "ship" {
+                json!({ "kind": "ship", "shipSlug": value })
+            } else {
+                json!({ "kind": "session", "sessionId": value })
+            }
+        }
+        _ => {
+            return Err(CliError::usage(
+                "th admin maintain-fleet-resource: kind must be fleet, ship, or session",
+            ));
+        }
+    };
+    call_and_render(
+        "admin maintain-fleet-resource",
+        "execute_admin_operation",
+        json!({ "operation": "maintainFleetResource", "target": target }),
         &flags,
     )
 }

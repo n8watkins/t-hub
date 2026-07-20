@@ -773,6 +773,44 @@ pub fn reassert_window_size_latest(name: &str) {
     );
 }
 
+/// Perform bounded, non-destructive maintenance on one exact live session.
+///
+/// Unlike [`reassert_window_size_latest`], this administrative path reports an
+/// error when the exact mutation cannot be confirmed. Callers can therefore
+/// distinguish a maintained session from a missing or indeterminate target and
+/// record an honest operation outcome.
+pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
+    if name.is_empty() || name.len() > 128 || !name.starts_with("th_") {
+        return Err(TmuxError {
+            op: "maintain-session",
+            code: None,
+            message: "session target must be one exact T-Hub tmux session".into(),
+        });
+    }
+    match session_liveness(name) {
+        SessionLiveness::Alive => {}
+        SessionLiveness::Gone => {
+            return Err(TmuxError {
+                op: "maintain-session",
+                code: None,
+                message: "session is definitively gone".into(),
+            });
+        }
+        SessionLiveness::Unknown => {
+            return Err(TmuxError {
+                op: "maintain-session",
+                code: None,
+                message: "session liveness is indeterminate; retry without mutating it".into(),
+            });
+        }
+    }
+    run(
+        "maintain-session",
+        &["set-option", "-t", name, "window-size", "latest"],
+    )?;
+    Ok(())
+}
+
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so

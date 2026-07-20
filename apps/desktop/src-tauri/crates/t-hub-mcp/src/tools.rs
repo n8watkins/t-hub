@@ -612,6 +612,64 @@ fn schema_approve_admin_action() -> Value {
     })
 }
 
+fn schema_execute_admin_operation() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "maintainSession",
+                    "recoverResource",
+                    "prepareRetirement",
+                    "maintainFleetResource"
+                ]
+            },
+            "target": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "fleet" }
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "ship" },
+                            "shipSlug": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "shipSlug"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "session" },
+                            "sessionId": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "sessionId"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "worktree" },
+                            "path": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "path"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        },
+        "required": ["operation", "target"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_get_agent() -> Value {
     json!({
         "type": "object",
@@ -1250,6 +1308,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Issue a durable one-time approval for one destructive delegated operation bound to the exact grant, actor, target, supervisor, and authority generation. Session target kind and ownership are derived by the backend from sessionId.",
             input_schema: schema_approve_admin_action,
+        },
+        ToolDef {
+            name: "execute_admin_operation",
+            tier: Tier::Organization,
+            summary: "Execute a bounded role-authorized Ship Admin or Fleet Admin maintenance operation, or prepare an authoritative recovery or retirement plan when mutation is unsafe.",
+            input_schema: schema_execute_admin_operation,
         },
         ToolDef {
             name: "revoke_admin",
@@ -1999,6 +2063,30 @@ mod tests {
             approve_schema["oneOf"][1]["required"],
             json!(["grantId", "operation", "target"])
         );
+
+        let execute = find("execute_admin_operation").unwrap();
+        assert_eq!(execute.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let execute_schema = (execute.input_schema)();
+        assert_eq!(execute_schema["required"], json!(["operation", "target"]));
+        assert_eq!(
+            execute_schema["properties"]["operation"]["enum"],
+            json!([
+                "maintainSession",
+                "recoverResource",
+                "prepareRetirement",
+                "maintainFleetResource"
+            ])
+        );
+        let target_variants = execute_schema["properties"]["target"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(target_variants.len(), 4);
+        assert!(target_variants.iter().all(|variant| {
+            !matches!(
+                variant["properties"]["kind"]["const"].as_str(),
+                Some("generalReserved" | "implementation")
+            )
+        }));
         assert_eq!(
             (find("close_terminal").unwrap().input_schema)()["properties"]["approvalId"]["type"],
             "string"
