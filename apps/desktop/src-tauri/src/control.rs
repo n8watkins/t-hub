@@ -4817,7 +4817,7 @@ impl CaptainsRegistry {
     ) -> Result<AgentSessionRecord, String> {
         self.update_agent_session(agent_session_id, |agent| {
             agent.workspace_tab_id = workspace_tab_id;
-            agent.runtime_state = RuntimeState::Starting;
+            agent.runtime_state = RuntimeState::Running;
             agent.updated_at = now_ms();
         })
     }
