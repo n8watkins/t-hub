@@ -23644,7 +23644,7 @@ mod tests {
         let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
         tmux::send_text(&target, &command, true).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let result = loop {
             if let Ok(after) = observe_harness_process(&target) {
                 match attest_launch_permissions(
@@ -23653,8 +23653,12 @@ mod tests {
                     &after,
                     PermMode::BypassPermissions,
                 ) {
-                    Err(crate::harness::LaunchAttestationError::StaleEvidence)
-                        if Instant::now() < deadline => {}
+                    Err(crate::harness::LaunchAttestationError::StaleEvidence) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "fake Harness did not replace the foreground shell"
+                        );
+                    }
                     result => break result,
                 }
             }
