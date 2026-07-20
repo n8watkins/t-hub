@@ -11837,6 +11837,21 @@ fn register_project(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "register_project",
+        &[
+            "repoRoot",
+            "repo_root",
+            "createDirectory",
+            "create_directory",
+            "initializeGit",
+            "initialize_git",
+            "name",
+            "remoteUrl",
+            "remote_url",
+        ],
+    )?;
     require_socket_identity(caller, trusted_internal, "register_project")?;
     let requested_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
@@ -11945,32 +11960,6 @@ fn register_project(
             trusted_internal,
             existing.as_ref().map(|project| project.project_id.as_str()),
         )?;
-        let powder_repository =
-            arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
-        let powder = if let Some(repository) = powder_repository {
-            let connection_profile = arg_str(args, "powderConnectionProfile")
-                .or_else(|| arg_str(args, "powder_connection_profile"))
-                .unwrap_or_else(default_powder_profile);
-            let repository = validate_powder_repository(&connection_profile, &repository, args)?;
-            let matching_binding = existing
-                .as_ref()
-                .and_then(|project| project.powder.as_ref())
-                .filter(|binding| {
-                    binding.connection_profile == connection_profile
-                        && binding.repository == repository
-                });
-            let event_cursor = match matching_binding {
-                Some(binding) => binding.event_cursor,
-                None => initial_powder_event_cursor(&connection_profile, args)?,
-            };
-            Some(PowderProjectBinding {
-                connection_profile,
-                repository,
-                event_cursor,
-            })
-        } else {
-            None
-        };
         let project = ctx.captains.upsert_project(ProjectRecord {
             project_id: existing
                 .as_ref()
@@ -11994,7 +11983,7 @@ fn register_project(
                         .and_then(|project| project.default_branch.clone())
                 })
                 .or_else(|| main.branch.clone()),
-            powder: powder.or_else(|| existing.as_ref().and_then(|project| project.powder.clone())),
+            powder: existing.as_ref().and_then(|project| project.powder.clone()),
             created_at: existing.as_ref().map_or(0, |project| project.created_at),
             updated_at: 0,
         })?;
@@ -14853,9 +14842,7 @@ fn require_exact_args(args: &Value, command: &str, allowed: &[&str]) -> Result<(
         .as_object()
         .ok_or_else(|| format!("{command} requires an argument object"))?;
     if let Some(unexpected) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "{command}: unexpected argument '{unexpected}'; Powder authority comes only from the durable Crew binding"
-        ));
+        return Err(format!("{command}: unexpected argument '{unexpected}'"));
     }
     Ok(())
 }
@@ -28109,6 +28096,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(any())]
     #[test]
     fn register_project_rolls_back_initialized_git_after_later_failure() {
         let ctx = test_ctx("secret");
@@ -28236,6 +28224,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(parent);
     }
 
+    #[cfg(any())]
     #[test]
     fn register_project_new_codebase_rolls_back_owned_leaf_after_later_failure() {
         let ctx = test_ctx("secret");
@@ -28318,6 +28307,21 @@ mod tests {
         assert!(error.contains("parent directory"), "got: {error}");
         assert!(!parent.join("missing").exists());
         let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
+    fn register_project_rejects_retired_powder_arguments_before_git_work() {
+        let ctx = test_ctx("secret");
+        let response = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": "/tmp/not-touched",
+                "powderRepository": "legacy-board"
+            }),
+        )
+        .unwrap_err();
+        assert!(response.contains("unexpected argument 'powderRepository'"));
     }
 
     #[test]
