@@ -8350,10 +8350,22 @@ impl CaptainControlLeases {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::retain_live(&mut state);
         if let Some(secret) = state.by_identity.get(&lease.identity_id).cloned() {
-            if let Some(existing) = state.by_secret.get(&secret) {
+            if let Some(existing) = state.by_secret.get_mut(&secret) {
                 if existing.terminal_id == lease.terminal_id
                     && existing.authority == lease.authority
                 {
+                    // Renewal is a sliding deadline, not merely an idempotent lookup.
+                    // Advance both clocks while holding the one-per-identity maps'
+                    // single lock so an MCP refresh cannot receive the old near-expiry
+                    // deadline or race a second live credential into existence.
+                    let minimum_monotonic_extension = existing
+                        .expires_at
+                        .checked_add(Duration::from_millis(1))
+                        .unwrap_or(existing.expires_at);
+                    existing.expires_at = lease.expires_at.max(minimum_monotonic_extension);
+                    existing.expires_at_epoch_ms = lease
+                        .expires_at_epoch_ms
+                        .max(existing.expires_at_epoch_ms.saturating_add(1));
                     return (secret, existing.expires_at_epoch_ms);
                 }
             }
@@ -27705,6 +27717,7 @@ impl ControlContext {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex as StdMutex};
+    use std::thread;
 
     #[test]
     fn control_request_debug_redacts_all_credential_and_argument_values() {
@@ -43951,6 +43964,7 @@ mod tests {
         assert!(renewed.ok, "{:?}", renewed.error);
         let result = renewed.result.unwrap();
         let lease = result["lease"].as_str().unwrap();
+        let first_expires_at = result["expiresAt"].as_u64().unwrap();
         assert_ne!(lease, ctx.token);
         assert_ne!(lease, ctx.read_token);
         assert_eq!(result["terminalId"], "lease-captain");
@@ -43970,7 +43984,9 @@ mod tests {
             ),
         );
         assert!(repeated.ok, "{:?}", repeated.error);
-        assert_eq!(repeated.result.unwrap()["lease"], lease);
+        let repeated = repeated.result.unwrap();
+        assert_eq!(repeated["lease"], lease);
+        assert!(repeated["expiresAt"].as_u64().unwrap() > first_expires_at);
         let lease_state = ctx.control_leases.state.lock().unwrap();
         assert_eq!(lease_state.by_secret.len(), 1);
         assert_eq!(lease_state.by_identity.len(), 1);
@@ -44002,6 +44018,103 @@ mod tests {
         let revoked = dispatch_authenticated(
             &ctx,
             req_session(lease, &identity.secret, "my_capability", json!({})),
+        );
+        assert_eq!(
+            revoked.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+    }
+
+    #[test]
+    fn renewing_same_identity_lease_atomically_extends_both_deadlines() {
+        let (ctx, _, identities, identity) = captain_lease_fixture(true);
+        let authority = LeaseAuthority::Captain {
+            ship_slug: "lease-ship".into(),
+            project_id: "lease-project".into(),
+            generation: ctx.captains.test_scoped_authority_generation(
+                "lease-ship",
+                "lease-captain",
+                "lease-project",
+            ),
+        };
+        let old_deadline = Instant::now() + Duration::from_millis(80);
+        let old_epoch_deadline = now_ms().saturating_add(80);
+        let (old_secret, old_expires_at) = ctx.control_leases.issue(CaptainControlLease {
+            identity_id: identity.id.clone(),
+            terminal_id: "lease-captain".into(),
+            authority: authority.clone(),
+            expires_at: old_deadline,
+            expires_at_epoch_ms: old_epoch_deadline,
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        let renewed_deadline = Instant::now() + Duration::from_millis(250);
+        let renewed_epoch_deadline = now_ms().saturating_add(250);
+        let (renewed_secret, renewed_expires_at) = ctx.control_leases.issue(CaptainControlLease {
+            identity_id: identity.id.clone(),
+            terminal_id: "lease-captain".into(),
+            authority: authority.clone(),
+            expires_at: renewed_deadline,
+            expires_at_epoch_ms: renewed_epoch_deadline,
+        });
+
+        assert_eq!(renewed_secret, old_secret);
+        assert!(renewed_expires_at > old_expires_at);
+        let renewed = ctx.control_leases.get(&renewed_secret).unwrap();
+        assert!(renewed.expires_at > old_deadline);
+        assert_eq!(renewed.authority, authority);
+        let state = ctx.control_leases.state.lock().unwrap();
+        assert_eq!(state.by_secret.len(), 1);
+        assert_eq!(state.by_identity.len(), 1);
+        assert_eq!(state.by_identity.get(&identity.id), Some(&renewed_secret));
+        drop(state);
+
+        thread::sleep(
+            old_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_add(Duration::from_millis(20)),
+        );
+        let after_old_deadline = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &renewed_secret,
+                &identity.secret,
+                "my_capability",
+                Value::Null,
+            ),
+        );
+        assert_eq!(after_old_deadline.result.unwrap()["capability"], "control");
+
+        let foreign = identities
+            .mint_and_bind(
+                crate::identity::Role::Captain,
+                Some("foreign-ship".into()),
+                "foreign-captain",
+            )
+            .unwrap();
+        let stolen = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &renewed_secret,
+                &foreign.secret,
+                "my_capability",
+                Value::Null,
+            ),
+        );
+        assert_eq!(
+            stolen.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+
+        identities.revoke(&identity.id).unwrap();
+        let revoked = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &renewed_secret,
+                &identity.secret,
+                "my_capability",
+                Value::Null,
+            ),
         );
         assert_eq!(
             revoked.error.as_deref(),
