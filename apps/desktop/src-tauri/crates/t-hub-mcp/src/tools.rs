@@ -17,11 +17,8 @@
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
 //!     `captain_bootstrap` and the agent-session operations.
-//!   - **Powder Crew evidence**: append and completion are Organization tier;
-//!     evidence read is Read tier. The backend narrowly lets a bound Crew use a
-//!     read-capability token for its own work-log append, then rechecks the exact
-//!     Crew tile and ship before mutating Powder.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
+//!     `start_agent`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
 //!
