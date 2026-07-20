@@ -463,7 +463,11 @@ fn schema_agent_checkpoint() -> Value {
         "properties": {
             "agentSessionId": { "type": "string" },
             "authorSessionId": { "type": "string" },
-            "summary": { "type": "string", "minLength": 1, "maxLength": 4096 }
+            "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "stage": {
+                "type": "string",
+                "enum": ["working", "needsInput", "readyForReview", "awaitingIntegration", "complete", "stopped"]
+            }
         },
         "required": ["agentSessionId", "authorSessionId", "summary"],
         "additionalProperties": false

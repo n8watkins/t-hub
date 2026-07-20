@@ -35,7 +35,7 @@ fn print_help() {
 start      --request-id ID --captain ID --directory PATH --assignment TEXT [--harness codex|claude] [--name NAME] [--tab ID]\n\
 list       --captain ID or --project ID [--cursor N] [--limit N] [--json]\n\
 show       <agentSessionId> [--json]\n\
-checkpoint <agentSessionId> <summary> --author ID [--json]\n\
+checkpoint <agentSessionId> <summary> --author ID [--stage STAGE] [--json]\n\
 events     <agentSessionId> [--cursor N] [--limit N] [--json]"
     );
 }
@@ -107,18 +107,22 @@ fn show(args: &[String]) -> Result<(), CliError> {
 }
 
 fn checkpoint(args: &[String]) -> Result<(), CliError> {
-    let flags = Flags::parse(args, &["--author"])?;
+    let flags = Flags::parse(args, &["--author", "--stage"])?;
     let agent = flags.positional(0, "agents checkpoint", "<agentSessionId>")?;
     let summary = flags.positional(1, "agents checkpoint", "<summary>")?;
     let author = required(&flags, "--author", "agents checkpoint")?;
+    let mut input = json!({
+        "agentSessionId": agent,
+        "authorSessionId": author,
+        "summary": summary,
+    });
+    if let Some(stage) = flags.opts.get("--stage") {
+        input["stage"] = json!(stage);
+    }
     call_and_render(
         "agents checkpoint",
         "agent_checkpoint",
-        json!({
-            "agentSessionId": agent,
-            "authorSessionId": author,
-            "summary": summary,
-        }),
+        input,
         &flags,
     )
 }

@@ -19,6 +19,7 @@ export function StartAgentDialog({
 }: StartAgentDialogProps) {
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
+  const [requestId, setRequestId] = useState(() => crypto.randomUUID());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,13 +35,14 @@ export function StartAgentDialog({
     setError(null);
     try {
       await controlRequest("start_agent", {
-        requestId: crypto.randomUUID(),
+        requestId,
         captainSessionId,
         assignment: trimmed,
         directory,
         harness,
       });
       setAssignment("");
+      setRequestId(crypto.randomUUID());
       onStarted();
       onClose();
     } catch (cause) {

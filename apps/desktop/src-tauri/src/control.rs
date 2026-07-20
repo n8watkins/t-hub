@@ -4726,6 +4726,7 @@ impl CaptainsRegistry {
         agent_session_id: &str,
         author_session_id: &str,
         summary: &str,
+        stage: Option<crate::agent_session::WorkStage>,
     ) -> Result<AgentCheckpoint, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
@@ -4745,6 +4746,9 @@ impl CaptainsRegistry {
         };
         checkpoint.validate()?;
         current.agent_sessions[agent_index].updated_at = checkpoint.created_at;
+        if let Some(stage) = stage {
+            current.agent_sessions[agent_index].work_stage = stage;
+        }
         current.agent_checkpoints.push(checkpoint.clone());
         current.agent_events.push(AgentEvent {
             cursor,
@@ -4825,6 +4829,17 @@ impl CaptainsRegistry {
             agent.updated_at = now_ms();
         })
         .map(|_| ())
+    }
+
+    pub fn update_agent_stage(
+        &self,
+        agent_session_id: &str,
+        stage: crate::agent_session::WorkStage,
+    ) -> Result<AgentSessionRecord, String> {
+        self.update_agent_session(agent_session_id, |agent| {
+            agent.work_stage = stage;
+            agent.updated_at = now_ms();
+        })
     }
 
     fn update_agent_session(
@@ -10173,11 +10188,20 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     && identity.tile.is_some()
             })
             .unwrap_or(false);
+    let agent_self_checkpoint = req.command == "agent_checkpoint"
+        && caller
+            .as_ref()
+            .zip(arg_str(&req.args, "agentSessionId"))
+            .is_some_and(|(identity, agent)| {
+                identity.mint_role == crate::identity::Role::Crew
+                    && identity.fleet_role.is_none()
+                    && identity.tile.as_deref() == Some(agent.as_str())
+            });
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
     // and ProcessChanging require the control token.
-    if !cap.allows(tier) && !inbox_self_ack && !crew_self_work_log {
+    if !cap.allows(tier) && !inbox_self_ack && !crew_self_work_log && !agent_self_checkpoint {
         let message = format!(
             "unauthorized: '{}' requires the control capability (this token is read-only)",
             req.command
@@ -10616,9 +10640,9 @@ fn dispatch_with_caller(
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
-        "list_agents" => list_agents(ctx, args),
-        "get_agent" => get_agent(ctx, args),
-        "agent_events" => agent_events(ctx, args),
+        "list_agents" => list_agents(ctx, args, caller, trusted_internal),
+        "get_agent" => get_agent(ctx, args, caller, trusted_internal),
+        "agent_events" => agent_events(ctx, args, caller, trusted_internal),
         "list_powder_boards" => list_powder_boards(args),
         "project_board_snapshot" => project_board_snapshot(ctx, args),
         "read_crew_powder_evidence" => {
@@ -10687,7 +10711,7 @@ fn dispatch_with_caller(
         "release_captain" => release_captain(ctx, args, caller, trusted_internal),
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
-        "agent_checkpoint" => agent_checkpoint(ctx, args),
+        "agent_checkpoint" => agent_checkpoint(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
         }
@@ -10837,7 +10861,95 @@ fn agent_page_cursor(args: &Value, command: &str) -> Result<usize, String> {
         .map_err(|_| format!("{command} cursor must be a non-negative integer"))
 }
 
-fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAuthority {
+    Apex,
+    Captain,
+    Agent,
+}
+
+fn authorize_agent(
+    ctx: &ControlContext,
+    agent: &AgentSessionRecord,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<AgentAuthority, String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(AgentAuthority::Apex);
+    }
+    let caller = caller.ok_or_else(|| {
+        format!("acl: '{command}' requires the owning Captain or exact agent session")
+    })?;
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.terminal_id.as_deref() == Some(agent.captain_session_id.as_str()))
+        .ok_or_else(|| format!("acl: '{command}' agent ownership is unavailable"))?;
+    let same_ship = caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str());
+    let owning_captain = same_ship
+        && caller.fleet_role == Some(FleetRole::Captain)
+        && caller.tile.as_deref() == captain.terminal_id.as_deref()
+        && captain.role == FleetRole::Captain
+        && captain.state == ClaimState::Active;
+    if owning_captain {
+        return Ok(AgentAuthority::Captain);
+    }
+    let exact_agent = same_ship
+        && caller.mint_role == crate::identity::Role::Crew
+        && caller.fleet_role.is_none()
+        && caller.tile.as_deref() == Some(agent.agent_session_id.as_str());
+    if exact_agent {
+        return Ok(AgentAuthority::Agent);
+    }
+    Err(format!(
+        "acl: '{command}' requires the owning Captain or exact agent session"
+    ))
+}
+
+fn authorize_agent_filter(
+    ctx: &ControlContext,
+    captain_session_id: Option<&str>,
+    project_id: Option<&str>,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<Option<String>, String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(None);
+    }
+    let caller = caller.ok_or_else(|| {
+        format!("acl: '{command}' requires the owning Captain or a fleet supervisor")
+    })?;
+    if caller.fleet_role != Some(FleetRole::Captain) {
+        return Err(format!(
+            "acl: '{command}' requires the owning Captain or a fleet supervisor"
+        ));
+    }
+    let snapshot = ctx.captains.snapshot();
+    let owned = snapshot.captains.iter().find(|captain| {
+        captain.role == FleetRole::Captain
+            && captain.state == ClaimState::Active
+            && caller.tile.as_deref() == captain.terminal_id.as_deref()
+            && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
+            && captain_session_id.is_none_or(|id| captain.terminal_id.as_deref() == Some(id))
+            && project_id.is_none_or(|id| captain.project_id.as_deref() == Some(id))
+    });
+    let Some(captain) = owned else {
+        return Err(format!(
+            "acl: '{command}' requires the owning Captain or a fleet supervisor"
+        ));
+    };
+    Ok(Some(captain.ship_slug.clone()))
+}
+
+fn list_agents(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     require_exact_args(
         args,
         "list_agents",
@@ -10857,6 +10969,14 @@ fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             "list_agents state must be 'active' until removed-agent history is available".into(),
         );
     }
+    let caller_ship = authorize_agent_filter(
+        ctx,
+        captain_session_id.as_deref(),
+        project_id.as_deref(),
+        caller,
+        trusted_internal,
+        "list_agents",
+    )?;
     let cursor = agent_page_cursor(args, "list_agents")?;
     let limit = agent_page_limit(args, "list_agents")?;
     let mut records: Vec<_> = ctx
@@ -10871,6 +10991,11 @@ fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 && project_id
                     .as_deref()
                     .is_none_or(|project| agent.project_id == project)
+                && caller_ship.as_deref().is_none_or(|ship| {
+                    ctx.captains
+                        .captain_for_session(&agent.captain_session_id)
+                        .is_some_and(|captain| captain.ship_slug == ship)
+                })
         })
         .collect();
     records.sort_by(|left, right| left.agent_session_id.cmp(&right.agent_session_id));
@@ -10901,7 +11026,12 @@ fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     }))
 }
 
-fn get_agent(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn get_agent(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     require_exact_args(args, "get_agent", &["agentSessionId"])?;
     let agent_session_id = arg_str(args, "agentSessionId")
         .filter(|value| !value.trim().is_empty())
@@ -10913,14 +11043,20 @@ fn get_agent(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .into_iter()
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
+    authorize_agent(ctx, &agent, caller, trusted_internal, "get_agent")?;
     serde_json::to_value(agent).map_err(|error| format!("get_agent serialization failed: {error}"))
 }
 
-fn agent_checkpoint(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn agent_checkpoint(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     require_exact_args(
         args,
         "agent_checkpoint",
-        &["agentSessionId", "authorSessionId", "summary"],
+        &["agentSessionId", "authorSessionId", "summary", "stage"],
     )?;
     let agent_session_id = arg_str(args, "agentSessionId")
         .filter(|value| !value.trim().is_empty())
@@ -10931,16 +11067,62 @@ fn agent_checkpoint(ctx: &ControlContext, args: &Value) -> Result<Value, String>
     let summary = arg_str(args, "summary")
         .filter(|value| !value.trim().is_empty())
         .ok_or("agent_checkpoint requires a non-empty 'summary'")?;
-    let checkpoint =
-        ctx.captains
-            .append_agent_checkpoint(&agent_session_id, &author_session_id, &summary)?;
+    let agent = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .find(|agent| agent.agent_session_id == agent_session_id)
+        .ok_or_else(|| format!("agent_checkpoint: agent '{agent_session_id}' was not found"))?;
+    let authority = authorize_agent(ctx, &agent, caller, trusted_internal, "agent_checkpoint")?;
+    if !trusted_internal && caller.is_none_or(|identity| identity.session_id != author_session_id) {
+        return Err(
+            "acl: agent_checkpoint authorSessionId must match the authenticated session".into(),
+        );
+    }
+    let stage = args
+        .get("stage")
+        .map(|value| {
+            serde_json::from_value::<crate::agent_session::WorkStage>(value.clone())
+                .map_err(|_| "agent_checkpoint stage is invalid".to_string())
+        })
+        .transpose()?;
+    if let Some(stage) = stage {
+        let allowed = match authority {
+            AgentAuthority::Apex | AgentAuthority::Captain => {
+                !matches!(stage, crate::agent_session::WorkStage::Stopped)
+            }
+            AgentAuthority::Agent => matches!(
+                stage,
+                crate::agent_session::WorkStage::Working
+                    | crate::agent_session::WorkStage::NeedsInput
+                    | crate::agent_session::WorkStage::ReadyForReview
+            ),
+        };
+        if !allowed {
+            return Err(
+                "acl: agent_checkpoint stage is not permitted for the authenticated actor".into(),
+            );
+        }
+    }
+    let checkpoint = ctx.captains.append_agent_checkpoint(
+        &agent_session_id,
+        &author_session_id,
+        &summary,
+        stage,
+    )?;
     Ok(json!({
         "checkpoint": checkpoint,
         "eventCursor": checkpoint.cursor,
     }))
 }
 
-fn agent_events(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn agent_events(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     require_exact_args(args, "agent_events", &["agentSessionId", "cursor", "limit"])?;
     let agent_session_id = arg_str(args, "agentSessionId")
         .filter(|value| !value.trim().is_empty())
@@ -10948,15 +11130,16 @@ fn agent_events(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let after = agent_page_cursor(args, "agent_events")? as u64;
     let limit = agent_page_limit(args, "agent_events")?;
     let snapshot = ctx.captains.snapshot();
-    if !snapshot
+    let Some(agent) = snapshot
         .agent_sessions
         .iter()
-        .any(|agent| agent.agent_session_id == agent_session_id)
-    {
+        .find(|agent| agent.agent_session_id == agent_session_id)
+    else {
         return Err(format!(
             "agent_events: agent '{agent_session_id}' was not found"
         ));
-    }
+    };
+    authorize_agent(ctx, agent, caller, trusted_internal, "agent_events")?;
     let event_cursor = snapshot
         .agent_events
         .iter()
@@ -12788,52 +12971,6 @@ fn attach_captain(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
     enforce_attach_authority(caller, trusted_internal, &terminal_id, FleetRole::Captain)?;
-    let powder_binding = project.powder.as_ref().ok_or_else(|| {
-        format!(
-            "attach_captain: project '{}' must be bound to Powder before attachment",
-            project.name
-        )
-    })?;
-    #[cfg(not(test))]
-    {
-        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
-        client
-            .health()
-            .and_then(|_| client.authorization_probe())
-            .and_then(|_| {
-                client
-                    .get_repository(&powder_binding.repository)
-                    .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "attach_captain: Powder preflight failed for repository '{}': {error}",
-                    powder_binding.repository
-                )
-            })?;
-    }
-    #[cfg(test)]
-    if !args
-        .get("testSkipPowderHealth")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
-        client
-            .health()
-            .and_then(|_| client.authorization_probe())
-            .and_then(|_| {
-                client
-                    .get_repository(&powder_binding.repository)
-                    .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "attach_captain: Powder preflight failed for repository '{}': {error}",
-                    powder_binding.repository
-                )
-            })?;
-    }
     let _provision = ctx.captains.provision_guard();
     if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
@@ -19050,7 +19187,14 @@ fn start_agent(
         .find(|captain| captain.terminal_id.as_deref() == Some(captain_session_id.as_str()))
         .cloned()
         .ok_or_else(|| format!("start_agent: Captain '{captain_session_id}' was not found"))?;
-    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    authorize_agent_filter(
+        ctx,
+        Some(captain_session_id.as_str()),
+        captain.project_id.as_deref(),
+        caller,
+        trusted_internal,
+        "start_agent",
+    )?;
     let project_id = captain
         .project_id
         .clone()
