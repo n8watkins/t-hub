@@ -1000,20 +1000,29 @@ fn lane_collisions(left: &LaneClaim, right: &LaneClaim) -> Vec<(MutableResourceK
 }
 
 fn normalize_file_claim(claim: &str) -> Option<String> {
-    let replaced = claim.trim().replace('\\', "/");
-    let mut components = Vec::new();
-    for component in replaced.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => return None,
-            value => components.push(value),
-        }
+    if claim.is_empty()
+        || claim != claim.trim()
+        || claim.starts_with('/')
+        || claim.contains('\\')
+        || claim.chars().any(char::is_control)
+        || claim
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
+    {
+        return None;
     }
-    if components.is_empty() {
-        None
-    } else {
-        Some(components.join("/"))
+    let bytes = claim.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return None;
     }
+    let components = claim.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return None;
+    }
+    Some(components.join("/"))
 }
 
 fn file_claims_overlap(left: &str, right: &str) -> bool {
@@ -1327,6 +1336,64 @@ mod tests {
                 .unwrap_err()
                 .code,
             DispatchReasonCode::InterfaceCollision
+        );
+    }
+
+    #[test]
+    fn mutable_file_claims_must_be_normalized_repository_relative_paths() {
+        let governor = SpawnGovernor::new(32, 20.0, 8.0);
+        for invalid in [
+            "",
+            " ",
+            ".",
+            "./apps/core",
+            "/apps/core",
+            "C:/apps/core",
+            "c:apps/core",
+            r"C:\apps\core",
+            r"\\server\repo\apps\core",
+            "apps/../core",
+            "apps//core",
+            "apps/core/",
+            r"apps\core",
+            "apps/*/core",
+            "apps/**",
+            "apps/core?.rs",
+            "apps/[ab]/core",
+            "apps/{core,ui}",
+            " apps/core",
+            "apps/core ",
+        ] {
+            let mut owner = lane("lane-invalid");
+            owner.mutable_files = strings(&[invalid]);
+            let refusal = governor
+                .preflight_dispatch(&preflight(vec![owner]))
+                .unwrap_err();
+            assert_eq!(
+                refusal.code,
+                DispatchReasonCode::InvalidResourceClaim,
+                "claim {invalid:?} must be rejected"
+            );
+            assert_eq!(refusal.resource.as_deref(), Some(invalid));
+        }
+    }
+
+    #[test]
+    fn logical_directory_prefixes_collide_across_independent_worktrees() {
+        let governor = SpawnGovernor::new(32, 20.0, 8.0);
+        let mut first_worktree = lane("lane-worktree-a");
+        first_worktree.mutable_files = strings(&["apps/desktop/src"]);
+        let mut second_worktree = lane("lane-worktree-b");
+        second_worktree.mutable_files = strings(&["apps/desktop/src/App.tsx"]);
+
+        let refusal = governor
+            .preflight_dispatch(&preflight(vec![first_worktree, second_worktree]))
+            .unwrap_err();
+
+        assert_eq!(refusal.code, DispatchReasonCode::MutableFileCollision);
+        assert_eq!(
+            refusal.resource.as_deref(),
+            Some("apps/desktop/src <-> apps/desktop/src/App.tsx")
         );
     }
 
