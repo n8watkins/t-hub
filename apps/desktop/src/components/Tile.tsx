@@ -65,7 +65,16 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
 import { clipboardWrite } from "../lib/clipboard";
-import { Anchor, Copy, GitBranch, RotateCcw } from "lucide-react";
+import {
+  Anchor,
+  Copy,
+  Files,
+  GitBranch,
+  Play,
+  RotateCcw,
+  SquareKanban,
+  SquareTerminal,
+} from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts
@@ -107,12 +116,22 @@ function useGitInfo(cwd: string): GitInfo | null {
   return info;
 }
 
-/** The tile-header tab bar order + labels. Terminal is the default view. */
-const PANEL_TABS: { id: PanelTab; label: string }[] = [
-  { id: "terminal", label: "Terminal" },
-  { id: "files", label: "Files" },
-  { id: "preview", label: "Run + Preview" },
-  { id: "board", label: "Board" },
+/** The tile-header tab bar order + labels. Terminal is the default view.
+ *  Each tab carries the RESPONSIVE treatment's three densities (index.css
+ *  @container tiers pick one): an icon (always rendered; the only survivor at
+ *  the narrow tier), the full label (roomy tier), and a short label (medium
+ *  tier). The full label stays the stable accessible name (aria-label + title)
+ *  at every width. */
+const PANEL_TABS: {
+  id: PanelTab;
+  label: string;
+  short: string;
+  icon: typeof SquareTerminal;
+}[] = [
+  { id: "terminal", label: "Terminal", short: "Term", icon: SquareTerminal },
+  { id: "files", label: "Files", short: "Files", icon: Files },
+  { id: "preview", label: "Run + Preview", short: "Run", icon: Play },
+  { id: "board", label: "Board", short: "Board", icon: SquareKanban },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -583,7 +602,10 @@ export function Tile({
       data-tile-header={showTileHeader ? "1" : "0"}
       data-header-hover={headerOnHover ? "1" : "0"}
       className={[
-        "relative flex h-full min-h-0 w-full flex-col overflow-hidden",
+        // th-tile-container makes this tile a CSS size container: the header's
+        // responsive tiers (index.css @container rules) key off THIS tile's own
+        // width, not the window's, so each tile in a mixed grid adapts alone.
+        "th-tile-container relative flex h-full min-h-0 w-full flex-col overflow-hidden",
         isSelfDragging ? "opacity-40" : "",
       ].join(" ")}
       style={{
@@ -717,7 +739,7 @@ export function Tile({
               <OrchestratorCrownIcon size={13} />
             </span>
             <span
-              className="shrink-0 truncate"
+              className="min-w-0 truncate"
               style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
               title={cwd || undefined}
             >
@@ -726,8 +748,12 @@ export function Tile({
           </>
         ) : (
           folderName && (
+            // Shrinkable (NOT shrink-0): in a narrow tile the folder name
+            // truncates to an ellipsis instead of shoving the view switcher and
+            // the ×/fullscreen controls off the right edge. The full cwd stays
+            // in the tooltip.
             <span
-              className="shrink-0 truncate"
+              className="min-w-0 truncate"
               style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
               title={cwd || undefined}
             >
@@ -744,8 +770,11 @@ export function Tile({
             can differ from the real branch (`feat/x` → dir `feat-x`), so showing the
             actual branch here is the accurate signal. */}
         {git?.isRepo && git.branch && (
+          // th-git-chip: shrinks/truncates under pressure and is hidden
+          // entirely at the narrow @container tier (index.css). At icon-only
+          // widths there is no room for a branch, and the tooltip carries it.
           <span
-            className="flex shrink-0 items-center gap-1 truncate"
+            className="th-git-chip flex min-w-0 items-center gap-1"
             style={{ color: "var(--th-fg)", fontSize: "1.02em" }}
             title={`${git.isLinkedWorktree ? "worktree" : "branch"}: ${git.branch}${
               git.dirtyCount > 0
@@ -799,7 +828,7 @@ export function Tile({
             }}
             placeholder="name this work…"
             spellCheck={false}
-            className="w-40 max-w-[40%] shrink rounded bg-transparent px-1 py-0.5 outline-none"
+            className="th-work-name w-40 max-w-[40%] shrink rounded bg-transparent px-1 py-0.5 outline-none"
             style={{
               color: "var(--th-fg)",
               border: `1px solid ${focusRing}`,
@@ -814,7 +843,7 @@ export function Tile({
               onFocus();
               startNameEdit();
             }}
-            className="max-w-[40%] shrink truncate rounded px-1 py-0.5 text-left hover:bg-neutral-800/50"
+            className="th-work-name max-w-[40%] shrink truncate rounded px-1 py-0.5 text-left hover:bg-neutral-800/50"
             style={{
               color: workName ? "var(--th-fg)" : "var(--th-fg-muted)",
               fontStyle: workName ? undefined : "italic",
@@ -839,9 +868,13 @@ export function Tile({
             gated on the opt-in header setting (default OFF): the header is tight
             on space, so the ctx% lives here only when the user turns it on. The
             sidebar captain rows show it regardless. */}
-        {showHeaderContextMeter && (
-          <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
-        )}
+        {showHeaderContextMeter &&
+          client === "claude" &&
+          contextUsedPct != null && (
+            <span className="th-context-meter shrink-0">
+              <ContextMeter usedPct={contextUsedPct} />
+            </span>
+          )}
 
         {/* Per-tile view switcher. Clicking a tab
             sets THIS tile's usePanels tab; the body (below) swaps to that surface
@@ -854,7 +887,7 @@ export function Tile({
             the right edge of the header (it used to be absolutely centered). It
             sits just left of the ⋯ / ⤢ / × controls. */}
         <div
-          className="z-10 flex shrink-0 items-center rounded-full border p-0.5"
+          className="th-tab-list z-10 flex shrink-0 items-center rounded-full border p-0.5"
           style={{
             backgroundColor: "var(--th-app-bg)",
             borderColor: "var(--th-border)",
@@ -863,7 +896,16 @@ export function Tile({
         >
           {PANEL_TABS.map((t) => {
             const selected = activeTab === t.id;
+            const Icon = t.icon;
             return (
+              // Responsive densities (index.css @container tiers off the tile's
+              // own width): roomy = icon + full label, medium = icon + short
+              // label, narrow = icon only. The icon is always in the DOM and the
+              // two label spans are CSS-toggled, so no re-render happens on
+              // resize and the accessible name (aria-label/title, always the
+              // FULL label) plus aria-pressed never change with the width. The
+              // fixed pill height (h-7) keeps the tab bar - and the header -
+              // the same height at every tier.
               <button
                 key={t.id}
                 type="button"
@@ -874,7 +916,7 @@ export function Tile({
                   onFocus();
                   setTab(terminalId, t.id);
                 }}
-                className="rounded-full px-2.5 py-1.5 text-[0.9em] leading-none transition-colors"
+                className="th-tab flex h-7 items-center gap-1 rounded-full px-2.5 text-[0.9em] leading-none transition-colors"
                 style={{
                   color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
                   backgroundColor: selected
@@ -883,9 +925,14 @@ export function Tile({
                   fontWeight: selected ? 600 : 400,
                 }}
                 title={`${t.label} view`}
+                aria-label={t.label}
                 aria-pressed={selected}
               >
-                {t.label}
+                <Icon className="th-tab-icon shrink-0" size="1.2em" aria-hidden />
+                <span className="th-tab-label">{t.label}</span>
+                <span className="th-tab-label-short" aria-hidden>
+                  {t.short}
+                </span>
               </button>
             );
           })}
@@ -902,7 +949,7 @@ export function Tile({
             onFocus();
             refreshTerminal(terminalId);
           }}
-          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          className="th-header-control th-ctl-secondary flex h-6 w-6 shrink-0 items-center justify-center rounded p-0 leading-none hover:bg-neutral-800"
           style={{ color: "var(--th-fg-muted)" }}
           title="Refresh terminal (re-fit + repaint)"
           aria-label="Refresh terminal"
@@ -923,7 +970,7 @@ export function Tile({
             onFocus();
             requestRestart();
           }}
-          className="flex shrink-0 items-center rounded px-1 leading-none hover:bg-neutral-800"
+          className="th-header-control th-ctl-secondary flex h-6 w-6 shrink-0 items-center justify-center rounded p-0 leading-none hover:bg-neutral-800"
           style={{ color: "var(--th-fg-muted)" }}
           title="Kill & restart session (fresh session, same folder)"
           aria-label="Kill and restart session"
@@ -945,7 +992,7 @@ export function Tile({
               m ? null : { right: window.innerWidth - r.right, top: r.bottom + 4 },
             );
           }}
-          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          className="th-header-control flex h-6 w-6 shrink-0 items-center justify-center rounded p-0 leading-none hover:bg-neutral-800"
           style={{ color: "var(--th-fg-muted)" }}
           title="Terminal colors"
           aria-label="Terminal colors"
@@ -967,7 +1014,7 @@ export function Tile({
             onFocus();
             toggleFullscreen(terminalId);
           }}
-          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          className="th-header-control flex h-6 w-6 shrink-0 items-center justify-center rounded p-0 leading-none hover:bg-neutral-800"
           style={{ color: "var(--th-fg-muted)" }}
           title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen this tile"}
           aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen tile"}
@@ -1018,7 +1065,7 @@ export function Tile({
             e.stopPropagation();
             requestKill();
           }}
-          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          className="th-header-control flex h-6 w-6 shrink-0 items-center justify-center rounded p-0 leading-none hover:bg-neutral-800"
           style={{ color: "var(--th-fg-muted)" }}
           title={
             busy
@@ -1145,6 +1192,17 @@ export function Tile({
               onClick={() => {
                 setCtxMenu(null);
                 refreshTerminal(terminalId);
+              }}
+            />
+            {/* Same confirm-guarded kill+restart as the header's ↺. This is also
+                the only path to it at the minimum tile width, where the header
+                hides the secondary ⟳/↺ controls (index.css th-ctl-secondary). */}
+            <CtxItem
+              label="Kill & restart session"
+              hint="Fresh session in the same folder, this tile's place (always asks first)"
+              onClick={() => {
+                setCtxMenu(null);
+                requestRestart();
               }}
             />
             <CtxItem

@@ -137,6 +137,67 @@ describe("Tile Run and Preview entry point", () => {
   });
 });
 
+describe("Tile responsive header controls", () => {
+  it("keeps stable tab names while rendering icon, full, and short variants", () => {
+    const header = renderTile("cap00001");
+    const tabs = [
+      { label: "Terminal", short: "Term", pressed: "true" },
+      { label: "Files", short: "Files", pressed: "false" },
+      { label: "Run + Preview", short: "Run", pressed: "false" },
+      { label: "Board", short: "Board", pressed: "false" },
+    ];
+
+    for (const tab of tabs) {
+      const button = within(header).getByRole("button", {
+        name: tab.label,
+      });
+      expect(button.getAttribute("title")).toBe(`${tab.label} view`);
+      expect(button.getAttribute("aria-pressed")).toBe(tab.pressed);
+      expect(button.querySelector(".th-tab-icon")?.getAttribute("aria-hidden")).toBe(
+        "true",
+      );
+      expect(button.querySelector(".th-tab-label")?.textContent).toBe(tab.label);
+      const short = button.querySelector(".th-tab-label-short");
+      expect(short?.textContent).toBe(tab.short);
+      expect(short?.getAttribute("aria-hidden")).toBe("true");
+    }
+
+    expect(within(header).queryByRole("button", { name: "Terminal view" })).toBeNull();
+    expect(header.querySelector(".th-tab-list")).toBeTruthy();
+  });
+
+  it("switches views without changing the tab names", () => {
+    const header = renderTile("cap00001");
+    const files = within(header).getByRole("button", { name: "Files" });
+
+    act(() => {
+      fireEvent.click(files);
+    });
+
+    expect(usePanels.getState().tab.cap00001).toBe("files");
+    expect(files.getAttribute("aria-pressed")).toBe("true");
+    expect(within(header).getByRole("button", { name: "Terminal" })).toBeTruthy();
+  });
+
+  it("gives every persistent header action a 24px target", () => {
+    const header = renderTile("cap00001");
+    const actions = [
+      "Refresh terminal",
+      "Kill and restart session",
+      "Terminal colors",
+      "Fullscreen tile",
+      "Kill session",
+    ];
+
+    for (const name of actions) {
+      const button = within(header).getByRole("button", { name });
+      expect(button.classList.contains("th-header-control")).toBe(true);
+      expect(button.classList.contains("h-6")).toBe(true);
+      expect(button.classList.contains("w-6")).toBe(true);
+    }
+  });
+});
+
 describe("Tile header context menu: IDs + Mark as Cortana", () => {
   /** Right-click the header to open the context menu, then return the menu's
    *  root (it renders fixed to the document, not inside the header). */
@@ -288,6 +349,17 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     });
     menu = openMenu("cap00001");
     expect(within(menu).getByText("Unmark Cortana")).toBeTruthy();
+  });
+
+  it("keeps kill and restart available when the narrow header hides it", () => {
+    const menu = openMenu("cap00001");
+    act(() => {
+      fireEvent.click(within(menu).getByText("Kill & restart session"));
+    });
+
+    const dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.textContent).toContain("Kill & restart this session?");
   });
 
   it("marking Cortana from the menu sets the designation and flashes the next-steps hint", () => {

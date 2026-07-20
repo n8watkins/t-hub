@@ -124,6 +124,97 @@ body {
   opacity: 1;
 }
 
+/*
+ * Responsive tile-header densities. Each Tile root is a CSS size container
+ * (.th-tile-container in Tile.tsx), so these tiers key off the INDIVIDUAL
+ * tile's width - a narrow tile in a dense grid compacts while a wide one keeps
+ * full labels, and no JS/resize listeners are involved. The view-switcher tabs
+ * degrade full label -> short label -> icon only; the identity chips that can
+ * regrow elsewhere (git branch, work name) drop out at the narrow tier; the
+ * secondary recovery controls (refresh / kill+restart, both also in the
+ * right-click menu) drop out only at the minimum tile width. Below 360px the
+ * controls and identity use the top half while the icon tabs use the bottom
+ * half. Header HEIGHT never changes - only its internal layout does - so the
+ * grid stays stable across tiers.
+ *
+ * Tier boundaries (tile width): >=680 roomy, 460-679 medium, 360-459 narrow,
+ * 240-359 two-row narrow, and <240 minimum. Chosen against the measured chrome:
+ * full switcher+controls need ~450px beyond the identity, short labels ~360px,
+ * and one-row icon-only chrome needs ~240px.
+ */
+.th-tile-container {
+  container-type: inline-size;
+}
+/* Roomy (default): icon + full label; the short label is the hidden alternate. */
+.th-tab-label-short {
+  display: none;
+}
+/* Medium: swap the full label for the short one; tighten the pill padding. */
+@container (max-width: 679px) {
+  .th-context-meter {
+    display: none;
+  }
+  .th-tab-label {
+    display: none;
+  }
+  .th-tab-label-short {
+    display: inline;
+  }
+  .th-tab {
+    padding-inline: 0.5rem;
+  }
+}
+/* Narrow: icon-only tabs; drop the git chip + work name; tighten the gaps.
+ * (The tab's aria-label/title keep carrying the full view name.) */
+@container (max-width: 459px) {
+  .th-tab-label,
+  .th-tab-label-short {
+    display: none;
+  }
+  .th-tab {
+    padding-inline: 0.375rem;
+  }
+  .th-git-chip,
+  .th-work-name {
+    display: none;
+  }
+  .th-tile-header {
+    gap: 0.25rem;
+  }
+}
+/* Extra narrow: split the same fixed-height header into two compact rows.
+ * Identity and controls keep a 24px top row; icon tabs occupy the bottom row.
+ * This prevents the 160px minimum tile width from clipping primary controls. */
+@container (max-width: 359px) {
+  .th-tile-header {
+    padding-bottom: 26px;
+  }
+  .th-tab-list {
+    position: absolute;
+    bottom: 1px;
+    left: 50%;
+    padding: 1px;
+    transform: translateX(-50%);
+  }
+  .th-tab {
+    width: 1.5rem;
+    height: 1.25rem;
+    justify-content: center;
+    padding-inline: 0;
+  }
+}
+/* Minimum width: secondary recovery actions remain in the context menu, while
+ * tighter padding and gaps preserve identity plus colors/fullscreen/close. */
+@container (max-width: 239px) {
+  .th-ctl-secondary {
+    display: none;
+  }
+  .th-tile-header {
+    gap: 0.125rem;
+    padding-inline: 0.25rem;
+  }
+}
+
 /* Accent-following hover for the resize gutters' indicator line + the new-
  * terminal FAB, so the primary accent affordances track the active theme. */
 .group:hover > .th-gutter-line {
