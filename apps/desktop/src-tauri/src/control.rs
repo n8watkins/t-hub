@@ -10427,6 +10427,14 @@ fn target_ship_ref(ctx: &ControlContext, tile: &str) -> crate::acl::ShipRef {
     }
 }
 
+fn target_ship_slug(ctx: &ControlContext, tile: &str) -> Option<String> {
+    match ctx.captains.ship_of(tile) {
+        Some(ShipMembership::Supervisor { ship_slug, .. })
+        | Some(ShipMembership::Crew { ship_slug }) => Some(ship_slug),
+        None => None,
+    }
+}
+
 /// The recipient's [`crate::acl::MessageTarget`] (role + ship) for the send ACL, from
 /// the captains registry. An unregistered recipient tile is `Unknown`/no-ship.
 fn message_target(ctx: &ControlContext, tile: &str) -> crate::acl::MessageTarget {
@@ -10834,6 +10842,58 @@ fn enforce_project_authority(
         Ok(())
     } else {
         Err("acl: project mutation requires General/Cortana or the owning Captain".into())
+    }
+}
+
+fn enforce_project_path_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    path: &str,
+    command: &str,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a Fleet identity"))?;
+    let terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or_else(|| format!("acl: '{command}' caller has no terminal binding"))?;
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain.role == FleetRole::Captain
+                && captain.state == ClaimState::Active
+                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
+        })
+        .ok_or_else(|| format!("acl: '{command}' requires an active Captain"))?;
+    let project_id = captain
+        .project_id
+        .as_deref()
+        .ok_or_else(|| format!("acl: '{command}' Captain has no Project"))?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("acl: '{command}' Captain Project is unavailable"))?;
+    let requested = files::posix_form(path).trim_end_matches('/').to_string();
+    if requested.split('/').any(|segment| segment == "..") {
+        return Err(format!("acl: '{command}' path traversal is not permitted"));
+    }
+    let root = files::posix_form(&project.repo_root)
+        .trim_end_matches('/')
+        .to_string();
+    if requested == root || requested.starts_with(&format!("{root}/")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' path is outside caller Project '{}'",
+            project.project_id
+        ))
     }
 }
 
@@ -12161,7 +12221,13 @@ fn dispatch_with_caller(
         // process-changing subset (spawn) is gated behind the confirmation flag
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
-        "focus_session" => organization_apply(ctx, "focus_session", args),
+        "focus_session" => {
+            let session_id = arg_str(args, "sessionId")
+                .or_else(|| arg_str(args, "session_id"))
+                .ok_or("focus_session requires a 'sessionId' argument")?;
+            enforce_session_access(ctx, caller, trusted_internal, &session_id)?;
+            organization_apply(ctx, "focus_session", args)
+        }
         "history_focus" => history_focus(ctx, args, caller, trusted_internal),
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
@@ -12172,20 +12238,20 @@ fn dispatch_with_caller(
         // addressable tabs) and forwards that id for the frontend to adopt.
         "new_tab" => new_tab(ctx, args, caller, trusted_internal),
         "close_tab" | "remove_tab" => close_tab(ctx, args, caller, trusted_internal),
-        "focus_tab" => focus_tab(ctx, args),
-        "open_file" => open_file(ctx, args),
+        "focus_tab" => focus_tab(ctx, args, caller, trusted_internal),
+        "open_file" => open_file(ctx, args, caller, trusted_internal),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
         // the UI; remove forwards to the UI so it detaches live tiles BEFORE git
         // tears the dir down (no orphaned processes). list (T-B) is the read-only
         // socket twin of the `git_worktree_list` Tauri command, for a socket UI's
         // worktree list/re-open/remove flows.
         "create_worktree" => create_worktree(ctx, args, caller, trusted_internal),
-        "remove_worktree" => remove_worktree(ctx, args),
+        "remove_worktree" => remove_worktree(ctx, args, caller, trusted_internal),
         "list_worktrees" | "git_worktree_list" => list_worktrees(ctx, args),
         // Recent list × made durable: move a project's transcripts out of the
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
-        "archive_recent_project" => archive_recent_project(args),
+        "archive_recent_project" => archive_recent_project(ctx, args, caller, trusted_internal),
         "register_project" => register_project(ctx, args, caller, trusted_internal),
         "bind_project_powder" => bind_project_powder(ctx, args, caller, trusted_internal),
         // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
@@ -12213,8 +12279,8 @@ fn dispatch_with_caller(
         // orchestrator's loop when a watched session goes idle / needs-input /
         // completes. Organization tier (audited); the wake itself injects via the
         // same backend send_text path the ProcessChanging tier gates.
-        "watch_fleet" => watch_fleet(ctx, args),
-        "unwatch_fleet" => unwatch_fleet(ctx, args),
+        "watch_fleet" => watch_fleet(ctx, args, caller, trusted_internal),
+        "unwatch_fleet" => unwatch_fleet(ctx, args, caller, trusted_internal),
         // Relay-wedge self-heal (cause 2): move the listener to a fresh port +
         // rewrite control.json so a WSL client stuck behind the mirrored-loopback
         // relay wedge recovers without an app restart. WRITE-token gated
@@ -14959,11 +15025,17 @@ fn history_resume(
 /// at `args.cwd` out of `~/.claude/projects` into `projects-archive` (reversible)
 /// so the dismissed project stops appearing in Recent and stops costing scan time.
 /// Returns `true` on success.
-fn archive_recent_project(args: &Value) -> Result<Value, String> {
+fn archive_recent_project(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
     if cwd.is_empty() {
         return Err("archive_recent_project requires a 'cwd'".into());
     }
+    enforce_project_path_authority(ctx, caller, trusted_internal, cwd, "archive_recent_project")?;
     crate::recent::archive_project(cwd)?;
     Ok(Value::Bool(true))
 }
@@ -15619,6 +15691,22 @@ fn register_project(
             "register_project: createDirectory requires initializeGit: true for a new codebase"
                 .into(),
         );
+    }
+    if create_directory || initialize_git {
+        let registered_project_id = ctx
+            .captains
+            .projects()
+            .into_iter()
+            .find(|project| {
+                files::posix_form(&project.repo_root) == files::posix_form(&requested_root)
+            })
+            .map(|project| project.project_id);
+        enforce_project_authority(
+            ctx,
+            caller,
+            trusted_internal,
+            registered_project_id.as_deref(),
+        )?;
     }
     if create_directory && !ctx.peer_is_loopback {
         files::scoped_create_path(&requested_root, true, files::remote_file_roots())?;
@@ -23496,8 +23584,14 @@ fn delegated_admin_target_for_terminal(
 /// the one Organization-tier action that has a real, side-effect-free backing
 /// implementation today (the Files reader), so the MCP "open a file" tool returns
 /// the file's contents/metadata. Args: `path` (required).
-fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn open_file(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("open_file requires a 'path' argument")?;
+    enforce_project_path_authority(ctx, caller, trusted_internal, &path, "open_file")?;
     // Same file-read scope as the #23 reader: a REMOTE peer may only open files
     // under the operator allowlist; loopback (the local MCP) is unrestricted.
     let contents =
@@ -23979,13 +24073,26 @@ fn final_path_component(path: &str) -> String {
 /// The same gate is used by direct Tauri removal, so control, MCP, CLI, and UI
 /// callers all receive a synchronous refusal before any UI detach or Git
 /// mutation. Args: `repoRoot`, `worktreePath` (required); `force` (optional).
-fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn remove_worktree(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let repo_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("remove_worktree requires a 'repoRoot' argument")?;
     let worktree_path = arg_str(args, "worktreePath")
         .or_else(|| arg_str(args, "worktree_path"))
         .ok_or("remove_worktree requires a 'worktreePath' argument")?;
+    enforce_project_path_authority(ctx, caller, trusted_internal, &repo_root, "remove_worktree")?;
+    enforce_project_path_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        &worktree_path,
+        "remove_worktree",
+    )?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // #27: a REMOTE peer may remove worktrees ONLY under the operator allowlist —
@@ -24867,12 +24974,102 @@ fn parse_watch_scope(args: &Value) -> Result<crate::fleet::WatchScope, String> {
 /// (default: the actionable set - idle/turn-complete, needs-input, completed/exited).
 /// Requires a live terminal (like `claim_captain`), so a bogus id can't arm a dead
 /// watch. Idempotent: re-arming replaces the prior watch for that orchestrator.
-fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn enforce_watch_owner(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    orchestrator: &str,
+    command: &str,
+) -> Result<(), String> {
+    require_socket_identity(caller, trusted_internal, command)?;
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.expect("non-apex watch caller is identified");
+    if caller.tile.as_deref() == Some(orchestrator) {
+        return Ok(());
+    }
+    let owns_same_ship = caller.fleet_role == Some(FleetRole::Captain)
+        && caller.ship_slug.is_some()
+        && target_ship_slug(ctx, orchestrator).as_deref() == caller.ship_slug.as_deref();
+    if owns_same_ship {
+        return Ok(());
+    }
+    Err(format!(
+        "acl: '{command}' may mutate only the caller's own or same-ship watch"
+    ))
+}
+
+fn ship_scoped_watch_scope(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    scope: crate::fleet::WatchScope,
+) -> Result<crate::fleet::WatchScope, String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(scope);
+    }
+    let caller = caller.ok_or("watch_fleet requires a durable caller identity")?;
+    let ship = caller
+        .ship_slug
+        .as_deref()
+        .ok_or("watch_fleet requires an authoritative ship scope")?;
+    let snapshot = ctx.captains.snapshot();
+    let mut captain_ids = Vec::new();
+    let mut all_ids = Vec::new();
+    for captain in snapshot
+        .captains
+        .iter()
+        .filter(|captain| captain.ship_slug == ship && captain.state == ClaimState::Active)
+    {
+        if let Some(terminal_id) = &captain.terminal_id {
+            captain_ids.push(terminal_id.clone());
+            all_ids.push(terminal_id.clone());
+        }
+        all_ids.extend(
+            captain
+                .crew
+                .iter()
+                .filter(|crew| matches!(crew.state, CrewState::Active))
+                .map(|crew| crew.terminal_id.clone()),
+        );
+    }
+    let sessions = match scope {
+        crate::fleet::WatchScope::Captains => captain_ids,
+        crate::fleet::WatchScope::All => all_ids,
+        crate::fleet::WatchScope::Sessions(sessions) => {
+            for target in &sessions {
+                if caller.tile.as_deref() != Some(target.as_str())
+                    && target_ship_slug(ctx, target).as_deref() != Some(ship)
+                {
+                    return Err(format!(
+                        "acl: watch_fleet target '{target}' is outside caller ship '{ship}'"
+                    ));
+                }
+            }
+            sessions
+        }
+    };
+    if sessions.is_empty() {
+        return Err(format!(
+            "watch_fleet has no active sessions in caller ship '{ship}'"
+        ));
+    }
+    Ok(crate::fleet::WatchScope::Sessions(sessions))
+}
+
+fn watch_fleet(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let orchestrator = arg_str(args, "orchestratorSessionId")
         .or_else(|| arg_str(args, "orchestrator_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("watch_fleet requires an 'orchestratorSessionId' argument (the orchestrator's own session id)")?;
+    enforce_watch_owner(ctx, caller, trusted_internal, &orchestrator, "watch_fleet")?;
     // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` rejects; an `Unknown`
     // probe is a retryable control-plane timeout, not proof the orchestrator died.
     match tmux::session_liveness(&tmux_target(&orchestrator)) {
@@ -24890,7 +25087,7 @@ fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             )));
         }
     }
-    let scope = parse_watch_scope(args)?;
+    let scope = ship_scoped_watch_scope(ctx, caller, trusted_internal, parse_watch_scope(args)?)?;
     // `states`: an array of camelCase status strings, or absent for the default
     // actionable set. Unrecognized strings are dropped (they can never match a real
     // status); an all-unrecognized list falls back to the default rather than a
@@ -24918,12 +25115,24 @@ fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// `unwatch_fleet` (Organization, audited): disarm an orchestrator wake previously
 /// armed by `watch_fleet`, addressed by `orchestratorSessionId`. Idempotent-ish:
 /// reports whether a watch was actually removed.
-fn unwatch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn unwatch_fleet(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let orchestrator = arg_str(args, "orchestratorSessionId")
         .or_else(|| arg_str(args, "orchestrator_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("unwatch_fleet requires an 'orchestratorSessionId' argument")?;
+    enforce_watch_owner(
+        ctx,
+        caller,
+        trusted_internal,
+        &orchestrator,
+        "unwatch_fleet",
+    )?;
     let removed = ctx.fleet_watches.disarm(&orchestrator);
     Ok(json!({
         "accepted": "unwatch_fleet",
@@ -24945,10 +25154,17 @@ fn list_fleet_watches(ctx: &ControlContext) -> Result<Value, String> {
 /// command that intentionally moves the user's view. Validates the tab against
 /// the registry (strict), mirrors the new active tab there (so `list_tabs` and
 /// default spawn placement track it), and forwards to the UI.
-fn focus_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn focus_tab(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .ok_or("focus_tab requires a 'tabId' argument")?;
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "focus_tab")?;
+    enforce_workspace_owner(ctx, &authority, &tab_id, "focus_tab")?;
     // Validate-and-set atomically (a focus racing a close must fail cleanly, not
     // leave the registry's active pointer on a deleted tab).
     if !ctx.tabs.set_active_tab(&tab_id) {
@@ -27987,10 +28203,16 @@ mod tests {
         let ctx = test_ctx("t");
         // No live tmux for this id -> the arm is refused so a bogus id can't arm a
         // watch that could never deliver.
-        let err = watch_fleet(&ctx, &json!({ "orchestratorSessionId": "nolivetile" })).unwrap_err();
+        let err = watch_fleet(
+            &ctx,
+            &json!({ "orchestratorSessionId": "nolivetile" }),
+            None,
+            true,
+        )
+        .unwrap_err();
         assert!(err.contains("no live terminal"), "got: {err}");
         // And it requires the id at all.
-        assert!(watch_fleet(&ctx, &json!({}))
+        assert!(watch_fleet(&ctx, &json!({}), None, true)
             .unwrap_err()
             .contains("orchestratorSessionId"));
     }
@@ -27998,7 +28220,13 @@ mod tests {
     #[test]
     fn unwatch_and_list_fleet_watches_on_empty_registry() {
         let ctx = test_ctx("t");
-        let v = unwatch_fleet(&ctx, &json!({ "orchestratorSessionId": "whoever" })).unwrap();
+        let v = unwatch_fleet(
+            &ctx,
+            &json!({ "orchestratorSessionId": "whoever" }),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(v.get("removed").and_then(|x| x.as_bool()), Some(false));
         let list = list_fleet_watches(&ctx).unwrap();
         assert_eq!(list.get("count").and_then(|x| x.as_u64()), Some(0));
@@ -28014,7 +28242,13 @@ mod tests {
             .arm("orc12345", crate::fleet::WatchScope::Captains, vec![]);
         let list = list_fleet_watches(&ctx).unwrap();
         assert_eq!(list.get("count").and_then(|x| x.as_u64()), Some(1));
-        let removed = unwatch_fleet(&ctx, &json!({ "orchestratorSessionId": "orc12345" })).unwrap();
+        let removed = unwatch_fleet(
+            &ctx,
+            &json!({ "orchestratorSessionId": "orc12345" }),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(removed.get("removed").and_then(|x| x.as_bool()), Some(true));
         assert_eq!(
             list_fleet_watches(&ctx)
@@ -32556,6 +32790,8 @@ mod tests {
         let before_tabs = tabs.snapshot_full();
 
         for (command, args) in [
+            ("focus_session", json!({"sessionId": "captain-b"})),
+            ("focus_tab", json!({"tabId": "work-b"})),
             (
                 "move_tile",
                 json!({"terminalId": "ordinary-b", "tabId": "work-b"}),
@@ -40166,6 +40402,47 @@ mod tests {
     }
 
     #[test]
+    fn register_project_authorizes_before_creating_or_initializing_files() {
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Captain,
+            "foreign-ship",
+            "foreign-captain",
+        );
+        let ctx = test_ctx("register-project-scope").with_identity_store(identities);
+        let parent = std::env::temp_dir().join(format!(
+            "t-hub-register-scope-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let requested = parent.join("must-not-exist");
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "register-project-scope",
+                &captain,
+                "register_project",
+                json!({
+                    "repoRoot": requested.to_string_lossy(),
+                    "createDirectory": true,
+                    "initializeGit": true,
+                }),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("only General/Cortana")));
+        assert!(!requested.exists(), "authorization ran after filesystem mutation");
+        let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
     fn register_project_refuses_a_non_repository() {
         let ctx = test_ctx("secret");
         let dir = std::env::temp_dir().join(format!(
@@ -43685,6 +43962,43 @@ mod tests {
         );
         assert!(mutation.ok, "{:?}", mutation.error);
         assert!(ctx.tabs.id_for_name("Cortana Ops").is_some());
+    }
+
+    #[test]
+    fn scoped_captain_cannot_arm_or_remove_a_foreign_ship_watch() {
+        let (ctx, captains, _, identity) = captain_lease_fixture(true);
+        captains
+            .claim_test("foreign-captain", Some("foreign-ship"), vec![])
+            .unwrap();
+        let renewed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        let lease = renewed.result.unwrap()["lease"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for command in ["watch_fleet", "unwatch_fleet"] {
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &lease,
+                    &identity.secret,
+                    command,
+                    json!({"orchestratorSessionId": "foreign-captain"}),
+                ),
+            );
+            assert!(!response.ok, "{command} accepted a foreign watch");
+            assert!(response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("own or same-ship watch")));
+        }
     }
 
     #[test]
