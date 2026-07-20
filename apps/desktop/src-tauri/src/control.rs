@@ -62,7 +62,7 @@ use crate::harness::{
     HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
-use crate::{files, git, plane, powder, pty, tmux};
+use crate::{agent_session::AgentSessionRecord, files, git, plane, powder, pty, tmux};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -1089,10 +1089,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// standard HMAC-SHA-256 identity keyed by the protected client credential, so
 /// a protected profile URL is never copied into the registry or a captain sync
 /// payload and the durable value is not a URL equality oracle.
+/// v17 adds the Powder-independent durable agent-session collection.
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 16;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 17;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -2431,6 +2432,11 @@ pub struct CaptainsSnapshot {
     pub seq: u64,
     #[serde(default)]
     pub captains: Vec<CaptainRecord>,
+    /// Powder-independent durable agent sessions.
+    /// Legacy Crew records remain in `captains` until compatibility migration
+    /// is complete.
+    #[serde(default)]
+    pub agent_sessions: Vec<AgentSessionRecord>,
     /// Durable registered repositories. Added in schema v2; older snapshots
     /// deserialize to an empty registry.
     #[serde(default)]
@@ -2684,6 +2690,7 @@ impl AuthorityGenerations {
 #[derive(Clone)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
+    agent_sessions: Vec<AgentSessionRecord>,
     projects: Vec<ProjectRecord>,
     workspaces: Vec<FleetWorkspaceRecord>,
     pending_fleet_operations: Vec<PendingFleetOperation>,
@@ -2705,6 +2712,7 @@ impl Default for CaptainsInner {
     fn default() -> Self {
         Self {
             captains: Vec::new(),
+            agent_sessions: Vec::new(),
             projects: Vec::new(),
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: Vec::new(),
@@ -2949,6 +2957,7 @@ impl CaptainsRegistry {
                 schema_version: CAPTAINS_SCHEMA_VERSION,
                 seq: 0,
                 captains: Vec::new(),
+                agent_sessions: Vec::new(),
                 projects: Vec::new(),
                 workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
                 pending_fleet_operations: Vec::new(),
@@ -3049,6 +3058,7 @@ impl CaptainsRegistry {
                 let workspaces = Self::reconcile_durable_workspaces(&captains, snap.workspaces);
                 CaptainsInner {
                     captains,
+                    agent_sessions: snap.agent_sessions,
                     projects: snap.projects,
                     workspaces,
                     pending_fleet_operations: snap.pending_fleet_operations,
@@ -3185,6 +3195,22 @@ impl CaptainsRegistry {
                         project.project_id
                     ));
                 }
+            }
+        }
+        let mut agent_session_ids = std::collections::HashSet::new();
+        for agent in &snapshot.agent_sessions {
+            agent.validate()?;
+            if !agent_session_ids.insert(agent.agent_session_id.as_str()) {
+                return Err(format!(
+                    "captains registry contains duplicate agentSessionId '{}'",
+                    agent.agent_session_id
+                ));
+            }
+            if !project_ids.contains(agent.project_id.as_str()) {
+                return Err(format!(
+                    "agent session '{}' references unknown projectId '{}'",
+                    agent.agent_session_id, agent.project_id
+                ));
             }
         }
         let mut pending_claim_scopes = std::collections::HashSet::new();
@@ -3624,6 +3650,7 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            agent_sessions: g.agent_sessions.clone(),
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -4439,6 +4466,52 @@ impl CaptainsRegistry {
             // clobber it.
             return Ok(());
         }
+        if path.exists() {
+            if let Ok(existing) = Self::read_snapshot(path) {
+                if existing.schema_version < CAPTAINS_SCHEMA_VERSION {
+                    let file_name = path
+                        .file_name()
+                        .ok_or_else(|| "captains registry path has no file name".to_string())?
+                        .to_string_lossy();
+                    let prefix = format!("{file_name}.migration-v{CAPTAINS_SCHEMA_VERSION}.");
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| "captains registry path has no parent".to_string())?;
+                    let already_backed_up = std::fs::read_dir(parent)
+                        .map_err(|error| {
+                            format!(
+                                "captains registry migration backup directory '{}' could not be read: {error}",
+                                parent.display()
+                            )
+                        })?
+                        .flatten()
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+                    if !already_backed_up {
+                        let backup = parent.join(format!("{prefix}{}.bak", now_ms()));
+                        std::fs::copy(path, &backup).map_err(|error| {
+                            format!(
+                                "captains registry migration backup '{}' could not be written: {error}",
+                                backup.display()
+                            )
+                        })?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Err(error) = std::fs::set_permissions(
+                                &backup,
+                                std::fs::Permissions::from_mode(0o600),
+                            ) {
+                                let _ = std::fs::remove_file(&backup);
+                                return Err(format!(
+                                    "captains registry migration backup permissions on '{}' failed: {error}",
+                                    backup.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Test seam: stand in for a slow/stalled disk write, holding `persist` but
         // NOT `inner`, so a test can prove a concurrent reader/mutator is unblocked.
         #[cfg(test)]
@@ -4565,6 +4638,7 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            agent_sessions: g.agent_sessions.clone(),
             projects: g.projects.clone(),
             workspaces: g.workspaces.clone(),
             pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -4870,6 +4944,7 @@ impl CaptainsRegistry {
                 schema_version: CAPTAINS_SCHEMA_VERSION,
                 seq: g.seq,
                 captains: g.captains.clone(),
+                agent_sessions: g.agent_sessions.clone(),
                 projects: g.projects.clone(),
                 workspaces: g.workspaces.clone(),
                 pending_fleet_operations: g.pending_fleet_operations.clone(),
@@ -25577,6 +25652,7 @@ mod tests {
             schema_version: 12,
             seq: 1,
             captains: vec![],
+            agent_sessions: vec![],
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],
@@ -25599,6 +25675,46 @@ mod tests {
         let persisted: CaptainsSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.schema_version, CAPTAINS_SCHEMA_VERSION);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn first_schema_v17_write_creates_a_timestamped_migration_backup() {
+        let path = captains_tmp("schema-v17-migration-backup");
+        let legacy = CaptainsSnapshot {
+            schema_version: 16,
+            seq: 1,
+            captains: vec![],
+            agent_sessions: vec![],
+            projects: vec![],
+            workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
+            pending_fleet_operations: vec![],
+            retired_fleet_tile_ids: vec![],
+            pending_dispatch_claims: vec![],
+            pending_dispatch_releases: vec![],
+        };
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .claim_test("migration-backup-captain", None, vec![])
+            .unwrap();
+
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        let prefix = format!("{file_name}.migration-v17.");
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup_body = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert_eq!(backup_body, serde_json::to_string(&legacy).unwrap());
+
+        for backup in backups {
+            let _ = std::fs::remove_file(backup.path());
+        }
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
     }
@@ -25973,6 +26089,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 4,
             captains: vec![],
+            agent_sessions: vec![],
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
@@ -26070,6 +26187,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 1,
             captains: vec![],
+            agent_sessions: vec![],
             projects: vec![],
             workspaces: vec![FleetWorkspaceRecord::captain_workspace()],
             pending_fleet_operations: vec![],
@@ -31333,6 +31451,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 0,
             captains: vec![],
+            agent_sessions: vec![],
             projects: vec![],
             workspaces: vec![],
             pending_fleet_operations: vec![],
