@@ -26,6 +26,7 @@ const NO_CREW: readonly CrewRef[] = [];
 /** One crewmate's rolled-up state. */
 export interface CrewMember {
   id: string;
+  delegatedRole?: "shipAdmin" | "fleetAdmin";
   /** The crew session has reported a status (vs. just-spawned, not yet known). */
   known: boolean;
   /** Mid-turn (working / waiting / needs-input). */
@@ -68,6 +69,7 @@ export function useCrewSummary(terminalId: string): CrewSummary {
         const st = sid !== undefined ? statuses[sid] : undefined;
         return {
           id,
+          delegatedRole: c.delegatedRole,
           known: st !== undefined,
           running: st !== undefined && CREW_RUNNING.has(st),
           needsInput: st === "needsQuestion" || st === "needsPermission",

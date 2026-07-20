@@ -119,19 +119,39 @@ start_agent(
   captainSessionId,
   assignment,
   directory,
+  sourceCommit,
+  visibleProductBug,
+  laneId,
+  dependencies,
+  mutableFiles,
+  mutableSchemas,
+  mutableInterfaces,
+  integrationContracts,
   harness?,
   name?,
   workspaceTabId?
 )
 ```
 
-`requestId`, `captainSessionId`, `assignment`, and `directory` are required.
+All fields except `harness`, `name`, and `workspaceTabId` are required.
 
 `requestId` is stable across retries of one accepted launch attempt and is deduplicated through the existing T-Hub request cache.
 
 A duplicate `requestId` must replay the original outcome without creating another agent record or terminal.
 
 `directory` must already exist and must resolve inside the Captain's registered Project repository or one of its Git worktrees.
+
+`sourceCommit` must be the exact clean commit currently checked out in `directory`.
+The operation rejects a dirty checkout, an abbreviated commit, or a commit that does not equal `HEAD`.
+Unrelated dirty user work must remain outside the dispatch baseline.
+
+`laneId`, `dependencies`, the mutable resource arrays, and `integrationContracts` define the adaptive concurrency contract.
+An empty `dependencies` array explicitly declares an independent lane.
+Shared mutable files, schemas, or interfaces require one integration owner and an ordering contract.
+The runtime governor evaluates machine health, Provider capacity, worktree availability, active lanes, collisions, and reserved Cortana, administrator, and recovery capacity before launch.
+No fixed agent-count recommendation overrides that decision.
+
+`visibleProductBug` records whether acceptance requires packaged graphical end-to-end evidence.
 
 The Captain may use the existing worktree operation before `start_agent` when isolation is required.
 
@@ -147,7 +167,7 @@ The operation must persist the assignment and a `starting` agent record before l
 
 The assignment is the authoritative launch prompt and is delivered exactly once during the accepted launch attempt.
 
-The success response must contain the agent session ID, Captain session ID, Project ID, directory, detected worktree and branch, harness, runtime state, work stage, and whether the assignment was delivered.
+The success response must contain the agent session ID, Captain session ID, Project ID, directory, detected worktree and branch, exact source commit, lane claim, integration contracts, capacity report, Harness, runtime state, work stage, and whether the assignment was delivered.
 
 If launch fails, T-Hub records the failure honestly and cleans up only the newly created terminal when ownership is proven.
 
@@ -162,6 +182,8 @@ Provide or adapt the following bounded operations.
 - `agent_checkpoint` appends a bounded human-readable progress or handoff summary.
 - `agent_events` returns cursor-based lifecycle and checkpoint deltas.
 - `captain_bootstrap` returns a compact recovery snapshot.
+- `dispatch_preflight` evaluates the exact baseline, lane claims, mutable-resource claims, integration contracts, and reserved capacity before launch.
+- `record_agent_delivery` records immutable implementation, review, test, integration, package, installation, and live-verification evidence for an exact commit.
 
 `list_agents` excludes removed agents by default.
 
@@ -182,6 +204,12 @@ Checkpoint records are session history and must not grow into cards, criteria, d
 An agent may set its own stage to `working`, `needsInput`, or `readyForReview` through `agent_checkpoint`.
 
 The owning Captain may set the agent to any non-destructive work stage, including `awaitingIntegration`, `complete`, or reopening it to `working`.
+
+The `complete` work stage requires independent review and all required acceptance checks to pass on the same exact commit.
+
+Implementation, review, testing, completion, integration, packaging, installation, and live verification remain separate facts.
+
+Visible product changes require packaged graphical end-to-end evidence before they may be reported complete.
 
 Only the owning Captain or a higher authorized supervisor may stop the agent session.
 
@@ -436,7 +464,7 @@ Do not install, restart, publish, push, or release without separate General auth
 The migration is complete only when all of the following are true.
 
 - A Captain can start and supervise multiple Codex or Claude agents without Powder.
-- A new agent needs only an assignment and an existing directory, with optional harness and presentation fields.
+- A new agent needs an assignment, an existing directory, an exact clean source commit, an explicit lane and dependency declaration, mutable-resource claims, integration contracts, and the visible-product-bug flag, with optional harness and presentation fields.
 - T-Hub durably recovers Captain, agent, provider conversation, Git, workspace, lifecycle, and checkpoint state after restart.
 - Human-readable progress is available without introducing cards or a task board.
 - Bootstrap and ongoing supervision use bounded snapshots and cursor deltas.

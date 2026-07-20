@@ -139,9 +139,27 @@ defaults
 T-Hub does not currently define a project-level CLI configuration layer, so one must not be implied.
 Endpoint discovery must remain compatible with the documented control environment variables and user handshake file while later reliability work adds stale-endpoint rediscovery.
 
-## Testing Requirements for Later Implementation
+## Active Supervisory Workflow Commands
 
-The implementation phase must use the existing Rust test approach and add process-level CLI contract coverage.
+The supervisory workflow is active through the shared control operation catalog.
+
+- `th agents preflight` evaluates an exact source commit, lane identity, dependencies, mutable files, schemas, interfaces, integration contracts, and reserved runtime capacity without launching an agent.
+- `th agents start` requires the same exact dispatch baseline and concurrency contract and rejects a dirty checkout, abbreviated commit, stale commit, resource collision, missing ordering contract, or exhausted reserved capacity.
+- `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
+- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, and `cleanup-session` expose durable delegated administration through the same authorization service used by MCP and control clients.
+- `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
+- `th admin cleanup-session` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
+- `th worktree prune` is reporting-only even when the compatibility `--yes` flag is supplied.
+
+Worktree removal and reuse remain unavailable until one authoritative worktree safety service can prove ownership, integration, retention, and removability for the exact target.
+
+The CLI and MCP adapters serialize the same request and response schemas and do not make independent authorization decisions.
+
+Delivery output must preserve `implemented`, `reviewed`, `tested`, `complete`, `integrated`, `packaged`, `installed`, and `live-verified` as separate facts.
+
+## Testing Requirements
+
+The implementation uses the existing Rust test approach and process-level CLI contract coverage.
 The suite must prove parseable and isolated JSON stdout, strict usage failures, explicit empty collections, stable exit categories, idempotent no-ops, destructive confirmation before mutation, deterministic ordering, bounded output, and complete `--full` retrieval where supported.
 It must also test endpoint restart, stale discovery state, timeout, malformed response, protocol mismatch, retry, and ambiguous mutation recovery.
 CLI and MCP parity tests should be generated from the shared operation catalog after that catalog exists.

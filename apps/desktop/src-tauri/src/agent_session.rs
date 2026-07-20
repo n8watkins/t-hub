@@ -452,6 +452,20 @@ impl DeliveryProvenance {
                     "artifact.sourceBaseline must equal integration.canonicalCommit".into(),
                 );
             }
+            if let Some(AcceptanceTestEvidence {
+                environment:
+                    AcceptanceEnvironment::PackagedGuiE2e {
+                        artifact_id,
+                        source_commit: _,
+                        installation_target: _,
+                    },
+                ..
+            }) = &self.acceptance_test
+            {
+                if artifact.artifact_id != *artifact_id {
+                    return Err("artifact.artifactId must equal packaged GUI E2E artifactId".into());
+                }
+            }
             validate_reference("artifact.reference", &artifact.reference)?;
             if artifact.recorded_at < integration.recorded_at {
                 return Err("artifact.recordedAt must not precede integration evidence".into());
@@ -465,6 +479,24 @@ impl DeliveryProvenance {
                 .ok_or("delivery provenance cannot be installed before it is packaged")?;
             if installation.artifact_id != artifact.artifact_id {
                 return Err("installation.artifactId must equal artifact.artifactId".into());
+            }
+            if let Some(AcceptanceTestEvidence {
+                environment:
+                    AcceptanceEnvironment::PackagedGuiE2e {
+                        artifact_id,
+                        source_commit: _,
+                        installation_target,
+                    },
+                ..
+            }) = &self.acceptance_test
+            {
+                if installation.artifact_id != *artifact_id
+                    || installation.target != *installation_target
+                {
+                    return Err(
+                        "installation must match packaged GUI E2E artifact and target".into(),
+                    );
+                }
             }
             validate_nonempty("installation.target", &installation.target)?;
             validate_reference("installation.reference", &installation.reference)?;
@@ -565,6 +597,13 @@ pub struct AgentSessionRecord {
     /// Missing only on records written before delivery provenance was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryProvenance>,
+    /// Missing only on records written before adaptive dispatch preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_claim: Option<crate::governor::LaneClaim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_contracts: Vec<crate::governor::IntegrationContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_capacity: Option<crate::governor::CapacityReport>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -616,6 +655,37 @@ impl AgentSessionRecord {
                 );
             }
         }
+        match (&self.lane_claim, &self.dispatch_capacity) {
+            (Some(lane), Some(capacity)) => {
+                if lane.lane_id.trim().is_empty()
+                    || lane.owner_id != self.agent_session_id
+                    || lane.dependencies.is_none()
+                {
+                    return Err(
+                        "agent session lane evidence must name this agent as the explicit owner"
+                            .into(),
+                    );
+                }
+                if capacity.requested_lanes != 1 {
+                    return Err(
+                        "agent session dispatch capacity must describe exactly one admitted lane"
+                            .into(),
+                    );
+                }
+            }
+            (None, None) if self.integration_contracts.is_empty() => {}
+            (None, None) => {
+                return Err(
+                    "agent session integration contracts require durable lane evidence".into(),
+                );
+            }
+            _ => {
+                return Err(
+                    "agent session lane and dispatch capacity evidence must be recorded together"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -625,6 +695,12 @@ impl AgentSessionRecord {
         self.validate()?;
         if self.delivery.is_none() {
             return Err("agent session dispatch requires an exact source baseline".into());
+        }
+        if self.lane_claim.is_none() || self.dispatch_capacity.is_none() {
+            return Err(
+                "agent session dispatch requires explicit lane ownership and adaptive capacity evidence"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -674,6 +750,8 @@ pub struct AgentEvent {
     pub work_stage: Option<WorkStage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<AgentCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_states: Option<DeliveryStates>,
 }
 
 pub fn snapshot_digest<T: Serialize>(snapshot: &T) -> Result<String, String> {
@@ -708,9 +786,46 @@ mod tests {
             runtime_state: RuntimeState::Starting,
             work_stage: WorkStage::Assigned,
             delivery: None,
+            lane_claim: None,
+            integration_contracts: Vec::new(),
+            dispatch_capacity: None,
             created_at: 10,
             updated_at: 10,
         }
+    }
+
+    fn dispatch_evidence() -> (crate::governor::LaneClaim, crate::governor::CapacityReport) {
+        let lane = crate::governor::LaneClaim {
+            lane_id: "lane-1".into(),
+            owner_id: "agent-1".into(),
+            dependencies: Some(std::collections::BTreeSet::new()),
+            mutable_files: std::collections::BTreeSet::new(),
+            mutable_schemas: std::collections::BTreeSet::new(),
+            mutable_interfaces: std::collections::BTreeSet::new(),
+        };
+        let request = crate::governor::DispatchPreflight {
+            requested_lanes: vec![lane.clone()],
+            active_lanes: Vec::new(),
+            satisfied_dependencies: std::collections::BTreeSet::new(),
+            integration_contracts: Vec::new(),
+            capacity: crate::governor::RuntimeCapacity {
+                live_sessions: 3,
+                machine_healthy: true,
+                machine_session_capacity: 64,
+                provider_session_capacity: 64,
+                provider_live_sessions: 3,
+                available_worktrees: 8,
+                active_captains: 0,
+                live_cortana: 1,
+                live_fleet_admins: 1,
+                live_ship_admins: 0,
+                live_recovery_sessions: 1,
+            },
+        };
+        let capacity = crate::governor::SpawnGovernor::default()
+            .preflight_dispatch(&request)
+            .unwrap();
+        (lane, capacity)
     }
 
     fn review() -> ReviewEvidence {
@@ -945,8 +1060,15 @@ mod tests {
 
         let mut dispatched = record();
         dispatched.delivery = Some(DeliveryProvenance::new(SOURCE_BASELINE, false));
+        let (lane_claim, dispatch_capacity) = dispatch_evidence();
+        dispatched.lane_claim = Some(lane_claim);
+        dispatched.dispatch_capacity = Some(dispatch_capacity);
         dispatched.validate_for_dispatch().unwrap();
 
+        dispatched.dispatch_capacity = None;
+        assert!(dispatched.validate_for_dispatch().is_err());
+        let (_, dispatch_capacity) = dispatch_evidence();
+        dispatched.dispatch_capacity = Some(dispatch_capacity);
         dispatched.delivery = Some(DeliveryProvenance::new("short", false));
         assert!(dispatched.validate_for_dispatch().is_err());
     }

@@ -1,8 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use super::args::StrictFlags;
 use super::{control, emit_json_ok, endpoint, CliError};
+
+type AgentFlags = StrictFlags;
 
 pub fn command_label(args: &[String]) -> String {
     match args.first().map(String::as_str) {
@@ -17,29 +20,63 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
     match args.first().map(String::as_str).unwrap_or("") {
+        "preflight" => preflight(&args[1..]),
         "start" => start(&args[1..]),
         "list" => list(&args[1..]),
         "show" => show(&args[1..]),
         "checkpoint" => checkpoint(&args[1..]),
+        "delivery" => delivery(&args[1..]),
         "events" => events(&args[1..]),
         "" => Err(CliError::usage(
-            "usage: th agents <start|list|show|checkpoint|events> ...",
+            "usage: th agents <preflight|start|list|show|checkpoint|delivery|events> ...",
         )),
         other => Err(CliError::usage(format!(
-            "unknown agents subcommand '{other}' (expected start|list|show|checkpoint|events)"
+            "unknown agents subcommand '{other}' (expected preflight|start|list|show|checkpoint|delivery|events)"
         ))),
     }
 }
 
 fn print_help() {
     println!(
-        "usage: th agents <start|list|show|checkpoint|events> [flags]\n\n\
-start      --request-id ID --captain ID --directory PATH --assignment TEXT [--harness codex|claude] [--name NAME] [--tab ID]\n\
+        "usage: th agents <preflight|start|list|show|checkpoint|delivery|events> [flags]\n\n\
+preflight  --project ID --lanes-json JSON [--integration-contracts-json JSON] [--json]\n\
+start      --request-id ID --captain ID --directory PATH --assignment TEXT --source-commit COMMIT --lane-id ID [ownership flags]\n\
 list       --captain ID or --project ID [--cursor N] [--limit N] [--state active|removed] [--json]\n\
 show       <agentSessionId> [--json]\n\
 checkpoint <agentSessionId> <summary> --author ID [--stage STAGE] [--json]\n\
+delivery   <agentSessionId> <state> --evidence-json JSON [--json]\n\
 events     <agentSessionId> [--cursor N] [--limit N] [--json]"
     );
+}
+
+fn preflight(args: &[String]) -> Result<(), CliError> {
+    let flags = AgentFlags::parse(
+        args,
+        &["--project", "--lanes-json", "--integration-contracts-json"],
+        &["--json"],
+    )?;
+    flags.require_positionals(0, "th agents preflight [flags]")?;
+    let project = required(&flags, "--project", "agents preflight")?;
+    let lanes = json_array(
+        &required(&flags, "--lanes-json", "agents preflight")?,
+        "th agents preflight: --lanes-json",
+        false,
+    )?;
+    let integration_contracts = optional_json_array(
+        &flags,
+        "--integration-contracts-json",
+        "th agents preflight: --integration-contracts-json",
+    )?;
+    call_and_render(
+        "agents preflight",
+        "dispatch_preflight",
+        json!({
+            "projectId": project,
+            "requestedLanes": lanes,
+            "integrationContracts": integration_contracts,
+        }),
+        &flags,
+    )
 }
 
 fn start(args: &[String]) -> Result<(), CliError> {
@@ -53,19 +90,41 @@ fn start(args: &[String]) -> Result<(), CliError> {
             "--harness",
             "--name",
             "--tab",
+            "--source-commit",
+            "--lane-id",
+            "--dependencies",
+            "--mutable-files",
+            "--mutable-schemas",
+            "--mutable-interfaces",
+            "--integration-contracts-json",
         ],
-        &["--json"],
+        &["--visible-product-bug", "--json"],
     )?;
     flags.require_positionals(0, "th agents start [flags]")?;
     let request_id = required(&flags, "--request-id", "agents start")?;
     let captain = required(&flags, "--captain", "agents start")?;
     let directory = required(&flags, "--directory", "agents start")?;
     let assignment = required(&flags, "--assignment", "agents start")?;
+    let source_commit = required(&flags, "--source-commit", "agents start")?;
+    validate_commit(&source_commit, "th agents start: --source-commit")?;
+    let lane_id = required(&flags, "--lane-id", "agents start")?;
     let mut args = json!({
         "requestId": request_id,
         "captainSessionId": captain,
         "directory": directory,
         "assignment": assignment,
+        "sourceCommit": source_commit,
+        "visibleProductBug": flags.booleans.contains("--visible-product-bug"),
+        "laneId": lane_id,
+        "dependencies": optional_csv(&flags, "--dependencies")?,
+        "mutableFiles": optional_csv(&flags, "--mutable-files")?,
+        "mutableSchemas": optional_csv(&flags, "--mutable-schemas")?,
+        "mutableInterfaces": optional_csv(&flags, "--mutable-interfaces")?,
+        "integrationContracts": optional_json_array(
+            &flags,
+            "--integration-contracts-json",
+            "th agents start: --integration-contracts-json",
+        )?,
     });
     for (flag, key) in [
         ("--harness", "harness"),
@@ -93,7 +152,7 @@ fn list(args: &[String]) -> Result<(), CliError> {
         &["--json"],
     )?;
     flags.require_positionals(0, "th agents list [flags]")?;
-    if flags.options.get("--captain").is_none() && flags.options.get("--project").is_none() {
+    if !flags.options.contains_key("--captain") && !flags.options.contains_key("--project") {
         return Err(CliError::usage(
             "th agents list: requires --captain <id> or --project <id>",
         ));
@@ -154,6 +213,51 @@ fn checkpoint(args: &[String]) -> Result<(), CliError> {
         input["stage"] = json!(stage);
     }
     call_and_render("agents checkpoint", "agent_checkpoint", input, &flags)
+}
+
+fn delivery(args: &[String]) -> Result<(), CliError> {
+    let flags = AgentFlags::parse(args, &["--evidence-json"], &["--json"])?;
+    flags.require_positionals(
+        2,
+        "th agents delivery <agentSessionId> <state> --evidence-json <json> [--json]",
+    )?;
+    let agent = positional(&flags, 0, "agents delivery", "<agentSessionId>")?;
+    let state = positional(&flags, 1, "agents delivery", "<state>")?;
+    if !matches!(
+        state.as_str(),
+        "implemented"
+            | "reviewed"
+            | "tested"
+            | "integrated"
+            | "packaged"
+            | "installed"
+            | "liveVerified"
+    ) {
+        return Err(CliError::usage(
+            "th agents delivery: state must be implemented, reviewed, tested, integrated, packaged, installed, or liveVerified",
+        ));
+    }
+    let evidence_text = required(&flags, "--evidence-json", "agents delivery")?;
+    let evidence = serde_json::from_str::<Value>(&evidence_text).map_err(|error| {
+        CliError::usage(format!(
+            "th agents delivery: --evidence-json must be valid JSON: {error}"
+        ))
+    })?;
+    if !evidence.is_object() {
+        return Err(CliError::usage(
+            "th agents delivery: --evidence-json must be a JSON object",
+        ));
+    }
+    call_and_render(
+        "agents delivery",
+        "record_agent_delivery",
+        json!({
+            "agentSessionId": agent,
+            "state": state,
+            "evidence": evidence,
+        }),
+        &flags,
+    )
 }
 
 fn events(args: &[String]) -> Result<(), CliError> {
@@ -237,6 +341,54 @@ fn validate_stage(stage: &str) -> Result<(), CliError> {
     ))
 }
 
+fn validate_commit(value: &str, label: &str) -> Result<(), CliError> {
+    if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "{label} must be an exact 40- or 64-character hexadecimal commit"
+    )))
+}
+
+fn optional_csv(flags: &AgentFlags, name: &str) -> Result<Vec<String>, CliError> {
+    let Some(value) = flags.options.get(name) else {
+        return Ok(Vec::new());
+    };
+    let mut values = BTreeSet::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(CliError::usage(format!(
+                "th agents start: {name} must be a comma-separated list without empty entries"
+            )));
+        }
+        values.insert(item.to_string());
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn optional_json_array(
+    flags: &AgentFlags,
+    name: &str,
+    label: &str,
+) -> Result<Vec<Value>, CliError> {
+    match flags.options.get(name) {
+        Some(value) => json_array(value, label, true),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn json_array(value: &str, label: &str, allow_empty: bool) -> Result<Vec<Value>, CliError> {
+    let values = serde_json::from_str::<Vec<Value>>(value)
+        .map_err(|error| CliError::usage(format!("{label} must be a JSON array: {error}")))?;
+    if !allow_empty && values.is_empty() {
+        return Err(CliError::usage(format!(
+            "{label} must contain at least one lane"
+        )));
+    }
+    Ok(values)
+}
+
 fn call_and_render(
     label: &str,
     operation: &str,
@@ -244,7 +396,7 @@ fn call_and_render(
     flags: &AgentFlags,
 ) -> Result<(), CliError> {
     let result = control::call(&endpoint()?, operation, args)?;
-    if flags.json {
+    if flags.json() {
         emit_json_ok(label, result);
     } else {
         println!(
@@ -252,87 +404,6 @@ fn call_and_render(
             label,
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
-    }
-    Ok(())
-}
-
-struct AgentFlags {
-    positionals: Vec<String>,
-    options: HashMap<String, String>,
-    json: bool,
-}
-
-impl AgentFlags {
-    fn parse(
-        args: &[String],
-        value_flags: &[&str],
-        boolean_flags: &[&str],
-    ) -> Result<Self, CliError> {
-        let value_flags: HashSet<&str> = value_flags.iter().copied().collect();
-        let boolean_flags: HashSet<&str> = boolean_flags.iter().copied().collect();
-        let mut positionals = Vec::new();
-        let mut options = HashMap::new();
-        let mut booleans = HashSet::new();
-        let mut index = 0;
-        while index < args.len() {
-            let argument = &args[index];
-            if let Some((name, value)) = argument.split_once('=') {
-                if !name.starts_with("--") || !value_flags.contains(name) {
-                    return Err(CliError::usage(format!("unknown flag '{name}'")));
-                }
-                if value.is_empty() {
-                    return Err(CliError::usage(format!("{name} expects a value")));
-                }
-                insert_once(&mut options, name, value)?;
-            } else if value_flags.contains(argument.as_str()) {
-                let value = args
-                    .get(index + 1)
-                    .filter(|value| !value.starts_with('-'))
-                    .ok_or_else(|| CliError::usage(format!("{argument} expects a value")))?;
-                insert_once(&mut options, argument, value)?;
-                index += 1;
-            } else if boolean_flags.contains(argument.as_str()) {
-                if !booleans.insert(argument.clone()) {
-                    return Err(CliError::usage(format!(
-                        "{argument} may be provided only once"
-                    )));
-                }
-            } else if argument.starts_with('-') {
-                return Err(CliError::usage(format!("unknown flag '{argument}'")));
-            } else {
-                positionals.push(argument.clone());
-            }
-            index += 1;
-        }
-        Ok(Self {
-            positionals,
-            options,
-            json: booleans.contains("--json"),
-        })
-    }
-
-    fn require_positionals(&self, expected: usize, usage: &str) -> Result<(), CliError> {
-        if self.positionals.len() == expected {
-            return Ok(());
-        }
-        Err(CliError::usage(format!(
-            "usage: {usage} (expected {expected} positional argument{}, got {})",
-            if expected == 1 { "" } else { "s" },
-            self.positionals.len()
-        )))
-    }
-}
-
-fn insert_once(
-    options: &mut HashMap<String, String>,
-    name: &str,
-    value: &str,
-) -> Result<(), CliError> {
-    if options
-        .insert(name.to_string(), value.to_string())
-        .is_some()
-    {
-        return Err(CliError::usage(format!("{name} may be provided only once")));
     }
     Ok(())
 }

@@ -97,6 +97,24 @@ tests and exit gates, resolves dependencies, reviews evidence, and closes owned
 work safely.
 A Captain has control authority only over its own ship and agent sessions.
 A Captain must remain at orchestration altitude and must not use continuous terminal watching as a substitute for structured evidence.
+A Captain may read one bounded authoritative summary directly when that is sufficient to decide, prioritize, delegate, review, or escalate.
+Multi-step investigations, terminal inspection, repository inspection, worktree maintenance, session cleanup, and other administrative execution belong to authorized agent sessions.
+
+### Ship Admin
+
+A Ship Admin is a durable agent-session role appointed by the owning Captain for one exact ship.
+The role persists until revocation, supervisor retirement, or ownership invalidation and carries only an explicit permitted operation set.
+A Ship Admin may execute granted status inspection, session maintenance, resource recovery, worktree maintenance, retirement preparation, and exactly approved cleanup inside that ship.
+A Ship Admin cannot appoint administrators, re-delegate authority, become Captain, cross ships, direct implementation, or exercise authority the Captain does not possess.
+The default operating posture is one standing Ship Admin per active Captain, with additional Ship Admins permitted for genuinely independent administrative work when capacity allows.
+
+### Fleet Admin
+
+A Fleet Admin is a durable agent-session role appointed by Cortana for fleet-level administration within Cortana's existing authority.
+The role persists until revocation, Cortana retirement, or Cortana ownership invalidation and carries only an explicit permitted operation set.
+A Fleet Admin may inspect Captains, build cross-Captain status reports, recover resources, maintain fleet resources, and prepare retirement when those operations are granted.
+A Fleet Admin cannot direct implementation, control Captain-owned agents directly, acquire Captain authority, grant roles, or bypass General-reserved approval.
+The default operating posture is one standing Fleet Admin, with more permitted for independent administrative work when capacity allows.
 
 ### Peer Captains
 
@@ -263,14 +281,18 @@ System-generated lifecycle notices are a separate trusted producer and never gra
 | Cortana | General | Fleet status, health, recovery, retirement request, or decision request | No implementation authority |
 | Cortana | Captain | Navigation, health, recovery, General relay, context, or retirement coordination | No agent direction unless relaying an exact General instruction |
 | Cortana | Agent session | No free-form implementation route | Cortana must communicate through the owning Captain and cannot steer, interrupt, or retire an agent |
+| Cortana | Fleet Admin | Exact administrative assignment, status request, recovery request, or revocation | Execution authority only inside the durable grant |
 | Captain | General | Status, blocker, decision request, completion, risk, or authorization request | General may decide or delegate explicitly |
 | Captain | Own agent sessions | Assignment delivery, follow-up instruction, review finding, decision, recovery, stop, or coordination | Bounded by the Captain's Assignment, ship, and delegated authority |
+| Captain | Own Ship Admin | Exact administrative assignment, status request, maintenance request, cleanup approval, or revocation | Execution authority only inside the durable grant and exact ship |
 | Captain | Peer Captain | Coordination, dependency, conflict, technical request, or status | No authority transfer or foreign agent control |
 | Captain | Foreign agent | Denied | Route through the owning Captain |
 | Agent | Owning Captain | Status requiring attention, blocker, decision request, permission request, review response, completion, or emergency | No authority expansion |
 | Agent | General | Emergency or explicit General-requested dialogue, copied to the owning Captain when safe | No silent scope or ownership change |
 | Agent | Same-Assignment agent | Dependency coordination or status linked to shared work | No instruction or control authority over the peer |
 | Agent | Foreign agent or peer Captain | Denied by default | Route through the owning Captain unless the General authorizes a specific coordination route |
+| Ship Admin | Owning Captain | Administrative result, evidence, blocker, or escalation | No implementation direction or authority expansion |
+| Fleet Admin | Cortana | Fleet administrative result, evidence, blocker, or escalation | No implementation direction or Captain authority |
 | T-Hub lifecycle service | Authorized owning identities | Needs-answer, needs-permission, failure, recovery, completion, context, or resource-risk notice | Attention only, never approval or implementation authority |
 
 Every authorization decision uses durable sender and recipient identity, Project,
@@ -370,11 +392,15 @@ Agents cannot approve their own request.
 
 Before dispatch, the Captain must:
 
-1. Confirm the Assignment, Project, dependencies, and authorization are unambiguous.
-2. Define bounded scope, explicit file ownership, expected branch and worktree, required tests, commit policy, escalation rules, and exit gate.
-3. Choose the Harness and effective local execution permission deliberately.
-4. Preserve least-privilege T-Hub control authority while allowing the repository's configured local development permission.
-5. Start through the sanctioned transaction and verify the agent session, terminal, Harness, worktree, branch, and prompt.
+1. Establish and record one exact clean source commit for every agent assignment.
+2. Preserve unrelated dirty user work outside the dispatch baseline.
+3. Commit shared interfaces before dependent lanes begin.
+4. Confirm the Assignment, Project, dependencies, and authorization are unambiguous.
+5. Define bounded scope, explicit file ownership, expected branch and worktree, required tests, commit policy, escalation rules, and exit gate.
+6. Declare one stable lane identity, its explicit dependency set, its mutable file, schema, and interface claims, and any required integration ordering contract.
+7. Choose the Harness and effective local execution permission deliberately.
+8. Run adaptive dispatch preflight and preserve capacity for Cortana, standing administrators, and recovery.
+9. Start through the sanctioned transaction and verify the agent session, terminal, Harness, worktree, branch, source commit, prompt, and recorded capacity decision.
 
 During work, the Captain must:
 
@@ -393,6 +419,20 @@ Before completion, the Captain must:
 4. Advance the work stage only after the acceptance criteria pass.
 5. Close the agent session and release owned resources only after landed-work and recovery checks pass.
 6. Update the checkpoint and handoff before context replacement or retirement.
+
+Completion and release reporting must use these separate states:
+
+- `implemented` means code exists at an exact commit.
+- `reviewed` means an independent reviewer approved that exact commit.
+- `tested` means the required acceptance checks passed on that exact commit.
+- `complete` means the stated scope is both independently reviewed and acceptance-tested on the same exact result commit.
+- `integrated` means the complete result is present in the named canonical baseline.
+- `packaged` means an artifact was built from that baseline.
+- `installed` means that artifact replaced the intended installation.
+- `live-verified` means the required flow passed against the installed application through a human or AI-agent verifier.
+
+Visible product bugs require packaged graphical end-to-end evidence before `tested` may satisfy `complete`.
+Integration must record the dispatch baseline and the exact agent commits that produced the canonical result.
 
 ## Agent Responsibilities
 
@@ -453,6 +493,11 @@ Multiple Captains may hold distinct Assignments in the same Project.
 Each Assignment must have explicit scope and agent-session ownership.
 Shared interfaces require a declared integration order and one integration owner.
 Two Captains must not edit the same registry schema, migration, lifecycle core, or version files concurrently without an agreed boundary.
+
+There is no fixed three-agent, four-agent, or other policy cap on independent implementation lanes.
+Every genuinely independent lane with explicit ownership and dependencies may proceed when the runtime governor, machine health, Provider limits, worktree availability, and integration-collision checks admit it.
+Parallel lanes that share mutable files, schemas, or interfaces require one declared integration owner and an explicit ordering contract.
+The governor must retain capacity for Cortana, standing administrators, and recovery rather than filling every available session slot with implementation work.
 
 When overlap is discovered, the Captains exchange a coordination message that identifies the files, interface, dependency, recommended owner, and impact.
 They continue non-overlapping work while the ownership decision is pending.

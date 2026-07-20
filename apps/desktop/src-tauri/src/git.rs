@@ -136,6 +136,75 @@ fn invalidate_git_info_cache(cwd: &str) {
     }
 }
 
+/// Require `cwd` to be a clean checkout whose current HEAD is the exact commit
+/// named by `expected`. This is the dispatch gate that keeps uncommitted user
+/// work out of an agent's source baseline.
+pub(crate) fn require_clean_exact_baseline(cwd: &str, expected: &str) -> Result<(), String> {
+    if !matches!(expected.len(), 40 | 64) || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("sourceCommit must be an exact 40- or 64-character Git commit".into());
+    }
+    let expected_revision = format!("{expected}^{{commit}}");
+    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &expected_revision])?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!(
+            "sourceCommit '{expected}' is not a commit in this repository: {detail}"
+        ));
+    }
+    let resolved = first_line_opt(&stdout)
+        .ok_or("git returned no commit while verifying sourceCommit")?
+        .to_ascii_lowercase();
+    if resolved != expected.to_ascii_lowercase() {
+        return Err(format!(
+            "sourceCommit '{expected}' did not resolve to the same exact commit '{resolved}'"
+        ));
+    }
+    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!("could not resolve checkout HEAD: {detail}"));
+    }
+    let head = first_line_opt(&stdout).ok_or("git returned no checkout HEAD commit")?;
+    if !head.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "sourceCommit '{expected}' does not match checkout HEAD '{head}'"
+        ));
+    }
+    let (ok, stdout, stderr) = run_git(
+        cwd,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    )?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!("could not verify clean checkout: {detail}"));
+    }
+    if !stdout.trim().is_empty() {
+        return Err(
+            "checkout contains uncommitted or untracked work; preserve it and dispatch from a separate clean worktree"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Initialize a new repository in an existing directory after the caller has
 /// obtained explicit user authorization. Refuses to touch an existing `.git`
 /// entry, including a malformed one, so this operation never rewrites version
@@ -1528,5 +1597,45 @@ detached
             expected
         );
         assert_eq!(worktree_add_args("/home/u/repo-feat", None, true), expected);
+    }
+
+    #[test]
+    fn dispatch_baseline_requires_exact_clean_head() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-dispatch-baseline-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = root.to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            let (ok, stdout, stderr) = run_git_for_test(&cwd, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        run(&["init", "-q"]);
+        std::fs::write(root.join("tracked.txt"), "baseline\n").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&[
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "baseline",
+        ]);
+        let head = run(&["rev-parse", "HEAD"]).trim().to_string();
+        require_clean_exact_baseline(&cwd, &head).unwrap();
+
+        let abbreviated = &head[..12];
+        assert!(require_clean_exact_baseline(&cwd, abbreviated)
+            .unwrap_err()
+            .contains("exact 40- or 64-character"));
+
+        std::fs::write(root.join("untracked.txt"), "user work\n").unwrap();
+        assert!(require_clean_exact_baseline(&cwd, &head)
+            .unwrap_err()
+            .contains("separate clean worktree"));
+        std::fs::remove_dir_all(root).ok();
     }
 }

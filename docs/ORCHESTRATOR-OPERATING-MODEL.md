@@ -13,6 +13,16 @@ escalation, and completion follow
 Cortana's identity is independent of its current terminal, Harness, Provider, model, or conversation.
 Replacing Cortana's runtime must preserve its identity, durable checkpoints, and allowed responsibilities.
 
+## Durable Runtime Reconciliation
+
+T-Hub maintains exactly one durable Cortana identity with at most one authoritative active runtime.
+Desktop startup calls one idempotent backend reconciliation operation rather than adopting whichever terminal happens to be visible.
+Concurrent startup attempts use a stable operation identity and serialize against the same durable record.
+Recovery preserves Cortana's identity and checkpoints while replacing a missing terminal or Harness runtime at a later generation.
+When several candidates exist, reconciliation accepts only one deterministic authoritative generation and safely retires only older trusted duplicates.
+Equal highest generations, foreign identities, uncertain liveness, and untrusted live candidates fail closed into a visible degraded recovery state.
+The runtime governor reserves capacity for Cortana and recovery before admitting ordinary implementation lanes.
+
 ## Valid Codebase Entry Paths
 
 Captain creation must support three equally normal starting points.
@@ -84,6 +94,9 @@ Cortana should:
 - Recover a broken Captain runtime without replacing its durable identity.
 - Retire a Captain when the General explicitly requests it or previously delegates retirement on completion.
 - Verify retirement safety before removing runtime and Assignment state.
+- Read one bounded authoritative summary directly when it is sufficient for a decision.
+- Delegate multi-step investigation, terminal inspection, repository inspection, and administrative mutation to authorized agent sessions.
+- Maintain one standing Fleet Admin by default when a live administrative agent and capacity are available.
 
 Cortana should not:
 
@@ -95,6 +108,27 @@ Cortana should not:
 - Invent task-board state or dispatch work outside the durable agent-session contract.
 - Resolve Project-level implementation conflicts unless the General explicitly asks for coordination help.
 - Create a public remote, publish, deploy, install, spend money, or perform destructive replacement without authorization.
+- Perform routine multi-step investigation or administrative execution when a delegated administrator can carry it out within an exact scope.
+
+## Delegated Administrative Roles
+
+A Ship Admin is a durable agent-session role appointed by the owning Captain and retained until explicit revocation, supervisor retirement, or ownership invalidation.
+The Ship Admin may inspect status and perform only the granted session, resource, retirement-preparation, or worktree-maintenance operations inside that exact ship.
+A Ship Admin cannot appoint administrators, re-delegate authority, become Captain, cross ships, direct implementation, or exercise authority the Captain does not possess.
+Each active Captain should maintain one standing Ship Admin by default when a suitable live agent and reserved capacity are available.
+
+A Fleet Admin is a durable agent-session role appointed by Cortana and retained until explicit revocation, Cortana retirement, or Cortana ownership invalidation.
+A Fleet Admin may inspect and administer Captains across the fleet only through its explicit operation set and Cortana's existing authority.
+Fleet Admins support cross-Captain status, recovery, resource maintenance, and retirement preparation.
+Multiple Fleet Admins may exist concurrently, but the default reservation is one standing Fleet Admin.
+A Fleet Admin cannot direct implementation, acquire Captain authority, grant roles, control Captain-owned agents directly, or bypass General-reserved approval.
+
+The outer control capability only permits a caller to reach control operations.
+The durable delegated role, grant generation, delegating supervisor identity, exact ship or fleet scope, permitted operation set, current supervisor generation, and revocation state determine effective authority.
+Every authorized operation is attributed to both the acting administrator and the delegating supervisor.
+Revocation remains effective across reconnects and restarts.
+Destructive session cleanup additionally requires one exact supervisor approval that binds the grant, actor, operation, and target and is consumed at most once.
+Worktree removal and reuse remain unavailable until the unified worktree safety service supplies an authoritative mutation-time verdict.
 
 ## Captain, Workspace, and Crew Boundary
 

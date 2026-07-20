@@ -284,7 +284,8 @@ fn schema_close_terminal() -> Value {
         "type": "object",
         "properties": {
             "sessionId": { "type": "string", "description": "Session/terminal id to close (kills the tmux session th_<id> and its process tree)." },
-            "force": { "type": "boolean", "description": "Operator escape (default false). When the liveness probe times out under a degraded control plane, close normally REFUSES (retryable). Set force:true to reap a session you KNOW is dead: it re-probes once and reaps unless the re-probe CONFIRMS the session Alive. WARNING: under a sustained wedge a live-but-slow session's re-probe also times out (indistinguishable from dead) and force WILL reap it - use force ONLY when you believe the session is dead. Try a normal close first." }
+            "force": { "type": "boolean", "description": "Operator escape (default false). When the liveness probe times out under a degraded control plane, close normally REFUSES (retryable). Set force:true to reap a session you KNOW is dead: it re-probes once and reaps unless the re-probe CONFIRMS the session Alive. WARNING: under a sustained wedge a live-but-slow session's re-probe also times out (indistinguishable from dead) and force WILL reap it - use force ONLY when you believe the session is dead. Try a normal close first." },
+            "approvalId": { "type": "string", "minLength": 1, "description": "One-time exact approval issued by the delegating supervisor. Required only when a Ship Admin or Fleet Admin performs this cleanup." }
         },
         "required": ["sessionId"],
         "additionalProperties": false
@@ -445,6 +446,172 @@ fn schema_list_agents() -> Value {
     })
 }
 
+fn schema_lane_claim() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "laneId": { "type": "string", "minLength": 1 },
+            "ownerId": { "type": "string", "minLength": 1 },
+            "dependencies": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableFiles": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableSchemas": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableInterfaces": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            }
+        },
+        "required": ["laneId", "ownerId", "dependencies"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_integration_contract() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "contractId": { "type": "string", "minLength": 1 },
+            "integrationOwner": { "type": "string", "minLength": 1 },
+            "orderedLaneIds": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 2,
+                "uniqueItems": true
+            }
+        },
+        "required": ["contractId", "integrationOwner", "orderedLaneIds"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_dispatch_preflight() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "minLength": 1 },
+            "requestedLanes": {
+                "type": "array",
+                "items": schema_lane_claim(),
+                "minItems": 1
+            },
+            "integrationContracts": {
+                "type": "array",
+                "items": schema_integration_contract()
+            }
+        },
+        "required": ["projectId", "requestedLanes", "integrationContracts"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_admin_operation() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "inspectStatus",
+            "maintainSession",
+            "cleanupSession",
+            "recoverResource",
+            "maintainWorktree",
+            "cleanupWorktree",
+            "prepareRetirement",
+            "buildCrossCaptainReport",
+            "maintainFleetResource"
+        ]
+    })
+}
+
+fn schema_list_admin_grants() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+fn schema_appoint_admin() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "actorSessionId": { "type": "string", "minLength": 1 },
+            "role": { "type": "string", "enum": ["shipAdmin", "fleetAdmin"] },
+            "permittedOperations": {
+                "type": "array",
+                "items": schema_admin_operation(),
+                "minItems": 1,
+                "uniqueItems": true
+            }
+        },
+        "required": ["actorSessionId", "role", "permittedOperations"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_revoke_admin() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "grantId": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "required": ["grantId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_admin_worktree_target() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "const": "worktree" },
+            "shipSlug": { "type": "string", "minLength": 1 },
+            "worktreeId": { "type": "string", "minLength": 1 }
+        },
+        "required": ["kind", "shipSlug", "worktreeId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_approve_admin_action() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "grantId": { "type": "string", "minLength": 1 },
+                    "operation": { "const": "cleanupSession" },
+                    "sessionId": { "type": "string", "minLength": 1 }
+                },
+                "required": ["grantId", "operation", "sessionId"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "grantId": { "type": "string", "minLength": 1 },
+                    "operation": { "const": "cleanupWorktree" },
+                    "target": schema_admin_worktree_target()
+                },
+                "required": ["grantId", "operation", "target"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
 fn schema_get_agent() -> Value {
     json!({
         "type": "object",
@@ -467,6 +634,145 @@ fn schema_agent_checkpoint() -> Value {
             }
         },
         "required": ["agentSessionId", "authorSessionId", "summary"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_record_agent_delivery() -> Value {
+    let commit = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$" });
+    let reference = json!({ "type": "string", "minLength": 1, "maxLength": 16384 });
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string", "minLength": 1 },
+            "state": {
+                "type": "string",
+                "enum": ["implemented", "reviewed", "tested", "integrated", "packaged", "installed", "liveVerified"]
+            },
+            "evidence": { "type": "object" }
+        },
+        "required": ["agentSessionId", "state", "evidence"],
+        "oneOf": [
+            {
+                "properties": {
+                    "state": { "const": "implemented" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": { "commit": commit.clone() },
+                        "required": ["commit"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "reviewed" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": { "commit": commit.clone(), "reference": reference.clone() },
+                        "required": ["commit", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "tested" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "commit": commit.clone(),
+                            "reference": reference.clone(),
+                            "environment": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "source" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "packagedGuiE2e" },
+                                            "artifactId": { "type": "string", "minLength": 1 },
+                                            "sourceCommit": commit.clone(),
+                                            "installationTarget": { "type": "string", "minLength": 1 }
+                                        },
+                                        "required": ["kind", "artifactId", "sourceCommit", "installationTarget"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            }
+                        },
+                        "required": ["commit", "reference", "environment"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "integrated" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "sourceCommit": commit.clone(),
+                            "canonicalBaseline": { "type": "string", "minLength": 1 },
+                            "canonicalCommit": commit.clone(),
+                            "reference": reference.clone()
+                        },
+                        "required": ["sourceCommit", "canonicalBaseline", "canonicalCommit", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "packaged" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "sourceBaseline": commit.clone(),
+                            "reference": reference.clone()
+                        },
+                        "required": ["artifactId", "sourceBaseline", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "installed" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "target": { "type": "string", "minLength": 1 },
+                            "reference": reference.clone()
+                        },
+                        "required": ["artifactId", "target", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "liveVerified" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "target": { "type": "string", "minLength": 1 },
+                            "verifierKind": { "type": "string", "enum": ["human", "aiAgent"] },
+                            "reference": reference
+                        },
+                        "required": ["artifactId", "target", "verifierKind", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -494,9 +800,17 @@ fn schema_start_agent() -> Value {
             "directory": { "type": "string" },
             "harness": { "type": "string", "enum": ["codex", "claude"] },
             "name": { "type": "string" },
-            "workspaceTabId": { "type": "string" }
+            "workspaceTabId": { "type": "string" },
+            "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$", "description": "Exact commit checked out in the clean dispatch worktree." },
+            "visibleProductBug": { "type": "boolean", "description": "True when acceptance requires packaged GUI E2E evidence." },
+            "laneId": { "type": "string", "minLength": 1, "description": "Stable identity for this independent implementation lane." },
+            "dependencies": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableFiles": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableSchemas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableInterfaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "integrationContracts": { "type": "array", "items": schema_integration_contract() }
         },
-        "required": ["requestId", "captainSessionId", "assignment", "directory"],
+        "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug", "laneId", "dependencies", "mutableFiles", "mutableSchemas", "mutableInterfaces", "integrationContracts"],
         "additionalProperties": false
     })
 }
@@ -712,6 +1026,18 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_list_agents,
         },
         ToolDef {
+            name: "dispatch_preflight",
+            tier: Tier::Read,
+            summary: "Evaluate independent lane ownership, dependencies, mutable-resource collisions, live capacity, and reserved supervisor or recovery headroom without imposing a fixed lane-count cap.",
+            input_schema: schema_dispatch_preflight,
+        },
+        ToolDef {
+            name: "list_admin_grants",
+            tier: Tier::Read,
+            summary: "List the caller's durable Ship Admin or Fleet Admin grants, including scope, generation, permitted operations, and revocation state.",
+            input_schema: schema_list_admin_grants,
+        },
+        ToolDef {
             name: "get_agent",
             tier: Tier::Read,
             summary: "Get the full durable record for one agent session, including its assignment.",
@@ -825,6 +1151,30 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Append a bounded human-readable checkpoint to a durable agent session.",
             input_schema: schema_agent_checkpoint,
+        },
+        ToolDef {
+            name: "record_agent_delivery",
+            tier: Tier::Organization,
+            summary: "Record immutable exact-commit evidence for implemented, reviewed, tested, complete, integrated, packaged, installed, and live-verified states. Complete is derived only from review plus acceptance testing.",
+            input_schema: schema_record_agent_delivery,
+        },
+        ToolDef {
+            name: "appoint_admin",
+            tier: Tier::Organization,
+            summary: "Appoint one Crew identity as a durable Ship Admin or Fleet Admin within the authenticated supervisor's exact authority.",
+            input_schema: schema_appoint_admin,
+        },
+        ToolDef {
+            name: "approve_admin_action",
+            tier: Tier::Organization,
+            summary: "Issue a durable one-time approval for one destructive delegated operation bound to the exact grant, actor, target, supervisor, and authority generation. Session target kind and ownership are derived by the backend from sessionId.",
+            input_schema: schema_approve_admin_action,
+        },
+        ToolDef {
+            name: "revoke_admin",
+            tier: Tier::Organization,
+            summary: "Revoke one durable administrative grant while retaining its audit tombstone.",
+            input_schema: schema_revoke_admin,
         },
         ToolDef {
             name: "register_project",
@@ -1005,6 +1355,27 @@ mod tests {
         let schema = (find("list_agents").unwrap().input_schema)();
         let state = schema["properties"]["state"]["enum"].as_array().unwrap();
         assert_eq!(state, &vec![json!("active"), json!("removed")]);
+    }
+
+    #[test]
+    fn delivery_evidence_schema_keeps_every_state_explicit() {
+        let tool = find("record_agent_delivery").unwrap();
+        assert_eq!(tool.tier, Tier::Organization);
+        let schema = (tool.input_schema)();
+        let states = schema["properties"]["state"]["enum"].as_array().unwrap();
+        assert_eq!(
+            states,
+            &vec![
+                json!("implemented"),
+                json!("reviewed"),
+                json!("tested"),
+                json!("integrated"),
+                json!("packaged"),
+                json!("installed"),
+                json!("liveVerified"),
+            ]
+        );
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), states.len());
     }
 
     #[test]
@@ -1427,6 +1798,91 @@ mod tests {
                 "{name} must accept spawnedBy"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_dispatch_tools_require_explicit_lane_and_collision_evidence() {
+        let preflight = find("dispatch_preflight").unwrap();
+        let preflight_mcp = preflight.to_mcp();
+        assert_eq!(preflight_mcp["annotations"]["t-hubTier"], "read");
+        let preflight_schema = (preflight.input_schema)();
+        assert_eq!(
+            preflight_schema["required"],
+            json!(["projectId", "requestedLanes", "integrationContracts"])
+        );
+        let lane = &preflight_schema["properties"]["requestedLanes"]["items"];
+        assert_eq!(
+            lane["required"],
+            json!(["laneId", "ownerId", "dependencies"])
+        );
+
+        let start = (find("start_agent").unwrap().input_schema)();
+        for required in [
+            "sourceCommit",
+            "laneId",
+            "dependencies",
+            "mutableFiles",
+            "mutableSchemas",
+            "mutableInterfaces",
+            "integrationContracts",
+        ] {
+            assert!(
+                start["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == required),
+                "start_agent must require {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_admin_tools_expose_durable_role_scope_without_general_authority() {
+        let list = find("list_admin_grants").unwrap().to_mcp();
+        assert_eq!(list["annotations"]["t-hubTier"], "read");
+        assert_eq!(list["annotations"]["confirmationRequired"], false);
+
+        let appoint = find("appoint_admin").unwrap();
+        assert_eq!(appoint.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let schema = (appoint.input_schema)();
+        assert_eq!(
+            schema["required"],
+            json!(["actorSessionId", "role", "permittedOperations"])
+        );
+        let operations = schema["properties"]["permittedOperations"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        for forbidden in [
+            "directImplementation",
+            "grantAdministrativeRole",
+            "assumeCaptainAuthority",
+            "approveGeneralReservedAction",
+        ] {
+            assert!(!operations.iter().any(|operation| operation == forbidden));
+        }
+
+        let revoke = find("revoke_admin").unwrap().to_mcp();
+        assert_eq!(revoke["annotations"]["t-hubTier"], "organization");
+
+        let approve = find("approve_admin_action").unwrap();
+        assert_eq!(approve.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let approve_schema = (approve.input_schema)();
+        assert_eq!(
+            approve_schema["oneOf"][0]["required"],
+            json!(["grantId", "operation", "sessionId"])
+        );
+        assert!(approve_schema["oneOf"][0]["properties"]
+            .get("target")
+            .is_none());
+        assert_eq!(
+            approve_schema["oneOf"][1]["required"],
+            json!(["grantId", "operation", "target"])
+        );
+        assert_eq!(
+            (find("close_terminal").unwrap().input_schema)()["properties"]["approvalId"]["type"],
+            "string"
+        );
     }
 
     #[test]

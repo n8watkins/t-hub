@@ -80,6 +80,8 @@ pub struct CortanaReconcilePlan {
     pub action: CortanaReconcileAction,
     pub authoritative: Option<CortanaRuntimeCandidate>,
     pub retire_terminal_ids: Vec<String>,
+    #[serde(default)]
+    pub quarantine_terminal_ids: Vec<String>,
     pub next_generation: u64,
     pub degraded_reason: Option<String>,
 }
@@ -91,19 +93,40 @@ impl CortanaReconcilePlan {
             action: CortanaReconcileAction::Degraded,
             authoritative: None,
             retire_terminal_ids: Vec::new(),
+            quarantine_terminal_ids: Vec::new(),
+            next_generation: generation,
+            degraded_reason: Some(reason.into()),
+        }
+    }
+
+    fn degraded_with_quarantine(
+        operation_id: &str,
+        generation: u64,
+        reason: impl Into<String>,
+        quarantine_terminal_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.to_string(),
+            action: CortanaReconcileAction::Degraded,
+            authoritative: None,
+            retire_terminal_ids: Vec::new(),
+            quarantine_terminal_ids,
             next_generation: generation,
             degraded_reason: Some(reason.into()),
         }
     }
 }
 
-fn valid_runtime(candidate: &CortanaRuntimeCandidate) -> bool {
+fn full_capability_runtime(candidate: &CortanaRuntimeCandidate) -> bool {
     candidate.terminal == RuntimeEvidence::Alive
         && candidate.harness_process == RuntimeEvidence::Alive
         && candidate.current_control_capability
         && candidate.trusted_cortana_identity
         && candidate.identity_id.is_some()
-        && candidate.generation > 0
+}
+
+fn valid_runtime(candidate: &CortanaRuntimeCandidate) -> bool {
+    full_capability_runtime(candidate) && candidate.generation > 0
 }
 
 /// Select the single authoritative Cortana runtime from bounded observations.
@@ -111,8 +134,12 @@ fn valid_runtime(candidate: &CortanaRuntimeCandidate) -> bool {
 /// The caller supplies every runtime discovered in Cortana's reserved home.
 /// A live runtime with untrusted authority, an unknown liveness result, or two
 /// candidates at the same highest generation makes the result degraded.
+/// Same-generation owned duplicates are returned as exact quarantine targets
+/// without choosing an authority.
 /// Lower trusted generations can be safely retired only after one strictly
 /// higher authoritative generation has been selected.
+/// One trusted generation-zero runtime can be migrated to generation one only
+/// while the durable singleton has neither an identity nor a generation.
 pub fn plan_reconciliation(
     durable: &CortanaDurableIdentity,
     operation_id: &str,
@@ -159,7 +186,7 @@ pub fn plan_reconciliation(
             && (!candidate.current_control_capability
                 || !candidate.trusted_cortana_identity
                 || candidate.identity_id.is_none()
-                || candidate.generation == 0)
+                || candidate.generation == 0 && candidate.harness_process != RuntimeEvidence::Alive)
     }) {
         return CortanaReconcilePlan::degraded(
             operation_id,
@@ -171,14 +198,14 @@ pub fn plan_reconciliation(
         );
     }
 
-    let mut viable = candidates
+    let trusted_live = candidates
         .iter()
-        .filter(|candidate| valid_runtime(candidate))
+        .filter(|candidate| full_capability_runtime(candidate))
         .cloned()
         .collect::<Vec<_>>();
 
     if let Some(identity_id) = durable.identity_id.as_deref() {
-        if let Some(candidate) = viable
+        if let Some(candidate) = trusted_live
             .iter()
             .find(|candidate| candidate.identity_id.as_deref() != Some(identity_id))
         {
@@ -194,7 +221,10 @@ pub fn plan_reconciliation(
     }
 
     if let Some(harness) = durable.harness.as_deref() {
-        if let Some(candidate) = viable.iter().find(|candidate| candidate.harness != harness) {
+        if let Some(candidate) = trusted_live
+            .iter()
+            .find(|candidate| candidate.harness != harness)
+        {
             return CortanaReconcilePlan::degraded(
                 operation_id,
                 durable.generation,
@@ -205,6 +235,37 @@ pub fn plan_reconciliation(
             );
         }
     }
+
+    let generation_zero = trusted_live
+        .iter()
+        .filter(|candidate| candidate.generation == 0)
+        .collect::<Vec<_>>();
+    if !generation_zero.is_empty() {
+        let durable_is_uninitialized = durable.identity_id.is_none() && durable.generation == 0;
+        if durable_is_uninitialized && generation_zero.len() == 1 && trusted_live.len() == 1 {
+            let mut authoritative = generation_zero[0].clone();
+            authoritative.generation = 1;
+            return CortanaReconcilePlan {
+                operation_id: operation_id.to_string(),
+                action: CortanaReconcileAction::Adopt,
+                authoritative: Some(authoritative),
+                retire_terminal_ids: Vec::new(),
+                quarantine_terminal_ids: Vec::new(),
+                next_generation: 2,
+                degraded_reason: None,
+            };
+        }
+        return CortanaReconcilePlan::degraded(
+            operation_id,
+            durable.generation,
+            "a generation-zero Cortana runtime may only be migrated when it is the sole trusted live full-capability candidate and no durable identity or generation exists",
+        );
+    }
+
+    let mut viable = trusted_live
+        .into_iter()
+        .filter(valid_runtime)
+        .collect::<Vec<_>>();
 
     viable.sort_by(|left, right| {
         right
@@ -217,18 +278,50 @@ pub fn plan_reconciliation(
         .map(|candidate| candidate.generation)
         .unwrap_or(durable.generation);
 
-    if viable
+    let highest_candidates = viable
         .iter()
         .filter(|candidate| candidate.generation == highest_generation)
-        .count()
-        > 1
-    {
-        return CortanaReconcilePlan::degraded(
+        .collect::<Vec<_>>();
+    if highest_candidates.len() > 1 {
+        let identity_id = highest_candidates[0].identity_id.as_deref();
+        if highest_candidates
+            .iter()
+            .any(|candidate| candidate.identity_id.as_deref() != identity_id)
+        {
+            return CortanaReconcilePlan::degraded(
+                operation_id,
+                highest_generation,
+                format!(
+                    "multiple trusted Cortana identities claim generation {highest_generation}"
+                ),
+            );
+        }
+        let harness = highest_candidates[0].harness.as_str();
+        if highest_candidates
+            .iter()
+            .any(|candidate| candidate.harness != harness)
+        {
+            return CortanaReconcilePlan::degraded(
+                operation_id,
+                highest_generation,
+                format!(
+                    "multiple Cortana harnesses claim authoritative generation {highest_generation}"
+                ),
+            );
+        }
+        let quarantine_terminal_ids = highest_candidates
+            .iter()
+            .map(|candidate| candidate.terminal_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        return CortanaReconcilePlan::degraded_with_quarantine(
             operation_id,
             highest_generation,
             format!(
                 "multiple Cortana runtimes claim authoritative generation {highest_generation}"
             ),
+            quarantine_terminal_ids,
         );
     }
 
@@ -250,6 +343,7 @@ pub fn plan_reconciliation(
             },
             authoritative: None,
             retire_terminal_ids: Vec::new(),
+            quarantine_terminal_ids: Vec::new(),
             next_generation: durable.generation.saturating_add(1).max(1),
             degraded_reason: None,
         };
@@ -278,6 +372,7 @@ pub fn plan_reconciliation(
         next_generation: authoritative.generation.saturating_add(1),
         authoritative: Some(authoritative),
         retire_terminal_ids,
+        quarantine_terminal_ids: Vec::new(),
         degraded_reason: None,
     }
 }
@@ -327,6 +422,7 @@ mod tests {
         assert_eq!(plan.authoritative.unwrap().terminal_id, "term-4");
         assert_eq!(plan.next_generation, 5);
         assert!(plan.retire_terminal_ids.is_empty());
+        assert!(plan.quarantine_terminal_ids.is_empty());
     }
 
     #[test]
@@ -342,24 +438,159 @@ mod tests {
         assert_eq!(plan.action, CortanaReconcileAction::Recover);
         assert_eq!(plan.authoritative.unwrap().terminal_id, "term-5");
         assert_eq!(plan.retire_terminal_ids, vec!["term-4"]);
+        assert!(plan.quarantine_terminal_ids.is_empty());
         assert_eq!(plan.next_generation, 6);
     }
 
     #[test]
-    fn equal_highest_generations_fail_closed() {
+    fn equal_highest_generations_fail_closed_with_exact_quarantine_targets() {
         let plan = plan_reconciliation(
             &durable(),
             "startup-5",
             &[
-                candidate("term-a", "cortana-identity", 5),
                 candidate("term-b", "cortana-identity", 5),
+                candidate("term-old", "cortana-identity", 4),
+                candidate("term-a", "cortana-identity", 5),
+                candidate("term-c", "cortana-identity", 5),
             ],
         );
         assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+        assert!(plan.authoritative.is_none());
+        assert!(plan.retire_terminal_ids.is_empty());
+        assert_eq!(
+            plan.quarantine_terminal_ids,
+            vec!["term-a", "term-b", "term-c"]
+        );
         assert!(plan
             .degraded_reason
             .unwrap()
             .contains("multiple Cortana runtimes"));
+    }
+
+    #[test]
+    fn duplicate_quarantine_order_is_independent_of_discovery_order() {
+        let first = plan_reconciliation(
+            &durable(),
+            "startup-5",
+            &[
+                candidate("term-z", "cortana-identity", 5),
+                candidate("term-a", "cortana-identity", 5),
+            ],
+        );
+        let second = plan_reconciliation(
+            &durable(),
+            "startup-5",
+            &[
+                candidate("term-a", "cortana-identity", 5),
+                candidate("term-z", "cortana-identity", 5),
+            ],
+        );
+        assert_eq!(
+            first.quarantine_terminal_ids,
+            second.quarantine_terminal_ids
+        );
+        assert_eq!(first.quarantine_terminal_ids, vec!["term-a", "term-z"]);
+    }
+
+    #[test]
+    fn migrates_one_legacy_runtime_to_an_adopted_generation_one_candidate() {
+        let legacy = candidate("term-legacy", "legacy-cortana", 0);
+        let plan = plan_reconciliation(
+            &CortanaDurableIdentity::default(),
+            "startup-1",
+            std::slice::from_ref(&legacy),
+        );
+
+        assert_eq!(plan.action, CortanaReconcileAction::Adopt);
+        assert_eq!(plan.next_generation, 2);
+        assert!(plan.retire_terminal_ids.is_empty());
+        assert!(plan.quarantine_terminal_ids.is_empty());
+        let authoritative = plan.authoritative.unwrap();
+        assert_eq!(authoritative.terminal_id, "term-legacy");
+        assert_eq!(authoritative.identity_id.as_deref(), Some("legacy-cortana"));
+        assert_eq!(authoritative.generation, 1);
+        assert_eq!(legacy.generation, 0);
+    }
+
+    #[test]
+    fn migration_requires_no_durable_identity_and_no_durable_generation() {
+        let durable_identity = CortanaDurableIdentity {
+            identity_id: Some("legacy-cortana".into()),
+            ..CortanaDurableIdentity::default()
+        };
+        let durable_generation = CortanaDurableIdentity {
+            generation: 1,
+            ..CortanaDurableIdentity::default()
+        };
+
+        for durable in [durable_identity, durable_generation] {
+            let plan = plan_reconciliation(
+                &durable,
+                "startup-1",
+                &[candidate("term-legacy", "legacy-cortana", 0)],
+            );
+            assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+            assert!(plan.authoritative.is_none());
+            assert!(plan.quarantine_terminal_ids.is_empty());
+            assert!(plan.degraded_reason.unwrap().contains("generation-zero"));
+        }
+    }
+
+    #[test]
+    fn migration_requires_exactly_one_trusted_live_full_capability_candidate() {
+        let uninitialized = CortanaDurableIdentity::default();
+        let cases = [
+            vec![
+                candidate("term-a", "legacy-cortana", 0),
+                candidate("term-b", "legacy-cortana", 0),
+            ],
+            vec![
+                candidate("term-legacy", "legacy-cortana", 0),
+                candidate("term-new", "legacy-cortana", 1),
+            ],
+        ];
+
+        for candidates in cases {
+            let plan = plan_reconciliation(&uninitialized, "startup-1", &candidates);
+            assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+            assert!(plan.authoritative.is_none());
+            assert!(plan.retire_terminal_ids.is_empty());
+            assert!(plan.quarantine_terminal_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn incomplete_generation_zero_candidates_are_never_adopted() {
+        let mut terminal_unknown = candidate("term-terminal-unknown", "legacy-cortana", 0);
+        terminal_unknown.terminal = RuntimeEvidence::Unknown;
+        let mut terminal_gone = candidate("term-terminal-gone", "legacy-cortana", 0);
+        terminal_gone.terminal = RuntimeEvidence::Gone;
+        let mut harness_unknown = candidate("term-harness-unknown", "legacy-cortana", 0);
+        harness_unknown.harness_process = RuntimeEvidence::Unknown;
+        let mut harness_gone = candidate("term-harness-gone", "legacy-cortana", 0);
+        harness_gone.harness_process = RuntimeEvidence::Gone;
+        let mut no_control = candidate("term-no-control", "legacy-cortana", 0);
+        no_control.current_control_capability = false;
+        let mut untrusted = candidate("term-untrusted", "legacy-cortana", 0);
+        untrusted.trusted_cortana_identity = false;
+        let mut no_identity = candidate("term-no-identity", "legacy-cortana", 0);
+        no_identity.identity_id = None;
+
+        for runtime in [
+            terminal_unknown,
+            terminal_gone,
+            harness_unknown,
+            harness_gone,
+            no_control,
+            untrusted,
+            no_identity,
+        ] {
+            let plan =
+                plan_reconciliation(&CortanaDurableIdentity::default(), "startup-1", &[runtime]);
+            assert_ne!(plan.action, CortanaReconcileAction::Adopt);
+            assert!(plan.authoritative.is_none());
+            assert!(plan.quarantine_terminal_ids.is_empty());
+        }
     }
 
     #[test]
@@ -368,7 +599,101 @@ mod tests {
         runtime.harness_process = RuntimeEvidence::Unknown;
         let plan = plan_reconciliation(&durable(), "startup-4", &[runtime]);
         assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+        assert!(plan.quarantine_terminal_ids.is_empty());
         assert!(plan.degraded_reason.unwrap().contains("uncertain liveness"));
+    }
+
+    #[test]
+    fn unsafe_observations_never_become_quarantine_targets() {
+        let duplicate_a = candidate("term-a", "cortana-identity", 5);
+        let duplicate_b = candidate("term-b", "cortana-identity", 5);
+        let mut foreign = candidate("term-foreign", "foreign-identity", 5);
+        foreign.trusted_cortana_identity = false;
+        let mut no_control = candidate("term-no-control", "cortana-identity", 5);
+        no_control.current_control_capability = false;
+        let mut terminal_unknown = candidate("term-terminal-unknown", "cortana-identity", 5);
+        terminal_unknown.terminal = RuntimeEvidence::Unknown;
+        let mut harness_unknown = candidate("term-harness-unknown", "cortana-identity", 5);
+        harness_unknown.harness_process = RuntimeEvidence::Unknown;
+        let mut wrong_harness = candidate("term-wrong-harness", "cortana-identity", 5);
+        wrong_harness.harness = "claude".into();
+        let wrong_identity = candidate("term-wrong-identity", "other-cortana-identity", 5);
+
+        for unsafe_candidate in [
+            foreign,
+            no_control,
+            terminal_unknown,
+            harness_unknown,
+            wrong_harness,
+            wrong_identity,
+        ] {
+            let plan = plan_reconciliation(
+                &durable(),
+                "startup-5",
+                &[duplicate_a.clone(), duplicate_b.clone(), unsafe_candidate],
+            );
+            assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+            assert!(plan.authoritative.is_none());
+            assert!(plan.retire_terminal_ids.is_empty());
+            assert!(plan.quarantine_terminal_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn non_live_candidates_are_excluded_from_exact_duplicate_quarantine_targets() {
+        let mut terminal_gone = candidate("term-terminal-gone", "cortana-identity", 5);
+        terminal_gone.terminal = RuntimeEvidence::Gone;
+        let mut harness_gone = candidate("term-harness-gone", "cortana-identity", 5);
+        harness_gone.harness_process = RuntimeEvidence::Gone;
+
+        let plan = plan_reconciliation(
+            &durable(),
+            "startup-5",
+            &[
+                candidate("term-b", "cortana-identity", 5),
+                terminal_gone,
+                harness_gone,
+                candidate("term-a", "cortana-identity", 5),
+            ],
+        );
+
+        assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+        assert_eq!(plan.quarantine_terminal_ids, vec!["term-a", "term-b"]);
+    }
+
+    #[test]
+    fn conflicting_undurable_identity_or_harness_evidence_is_not_owned_for_quarantine() {
+        let different_identities = plan_reconciliation(
+            &CortanaDurableIdentity::default(),
+            "startup-5",
+            &[
+                candidate("term-a", "cortana-a", 5),
+                candidate("term-b", "cortana-b", 5),
+            ],
+        );
+        assert_eq!(
+            different_identities.action,
+            CortanaReconcileAction::Degraded
+        );
+        assert!(different_identities.quarantine_terminal_ids.is_empty());
+        assert!(different_identities
+            .degraded_reason
+            .unwrap()
+            .contains("trusted Cortana identities"));
+
+        let mut claude = candidate("term-b", "cortana-a", 5);
+        claude.harness = "claude".into();
+        let different_harnesses = plan_reconciliation(
+            &CortanaDurableIdentity::default(),
+            "startup-5",
+            &[candidate("term-a", "cortana-a", 5), claude],
+        );
+        assert_eq!(different_harnesses.action, CortanaReconcileAction::Degraded);
+        assert!(different_harnesses.quarantine_terminal_ids.is_empty());
+        assert!(different_harnesses
+            .degraded_reason
+            .unwrap()
+            .contains("Cortana harnesses"));
     }
 
     #[test]
@@ -379,6 +704,7 @@ mod tests {
             &[candidate("term-9", "foreign-identity", 9)],
         );
         assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+        assert!(plan.quarantine_terminal_ids.is_empty());
         assert!(plan
             .degraded_reason
             .unwrap()
@@ -391,6 +717,7 @@ mod tests {
         runtime.current_control_capability = false;
         let plan = plan_reconciliation(&durable(), "startup-9", &[runtime]);
         assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+        assert!(plan.quarantine_terminal_ids.is_empty());
         assert!(plan
             .degraded_reason
             .unwrap()

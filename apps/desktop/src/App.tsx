@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
 import { useCaptain, agentOrder } from "./store/captain";
+import {
+  createCortanaReconciliationMonitor,
+  type CortanaReconciliationMonitor,
+} from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { CommandPalette, PrefixHint } from "./components/CommandPalette";
@@ -14,10 +18,8 @@ import { useWindowMaximized } from "./lib/windowMaximized";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
 import { controlRequest } from "./ipc/controlClient";
 import {
+  createCortanaRecoveryOperation,
   cortanaFailureMessage,
-  isAmbiguousCortanaFailure,
-  newCortanaRecoveryId,
-  type CortanaReconcileResult,
 } from "./lib/cortanaStartup";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
@@ -133,8 +135,8 @@ function useTitlebarReveal(
 
 export default function App() {
   const [cortanaRecoveryError, setCortanaRecoveryError] = useState<string | null>(null);
-  const [cortanaRecoveryRetry, setCortanaRecoveryRetry] = useState(0);
-  const cortanaRecoveryOperationId = useRef(newCortanaRecoveryId());
+  const [cortanaRecoveryOperation] = useState(createCortanaRecoveryOperation);
+  const cortanaReconciliationMonitor = useRef<CortanaReconciliationMonitor | null>(null);
   // A satellite starts with the supervision sidebar hidden — it's a focused
   // terminal canvas, not the full command center. The main window restores the
   // user's persisted collapse mode (#1: full / rail / hidden).
@@ -216,70 +218,87 @@ export default function App() {
     };
   }, []);
 
-  // Orchestrator startup (main window only): ask the trusted app host to adopt
-  // or recover the durable Cortana singleton, then reconcile the live terminal
-  // list into the reserved Captains workspace tab. This also migrates an
-  // upgrading user's captains that were persisted in work tabs before the
-  // reserved tab existed. Retries reuse the same durable operation identity.
+  // Cortana lifetime reconciliation (main window only): the backend atomically
+  // keeps, adopts, recovers, or creates exactly one durable supervisor. Each
+  // authoritative result advances to a fresh operation identity for the next
+  // health check. Ambiguous transport failures retain the current identity so a
+  // retry can recover the cached result without applying the mutation twice.
   useEffect(() => {
     if (SATELLITE) return;
-    let done = false;
-    let cancelled = false;
-    let unsub: (() => void) | undefined;
+    let authoritativeTerminalId: string | null = null;
+    const monitor = createCortanaReconciliationMonitor({
+      reconcile: () => {
+        const operationId = cortanaRecoveryOperation.currentId();
+        return controlRequest("reconcile_cortana", {
+          operationId,
+          requestId: operationId,
+        });
+      },
+      onResult: (result) => {
+        cortanaRecoveryOperation.authoritativeResult();
+        if (!result.healthy) {
+          authoritativeTerminalId = null;
+          setCortanaRecoveryError(
+            cortanaFailureMessage(
+              result.degradedReason ?? "Cortana identity evidence is ambiguous.",
+            ),
+          );
+          return;
+        }
+        if (!result.terminalId) {
+          authoritativeTerminalId = null;
+          setCortanaRecoveryError("Cortana recovery returned no authoritative terminal.");
+          return;
+        }
 
-    const run = (
-      terminalId: string,
-      terminals: Record<string, { cwd?: string; state?: string }>,
-    ) => {
-      if (done || !terminals[terminalId]) return;
-      done = true;
-      // Authority has already been committed by the backend transaction and is
-      // delivered through the Captain sync. Only organize tiles here so startup
-      // cannot race that claim through the legacy release-then-claim setter.
+        authoritativeTerminalId = result.terminalId;
+        setCortanaRecoveryError(null);
+        const workspace = useWorkspace.getState();
+        if (workspace.terminals[result.terminalId]) {
+          workspace.moveTileToCaptainsTab(result.terminalId);
+        }
+      },
+      onError: (error) => {
+        cortanaRecoveryOperation.failure(error);
+        console.error("Cortana recovery failed", error);
+        setCortanaRecoveryError(cortanaFailureMessage(error));
+      },
+    });
+    cortanaReconciliationMonitor.current = monitor;
+    monitor.start();
+    monitor.observeTerminals(useWorkspace.getState().terminals);
+    const unsubscribe = useWorkspace.subscribe((state) => {
+      monitor.observeTerminals(state.terminals);
+      if (authoritativeTerminalId && state.terminals[authoritativeTerminalId]) {
+        state.moveTileToCaptainsTab(authoritativeTerminalId);
+      }
+    });
+    return () => {
+      unsubscribe();
+      monitor.stop();
+      if (cortanaReconciliationMonitor.current === monitor) {
+        cortanaReconciliationMonitor.current = null;
+      }
+    };
+  }, [cortanaRecoveryOperation]);
+
+  // Keep every designated supervisor tile in the reserved Captains workspace.
+  // The backend reconciliation and captains registry are authoritative for
+  // Cortana identity; this effect handles layout only.
+  useEffect(() => {
+    if (SATELLITE) return;
+    const run = (terminals: Record<string, { cwd?: string; state?: string }>) => {
       const ws = useWorkspace.getState();
-      ws.moveTileToCaptainsTab(terminalId);
       for (const id of agentOrder(useCaptain.getState())) {
         if (terminals[id]) ws.moveTileToCaptainsTab(id);
       }
     };
-
-    const operationId = cortanaRecoveryOperationId.current;
-    void (controlRequest("reconcile_cortana", {
-      operationId,
-      requestId: operationId,
-    }) as Promise<CortanaReconcileResult>)
-      .then((result) => {
-        if (cancelled) return;
-        if (!result.healthy) {
-          throw new Error(
-            result.degradedReason ?? "Cortana recovery requires manual intervention",
-          );
-        }
-        const terminalId = result.terminalId?.trim();
-        if (!terminalId) {
-          throw new Error("Cortana recovery returned no authoritative terminal");
-        }
-        setCortanaRecoveryError(null);
-        // Terminals may already be seeded when recovery completes; subscribe
-        // first to close the race, then inspect the current snapshot.
-        unsub = useWorkspace.subscribe((s) => run(terminalId, s.terminals));
-        run(terminalId, useWorkspace.getState().terminals);
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          if (!isAmbiguousCortanaFailure(error)) {
-            cortanaRecoveryOperationId.current = newCortanaRecoveryId();
-          }
-          console.error("Cortana startup recovery failed", error);
-          setCortanaRecoveryError(cortanaFailureMessage(error));
-        }
-      });
-
+    run(useWorkspace.getState().terminals);
+    const unsubscribe = useWorkspace.subscribe((state) => run(state.terminals));
     return () => {
-      cancelled = true;
-      unsub?.();
+      unsubscribe();
     };
-  }, [cortanaRecoveryRetry]);
+  }, []);
 
   const maximized = useWindowMaximized();
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
@@ -392,7 +411,7 @@ export default function App() {
           <button
             type="button"
             className="rounded bg-red-800 px-2 py-1 font-medium hover:bg-red-700"
-            onClick={() => setCortanaRecoveryRetry((value) => value + 1)}
+            onClick={() => cortanaReconciliationMonitor.current?.requestNow()}
           >
             Retry
           </button>
