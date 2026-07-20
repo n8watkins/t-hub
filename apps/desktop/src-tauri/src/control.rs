@@ -42881,7 +42881,8 @@ mod tests {
 
         let path = captains_tmp("identity-prebind-rollback");
         let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
-        store.fail_persist_after(1);
+        // mint_and_bind persists the pre-bound identity atomically in one write.
+        store.fail_persist_after(0);
         let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
         failing.addr = "127.0.0.1:4242".to_string();
         let error = spawn_env_with_identity(
