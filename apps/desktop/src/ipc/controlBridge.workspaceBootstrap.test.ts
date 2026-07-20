@@ -91,4 +91,24 @@ describe("workspace registry bootstrap", () => {
       expect.anything(),
     );
   });
+
+  it("seeds a work workspace when both sides are Captain-only", async () => {
+    seed([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] }]);
+    controlRequest.mockResolvedValue({
+      seq: 7,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+
+    await bootstrapWorkspaceTabs();
+
+    const tabs = useWorkspace.getState().tabs;
+    expect(tabs.map((tab) => tab.id)).toHaveLength(2);
+    expect(tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
+    expect(useWorkspace.getState().activeTabId).not.toBe(CAPTAINS_TAB_ID);
+    expect(invoke).toHaveBeenCalledWith(
+      "report_workspace_tabs",
+      expect.objectContaining({ baseSeq: 7 }),
+    );
+  });
 });

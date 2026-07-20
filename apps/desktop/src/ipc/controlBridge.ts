@@ -155,11 +155,20 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
       });
     }
 
-    if (serverWork.length === 0 && localWork.length > 0) {
+    if (serverWork.length === 0) {
+      // A Captain-only local layout is also unrecoverable: adopting it would
+      // leave the Canvas unmounted, which prevents listTerminals() from ever
+      // running and creates a deadlock where the live shells remain invisible.
+      // Seed one ordinary workspace before repairing the server registry.
+      let repairedLocal = local;
+      if (localWork.length === 0) {
+        useWorkspace.getState().addTab();
+        repairedLocal = useWorkspace.getState();
+      }
       const { reportWorkspaceTabs } = await import("./client");
       const repaired = await reportWorkspaceTabs(
-        tabReports(local.tabs),
-        local.activeTabId,
+        tabReports(repairedLocal.tabs),
+        repairedLocal.activeTabId,
         res.seq,
       );
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
