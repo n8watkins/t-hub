@@ -9,15 +9,16 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `list_projects`, `list_powder_boards`,
+//!     `list_captains`, `list_projects`,
 //!     `list_fleet_watches`, `read_terminal`,
 //!     `my_capability`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
-//!     `bind_project_powder`.
+//!     `captain_bootstrap` and the agent-session operations.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
+//!     `start_agent`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
 //!
@@ -334,9 +335,26 @@ fn schema_claim_captain() -> Value {
             "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused." },
             "provider":         { "type": "string", "enum": ["codex", "claude"], "description": "Harness that owns providerSessionId. Legacy callers default to Claude." },
             "providerSessionId": { "type": "string", "description": "Optional provider-native conversation id, such as CODEX_THREAD_ID or a Claude session UUID." },
-            "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional workspace tab ids this captain controls (defaults to the tab currently holding the captain's tile)." }
+            "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional existing Work Workspace ids this Captain owns. No placement, cwd, or active-tab inference occurs when omitted." }
         },
         "required": ["captainSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_rename_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
+            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
+            "displayName": { "type": "string", "minLength": 1, "maxLength": 120, "description": "Durable trimmed Captain display name." }
+        },
+        "required": ["displayName"],
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["shipSlug"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -350,48 +368,8 @@ fn schema_register_project() -> Value {
             "initializeGit": { "type": "boolean", "description": "Explicitly initialize Git with main as the default branch when repoRoot is not already a repository. Defaults to false and never replaces an existing .git entry." },
             "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
-            "powderRepository": { "type": "string", "description": "Optional canonical Powder repository name to bind during registration." },
-            "powderConnectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
         },
         "required": ["repoRoot"],
-        "additionalProperties": false
-    })
-}
-
-fn schema_bind_project_powder() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "projectId": { "type": "string", "description": "Durable T-Hub project id from list_projects." },
-            "repository": { "type": "string", "description": "Canonical Powder repository name." },
-            "connectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
-        },
-        "required": ["projectId", "repository"],
-        "additionalProperties": false
-    })
-}
-
-fn schema_list_powder_boards() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "connectionProfile": { "type": "string", "minLength": 1, "description": "Protected Powder endpoint profile name; defaults to 'default'." },
-            "offset": { "type": "integer", "minimum": 0, "description": "Zero-based result offset; defaults to 0." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum boards to return; defaults to 100." }
-        },
-        "additionalProperties": false
-    })
-}
-
-fn schema_project_board_snapshot() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "terminalId": { "type": "string", "minLength": 1, "description": "Focused T-Hub terminal id. Durable Captain or Crew ownership wins over cwd." },
-            "cwd": { "type": "string", "description": "Optional fallback WSL cwd for an ordinary terminal; T-Hub resolves its canonical Git main worktree." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum repository-scoped cards to return; defaults to 1000." }
-        },
-        "required": ["terminalId"],
         "additionalProperties": false
     })
 }
@@ -411,11 +389,85 @@ fn schema_captain_bootstrap() -> Value {
     })
 }
 
+fn schema_list_agents() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string" },
+            "projectId": { "type": "string" },
+            "cursor": { "type": "string", "pattern": "^[0-9]+$", "default": "0" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+            "state": { "type": "string", "enum": ["active", "removed"] }
+        },
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["projectId"] }
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn schema_get_agent() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "agentSessionId": { "type": "string" } },
+        "required": ["agentSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_agent_checkpoint() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string" },
+            "authorSessionId": { "type": "string" },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "stage": {
+                "type": "string",
+                "enum": ["working", "needsInput", "readyForReview", "awaitingIntegration", "complete", "stopped"]
+            }
+        },
+        "required": ["agentSessionId", "authorSessionId", "summary"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_agent_events() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string" },
+            "cursor": { "type": "string", "pattern": "^[0-9]+$", "default": "0" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+        },
+        "required": ["agentSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_start_agent() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "requestId": { "type": "string", "minLength": 1 },
+            "captainSessionId": { "type": "string" },
+            "assignment": { "type": "string", "minLength": 1, "maxLength": 16384 },
+            "directory": { "type": "string" },
+            "harness": { "type": "string", "enum": ["codex", "claude"] },
+            "name": { "type": "string" },
+            "workspaceTabId": { "type": "string" }
+        },
+        "required": ["requestId", "captainSessionId", "assignment", "directory"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_commission_captain() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "projectId": { "type": "string", "description": "Registered Project to supervise." },
             "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
             "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
             "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
@@ -431,49 +483,14 @@ fn schema_attach_captain() -> Value {
         "type": "object",
         "properties": {
             "captainSessionId": { "type": "string", "description": "Live terminal to attach. It must already have control capability; read-only terminals are refused without elevation." },
-            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "projectId": { "type": "string", "description": "Registered Project to supervise." },
             "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
             "provider": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
             "providerSessionId": { "type": "string", "description": "Provider-native conversation id to checkpoint immediately." },
             "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
-            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Project workspace tabs this Captain owns. Defaults to the terminal's current tab." }
+            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Existing project Work Workspace ids this Captain owns. No current-tab inference occurs." }
         },
         "required": ["captainSessionId", "projectId", "assignment"],
-        "additionalProperties": false
-    })
-}
-
-fn schema_powder_status() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "projectId": { "type": "string", "description": "Registered Powder-bound project id." }
-        },
-        "required": ["projectId"],
-        "additionalProperties": false
-    })
-}
-
-fn schema_dispatch_crew() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
-            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
-            "cardId": { "type": "string", "description": "Ready Powder card to claim before starting work." },
-            "task": { "type": "string", "description": "Bounded Crew assignment for this card." },
-            "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Crew harness. Defaults to the Captain harness." },
-            "worktreePath": { "type": "string", "description": "Existing Git worktree of the Captain project. Defaults to the main worktree." },
-            "branch": { "type": "string", "description": "Branch recorded in the durable Crew manifest." },
-            "ttlSeconds": { "type": "integer", "minimum": 300, "maximum": 86400, "description": "Initial Powder claim TTL. Defaults to 3600." },
-            "tabId": { "type": "string", "description": "Optional existing workspace tab for the Crew tile." },
-            "tabName": { "type": "string", "description": "Optional workspace tab name, reused or created without switching focus." }
-        },
-        "required": ["cardId", "task"],
-        "anyOf": [
-            { "required": ["captainSessionId"] },
-            { "required": ["shipSlug"] }
-        ],
         "additionalProperties": false
     })
 }
@@ -502,17 +519,6 @@ fn schema_captain_checkpoint() -> Value {
                 ]
             }
         ],
-        "additionalProperties": false
-    })
-}
-
-fn schema_heartbeat_crew_powder() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "crewSessionId": { "type": "string", "description": "Live Crew terminal whose Powder claim should be heartbeated." }
-        },
-        "required": ["crewSessionId"],
         "additionalProperties": false
     })
 }
@@ -658,26 +664,32 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "list_projects",
             tier: Tier::Read,
-            summary: "List durable registered projects and their Powder repository bindings.",
+            summary: "List durable registered projects and their Git repository metadata.",
             input_schema: schema_empty,
         },
         ToolDef {
-            name: "list_powder_boards",
+            name: "list_agents",
             tier: Tier::Read,
-            summary: "List a bounded page of visible canonical Powder boards for a protected connection profile.",
-            input_schema: schema_list_powder_boards,
+            summary: "List bounded durable agent-session summaries for one Captain or Project.",
+            input_schema: schema_list_agents,
+        },
+        ToolDef {
+            name: "get_agent",
+            tier: Tier::Read,
+            summary: "Get the full durable record for one agent session, including its assignment.",
+            input_schema: schema_get_agent,
+        },
+        ToolDef {
+            name: "agent_events",
+            tier: Tier::Read,
+            summary: "Read bounded lifecycle and checkpoint events after a cursor.",
+            input_schema: schema_agent_events,
         },
         ToolDef {
             name: "captain_bootstrap",
             tier: Tier::Read,
-            summary: "Recover a Captain's durable project, assignment, Crew roster, and Powder binding after a reset or new conversation.",
+            summary: "Recover a Captain's durable project, assignment, and agent-session roster after a reset or new conversation.",
             input_schema: schema_captain_bootstrap,
-        },
-        ToolDef {
-            name: "powder_status",
-            tier: Tier::Read,
-            summary: "Verify the protected Powder connection for a registered project without exposing credentials.",
-            input_schema: schema_powder_status,
         },
         ToolDef {
             name: "list_fleet_watches",
@@ -747,28 +759,28 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_release_captain,
         },
         ToolDef {
+            name: "rename_captain",
+            tier: Tier::Organization,
+            summary: "Rename one durable Captain identity without changing its Assignment, terminal, Harness, or Workspace ownership.",
+            input_schema: schema_rename_captain,
+        },
+        ToolDef {
             name: "captain_checkpoint",
             tier: Tier::Organization,
             summary: "Persist a Captain or Crew conversation identifier and reset-safe resume point in the ship manifest.",
             input_schema: schema_captain_checkpoint,
         },
         ToolDef {
+            name: "agent_checkpoint",
+            tier: Tier::Organization,
+            summary: "Append a bounded human-readable checkpoint to a durable agent session.",
+            input_schema: schema_agent_checkpoint,
+        },
+        ToolDef {
             name: "register_project",
             tier: Tier::Organization,
-            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf, optionally with its Powder mapping.",
+            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf.",
             input_schema: schema_register_project,
-        },
-        ToolDef {
-            name: "bind_project_powder",
-            tier: Tier::Organization,
-            summary: "Bind a registered T-Hub project to a canonical Powder repository and protected connection profile.",
-            input_schema: schema_bind_project_powder,
-        },
-        ToolDef {
-            name: "project_board_snapshot",
-            tier: Tier::Read,
-            summary: "Resolve a terminal's durable Project and return a bounded, credential-safe snapshot of its Powder board.",
-            input_schema: schema_project_board_snapshot,
         },
         ToolDef {
             name: "watch_fleet",
@@ -791,28 +803,22 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_spawn_terminal,
         },
         ToolDef {
+            name: "start_agent",
+            tier: Tier::ProcessChanging,
+            summary: "Start one Codex or Claude agent in an existing Project checkout with a durable assignment.",
+            input_schema: schema_start_agent,
+        },
+        ToolDef {
             name: "commission_captain",
             tier: Tier::ProcessChanging,
-            summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable Powder-backed ship.",
+            summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable ship.",
             input_schema: schema_commission_captain,
         },
         ToolDef {
             name: "attach_captain",
             tier: Tier::ProcessChanging,
-            summary: "Attach an existing control-capability terminal as a Powder-backed project Captain without rewriting or elevating its bearer token.",
+            summary: "Attach an existing control-capability terminal as a project Captain without rewriting or elevating its bearer token.",
             input_schema: schema_attach_captain,
-        },
-        ToolDef {
-            name: "dispatch_crew",
-            tier: Tier::ProcessChanging,
-            summary: "Claim a project Powder card, spawn one least-privilege Crew harness, and persist the card/run-to-terminal binding transactionally.",
-            input_schema: schema_dispatch_crew,
-        },
-        ToolDef {
-            name: "heartbeat_crew_powder",
-            tier: Tier::ProcessChanging,
-            summary: "Heartbeat a Crew Powder claim only after verifying its terminal is live.",
-            input_schema: schema_heartbeat_crew_powder,
         },
         ToolDef {
             name: "send_text",
@@ -906,11 +912,40 @@ mod tests {
             "claim_captain",
             "attach_captain",
             "release_captain",
+            "rename_captain",
             "get_theme",
             "set_theme",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
+    }
+
+    #[test]
+    fn retired_powder_tools_are_not_advertised() {
+        for name in [
+            "dispatch_crew",
+            "list_powder_boards",
+            "bind_project_powder",
+            "project_board_snapshot",
+            "powder_status",
+            "heartbeat_crew_powder",
+            "append_crew_powder_work_log",
+            "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
+            "complete_crew_powder",
+        ] {
+            assert!(
+                find(name).is_none(),
+                "retired tool is still advertised: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_listing_schema_exposes_removed_history_filter() {
+        let schema = (find("list_agents").unwrap().input_schema)();
+        let state = schema["properties"]["state"]["enum"].as_array().unwrap();
+        assert_eq!(state, &vec![json!("active"), json!("removed")]);
     }
 
     #[test]
@@ -995,7 +1030,12 @@ mod tests {
         let list = find("list_captains").unwrap().to_mcp();
         assert_eq!(list["annotations"]["t-hubTier"], "read");
         assert_eq!(list["annotations"]["confirmationRequired"], false);
-        for name in ["claim_captain", "release_captain", "captain_checkpoint"] {
+        for name in [
+            "claim_captain",
+            "release_captain",
+            "rename_captain",
+            "captain_checkpoint",
+        ] {
             let mcp = find(name).unwrap().to_mcp();
             assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
@@ -1006,8 +1046,12 @@ mod tests {
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+        let rename_schema = (find("rename_captain").unwrap().input_schema)();
+        assert_eq!(rename_schema["required"], json!(["displayName"]));
+        assert_eq!(rename_schema["properties"]["displayName"]["maxLength"], 120);
     }
 
+    #[cfg(any())]
     #[test]
     fn project_tools_expose_read_and_audited_mutation_tiers() {
         let list = find("list_projects").unwrap();
@@ -1099,6 +1143,10 @@ mod tests {
             (dispatch.input_schema)()["anyOf"].as_array().unwrap().len(),
             2
         );
+        assert_eq!(
+            (dispatch.input_schema)()["properties"]["workspaceTabId"]["type"],
+            "string"
+        );
 
         let checkpoint = find("captain_checkpoint").unwrap();
         assert_eq!(checkpoint.tier, Tier::Organization);
@@ -1116,6 +1164,147 @@ mod tests {
             (heartbeat.input_schema)()["required"],
             json!(["crewSessionId"])
         );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn powder_evidence_tools_share_minimal_bound_authority_schemas() {
+        let append = find("append_crew_powder_work_log").unwrap();
+        assert_eq!(append.tier, Tier::Organization);
+        assert_eq!(
+            (append.input_schema)()["required"],
+            json!(["operationId", "message"])
+        );
+
+        let evidence = find("read_crew_powder_evidence").unwrap();
+        assert_eq!(evidence.tier, Tier::Read);
+        assert_eq!(
+            (evidence.input_schema)()["properties"]["limit"]["maximum"],
+            20
+        );
+
+        let complete = find("complete_crew_powder").unwrap();
+        assert_eq!(complete.tier, Tier::ProcessChanging);
+        assert_eq!(
+            (complete.input_schema)()["required"],
+            json!(["crewSessionId", "operationId", "proof", "criterionProofs"])
+        );
+        assert_eq!(
+            (complete.input_schema)()["properties"]["criterionProofs"]["maxItems"],
+            128
+        );
+        assert_eq!(
+            (append.input_schema)()["properties"]["message"]["maxLength"],
+            16384
+        );
+        assert_eq!(
+            (complete.input_schema)()["properties"]["proof"]["maxLength"],
+            4096
+        );
+        assert_eq!(
+            complete.to_mcp()["annotations"]["confirmationRequired"],
+            true
+        );
+
+        let review = find("review_crew_powder_criterion").unwrap();
+        assert_eq!(review.tier, Tier::Organization);
+        assert_eq!(
+            (review.input_schema)()["required"],
+            json!([
+                "crewSessionId",
+                "operationId",
+                "criterion",
+                "criterionId",
+                "decision",
+                "proof",
+                "expectedReviewerIdentity"
+            ])
+        );
+        assert_eq!(
+            (review.input_schema)()["properties"]["expectedReviewerIdentity"]["description"],
+            "Legacy caller-facing reviewer label retained for durable-intent compatibility. It is not authoritative: T-Hub verifies the receipt against the protected Powder profile operationIdentity."
+        );
+
+        // Append and review remain Organization mutations. The backend
+        // separately admits the narrow Crew-self work-log case through a read
+        // token, then rechecks exact Crew and ship ownership.
+        for name in [
+            "append_crew_powder_work_log",
+            "review_crew_powder_criterion",
+        ] {
+            let tool = find(name).unwrap().to_mcp();
+            assert_eq!(tool["annotations"]["t-hubTier"], "organization", "{name}");
+            assert_eq!(
+                tool["annotations"]["confirmationRequired"], false,
+                "{name} must reach role-bound backend authorization"
+            );
+        }
+        let complete_mcp = complete.to_mcp();
+        assert_eq!(complete_mcp["annotations"]["t-hubTier"], "process-changing");
+        assert_eq!(complete_mcp["annotations"]["confirmationRequired"], true);
+        assert!(complete_mcp["description"]
+            .as_str()
+            .unwrap()
+            .contains("CONFIRMATION REQUIRED"));
+        let read = evidence.to_mcp();
+        assert_eq!(read["annotations"]["t-hubTier"], "read");
+        assert_eq!(read["annotations"]["confirmationRequired"], false);
+
+        // JSON Schema maxLength counts Unicode scalar values. The descriptions
+        // therefore state the backend's byte contract explicitly; CLI process
+        // and combined-control tests enforce the UTF-8 byte limit itself.
+        assert!(
+            (append.input_schema)()["properties"]["message"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("16 KiB UTF-8")
+        );
+        assert!(
+            (complete.input_schema)()["properties"]["proof"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("4096 UTF-8 bytes")
+        );
+
+        for name in [
+            "append_crew_powder_work_log",
+            "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
+            "complete_crew_powder",
+        ] {
+            let schema = (find(name).unwrap().input_schema)();
+            assert_eq!(schema["type"], "object", "{name}");
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            for escape in [
+                "card",
+                "cardId",
+                "card_id",
+                "run",
+                "runId",
+                "run_id",
+                "profile",
+                "connectionProfile",
+                "connection_profile",
+                "endpoint",
+                "powderEndpoint",
+                "powder_endpoint",
+                "repository",
+                "powderRepository",
+                "powder_repository",
+                "repo",
+                "credential",
+                "apiKey",
+                "api_key",
+                "key",
+                "token",
+                "secret",
+            ] {
+                assert!(
+                    schema["properties"].get(escape).is_none(),
+                    "{name} must not expose {escape}"
+                );
+            }
+        }
     }
 
     #[test]

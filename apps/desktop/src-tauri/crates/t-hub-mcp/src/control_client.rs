@@ -12,30 +12,29 @@
 //! response line. Connections are not pooled - `tools/call` is infrequent and a
 //! fresh connection keeps the client stateless and robust to app restarts.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Per-attempt socket read timeout. A response that has not started arriving
-/// within this window bounces to the overall-deadline retry loop (the command may
-/// have been accepted and its response is merely late), rather than surfacing an
-/// ambiguous error on the first idle.
-const READ_TIMEOUT_PER_ATTEMPT: Duration = Duration::from_secs(10);
+/// One control operation, including discovery, connect, write, read, endpoint
+/// invalidation, retry, bridge recovery, and ambiguous-response lookup, must
+/// finish within this wall-clock budget.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Overall deadline for reading one response before the round-trip is declared a
-/// transport failure. Retrying WouldBlock up to here (instead of failing at the
-/// first 15s idle, as before) directly fixes the ask-#2 client leg: a briefly
-/// busy/wedged app still gets its late response delivered.
-const READ_OVERALL_DEADLINE: Duration = Duration::from_secs(45);
+/// A single endpoint gets only a short slice of the overall budget so an
+/// inherited port that accepts but stays silent cannot consume the recovery
+/// window before the current endpoint is tried.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long to keep resolving an AMBIGUOUS spawn-class failure via
-/// `get_request_status` (polling while the original is still in flight) before
-/// giving up and telling the caller to poll it themselves.
-const AMBIGUOUS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
+/// Every control client accepts at most 1 MiB before the NDJSON response newline.
+/// This bounds memory, parsing work, and any structured error derived from a peer.
+const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Spawn-class commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
@@ -263,27 +262,40 @@ struct ControlResponse {
 
 /// Why a single control round-trip failed, so the retry layer can tell a moved
 /// endpoint apart from a command the app deliberately rejected.
+#[derive(Debug)]
 enum CallError {
     /// Transport-level FAST failure: connect refused, the stream died, or spoke
     /// garbage. A restarted/rebound app on a new ephemeral port looks exactly like
     /// this (connect to the retired port refuses), so the caller re-reads
     /// control.json and retries - but this is NOT the relay-wedge signature.
-    Transport(String),
+    Transport(&'static str),
     /// The round-trip CONNECTED but no response arrived before the deadline. This is
     /// the relay-wedge signature: the WSL2 mirrored-loopback relay accepts the
     /// connect locally then never carries the flow, so the app (healthy, reachable
     /// Windows-side) never answers. Distinguished from [`Transport`] so the self-heal
     /// fires ONLY on a wedge, never on an app-down (which refuses fast).
-    Timeout(String),
+    Timeout(&'static str),
     /// The app answered and rejected the command (bad token, unknown command,
     /// governor refusal). A different endpoint won't change the verdict.
     App(String),
+    /// The peer answered with a malformed protocol frame. Retrying on another
+    /// endpoint would hide a compatibility failure.
+    Protocol(String),
+    /// The request was fully written, then the peer closed after sending only part
+    /// of its response frame. A requestId-bearing mutation may have applied, so its
+    /// caller must reconcile status rather than treating this as terminal protocol.
+    PartialResponse,
 }
 
 impl CallError {
-    fn into_message(self) -> String {
+    fn into_message(self, command: &str, attempts: u8, endpoint_replaced: bool) -> String {
         match self {
-            CallError::Transport(m) | CallError::Timeout(m) | CallError::App(m) => m,
+            CallError::Transport(stage) => {
+                unavailable_message(command, attempts, stage, endpoint_replaced)
+            }
+            CallError::Timeout(stage) => timeout_message(command, attempts, stage),
+            CallError::App(message) | CallError::Protocol(message) => message,
+            CallError::PartialResponse => partial_response_message(),
         }
     }
 
@@ -292,13 +304,66 @@ impl CallError {
     fn is_timeout(&self) -> bool {
         matches!(self, CallError::Timeout(_))
     }
+
+    fn stage(&self) -> &'static str {
+        match self {
+            CallError::Transport(stage) | CallError::Timeout(stage) => stage,
+            CallError::App(_) => "server",
+            CallError::Protocol(_) => "protocol",
+            CallError::PartialResponse => "read",
+        }
+    }
+}
+
+fn partial_response_message() -> String {
+    "control_protocol: unterminated response frame after request write".to_string()
+}
+
+fn unavailable_message(
+    command: &str,
+    attempts: u8,
+    stage: &str,
+    endpoint_replaced: bool,
+) -> String {
+    format!(
+        "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
+    )
+}
+
+fn timeout_message(command: &str, attempts: u8, stage: &str) -> String {
+    format!(
+        "control_timeout: command '{command}' failed within its {}s recovery deadline during {stage} after {attempts} attempt(s); retry_state=exhausted",
+        CONTROL_DEADLINE.as_secs()
+    )
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
+}
+
+#[derive(Clone, Copy)]
+struct CallBudget {
+    deadline: Instant,
+    attempt_timeout: Duration,
+}
+
+impl CallBudget {
+    /// Keep two polling slices inside the same overall deadline for stale
+    /// endpoint retry, idempotency-status reconciliation, or bridge recovery.
+    fn initial_attempt(self) -> Self {
+        let reserve = self.attempt_timeout.saturating_mul(2);
+        Self {
+            deadline: self.deadline.checked_sub(reserve).unwrap_or(self.deadline),
+            attempt_timeout: self.attempt_timeout,
+        }
+    }
 }
 
 /// Consecutive same-endpoint transport failures before the relay-wedge self-heal
 /// fires one bridge-triggered rebind. `1` = heal on the first confirmed failure: a
-/// wedged round-trip already burned ~[`READ_OVERALL_DEADLINE`] (45s) proving the
-/// endpoint is unreachable, so waiting for a second full timeout only doubles the
-/// outage. False positives (a genuinely-down app, or a rare >45s command) are cheap
+/// wedged round-trip already consumed one bounded attempt slice proving the
+/// endpoint is unresponsive, so waiting for another full deadline only doubles the
+/// outage. False positives (a genuinely-down app, or a rare slow command) are cheap
 /// and self-correcting - the bridge attempt just fails/rate-limits and the episode
 /// guard blocks any repeat until a success resets it.
 const WEDGE_TRIGGER_AFTER: u32 = 1;
@@ -375,13 +440,36 @@ pub fn resolve_and_call(
     command: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    resolve_and_call_with_deadline(discovery, command, args, CONTROL_DEADLINE, ATTEMPT_TIMEOUT)
+}
+
+fn resolve_and_call_with_deadline(
+    discovery: &Discovery,
+    command: &str,
+    args: &Value,
+    overall: Duration,
+    attempt_timeout: Duration,
+) -> Result<Value, String> {
+    let budget = CallBudget {
+        deadline: Instant::now() + overall,
+        attempt_timeout,
+    };
     // Idempotency (ask #1): a spawn-class command carries a `requestId` so every
     // retry below dedups server-side (a retry never double-applies; a completed
     // outcome is replayed). The SAME id is reused for the initial call and every
     // recovery path.
     let (args, request_id) = ensure_request_id(command, args);
     let endpoint = discovery.resolve()?;
-    match call_classified(&endpoint, command, &args) {
+    if Instant::now() >= budget.deadline {
+        return Err(timeout_message(command, 0, "discovery"));
+    }
+    match call_classified(
+        &endpoint,
+        command,
+        &args,
+        budget.initial_attempt(),
+        Some(discovery),
+    ) {
         Ok(v) => {
             wedge_detector().on_success();
             Ok(v)
@@ -392,9 +480,22 @@ pub fn resolve_and_call(
             wedge_detector().on_success();
             Err(msg)
         }
+        Err(CallError::Protocol(msg)) => {
+            wedge_detector().on_success();
+            Err(msg)
+        }
+        Err(CallError::PartialResponse) if request_id.is_none() => {
+            wedge_detector().on_success();
+            Err(partial_response_message())
+        }
         Err(first) => {
             let first_is_timeout = first.is_timeout();
-            let first_msg = first.into_message();
+            let first_stage = first.stage();
+            let first_msg = first.into_message(command, 1, false);
+
+            if Instant::now() >= budget.deadline {
+                return Err(timeout_message(command, 1, first_stage));
+            }
 
             // The endpoint we tried is unreachable/unresponsive. If control.json now
             // names a *different* addr (the app restarted or already rebound onto a new
@@ -425,7 +526,8 @@ pub fn resolve_and_call(
                         if first_is_timeout
                             && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER)
                         {
-                            try_bridge_rebind(discovery, &endpoint).unwrap_or(endpoint)
+                            try_bridge_rebind(discovery, &endpoint, budget.deadline)
+                                .unwrap_or(endpoint)
                         } else {
                             endpoint
                         }
@@ -438,6 +540,7 @@ pub fn resolve_and_call(
                     id,
                     first_msg,
                     discovery.has_env_pin(),
+                    budget,
                 );
                 if r.is_ok() {
                     wedge_detector().on_success();
@@ -450,7 +553,7 @@ pub fn resolve_and_call(
             // having ACTUALLY TRIED and still-failing is the one the wedge decision is
             // based on (F2: NOT the possibly-stale env pin we started from).
             if let Some(f) = fresh {
-                match call_classified(&f, command, &args) {
+                match call_classified(&f, command, &args, budget, None) {
                     Ok(v) => {
                         wedge_detector().on_success();
                         Ok(v)
@@ -468,15 +571,19 @@ pub fn resolve_and_call(
                             Err(msg)
                         }
                     }
+                    Err(CallError::Protocol(msg)) => Err(msg),
+                    Err(CallError::PartialResponse) => Err(partial_response_message()),
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
+                        let e2_msg = e2.into_message(command, 2, true);
                         maybe_heal_and_retry(
                             discovery,
                             command,
                             &args,
                             f,
-                            e2.into_message(),
+                            e2_msg,
                             e2_is_timeout,
+                            budget,
                         )
                     }
                 }
@@ -489,6 +596,7 @@ pub fn resolve_and_call(
                     endpoint,
                     first_msg,
                     first_is_timeout,
+                    budget,
                 )
             }
         }
@@ -511,10 +619,11 @@ fn maybe_heal_and_retry(
     tried: ControlEndpoint,
     err: String,
     timeout_class: bool,
+    budget: CallBudget,
 ) -> Result<Value, String> {
     if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
-        if let Some(healed) = try_bridge_rebind(discovery, &tried) {
-            return match call_classified(&healed, command, args) {
+        if let Some(healed) = try_bridge_rebind(discovery, &tried, budget.deadline) {
+            return match call_classified(&healed, command, args, budget, None) {
                 Ok(v) => {
                     wedge_detector().on_success();
                     Ok(v)
@@ -526,7 +635,9 @@ fn maybe_heal_and_retry(
                 Err(CallError::App(msg)) if discovery.has_env_pin() && is_auth_rejection(&msg) => {
                     Err(stale_env_token_error(&msg))
                 }
-                other => other.map_err(CallError::into_message),
+                Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => Err(msg),
+                Err(CallError::PartialResponse) => Err(partial_response_message()),
+                Err(other) => Err(other.into_message(command, 3, true)),
             };
         }
     }
@@ -559,12 +670,15 @@ fn stale_env_token_error(app_msg: &str) -> String {
     )
 }
 
-/// A socket read timeout / would-block surfaces as `WouldBlock` (unix SO_RCVTIMEO)
-/// or `TimedOut` (windows). Both mean "no data yet", not a dead transport.
-fn is_would_block(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MutationReissueState {
+    NotAttempted,
+    Attempted,
+}
+
+fn unknown_after_reissue_message(command: &str, request_id: &str) -> String {
+    format!(
+        "control_request_unknown: command '{command}' remained unknown after one idempotent reissue; request_id='{request_id}'; retry_state=exhausted"
     )
 }
 
@@ -587,11 +701,12 @@ fn resolve_ambiguous_request(
     request_id: &str,
     first_err: String,
     has_env_pin: bool,
+    budget: CallBudget,
 ) -> Result<Value, String> {
-    let deadline = Instant::now() + AMBIGUOUS_RESOLVE_DEADLINE;
     let status_args = serde_json::json!({ "requestId": request_id });
+    let mut reissue_state = MutationReissueState::NotAttempted;
     loop {
-        match call_classified(endpoint, "get_request_status", &status_args) {
+        match call_classified(endpoint, "get_request_status", &status_args, budget, None) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
                 Some("completed") => {
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -604,7 +719,7 @@ fn resolve_ambiguous_request(
                         .to_string());
                 }
                 Some("inFlight") => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= budget.deadline {
                         // PENDING, not failed (ask #2): the app ACCEPTED the spawn and
                         // is still materializing it (e.g. a Windows memory trough slowed
                         // it past our deadline). Hand back the resolvable requestId with
@@ -616,16 +731,38 @@ fn resolve_ambiguous_request(
                              still materializing after {}s - poll get_request_status with that \
                              requestId for its final outcome (do NOT re-issue the command). \
                              (Original client-deadline note: {first_err})",
-                            AMBIGUOUS_RESOLVE_DEADLINE.as_secs()
+                            CONTROL_DEADLINE.as_secs()
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                    sleep_within(budget.deadline, Duration::from_millis(200));
                 }
                 // "unknown" (or a server that answered oddly): the command never
-                // landed under this id, so re-running it once is safe + idempotent.
+                // landed under this id. Permit exactly one idempotent mutation
+                // reissue. If that reissue loses its response, return to status
+                // resolution; a later unknown is authoritative and never mutates.
                 _ => {
-                    return call_classified(endpoint, command, args)
-                        .map_err(CallError::into_message);
+                    if reissue_state == MutationReissueState::Attempted {
+                        return Err(unknown_after_reissue_message(command, request_id));
+                    }
+                    if Instant::now() >= budget.deadline {
+                        return Err(format!(
+                            "{}; request_id='{request_id}'",
+                            timeout_message(command, 2, "request status")
+                        ));
+                    }
+                    reissue_state = MutationReissueState::Attempted;
+                    match call_classified(endpoint, command, args, budget, None) {
+                        Ok(value) => return Ok(value),
+                        Err(CallError::App(msg)) if has_env_pin && is_auth_rejection(&msg) => {
+                            return Err(stale_env_token_error(&msg));
+                        }
+                        Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => {
+                            return Err(msg);
+                        }
+                        Err(CallError::PartialResponse)
+                        | Err(CallError::Transport(_))
+                        | Err(CallError::Timeout(_)) => continue,
+                    }
                 }
             },
             // The app answered but rejected the STATUS query itself. Under a kept env
@@ -640,16 +777,27 @@ fn resolve_ambiguous_request(
                 }
                 return Err(first_err);
             }
+            Err(CallError::Protocol(msg)) => return Err(msg),
+            Err(CallError::PartialResponse) => return Err(first_err),
             // The channel is still unreachable (fast transport failure) or wedged
             // (timeout): keep trying to reach the status endpoint until the deadline,
             // else give up with the original error.
             Err(CallError::Transport(_)) | Err(CallError::Timeout(_)) => {
-                if Instant::now() >= deadline {
-                    return Err(first_err);
+                if Instant::now() >= budget.deadline {
+                    return Err(format!(
+                        "{}; request_id='{request_id}'",
+                        timeout_message(command, 2, "request status")
+                    ));
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                sleep_within(budget.deadline, Duration::from_millis(200));
             }
         }
+    }
+}
+
+fn sleep_within(deadline: Instant, desired: Duration) {
+    if let Some(left) = remaining(deadline) {
+        std::thread::sleep(left.min(desired));
     }
 }
 
@@ -658,7 +806,17 @@ fn resolve_ambiguous_request(
 /// goes through [`resolve_and_call`], which adds the restart-recovery retry.
 #[cfg(test)]
 fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
-    call_classified(endpoint, command, args).map_err(CallError::into_message)
+    call_classified(
+        endpoint,
+        command,
+        args,
+        CallBudget {
+            deadline: Instant::now() + CONTROL_DEADLINE,
+            attempt_timeout: ATTEMPT_TIMEOUT,
+        },
+        None,
+    )
+    .map_err(|error| error.into_message(command, 1, false))
 }
 
 /// The single round-trip, with its failure classified so [`resolve_and_call`]
@@ -667,6 +825,8 @@ fn call_classified(
     endpoint: &ControlEndpoint,
     command: &str,
     args: &Value,
+    budget: CallBudget,
+    discovery: Option<&Discovery>,
 ) -> Result<Value, CallError> {
     // Comms-plane Phase 3: present the caller session's PER-SESSION token
     // (`T_HUB_SESSION_TOKEN`, injected into this session's env at spawn) ALONGSIDE the
@@ -682,71 +842,117 @@ fn call_classified(
         "args": args,
     });
 
-    let stream = TcpStream::connect(&endpoint.addr).map_err(|e| {
-        CallError::Transport(format!(
-            "failed to connect to T-Hub control channel {}: {e}",
-            endpoint.addr
-        ))
+    let socket: SocketAddr = endpoint.addr.parse().map_err(|_| {
+        CallError::Protocol("control_protocol: malformed endpoint address".to_string())
     })?;
-    // Bounded timeouts so a hung app surfaces as a tool error, not a stuck MCP
-    // server. The per-attempt read timeout is short; the read loop below retries
-    // WouldBlock up to READ_OVERALL_DEADLINE so a merely-late response (the app was
-    // briefly busy/wedged) is still delivered rather than surfaced as an ambiguous
-    // failure on the first idle (ask #2, client leg).
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT_PER_ATTEMPT));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    let connect_budget = remaining(budget.deadline)
+        .map(|left| left.min(budget.attempt_timeout))
+        .filter(|budget| !budget.is_zero())
+        .ok_or(CallError::Timeout("connect"))?;
+    let stream = TcpStream::connect_timeout(&socket, connect_budget).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("connect")
+        } else {
+            CallError::Transport("connect")
+        }
+    })?;
+    let io_budget = remaining(budget.deadline)
+        .map(|left| left.min(budget.attempt_timeout))
+        .filter(|budget| !budget.is_zero())
+        .ok_or(CallError::Timeout("write"))?;
+    let _ = stream.set_write_timeout(Some(io_budget));
 
     let mut writer = stream
         .try_clone()
-        .map_err(|e| CallError::Transport(format!("failed to clone control stream: {e}")))?;
-    let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Transport(e.to_string()))?;
+        .map_err(|_| CallError::Transport("stream setup"))?;
+    let mut line = serde_json::to_vec(&request)
+        .map_err(|e| CallError::Protocol(format!("control_protocol: serialize failed: {e}")))?;
     line.push(b'\n');
-    writer
-        .write_all(&line)
-        .map_err(|e| CallError::Transport(format!("failed to send control request: {e}")))?;
-    writer
-        .flush()
-        .map_err(|e| CallError::Transport(format!("failed to flush control request: {e}")))?;
+    writer.write_all(&line).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("write")
+        } else {
+            CallError::Transport("write")
+        }
+    })?;
+    writer.flush().map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("write")
+        } else {
+            CallError::Transport("write")
+        }
+    })?;
 
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
-    let deadline = Instant::now() + READ_OVERALL_DEADLINE;
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| CallError::Transport("stream setup"))?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut next_probe = Instant::now() + budget.attempt_timeout;
     loop {
-        match reader.read_line(&mut resp_line) {
-            Ok(0) => {
-                return Err(CallError::Transport(
-                    "T-Hub control channel closed without responding".to_string(),
-                ));
+        let now = Instant::now();
+        if now >= budget.deadline {
+            return Err(CallError::Timeout("read"));
+        }
+        if now >= next_probe {
+            if discovery
+                .and_then(|source| source.refreshed_endpoint().ok())
+                .is_some_and(|fresh| fresh.addr != endpoint.addr || fresh.token != endpoint.token)
+            {
+                return Err(CallError::Timeout("read"));
             }
-            // A full line arrived (read_line stops at the newline).
-            Ok(_) => break,
-            // A per-attempt read timeout: the response is late, not (yet) gone.
-            // Keep waiting until the overall deadline before declaring the
-            // round-trip ambiguous - the command may already have been accepted.
-            Err(e) if is_would_block(&e) => {
-                if Instant::now() >= deadline {
-                    // Connected but silent past the deadline: the relay-wedge
-                    // signature (Timeout), NOT a fast transport failure.
-                    return Err(CallError::Timeout(format!(
-                        "failed to read control response: {e} (no response within {}s)",
-                        READ_OVERALL_DEADLINE.as_secs()
+            next_probe = now + budget.attempt_timeout;
+        }
+        match (&stream).read(&mut chunk) {
+            Ok(0) if response.is_empty() => return Err(CallError::Transport("read")),
+            Ok(0) => return Err(CallError::PartialResponse),
+            Ok(n) => {
+                let received = &chunk[..n];
+                let frame_bytes = received
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap_or(received.len());
+                if response.len().saturating_add(frame_bytes) > MAX_RESPONSE_FRAME_BYTES {
+                    return Err(CallError::Protocol(format!(
+                        "control_protocol: response frame exceeds {MAX_RESPONSE_FRAME_BYTES}-byte limit"
                     )));
                 }
+                response.extend_from_slice(&received[..frame_bytes]);
+                if frame_bytes < received.len() {
+                    break;
+                }
             }
-            Err(e) => {
-                return Err(CallError::Transport(format!(
-                    "failed to read control response: {e}"
-                )));
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                let wake_at = budget.deadline.min(next_probe);
+                std::thread::sleep(
+                    wake_at
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
+            Err(_) => return Err(CallError::Transport("read")),
         }
     }
 
-    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
-        CallError::Transport(format!(
-            "malformed control response: {e} (raw: {})",
-            resp_line.trim_end()
-        ))
+    let resp_line = String::from_utf8(response).map_err(|_| {
+        CallError::Protocol("control_protocol: response frame was not UTF-8".to_string())
     })?;
+    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
+        .map_err(|e| CallError::Protocol(format!("control_protocol: malformed response: {e}")))?;
 
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
@@ -762,7 +968,16 @@ fn call_classified(
 /// heal attempt never spawns a missing `powershell.exe`; there the client degrades to
 /// the existing file-re-read recovery.
 fn wsl_powershell_available() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BRIDGE_RESULT: std::cell::RefCell<Option<ControlEndpoint>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Attempt ONE relay-wedge self-heal: trigger an app-side `rebind_control` over the
@@ -779,11 +994,19 @@ fn wsl_powershell_available() -> bool {
 /// [`healed_endpoint_after_rebind`] rather than adopting control.json's (read-only,
 /// under item-3 harden) token - closing the same silent read-only downgrade the
 /// primary path fixes (P71-1).
-fn try_bridge_rebind(discovery: &Discovery, stale: &ControlEndpoint) -> Option<ControlEndpoint> {
+fn try_bridge_rebind(
+    discovery: &Discovery,
+    stale: &ControlEndpoint,
+    deadline: Instant,
+) -> Option<ControlEndpoint> {
+    #[cfg(test)]
+    if let Some(endpoint) = TEST_BRIDGE_RESULT.with(|slot| slot.borrow_mut().take()) {
+        return Some(endpoint);
+    }
     if !wsl_powershell_available() {
         return None;
     }
-    if !send_rebind_via_powershell(stale) {
+    if !send_rebind_via_powershell(stale, deadline) {
         return None;
     }
     healed_endpoint_after_rebind(discovery, stale)
@@ -811,7 +1034,7 @@ fn healed_endpoint_after_rebind(
 /// the one-line JSON request from them. Bounded by powershell's own 8s socket
 /// timeouts so a hung bridge can't park the MCP server. Returns true iff the app
 /// answered with a rebind (`"rebound"`), i.e. the port actually moved.
-fn send_rebind_via_powershell(stale: &ControlEndpoint) -> bool {
+fn send_rebind_via_powershell(stale: &ControlEndpoint, deadline: Instant) -> bool {
     // control.json addr is always loopback `host:port`; split from the right so a
     // stray host colon (there is none for 127.0.0.1) can't misparse the port.
     let (host, port) = match stale.addr.rsplit_once(':') {
@@ -856,7 +1079,12 @@ try {
         Ok(c) => c,
         Err(_) => return false, // powershell.exe not found / spawn failed
     };
-    match wait_with_timeout(&mut child, BRIDGE_TIMEOUT) {
+    let Some(budget) = remaining(deadline).map(|left| left.min(BRIDGE_TIMEOUT)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    match wait_with_timeout(&mut child, budget) {
         Some(out) => out.contains("\"rebound\""),
         None => false, // timed out (child killed) or read failed
     }
@@ -901,7 +1129,14 @@ fn wait_with_timeout(child: &mut std::process::Child, budget: Duration) -> Optio
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
+
+    enum ScriptedReply {
+        Line(&'static str),
+        Partial(&'static str),
+        Close,
+    }
 
     /// A fake control server that services a scripted SEQUENCE of connections. For
     /// each entry it accepts one connection, reads the one request line (captured
@@ -933,6 +1168,249 @@ mod tests {
                 }
                 // `None`: drop the connection with no response (failed response leg).
             }
+        });
+        (addr, captured)
+    }
+
+    fn byte_scripted_server(replies: Vec<ScriptedReply>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                        cap.lock().unwrap().push(value);
+                    }
+                }
+                match reply {
+                    ScriptedReply::Line(body) => {
+                        let _ = writer.write_all(body.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                    ScriptedReply::Partial(body) => {
+                        let _ = writer.write_all(body.as_bytes());
+                        let _ = writer.flush();
+                    }
+                    ScriptedReply::Close => {}
+                }
+            }
+        });
+        (addr, captured)
+    }
+
+    fn mcp_binary() -> PathBuf {
+        if let Some(path) = option_env!("CARGO_BIN_EXE_t-hub-mcp") {
+            return PathBuf::from(path);
+        }
+        let test_exe = std::env::current_exe().unwrap();
+        let debug_dir = test_exe.parent().and_then(|path| path.parent()).unwrap();
+        let name = if cfg!(windows) {
+            "t-hub-mcp.exe"
+        } else {
+            "t-hub-mcp"
+        };
+        let binary = debug_dir.join(name);
+        assert!(
+            binary.is_file(),
+            "MCP process binary missing at {}; run `cargo build -p t-hub-mcp` before this focused test",
+            binary.display()
+        );
+        binary
+    }
+
+    fn run_mcp_spawn_process(addr: &str, token: &str) -> (std::process::Output, Duration) {
+        let mut child = Command::new(mcp_binary())
+            .env("T_HUB_CONTROL_ADDR", addr)
+            .env("T_HUB_CONTROL_TOKEN", token)
+            .env("T_HUB_CONTROL_FILE", "/nonexistent/th-control.json")
+            .env_remove("T_HUB_SESSION_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "spawn_terminal",
+                "arguments": {
+                    "cwd": "/tmp",
+                    "requestId": "partial-eof-process-request"
+                }
+            }
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        serde_json::to_writer(&mut stdin, &request).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        drop(stdin);
+
+        let started = Instant::now();
+        let deadline = started + CONTROL_DEADLINE + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("MCP process exceeded test deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed = started.elapsed();
+        (child.wait_with_output().unwrap(), elapsed)
+    }
+
+    fn assert_safe_mcp_process_output(output: &std::process::Output, addr: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("initial-cut"));
+        assert!(!stdout.contains("retry-cut"));
+        assert!(!stdout.contains(addr));
+    }
+
+    fn assert_single_reissue_sequence(requests: &[Value]) {
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(requests[3]["command"], "get_request_status");
+        let request_id = &requests[0]["args"]["requestId"];
+        assert!(request_id.is_string());
+        for request in &requests[1..] {
+            assert_eq!(&request["args"]["requestId"], request_id);
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["command"] == "spawn_terminal")
+                .count(),
+            2,
+            "the mutation may be reissued at most once"
+        );
+    }
+
+    fn silent_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                    cap.lock().unwrap().push(value);
+                }
+            }
+            std::thread::sleep(hold);
+        });
+        (addr, captured)
+    }
+
+    fn delayed_server(reply: &'static str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            std::thread::sleep(delay);
+            let mut writer = stream;
+            writer.write_all(reply.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+        });
+        addr
+    }
+
+    fn trickle_server(interval: Duration, writes: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut writer = stream;
+            for _ in 0..writes {
+                if writer.write_all(b"{").is_err() || writer.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+        addr
+    }
+
+    fn raw_response_server(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            let _ = writer.write_all(&response);
+            let _ = writer.flush();
+        });
+        addr
+    }
+
+    fn exact_limit_response() -> Vec<u8> {
+        let mut response = br#"{"ok":true,"result":null}"#.to_vec();
+        response.resize(MAX_RESPONSE_FRAME_BYTES, b' ');
+        response.push(b'\n');
+        response
+    }
+
+    fn silent_then_status_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            let mut first_reader = BufReader::new(first);
+            let mut first_line = String::new();
+            first_reader.read_line(&mut first_line).unwrap();
+            cap.lock()
+                .unwrap()
+                .push(serde_json::from_str(first_line.trim_end()).unwrap());
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                drop(first_reader);
+            });
+
+            let (second, _) = listener.accept().unwrap();
+            let mut second_reader = BufReader::new(second.try_clone().unwrap());
+            let mut second_line = String::new();
+            second_reader.read_line(&mut second_line).unwrap();
+            cap.lock()
+                .unwrap()
+                .push(serde_json::from_str(second_line.trim_end()).unwrap());
+            let mut writer = second;
+            writer
+                .write_all(
+                    b"{\"ok\":true,\"result\":{\"status\":\"completed\",\"ok\":true,\"result\":{\"id\":\"resolved\"}}}\n",
+                )
+                .unwrap();
         });
         (addr, captured)
     }
@@ -1029,14 +1507,22 @@ mod tests {
         // ONLY on the Timeout class = connected-but-silent, the relay-wedge signature.
         // A connection that CLOSES without responding (app down / old listener
         // retired) must classify as Transport so it recovers via the file re-read and
-        // never triggers a spurious rebind. This guards that gate hermetically (a true
-        // connected-but-silent Timeout would need the full 45s deadline to reproduce).
+        // never triggers a spurious rebind. This guards that gate hermetically.
         let (addr, _captured) = scripted_server(vec![None]); // accept, read, drop, no reply
         let ep = ControlEndpoint {
             addr,
             token: "t".into(),
         };
-        let err = call_classified(&ep, "list_terminals", &serde_json::json!({}));
+        let err = call_classified(
+            &ep,
+            "list_terminals",
+            &serde_json::json!({}),
+            CallBudget {
+                deadline: Instant::now() + Duration::from_millis(200),
+                attempt_timeout: Duration::from_millis(50),
+            },
+            None,
+        );
         assert!(
             matches!(err, Err(CallError::Transport(_))),
             "a connection closed without responding must be Transport (app-down class), \
@@ -1045,17 +1531,337 @@ mod tests {
     }
 
     #[test]
+    fn connected_but_silent_inherited_port_recovers_via_current_endpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-silent-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        let (stale_addr, _stale_requests) = silent_server(Duration::from_millis(180));
+        let (fresh_addr, fresh_requests) = scripted_server(vec![Some(
+            r#"{"ok":true,"result":{"capabilities":["read"]}}"#,
+        )]);
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{fresh_addr}","token":"published-read"}}"#),
+        )
+        .unwrap();
+        let discovery = Discovery {
+            addr: Some(stale_addr),
+            token: Some("inherited-control".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "capabilities",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["capabilities"], serde_json::json!(["read"]));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(
+            fresh_requests.lock().unwrap()[0]["token"],
+            "inherited-control"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn healthy_response_can_outlive_attempt_slice_within_overall_deadline() {
+        let addr = delayed_server(
+            r#"{"ok":true,"result":{"usage":"ready"}}"#,
+            Duration::from_millis(90),
+        );
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "codex_usage",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(value["usage"], "ready");
+    }
+
+    #[test]
+    fn partial_frame_trickle_cannot_bypass_absolute_deadline() {
+        let addr = trickle_server(Duration::from_millis(10), 30);
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+        let started = Instant::now();
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_millis(70),
+                attempt_timeout: Duration::from_millis(20),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CallError::Timeout("read")));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn exact_limit_response_frame_is_accepted() {
+        let addr = raw_response_server(exact_limit_response());
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+
+        let value = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn over_limit_response_frame_is_bounded_and_credential_safe() {
+        let secret = "oversized-server-token-must-not-leak";
+        let mut response = vec![b'x'; MAX_RESPONSE_FRAME_BYTES];
+        response.extend_from_slice(secret.as_bytes());
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let endpoint = ControlEndpoint {
+            addr: addr.clone(),
+            token: "control-token-must-not-leak".into(),
+        };
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap_err();
+        let CallError::Protocol(message) = error else {
+            panic!("oversized frame must be a protocol error");
+        };
+        assert!(message.contains("response frame exceeds"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("control-token-must-not-leak"));
+        assert!(!message.contains(&addr));
+    }
+
+    #[test]
+    fn unterminated_response_frame_is_a_safe_protocol_error() {
+        let secret = "unterminated-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{\"ok\":true,\"{secret}\":").into_bytes());
+
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("unterminated response frame after request write"));
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn malformed_response_frame_does_not_echo_peer_content() {
+        let secret = "malformed-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{not-json:{secret}}}\n").into_bytes());
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap_err();
+        let CallError::Protocol(message) = error else {
+            panic!("malformed frame must be a protocol error");
+        };
+        assert!(message.contains("malformed response"));
+        assert!(!message.contains(secret));
+    }
+
+    #[test]
+    fn unchanged_silent_idempotent_call_uses_reserved_status_budget() {
+        let (addr, captured) = silent_then_status_server(Duration::from_millis(300));
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "resolved");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn unchanged_silent_read_uses_reserved_maybe_heal_budget() {
+        *wedge_detector() = WedgeDetector::default();
+        let (silent_addr, _requests) = silent_server(Duration::from_millis(300));
+        let (healed_addr, healed_requests) =
+            scripted_server(vec![Some(r#"{"ok":true,"result":{"tabs":[]}}"#)]);
+        TEST_BRIDGE_RESULT.with(|slot| {
+            *slot.borrow_mut() = Some(ControlEndpoint {
+                addr: healed_addr,
+                token: "control".into(),
+            });
+        });
+        let discovery = Discovery {
+            addr: Some(silent_addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["tabs"], serde_json::json!([]));
+        assert_eq!(healed_requests.lock().unwrap()[0]["command"], "list_tabs");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn stale_discovery_consumes_the_same_overall_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-stale-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(&file, r#"{"addr":"127.0.0.1:1","token":"read"}"#).unwrap();
+        let discovery = Discovery {
+            file: Some(file),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::ZERO,
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert!(error.contains("control_timeout"));
+        assert!(error.contains("discovery"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_budget_exhaustion_is_classified_and_credential_safe() {
+        let (addr, _requests) = silent_server(Duration::from_millis(180));
+        let discovery = Discovery {
+            addr: Some(addr.clone()),
+            token: Some("inherited-control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(70),
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("control_timeout"), "error: {error}");
+        assert!(error.contains("retry_state=exhausted"));
+        assert!(!error.contains(&addr));
+        assert!(!error.contains("inherited-control"));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
     fn send_rebind_via_powershell_rejects_malformed_addr_without_spawning() {
         // No colon and a non-numeric port both fail the parse guards BEFORE any
         // powershell spawn, so these are deterministic on any platform.
-        assert!(!send_rebind_via_powershell(&ControlEndpoint {
-            addr: "no-colon-here".to_string(),
-            token: "t".to_string(),
-        }));
-        assert!(!send_rebind_via_powershell(&ControlEndpoint {
-            addr: "127.0.0.1:not-a-port".to_string(),
-            token: "t".to_string(),
-        }));
+        assert!(!send_rebind_via_powershell(
+            &ControlEndpoint {
+                addr: "no-colon-here".to_string(),
+                token: "t".to_string(),
+            },
+            Instant::now() + Duration::from_millis(50),
+        ));
+        assert!(!send_rebind_via_powershell(
+            &ControlEndpoint {
+                addr: "127.0.0.1:not-a-port".to_string(),
+                token: "t".to_string(),
+            },
+            Instant::now() + Duration::from_millis(50),
+        ));
     }
 
     fn discovery_for(addr: String) -> Discovery {
@@ -1123,6 +1929,350 @@ mod tests {
             rid,
             "the status query reuses the original requestId"
         );
+    }
+
+    #[test]
+    fn partial_eof_idempotent_call_resolves_completed_outcome() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-partial"}}}"#,
+            ),
+        ]);
+
+        let value = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-completed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "sess-partial");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(
+            requests[1]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn partial_eof_idempotent_call_resolves_failed_outcome() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed safely"}}"#,
+            ),
+        ]);
+
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-failed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "spawn failed safely");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn partial_eof_unknown_status_reruns_once_with_same_request_id() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"id":"sess-retried"}}"#),
+        ]);
+
+        let value = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-unknown"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "sess-retried");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(
+            requests[2]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn partial_eof_status_unavailable_exhausts_budget_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Close,
+        ]);
+        let started = Instant::now();
+
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-unavailable"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("control_timeout"));
+        assert!(error.contains("request status"));
+        assert!(error.contains("partial-unavailable"));
+        assert!(!error.contains("cut"));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn idempotent_pre_write_protocol_error_remains_fail_closed() {
+        let discovery = Discovery {
+            addr: Some("not-a-control-address".into()),
+            token: Some("pre-write-token-must-not-leak".into()),
+            file: Some(PathBuf::from("/nonexistent/th-control.json")),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "pre-write-malformed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("malformed endpoint address"));
+        assert!(!error.contains("pre-write-token-must-not-leak"));
+    }
+
+    #[test]
+    fn process_partial_eof_resolves_completed_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-process"}}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-process"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(
+            requests[1]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn process_partial_eof_resolves_failed_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed safely"}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "spawn failed safely"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn process_partial_eof_unknown_reruns_once_with_same_request_id() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"id":"sess-process-retried"}}"#),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-process-retried"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(
+            requests[2]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn process_reissue_partial_then_completed_queries_status_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-after-reissue"}}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-after-reissue"
+        );
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_failed_queries_status_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed after reissue"}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "spawn failed after reissue"
+        );
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_still_unknown_never_mutates_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_request_unknown"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert!(message.contains("retry_state=exhausted"));
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_status_unavailable_is_bounded() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Close,
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_timeout"));
+        assert!(message.contains("request status"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed >= CONTROL_DEADLINE - Duration::from_secs(1));
+        assert!(elapsed <= CONTROL_DEADLINE + Duration::from_secs(1));
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_partial_eof_status_unavailable_is_bounded_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Close,
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_timeout"));
+        assert!(message.contains("request status"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert!(!message.contains("process-control-token"));
+        assert!(!message.contains("cut"));
+        assert!(!message.contains(&addr));
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(elapsed >= CONTROL_DEADLINE - Duration::from_secs(1));
+        assert!(elapsed <= CONTROL_DEADLINE + Duration::from_secs(1));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
     }
 
     #[test]

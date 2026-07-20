@@ -1,47 +1,73 @@
-//! End-to-end proof of the MCP path on this dev box (PRD §9.6).
-//!
-//! This exercises the **real** pieces together, with no Tauri GUI:
-//!   1. a real [`Supervisor`] seeded with hook events + a real [`StatusBridge`]
-//!      with an ingested statusline snapshot;
-//!   2. a real `t-hub` control listener ([`t_hub_lib::control::start`]) on a
-//!      loopback port, with the handshake written to a temp file;
-//!   3. a real tmux session (`th_*` on a per-process ISOLATED socket, never the
-//!      live `t-hub`) so `list_terminals` has something to report;
-//!   4. the real compiled `t-hub-mcp` binary, spawned as a subprocess and
-//!      driven over its stdin/stdout with genuine MCP JSON-RPC.
-//!
-//! It then asserts the full JSON round-trip for `initialize`, `tools/list`, and
-//! several `tools/call`s (a Read tool, a search, a status read, and the gated
-//! process-changing tool), proving: MCP binary → control channel → app dispatch
-//! → back.
-//!
-//! The test is resilient: if tmux isn't available it still runs every non-tmux
-//! assertion; if the `t-hub-mcp` binary can't be located it fails with a clear
-//! message telling you to `cargo build -p t-hub-mcp` first.
+#![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+//! End-to-end proof of the real MCP binary, control listener, and tmux path.
+//!
+//! The control listener runs in a helper process. Closing that process is the
+//! explicit listener shutdown boundary, so a failed assertion cannot leave an
+//! accept loop or request handler alive in the integration-test process.
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-
+use sha2::{Digest, Sha256};
 use t_hub_lib::control;
-
-// The crate's internal types are reachable because we seed them through the
-// public test constructor; we only need the protocol event enum + the two
-// bridges, which are re-exported on the lib's public surface used by control.
 use t_hub_protocol::JournalEventType;
 
-/// Locate the compiled `t-hub-mcp` binary. The integration test binary lives
-/// in `target/<profile>/deps/`, so the sibling binary is `../t-hub-mcp`.
+const MCP_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const HELPER_LIFETIME: Duration = Duration::from_secs(60);
+const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(3);
+static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+const RETIRED_POWDER_TOOLS: [&str; 4] = [
+    "append_crew_powder_work_log",
+    "read_crew_powder_evidence",
+    "review_crew_powder_criterion",
+    "complete_crew_powder",
+];
+
+#[allow(dead_code)]
+const FORBIDDEN_AUTHORITY_FIELDS: [&str; 22] = [
+    "card",
+    "cardId",
+    "card_id",
+    "run",
+    "runId",
+    "run_id",
+    "profile",
+    "connectionProfile",
+    "connection_profile",
+    "endpoint",
+    "powderEndpoint",
+    "powder_endpoint",
+    "repository",
+    "powderRepository",
+    "powder_repository",
+    "repo",
+    "credential",
+    "apiKey",
+    "api_key",
+    "key",
+    "token",
+    "secret",
+];
+
 fn locate_mcp_binary() -> PathBuf {
     let mut dir = std::env::current_exe().expect("current_exe");
-    dir.pop(); // drop the test binary filename → .../deps
+    dir.pop();
     if dir.ends_with("deps") {
-        dir.pop(); // → .../<profile>
+        dir.pop();
     }
     let candidate = dir.join(if cfg!(windows) {
         "t-hub-mcp.exe"
@@ -50,107 +76,836 @@ fn locate_mcp_binary() -> PathBuf {
     });
     assert!(
         candidate.exists(),
-        "t-hub-mcp binary not found at {} — run `cargo build -p t-hub-mcp` first \
-         (the e2e test spawns the real binary)",
+        "t-hub-mcp binary not found at {}; run `cargo build -p t-hub-mcp` first",
         candidate.display()
     );
     candidate
 }
 
-/// A thin driver around the spawned MCP subprocess: write one JSON-RPC request
-/// line, read one JSON-RPC response line.
+fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => return Err("child process did not exit before deadline".into()),
+            Err(error) => return Err(format!("poll child process: {error}")),
+        }
+    }
+}
+
+fn stop_child(child: &mut Child) -> Result<(), String> {
+    if wait_for_child(child, PROCESS_SHUTDOWN_TIMEOUT).is_ok() {
+        return Ok(());
+    }
+    match child.kill() {
+        Ok(()) => {}
+        Err(_error) if child.try_wait().ok().flatten().is_some() => return Ok(()),
+        Err(error) => return Err(format!("hard-kill child process: {error}")),
+    }
+    wait_for_child(child, PROCESS_SHUTDOWN_TIMEOUT)
+}
+
+enum StdinCommand {
+    Write(Vec<u8>, Sender<Result<(), String>>),
+    Shutdown,
+}
+
 struct McpProc {
-    child: Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    child: Option<Child>,
+    stdin_tx: Sender<StdinCommand>,
+    responses: Receiver<Result<Value, String>>,
+    writer_done: Receiver<()>,
+    reader_done: Receiver<()>,
+    writer: Option<thread::JoinHandle<()>>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl McpProc {
-    fn spawn(bin: &PathBuf, handshake_file: &PathBuf) -> Self {
-        let mut child = Command::new(bin)
-            // Point the binary's discovery at our temp handshake file so it
-            // connects to the listener this test started.
+    fn spawn(
+        bin: &Path,
+        handshake_file: &Path,
+        tmux_socket: &str,
+        endpoint: Option<(&str, &str)>,
+        session_token: Option<&str>,
+    ) -> Self {
+        let mut command = Command::new(bin);
+        command
             .env("T_HUB_CONTROL_FILE", handshake_file)
-            // Make sure no stray addr/token override leaks in from the harness.
+            .env("T_HUB_TMUX_SOCKET", tmux_socket)
             .env_remove("T_HUB_CONTROL_ADDR")
             .env_remove("T_HUB_CONTROL_TOKEN")
+            .env_remove("T_HUB_SESSION_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn t-hub-mcp");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+            .stderr(Stdio::inherit());
+        if let Some((addr, token)) = endpoint {
+            command
+                .env("T_HUB_CONTROL_ADDR", addr)
+                .env("T_HUB_CONTROL_TOKEN", token);
+        }
+        if let Some(session_token) = session_token {
+            command.env("T_HUB_SESSION_TOKEN", session_token);
+        }
+        let mut child = command.spawn().expect("spawn t-hub-mcp");
+        let mut stdin = child.stdin.take().expect("MCP stdin");
+        let stdout = child.stdout.take().expect("MCP stdout");
+
+        let (stdin_tx, stdin_rx) = mpsc::channel();
+        let (writer_done_tx, writer_done) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            while let Ok(command) = stdin_rx.recv() {
+                match command {
+                    StdinCommand::Write(line, ack) => {
+                        let result = stdin
+                            .write_all(&line)
+                            .and_then(|_| stdin.flush())
+                            .map_err(|error| format!("write MCP stdin: {error}"));
+                        let _ = ack.send(result);
+                    }
+                    StdinCommand::Shutdown => break,
+                }
+            }
+            let _ = writer_done_tx.send(());
+        });
+
+        let (response_tx, responses) = mpsc::channel();
+        let (reader_done_tx, reader_done) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match stdout.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = response_tx.send(Err("MCP stdout closed".to_string()));
+                        break;
+                    }
+                    Ok(_) => {
+                        let parsed = serde_json::from_str(line.trim_end())
+                            .map_err(|error| format!("invalid MCP JSON response: {error}"));
+                        if response_tx.send(parsed).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response_tx.send(Err(format!("read MCP stdout: {error}")));
+                        break;
+                    }
+                }
+            }
+            let _ = reader_done_tx.send(());
+        });
+
         Self {
-            child,
-            stdin,
-            stdout,
+            child: Some(child),
+            stdin_tx,
+            responses,
+            writer_done,
+            reader_done,
+            writer: Some(writer),
+            reader: Some(reader),
         }
     }
 
-    /// Send a request and read the next response line as JSON. Prints the
-    /// request/response pair so `cargo test -- --nocapture` shows the real wire
-    /// transcript (the human-readable proof evidence).
-    fn request(&mut self, value: Value) -> Value {
-        let req_line = serde_json::to_string(&value).unwrap();
-        println!("→ {req_line}");
-        let mut line = req_line.into_bytes();
+    fn send_line(&self, mut line: Vec<u8>) {
         line.push(b'\n');
-        self.stdin.write_all(&line).expect("write to mcp stdin");
-        self.stdin.flush().unwrap();
-        let mut resp = String::new();
-        let n = self.stdout.read_line(&mut resp).expect("read mcp stdout");
-        assert!(n > 0, "t-hub-mcp closed stdout without responding");
-        println!("← {}", resp.trim_end());
-        serde_json::from_str(resp.trim_end())
-            .unwrap_or_else(|e| panic!("non-JSON response {resp:?}: {e}"))
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.stdin_tx
+            .send(StdinCommand::Write(line, ack_tx))
+            .expect("MCP writer thread is available");
+        ack_rx
+            .recv_timeout(MCP_IO_TIMEOUT)
+            .expect("MCP stdin write deadline exceeded")
+            .expect("MCP stdin write failed");
     }
 
-    /// Send a notification (no response expected).
-    fn notify(&mut self, value: Value) {
-        let mut line = serde_json::to_vec(&value).unwrap();
-        line.push(b'\n');
-        self.stdin.write_all(&line).unwrap();
-        self.stdin.flush().unwrap();
+    fn request(&self, value: Value) -> Value {
+        self.send_line(serde_json::to_vec(&value).expect("serialize MCP request"));
+        self.responses
+            .recv_timeout(MCP_IO_TIMEOUT)
+            .expect("MCP response deadline exceeded")
+            .expect("MCP response failed")
+    }
+
+    fn notify(&self, value: Value) {
+        self.send_line(serde_json::to_vec(&value).expect("serialize MCP notification"));
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if self.child.is_none() && self.writer.is_none() && self.reader.is_none() {
+            return Ok(());
+        }
+        let _ = self.stdin_tx.send(StdinCommand::Shutdown);
+        if let Some(child) = self.child.as_mut() {
+            stop_child(child)?;
+        }
+        self.child.take();
+        self.finish_thread(true)?;
+        self.finish_thread(false)?;
+        Ok(())
+    }
+
+    fn finish_thread(&mut self, writer: bool) -> Result<(), String> {
+        let (done, handle) = if writer {
+            (&self.writer_done, &mut self.writer)
+        } else {
+            (&self.reader_done, &mut self.reader)
+        };
+        done.recv_timeout(PROCESS_SHUTDOWN_TIMEOUT).map_err(|_| {
+            format!(
+                "MCP {} thread did not stop",
+                if writer { "writer" } else { "reader" }
+            )
+        })?;
+        if let Some(handle) = handle.take() {
+            handle.join().map_err(|_| {
+                format!(
+                    "MCP {} thread panicked",
+                    if writer { "writer" } else { "reader" }
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for McpProc {
     fn drop(&mut self) {
-        // Closing stdin makes the server loop hit EOF and exit; then reap it.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.shutdown().is_err() {
+            std::process::abort();
+        }
     }
 }
 
-/// Helper to pull the structured tool-call payload out of an MCP `tools/call`
-/// success response.
-fn tool_structured(resp: &Value) -> &Value {
+struct ControlProc {
+    child: Option<Child>,
+    temp_dir: PathBuf,
+    handshake_file: PathBuf,
+    stop_file: PathBuf,
+    auth_file: PathBuf,
+    seed_file: PathBuf,
+    seed_ready_file: PathBuf,
+    powder_state_file: PathBuf,
+    addr: String,
+    control_token: String,
+    read_token: String,
+}
+
+struct TempDirGuard(Option<PathBuf>);
+
+impl TempDirGuard {
+    fn disarm(mut self) -> PathBuf {
+        self.0.take().expect("temporary directory path")
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+impl ControlProc {
+    fn spawn(tmux_socket: &str) -> Self {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_dir =
+            std::env::temp_dir().join(format!("th-mcp-e2e-control-{}-{id}", std::process::id()));
+        fs::create_dir_all(&temp_dir).expect("create control helper temp directory");
+        let temp_guard = TempDirGuard(Some(temp_dir));
+        let temp_dir = temp_guard.0.as_ref().unwrap();
+        let handshake_file = temp_dir.join("control.json");
+        let stop_file = temp_dir.join("stop");
+        let auth_file = temp_dir.join("auth.json");
+        let seed_file = temp_dir.join("seed.json");
+        let seed_ready_file = temp_dir.join("seed-ready");
+        let powder_state_file = temp_dir.join("powder-state.json");
+        let child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "mcp_control_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("T_HUB_MCP_CONTROL_HELPER", "1")
+            .env("T_HUB_CONTROL_FILE", &handshake_file)
+            .env("T_HUB_MCP_CONTROL_STOP_FILE", &stop_file)
+            .env("T_HUB_MCP_CONTROL_AUTH_FILE", &auth_file)
+            .env("T_HUB_MCP_CONTROL_SEED_FILE", &seed_file)
+            .env("T_HUB_MCP_CONTROL_SEED_READY_FILE", &seed_ready_file)
+            .env("T_HUB_MCP_POWDER_STATE_FILE", &powder_state_file)
+            .env("T_HUB_TMUX_SOCKET", tmux_socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn control helper process");
+        let temp_dir = temp_guard.disarm();
+        let mut process = Self {
+            child: Some(child),
+            temp_dir,
+            handshake_file,
+            stop_file,
+            auth_file,
+            seed_file,
+            seed_ready_file,
+            powder_state_file,
+            addr: String::new(),
+            control_token: String::new(),
+            read_token: String::new(),
+        };
+        process.wait_until_ready();
+        process
+    }
+
+    fn wait_until_ready(&mut self) {
+        let deadline = Instant::now() + HELPER_READY_TIMEOUT;
+        loop {
+            if let Some(auth) = fs::read(&self.auth_file)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+            {
+                self.addr = auth["addr"].as_str().expect("helper addr").to_string();
+                self.control_token = auth["controlToken"]
+                    .as_str()
+                    .expect("helper control token")
+                    .to_string();
+                self.read_token = auth["readToken"]
+                    .as_str()
+                    .expect("helper read token")
+                    .to_string();
+                return;
+            }
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+            {
+                panic!("control helper exited before readiness: {status}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control helper readiness deadline exceeded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if self.child.is_none() {
+            return Ok(());
+        }
+        fs::write(&self.stop_file, b"stop\n")
+            .map_err(|error| format!("signal control helper: {error}"))?;
+        if let Some(child) = self.child.as_mut() {
+            stop_child(child)?;
+        }
+        self.child.take();
+        let addr = self
+            .addr
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("parse helper address: {error}"))?;
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+            return Err("control listener remained reachable after helper exit".into());
+        }
+        fs::remove_dir_all(&self.temp_dir)
+            .map_err(|error| format!("remove control helper temp directory: {error}"))?;
+        if self.temp_dir.exists() {
+            return Err("control helper temp directory remained after removal".into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ControlProc {
+    fn drop(&mut self) {
+        if self.shutdown().is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+struct NoopApplySink;
+
+impl control::ApplySink for NoopApplySink {
+    fn apply(&self, _command: &str, _args: &Value) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PowderFixtureState {
+    completed: bool,
+    proof: Option<String>,
+    append_posts: Vec<Value>,
+    criterion_review_posts: Vec<Value>,
+    completion_posts: Vec<Value>,
+    request_paths: Vec<String>,
+}
+
+struct PowderFixtureServer {
+    addr: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    done: Receiver<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PowderFixtureServer {
+    fn start(state_file: PathBuf) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Powder fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("set Powder fixture nonblocking");
+        let addr = listener.local_addr().expect("Powder fixture address");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let (done_tx, done) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let state = Arc::new(std::sync::Mutex::new(PowderFixtureState::default()));
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((_stream, _)) if thread_stop.load(Ordering::Acquire) => break,
+                    Ok((stream, _)) => handle_powder_fixture_request(stream, &state, &state_file),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept Powder fixture request: {error}"),
+                }
+            }
+            write_powder_fixture_state(&state_file, &state.lock().unwrap());
+            let _ = done_tx.send(());
+        });
+        Self {
+            addr,
+            stop,
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if self.thread.is_none() {
+            return Ok(());
+        }
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
+        self.done
+            .recv_timeout(PROCESS_SHUTDOWN_TIMEOUT)
+            .map_err(|_| "Powder fixture thread did not stop".to_string())?;
+        self.thread
+            .take()
+            .expect("Powder fixture thread")
+            .join()
+            .map_err(|_| "Powder fixture thread panicked".to_string())?;
+        Ok(())
+    }
+}
+
+impl Drop for PowderFixtureServer {
+    fn drop(&mut self) {
+        if self.shutdown().is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+fn write_powder_fixture_state(path: &Path, state: &PowderFixtureState) {
+    fs::write(
+        path,
+        serde_json::to_vec(state).expect("serialize Powder fixture state"),
+    )
+    .expect("write Powder fixture state");
+}
+
+fn handle_powder_fixture_request(
+    mut stream: TcpStream,
+    state: &Arc<std::sync::Mutex<PowderFixtureState>>,
+    state_file: &Path,
+) {
+    stream
+        .set_read_timeout(Some(FIXTURE_IO_TIMEOUT))
+        .expect("set Powder fixture read timeout");
+    stream
+        .set_write_timeout(Some(FIXTURE_IO_TIMEOUT))
+        .expect("set Powder fixture write timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone Powder fixture stream"));
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("read Powder fixture request line");
+    if request_line.is_empty() {
+        return;
+    }
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("read Powder fixture header");
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some(length) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            content_length = length;
+        }
+    }
     assert!(
-        resp.get("error").is_none(),
-        "tools/call returned a transport error: {resp}"
+        content_length <= 32 * 1024,
+        "Powder fixture request too large"
     );
-    &resp["result"]["structuredContent"]
+    let mut body = vec![0; content_length];
+    reader
+        .read_exact(&mut body)
+        .expect("read Powder fixture request body");
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("parse Powder fixture request body")
+    };
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or_default();
+    let (status, response) = {
+        let mut state = state.lock().unwrap();
+        state.request_paths.push(format!("{method} {path}"));
+        let result = match (method, path) {
+            ("GET", "/readyz") => (200, json!({"ok": true, "schema_version": 18})),
+            ("GET", "/api/v1/routes") => (200, powder_capability_routes()),
+            ("GET", "/api/v1/cards/mcp-owned-card") => (200, powder_card_evidence(&state)),
+            ("GET", "/api/v1/runs/mcp-owned-run") => (200, powder_run_evidence(&state)),
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/work-log") => {
+                state.append_posts.push(body.clone());
+                (
+                    200,
+                    powder_operation_outcome(
+                        "work_log_append",
+                        &body,
+                        json!({
+                            "schema_version": "powder.work_log_entry.v1",
+                            "id": "work-log-mcp",
+                            "card_id": "mcp-owned-card",
+                            "actor": body["agent"],
+                            "agent": body["agent"],
+                            "model": body["model"],
+                            "reasoning": body["reasoning"],
+                            "harness": body["harness"],
+                            "run_id": "mcp-owned-run",
+                            "body": body["body"],
+                            "created_at": 11,
+                            "updated_at": 11
+                        }),
+                    ),
+                )
+            }
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/criteria/review") => {
+                state.criterion_review_posts.push(body.clone());
+                (
+                    200,
+                    powder_operation_outcome(
+                        "criterion_review",
+                        &body,
+                        json!({
+                            "id": "review-mcp",
+                            "operation_id": body["operation_id"],
+                            "card_id": "mcp-owned-card",
+                            "run_id": "mcp-owned-run",
+                            "criterion_index": body["criterion"],
+                            "criterion_id": body["criterion_id"],
+                            "criterion_text": "MCP dispatcher criterion",
+                            "decision": body["decision"],
+                            "reviewer": "mcp-captain",
+                            "reviewer_identity": "actor-t-hub",
+                            "proof": body["proof"],
+                            "supersedes_review_id": "review-initial",
+                            "created_at": 124
+                        }),
+                    ),
+                )
+            }
+            ("POST", "/api/v1/cards/mcp-owned-card/runs/mcp-owned-run/complete") => {
+                state.completion_posts.push(body.clone());
+                state.completed = true;
+                state.proof = body["proof"].as_str().map(str::to_string);
+                (
+                    200,
+                    powder_operation_outcome(
+                        "completion",
+                        &body,
+                        json!({
+                            "schema_version": "powder.run_bound_completion.v1",
+                            "card_id": "mcp-owned-card",
+                            "run_id": "mcp-owned-run",
+                            "operation_id": body["operation_id"],
+                            "status": "done",
+                            "proof": body["proof"],
+                            "criterion_proofs": body["criterion_proofs"],
+                            "updated_at": 126,
+                            "audit_event_id": "audit-mcp-operation"
+                        }),
+                    ),
+                )
+            }
+            _ => (404, json!({"error": "unexpected fixture route"})),
+        };
+        write_powder_fixture_state(state_file, &state);
+        result
+    };
+    let response = response.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        if status == 200 { "OK" } else { "Not Found" },
+        response.len(),
+        response
+    )
+    .expect("write Powder fixture response");
+    stream.flush().expect("flush Powder fixture response");
+}
+
+fn powder_capability_routes() -> Value {
+    json!([
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/work-log",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"agent\":\"...\",\"body\":\"...\"}"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"criterion\":0,\"criterion_id\":\"...\",\"decision\":\"approved\"}"
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/cards/{id}/runs/{run_id}/complete",
+            "body_shape": "{\"operation_id\":\"stable-id\",\"proof\":null,\"criterion_proofs\":null}"
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/operations/{id}",
+            "body_shape": null
+        }
+    ])
+}
+
+fn powder_operation_outcome(kind: &str, body: &Value, result: Value) -> Value {
+    json!({
+        "schema_version": "powder.operation_status.v1",
+        "operation_id": body["operation_id"],
+        "state": "succeeded",
+        "request_digest": powder_operation_request_digest(kind, body),
+        "kind": kind,
+        "target_card_id": "mcp-owned-card",
+        "expected_run_id": "mcp-owned-run",
+        "result": result,
+        "failure": null,
+        "audit_event_id": "audit-mcp-operation",
+        "created_at": 125,
+        "updated_at": 126,
+        "expires_at": 600
+    })
+}
+
+fn powder_operation_request_digest(kind: &str, body: &Value) -> String {
+    let criterion_index = body["criterion"].as_u64().map(|value| value.to_string());
+    let criterion_proofs = body["criterion_proofs"].as_array().map(|proofs| {
+        serde_json::to_string(
+            &proofs
+                .iter()
+                .map(|proof| {
+                    json!({
+                        "criterion": proof["criterion"],
+                        "url": proof["url"],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    });
+    let payload = match kind {
+        "work_log_append" => vec![
+            ("agent", body["agent"].as_str()),
+            ("model", body["model"].as_str()),
+            ("reasoning", body["reasoning"].as_str()),
+            ("harness", body["harness"].as_str()),
+            ("body", body["body"].as_str()),
+        ],
+        "criterion_review" => vec![
+            ("criterion_index", criterion_index.as_deref()),
+            ("criterion_id", body["criterion_id"].as_str()),
+            ("decision", body["decision"].as_str()),
+            ("proof", body["proof"].as_str()),
+        ],
+        "completion" => vec![
+            ("proof", body["proof"].as_str()),
+            ("criterion_proofs", criterion_proofs.as_deref()),
+        ],
+        _ => panic!("unsupported Powder operation kind"),
+    };
+    let mut hasher = Sha256::new();
+    for (name, value) in [
+        ("schema", Some("powder.operation_request.v1")),
+        ("kind", Some(kind)),
+        ("target_type", Some("card")),
+        ("target", Some("mcp-owned-card")),
+        ("authority", Some("actor-t-hub")),
+        ("expected_run", Some("mcp-owned-run")),
+    ]
+    .into_iter()
+    .chain(payload)
+    {
+        hasher.update(u32::try_from(name.len()).unwrap().to_be_bytes());
+        hasher.update(name.as_bytes());
+        match value {
+            Some(value) => {
+                hasher.update(u32::try_from(value.len()).unwrap().to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update(u32::MAX.to_be_bytes()),
+        }
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+const MCP_CRITERION_ID: &str =
+    "powder.criterion.v1:sha256:1977e92d087253639c224379af040d1b1b59714c0062b8fe6ab134abee4eaf5c:0";
+
+fn powder_criterion(state: &PowderFixtureState) -> Value {
+    let proof_links = state
+        .completion_posts
+        .last()
+        .and_then(|post| post["criterion_proofs"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|proof| proof["url"].as_str())
+        .map(|url| {
+            json!({
+                "url": url,
+                "actor": "mcp-captain",
+                "created_at": 126
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "text": "MCP dispatcher criterion",
+        "checked_by": "mcp-captain",
+        "checked_at": 123,
+        "proof_links": proof_links
+    })
+}
+
+fn powder_run(state: &PowderFixtureState) -> Value {
+    json!({
+        "id": "mcp-owned-run",
+        "card_id": "mcp-owned-card",
+        "state": if state.completed { "complete" } else { "active" },
+        "agent": "powder-agent",
+        "proof": state.proof,
+        "claim_expires_at": if state.completed { 0 } else { 100 },
+        "created_at": 1,
+        "updated_at": 2
+    })
+}
+
+fn powder_card(state: &PowderFixtureState) -> Value {
+    json!({
+        "id": "mcp-owned-card",
+        "title": "MCP dispatcher sentinel",
+        "status": if state.completed { "done" } else { "running" },
+        "repo": "t-hub",
+        "updated_at": 2,
+        "claim": if state.completed { Value::Null } else { json!({
+            "run_id": "mcp-owned-run",
+            "agent": "powder-agent",
+            "expires_at": 100
+        }) },
+        "criteria": [powder_criterion(state)]
+    })
+}
+
+fn powder_card_evidence(state: &PowderFixtureState) -> Value {
+    let work_log = state
+        .append_posts
+        .iter()
+        .enumerate()
+        .map(|(index, post)| {
+            json!({
+                "card_id": "mcp-owned-card",
+                "agent": post["agent"],
+                "model": post["model"],
+                "reasoning": post["reasoning"],
+                "harness": post["harness"],
+                "run_id": "mcp-owned-run",
+                "body": post["body"],
+                "created_at": 11 + index as i64
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "card": powder_card(state),
+        "runs": [powder_run(state)],
+        "runs_total": 1,
+        "work_log": work_log,
+        "work_log_total": state.append_posts.len(),
+        "current_run_criteria": if state.completed {
+            Vec::<Value>::new()
+        } else {
+            vec![powder_run_criterion()]
+        }
+    })
+}
+
+fn powder_run_evidence(state: &PowderFixtureState) -> Value {
+    json!({
+        "run": powder_run(state),
+        "card": powder_card(state),
+        "activities": [],
+        "activities_total": 0,
+        "links": [],
+        "links_total": 0,
+        "criteria": [powder_run_criterion()]
+    })
+}
+
+fn powder_run_criterion() -> Value {
+    json!({
+        "criterion_index": 0,
+        "criterion_id": MCP_CRITERION_ID,
+        "criterion_text": "MCP dispatcher criterion",
+        "review": {
+            "id": "review-initial",
+            "operation_id": "review-operation-initial",
+            "card_id": "mcp-owned-card",
+            "run_id": "mcp-owned-run",
+            "criterion_index": 0,
+            "criterion_id": MCP_CRITERION_ID,
+            "criterion_text": "MCP dispatcher criterion",
+            "decision": "approved",
+            "reviewer": "mcp-captain",
+            "reviewer_identity": "actor-t-hub",
+            "proof": "initial review proof",
+            "supersedes_review_id": null,
+            "created_at": 123
+        }
+    })
 }
 
 #[test]
-fn end_to_end_mcp_round_trip() {
-    let bin = locate_mcp_binary();
-
-    // ISOLATED SOCKET: point this whole test (the in-process control listener that
-    // runs the tmux ops, the spawned t-hub-mcp which inherits the env, and the
-    // make/kill helpers below) at a per-process socket, NEVER the live `t-hub` a
-    // running app drives. Set BEFORE anything resolves `tmux::socket()` (the first
-    // list_terminals). Cleaned up at the end alongside T_HUB_CONTROL_FILE.
-    let tmux_socket = format!("t-hub-mcpe2e-{}", std::process::id());
-    std::env::set_var("T_HUB_TMUX_SOCKET", &tmux_socket);
-
-    // --- 1. Seed real supervision + status state -------------------------
+#[ignore = "spawned only by end_to_end_mcp_round_trip"]
+fn mcp_control_helper() {
+    if std::env::var("T_HUB_MCP_CONTROL_HELPER").as_deref() != Ok("1") {
+        return;
+    }
     let supervisor = Arc::new(Mutex::new(t_hub_lib::supervision_for_test()));
     {
-        let mut s = supervisor.lock();
-        // An orchestrator with a running subagent, then Stop → WaitingOnSubagents.
-        s.ingest(
+        let mut state = supervisor.lock();
+        state.ingest(
             Some("sess-e2e"),
             None,
             None,
@@ -158,7 +913,7 @@ fn end_to_end_mcp_round_trip() {
             JournalEventType::SessionStart,
             1,
         );
-        s.ingest(
+        state.ingest(
             Some("sess-e2e"),
             None,
             None,
@@ -166,7 +921,7 @@ fn end_to_end_mcp_round_trip() {
             JournalEventType::UserPromptSubmit,
             2,
         );
-        s.ingest(
+        state.ingest(
             Some("sess-e2e"),
             Some("agent-1"),
             Some("general-purpose"),
@@ -174,7 +929,7 @@ fn end_to_end_mcp_round_trip() {
             JournalEventType::SubagentStart,
             3,
         );
-        s.ingest(
+        state.ingest(
             Some("sess-e2e"),
             None,
             None,
@@ -183,107 +938,700 @@ fn end_to_end_mcp_round_trip() {
             4,
         );
     }
-
     let status = Arc::new(t_hub_lib::status_bridge_for_test());
     status.ingest(
         "sess-e2e",
         &json!({ "context_window": { "used_percentage": 42.0 } }),
         1000,
     );
-
-    // --- 2. Start the real control listener ------------------------------
     let token = format!("e2e-token-{}", std::process::id());
-    let tmp = std::env::temp_dir().join(format!("th-mcp-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let handshake_file = tmp.join("control.json");
-    std::env::set_var("T_HUB_CONTROL_FILE", &handshake_file);
-
-    let ctx = control::ControlContext::with_shared_supervisor(
-        status.clone(),
-        supervisor.clone(),
-        token.clone(),
+    let read_token = format!("e2e-read-token-{}", std::process::id());
+    let registry = Arc::new(control::CaptainsRegistry::new());
+    let powder_state_file =
+        PathBuf::from(std::env::var_os("T_HUB_MCP_POWDER_STATE_FILE").expect("Powder state file"));
+    let mut powder_server = PowderFixtureServer::start(powder_state_file);
+    let profile_file = powder_server_profile_file(powder_server.addr);
+    std::env::set_var("T_HUB_POWDER_PROFILES_FILE", &profile_file);
+    let context =
+        control::ControlContext::with_shared_supervisor(status, supervisor, token.clone())
+            .with_read_token(read_token.clone())
+            .with_captains_registry(registry.clone())
+            .with_apply_sink(Arc::new(NoopApplySink));
+    let handshake = control::start(context).expect("control listener starts");
+    assert_eq!(handshake.local_control_token, token);
+    fs::write(
+        std::env::var_os("T_HUB_MCP_CONTROL_AUTH_FILE").expect("control helper auth file"),
+        serde_json::to_vec(&json!({
+            "addr": handshake.addr,
+            "controlToken": handshake.local_control_token,
+            "readToken": handshake.read_token,
+        }))
+        .expect("serialize control helper auth"),
+    )
+    .expect("write control helper auth");
+    let stop_file = PathBuf::from(
+        std::env::var_os("T_HUB_MCP_CONTROL_STOP_FILE").expect("control helper stop file"),
     );
-    let handshake = control::start(ctx).expect("control listener starts");
-    assert_eq!(handshake.token, token);
-    // Give the accept loop a beat to be ready.
-    std::thread::sleep(Duration::from_millis(100));
+    let seed_file = PathBuf::from(
+        std::env::var_os("T_HUB_MCP_CONTROL_SEED_FILE").expect("control helper seed file"),
+    );
+    let seed_ready_file = PathBuf::from(
+        std::env::var_os("T_HUB_MCP_CONTROL_SEED_READY_FILE")
+            .expect("control helper seed ready file"),
+    );
+    let deadline = Instant::now() + HELPER_LIFETIME;
+    let mut seeded = false;
+    while !stop_file.exists() && Instant::now() < deadline {
+        if !seeded {
+            if let Ok(body) = fs::read(&seed_file) {
+                let seed: Value = serde_json::from_slice(&body).expect("parse registry seed");
+                seed_powder_registry(&registry, &seed);
+                fs::write(&seed_ready_file, b"ready\n").expect("write seed ready marker");
+                seeded = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    powder_server.shutdown().expect("stop Powder fixture");
+    let _ = fs::remove_file(profile_file);
+}
 
-    // --- 3. A real tmux session so list_terminals reports something ------
+fn powder_server_profile_file(addr: SocketAddr) -> PathBuf {
+    let path =
+        PathBuf::from(std::env::var_os("T_HUB_MCP_POWDER_STATE_FILE").expect("Powder state file"))
+            .with_file_name("powder-profiles.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "profiles": {
+                "mcp-e2e-powder": {
+                    "baseUrl": format!("http://{addr}"),
+                    "agentName": "powder-agent",
+                    "operationIdentity": "actor-t-hub",
+                    "apiKey": "mcp-e2e-key"
+                }
+            }
+        }))
+        .expect("serialize Powder profile"),
+    )
+    .expect("write Powder profile");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("protect Powder profile fixture");
+    }
+    path
+}
+
+fn seed_powder_registry(registry: &control::CaptainsRegistry, seed: &Value) {
+    for fixture in ["owned", "foreign"] {
+        let captain = seed[format!("{fixture}Captain")]
+            .as_str()
+            .expect("seed Captain tile");
+        let crew = seed[format!("{fixture}Crew")]
+            .as_str()
+            .expect("seed Crew tile");
+        let ship = format!("mcp-{fixture}-ship");
+        let project_id = format!("mcp-{fixture}-project");
+        let card_id = format!("mcp-{fixture}-card");
+        let run_id = format!("mcp-{fixture}-run");
+        registry
+            .upsert_project(control::ProjectRecord {
+                project_id: project_id.clone(),
+                name: format!("MCP {fixture} project"),
+                repo_root: format!("/tmp/mcp-{fixture}-project"),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(control::PowderProjectBinding {
+                    connection_profile: "mcp-e2e-powder".into(),
+                    repository: "t-hub".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .expect("register Powder fixture project");
+        registry
+            .claim_provider(
+                captain,
+                Some(&ship),
+                control::FleetRole::Captain,
+                Some("codex"),
+                Some(&format!("mcp-{fixture}-thread")),
+                vec![],
+                &|_| false,
+                &|_| panic!("crew liveness is unused for a fresh claim"),
+            )
+            .expect("claim fixture Captain");
+        registry
+            .bind_ship_context(captain, &project_id, "MCP E2E fixture", "codex")
+            .or_else(|_| registry.bind_ship_context(&ship, &project_id, "MCP E2E fixture", "codex"))
+            .expect("bind fixture Captain project");
+        registry
+            .record_crew(captain, crew)
+            .expect("record fixture Crew");
+        let powder_work = serde_json::from_value(json!({
+            "cardId": card_id,
+            "runId": run_id,
+            "agent": "powder-agent",
+            "claimExpiresAt": 100,
+            "state": { "kind": "active" }
+        }))
+        .expect("deserialize cross-version Powder work binding");
+        registry
+            .bind_crew_context(
+                captain,
+                crew,
+                "Exercise Powder MCP lifecycle",
+                "codex",
+                Some("/tmp"),
+                Some("feat/mcp-e2e"),
+                powder_work,
+            )
+            .expect("bind fixture Crew Powder work");
+    }
+}
+
+fn tool_structured(response: &Value) -> &Value {
+    assert!(
+        response.get("error").is_none(),
+        "tools/call returned a transport error: {response}"
+    );
+    &response["result"]["structuredContent"]
+}
+
+fn assert_response_id(response: &Value, id: u64) {
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], id);
+}
+
+fn initialize_mcp(mcp: &McpProc, id: u64) {
+    let response = mcp.request(json!({
+        "jsonrpc": "2.0", "id": id, "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    assert_response_id(&response, id);
+    assert_eq!(response["result"]["serverInfo"]["name"], "t-hub-mcp");
+    mcp.notify(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+}
+
+fn call_tool(mcp: &McpProc, id: u64, name: &str, arguments: Value) -> Value {
+    let response = mcp.request(json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    }));
+    assert_response_id(&response, id);
+    response
+}
+
+fn tool_error_text(response: &Value) -> &str {
+    assert_eq!(
+        response["result"]["isError"], true,
+        "expected tool error: {response}"
+    );
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool error text")
+}
+
+fn spawn_fixture_terminal(mcp: &McpProc, id: u64, capability: &str) -> String {
+    let response = call_tool(
+        mcp,
+        id,
+        "spawn_terminal",
+        json!({
+            "cwd": "/tmp",
+            "startupCommand": "sleep 300",
+            "capability": capability
+        }),
+    );
+    let result = tool_structured(&response);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(result["accepted"], "spawn_terminal");
+    result["id"]
+        .as_str()
+        .expect("spawned terminal id")
+        .to_string()
+}
+
+fn tmux_session_token(socket: &str, terminal_id: &str) -> String {
+    let target = format!("th_{terminal_id}");
+    let output = bounded_tmux_output(
+        socket,
+        &["show-environment", "-t", &target, "T_HUB_SESSION_TOKEN"],
+    )
+    .expect("read tmux session identity");
+    assert!(output.status.success(), "tmux session identity unavailable");
+    String::from_utf8(output.stdout)
+        .expect("tmux session identity UTF-8")
+        .trim()
+        .strip_prefix("T_HUB_SESSION_TOKEN=")
+        .expect("tmux session token assignment")
+        .to_string()
+}
+
+fn wait_for_path(path: &Path, label: &str) {
+    let deadline = Instant::now() + HELPER_READY_TIMEOUT;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{label} deadline exceeded");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// Historical integration fixture retained for reference only. Retired Powder
+// operations must never be exercised by the active MCP E2E suite.
+#[cfg(any())]
+#[test]
+fn powder_tools_reach_real_authenticated_dispatcher() {
+    let bin = locate_mcp_binary();
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let tmux_socket = format!("t-hub-mcp-powder-{}-{test_id}", std::process::id());
+    let mut control = ControlProc::spawn(&tmux_socket);
+    let endpoint = (&control.addr[..], &control.read_token[..]);
+
+    let mut anonymous = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some(endpoint),
+        None,
+    );
+    initialize_mcp(&anonymous, 100);
+    let anonymous_read = call_tool(
+        &anonymous,
+        101,
+        "read_crew_powder_evidence",
+        json!({"limit": 20}),
+    );
+    let anonymous_read_error = tool_error_text(&anonymous_read);
+    if (anonymous_read_error.contains("unknown control command")
+        || anonymous_read_error.contains("is not exposed over the control channel"))
+        && std::env::var("T_HUB_ALLOW_MISSING_POWDER_CONTROL").as_deref() == Ok("1")
+    {
+        anonymous.shutdown().expect("stop anonymous MCP");
+        control.shutdown().expect("stop control helper");
+        return;
+    }
+    assert!(
+        anonymous_read_error.contains(
+            "acl: 'read_crew_powder_evidence' requires a valid Crew or Captain T_HUB_SESSION_TOKEN"
+        ),
+        "unexpected anonymous evidence refusal: {anonymous_read_error}"
+    );
+    let anonymous_append = call_tool(
+        &anonymous,
+        102,
+        "append_crew_powder_work_log",
+        json!({
+            "operationId": "mcp-anonymous-work-log",
+            "message": "anonymous must not append"
+        }),
+    );
+    assert!(tool_error_text(&anonymous_append).contains(
+        "unauthorized: 'append_crew_powder_work_log' requires the control capability (this token is read-only)"
+    ));
+    let anonymous_complete = call_tool(
+        &anonymous,
+        103,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": "missing",
+            "operationId": "mcp-anonymous-completion",
+            "proof": "anonymous must not complete",
+            "criterionProofs": []
+        }),
+    );
+    assert!(tool_error_text(&anonymous_complete).contains(
+        "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)"
+    ));
+    anonymous.shutdown().expect("stop anonymous MCP");
+
+    let mut tmux_guard = TmuxServerGuard::start(
+        tmux_socket.clone(),
+        format!("th_mcp_guard_{}", std::process::id()),
+    )
+    .expect("start dedicated Powder tmux server");
+    let mut bootstrap = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.control_token)),
+        None,
+    );
+    initialize_mcp(&bootstrap, 110);
+    let owned_captain = spawn_fixture_terminal(&bootstrap, 111, "control");
+    let owned_crew = spawn_fixture_terminal(&bootstrap, 112, "read");
+    let foreign_captain = spawn_fixture_terminal(&bootstrap, 113, "control");
+    let foreign_crew = spawn_fixture_terminal(&bootstrap, 114, "read");
+    let owned_captain_token = tmux_session_token(&tmux_socket, &owned_captain);
+    let owned_crew_token = tmux_session_token(&tmux_socket, &owned_crew);
+    let foreign_captain_token = tmux_session_token(&tmux_socket, &foreign_captain);
+    let foreign_crew_token = tmux_session_token(&tmux_socket, &foreign_crew);
+    fs::write(
+        &control.seed_file,
+        serde_json::to_vec(&json!({
+            "ownedCaptain": owned_captain,
+            "ownedCrew": owned_crew,
+            "foreignCaptain": foreign_captain,
+            "foreignCrew": foreign_crew,
+        }))
+        .expect("serialize registry seed"),
+    )
+    .expect("write registry seed");
+    wait_for_path(&control.seed_ready_file, "registry seed");
+    bootstrap.shutdown().expect("stop bootstrap MCP");
+
+    let mut owned_crew_mcp = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.read_token)),
+        Some(&owned_crew_token),
+    );
+    initialize_mcp(&owned_crew_mcp, 120);
+    let append = call_tool(
+        &owned_crew_mcp,
+        121,
+        "append_crew_powder_work_log",
+        json!({
+            "operationId": "mcp-work-log-operation",
+            "message": "real MCP append sentinel"
+        }),
+    );
+    assert_eq!(append["result"]["isError"], false, "{append}");
+    let append_data = tool_structured(&append);
+    assert_eq!(append_data["accepted"], "append_crew_powder_work_log");
+    assert_eq!(append_data["crewSessionId"], owned_crew);
+    assert_eq!(append_data["cardId"], "mcp-owned-card");
+    assert_eq!(append_data["runId"], "mcp-owned-run");
+    assert_eq!(append_data["messageBytes"], 24);
+    assert_eq!(append_data["mutationState"], "committed");
+    let crew_read = call_tool(
+        &owned_crew_mcp,
+        122,
+        "read_crew_powder_evidence",
+        json!({"limit": 20}),
+    );
+    let crew_read_data = tool_structured(&crew_read);
+    assert_eq!(crew_read_data["accepted"], "read_crew_powder_evidence");
+    assert_eq!(crew_read_data["crewSessionId"], owned_crew);
+    assert_eq!(crew_read_data["card"]["cardId"], "mcp-owned-card");
+    assert_eq!(crew_read_data["card"]["title"], "MCP dispatcher sentinel");
+    assert_eq!(crew_read_data["run"]["run"]["runId"], "mcp-owned-run");
+    assert_eq!(
+        crew_read_data["card"]["workLog"][0]["body"],
+        "real MCP append sentinel"
+    );
+    assert_eq!(
+        crew_read_data["card"]["workLog"][0]["agent"],
+        "powder-agent"
+    );
+    let crew_foreign = call_tool(
+        &owned_crew_mcp,
+        123,
+        "read_crew_powder_evidence",
+        json!({"crewSessionId": foreign_crew}),
+    );
+    assert!(tool_error_text(&crew_foreign).contains("requires the same-ship Captain"));
+    owned_crew_mcp.shutdown().expect("stop owned Crew MCP");
+
+    let mut foreign_crew_mcp = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.read_token)),
+        Some(&foreign_crew_token),
+    );
+    initialize_mcp(&foreign_crew_mcp, 130);
+    let foreign_owned = call_tool(
+        &foreign_crew_mcp,
+        131,
+        "read_crew_powder_evidence",
+        json!({"crewSessionId": owned_crew}),
+    );
+    assert!(tool_error_text(&foreign_owned).contains("requires the same-ship Captain"));
+    foreign_crew_mcp.shutdown().expect("stop foreign Crew MCP");
+
+    let mut read_only_captain = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.read_token)),
+        Some(&owned_captain_token),
+    );
+    initialize_mcp(&read_only_captain, 140);
+    let read_only_completion = call_tool(
+        &read_only_captain,
+        141,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-read-only-completion",
+            "proof": "read token must not complete",
+            "criterionProofs": []
+        }),
+    );
+    assert!(tool_error_text(&read_only_completion).contains(
+        "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)"
+    ));
+    read_only_captain
+        .shutdown()
+        .expect("stop read-only Captain MCP");
+
+    let mut foreign_captain_mcp = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.control_token)),
+        Some(&foreign_captain_token),
+    );
+    initialize_mcp(&foreign_captain_mcp, 150);
+    let foreign_completion = call_tool(
+        &foreign_captain_mcp,
+        151,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-foreign-completion",
+            "proof": "foreign must not complete",
+            "criterionProofs": []
+        }),
+    );
+    assert!(tool_error_text(&foreign_completion).contains("requires the same-ship Captain"));
+    foreign_captain_mcp
+        .shutdown()
+        .expect("stop foreign Captain MCP");
+
+    let mut owned_captain_mcp = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.control_token)),
+        Some(&owned_captain_token),
+    );
+    initialize_mcp(&owned_captain_mcp, 160);
+    let captain_read = call_tool(
+        &owned_captain_mcp,
+        161,
+        "read_crew_powder_evidence",
+        json!({"crewSessionId": owned_crew, "limit": 20}),
+    );
+    assert_eq!(tool_structured(&captain_read)["crewSessionId"], owned_crew);
+    let captain_foreign_read = call_tool(
+        &owned_captain_mcp,
+        162,
+        "read_crew_powder_evidence",
+        json!({"crewSessionId": foreign_crew}),
+    );
+    assert!(tool_error_text(&captain_foreign_read).contains("requires the same-ship Captain"));
+    let captain_foreign_complete = call_tool(
+        &owned_captain_mcp,
+        163,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": foreign_crew,
+            "operationId": "mcp-wrong-ship-completion",
+            "proof": "wrong ship",
+            "criterionProofs": []
+        }),
+    );
+    assert!(tool_error_text(&captain_foreign_complete).contains("requires the same-ship Captain"));
+    let criterion_review = call_tool(
+        &owned_captain_mcp,
+        164,
+        "review_crew_powder_criterion",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-criterion-operation",
+            "criterion": 0,
+            "criterionId": MCP_CRITERION_ID,
+            "decision": "approved",
+            "proof": "real MCP criterion sentinel",
+            "expectedReviewerIdentity": "actor-mcp-owned-captain"
+        }),
+    );
+    let criterion_review_data = tool_structured(&criterion_review);
+    assert_eq!(
+        criterion_review_data["accepted"],
+        "review_crew_powder_criterion"
+    );
+    assert_eq!(criterion_review_data["runId"], "mcp-owned-run");
+    assert_eq!(criterion_review_data["mutationState"], "committed");
+    let completion = call_tool(
+        &owned_captain_mcp,
+        165,
+        "complete_crew_powder",
+        json!({
+            "crewSessionId": owned_crew,
+            "operationId": "mcp-completion-operation",
+            "proof": "real MCP completion sentinel",
+            "criterionProofs": [{
+                "criterion": 0,
+                "criterionId": MCP_CRITERION_ID,
+                "url": "https://example.test/mcp-completion-proof"
+            }]
+        }),
+    );
+    if completion["result"]["isError"] != false {
+        let fixture = fs::read_to_string(&control.powder_state_file)
+            .unwrap_or_else(|error| format!("fixture state unavailable: {error}"));
+        panic!("completion failed: {completion}; Powder fixture: {fixture}");
+    }
+    let completion_data = tool_structured(&completion);
+    assert_eq!(completion_data["accepted"], "complete_crew_powder");
+    assert_eq!(completion_data["crewSessionId"], owned_crew);
+    assert_eq!(completion_data["cardId"], "mcp-owned-card");
+    assert_eq!(completion_data["runId"], "mcp-owned-run");
+    assert_eq!(completion_data["cardStatus"], "done");
+    assert_eq!(completion_data["runState"], "complete");
+    assert_eq!(completion_data["mutationState"], "committed");
+    owned_captain_mcp
+        .shutdown()
+        .expect("stop owned Captain MCP");
+
+    let fixture: Value = serde_json::from_slice(
+        &fs::read(&control.powder_state_file).expect("read Powder fixture sentinel"),
+    )
+    .expect("parse Powder fixture sentinel");
+    assert_eq!(fixture["appendPosts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture["criterionReviewPosts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture["completionPosts"].as_array().unwrap().len(), 1);
+    assert_eq!(fixture["appendPosts"][0]["agent"], "powder-agent");
+    assert_eq!(
+        fixture["appendPosts"][0]["operation_id"],
+        "mcp-work-log-operation"
+    );
+    assert!(fixture["appendPosts"][0].get("run_id").is_none());
+    assert_eq!(
+        fixture["appendPosts"][0]["body"],
+        "real MCP append sentinel"
+    );
+    assert_eq!(
+        fixture["criterionReviewPosts"][0]["operation_id"],
+        "mcp-criterion-operation"
+    );
+    assert_eq!(
+        fixture["completionPosts"][0]["proof"],
+        "real MCP completion sentinel"
+    );
+    assert_eq!(
+        fixture["completionPosts"][0]["operation_id"],
+        "mcp-completion-operation"
+    );
+    assert_eq!(fixture["completed"], true);
+    assert!(fixture["requestPaths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|path| !path.as_str().unwrap().contains("mcp-foreign")));
+    for required_get in [
+        "GET /readyz",
+        "GET /api/v1/routes",
+        "GET /api/v1/cards/mcp-owned-card",
+        "GET /api/v1/runs/mcp-owned-run",
+    ] {
+        assert!(
+            fixture["requestPaths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == required_get),
+            "Powder fixture did not receive {required_get}"
+        );
+    }
+
+    tmux_guard.shutdown().expect("stop Powder tmux fixtures");
+    control.shutdown().expect("stop Powder control helper");
+}
+
+#[test]
+fn end_to_end_mcp_round_trip() {
+    let bin = locate_mcp_binary();
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let tmux_socket = format!("t-hub-mcpe2e-{}-{test_id}", std::process::id());
+    let mut control = ControlProc::spawn(&tmux_socket);
+    let control_temp_dir = control.temp_dir.clone();
+
     let tmux_session = format!("th_e2e{}", std::process::id() % 100000);
-    let tmux_ok = make_tmux_session(&tmux_socket, &tmux_session);
-    // Drop-guard: the session is killed even if an assertion below panics, so a
-    // failure can never leak an `th_e2e*` session (belt on top of the explicit
-    // cleanup at the end).
-    let _session_guard = TmuxSessionGuard {
-        socket: tmux_socket.clone(),
-        name: tmux_session.clone(),
-    };
+    let mut tmux_guard = TmuxServerGuard::start(tmux_socket.clone(), tmux_session.clone())
+        .expect("start dedicated baseline tmux server");
+    let mut mcp = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        Some((&control.addr, &control.read_token)),
+        None,
+    );
 
-    // --- 4. Spawn the real t-hub-mcp binary + drive it -----------------
-    let mut mcp = McpProc::spawn(&bin, &handshake_file);
-
-    // initialize
     let init = mcp.request(json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
     }));
-    assert_eq!(init["id"], 1);
+    assert_response_id(&init, 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "t-hub-mcp");
     assert!(init["result"]["capabilities"]["tools"].is_object());
-
-    // initialized notification (no response)
     mcp.notify(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
-    // tools/list
     let list = mcp.request(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
-    let tools = list["result"]["tools"].as_array().unwrap();
-    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in [
-        "list_terminals",
+    assert_response_id(&list, 2);
+    let tools = list["result"]["tools"].as_array().expect("MCP tools array");
+    for required in [
+        "wsl_health",
         "get_status",
         "supervision_tree",
-        "wsl_health",
         "search_files",
         "list_tabs",
-        "spawn_terminal",
+        "list_terminals",
         "get_theme",
+        "spawn_terminal",
     ] {
-        assert!(names.contains(&expected), "tools/list missing {expected}");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == required),
+            "tools/list missing baseline tool {required}"
+        );
+    }
+    for name in RETIRED_POWDER_TOOLS {
+        assert!(
+            tools.iter().all(|tool| tool["name"] != name),
+            "retired Powder tool {name} must not be advertised"
+        );
     }
 
-    // tools/call → wsl_health (a Read tool that always works)
     let health = mcp.request(json!({
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
         "params": { "name": "wsl_health", "arguments": {} }
     }));
-    let h = tool_structured(&health);
+    assert_response_id(&health, 3);
+    let health_data = tool_structured(&health);
     assert_eq!(health["result"]["isError"], false);
-    assert!(h["metrics"]["capturedAtMs"].is_u64() || h["metrics"]["capturedAtMs"].is_number());
-    // Supervision was seeded with one session.
-    assert_eq!(h["supervisedSessions"], 1);
+    assert_eq!(health_data["supervisedSessions"], 1);
+    assert!(health_data["metrics"]["capturedAtMs"].as_u64().unwrap_or(0) > 0);
 
-    // tools/call → get_status for the seeded session
-    let st = mcp.request(json!({
+    let status = mcp.request(json!({
         "jsonrpc": "2.0", "id": 4, "method": "tools/call",
         "params": { "name": "get_status", "arguments": { "sessionId": "sess-e2e" } }
     }));
-    let stc = tool_structured(&st);
-    assert_eq!(stc["sessionId"], "sess-e2e");
-    assert_eq!(stc["status"], "waitingOnSubagents");
-    assert_eq!(stc["snapshot"]["contextUsedPct"], 42.0);
+    assert_response_id(&status, 4);
+    let status_data = tool_structured(&status);
+    assert_eq!(status_data["sessionId"], "sess-e2e");
+    assert_eq!(status_data["resolvedSessionId"], "sess-e2e");
+    assert_eq!(status_data["status"], "waitingOnSubagents");
+    assert_eq!(status_data["snapshot"]["contextUsedPct"], 42.0);
 
-    // tools/call → supervision_tree for the seeded session
     let tree = mcp.request(json!({
         "jsonrpc": "2.0", "id": 5, "method": "tools/call",
         "params": { "name": "supervision_tree", "arguments": { "sessionId": "sess-e2e" } }
     }));
-    let tc = tool_structured(&tree);
-    assert_eq!(tc["sessionId"], "sess-e2e");
-    assert_eq!(tc["status"], "waitingOnSubagents");
-    assert_eq!(tc["children"].as_array().unwrap().len(), 1);
-    assert_eq!(tc["children"][0]["agentId"], "agent-1");
+    assert_response_id(&tree, 5);
+    let tree_data = tool_structured(&tree);
+    assert_eq!(tree_data["sessionId"], "sess-e2e");
+    assert_eq!(tree_data["status"], "waitingOnSubagents");
+    assert_eq!(tree_data["children"].as_array().unwrap().len(), 1);
+    assert_eq!(tree_data["children"][0]["agentId"], "agent-1");
+    assert_eq!(tree_data["outstandingTasks"], 0);
 
-    // tools/call → search_files against this very repo's src-tauri tree
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let search = mcp.request(json!({
         "jsonrpc": "2.0", "id": 6, "method": "tools/call",
@@ -292,87 +1640,238 @@ fn end_to_end_mcp_round_trip() {
             "arguments": { "root": manifest.to_string_lossy(), "query": "control", "limit": 10 }
         }
     }));
-    let sc = tool_structured(&search);
-    let hits = sc["hits"].as_array().unwrap();
-    assert!(
-        hits.iter().any(|h| h["relPath"]
+    assert_response_id(&search, 6);
+    assert!(tool_structured(&search)["hits"]
+        .as_array()
+        .expect("search hits")
+        .iter()
+        .any(|hit| hit["relPath"]
             .as_str()
-            .map(|p| p.contains("control"))
-            .unwrap_or(false)),
-        "search_files should find a control* file; got {hits:?}"
-    );
+            .is_some_and(|path| path.contains("control"))));
 
-    // tools/call → list_terminals (asserts the tmux-backed session if tmux ran)
-    let terms = mcp.request(json!({
+    let terminals = mcp.request(json!({
         "jsonrpc": "2.0", "id": 7, "method": "tools/call",
         "params": { "name": "list_terminals", "arguments": {} }
     }));
-    let tcount = tool_structured(&terms);
-    assert!(tcount["terminals"].is_array());
-    if tmux_ok {
-        let ids: Vec<&str> = tcount["terminals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["tmuxSession"].as_str())
-            .collect();
-        assert!(
-            ids.iter().any(|s| *s == tmux_session),
-            "list_terminals should include {tmux_session}; got {ids:?}"
-        );
-    }
+    assert_response_id(&terminals, 7);
+    let terminal_data = tool_structured(&terminals);
+    assert!(terminal_data["terminals"].is_array());
+    assert!(terminal_data["terminals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|terminal| terminal["tmuxSession"] == tmux_session));
 
-    // tools/call → spawn_terminal: functional (#17) but routed through the UI
-    // ApplySink. This e2e listener is HEADLESS (no apply sink), so there is no UI
-    // to adopt the tile and the spawn is refused with a clear "no UI" error rather
-    // than creating an untracked tmux session. It still comes back as a tool error
-    // (isError), just no longer the old "gated off" refusal.
     let spawn = mcp.request(json!({
         "jsonrpc": "2.0", "id": 8, "method": "tools/call",
         "params": { "name": "spawn_terminal", "arguments": { "cwd": "/tmp" } }
     }));
-    assert_eq!(
-        spawn["result"]["isError"], true,
-        "spawn_terminal without a UI must refuse, got {spawn}"
+    assert_response_id(&spawn, 8);
+    assert_eq!(spawn["result"]["isError"], true);
+    assert!(spawn["result"]["content"][0]["text"]
+        .as_str()
+        .expect("spawn refusal")
+        .contains("requires the control capability (this token is read-only)"));
+
+    mcp.shutdown().expect("stop MCP process");
+    tmux_guard.shutdown().expect("stop tmux fixture");
+    control.shutdown().expect("stop control helper");
+    assert!(
+        !control_temp_dir.exists(),
+        "control helper temporary directory was not removed"
     );
-    let msg = spawn["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(msg.contains("no UI"), "refusal message: {msg}");
-
-    // --- cleanup ---------------------------------------------------------
-    if tmux_ok {
-        kill_tmux_session(&tmux_socket, &tmux_session);
-    }
-    drop(mcp);
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::env::remove_var("T_HUB_CONTROL_FILE");
-    std::env::remove_var("T_HUB_TMUX_SOCKET");
 }
 
-/// Kills its session on drop - including on a panicking assertion - so this E2E
-/// can never leak an `th_e2e*` session.
-struct TmuxSessionGuard {
+struct TmuxServerGuard {
     socket: String,
-    name: String,
+    socket_path: Option<PathBuf>,
+    active: bool,
 }
-impl Drop for TmuxSessionGuard {
-    fn drop(&mut self) {
-        kill_tmux_session(&self.socket, &self.name);
+
+impl TmuxServerGuard {
+    fn start(socket: String, initial_session: String) -> Result<Self, String> {
+        match probe_tmux_server(&socket) {
+            TmuxServerProbe::Absent => {}
+            TmuxServerProbe::Present => {
+                return Err(format!("dedicated tmux server {socket} already exists"));
+            }
+            TmuxServerProbe::Failed(error) => {
+                return Err(format!("probe dedicated tmux server {socket}: {error}"));
+            }
+        }
+        let mut guard = Self {
+            socket,
+            socket_path: None,
+            active: true,
+        };
+        let output = bounded_tmux_output(
+            &guard.socket,
+            &["new-session", "-d", "-s", &initial_session, "sleep 300"],
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "start dedicated tmux server {}: {}",
+                guard.socket,
+                command_failure(&output)
+            ));
+        }
+        match probe_tmux_server(&guard.socket) {
+            TmuxServerProbe::Present => {}
+            TmuxServerProbe::Absent => {
+                return Err(format!(
+                    "dedicated tmux server {} disappeared after start",
+                    guard.socket
+                ));
+            }
+            TmuxServerProbe::Failed(error) => {
+                return Err(format!(
+                    "verify dedicated tmux server {}: {error}",
+                    guard.socket
+                ));
+            }
+        }
+        let output =
+            bounded_tmux_output(&guard.socket, &["display-message", "-p", "#{socket_path}"])?;
+        if !output.status.success() {
+            return Err(format!(
+                "resolve dedicated tmux socket {}: {}",
+                guard.socket,
+                command_failure(&output)
+            ));
+        }
+        let socket_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        if socket_path.as_os_str().is_empty() || !socket_path.exists() {
+            return Err(format!(
+                "dedicated tmux socket path for {} was not present",
+                guard.socket
+            ));
+        }
+        guard.socket_path = Some(socket_path);
+        Ok(guard)
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        let mut last_probe_failure = None;
+        for _attempt in 0..3 {
+            match probe_tmux_server(&self.socket) {
+                TmuxServerProbe::Present => {
+                    if let Err(error) = kill_tmux_server(&self.socket) {
+                        last_probe_failure = Some(error);
+                    }
+                }
+                TmuxServerProbe::Absent => {
+                    if let Some(path) = self.socket_path.as_ref().filter(|path| path.exists()) {
+                        fs::remove_file(path)
+                            .map_err(|error| format!("remove stale tmux socket: {error}"))?;
+                    }
+                    if self.socket_path.as_ref().is_some_and(|path| path.exists()) {
+                        return Err(format!(
+                            "dedicated tmux socket for {} remained after server absence",
+                            self.socket
+                        ));
+                    }
+                    match probe_tmux_server(&self.socket) {
+                        TmuxServerProbe::Absent => {
+                            self.active = false;
+                            return Ok(());
+                        }
+                        TmuxServerProbe::Present => {}
+                        TmuxServerProbe::Failed(error) => {
+                            last_probe_failure = Some(error);
+                        }
+                    }
+                }
+                TmuxServerProbe::Failed(error) => {
+                    last_probe_failure = Some(error);
+                    let _ = kill_tmux_server(&self.socket);
+                }
+            }
+        }
+        Err(format!(
+            "dedicated tmux server {} was not confirmed absent{}",
+            self.socket,
+            last_probe_failure
+                .map(|error| format!("; last probe failure: {error}"))
+                .unwrap_or_default()
+        ))
     }
 }
 
-/// Create a detached tmux session on the ISOLATED test socket (never the live
-/// `t-hub`). Returns false (and the test skips tmux-specific asserts) if tmux
-/// isn't usable here.
-fn make_tmux_session(socket: &str, name: &str) -> bool {
-    Command::new("tmux")
-        .args(["-L", socket, "new-session", "-d", "-s", name, "sleep 300"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+impl Drop for TmuxServerGuard {
+    fn drop(&mut self) {
+        if self.shutdown().is_err() {
+            std::process::abort();
+        }
+    }
 }
 
-fn kill_tmux_session(socket: &str, name: &str) {
-    let _ = Command::new("tmux")
-        .args(["-L", socket, "kill-session", "-t", name])
-        .status();
+#[derive(Debug, PartialEq, Eq)]
+enum TmuxServerProbe {
+    Present,
+    Absent,
+    Failed(String),
+}
+
+fn bounded_tmux_output(socket: &str, args: &[&str]) -> Result<Output, String> {
+    let output = Command::new("timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=1s",
+            "3s",
+            "tmux",
+            "-L",
+            socket,
+        ])
+        .args(args)
+        .output()
+        .map_err(|error| format!("spawn bounded tmux command: {error}"))?;
+    if matches!(output.status.code(), Some(124 | 137)) {
+        return Err(format!(
+            "tmux command exceeded its timeout: tmux -L {socket} {}",
+            args.join(" ")
+        ));
+    }
+    Ok(output)
+}
+
+fn kill_tmux_server(socket: &str) -> Result<(), String> {
+    let output = bounded_tmux_output(socket, &["kill-server"])?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "kill dedicated tmux server {socket}: {}",
+        command_failure(&output)
+    ))
+}
+
+fn probe_tmux_server(socket: &str) -> TmuxServerProbe {
+    let output = match bounded_tmux_output(socket, &["list-sessions"]) {
+        Ok(output) => output,
+        Err(error) => return TmuxServerProbe::Failed(error),
+    };
+    if output.status.success() {
+        return TmuxServerProbe::Present;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let connection_absent = stderr.contains("error connecting to")
+        && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"));
+    if stderr.contains("no server running on") || connection_absent {
+        TmuxServerProbe::Absent
+    } else {
+        TmuxServerProbe::Failed(command_failure(&output))
+    }
+}
+
+fn command_failure(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        format!("exit status {}: {stderr}", output.status)
+    }
 }

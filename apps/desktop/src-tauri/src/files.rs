@@ -422,37 +422,38 @@ pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, Stri
 /// e.g. `\\wsl.localhost\Ubuntu-24.04\home\natkins\proj` → `/home/natkins/proj`.
 #[cfg(windows)]
 fn unc_to_posix(path: &Path) -> Option<String> {
-    let s = path.to_string_lossy();
-    // Already a bare POSIX path (shouldn't usually reach here post-normalize,
-    // but be lenient): pass through.
-    if s.starts_with('/') {
-        return Some(s.into_owned());
+    wsl_path_to_posix(&path.to_string_lossy())
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .and_then(|_| value.get(prefix.len()..))
+}
+
+/// Convert a bare POSIX path or any supported WSL UNC spelling to the path tmux
+/// sees inside WSL. Genuine Windows paths are not WSL paths and return `None`.
+fn wsl_path_to_posix(path: &str) -> Option<String> {
+    if path.starts_with('/') && !path.starts_with("//") {
+        return Some(path.to_string());
     }
-    // Peel a verbatim extended-length prefix first (`std::fs::canonicalize`
-    // emits these): `\\?\UNC\wsl.localhost\...` -> `\\wsl.localhost\...`, and a
-    // plain `\\?\C:\...` -> `C:\...` (which then won't match the WSL prefixes
-    // below and correctly returns None for a real drive path).
-    let s: std::borrow::Cow<str> = if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
-        std::borrow::Cow::Owned(format!("\\\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
-        std::borrow::Cow::Owned(rest.to_string())
-    } else {
-        s
-    };
-    // Strip a `\\wsl.localhost\<distro>` or `\\wsl$\<distro>` prefix.
-    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            // `rest` is `<distro>\home\natkins\...`; drop the distro segment.
-            let tail = match rest.split_once('\\') {
-                Some((_distro, tail)) => tail,
-                // `\\wsl.localhost\<distro>` with no trailing path → distro root.
-                None => "",
-            };
-            let posix = format!("/{}", tail.replace('\\', "/"));
-            return Some(posix);
-        }
+
+    let slashes = path.replace('/', "\\");
+    let normalized = strip_ascii_case_prefix(&slashes, "\\\\?\\UNC\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .unwrap_or(slashes);
+    let without_leading = normalized.strip_prefix("\\\\")?;
+    let mut parts = without_leading.split('\\');
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
     }
-    None
+    let distro = parts.next()?;
+    if distro.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", parts.collect::<Vec<_>>().join("/")))
 }
 
 /// Build a `wsl.exe -d <distro> --cd <cwd> -- bash -lc '<script>'` command with
@@ -1363,17 +1364,11 @@ fn host_of_resolved(real_posix: &Path) -> PathBuf {
     to_host_path(&real_posix.to_string_lossy())
 }
 
-/// The POSIX form of a control-channel path for the ancestor walk: identity on unix
-/// (already POSIX), the WSL-UNC→POSIX mapping on Windows.
-fn posix_form(path: &str) -> String {
-    #[cfg(not(windows))]
-    {
-        path.to_string()
-    }
-    #[cfg(windows)]
-    {
-        unc_to_posix(&PathBuf::from(path)).unwrap_or_else(|| path.to_string())
-    }
+/// Return the WSL runtime form of a control-channel path when it has one.
+/// This is platform-neutral because Windows Project roots cross into WSL tmux
+/// even when focused tests exercise that boundary on Linux.
+pub(crate) fn posix_form(path: &str) -> String {
+    wsl_path_to_posix(path).unwrap_or_else(|| path.to_string())
 }
 
 fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -2167,6 +2162,28 @@ mod tests {
         )
         .is_err());
         assert!(posix_to_wsl_unc("C:\\Users\\natha", distro).is_err());
+    }
+
+    #[test]
+    fn control_paths_convert_every_wsl_unc_form_without_touching_windows_paths() {
+        assert_eq!(posix_form("/home/natkins/project"), "/home/natkins/project");
+        assert_eq!(
+            posix_form("\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(
+            posix_form("\\\\wsl$\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(
+            posix_form("\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(posix_form("\\\\wsl.localhost\\Ubuntu-24.04"), "/");
+        assert_eq!(
+            posix_form("C:\\Users\\natha\\project"),
+            "C:\\Users\\natha\\project"
+        );
     }
 
     #[cfg(windows)]

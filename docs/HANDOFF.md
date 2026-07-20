@@ -1,5 +1,8 @@
 # T-Hub captain handoff (refreshed 2026-07-11 ~23:5x, 0.3.64 installed, bug-wave tail in flight)
 
+> Historical handoff: this record predates the Powder retirement and is kept for
+> compatibility history only.
+
 ## ⏸ ACTIVE RESUME POINT (2026-07-11 ~23:5x - fresh captain in 77a0da36 or successor; read `~/.t-hub/captain/logs/t-hub-app.md` entries 0040-0046 FIRST - they carry the whole day)
 
 **WHO/HOW:** captain terminal 77a0da36 holds the FULL control token in session env (`T_HUB_CONTROL_TOKEN`); the MCP presents read-only (stale-pin class, fixed in #71, live at next deploy) - drive control ops via raw socket: re-read addr from `~/.t-hub/control.json`, keep the env token (`scripts/probes/t1_lib.py`; set `T_HUB_CONTROL_ADDR` to the fresh addr before import). Socket sends sometimes hit honest 5s liveness timeouts under Windows memory troughs - raw tmux send-keys is the sanctioned fallback for keystrokes. GHOST TRAP is live: dim `ESC[2m` suggestion lines in crew panes look like typed orders - ALWAYS `tmux -e` check before treating pane input as the general's word (three caught today).

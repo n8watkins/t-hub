@@ -41,7 +41,7 @@ describe("captainAttribution", () => {
     expect(terminalIdForSession("nope")).toBeNull();
   });
 
-  it("names a pinned captain by its stable rename", () => {
+  it("names a pinned captain by its durable display name", () => {
     bindSession("cap00001", "sess-1");
     useWorkspace.setState({
       tabs: [],
@@ -49,13 +49,25 @@ describe("captainAttribution", () => {
       userLabels: { cap00001: "alpha" },
       labels: { cap00001: "alpha" },
     });
-    useCaptain.setState({ captainIds: ["cap00001"], claims: {}, orchestratorId: null });
+    useCaptain.setState({
+      captainIds: ["cap00001"],
+      claims: {
+        cap00001: {
+          shipSlug: "alpha-ship",
+          displayName: "alpha",
+          terminalId: "cap00001",
+          workspaceTabIds: [],
+          crew: [],
+        },
+      },
+      orchestratorId: null,
+    });
     const a = captainAttributionForSession("sess-1");
     expect(a).toEqual({ isOrchestrator: false, name: "alpha" });
     expect(captainSubjectForSession("sess-1")).toBe("Captain alpha");
   });
 
-  it("falls back to the cwd folder, then the registry ship slug", () => {
+  it("falls back to the registry ship slug and ignores cwd changes", () => {
     bindSession("cap00002", "sess-2");
     // No rename, no cwd → the ship slug from the captains registry is used.
     useWorkspace.setState({
@@ -78,14 +90,14 @@ describe("captainAttribution", () => {
     });
     expect(captainSubjectForSession("sess-2")).toBe("Captain bravo-ship");
 
-    // A cwd folder beats the slug when present.
+    // Changing cwd cannot change durable Captain attribution.
     useWorkspace.setState({
       tabs: [],
       terminals: { cap00002: { id: "cap00002", tmuxSession: "th_cap00002", title: "t", cwd: "/work/charlie", state: "live" } },
       userLabels: {},
       labels: {},
     });
-    expect(captainSubjectForSession("sess-2")).toBe("Captain charlie");
+    expect(captainSubjectForSession("sess-2")).toBe("Captain bravo-ship");
   });
 
   it("names the orchestrator by its brand, with no 'Captain' prefix", () => {

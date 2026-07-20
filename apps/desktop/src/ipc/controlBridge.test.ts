@@ -119,6 +119,16 @@ describe("applyControl (headless-org forwards)", () => {
     expect(s.terminals["dead"]).toBeUndefined();
   });
 
+  it("does not erase the work layout when a legacy Captain-only sync arrives", () => {
+    applyControl("sync_tabs", {
+      sync: sync([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: ["a"] }]),
+    });
+    const s = useWorkspace.getState();
+    expect(s.tabs.some((tab) => tab.id === "t1")).toBe(true);
+    expect(s.tabs.find((tab) => tab.id === "t1")?.order).toEqual(["a"]);
+    expect(s.activeTabId).toBe("t1");
+  });
+
   it("close_tab removes the emptied tab, view untouched when it was hidden", () => {
     applyControl("close_tab", {
       tabId: "t2",

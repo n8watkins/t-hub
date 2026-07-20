@@ -8,10 +8,13 @@ No client may independently decide whether a worktree is safe to open, reuse, re
 
 ## Authority
 
-The backend computes worktree status from Git, T-Hub's durable identity and resource registries, live terminal evidence, and Powder bindings.
+The backend computes worktree status from Git, T-Hub's durable identity and
+resource registries, live terminal evidence, agent-session bindings, and owned
+resource leases.
 Git is authoritative for repository, branch, checkout, dirty, merge, and worktree metadata.
 T-Hub is authoritative for terminal, Captain, Assignment, Workspace, Crew, and owned-resource bindings.
-Powder is authoritative for cards and claims.
+T-Hub is authoritative for agent-session assignments, checkpoints, and runtime
+state.
 Folder-name conventions are display hints only and must not be used as branch or ownership authority.
 
 Every snapshot must include its observation time and whether each unavailable field is unknown, unsupported, or stale.
@@ -45,7 +48,7 @@ A worktree snapshot should expose the following project-specific fields where av
 - Active terminal identifiers rooted in the worktree.
 - Owning Captain, Assignment, Workspace, and Crew identifiers when bound.
 - Owned-resource lease state and expiry when applicable.
-- Powder board, card, claim, and claim-expiry references when bound.
+- Agent-session identifier, assignment, and checkpoint cursor when bound.
 - Last meaningful activity time from T-Hub-owned evidence.
 
 ### Safety Decision
@@ -61,7 +64,8 @@ The main worktree is never removable through T-Hub.
 A dirty, locked, actively leased, or unknown worktree is never automatically removed or reused.
 An unmerged clean worktree may be classified as `requires-force`, but force must remain separate from destructive confirmation.
 An explicit force option must not override dirty state, active leases, unknown state, or the main-worktree boundary.
-Automatic cleanup must require a clean, merged, unleased, known linked worktree with no unresolved Powder claim or owned process.
+Automatic cleanup must require a clean, merged, unleased, known linked worktree
+with no active agent session or owned process.
 Missing directories and stale Git metadata require reconciliation rather than silent deletion.
 
 ## Removal Activation Gate
@@ -74,7 +78,8 @@ Re-enabling removal requires a mutation-time recomputation or serialized reserva
 ## Display Contract
 
 Dense tile and sidebar surfaces should show the authoritative branch, linked-worktree marker, dirty marker, and a degraded marker when status is stale or unknown.
-The Worktrees view should show branch, path, clean state, merge state, active leases, owner, Powder work, last activity, and removal verdict.
+The Worktrees view should show branch, path, clean state, merge state, active
+leases, owner, agent-session work, last activity, and removal verdict.
 Tooltips and detail views should expose the reason behind blocked, forced, stale, or unknown state.
 Recent, Captain, and Workspace surfaces must stop deriving branch names from `wt-*` or folder-name conventions when authoritative Git state is available.
 
@@ -98,13 +103,14 @@ An event-driven refresh should follow T-Hub-owned create, remove, commit, branch
 
 - Test main, linked, detached, locked, stale, missing, dirty, clean, merged, unmerged, leased, and unknown states.
 - Test nested terminal paths and multiple terminals sharing one worktree.
-- Test Captain, Workspace, Crew, Powder card, and claim bindings.
+- Test Captain, Workspace, Crew, agent-session, and lease bindings.
 - Test stale cache refresh and WSL restart reconciliation.
 - Test that CLI, MCP, and graphical views receive equivalent safety decisions.
 - Test that dirty, leased, main, and unknown worktrees cannot be automatically removed or reused.
 - Test that force and confirmation remain independent gates.
 - Test the suspended graphical, Tauri, control, MCP, and CLI paths, preservation of UI state, absence of Git invocation, and force bypass denial.
-- Before activation, test preflight-to-mutation races across Git state, terminal ownership, durable identity, leases, Powder claims, and WSL availability.
+- Before activation, test preflight-to-mutation races across Git state, terminal
+  ownership, durable identity, leases, agent sessions, and WSL availability.
 
 ## Current Implementation Status
 

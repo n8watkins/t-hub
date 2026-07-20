@@ -47,13 +47,13 @@ Keep each full Markdown sentence on its own physical line unless repository inst
 ## Preserve Durable Agent State
 
 If this is a registered T-Hub Captain or Crew session, use `captain_checkpoint` when the available T-Hub capability permits it.
-Store a concise resume point with active Crew, branches or PRs, Powder cards and runs, pending decisions, blockers, and the next ordered action.
+Store a concise resume point with active agent sessions, branches or PRs, pending decisions, blockers, and the next ordered action.
 Include the harness conversation identifier only when it is known from a trusted runtime source.
 Do not invent identifiers or claim a checkpoint succeeded when the tool was unavailable or refused it.
 
-When the session has an active Powder-backed card, append a concise progress entry through an authorized T-Hub or Powder work-log tool if one is available.
-Never retrieve or pass Powder credentials in a prompt, command argument, environment dump, handoff document, or checkpoint.
-If no sanctioned work-log surface is available, record that the Powder log was not updated and make that limitation part of the handoff's external-state evidence.
+When the session has a durable agent session, append a concise progress checkpoint through the authorized T-Hub agent-session surface if one is available.
+Never retrieve or pass legacy service credentials in a prompt, command argument, environment dump, handoff document, or checkpoint.
+If no sanctioned checkpoint surface is available, record that the durable session checkpoint was not updated and make that limitation part of the handoff's external-state evidence.
 
 ## Commit And Report
 
@@ -65,5 +65,5 @@ End with:
 
 1. A concise summary for the user.
 2. The handoff path and commit, if any.
-3. Verification, runtime, checkpoint, Powder-log, and push status.
+3. Verification, runtime, checkpoint, and push status.
 4. A short kickoff prompt naming the files to read first, the next task, acceptance checks, and repository commit/deploy rules.

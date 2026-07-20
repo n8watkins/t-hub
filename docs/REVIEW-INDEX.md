@@ -6,25 +6,34 @@ This index prevents historical audits, shipped execution plans, and abandoned ex
 When documents disagree, use the precedence below and verify claims against the current source and installed build.
 Historical documents should remain intact as design rationale and evidence unless a separate cleanup explicitly archives them.
 
+Canonical precedence is scope-based, while the numbered list below is the required reading order.
+The phased plan governs product decisions and dependencies, the handoff governs verified current runtime facts only, the operating model governs organizational lifecycle, and narrower canonical contracts govern their named subsystem behavior.
+No handoff or subsystem contract may override an explicit phased-plan decision or General authorization.
+When canonical scopes genuinely conflict, stop the affected action and record the resolved decision in the phased plan.
+
 ## Canonical Current Documents
 
-1. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is the authoritative forward roadmap, dependency map, testing doctrine, and exit-gate definition.
-2. [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) is the current runtime evidence and zero-context resume handoff.
-3. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and Crew operating model.
-4. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
-5. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
-6. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
+1. [POST-POWDER-ROADMAP.md](./POST-POWDER-ROADMAP.md) defines the active agent-session roadmap and acceptance gates.
+2. [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) defines the post-Powder agent-session model and compatibility boundary.
+3. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is supporting roadmap context; Powder-specific sections are historical.
+4. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and agent-session operating model.
+5. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, agent-session evidence, durable dialogue, escalation, review, and completion across the agent organization.
+6. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
+7. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
+8. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
 
 ## Current Supporting Specifications
 
+- [CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is the General-directed integration specification for scoped Captain grants, existing-repository self-bootstrap, and bounded routine delivery; the phased plan remains authoritative for ownership, order, and activation.
 - [PRODUCTION-READINESS.md](./PRODUCTION-READINESS.md) supplies release-quality gates that remain applicable where the phased plan has not superseded their sequencing.
 - [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the packaged runtime measurement procedure.
-- [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) describes the Powder integration boundary and protected profiles.
+- [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) is a historical compatibility reference for retired Powder data and profiles.
 - [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md) defines provider-neutral conversation identity, catalog, resume, recovery, archive, cache, and compatibility behavior.
 - [MCP.md](./MCP.md) documents the existing MCP and control-channel implementation, while the CLI-first roadmap governs its future surface.
 - [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md) remains the interaction and path-convention design, while the unified worktree contract governs status and safety.
 - [SESSION_AWARENESS.md](./SESSION_AWARENESS.md) records the existing Claude-oriented event spine, while the two-axis status model governs provider-neutral semantics.
 - [SMOKE-TEST.md](./SMOKE-TEST.md) is a useful regression checklist, but version-specific assertions must be checked against the current phased plan before use.
+- [AGENT-SESSION-SMOKE-0.3.106.md](./AGENT-SESSION-SMOKE-0.3.106.md) is the current version-specific release smoke procedure.
 
 ## Historical Reviews and Shipped Plans
 
@@ -38,8 +47,11 @@ These documents preserve rationale and prior findings but are not active backlog
 - [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) preserves the server-split design and earlier multi-client decisions.
 - [PERF-AUDIT.md](./PERF-AUDIT.md) is explicitly superseded for the original freeze diagnosis.
 - [PERF-AND-DRAG-WORKLOG.md](./PERF-AND-DRAG-WORKLOG.md) is the historical master worklog for the earlier drag and freeze investigation.
-- [HANDOFF.md](./HANDOFF.md) is an older handoff and must not replace the Captain and Powder handoff.
+- [HANDOFF.md](./HANDOFF.md) is an older historical handoff and must not replace the active agent-session contracts.
 - [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) and [CAPTAIN-SIDEBAR-PRD.md](./CAPTAIN-SIDEBAR-PRD.md) preserve earlier Captain UI slices that now feed the broader phased plan.
+- [APPTURNITY-PROJECT-LINK-CORTANA-RUNBOOK.md](./APPTURNITY-PROJECT-LINK-CORTANA-RUNBOOK.md) is a historical Powder-bound registration and dispatch runbook, not current operational authority.
+- [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) is a historical Powder execution record, not a current agent-session procedure.
+- Powder-era material in [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is historical unless the section explicitly points to the active durable agent-session contracts.
 
 ## Archived or Abandoned Experiments
 

@@ -10,14 +10,16 @@
 # Codex MCP registration is USER-GLOBAL (`$CODEX_HOME/config.toml`, default
 # `~/.codex/config.toml`), NOT per-repo like Claude's `.mcp.json`. Least-privilege
 # still holds: the item-3 capability env (a READ token by default) is injected at
-# the tmux SESSION level and inherited by the `t-hub-mcp` child regardless of
-# which harness spawned it (t-hub-mcp resolves `$T_HUB_CONTROL_TOKEN` first).
+# the tmux SESSION level. Codex only passes named variables to stdio MCP children,
+# so this registration declares the three T-Hub variable names without storing
+# their values (t-hub-mcp resolves `$T_HUB_CONTROL_TOKEN` first).
 #
-# NEVER hand-write config.toml. The live file carries user-authored `[hooks]` and
-# `[hooks.state]` trust blocks that a rewrite could clobber (plan finding MED-3);
-# `codex mcp add` MERGES natively and leaves those blocks byte-for-byte intact.
+# NEVER rewrite config.toml wholesale. The live file carries user-authored
+# `[hooks]` and `[hooks.state]` trust blocks that a rewrite could clobber (plan
+# finding MED-3). `codex mcp add` establishes the native registration, then this
+# script transactionally adds only its unsupported env_vars pass-through field.
 #
-# VERSION PIN: verified against `codex-cli 0.144.3` on 2026-07-13.
+# VERSION PIN: verified against `codex-cli 0.144.4` on 2026-07-15.
 # `codex mcp add/get/remove` are stable, but re-verify on a Codex bump.
 #
 # The normal binary is the stable WSL-side install produced by
@@ -53,23 +55,97 @@ if ! "$BIN" --list-tools >/dev/null 2>&1; then
 fi
 
 CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+ENV_VARS_JSON='["T_HUB_CONTROL_ADDR","T_HUB_CONTROL_TOKEN","T_HUB_SESSION_TOKEN"]'
+ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]'
 install -d -m 700 "$(dirname "$CONFIG")"
 exec 9>"${CONFIG}.t-hub.lock"
 flock -x 9
 
+has_exact_managed_table_shape() {
+  awk '
+    /^\[mcp_servers\.t-hub\]$/ {
+      if (found) bad = 1
+      found = 1
+      in_target = 1
+      next
+    }
+    /^\[mcp_servers\.t-hub\./ {
+      bad = 1
+      in_target = 0
+      next
+    }
+    /^\[/ { in_target = 0 }
+    in_target && /^[[:space:]]*$/ { next }
+    in_target && /^[[:space:]]*command[[:space:]]*=/ {
+      commands++
+      next
+    }
+    in_target && /^[[:space:]]*env_vars[[:space:]]*=/ {
+      env_vars++
+      next
+    }
+    in_target { bad = 1 }
+    END {
+      if (found != 1 || commands != 1 || env_vars > 1 || bad) exit 1
+    }
+  ' "$CONFIG"
+}
+
 # Read and mutate under the installer lock. Existing policy remains user-owned.
 CURRENT="$(codex mcp get t-hub --json 2>/dev/null || true)"
+CANONICAL_TRANSPORT=false
 if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e --arg bin "$BIN" '
-  .transport.type == "stdio" and .transport.command == $bin
+  .transport.type == "stdio" and .transport.command == $bin and
+  .transport.args == [] and (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == [
+    "T_HUB_CONTROL_ADDR",
+    "T_HUB_CONTROL_TOKEN",
+    "T_HUB_SESSION_TOKEN"
+  ] and .transport.cwd == null
 ' >/dev/null; then
-  echo "ensure-thub-codex: t-hub already points at $BIN; existing policy preserved"
+  CANONICAL_TRANSPORT=true
+fi
+
+if "$CANONICAL_TRANSPORT" && printf '%s' "$CURRENT" | jq -e '
+  .enabled == true and .disabled_reason == null
+' >/dev/null; then
+  echo "ensure-thub-codex: t-hub already points at $BIN with capability pass-through; existing policy preserved"
   exit 0
 fi
-if [ -n "$CURRENT" ] && ! printf '%s' "$CURRENT" | jq -e '
+if "$CANONICAL_TRANSPORT"; then
+  echo "ensure-thub-codex: refusing to report a disabled t-hub registration as ready" >&2
+  echo "ensure-thub-codex: re-enable it in Codex policy before provisioning" >&2
+  exit 1
+fi
+
+LEGACY_MATCH=false
+if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e --arg bin "$BIN" '
+  .enabled == true and .disabled_reason == null and
+  .transport.type == "stdio" and .transport.command == $bin and
+  .transport.args == [] and (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == [] and .transport.cwd == null
+' >/dev/null; then
+  LEGACY_MATCH=true
+fi
+
+if [ -L "$CONFIG" ]; then
+  echo "ensure-thub-codex: refusing to mutate symlinked config: $CONFIG" >&2
+  exit 1
+fi
+if [ -n "$CURRENT" ] && ! "$LEGACY_MATCH" && ! has_exact_managed_table_shape; then
+  echo "ensure-thub-codex: refusing to replace a customized t-hub registration" >&2
+  echo "ensure-thub-codex: the managed table contains unknown fields or nested policy" >&2
+  exit 1
+fi
+if [ -n "$CURRENT" ] && ! "$LEGACY_MATCH" && ! printf '%s' "$CURRENT" | jq -e '
   .enabled == true and .disabled_reason == null and
   .transport.type == "stdio" and .transport.args == [] and
   (.transport.env == null or .transport.env == {}) and
-  .transport.env_vars == [] and .transport.cwd == null and
+  (.transport.env_vars == [] or .transport.env_vars == [
+    "T_HUB_CONTROL_ADDR",
+    "T_HUB_CONTROL_TOKEN",
+    "T_HUB_SESSION_TOKEN"
+  ]) and .transport.cwd == null and
   .enabled_tools == null and .disabled_tools == null and
   .startup_timeout_sec == null and .tool_timeout_sec == null
 ' >/dev/null; then
@@ -108,7 +184,63 @@ rollback() {
 }
 trap rollback EXIT
 
-if [ -n "$CURRENT" ]; then
+insert_env_vars() {
+  source_hash="$(config_hash)"
+  update="$(mktemp "${CONFIG}.t-hub-update.XXXXXX")"
+  if ! cp -p "$CONFIG" "$update"; then
+    rm -f "$update"
+    return 1
+  fi
+
+  env_line="$(awk '
+    /^\[mcp_servers\.t-hub\]$/ { in_target = 1; next }
+    /^\[/ { in_target = 0 }
+    in_target && /^[[:space:]]*env_vars[[:space:]]*=/ { print NR }
+  ' "$update")"
+  command_line="$(awk '
+    /^\[mcp_servers\.t-hub\]$/ { in_target = 1; next }
+    /^\[/ { in_target = 0 }
+    in_target && /^[[:space:]]*command[[:space:]]*=/ { print NR }
+  ' "$update")"
+
+  if [ -n "$env_line" ]; then
+    if [[ "$env_line" == *$'\n'* ]] ||
+      ! sed -n "${env_line}p" "$update" | grep -Eq '^[[:space:]]*env_vars[[:space:]]*=[[:space:]]*\[[[:space:]]*\][[:space:]]*(#.*)?$'; then
+      echo "ensure-thub-codex: refusing to rewrite a customized env_vars declaration" >&2
+      rm -f "$update"
+      return 1
+    fi
+    edit="${env_line}c\\${ENV_VARS_TOML}"
+  else
+    if [ -z "$command_line" ] || [[ "$command_line" == *$'\n'* ]]; then
+      echo "ensure-thub-codex: could not locate the managed t-hub command" >&2
+      rm -f "$update"
+      return 1
+    fi
+    edit="${command_line}a\\${ENV_VARS_TOML}"
+  fi
+
+  if ! sed -i "$edit" "$update"; then
+    rm -f "$update"
+    return 1
+  fi
+  current_hash=absent
+  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
+  if [ "$current_hash" != "$source_hash" ]; then
+    rm -f "$update"
+    echo "ensure-thub-codex: config changed concurrently; refusing replacement" >&2
+    return 1
+  fi
+  mv -f "$update" "$CONFIG"
+}
+
+POLICY_BEFORE=""
+if "$LEGACY_MATCH"; then
+  POLICY_BEFORE="$(printf '%s' "$CURRENT" | jq -c '{
+    enabled, disabled_reason, enabled_tools, disabled_tools,
+    startup_timeout_sec, tool_timeout_sec
+  }')"
+elif [ -n "$CURRENT" ]; then
   if codex mcp remove t-hub >/dev/null; then
     refresh_expected_hash
   else
@@ -118,25 +250,55 @@ if [ -n "$CURRENT" ]; then
   fi
 fi
 
-if codex mcp add t-hub -- "$BIN"; then
+if ! "$LEGACY_MATCH" && codex mcp add t-hub -- "$BIN"; then
   refresh_expected_hash
-  VERIFIED="$(codex mcp get t-hub --json 2>/dev/null || true)"
-  if ! printf '%s' "$VERIFIED" | jq -e --arg bin "$BIN" '
-    .enabled == true and .transport.type == "stdio" and
-    .transport.command == $bin and .transport.args == [] and
-    (.transport.env == null or .transport.env == {}) and
-    .transport.env_vars == [] and .transport.cwd == null and
-    .enabled_tools == null and .disabled_tools == null and
-    .startup_timeout_sec == null and .tool_timeout_sec == null
-  ' >/dev/null; then
-    echo "ensure-thub-codex: registration verification failed" >&2
-    exit 1
-  fi
-  trap - EXIT
-  [ -z "$BACKUP" ] || rm -f "$BACKUP"
-  echo "ensure-thub-codex: registered t-hub server via 'codex mcp add' ($BIN)"
-else
+elif ! "$LEGACY_MATCH"; then
   refresh_expected_hash
   echo "ensure-thub-codex: 'codex mcp add' failed" >&2
   exit 1
+fi
+
+if ! insert_env_vars; then
+  echo "ensure-thub-codex: failed to declare capability environment pass-through" >&2
+  exit 1
+fi
+refresh_expected_hash
+
+VERIFIED="$(codex mcp get t-hub --json 2>/dev/null || true)"
+if ! printf '%s' "$VERIFIED" | jq -e --arg bin "$BIN" --argjson env_vars "$ENV_VARS_JSON" '
+  .enabled == true and .transport.type == "stdio" and
+  .transport.command == $bin and .transport.args == [] and
+  (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == $env_vars and .transport.cwd == null
+' >/dev/null; then
+  echo "ensure-thub-codex: registration verification failed" >&2
+  exit 1
+fi
+
+if "$LEGACY_MATCH"; then
+  POLICY_AFTER="$(printf '%s' "$VERIFIED" | jq -c '{
+    enabled, disabled_reason, enabled_tools, disabled_tools,
+    startup_timeout_sec, tool_timeout_sec
+  }')"
+  if [ "$POLICY_BEFORE" != "$POLICY_AFTER" ]; then
+    echo "ensure-thub-codex: existing Codex policy changed during migration" >&2
+    exit 1
+  fi
+else
+  if ! printf '%s' "$VERIFIED" | jq -e '
+    .disabled_reason == null and .enabled_tools == null and
+    .disabled_tools == null and .startup_timeout_sec == null and
+    .tool_timeout_sec == null
+  ' >/dev/null; then
+    echo "ensure-thub-codex: registration policy verification failed" >&2
+    exit 1
+  fi
+fi
+
+trap - EXIT
+[ -z "$BACKUP" ] || rm -f "$BACKUP"
+if "$LEGACY_MATCH"; then
+  echo "ensure-thub-codex: migrated t-hub capability pass-through ($BIN)"
+else
+  echo "ensure-thub-codex: registered t-hub server via 'codex mcp add' ($BIN)"
 fi

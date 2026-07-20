@@ -112,7 +112,6 @@ const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "terminal", label: "Terminal" },
   { id: "files", label: "Files" },
   { id: "preview", label: "Run + Preview" },
-  { id: "board", label: "Board" },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -237,7 +236,7 @@ export function Tile({
   const busy =
     (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
-  // Per-tile panel state (the Terminal / Files / Run + Preview / Board workbench).
+  // Per-tile panel state (the Terminal / Files / Run + Preview workbench).
   // Kept in usePanels so this presentational state doesn't
   // contend with the workspace store. The active tab decides whether the body
   // shows the pooled terminal or an in-tile surface. Fullscreen blows this one
@@ -249,7 +248,7 @@ export function Tile({
   const activeTab: PanelTab =
     rawTab === "dev"
       ? "preview"
-      : rawTab === "files" || rawTab === "preview" || rawTab === "board"
+      : rawTab === "files" || rawTab === "preview"
         ? rawTab
         : "terminal";
   const setTab = usePanels((s) => s.setTab);

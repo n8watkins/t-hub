@@ -2,9 +2,12 @@
 
 T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
-## Status — released personal alpha (v0.3.58)
+## Status - post-Powder agent-session candidate (v0.3.106)
 
-Well past the original "playable proof" nucleus: the terminal spine, the agent-supervision layer (the 0.5 plan), Codex support, and the full Windows/WSL integration all ship in the installed app. **v0.3.58 is released** — a signed Windows installer ships from a GitHub Release with `latest.json` auto-update wired in (Tauri updater plugin).
+The current product is a local agent-session cockpit for Codex and Claude.
+Durable Captain and agent records, checkpoints, lifecycle events, cursor-based recovery, and the CLI/MCP control channel are the active coordination surface.
+Powder is retired from active product flows.
+Legacy Powder registry fields remain readable as inert compatibility data.
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell with an xterm.js tile grid (Fit + WebGL + Search + Unicode 11), deterministic insertion/focus, and durable layout/workspace persistence.
 - **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
@@ -16,9 +19,12 @@ Well past the original "playable proof" nucleus: the terminal spine, the agent-s
 - **Native session-restore:** orphaned Claude sessions surviving an app/host restart are listed in the **Recovery** panel and brought back via `claude --resume <id>` into a fresh tile.
 - **Tray recovery actions:** light, no-restart recovery from the system tray — **Reload window** (re-renders the React UI without touching tmux/agent) and **Reconnect agent bridge** (safe disconnect → reconnect off the UI thread, preserving the journal cursor).
 - **Codex + Claude:** per-provider usage readouts, icons, and running-pulse activity in the sidebar.
-- **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket. The catalog is **~30 tools** — read tools (`get_status`, `list_terminals`, `read_terminal`, `supervision_tree`, `wait_for_status`, `scribe_status`, …) open, organization tools (`new_tab`/`focus_tab`/`rename_tab`, `create_worktree`/`remove_worktree`, `claim_captain`/`watch_fleet`, …) audited, and process-changing tools (`spawn_terminal`, `send_text`/`send_keys`, `close_terminal`, …) confirmation-gated.
+- **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket.
+The catalog includes `start_agent`, `list_agents`, `get_agent`, `agent_checkpoint`, and `agent_events` alongside terminal, workspace, and Captain operations.
+Retired Powder tools are not advertised.
 - **~58 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
-- **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL) — 300+ tests across stores, components, and pure-function libs (`pnpm test`).
+- **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL).
+Run the focused agent-session gates before release, then the complete Rust, CLI, MCP, frontend, formatting, Clippy, and zero-network gates.
 
 ## Repository layout
 
@@ -74,6 +80,9 @@ Then `pnpm tauri dev` (a window opens through WSLg).
 `pnpm dev` (Vite dev server) or `pnpm build`. The terminal backend commands are unavailable without the Tauri host, but the UI shell renders.
 
 ## Roadmap & docs
+
+- **[docs/POST-POWDER-ROADMAP.md](./docs/POST-POWDER-ROADMAP.md)** - the authoritative agent-session roadmap and acceptance gates.
+- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the bounded release smoke procedure for Windows and WSL.
 
 - **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the active stabilization program, CI target, security workstreams, and measurable Alpha/Beta/Stable release gates.
 - **[docs/PLAN.md](./docs/PLAN.md)** — the original phased plan (0.5 → 2.0). Most of the 0.5 supervision track has since shipped; kept as the design-rationale record.

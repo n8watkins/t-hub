@@ -12,7 +12,8 @@ It does not prove that the Windows and WSL product works, that a released instal
 
 Feature expansion should pause after the current `0.3.65` integration wave.
 The resulting build becomes the stabilization baseline, not the stable release.
-Powder expansion, additional orchestration features, and broad UI work resume only after the Beta gate in this document passes.
+Additional orchestration features and broad UI work resume only after the Beta
+gate in this document passes.
 
 ## Supported Production Scope
 

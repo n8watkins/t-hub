@@ -82,8 +82,10 @@ export const Commands = {
 /** One workspace tab as the core's tab registry sees it (TASK C / #22). Mirrors
  *  the Rust `control::TabRecord` (`{id, name, tileIds}`). */
 export interface TabReport {
+  schemaVersion?: 1;
   id: string;
   name: string;
+  kind?: "work" | "captain";
   tileIds: TerminalId[];
 }
 
@@ -96,6 +98,8 @@ export interface TabReport {
 export interface TabReportResult {
   seq: number;
   stale?: boolean;
+  /** Native Tauri commands serialize apply errors as data instead of rejecting. */
+  error?: string;
   activeTabId?: string | null;
   tabs?: TabReport[];
 }
