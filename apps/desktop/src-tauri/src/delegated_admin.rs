@@ -651,6 +651,15 @@ impl DelegatedAdminStore {
             .collect()
     }
 
+    pub fn grants_delegated_by(&self, supervisor_identity_id: &str) -> Vec<DelegatedAdminGrant> {
+        self.lock()
+            .grants
+            .values()
+            .filter(|grant| grant.delegator.identity_id == supervisor_identity_id)
+            .cloned()
+            .collect()
+    }
+
     /// Resolve and authorize an effective delegated grant.
     ///
     /// This method intentionally accepts no control token or capability tier.

@@ -272,6 +272,7 @@ fn start_control_listener(
     identity_store: std::sync::Arc<identity::IdentityStore>,
     inbox: std::sync::Arc<inbox::Inbox>,
     authz: std::sync::Arc<authz::AuthzStore>,
+    delegated_admin: std::sync::Arc<delegated_admin::DelegatedAdminStore>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -350,7 +351,8 @@ fn start_control_listener(
         // Comms-plane Phase 3: the delegation-gate carrier store (durable general-
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
-        .with_authz(authz);
+        .with_authz(authz)
+        .with_delegated_admin(delegated_admin);
     control::recover_pending_fleet_operations(&ctx);
     match control::start(ctx) {
         Ok(h) => {
@@ -664,6 +666,13 @@ pub fn run() {
             // authorization artifacts), loaded from `authorizations.json` so recorded
             // authorizations survive restarts. One Arc shared with the control listener.
             let authz_store = std::sync::Arc::new(authz::AuthzStore::load_default());
+            let delegated_admin_store = std::sync::Arc::new(
+                delegated_admin::DelegatedAdminStore::load_default().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "durable delegated-admin state could not be loaded safely: {error}"
+                    ))
+                })?,
+            );
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
@@ -714,6 +723,7 @@ pub fn run() {
                 identity_store,
                 inbox,
                 authz_store,
+                delegated_admin_store,
             ) {
                 control_client::install(app.handle(), &handshake);
             }

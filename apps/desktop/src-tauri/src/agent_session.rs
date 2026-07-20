@@ -840,7 +840,7 @@ mod tests {
         assert!(delivery.states().live_verified);
         delivery.validate().unwrap();
 
-        let value = serde_json::to_value(&delivery.states()).unwrap();
+        let value = serde_json::to_value(delivery.states()).unwrap();
         assert_eq!(value["complete"], true);
         assert_eq!(value["liveVerified"], true);
 

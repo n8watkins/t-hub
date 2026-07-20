@@ -8179,6 +8179,9 @@ pub struct ControlContext {
     /// `check_authorization` resolve-and-verify gate (a captain's money/publish consult)
     /// reach one store. Persistent (`authorizations.json`); ephemeral in headless tests.
     authz: Arc<crate::authz::AuthzStore>,
+    /// Durable Ship Admin and Fleet Admin appointments.
+    /// Control capability admission remains a separate outer gate.
+    delegated_admin: Arc<crate::delegated_admin::DelegatedAdminStore>,
 }
 
 impl ControlContext {
@@ -9464,7 +9467,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "inbox_ack"
         // comms-plane Phase 3: `authorize` records a durable governance artifact
         // (mutating, audited); only the general originates (enforced by the handler ACL).
-        | "authorize" => CommandTier::Organization,
+        | "authorize" | "appoint_admin" | "revoke_admin" => CommandTier::Organization,
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
         // (least-privilege read token) can send up to its captain; the handler REQUIRES a
         // resolved session identity (or a Full host) and the `can_message` ACL is the real
@@ -10515,6 +10518,27 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         );
         return ControlResponse::err(message);
     }
+    let delegated_control_access = if tier == CommandTier::Read
+        || inbox_self_ack
+        || crew_self_work_log
+        || agent_self_checkpoint
+    {
+        crate::delegated_admin::ControlAccess::Read
+    } else {
+        crate::delegated_admin::ControlAccess::Mutation
+    };
+    let delegated_capability = match cap {
+        Capability::ReadOnly => crate::delegated_admin::ControlCapability::ReadOnly,
+        Capability::Full => crate::delegated_admin::ControlCapability::Full,
+    };
+    if let Err(error) = crate::delegated_admin::require_control_capability(
+        delegated_capability,
+        delegated_control_access,
+    ) {
+        return ControlResponse::err(format!(
+            "unauthorized: delegated control admission failed: {error}"
+        ));
+    }
 
     // item-3 Pillar C: `my_capability` echoes the CALLER's resolved capability so the
     // out-of-process PreToolUse gate can resolve its own class (control vs read) from
@@ -10970,6 +10994,7 @@ fn dispatch_with_caller(
         // The resolve-and-verify GATE a captain's money/publish gate consults
         // (`general_authorization_present`): read-only, Read tier.
         "check_authorization" => check_authorization(ctx, args),
+        "list_admin_grants" => list_admin_grants(ctx, args, caller, trusted_internal),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
         // These are surfaced by the MCP server and accepted here, but the
@@ -11011,6 +11036,8 @@ fn dispatch_with_caller(
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "agent_checkpoint" => agent_checkpoint(ctx, args, caller, trusted_internal),
+        "appoint_admin" => appoint_admin(ctx, args, caller, trusted_internal),
+        "revoke_admin" => revoke_admin(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
         }
@@ -18625,6 +18652,324 @@ fn check_authorization(ctx: &ControlContext, args: &Value) -> Result<Value, Stri
     }))
 }
 
+fn stable_supervisor_generation(parts: &[&str]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    )
+    .max(1)
+}
+
+fn supervisor_authority_for_caller(
+    ctx: &ControlContext,
+    caller: &ResolvedIdentity,
+) -> Result<crate::delegated_admin::SupervisorAuthority, String> {
+    match caller.fleet_role {
+        Some(FleetRole::Cortana) => {
+            let durable = ctx.captains.cortana_identity();
+            let active = ctx.captains.snapshot().captains.iter().any(|captain| {
+                captain.role == FleetRole::Cortana
+                    && captain.state == ClaimState::Active
+                    && captain.terminal_id.as_deref() == caller.tile.as_deref()
+            });
+            if durable.identity_id.as_deref() != Some(caller.session_id.as_str()) {
+                return Err("delegated admin: caller is not the durable Cortana identity".into());
+            }
+            Ok(crate::delegated_admin::SupervisorAuthority {
+                identity_id: caller.session_id.clone(),
+                role: crate::delegated_admin::DelegatingSupervisorRole::Cortana,
+                ship_slug: None,
+                authority_generation: durable.generation,
+                active,
+            })
+        }
+        Some(FleetRole::Captain) => {
+            let tile = caller
+                .tile
+                .as_deref()
+                .ok_or("delegated admin: Captain identity has no terminal")?;
+            let captain = ctx
+                .captains
+                .captain_for_session(tile)
+                .filter(|captain| captain.role == FleetRole::Captain)
+                .ok_or("delegated admin: caller is not an active Captain")?;
+            Ok(crate::delegated_admin::SupervisorAuthority {
+                identity_id: caller.session_id.clone(),
+                role: crate::delegated_admin::DelegatingSupervisorRole::Captain,
+                ship_slug: Some(captain.ship_slug.clone()),
+                authority_generation: stable_supervisor_generation(&[
+                    &captain.assignment_id,
+                    &captain.ship_slug,
+                ]),
+                active: captain.state == ClaimState::Active,
+            })
+        }
+        None => Err("delegated admin: only Cortana or a Captain may grant roles".into()),
+    }
+}
+
+fn current_delegating_supervisor(
+    ctx: &ControlContext,
+    grant: &crate::delegated_admin::DelegatedAdminGrant,
+) -> crate::delegated_admin::SupervisorAuthority {
+    match grant.delegator.role {
+        crate::delegated_admin::DelegatingSupervisorRole::Cortana => {
+            let durable = ctx.captains.cortana_identity();
+            let active = ctx.captains.snapshot().captains.iter().any(|captain| {
+                captain.role == FleetRole::Cortana
+                    && captain.state == ClaimState::Active
+                    && captain.terminal_id.is_some()
+            });
+            crate::delegated_admin::SupervisorAuthority {
+                identity_id: durable
+                    .identity_id
+                    .unwrap_or_else(|| grant.delegator.identity_id.clone()),
+                role: crate::delegated_admin::DelegatingSupervisorRole::Cortana,
+                ship_slug: None,
+                authority_generation: durable.generation,
+                active,
+            }
+        }
+        crate::delegated_admin::DelegatingSupervisorRole::Captain => {
+            let captain = grant.delegator.ship_slug.as_deref().and_then(|ship_slug| {
+                ctx.captains
+                    .snapshot()
+                    .captains
+                    .into_iter()
+                    .find(|captain| {
+                        captain.role == FleetRole::Captain && captain.ship_slug == ship_slug
+                    })
+            });
+            let current_identity = captain
+                .as_ref()
+                .and_then(|captain| captain.terminal_id.as_deref())
+                .and_then(|terminal_id| ctx.identity.for_tile(terminal_id));
+            let authority_generation = captain
+                .as_ref()
+                .map(|captain| {
+                    stable_supervisor_generation(&[&captain.assignment_id, &captain.ship_slug])
+                })
+                .unwrap_or_default();
+            crate::delegated_admin::SupervisorAuthority {
+                identity_id: current_identity
+                    .map(|identity| identity.id)
+                    .unwrap_or_else(|| grant.delegator.identity_id.clone()),
+                role: crate::delegated_admin::DelegatingSupervisorRole::Captain,
+                ship_slug: grant.delegator.ship_slug.clone(),
+                authority_generation,
+                active: captain
+                    .as_ref()
+                    .is_some_and(|captain| captain.state == ClaimState::Active),
+            }
+        }
+    }
+}
+
+fn parse_admin_role(value: &str) -> Result<crate::delegated_admin::DelegatedAdminRole, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "shipadmin" | "ship-admin" | "ship_admin" => {
+            Ok(crate::delegated_admin::DelegatedAdminRole::ShipAdmin)
+        }
+        "fleetadmin" | "fleet-admin" | "fleet_admin" => {
+            Ok(crate::delegated_admin::DelegatedAdminRole::FleetAdmin)
+        }
+        _ => Err("appoint_admin role must be 'shipAdmin' or 'fleetAdmin'".into()),
+    }
+}
+
+fn parse_admin_operations(
+    args: &Value,
+) -> Result<std::collections::BTreeSet<crate::delegated_admin::AdminOperation>, String> {
+    let values = args
+        .get("permittedOperations")
+        .or_else(|| args.get("permitted_operations"))
+        .and_then(Value::as_array)
+        .ok_or("appoint_admin requires a permittedOperations array")?;
+    values
+        .iter()
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                format!("appoint_admin contains an unknown permitted operation: {error}")
+            })
+        })
+        .collect()
+}
+
+fn appoint_admin(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "appoint_admin")?;
+    let caller = caller.ok_or("appoint_admin requires a supervisor session identity")?;
+    let supervisor = supervisor_authority_for_caller(ctx, caller)?;
+    if !supervisor.active {
+        return Err("appoint_admin requires an active supervisor".into());
+    }
+    let actor_session_id = arg_str(args, "actorSessionId")
+        .or_else(|| arg_str(args, "actor_session_id"))
+        .ok_or("appoint_admin requires an actorSessionId")?;
+    let actor = ctx
+        .identity
+        .for_tile(&actor_session_id)
+        .ok_or_else(|| format!("appoint_admin cannot resolve Crew '{actor_session_id}'"))?;
+    if actor.role != crate::identity::Role::Crew {
+        return Err("appoint_admin may appoint only a Crew identity".into());
+    }
+    let role = parse_admin_role(&arg_str(args, "role").ok_or("appoint_admin requires a role")?)?;
+    let scope = match role {
+        crate::delegated_admin::DelegatedAdminRole::ShipAdmin => {
+            if supervisor.role != crate::delegated_admin::DelegatingSupervisorRole::Captain {
+                return Err("appoint_admin Ship Admin requires the owning Captain".into());
+            }
+            let ship_slug = supervisor
+                .ship_slug
+                .clone()
+                .ok_or("appoint_admin Captain has no ship scope")?;
+            let actor_is_crew = ctx.captains.snapshot().captains.iter().any(|captain| {
+                captain.ship_slug == ship_slug
+                    && captain
+                        .crew
+                        .iter()
+                        .any(|crew| crew.terminal_id == actor_session_id)
+            });
+            if !actor_is_crew {
+                return Err(format!(
+                    "appoint_admin Crew '{actor_session_id}' is not owned by ship '{ship_slug}'"
+                ));
+            }
+            crate::delegated_admin::AdminScope::Ship { ship_slug }
+        }
+        crate::delegated_admin::DelegatedAdminRole::FleetAdmin => {
+            if supervisor.role != crate::delegated_admin::DelegatingSupervisorRole::Cortana {
+                return Err("appoint_admin Fleet Admin requires Cortana".into());
+            }
+            crate::delegated_admin::AdminScope::Fleet
+        }
+    };
+    let grant = ctx
+        .delegated_admin
+        .appoint(crate::delegated_admin::AppointmentRequest {
+            actor_identity_id: actor.id,
+            role,
+            delegator: supervisor,
+            scope,
+            permitted_operations: parse_admin_operations(args)?,
+        })
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    Ok(json!({
+        "accepted": "appoint_admin",
+        "grant": grant,
+        "audited": true,
+    }))
+}
+
+fn revoke_admin(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "revoke_admin")?;
+    let caller = caller.ok_or("revoke_admin requires a supervisor session identity")?;
+    let supervisor = supervisor_authority_for_caller(ctx, caller)?;
+    let grant_id = arg_str(args, "grantId")
+        .or_else(|| arg_str(args, "grant_id"))
+        .ok_or("revoke_admin requires a grantId")?;
+    let grant = ctx
+        .delegated_admin
+        .revoke(&grant_id, &supervisor, arg_str(args, "reason"))
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    Ok(json!({
+        "accepted": "revoke_admin",
+        "grant": grant,
+        "audited": true,
+    }))
+}
+
+fn list_admin_grants(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let grants = if let Some(caller) = caller {
+        if caller.fleet_role.is_some() {
+            ctx.delegated_admin.grants_delegated_by(&caller.session_id)
+        } else {
+            ctx.delegated_admin.grants_for_actor(&caller.session_id)
+        }
+    } else if trusted_internal {
+        let actor_identity_id = arg_str(args, "actorIdentityId")
+            .or_else(|| arg_str(args, "actor_identity_id"))
+            .ok_or("list_admin_grants trusted host requires actorIdentityId")?;
+        ctx.delegated_admin.grants_for_actor(&actor_identity_id)
+    } else {
+        return Err("list_admin_grants requires a session identity".into());
+    };
+    Ok(json!({
+        "count": grants.len(),
+        "grants": grants,
+    }))
+}
+
+fn authorize_delegated_admin(
+    ctx: &ControlContext,
+    caller: &ResolvedIdentity,
+    operation: crate::delegated_admin::AdminOperation,
+    target: crate::delegated_admin::AdminTarget,
+    safeguards: crate::delegated_admin::AdminSafeguards,
+) -> Result<crate::delegated_admin::AdminAuditContext, String> {
+    let grant = ctx
+        .delegated_admin
+        .grants_for_actor(&caller.session_id)
+        .into_iter()
+        .find(|grant| grant.state.is_active())
+        .ok_or("delegated admin: caller has no active administrative grant")?;
+    let supervisor = current_delegating_supervisor(ctx, &grant);
+    let audit = ctx
+        .delegated_admin
+        .authorize(
+            &crate::delegated_admin::AdminActor {
+                identity_id: caller.session_id.clone(),
+                session_tile: caller.tile.clone(),
+            },
+            &supervisor,
+            operation,
+            &target,
+            &safeguards,
+        )
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    let audit_value = serde_json::to_value(&audit).unwrap_or_default();
+    ctx.audit.record(
+        "delegated_admin_authorized",
+        "organization",
+        "allowed",
+        &audit_value,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: "delegated",
+            session: audit.actor_session_tile.as_deref(),
+            spawned_by: None,
+            error: None,
+        },
+    );
+    Ok(audit)
+}
+
 /// Comms-plane Phase 3: operate-fleet-infra (§2.7 R-L2). The plane's own administrative
 /// operations (queue purge/flush) gated to the apex fleet-infra owner
 /// (`can_operate_fleet_infra`): a captain/crew may NOT administer the shared plane. The
@@ -18686,7 +19031,17 @@ fn read_terminal(
     // Phase 3 (§2.6 H3): the cross-ship READ hole - `read_terminal` captures another
     // session's scrollback directly via tmux, bypassing the plane entirely. An
     // identified session may read a pane ONLY on its own ship; the proven host is unrestricted.
-    enforce_session_access(ctx, caller, trusted_internal, &session_id)?;
+    if let Err(acl_error) = enforce_session_access(ctx, caller, trusted_internal, &session_id) {
+        let caller = caller.ok_or(acl_error)?;
+        let target = delegated_admin_target_for_terminal(ctx, &session_id)?;
+        authorize_delegated_admin(
+            ctx,
+            caller,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            target,
+            crate::delegated_admin::AdminSafeguards::default(),
+        )?;
+    }
     let target = tmux_target(&session_id);
     let history = args
         .get("historyLines")
@@ -18702,6 +19057,51 @@ fn read_terminal(
         "historyLines": history,
         "text": text,
     }))
+}
+
+fn delegated_admin_target_for_terminal(
+    ctx: &ControlContext,
+    terminal_id: &str,
+) -> Result<crate::delegated_admin::AdminTarget, String> {
+    let terminal_id = terminal_id.strip_prefix("th_").unwrap_or(terminal_id);
+    let snapshot = ctx.captains.snapshot();
+    if let Some(captain) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.terminal_id.as_deref() == Some(terminal_id))
+    {
+        let captain_identity_id = ctx
+            .identity
+            .for_tile(terminal_id)
+            .map(|identity| identity.id)
+            .unwrap_or_else(|| captain.assignment_id.clone());
+        return Ok(crate::delegated_admin::AdminTarget::Captain {
+            ship_slug: captain.ship_slug.clone(),
+            captain_identity_id,
+        });
+    }
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == terminal_id)
+        })
+        .collect::<Vec<_>>();
+    match owners.as_slice() {
+        [owner] => Ok(crate::delegated_admin::AdminTarget::CrewSession {
+            ship_slug: owner.ship_slug.clone(),
+            session_id: terminal_id.to_string(),
+        }),
+        [] => Err(format!(
+            "delegated admin: terminal '{terminal_id}' has no authoritative Fleet owner"
+        )),
+        _ => Err(format!(
+            "delegated admin: terminal '{terminal_id}' has ambiguous Fleet ownership"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -21128,6 +21528,7 @@ impl ControlContext {
             identity: Arc::new(crate::identity::IdentityStore::ephemeral()),
             inbox: Arc::new(crate::inbox::Inbox::ephemeral()),
             authz: Arc::new(crate::authz::AuthzStore::ephemeral()),
+            delegated_admin: Arc::new(crate::delegated_admin::DelegatedAdminStore::ephemeral()),
         }
     }
 
@@ -21212,6 +21613,14 @@ impl ControlContext {
     /// ephemeral one from [`new`](Self::new).
     pub fn with_authz(mut self, authz: Arc<crate::authz::AuthzStore>) -> Self {
         self.authz = authz;
+        self
+    }
+
+    pub fn with_delegated_admin(
+        mut self,
+        delegated_admin: Arc<crate::delegated_admin::DelegatedAdminStore>,
+    ) -> Self {
+        self.delegated_admin = delegated_admin;
         self
     }
 
@@ -28220,6 +28629,83 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    #[test]
+    fn captain_appoints_and_revokes_a_ship_admin_for_exact_ship_inspection() {
+        let ctx = test_ctx("delegated-admin");
+        ctx.captains
+            .claim_test("captain-admin", Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .record_crew("captain-admin", "crew-admin")
+            .unwrap();
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-admin")
+            .unwrap();
+        let crew_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&crew_identity.id, "crew-admin")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let appointed = appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": "crew-admin",
+                "role": "shipAdmin",
+                "permittedOperations": ["inspectStatus", "maintainSession"],
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let grant_id = appointed["grant"]["grantId"].as_str().unwrap().to_string();
+        let crew = resolve_identity(&ctx, &crew_identity.secret).unwrap();
+        let audit = authorize_delegated_admin(
+            &ctx,
+            &crew,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            crate::delegated_admin::AdminTarget::CrewSession {
+                ship_slug: "alpha".into(),
+                session_id: "crew-peer".into(),
+            },
+            crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .unwrap();
+        assert_eq!(audit.actor_identity_id, crew_identity.id);
+        assert_eq!(audit.delegating_supervisor_identity_id, captain_identity.id);
+        let foreign = authorize_delegated_admin(
+            &ctx,
+            &crew,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            crate::delegated_admin::AdminTarget::CrewSession {
+                ship_slug: "beta".into(),
+                session_id: "foreign".into(),
+            },
+            crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .unwrap_err();
+        assert!(foreign.contains("targetOutOfScope"));
+
+        revoke_admin(
+            &ctx,
+            &json!({ "grantId": grant_id, "reason": "rotation" }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let revoked = authorize_delegated_admin(
+            &ctx,
+            &crew,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            crate::delegated_admin::AdminTarget::Ship {
+                ship_slug: "alpha".into(),
+            },
+            crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .unwrap_err();
+        assert!(revoked.contains("no active administrative grant"));
     }
 
     #[test]
