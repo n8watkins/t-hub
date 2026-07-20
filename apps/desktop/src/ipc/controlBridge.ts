@@ -25,6 +25,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { isSatelliteWindow, useWorkspace } from "../store/workspace";
 import { useCaptain, type CaptainClaimRecord, type CrewRef } from "../store/captain";
+import { notify } from "../lib/notify";
 import { controlRequest } from "./controlClient";
 import type { TabReport, TabReportResult } from "./types";
 
@@ -68,6 +69,19 @@ let lastSeq = 0;
 // widen the stale-report window). Zustand notifies subscribers synchronously
 // inside set(), so a plain flag is race-free here.
 let adoptingRegistry = false;
+let layoutSyncFailed = false;
+
+function surfaceLayoutSyncFailure(error: unknown): void {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+  console.error("workspace registry sync failed", error);
+  if (layoutSyncFailed) return;
+  layoutSyncFailed = true;
+  notify(
+    "error",
+    "Workspace sync failed",
+    "Your local layout is still available. Restart T-Hub to retry synchronization.",
+  );
+}
 
 /**
  * Adopt an apply's authoritative registry snapshot (`args.sync`) into the
@@ -116,7 +130,13 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
       activeTabId?: unknown;
       tabs?: unknown;
     };
-    if (typeof res.seq !== "number" || !Array.isArray(res.tabs) || res.tabs.length === 0) {
+    if (
+      !res ||
+      typeof res !== "object" ||
+      typeof res.seq !== "number" ||
+      !Array.isArray(res.tabs) ||
+      res.tabs.length === 0
+    ) {
       return;
     }
 
@@ -125,6 +145,15 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
     const local = useWorkspace.getState();
     const localWork = local.tabs.filter((tab) => tab.id !== "captains-reserved");
     const serverWork = serverTabs.filter((tab) => tab.id !== "captains-reserved");
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      console.warn("workspace registry bootstrap", {
+        localTabs: local.tabs.length,
+        serverTabs: serverTabs.length,
+        localWorkspaces: localWork.length,
+        serverWorkspaces: serverWork.length,
+        liveTerminals: Object.keys(local.terminals).length,
+      });
+    }
 
     if (serverWork.length === 0 && localWork.length > 0) {
       const { reportWorkspaceTabs } = await import("./client");
@@ -151,8 +180,9 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
     } finally {
       adoptingRegistry = false;
     }
-  } catch {
+  } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
+    surfaceLayoutSyncFailure(error);
   }
 }
 
@@ -570,6 +600,7 @@ function startTabReporter(): void {
     void import("./client")
       .then((m) => m.reportWorkspaceTabs(payload, activeTabId, lastSeq))
       .then((res: TabReportResult | void) => {
+        layoutSyncFailed = false;
         if (res && typeof res.seq === "number") {
           lastSeq = res.seq;
           if (res.stale && Array.isArray(res.tabs)) {
@@ -583,8 +614,9 @@ function startTabReporter(): void {
           }
         }
       })
-      .catch(() => {
-        // Not under Tauri, or the command isn't available — safe to ignore.
+      .catch((error) => {
+        // Keep the local layout usable, but make a real Tauri failure visible.
+        surfaceLayoutSyncFailure(error);
       })
       .finally(() => {
         inFlight = false;
