@@ -432,6 +432,76 @@ fn schema_captain_bootstrap() -> Value {
     })
 }
 
+fn schema_list_agents() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string" },
+            "projectId": { "type": "string" },
+            "cursor": { "type": "string", "pattern": "^[0-9]+$", "default": "0" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+            "state": { "type": "string", "enum": ["active"] }
+        },
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["projectId"] }
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn schema_get_agent() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "agentSessionId": { "type": "string" } },
+        "required": ["agentSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_agent_checkpoint() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string" },
+            "authorSessionId": { "type": "string" },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "required": ["agentSessionId", "authorSessionId", "summary"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_agent_events() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string" },
+            "cursor": { "type": "string", "pattern": "^[0-9]+$", "default": "0" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+        },
+        "required": ["agentSessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_start_agent() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "requestId": { "type": "string", "minLength": 1 },
+            "captainSessionId": { "type": "string" },
+            "assignment": { "type": "string", "minLength": 1, "maxLength": 16384 },
+            "directory": { "type": "string" },
+            "harness": { "type": "string", "enum": ["codex", "claude"] },
+            "name": { "type": "string" },
+            "workspaceTabId": { "type": "string" }
+        },
+        "required": ["requestId", "captainSessionId", "assignment", "directory"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_commission_captain() -> Value {
     json!({
         "type": "object",
@@ -811,6 +881,24 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "list_agents",
+            tier: Tier::Read,
+            summary: "List bounded durable agent-session summaries for one Captain or Project.",
+            input_schema: schema_list_agents,
+        },
+        ToolDef {
+            name: "get_agent",
+            tier: Tier::Read,
+            summary: "Get the full durable record for one agent session, including its assignment.",
+            input_schema: schema_get_agent,
+        },
+        ToolDef {
+            name: "agent_events",
+            tier: Tier::Read,
+            summary: "Read bounded lifecycle and checkpoint events after a cursor.",
+            input_schema: schema_agent_events,
+        },
+        ToolDef {
             name: "list_powder_boards",
             tier: Tier::Read,
             summary: "List a bounded page of visible canonical Powder boards for a protected connection profile.",
@@ -908,6 +996,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_captain_checkpoint,
         },
         ToolDef {
+            name: "agent_checkpoint",
+            tier: Tier::Organization,
+            summary: "Append a bounded human-readable checkpoint to a durable agent session.",
+            input_schema: schema_agent_checkpoint,
+        },
+        ToolDef {
             name: "append_crew_powder_work_log",
             tier: Tier::Organization,
             summary: "Append an attributed, bounded work-log message to the calling Crew session's bound Powder card and run. A narrow backend override admits only a read-capability Crew appending to its own binding.",
@@ -962,6 +1056,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
             input_schema: schema_spawn_terminal,
+        },
+        ToolDef {
+            name: "start_agent",
+            tier: Tier::ProcessChanging,
+            summary: "Start one Codex or Claude agent in an existing Project checkout with a durable assignment.",
+            input_schema: schema_start_agent,
         },
         ToolDef {
             name: "commission_captain",
