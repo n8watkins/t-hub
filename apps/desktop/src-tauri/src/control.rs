@@ -19219,6 +19219,51 @@ fn current_delegating_supervisor(
     }
 }
 
+fn current_admin_actor(
+    ctx: &ControlContext,
+    grant: &crate::delegated_admin::DelegatedAdminGrant,
+) -> crate::delegated_admin::AdminActor {
+    let identity = ctx.identity.get(&grant.actor_identity_id);
+    let session_tile = identity
+        .as_ref()
+        .and_then(|identity| identity.session_tile.clone());
+    let memberships = session_tile
+        .as_deref()
+        .map(|terminal_id| {
+            ctx.captains
+                .snapshot()
+                .captains
+                .into_iter()
+                .filter(|captain| {
+                    captain.crew.iter().any(|crew| {
+                        crew.terminal_id == terminal_id && matches!(crew.state, CrewState::Active)
+                    })
+                })
+                .map(|captain| captain.ship_slug)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let current_ship_slug = match memberships.as_slice() {
+        [ship_slug] => Some(ship_slug.clone()),
+        _ => None,
+    };
+    let is_current_crew = identity.as_ref().is_some_and(|identity| {
+        identity.role == crate::identity::Role::Crew
+            && !ctx.identity.is_revoked(&identity.id)
+            && memberships.len() == 1
+    });
+    let runtime_active = session_tile.as_deref().is_some_and(|terminal_id| {
+        tmux::session_liveness(&tmux_target(terminal_id)) == tmux::SessionLiveness::Alive
+    });
+    crate::delegated_admin::AdminActor {
+        identity_id: grant.actor_identity_id.clone(),
+        session_tile,
+        current_ship_slug,
+        is_current_crew,
+        runtime_active,
+    }
+}
+
 fn parse_admin_role(value: &str) -> Result<crate::delegated_admin::DelegatedAdminRole, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "shipadmin" | "ship-admin" | "ship_admin" => {
@@ -19382,7 +19427,12 @@ fn approve_admin_action(
     .map_err(|error| format!("approve_admin_action target is invalid: {error}"))?;
     let approval = ctx
         .delegated_admin
-        .issue_exact_approval(&grant_id, &supervisor, operation, &target)
+        .get(&grant_id)
+        .ok_or_else(|| format!("grantNotFound: grant '{grant_id}' was not found"))?;
+    let actor = current_admin_actor(ctx, &approval);
+    let approval = ctx
+        .delegated_admin
+        .issue_exact_approval(&grant_id, &actor, &supervisor, operation, &target)
         .map_err(|error| format!("{}: {error}", error.code()))?;
     Ok(json!({
         "accepted": "approve_admin_action",
@@ -19431,12 +19481,14 @@ fn authorize_delegated_admin(
         .find(|grant| grant.state.is_active())
         .ok_or("delegated admin: caller has no active administrative grant")?;
     let supervisor = current_delegating_supervisor(ctx, &grant);
+    let actor = current_admin_actor(ctx, &grant);
     let audit = ctx
         .delegated_admin
         .authorize(
             &crate::delegated_admin::AdminActor {
                 identity_id: caller.session_id.clone(),
                 session_tile: caller.tile.clone(),
+                ..actor
             },
             &supervisor,
             operation,
@@ -22046,11 +22098,16 @@ fn close_terminal_authorized(
                     .find(|grant| grant.state.is_active())
                     .ok_or("delegated admin: caller has no active administrative grant")?;
                 let supervisor = current_delegating_supervisor(ctx, &grant);
-                let exact_approval = ctx
+                let actor = current_admin_actor(ctx, &grant);
+                let consumed_approval = ctx
                     .delegated_admin
                     .consume_exact_approval(
                         &approval_id,
-                        &caller.session_id,
+                        &crate::delegated_admin::AdminActor {
+                            identity_id: caller.session_id.clone(),
+                            session_tile: caller.tile.clone(),
+                            ..actor
+                        },
                         &supervisor,
                         crate::delegated_admin::AdminOperation::CleanupSession,
                         &admin_target,
@@ -22063,7 +22120,7 @@ fn close_terminal_authorized(
                     admin_target,
                     crate::delegated_admin::AdminSafeguards {
                         authoritative_ownership_verified: true,
-                        exact_approval: Some(exact_approval.clone()),
+                        consumed_approval: Some(consumed_approval.clone()),
                         worktree_safety: None,
                     },
                 )?;
@@ -22071,7 +22128,7 @@ fn close_terminal_authorized(
                     None,
                     Some(DelegatedCleanupAuthority {
                         audit,
-                        exact_approval,
+                        consumed_approval,
                     }),
                 )
             }
@@ -22088,7 +22145,7 @@ fn close_terminal_authorized(
 #[derive(Debug, Clone)]
 struct DelegatedCleanupAuthority {
     audit: crate::delegated_admin::AdminAuditContext,
-    exact_approval: crate::delegated_admin::ExactApproval,
+    consumed_approval: crate::delegated_admin::ConsumedExactApproval,
 }
 
 #[derive(Debug, Clone)]
@@ -22143,18 +22200,20 @@ fn revalidate_close_lifecycle_authority(
                 })
                 .ok_or("delegated admin: cleanup authority changed before terminal teardown")?;
             let supervisor = current_delegating_supervisor(ctx, &grant);
+            let actor = current_admin_actor(ctx, &grant);
             ctx.delegated_admin
                 .authorize(
                     &crate::delegated_admin::AdminActor {
                         identity_id: authority.audit.actor_identity_id.clone(),
                         session_tile: authority.audit.actor_session_tile.clone(),
+                        ..actor
                     },
                     &supervisor,
                     crate::delegated_admin::AdminOperation::CleanupSession,
                     &authority.audit.target,
                     &crate::delegated_admin::AdminSafeguards {
                         authoritative_ownership_verified: true,
-                        exact_approval: Some(authority.exact_approval.clone()),
+                        consumed_approval: Some(authority.consumed_approval.clone()),
                         worktree_safety: None,
                     },
                 )
