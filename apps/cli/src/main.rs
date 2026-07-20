@@ -10,7 +10,9 @@
 //! stable machine envelope, output is bounded + sorted, and the shell exit code
 //! is a stable taxonomy agents can branch on (see [`exit`]).
 
+mod admin;
 mod agents;
+mod args;
 mod control;
 mod powder;
 mod render;
@@ -221,6 +223,7 @@ fn command_label(args: &[String]) -> String {
         },
         Some("powder") => powder::command_label(&args[1..]),
         Some("agents") => agents::command_label(&args[1..]),
+        Some("admin") => admin::command_label(&args[1..]),
         Some(c) => c.to_string(),
     }
 }
@@ -242,6 +245,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "events" | "watch" => cmd_events(rest),
         "powder" => powder::run(rest),
         "agents" => agents::run(rest),
+        "admin" => admin::run(rest),
         other => Err(CliError::usage(format!(
             "unknown command '{other}'. Run `th --help` for the command list."
         ))),
@@ -527,15 +531,19 @@ fn cmd_worktree_ls(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `th worktree prune [repoRoot]` - reap worktrees that are merged AND clean
-/// AND unleased: close any dead session over the socket, `git worktree remove`,
-/// delete the branch. Dry-run by default; `--yes` executes; `--force` extends
-/// the reap to unmerged branches (printing what would be lost). Dirty or
-/// leased worktrees are NEVER touched, flag or no flag.
+/// `th worktree prune [repoRoot]` reports worktrees that appear merged, clean,
+/// and unleased.
+/// Execution remains unavailable until the unified worktree safety service can
+/// prove authoritative ownership, retention, and exact-target removability.
 fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
     let f = Flags::parse(args, &[])?;
     let yes = f.bools.contains("--yes");
     let force = f.bools.contains("--force");
+    if yes {
+        return Err(CliError::gated(
+            "th worktree prune execution is temporarily unavailable until the authoritative worktree safety service is active; rerun without --yes for a non-destructive report",
+        ));
+    }
     let scan = worktree::scan(f.pos.first()).map_err(CliError::git)?;
 
     // Fail SAFE: without trustworthy lease data a "free" worktree might really
@@ -582,22 +590,6 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
         })
         .collect();
 
-    // Execute (only with --yes): reap in plan order, keep going past failures,
-    // report every outcome.
-    let mut executed: Vec<worktree::ReapResult> = Vec::new();
-    let mut failures = 0usize;
-    if yes {
-        for item in &plan {
-            if let worktree::Decision::Reap { forced } = item.decision {
-                let res = worktree::execute_reap(&scan, item.w, forced);
-                if res.error.is_some() {
-                    failures += 1;
-                }
-                executed.push(res);
-            }
-        }
-    }
-
     if f.json {
         let plan_json: Vec<Value> = plan
             .iter()
@@ -617,36 +609,14 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                 })
             })
             .collect();
-        let executed_json: Vec<Value> = executed
-            .iter()
-            .map(|r| {
-                json!({
-                    "path": r.path,
-                    "branch": r.branch,
-                    "closedSessions": r.closed_sessions,
-                    "worktreeRemoved": r.removed,
-                    "branchDeleted": r.branch_deleted,
-                    "error": r.error,
-                })
-            })
-            .collect();
         let data = json!({
             "repoRoot": scan.repo_root,
             "defaultBranch": scan.default_branch,
-            "dryRun": !yes,
+            "dryRun": true,
             "force": force,
             "plan": plan_json,
-            "executed": executed_json,
+            "executed": Vec::<Value>::new(),
         });
-        if failures > 0 {
-            // The envelope must not read as success when reaps failed; the
-            // human-readable detail is duplicated compactly in the message.
-            return Err(CliError::git(format!(
-                "{failures} of {} reap(s) failed: {}",
-                executed.len(),
-                compact(&data)
-            )));
-        }
         emit_json_ok("worktree prune", data);
         return Ok(());
     }
@@ -655,10 +625,9 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
     let rows: Vec<render::PruneRow> = plan
         .iter()
         .map(|item| {
-            let exec = executed.iter().find(|r| r.path == item.w.path);
-            let (action, detail) = match (&item.decision, exec) {
-                (worktree::Decision::Skip { reason }, _) => ("SKIP".to_string(), reason.clone()),
-                (worktree::Decision::Reap { forced }, None) => {
+            let (action, detail) = match &item.decision {
+                worktree::Decision::Skip { reason } => ("SKIP".to_string(), reason.clone()),
+                worktree::Decision::Reap { forced } => {
                     let mut d = String::from("merged + clean + unleased");
                     if *forced {
                         d = "FORCED past an unmerged branch".to_string();
@@ -669,32 +638,6 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                             item.dead_sessions.join(", ")
                         ));
                     }
-                    (
-                        if *forced {
-                            "REAP*".to_string()
-                        } else {
-                            "REAP".to_string()
-                        },
-                        d,
-                    )
-                }
-                (worktree::Decision::Reap { forced }, Some(r)) => {
-                    let d = match &r.error {
-                        Some(e) => format!("FAILED: {e}"),
-                        None => {
-                            let mut d = String::from("removed");
-                            if r.branch_deleted {
-                                d.push_str(", branch deleted");
-                            }
-                            if !r.closed_sessions.is_empty() {
-                                d.push_str(&format!(
-                                    ", closed dead session(s) {}",
-                                    r.closed_sessions.join(", ")
-                                ));
-                            }
-                            d
-                        }
-                    };
                     (
                         if *forced {
                             "REAP*".to_string()
@@ -718,13 +661,7 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
             }
         })
         .collect();
-    render::prune_plan(&scan.repo_root, &scan.default_branch, !yes, &rows, &ui);
-
-    if failures > 0 {
-        return Err(CliError::git(format!(
-            "{failures} reap(s) failed - see the report above"
-        )));
-    }
+    render::prune_plan(&scan.repo_root, &scan.default_branch, true, &rows, &ui);
     Ok(())
 }
 
@@ -753,25 +690,6 @@ fn cmd_worktree_new(args: &[String]) -> Result<(), CliError> {
         None => worktree::pool_path(&repo_root, &branch),
     };
 
-    // Pool reuse (treehouse-style): if an existing worktree is clean, unleased,
-    // and its branch is merged - i.e. it would be safe to PRUNE - recycle it in
-    // place (keeping ignored build artifacts) instead of growing the pool.
-    // `--fresh` opts out; any doubt (scan failure, unverifiable leases) falls
-    // through to the normal fresh create, which never destroys anything.
-    if !f.bools.contains("--fresh") {
-        if let Ok(scan) = worktree::scan(Some(&repo_root)) {
-            if scan.leases_complete {
-                match worktree::plan_reuse(&scan, f.opts.get("--path"), &worktree_path) {
-                    worktree::ReusePlan::Reuse(candidate) => {
-                        return reuse_worktree(&f, &scan, &candidate, &branch, &worktree_path);
-                    }
-                    worktree::ReusePlan::Conflict(msg) => return Err(CliError::git(msg)),
-                    worktree::ReusePlan::Fresh => {}
-                }
-            }
-        }
-    }
-
     let mut wt_args =
         json!({ "repoRoot": repo_root, "worktreePath": worktree_path, "branch": branch });
     if let Some(tab) = f.opts.get("--tab") {
@@ -795,53 +713,6 @@ fn cmd_worktree_new(args: &[String]) -> Result<(), CliError> {
                 (
                     format!("th worktree rm {repo_root} {worktree_path}"),
                     "remove it when done",
-                ),
-            ],
-        );
-    }
-    Ok(())
-}
-
-/// The reuse arm of `worktree new`: recycle a reapable pool worktree onto the
-/// new branch. Pure local git - the app keeps whatever tab it already had for
-/// the slot (the next-hints cover opening a terminal there).
-fn reuse_worktree(
-    f: &Flags,
-    scan: &worktree::RepoScan,
-    candidate: &str,
-    branch: &str,
-    desired_path: &str,
-) -> Result<(), CliError> {
-    let out =
-        worktree::execute_reuse(scan, candidate, branch, desired_path).map_err(CliError::git)?;
-    let data = json!({
-        "reused": true,
-        "repoRoot": scan.repo_root,
-        "worktreePath": out.path,
-        "branch": out.branch,
-        "previousBranch": out.previous_branch,
-        "baseCommit": out.base_commit,
-        "moved": out.moved,
-        "notes": out.notes,
-    });
-    if f.json {
-        emit_json_ok("worktree new", data);
-    } else {
-        let ui = f.ui();
-        println!(
-            "worktree reused (pool recycle, no fresh checkout): {}",
-            compact(&data)
-        );
-        render::next(
-            &ui,
-            &[
-                (
-                    format!("th worktree ls {}", scan.repo_root),
-                    "the lifecycle table",
-                ),
-                (
-                    format!("th spawn {}", out.path),
-                    "open a terminal there (gated in this build)",
                 ),
             ],
         );
@@ -1037,15 +908,14 @@ commands:\n\
   spawn <cwd>               spawn a terminal (gated in this build) [--name N]\n\
   worktree ls [repoRoot]    lifecycle table: BRANCH/DIRTY/MERGED/LEASED  [--json]\n\
   worktree new <repoRoot> <branch>   create a git worktree + tab  [--path P] [--tab T]\n\
-                            (recycles a merged+clean+unleased pool worktree\n\
-                             in place when one exists; --fresh opts out)\n\
   worktree rm  <repoRoot> <path>     temporarily unavailable pending safety service\n\
-  worktree prune [repoRoot] reap merged+clean+unleased worktrees; dry-run by\n\
-                            default  [--yes execute] [--force include unmerged]\n\
+  worktree prune [repoRoot] report cleanup candidates; execution unavailable\n\
+                            pending the safety service [--force show unmerged]\n\
   tabs                      list workspace tabs                [--json]\n\
   health                    WSL host snapshot                  [--json]\n\
   events                    stream the control event bus (Ctrl-C to stop)\n\
-  agents                    start and supervise durable agent sessions\n\
+  agents                    preflight, start, and supervise durable agent sessions\n\
+  admin                     manage durable Ship and Fleet Admin grants\n\
 \n\
 flags:\n\
   --json        stable machine envelope: {{ok, command, data, error}} (read cmds)\n\

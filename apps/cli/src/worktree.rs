@@ -195,7 +195,6 @@ pub struct Leases {
     pub source: LeaseSource,
     pub complete: bool,
     pub note: Option<String>,
-    pub endpoint: Option<control::Endpoint>,
 }
 
 /// Is `cwd` at or under `root`? Plain path-prefix on `/`-separated components
@@ -323,7 +322,7 @@ fn tmux_command(sock: &str) -> Command {
 /// app-down fallback. Never errors - degraded sources are reported in `source`
 /// / `complete` / `note` so callers decide how safe to be.
 pub fn gather_leases() -> Leases {
-    let (endpoint, control_result) = match control::resolve_endpoint() {
+    let (_endpoint, control_result) = match control::resolve_endpoint() {
         Ok(ep) => {
             let r = control::call(&ep, "list_terminals", json!({}));
             (Some(ep), Some(r))
@@ -362,7 +361,6 @@ pub fn gather_leases() -> Leases {
                     source: LeaseSource::Control,
                     complete: true,
                     note: None,
-                    endpoint,
                 };
             }
             match tmux_panes() {
@@ -407,7 +405,6 @@ pub fn gather_leases() -> Leases {
                         source: LeaseSource::ControlTmux,
                         complete,
                         note,
-                        endpoint,
                     }
                 }
                 Err(e) => {
@@ -419,7 +416,6 @@ pub fn gather_leases() -> Leases {
                         source: LeaseSource::ControlTmux,
                         complete: false,
                         note: Some(note),
-                        endpoint,
                     }
                 }
             }
@@ -446,7 +442,6 @@ pub fn gather_leases() -> Leases {
                             "app down - leases read straight from the t-hub tmux socket"
                                 .to_string(),
                         ),
-                        endpoint: None,
                     }
                 }
                 Err(e) => Leases {
@@ -456,7 +451,6 @@ pub fn gather_leases() -> Leases {
                     note: Some(format!(
                         "neither the control socket nor tmux is reachable ({e})"
                     )),
-                    endpoint: None,
                 },
             }
         }
@@ -492,7 +486,6 @@ pub struct RepoScan {
     pub leases_complete: bool,
     pub lease_note: Option<String>,
     pub sessions: Vec<SessionPane>,
-    pub endpoint: Option<control::Endpoint>,
     pub worktrees: Vec<WorktreeStatus>,
 }
 
@@ -626,7 +619,6 @@ pub fn scan(dir: Option<&String>) -> Result<RepoScan, String> {
         leases_complete: leases.complete,
         lease_note: leases.note,
         sessions: leases.sessions,
-        endpoint: leases.endpoint,
         worktrees,
     })
 }
@@ -711,62 +703,7 @@ pub fn prune_decision(w: &WorktreeStatus, default_branch: &str, force: bool) -> 
     }
 }
 
-// ---- reap execution ------------------------------------------------------------
-
-/// The outcome of executing one reap (prune with `--yes`).
-pub struct ReapResult {
-    pub path: String,
-    pub branch: Option<String>,
-    pub closed_sessions: Vec<String>,
-    pub removed: bool,
-    pub branch_deleted: bool,
-    pub error: Option<String>,
-}
-
-/// Reap one worktree: close its dead sessions over the socket (best-effort),
-/// `git worktree remove` it, then delete the branch (`-d`, or `-D` when the
-/// reap was forced past an unmerged branch). Dirty/leased were already ruled
-/// out by [`prune_decision`]; `git worktree remove` re-checks cleanliness
-/// itself as a final backstop, and we never pass it `--force`.
-pub fn execute_reap(scan: &RepoScan, w: &WorktreeStatus, forced: bool) -> ReapResult {
-    let mut res = ReapResult {
-        path: w.path.clone(),
-        branch: w.branch.clone(),
-        closed_sessions: Vec::new(),
-        removed: false,
-        branch_deleted: false,
-        error: None,
-    };
-
-    if let Some(ep) = &scan.endpoint {
-        for id in dead_sessions_for(&w.path, &scan.worktree_paths(), &scan.sessions) {
-            match control::call(ep, "close_terminal", json!({ "sessionId": id })) {
-                Ok(_) => res.closed_sessions.push(id),
-                Err(e) => {
-                    res.error = Some(format!("failed to close dead session {id}: {e:?}"));
-                    return res;
-                }
-            }
-        }
-    }
-
-    if let Err(e) = git_ok(&scan.repo_root, &["worktree", "remove", &w.path]) {
-        res.error = Some(e);
-        return res;
-    }
-    res.removed = true;
-
-    if let Some(b) = &w.branch {
-        let flag = if forced { "-D" } else { "-d" };
-        match git_ok(&scan.repo_root, &["branch", flag, b]) {
-            Ok(_) => res.branch_deleted = true,
-            Err(e) => res.error = Some(e),
-        }
-    }
-    res
-}
-
-// ---- pool reuse for `worktree new` ---------------------------------------------
+// ---- worktree path derivation ---------------------------------------------------
 
 /// The derived pool path for a branch: `<repoRoot>/.claude/worktrees/<leaf>`
 /// (this repo's own convention, matching `th worktree new`'s default).
@@ -777,171 +714,6 @@ pub fn pool_path(repo_root: &str, branch: &str) -> String {
         repo_root.trim_end_matches('/'),
         leaf
     )
-}
-
-/// Is `path` inside the repo's worktree pool directory?
-fn in_pool(repo_root: &str, path: &str) -> bool {
-    path_within(
-        path,
-        &format!("{}/.claude/worktrees", repo_root.trim_end_matches('/')),
-    )
-}
-
-/// A worktree qualifies for reuse under exactly the reap conditions: linked,
-/// unlocked, clean, unleased, and its branch fully merged. Same doctrine -
-/// if it would be safe to prune, it is safe to recycle.
-fn reusable(w: &WorktreeStatus, default_branch: &str) -> bool {
-    matches!(
-        prune_decision(w, default_branch, false),
-        Decision::Reap { .. }
-    ) && w.branch.is_some()
-}
-
-/// What `worktree new` should do about the pool.
-#[derive(Debug, PartialEq)]
-pub enum ReusePlan {
-    /// Recycle this worktree in place instead of growing the pool.
-    Reuse(String),
-    /// No safe candidate - fall through to the normal fresh create.
-    Fresh,
-    /// The target path is already a worktree that is NOT safe to recycle;
-    /// creating fresh there would fail anyway, so surface the reason now.
-    Conflict(String),
-}
-
-/// Pick a reuse candidate. With `--path` the choice is pinned to that exact
-/// path; otherwise prefer the worktree already sitting at the derived pool
-/// path, then the first (path-sorted) reusable pool worktree.
-pub fn plan_reuse(
-    scan: &RepoScan,
-    explicit_path: Option<&String>,
-    derived_path: &str,
-) -> ReusePlan {
-    let find_at = |p: &str| {
-        let p = p.trim_end_matches('/');
-        scan.worktrees
-            .iter()
-            .find(|w| w.path.trim_end_matches('/') == p)
-    };
-    let conflict = |w: &WorktreeStatus| {
-        let reason = match prune_decision(w, &scan.default_branch, false) {
-            Decision::Skip { reason } => reason,
-            Decision::Reap { .. } => "not recyclable".to_string(),
-        };
-        ReusePlan::Conflict(format!(
-            "a worktree already exists at {} and is not safe to recycle: {reason}. \
-             Pick a different --path, or reap it first with `th worktree prune`.",
-            w.path
-        ))
-    };
-
-    if let Some(p) = explicit_path {
-        return match find_at(p) {
-            Some(w) if reusable(w, &scan.default_branch) => ReusePlan::Reuse(w.path.clone()),
-            Some(w) => conflict(w),
-            None => ReusePlan::Fresh,
-        };
-    }
-
-    if let Some(w) = find_at(derived_path) {
-        return if reusable(w, &scan.default_branch) {
-            ReusePlan::Reuse(w.path.clone())
-        } else {
-            conflict(w)
-        };
-    }
-
-    let mut candidates: Vec<&WorktreeStatus> = scan
-        .worktrees
-        .iter()
-        .filter(|w| in_pool(&scan.repo_root, &w.path) && reusable(w, &scan.default_branch))
-        .collect();
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
-    match candidates.first() {
-        Some(w) => ReusePlan::Reuse(w.path.clone()),
-        None => ReusePlan::Fresh,
-    }
-}
-
-/// The outcome of recycling a pool worktree onto a new branch.
-pub struct ReuseOutcome {
-    pub path: String,
-    pub branch: String,
-    pub previous_branch: Option<String>,
-    pub base_commit: String,
-    pub moved: bool,
-    pub notes: Vec<String>,
-}
-
-/// Recycle `candidate` onto `new_branch` IN PLACE (preserving ignored build
-/// artifacts - the whole point of a pool): optionally `git worktree move` it to
-/// the canonical pool path, switch to the new branch (created at the repo
-/// root's HEAD, mirroring `git worktree add`'s default base), then delete the
-/// old, already-merged branch.
-pub fn execute_reuse(
-    scan: &RepoScan,
-    candidate_path: &str,
-    new_branch: &str,
-    desired_path: &str,
-) -> Result<ReuseOutcome, String> {
-    let w = scan
-        .worktrees
-        .iter()
-        .find(|w| w.path == candidate_path)
-        .ok_or_else(|| format!("reuse candidate vanished: {candidate_path}"))?;
-    let mut notes = Vec::new();
-
-    // 1. Move the directory to the canonical pool path when it's free, so the
-    //    slot's name follows the branch it now serves. Non-fatal on failure.
-    let mut path = w.path.clone();
-    if path.trim_end_matches('/') != desired_path.trim_end_matches('/') {
-        if std::path::Path::new(desired_path).exists() {
-            notes.push(format!(
-                "kept path {path} (target {desired_path} already exists)"
-            ));
-        } else {
-            match git_ok(&scan.repo_root, &["worktree", "move", &path, desired_path]) {
-                Ok(_) => path = desired_path.to_string(),
-                Err(e) => notes.push(format!("kept path {path} (worktree move failed: {e})")),
-            }
-        }
-    }
-
-    // 2. Switch to the new branch. Existing branch → adopt it as-is (matching
-    //    the server's smart branch handling); otherwise create it at the repo
-    //    root's current HEAD.
-    let base = git_ok(&scan.repo_root, &["rev-parse", "HEAD"])?;
-    let branch_ref = format!("refs/heads/{new_branch}");
-    let exists = matches!(
-        run_git(
-            &scan.repo_root,
-            &["show-ref", "--verify", "--quiet", &branch_ref]
-        ),
-        Ok((Some(0), _, _))
-    );
-    if exists {
-        git_ok(&path, &["switch", new_branch])?;
-    } else {
-        git_ok(&path, &["switch", "-c", new_branch, &base])?;
-    }
-
-    // 3. The old branch is fully merged (reuse requires it) - retire it.
-    if let Some(old) = &w.branch {
-        if old != new_branch {
-            if let Err(e) = git_ok(&scan.repo_root, &["branch", "-d", old]) {
-                notes.push(format!("old branch {old} not deleted: {e}"));
-            }
-        }
-    }
-
-    Ok(ReuseOutcome {
-        path,
-        branch: new_branch.to_string(),
-        previous_branch: w.branch.clone(),
-        base_commit: base,
-        moved: w.path != desired_path && !notes.iter().any(|n| n.starts_with("kept path")),
-        notes,
-    })
 }
 
 // ---- JSON shapes (stable envelope payloads) --------------------------------------
@@ -1252,124 +1024,6 @@ prunable gitdir file points to non-existent location
         assert!(skip_reason(prune_decision(&w, "main", true)).contains("leased"));
         w.lease = None;
         assert!(skip_reason(prune_decision(&w, "main", true)).contains("dirty"));
-    }
-
-    // -- reuse planning --
-
-    fn scan_with(worktrees: Vec<WorktreeStatus>) -> RepoScan {
-        RepoScan {
-            repo_root: "/repo".to_string(),
-            default_branch: "main".to_string(),
-            lease_source: LeaseSource::Control,
-            leases_complete: true,
-            lease_note: None,
-            sessions: Vec::new(),
-            endpoint: None,
-            worktrees,
-        }
-    }
-
-    #[test]
-    fn reuse_picks_reusable_pool_worktree() {
-        let mut main = wt("/repo", Some("main"));
-        main.is_main = true;
-        let scan = scan_with(vec![main, wt("/repo/.claude/worktrees/done", Some("done"))]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new-task"),
-            ReusePlan::Reuse("/repo/.claude/worktrees/done".to_string())
-        );
-    }
-
-    #[test]
-    fn reuse_prefers_candidate_already_at_derived_path_and_sorts_rest() {
-        let a = wt("/repo/.claude/worktrees/aaa", Some("aaa"));
-        let b = wt("/repo/.claude/worktrees/new-task", Some("old"));
-        let scan = scan_with(vec![b.clone(), a.clone()]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new-task"),
-            ReusePlan::Reuse("/repo/.claude/worktrees/new-task".to_string())
-        );
-        let scan = scan_with(vec![wt("/repo/.claude/worktrees/zzz", Some("z")), a]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new-task"),
-            ReusePlan::Reuse("/repo/.claude/worktrees/aaa".to_string())
-        );
-    }
-
-    #[test]
-    fn reuse_never_touches_dirty_leased_or_unmerged_candidates() {
-        let mut dirty = wt("/repo/.claude/worktrees/a", Some("a"));
-        dirty.dirty = Some(2);
-        let mut leased = wt("/repo/.claude/worktrees/b", Some("b"));
-        leased.lease = Some("052ccbb2".to_string());
-        let mut unmerged = wt("/repo/.claude/worktrees/c", Some("c"));
-        unmerged.merged = Some(false);
-        let scan = scan_with(vec![dirty, leased, unmerged]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
-            ReusePlan::Fresh
-        );
-    }
-
-    #[test]
-    fn reuse_ignores_clean_worktrees_outside_the_pool() {
-        let scan = scan_with(vec![wt("/somewhere/else", Some("done"))]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
-            ReusePlan::Fresh
-        );
-    }
-
-    #[test]
-    fn derived_path_occupied_by_unsafe_worktree_is_a_conflict() {
-        let mut w = wt("/repo/.claude/worktrees/new-task", Some("old"));
-        w.lease = Some("052ccbb2".to_string());
-        let scan = scan_with(vec![w]);
-        match plan_reuse(&scan, None, "/repo/.claude/worktrees/new-task") {
-            ReusePlan::Conflict(msg) => assert!(msg.contains("leased"), "msg: {msg}"),
-            other => panic!("expected Conflict, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_path_pins_the_choice() {
-        let a = wt("/repo/.claude/worktrees/aaa", Some("aaa"));
-        let scan = scan_with(vec![a]);
-        let p = "/repo/.claude/worktrees/aaa".to_string();
-        assert_eq!(
-            plan_reuse(&scan, Some(&p), "/repo/.claude/worktrees/derived"),
-            ReusePlan::Reuse(p.clone())
-        );
-        let missing = "/repo/elsewhere".to_string();
-        assert_eq!(
-            plan_reuse(&scan, Some(&missing), "/repo/.claude/worktrees/derived"),
-            ReusePlan::Fresh
-        );
-    }
-
-    #[test]
-    fn explicit_path_at_unsafe_worktree_is_a_conflict() {
-        let mut w = wt("/repo/.claude/worktrees/aaa", Some("aaa"));
-        w.dirty = Some(1);
-        let scan = scan_with(vec![w]);
-        let p = "/repo/.claude/worktrees/aaa".to_string();
-        match plan_reuse(&scan, Some(&p), "/repo/.claude/worktrees/derived") {
-            ReusePlan::Conflict(msg) => assert!(msg.contains("dirty"), "msg: {msg}"),
-            other => panic!("expected Conflict, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn detached_pool_worktree_is_not_reused() {
-        // Clean + unleased but detached: prune (with force) may reap it, but
-        // reuse requires a branch to retire.
-        let mut w = wt("/repo/.claude/worktrees/det", None);
-        w.merged = None;
-        let scan = scan_with(vec![w]);
-        assert_eq!(
-            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
-            ReusePlan::Fresh
-        );
     }
 
     // -- pool path derivation --
