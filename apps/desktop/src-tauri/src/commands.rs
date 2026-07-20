@@ -145,14 +145,16 @@ fn ui_spawn_capability_env(
     // (possibly polluted) full token; a blank token resolves to nothing, so the child
     // has no capability rather than an inherited one.
     let scrub = || {
-        vec![
+        let mut env = vec![
             ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
             ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
             (
                 crate::identity::SESSION_TOKEN_ENV.to_string(),
                 String::new(),
             ),
-        ]
+        ];
+        env.extend(crate::control::crew_credential_withholding_env());
+        env
     };
     let Ok(endpoint) = control_endpoint(app) else {
         return Ok((scrub(), false, None));
@@ -184,6 +186,9 @@ fn ui_spawn_capability_env(
         .as_ref()
         .map(|store| store.mint_for(crate::identity::Role::Crew, None))
         .transpose()?;
+    if identity.is_none() {
+        return Err("UI Crew spawn requires the identity store; refusing to launch without credential withholding".into());
+    }
     let mut env = vec![
         ("T_HUB_CONTROL_ADDR".to_string(), addr),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
@@ -192,11 +197,6 @@ fn ui_spawn_capability_env(
         env.push((
             crate::identity::SESSION_TOKEN_ENV.to_string(),
             identity.secret.clone(),
-        ));
-    } else {
-        env.push((
-            crate::identity::SESSION_TOKEN_ENV.to_string(),
-            String::new(),
         ));
     }
     Ok((env, is_control, identity))
