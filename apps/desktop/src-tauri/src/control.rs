@@ -9931,7 +9931,10 @@ fn authoritative_cortana_identity(
     let Some(tile) = identity.session_tile.as_deref() else {
         return false;
     };
-    let durable = ctx.captains.cortana_identity();
+    // Read all durable singleton facts from one versioned snapshot.  Mixing a
+    // standalone Cortana read with a later registry read admits torn authority.
+    let snapshot = ctx.captains.snapshot();
+    let durable = snapshot.cortana;
     if durable.generation == 0
         || durable.identity_id.as_deref() != Some(identity.id.as_str())
         || durable.terminal_id.as_deref() != Some(tile)
@@ -9942,9 +9945,7 @@ fn authoritative_cortana_identity(
     {
         return false;
     }
-    let active_cortana_claims = ctx
-        .captains
-        .snapshot()
+    let active_cortana_claims = snapshot
         .captains
         .into_iter()
         .filter(|captain| captain.role == FleetRole::Cortana && captain.state == ClaimState::Active)
@@ -10624,7 +10625,7 @@ fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
 /// Capability and organizational role are independent: an administrative Crew may
 /// receive the control capability for its exact operations while still receiving no
 /// ambient publishing credentials.
-fn crew_credential_withholding_env() -> Vec<(String, String)> {
+pub(crate) fn crew_credential_withholding_env() -> Vec<(String, String)> {
     let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
     // them empty at the session level scrubs any value inherited from the app env.
@@ -10723,20 +10724,15 @@ fn spawn_env_with_identity(
         .or_else(|| arg_str(args, "spawned_by"))
         .and_then(|spawner| ctx.captains.ship_of(&spawner))
         .map(|m| m.ship_slug().to_string());
-    let mut identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship)?;
-    if let Some(session_id) = requested_session_id {
-        if let Err(error) = ctx.identity.bind_tile(&identity.id, session_id) {
-            let rollback = ctx.identity.retire(&identity.id);
-            return Err(format!(
-                "spawn_terminal: identity pre-binding persistence failed: {error}{}",
-                rollback
-                    .err()
-                    .map(|rollback| format!("; identity rollback also failed: {rollback}"))
-                    .unwrap_or_default()
-            ));
-        }
-        identity.session_tile = Some(session_id.to_string());
-    }
+    let identity = match requested_session_id {
+        Some(session_id) => ctx
+            .identity
+            .mint_and_bind(crate::identity::Role::Crew, ship, session_id)
+            .map_err(|error| {
+                format!("spawn_terminal: identity pre-binding persistence failed: {error}")
+            })?,
+        None => ctx.identity.mint_for(crate::identity::Role::Crew, ship)?,
+    };
     env.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
@@ -11109,7 +11105,12 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // Every untrusted Organization or ProcessChanging request must also present a
     // currently valid per-session identity.
     // Only the exact in-process host provenance may omit that identity.
-    if cap == Capability::Full && tier != CommandTier::Read && !trusted_internal && caller.is_none()
+    if cap == Capability::Full
+        && tier != CommandTier::Read
+        && !trusted_internal
+        && caller
+            .as_ref()
+            .is_none_or(|identity| identity.tile.is_none())
     {
         let message = format!(
             "unauthorized: '{}' requires a valid T_HUB_SESSION_TOKEN with the control capability",
@@ -21727,6 +21728,10 @@ fn appoint_admin(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    // Hold the registry's common mutation transaction across authority
+    // validation and grant commit.  Captain/Cortana claim or promotion cannot
+    // interleave between these two steps and invalidate the decision.
+    let _authorization_transaction = ctx.tabs.identity_transaction();
     require_exact_args(
         args,
         "appoint_admin",
@@ -25110,10 +25115,22 @@ fn start_agent(
         Ok(spawned) => spawned,
         Err(error) => {
             let cleanup = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            let identity_cleanup = ctx.identity.retire_tile(&agent_session_id);
             return Err(match cleanup {
-                Ok(()) => error,
+                Ok(()) => match identity_cleanup {
+                    Ok(_) => error,
+                    Err(cleanup_error) => {
+                        format!("{error}; identity cleanup failed: {cleanup_error}")
+                    }
+                },
                 Err(cleanup_error) => {
-                    format!("{error}; agent failure state could not be persisted: {cleanup_error}")
+                    format!(
+                        "{error}; agent failure state could not be persisted: {cleanup_error}{}",
+                        identity_cleanup
+                            .err()
+                            .map(|e| format!("; identity cleanup failed: {e}"))
+                            .unwrap_or_default()
+                    )
                 }
             });
         }
@@ -25129,7 +25146,9 @@ fn start_agent(
         Ok(started) => started,
         Err(error) => {
             let _ = tmux::kill_session_tree(&tmux_target(&agent_session_id));
+            ctx.tabs.retire_tile_locked(&agent_session_id);
             let _ = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            let _ = ctx.identity.retire_tile(&agent_session_id);
             return Err(format!(
                 "start_agent: launch succeeded but durable start state could not be persisted: {error}"
             ));
@@ -25405,7 +25424,11 @@ fn spawn_terminal_with_private_pane_command_and_id(
             Err(error) => {
                 let _ = tmux::kill_session_tree(&tmux_session);
                 if let Some(identity) = &minted_identity {
-                    let _ = ctx.identity.retire(&identity.id);
+                    if let Err(cleanup) = ctx.identity.retire(&identity.id) {
+                        return Err(format!(
+                            "spawn_terminal: exact Workspace placement failed; identity cleanup failed: {cleanup}"
+                        ));
+                    }
                 }
                 return Err(format!(
                     "spawn_terminal: exact Workspace placement failed and the terminal was rolled back: {error}"
@@ -25415,6 +25438,21 @@ fn spawn_terminal_with_private_pane_command_and_id(
     } else {
         ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref())
     };
+
+    if placed_tab.is_none() {
+        let _ = tmux::kill_session_tree(&tmux_session);
+        ctx.tabs.retire_tile_locked(&id);
+        if let Some(identity) = &minted_identity {
+            if let Err(error) = ctx.identity.retire(&identity.id) {
+                return Err(format!(
+                    "spawn_terminal: Workspace placement failed and identity cleanup failed: {error}"
+                ));
+            }
+        }
+        return Err(
+            "spawn_terminal: Workspace placement failed and the terminal was rolled back".into(),
+        );
+    }
 
     // Captain-chat phase 2: record the crew link under the spawning captain.
     // The spawn NEVER fails on this - an unclaimed spawnedBy simply records

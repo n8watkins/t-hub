@@ -309,6 +309,41 @@ impl IdentityStore {
         Ok(identity)
     }
 
+    /// Mint and bind in one store transaction.  This is used when the durable
+    /// tile id is known before launch (for example an AgentSession id), so no
+    /// observer can see a usable identity in an unbound intermediate state.
+    pub fn mint_and_bind(
+        &self,
+        role: Role,
+        ship: Option<String>,
+        tile: &str,
+    ) -> Result<SessionIdentity, String> {
+        if tile.trim().is_empty() {
+            return Err("cannot bind an identity to an empty tile".into());
+        }
+        let identity = SessionIdentity {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            secret: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            role,
+            session_tile: Some(tile.to_string()),
+            ship_slug: ship,
+            minted_at: now_ms(),
+        };
+        let mut snap = self.lock();
+        let previous = snap.clone();
+        snap.identities
+            .insert(identity.id.clone(), identity.clone());
+        if let Err(error) = self.persist(&snap) {
+            *snap = previous;
+            return Err(error);
+        }
+        Ok(identity)
+    }
+
     /// Bind a minted identity to the tile id its session landed on (after spawn). The
     /// tile is a mutable pointer; the durable key stays the minted id.
     pub fn bind_tile(&self, id: &str, tile: &str) -> Result<(), String> {

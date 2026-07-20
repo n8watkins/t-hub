@@ -190,6 +190,9 @@ fn ui_spawn_capability_env(
             crate::identity::SESSION_TOKEN_ENV.to_string(),
             identity.secret.clone(),
         ));
+        // UI-created terminals are Crew by default, so they must receive the
+        // same independent credential-withholding wall as socket-created Crew.
+        env.extend(crate::control::crew_credential_withholding_env());
     } else {
         env.push((
             crate::identity::SESSION_TOKEN_ENV.to_string(),
