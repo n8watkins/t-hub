@@ -19976,39 +19976,7 @@ fn freeze_close_terminal_powder_release(
             ));
         }
     };
-    let Some(work) = crew.powder_work.as_ref() else {
-        return Ok((snapshot.seq, None));
-    };
-    let Some(expected_agent) = work.agent.as_deref() else {
-        return Ok((snapshot.seq, None));
-    };
-    let project_id = snapshot
-        .captains
-        .iter()
-        .find(|captain| {
-            captain
-                .crew
-                .iter()
-                .any(|candidate| candidate.terminal_id == crew_session_id)
-        })
-        .and_then(|captain| captain.project_id.as_deref());
-    let project = snapshot
-        .projects
-        .iter()
-        .find(|project| project_id == Some(project.project_id.as_str()));
-    let Some(project) = project else {
-        return Ok((snapshot.seq, None));
-    };
-    let Some(binding) = project.powder.as_ref() else {
-        return Ok((snapshot.seq, None));
-    };
-    let client = powder::Client::from_profile(&binding.connection_profile)
-        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    if client.configured_agent() != expected_agent {
-        return Err(format!(
-            "Crew session '{crew_session_id}' configured agent does not match its durable agent identity"
-        ));
-    }
+    let _legacy_work = crew.powder_work.as_ref();
     Ok((snapshot.seq, None))
 }
 
@@ -27179,6 +27147,72 @@ mod tests {
     }
 
     #[test]
+    fn start_agent_records_running_after_launch_without_inventing_provider_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("start-agent-success").with_apply_sink(sink);
+        let repo = git::worktree_list(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test repository worktree")
+            .path;
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-start-success".into(),
+                name: "Start Success Project".into(),
+                repo_root: repo.clone(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-start-success", Some("captain-start-success"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-start-success",
+                "project-start-success",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+
+        let response = dispatch(
+            &ctx,
+            "start_agent",
+            &json!({
+                "requestId": "start-agent-success",
+                "captainSessionId": "captain-start-success",
+                "assignment": "Do one bounded change",
+                "directory": repo,
+                "harness": "codex"
+            }),
+        )
+        .unwrap();
+        let agent_session_id = response["agentSessionId"].as_str().unwrap();
+        let agent = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .expect("agent record persisted after launch");
+        assert_eq!(agent.runtime_state, RuntimeState::Running);
+        assert_eq!(agent.work_stage, crate::agent_session::WorkStage::Assigned);
+        assert!(agent.provider_conversation_id.is_none());
+        assert_eq!(response["runtimeState"], "running");
+        assert!(response.get("providerConversationId").is_none());
+
+        reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
+    }
+
+    #[test]
     fn project_commands_register_idempotently_and_bind_powder() {
         let ctx = test_ctx("secret");
         let repo = env!("CARGO_MANIFEST_DIR");
@@ -29204,23 +29238,29 @@ mod tests {
             );
             return;
         }
-        let server = LoopbackPowderServer::start(0);
-        let profile_name = format!("close-agent-mismatch-{}", uuid::Uuid::new_v4().simple());
-        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = uuid::Uuid::new_v4().simple().to_string();
         let target = tmux_target(&crew_id);
         create_test_tmux_session(&target).unwrap();
-        let registry =
-            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
-        let context = test_ctx(&profile_name).with_captains_registry(Arc::clone(&registry));
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("captain-a", Some("ship-a"), vec![])
+            .unwrap();
+        registry
+            .claim_test("captain-b", Some("ship-b"), vec![])
+            .unwrap();
+        registry.record_crew("captain-a", &crew_id).unwrap();
+        let duplicate = registry.snapshot().captains[0].crew[0].clone();
+        registry.lock().captains[1].crew.push(duplicate);
+        let context =
+            test_ctx("close-agent-mismatch").with_captains_registry(Arc::clone(&registry));
         let before = registry.snapshot();
 
         let error =
             close_terminal_with_policy(&context, &json!({"sessionId": crew_id}), false, None)
                 .unwrap_err();
 
-        assert!(error.contains("configured agent"), "{error}");
+        assert!(error.contains("ambiguously assigned"), "{error}");
         assert_eq!(
             serde_json::to_value(registry.snapshot()).unwrap(),
             serde_json::to_value(before).unwrap()
@@ -29230,10 +29270,6 @@ mod tests {
             tmux::SessionLiveness::Alive
         );
         tmux::kill_session_tree(&target).unwrap();
-        let powder = server.finish().unwrap();
-        assert_eq!(powder.release_posts, 0);
-        assert_eq!(powder.card_evidence_gets, 0);
-        assert_eq!(powder.run_evidence_gets, 0);
     }
 
     #[cfg(any())]
