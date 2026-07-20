@@ -164,10 +164,16 @@ The CLI and MCP adapters serialize the same request and response schemas and do 
 Delivery output must preserve `implemented`, `reviewed`, `tested`, `complete`, `integrated`, `packaged`, `installed`, and `live-verified` as separate facts.
 Every new `integrated` evidence object must include the authenticated integration owner and the ordered, bounded, unique lane inputs whose exact baseline and resulting commits produced the canonical integration.
 The backend resolves `canonicalBaseline` as an exact local branch in the registered Project repository, requires its tip to equal `canonicalCommit`, and verifies every manifest source and result is in the recorded ancestry.
+All exact-commit and ancestry gates disable Git replacement objects so repository-local `refs/replace` cannot forge provenance.
+When an Agent has durable integration contracts, the manifest's exact ordered lane vector selects one contract.
+The authenticated actor must equal that contract's integration owner, and zero or multiple exact matches fail closed.
 Legacy integration evidence without a manifest remains readable but must not report the `integrated` state.
 Completed lanes retain their checkout, collision claims, and worktree ownership until valid integration evidence is recorded or the lane is explicitly stopped.
+Only the owning Captain, Cortana, General, or trusted host may set `stopped` through `agent_checkpoint`.
+The `stopped` stage is a terminal discard that releases ownership and refuses later stage or delivery updates, while an Agent's self-stage permissions remain unchanged.
 For packaged GUI acceptance, `acceptanceTest.environment.artifactId` identifies the candidate artifact built from the lane `resultingCommit`.
 That candidate identity is independent from the final `artifact.artifactId` built from the later canonical integration commit.
+The tested-evidence command accepts documented camelCase GUI environment fields, while durable output preserves the legacy `artifact_id`, `source_commit`, and `installation_target` names for rollback compatibility.
 Every new `packaged` evidence object must include the branch, exact source baseline and source commit, exact Git tree, version, installer SHA-256, build time, signature status, artifact ID, and reference.
 The artifact `recordedAt` field is the server audit time, while `manifest.builtAt` is the asserted build completion time in Unix epoch milliseconds and must fall between the integration and artifact record times, inclusive.
 Legacy artifact evidence without a complete manifest remains readable but must not report the `packaged` state.

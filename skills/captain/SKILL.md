@@ -110,6 +110,8 @@ Defer work and report the limiting evidence when the governor refuses capacity.
 8. Treat launch failure, unavailable state, missing Assignment acknowledgement, or stale ownership as an honest recovery state.
 
 Keep a complete lane's checkout, mutable-resource claims, and worktree ownership reserved until its exact result is integrated or the lane is explicitly stopped.
+Use `agent_checkpoint` with stage `stopped` only to discard an abandoned lane, and treat that transition as terminal.
+Before recording integration, require the manifest lane order and authenticated integration owner to match exactly one durable integration contract for the target Agent.
 For visible GUI scope, treat the packaged GUI E2E artifact as a candidate built from the lane result.
 Record the final release artifact separately after integration because it must be built from the canonical commit and may have a different artifact ID and installation target.
 

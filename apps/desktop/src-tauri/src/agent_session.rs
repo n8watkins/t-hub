@@ -82,11 +82,11 @@ pub struct ReviewEvidence {
 pub enum AcceptanceEnvironment {
     Source,
     PackagedGuiE2e {
-        #[serde(rename = "artifactId", alias = "artifact_id")]
+        #[serde(alias = "artifactId")]
         artifact_id: String,
-        #[serde(rename = "sourceCommit", alias = "source_commit")]
+        #[serde(alias = "sourceCommit")]
         source_commit: String,
-        #[serde(rename = "installationTarget", alias = "installation_target")]
+        #[serde(alias = "installationTarget")]
         installation_target: String,
     },
 }
@@ -1124,19 +1124,28 @@ mod tests {
     }
 
     #[test]
-    fn packaged_gui_environment_loads_legacy_snake_case_and_serializes_camel_case() {
-        let environment: AcceptanceEnvironment = serde_json::from_value(serde_json::json!({
+    fn packaged_gui_environment_preserves_legacy_wire_shape_and_accepts_camel_case() {
+        let legacy = serde_json::json!({
             "kind": "packagedGuiE2e",
             "artifact_id": "candidate-legacy",
             "source_commit": RESULT_COMMIT,
             "installation_target": "legacy target"
+        });
+        let environment: AcceptanceEnvironment = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&environment).unwrap(), legacy);
+
+        let camel: AcceptanceEnvironment = serde_json::from_value(serde_json::json!({
+            "kind": "packagedGuiE2e",
+            "artifactId": "candidate-legacy",
+            "sourceCommit": RESULT_COMMIT,
+            "installationTarget": "legacy target"
         }))
         .unwrap();
-        let value = serde_json::to_value(environment).unwrap();
-        assert_eq!(value["artifactId"], "candidate-legacy");
-        assert_eq!(value["sourceCommit"], RESULT_COMMIT);
-        assert_eq!(value["installationTarget"], "legacy target");
-        assert!(value.get("artifact_id").is_none());
+        assert_eq!(camel, environment);
+        let rolled_back = serde_json::to_value(camel).unwrap();
+        assert_eq!(rolled_back, legacy);
+        let round_trip: AcceptanceEnvironment = serde_json::from_value(rolled_back).unwrap();
+        assert_eq!(round_trip, environment);
     }
 
     #[test]
@@ -1225,12 +1234,12 @@ mod tests {
 
         let value = serde_json::to_value(&delivery).unwrap();
         assert_eq!(
-            value["acceptanceTest"]["environment"]["artifactId"],
+            value["acceptanceTest"]["environment"]["artifact_id"],
             "sha256:candidate-artifact"
         );
         assert_eq!(value["artifact"]["artifactId"], "sha256:release-artifact");
         assert_eq!(
-            value["acceptanceTest"]["environment"]["sourceCommit"],
+            value["acceptanceTest"]["environment"]["source_commit"],
             RESULT_COMMIT
         );
         assert_eq!(value["artifact"]["sourceBaseline"], CANONICAL_COMMIT);

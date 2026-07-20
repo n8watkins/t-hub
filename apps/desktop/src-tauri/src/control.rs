@@ -4993,6 +4993,14 @@ impl CaptainsRegistry {
             created_at: now_ms(),
         };
         checkpoint.validate()?;
+        if current.agent_sessions[agent_index].work_stage
+            == crate::agent_session::WorkStage::Stopped
+            && stage.is_some_and(|stage| stage != crate::agent_session::WorkStage::Stopped)
+        {
+            return Err(
+                "agent_checkpoint: stopped is a terminal work stage and cannot be resumed".into(),
+            );
+        }
         current.agent_sessions[agent_index].updated_at = checkpoint.created_at;
         if let Some(stage) = stage {
             current.agent_sessions[agent_index].work_stage = stage;
@@ -5041,6 +5049,12 @@ impl CaptainsRegistry {
             .ok_or_else(|| {
                 format!("record_agent_delivery: agent '{agent_session_id}' was not found")
             })?;
+        if agent.work_stage == crate::agent_session::WorkStage::Stopped {
+            return Err(
+                "record_agent_delivery: a stopped lane is discarded and cannot accept new delivery evidence"
+                    .into(),
+            );
+        }
         let delivery = agent
             .delivery
             .as_mut()
@@ -12337,9 +12351,7 @@ fn agent_checkpoint(
         .transpose()?;
     if let Some(stage) = stage {
         let allowed = match authority {
-            AgentAuthority::Apex | AgentAuthority::Captain => {
-                !matches!(stage, crate::agent_session::WorkStage::Stopped)
-            }
+            AgentAuthority::Apex | AgentAuthority::Captain => true,
             AgentAuthority::Agent => matches!(
                 stage,
                 crate::agent_session::WorkStage::Working
@@ -12388,6 +12400,87 @@ fn evidence_string(evidence: &Value, field: &str, state: &str) -> Result<String,
         .ok_or_else(|| {
             format!("record_agent_delivery {state} requires a non-empty evidence.{field}")
         })
+}
+
+fn enforce_recorded_integration_contract(
+    target_agent: &AgentSessionRecord,
+    manifest: &crate::agent_session::IntegrationManifest,
+    actor_identity: &str,
+) -> Result<(), String> {
+    if target_agent.integration_contracts.is_empty() {
+        return Ok(());
+    }
+    let mut contract_ids = BTreeSet::new();
+    for contract in &target_agent.integration_contracts {
+        let unique_lanes = contract.ordered_lane_ids.iter().collect::<BTreeSet<_>>();
+        if contract.contract_id.trim().is_empty()
+            || contract.integration_owner.trim().is_empty()
+            || contract.ordered_lane_ids.len() < 2
+            || unique_lanes.len() != contract.ordered_lane_ids.len()
+            || !contract_ids.insert(contract.contract_id.as_str())
+        {
+            return Err(
+                "record_agent_delivery integrated durable integration contracts are invalid or ambiguous"
+                    .into(),
+            );
+        }
+    }
+
+    let manifest_lane_ids = manifest
+        .inputs
+        .iter()
+        .map(|input| input.lane_id.as_str())
+        .collect::<Vec<_>>();
+    let matching = target_agent
+        .integration_contracts
+        .iter()
+        .filter(|contract| {
+            contract
+                .ordered_lane_ids
+                .iter()
+                .map(String::as_str)
+                .eq(manifest_lane_ids.iter().copied())
+        })
+        .collect::<Vec<_>>();
+    let contract = match matching.as_slice() {
+        [contract] => *contract,
+        [] => {
+            return Err(
+                "record_agent_delivery integrated manifest lane order must exactly match one durable integration contract"
+                    .into(),
+            )
+        }
+        _ => {
+            return Err(
+                "record_agent_delivery integrated manifest matches multiple durable integration contracts and is ambiguous"
+                    .into(),
+            )
+        }
+    };
+    let target_lane_id = target_agent
+        .lane_claim
+        .as_ref()
+        .map(|lane| lane.lane_id.as_str())
+        .ok_or(
+            "record_agent_delivery integrated target has contracts without a durable lane claim",
+        )?;
+    if !contract
+        .ordered_lane_ids
+        .iter()
+        .any(|lane_id| lane_id == target_lane_id)
+    {
+        return Err(
+            "record_agent_delivery integrated contract does not include the target agent lane"
+                .into(),
+        );
+    }
+    if contract.integration_owner != actor_identity {
+        return Err(format!(
+            "record_agent_delivery integrated contract '{}' designates integration owner '{}', not authenticated actor '{}'",
+            contract.contract_id, contract.integration_owner, actor_identity
+        ));
+    }
+    Ok(())
 }
 
 fn validate_registered_integration_inputs(
@@ -12600,6 +12693,7 @@ fn record_agent_delivery(
                         .into(),
                 );
             }
+            enforce_recorded_integration_contract(&agent, &manifest, &actor_identity)?;
             validate_registered_integration_inputs(
                 ctx,
                 &agent,
@@ -33783,6 +33877,15 @@ mod tests {
                 updated_at: 2,
             })
             .unwrap();
+        let captain_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("delivery-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-delivery")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let integration_owner_identity = captain.session_id.clone();
         let (lane_claim, dispatch_capacity) =
             test_dispatch_evidence("lane-delivery", "agent-delivery");
         ctx.captains
@@ -33805,22 +33908,29 @@ mod tests {
                     &baseline, true,
                 )),
                 lane_claim: Some(lane_claim),
-                integration_contracts: Vec::new(),
+                integration_contracts: vec![
+                    crate::governor::IntegrationContract {
+                        contract_id: "delivery-integration".into(),
+                        integration_owner: integration_owner_identity.clone(),
+                        ordered_lane_ids: vec!["shared-interface".into(), "lane-delivery".into()],
+                    },
+                    crate::governor::IntegrationContract {
+                        contract_id: "incomplete-integration-test".into(),
+                        integration_owner: integration_owner_identity.clone(),
+                        ordered_lane_ids: vec!["incomplete-lane".into(), "lane-delivery".into()],
+                    },
+                    crate::governor::IntegrationContract {
+                        contract_id: "divergent-integration-test".into(),
+                        integration_owner: integration_owner_identity.clone(),
+                        ordered_lane_ids: vec!["divergent-lane".into(), "lane-delivery".into()],
+                    },
+                ],
                 dispatch_capacity: Some(dispatch_capacity),
                 admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
             .unwrap();
-        let captain_identity = ctx
-            .identity
-            .mint_for(crate::identity::Role::Captain, Some("delivery-ship".into()))
-            .unwrap();
-        ctx.identity
-            .bind_tile(&captain_identity.id, "captain-delivery")
-            .unwrap();
-        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
-        let integration_owner_identity = captain.session_id.clone();
         let agent_identity = ctx
             .identity
             .mint_for(crate::identity::Role::Crew, Some("delivery-ship".into()))
@@ -33829,6 +33939,90 @@ mod tests {
             .bind_tile(&agent_identity.id, "agent-delivery")
             .unwrap();
         let agent = resolve_identity(&ctx, &agent_identity.secret).unwrap();
+
+        let self_discard = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-delivery",
+                &agent_identity.secret,
+                "agent_checkpoint",
+                json!({
+                    "agentSessionId": "agent-delivery",
+                    "authorSessionId": agent.session_id,
+                    "summary": "attempt self discard",
+                    "stage": "stopped"
+                }),
+            ),
+        );
+        assert!(!self_discard.ok);
+        assert!(
+            self_discard
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("stage is not permitted")),
+            "got: {:?}",
+            self_discard.error
+        );
+        assert!(
+            active_dispatch_lanes(&ctx.captains.snapshot(), "project-delivery")
+                .iter()
+                .any(|lane| lane.lane_id == "incomplete-lane")
+        );
+        let discard = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-delivery",
+                &captain_identity.secret,
+                "agent_checkpoint",
+                json!({
+                    "agentSessionId": "agent-incomplete",
+                    "authorSessionId": captain.session_id,
+                    "summary": "discard abandoned lane",
+                    "stage": "stopped"
+                }),
+            ),
+        );
+        assert!(discard.ok, "got: {:?}", discard.error);
+        assert!(
+            !active_dispatch_lanes(&ctx.captains.snapshot(), "project-delivery")
+                .iter()
+                .any(|lane| lane.lane_id == "incomplete-lane")
+        );
+        let resume_discarded = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-delivery",
+                &captain_identity.secret,
+                "agent_checkpoint",
+                json!({
+                    "agentSessionId": "agent-incomplete",
+                    "authorSessionId": captain.session_id,
+                    "summary": "attempt to resume discarded lane",
+                    "stage": "working"
+                }),
+            ),
+        );
+        assert!(!resume_discarded.ok);
+        assert!(resume_discarded
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("terminal work stage")));
+        let update_discarded = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-incomplete",
+                "state": "reviewed",
+                "evidence": {
+                    "commit": incomplete_result,
+                    "reference": "review://discarded"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(update_discarded.contains("stopped lane is discarded"));
 
         let implemented = dispatch_authenticated(
             &ctx,
@@ -33953,6 +34147,29 @@ mod tests {
                 }
             })
         };
+        let manifest = serde_json::from_value::<crate::agent_session::IntegrationManifest>(
+            integration_evidence(&integration_owner_identity)["manifest"].clone(),
+        )
+        .unwrap();
+        let mut ambiguous_target = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .find(|agent| agent.agent_session_id == "agent-delivery")
+            .unwrap();
+        let mut duplicate_contract = ambiguous_target.integration_contracts[0].clone();
+        duplicate_contract.contract_id = "duplicate-delivery-integration".into();
+        ambiguous_target
+            .integration_contracts
+            .push(duplicate_contract);
+        assert!(enforce_recorded_integration_contract(
+            &ambiguous_target,
+            &manifest,
+            &integration_owner_identity,
+        )
+        .unwrap_err()
+        .contains("matches multiple durable integration contracts"));
         let forged_owner = dispatch_with_caller(
             &ctx,
             "record_agent_delivery",
@@ -33966,6 +34183,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(forged_owner.contains("authenticated actor identity"));
+
+        let general_identity = ctx.identity.mint(crate::identity::Role::General).unwrap();
+        let general = resolve_identity(&ctx, &general_identity.secret).unwrap();
+        let wrong_designated_owner = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": integration_evidence(&general.session_id)
+            }),
+            Some(&general),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            wrong_designated_owner.contains("designates integration owner"),
+            "got: {wrong_designated_owner}"
+        );
+
+        let mut omitted_lane = integration_evidence(&integration_owner_identity);
+        omitted_lane["manifest"]["inputs"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let omitted_lane = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": omitted_lane
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(omitted_lane.contains("exactly match one durable integration contract"));
+
+        let mut reordered_lanes = integration_evidence(&integration_owner_identity);
+        reordered_lanes["manifest"]["inputs"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        let reordered_lanes = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": reordered_lanes
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(reordered_lanes.contains("exactly match one durable integration contract"));
+        assert!(
+            !ctx.captains
+                .snapshot()
+                .agent_sessions
+                .iter()
+                .find(|agent| agent.agent_session_id == "agent-delivery")
+                .unwrap()
+                .delivery_states()
+                .unwrap()
+                .integrated
+        );
 
         let mut invented_agent = integration_evidence(&integration_owner_identity);
         invented_agent["manifest"]["inputs"][0]["agentSessionId"] = json!("invented-agent");
@@ -33997,7 +34282,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(wrong_lane.contains("does not match"));
+        assert!(wrong_lane.contains("exactly match one durable integration contract"));
 
         let mut wrong_commits = integration_evidence(&integration_owner_identity);
         wrong_commits["manifest"]["inputs"][0]["sourceBaseline"] =
@@ -34189,7 +34474,7 @@ mod tests {
         .unwrap();
         assert_eq!(installed["deliveryStates"]["installed"], true);
         assert_eq!(
-            installed["agent"]["delivery"]["acceptanceTest"]["environment"]["artifactId"],
+            installed["agent"]["delivery"]["acceptanceTest"]["environment"]["artifact_id"],
             "candidate-installer-1"
         );
         assert_eq!(

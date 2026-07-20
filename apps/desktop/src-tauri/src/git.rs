@@ -126,6 +126,16 @@ static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
 /// Exceptional sources remain visible on every occurrence.
 static GIT_INFO_AGENT_SOURCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
+fn run_git_without_replacements(
+    cwd: &str,
+    args: &[&str],
+) -> Result<(bool, String, String), String> {
+    let mut hardened_args = Vec::with_capacity(args.len() + 1);
+    hardened_args.push("--no-replace-objects");
+    hardened_args.extend_from_slice(args);
+    run_git(cwd, &hardened_args)
+}
+
 /// Drop any cached `git_info` for `cwd` so the next poll re-runs git. Called after
 /// a mutation (commit / worktree add+remove) that changes what `git_info` reports —
 /// otherwise the TTL cache would serve a stale answer (e.g. the pre-commit dirty
@@ -145,7 +155,8 @@ pub(crate) fn require_clean_exact_baseline(cwd: &str, expected: &str) -> Result<
         return Err("sourceCommit must be an exact 40- or 64-character Git commit".into());
     }
     let expected_revision = format!("{expected}^{{commit}}");
-    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &expected_revision])?;
+    let (ok, stdout, stderr) =
+        run_git_without_replacements(cwd, &["rev-parse", "--verify", &expected_revision])?;
     if !ok {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -164,7 +175,8 @@ pub(crate) fn require_clean_exact_baseline(cwd: &str, expected: &str) -> Result<
             "sourceCommit '{expected}' did not resolve to the same exact commit '{resolved}'"
         ));
     }
-    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let (ok, stdout, stderr) =
+        run_git_without_replacements(cwd, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     if !ok {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -225,7 +237,8 @@ pub(crate) fn require_commit_ancestor(
             ));
         }
         let revision = format!("{commit}^{{commit}}");
-        let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &revision])?;
+        let (ok, stdout, stderr) =
+            run_git_without_replacements(cwd, &["rev-parse", "--verify", &revision])?;
         if !ok {
             let detail = if stderr.trim().is_empty() {
                 stdout.trim()
@@ -246,7 +259,7 @@ pub(crate) fn require_commit_ancestor(
     }
 
     let (ok, stdout, stderr) =
-        run_git(cwd, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+        run_git_without_replacements(cwd, &["merge-base", "--is-ancestor", ancestor, descendant])?;
     if ok {
         return Ok(());
     }
@@ -279,7 +292,8 @@ pub(crate) fn require_exact_local_branch_tip(
     if branch_name.trim().is_empty() || branch_name != branch_name.trim() {
         return Err("canonical baseline must name a non-empty local Git branch".into());
     }
-    let (valid, stdout, stderr) = run_git(cwd, &["check-ref-format", "--branch", branch_name])?;
+    let (valid, stdout, stderr) =
+        run_git_without_replacements(cwd, &["check-ref-format", "--branch", branch_name])?;
     if !valid {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -291,7 +305,8 @@ pub(crate) fn require_exact_local_branch_tip(
         ));
     }
     let reference = format!("refs/heads/{branch_name}^{{commit}}");
-    let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &reference])?;
+    let (ok, stdout, stderr) =
+        run_git_without_replacements(cwd, &["rev-parse", "--verify", &reference])?;
     if !ok {
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
@@ -1801,6 +1816,38 @@ detached
         assert!(require_exact_local_branch_tip(&cwd, "main~1", &ancestor)
             .unwrap_err()
             .contains("not a valid local Git branch"));
+
+        run(&["branch", "sibling", &ancestor]);
+        run(&["checkout", "-q", "sibling"]);
+        std::fs::write(root.join("sibling.txt"), "sibling result\n").unwrap();
+        run(&["add", "sibling.txt"]);
+        run(&[
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "sibling",
+        ]);
+        let sibling = run(&["rev-parse", "HEAD"]).trim().to_string();
+        run(&["checkout", "-q", "main"]);
+        run(&["replace", "--graft", &descendant, &sibling]);
+        let (replace_admitted, _, replace_error) = run_git_for_test(
+            &cwd,
+            &["merge-base", "--is-ancestor", &sibling, &descendant],
+        )
+        .unwrap();
+        assert!(
+            replace_admitted,
+            "the exploit fixture must alter ordinary Git ancestry: {replace_error}"
+        );
+        assert!(
+            require_commit_ancestor(&cwd, &sibling, &descendant)
+                .unwrap_err()
+                .contains("is not an ancestor"),
+            "provenance ancestry must ignore refs/replace"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }
