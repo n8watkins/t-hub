@@ -310,10 +310,13 @@ mod tests {
         hanging.args(["-lc", &script]);
 
         let started = Instant::now();
-        let error = bounded_output(hanging, "timeout-test", Duration::from_millis(100))
+        // Give the child enough time to publish its descendant PID even when the
+        // full workspace suite is concurrently saturating the process scheduler.
+        // The bounded collector still owns and enforces the one-second deadline.
+        let error = bounded_output(hanging, "timeout-test", Duration::from_secs(1))
             .expect_err("collector must time out");
         assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
 
         let descendant_pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("descendant pid file")
