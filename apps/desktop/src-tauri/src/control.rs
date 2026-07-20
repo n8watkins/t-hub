@@ -10094,7 +10094,11 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 fn is_idempotent_command(command: &str) -> bool {
     matches!(
         command,
-        "spawn_terminal" | "create_worktree" | "commission_captain" | "dispatch_crew"
+        "spawn_terminal"
+            | "create_worktree"
+            | "commission_captain"
+            | "dispatch_crew"
+            | "start_agent"
     )
 }
 
