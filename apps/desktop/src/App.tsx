@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
 import { useCaptain, agentOrder } from "./store/captain";
-import { resolveOrchestrator } from "./lib/ensureOrchestrator";
+import {
+  CORTANA_RECONCILE_OPERATION_ID,
+  parseCortanaReconcileResult,
+} from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { CommandPalette, PrefixHint } from "./components/CommandPalette";
@@ -13,6 +16,7 @@ import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
 import { useWindowMaximized } from "./lib/windowMaximized";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
+import { controlRequest } from "./ipc/controlClient";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -133,6 +137,7 @@ export default function App() {
     SATELLITE ? "hidden" : loadSidebarMode(),
   );
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [cortanaRecoveryProblem, setCortanaRecoveryProblem] = useState<string | null>(null);
 
   // --- Sidebar wiring (feat/projects-sidebar, Agent A) ---------------------
   // The sidebar is pure Projects navigation + Recent recall now. Two callbacks:
@@ -207,26 +212,41 @@ export default function App() {
     };
   }, []);
 
-  // Orchestrator startup (main window only): once the live terminal list has
-  // seeded, ADOPT an existing orchestrator (persisted-alive, else by cwd
-  // ~/.t-hub/orchestrator - never spawn), then RECONCILE every designated agent
-  // (orchestrator + pinned captains) into the reserved Captains workspace tab.
-  // The reconcile also migrates an upgrading user whose captains were persisted
-  // in work tabs before this tab existed. Runs at most once.
+  // Cortana startup (main window only): the backend atomically keeps, adopts,
+  // recovers, or creates exactly one durable supervisor. Every window uses the
+  // same operation id, so duplicate startup calls serialize into one recovery.
+  // A malformed, failed, or explicitly degraded result stays visible.
   useEffect(() => {
     if (SATELLITE) return;
-    let done = false;
+    let disposed = false;
+    void controlRequest("reconcile_cortana", {
+      operationId: CORTANA_RECONCILE_OPERATION_ID,
+    })
+      .then((value) => {
+        if (disposed) return;
+        const result = parseCortanaReconcileResult(value);
+        setCortanaRecoveryProblem(
+          result.healthy
+            ? null
+            : (result.degradedReason ?? "Cortana identity evidence is ambiguous."),
+        );
+      })
+      .catch((cause) => {
+        if (!disposed) {
+          setCortanaRecoveryProblem(cause instanceof Error ? cause.message : String(cause));
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  // Keep every designated supervisor tile in the reserved Captains workspace.
+  // The backend reconciliation and captains registry are authoritative for
+  // Cortana identity; this effect handles layout only.
+  useEffect(() => {
+    if (SATELLITE) return;
     const run = (terminals: Record<string, { cwd?: string; state?: string }>) => {
-      if (done || Object.keys(terminals).length === 0) return;
-      done = true;
-      const cap = useCaptain.getState();
-      const designate = resolveOrchestrator(cap.orchestratorId, terminals);
-      if (designate && designate !== cap.orchestratorId) {
-        cap.setOrchestratorId(designate);
-      }
-      // Place every live agent tile in the Captains tab (idempotent - a tile
-      // already there is a no-op). setOrchestratorId above already moved the
-      // orchestrator; this catches persisted captains still sitting in work tabs.
       const ws = useWorkspace.getState();
       for (const id of agentOrder(useCaptain.getState())) {
         if (terminals[id]) ws.moveTileToCaptainsTab(id);
@@ -390,6 +410,16 @@ export default function App() {
           {...barHover}
         >
           <Titlebar satellite={SATELLITE} onToggleSidebar={cycleSidebarMode} />
+        </div>
+      )}
+
+      {cortanaRecoveryProblem && (
+        <div
+          role="alert"
+          className="border-y border-amber-400/40 bg-amber-950/80 px-3 py-2 text-xs text-amber-100"
+        >
+          <span className="font-semibold">Cortana recovery is degraded.</span>{" "}
+          {cortanaRecoveryProblem}
         </div>
       )}
 

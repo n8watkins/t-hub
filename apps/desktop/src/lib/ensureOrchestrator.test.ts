@@ -1,7 +1,8 @@
-// The ADOPT-ONLY default-orchestrator resolution (no spawn, per the audit).
 import { describe, it, expect } from "vitest";
 import {
+  CORTANA_RECONCILE_OPERATION_ID,
   isOrchestratorCwd,
+  parseCortanaReconcileResult,
   resolveOrchestrator,
   ORCHESTRATOR_CWD_SUFFIX,
 } from "./ensureOrchestrator";
@@ -52,5 +53,49 @@ describe("resolveOrchestrator (adopt-only, never spawns)", () => {
     const terminals = { b: { cwd: home } };
     const first = resolveOrchestrator(null, terminals);
     expect(resolveOrchestrator(first, terminals)).toBe(first);
+  });
+});
+
+describe("parseCortanaReconcileResult", () => {
+  it("accepts one authoritative healthy identity", () => {
+    expect(
+      parseCortanaReconcileResult({
+        operationId: CORTANA_RECONCILE_OPERATION_ID,
+        action: "recover",
+        healthy: true,
+        terminalId: "c0ffee01",
+        identityId: "identity-cortana",
+        generation: 2,
+        degradedReason: null,
+      }),
+    ).toMatchObject({ healthy: true, generation: 2 });
+  });
+
+  it("preserves an explicit degraded reason", () => {
+    expect(
+      parseCortanaReconcileResult({
+        operationId: CORTANA_RECONCILE_OPERATION_ID,
+        action: "degraded",
+        healthy: false,
+        terminalId: null,
+        identityId: "identity-cortana",
+        generation: 4,
+        degradedReason: "duplicate authoritative generation",
+      }).degradedReason,
+    ).toBe("duplicate authoritative generation");
+  });
+
+  it("rejects false health and malformed evidence", () => {
+    expect(() =>
+      parseCortanaReconcileResult({
+        operationId: CORTANA_RECONCILE_OPERATION_ID,
+        action: "keep",
+        healthy: true,
+        terminalId: null,
+        identityId: "identity-cortana",
+        generation: 1,
+        degradedReason: null,
+      }),
+    ).toThrow("claimed health");
   });
 });
