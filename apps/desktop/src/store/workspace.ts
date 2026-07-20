@@ -1189,8 +1189,22 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const { tabs, activeTabId, poppedOutTabs } = get();
       // Keep each tab's ordering for ids that still exist; prune dead ids.
       const placed = new Set<TerminalId>();
+      const registeredCaptains = new Set(captainRegistryIds());
+      const recoveredFromCaptain: TerminalId[] = [];
       const nextTabs = tabs.map((t) => {
-        const order = t.order.filter((id) => liveIds.has(id));
+        let order = t.order.filter((id) => liveIds.has(id));
+        // A registry-less boot can briefly append every live shell to the
+        // active Captain Workspace before bootstrap creates the first Work
+        // Workspace. Keep durable Captain tiles pinned, but recover ordinary
+        // shells into a work tab so the next report is valid.
+        if (workspaceKind(t) === "captain") {
+          const captainOrder: TerminalId[] = [];
+          for (const id of order) {
+            if (registeredCaptains.has(id)) captainOrder.push(id);
+            else recoveredFromCaptain.push(id);
+          }
+          order = captainOrder;
+        }
         for (const id of order) placed.add(id);
         return { ...t, order };
       });
@@ -1203,6 +1217,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         for (const id of order) placed.add(id);
         return { ...t, order };
       });
+      let nextActiveTabId = activeTabId;
 
       // Any live terminal not already placed in some tab is appended to the
       // active tab (covers first load with pre-existing sessions, or sessions
@@ -1223,14 +1238,28 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const appended =
         SATELLITE_TAB || get().registryAdopted
           ? []
-          : list.map((t) => t.id).filter((id) => !placed.has(id));
+          : [...recoveredFromCaptain, ...list.map((t) => t.id)].filter(
+              (id, index, all) => !placed.has(id) && all.indexOf(id) === index,
+            );
       if (appended.length > 0) {
-        const activeIdx = nextTabs.findIndex((t) => t.id === activeTabId);
-        const idx = activeIdx >= 0 ? activeIdx : 0;
+        let idx = nextTabs.findIndex(
+          (t) => t.id === activeTabId && workspaceKind(t) === "work",
+        );
+        if (idx < 0) idx = nextTabs.findIndex((t) => workspaceKind(t) === "work");
+        if (idx < 0) {
+          const fresh: WorkspaceTab = {
+            id: newTabId(),
+            name: DEFAULT_TAB_NAME,
+            order: [],
+          };
+          idx = nextTabs.length - 1;
+          nextTabs.splice(idx, 0, fresh);
+        }
         nextTabs[idx] = {
           ...nextTabs[idx],
           order: [...nextTabs[idx].order, ...appended],
         };
+        nextActiveTabId = nextTabs[idx].id;
       }
 
       // SATELLITE blank-boot (#4): DEFERRED — needs scoped recovery, not the
@@ -1244,13 +1273,19 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // persist-before-pop-out guarantee). Until then a satellite that pruned to
       // empty stays empty (pre-v0.3.20 behavior) rather than dual-attaching.
 
-      const active = nextTabs.find((t) => t.id === activeTabId) ?? nextTabs[0];
+      const active = nextTabs.find((t) => t.id === nextActiveTabId) ?? nextTabs[0];
       const focusedId =
         get().focusedId && active.order.includes(get().focusedId as TerminalId)
           ? get().focusedId
           : active.order[0] ?? null;
 
-      set({ terminals, tabs: nextTabs, poppedOutTabs: nextPopped, focusedId });
+      set({
+        terminals,
+        tabs: nextTabs,
+        activeTabId: nextActiveTabId,
+        poppedOutTabs: nextPopped,
+        focusedId,
+      });
       persist();
     },
 
