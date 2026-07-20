@@ -462,7 +462,11 @@ function AgentRow({
           {crew.members.length > 0 && (
             <div className="flex flex-col">
               {crew.members.map((m) => (
-                <CrewRow key={m.id} terminalId={m.id} />
+                <CrewRow
+                  key={m.id}
+                  terminalId={m.id}
+                  delegatedRole={m.delegatedRole}
+                />
               ))}
             </div>
           )}
@@ -484,7 +488,13 @@ function AgentRow({
  *  dot + identity + the workspace tab it lives in. Its own component so it can
  *  use the shared per-terminal hooks without a hook loop; identity-first like
  *  the captain rows (rename, else cwd basename). */
-function CrewRow({ terminalId }: { terminalId: string }) {
+function CrewRow({
+  terminalId,
+  delegatedRole,
+}: {
+  terminalId: string;
+  delegatedRole?: "shipAdmin" | "fleetAdmin";
+}) {
   const [deliveryStates, setDeliveryStates] = useState<DeliveryStates | null>(null);
   const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
@@ -530,6 +540,19 @@ function CrewRow({ terminalId }: { terminalId: string }) {
             style={{ color: "var(--th-fg-muted)" }}
           >
             {workspaceName}
+          </span>
+        )}
+        {delegatedRole && (
+          <span
+            className="shrink-0 rounded border px-1 py-0.5 text-[8px] font-semibold"
+            style={{ color: "var(--th-accent)", borderColor: "var(--th-border)" }}
+            title={
+              delegatedRole === "shipAdmin"
+                ? "Durable Ship Admin"
+                : "Durable Fleet Admin"
+            }
+          >
+            {delegatedRole === "shipAdmin" ? "Ship Admin" : "Fleet Admin"}
           </span>
         )}
       </div>

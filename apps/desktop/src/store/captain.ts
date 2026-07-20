@@ -156,6 +156,8 @@ export interface CrewRef {
   conversationId?: string;
   resumePoint?: string;
   workspaceTabId?: string;
+  delegatedRole?: "shipAdmin" | "fleetAdmin";
+  delegatedGrantGeneration?: number;
   state?: {
     kind:
       | "active"

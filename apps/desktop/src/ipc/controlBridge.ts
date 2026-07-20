@@ -260,6 +260,14 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
                 conversationId: str(raw, "conversationId"),
                 resumePoint: str(raw, "resumePoint"),
                 workspaceTabId: str(raw, "workspaceTabId"),
+                delegatedRole:
+                  raw.delegatedRole === "shipAdmin" || raw.delegatedRole === "fleetAdmin"
+                    ? raw.delegatedRole
+                    : undefined,
+                delegatedGrantGeneration:
+                  typeof raw.delegatedGrantGeneration === "number"
+                    ? raw.delegatedGrantGeneration
+                    : undefined,
                 state: raw.state as CrewRef["state"],
               },
             ];

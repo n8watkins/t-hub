@@ -12,7 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -74,7 +75,10 @@ pub struct SupervisorAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AdminScope {
-    Ship { ship_slug: String },
+    Ship {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
+        ship_slug: String,
+    },
     Fleet,
 }
 
@@ -123,25 +127,34 @@ impl AdminOperation {
 pub enum AdminTarget {
     Fleet,
     Ship {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
         ship_slug: String,
     },
     Captain {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
         ship_slug: String,
+        #[serde(rename = "captainIdentityId", alias = "captain_identity_id")]
         captain_identity_id: String,
     },
     CrewSession {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
         ship_slug: String,
+        #[serde(rename = "sessionId", alias = "session_id")]
         session_id: String,
     },
     Worktree {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
         ship_slug: String,
+        #[serde(rename = "worktreeId", alias = "worktree_id")]
         worktree_id: String,
     },
     GeneralReserved {
         action: String,
     },
     Implementation {
+        #[serde(rename = "shipSlug", alias = "ship_slug")]
         ship_slug: String,
+        #[serde(rename = "assignmentId", alias = "assignment_id")]
         assignment_id: String,
     },
 }
@@ -268,6 +281,38 @@ pub struct ExactApproval {
     pub supervisor_generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum ApprovalState {
+    Active,
+    Consumed {
+        consumed_at: u64,
+        consumed_by_identity_id: String,
+    },
+    Invalidated {
+        invalidated_at: u64,
+        reason: String,
+    },
+}
+
+impl ApprovalState {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatedAdminApproval {
+    pub approval: ExactApproval,
+    pub grant_id: String,
+    pub grant_generation: u64,
+    pub actor_identity_id: String,
+    pub target: AdminTarget,
+    pub issued_at: u64,
+    pub state: ApprovalState,
+}
+
 /// Authoritative worktree-safety verdict for the exact cleanup target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,6 +395,9 @@ pub enum DelegatedAdminError {
     ActiveGrantExists(String),
     GrantNotFound(String),
     GrantRevoked(String),
+    ApprovalNotFound(String),
+    ApprovalUsed(String),
+    ApprovalMismatch(String),
     NoActiveGrant(String),
     SupervisorInactive(String),
     SupervisorMismatch(String),
@@ -377,6 +425,9 @@ impl DelegatedAdminError {
             Self::ActiveGrantExists(_) => "activeGrantExists",
             Self::GrantNotFound(_) => "grantNotFound",
             Self::GrantRevoked(_) => "grantRevoked",
+            Self::ApprovalNotFound(_) => "approvalNotFound",
+            Self::ApprovalUsed(_) => "approvalUsed",
+            Self::ApprovalMismatch(_) => "approvalMismatch",
             Self::NoActiveGrant(_) => "noActiveGrant",
             Self::SupervisorInactive(_) => "supervisorInactive",
             Self::SupervisorMismatch(_) => "supervisorMismatch",
@@ -416,6 +467,15 @@ impl std::fmt::Display for DelegatedAdminError {
             }
             Self::GrantNotFound(grant) => write!(formatter, "grant '{grant}' was not found"),
             Self::GrantRevoked(grant) => write!(formatter, "grant '{grant}' is revoked"),
+            Self::ApprovalNotFound(approval) => {
+                write!(formatter, "approval '{approval}' was not found")
+            }
+            Self::ApprovalUsed(approval) => {
+                write!(formatter, "approval '{approval}' is no longer active")
+            }
+            Self::ApprovalMismatch(reason) => {
+                write!(formatter, "approval does not match: {reason}")
+            }
             Self::NoActiveGrant(actor) => {
                 write!(formatter, "actor '{actor}' has no active delegated grant")
             }
@@ -484,6 +544,8 @@ struct DelegatedAdminSnapshot {
     schema_version: u32,
     next_generation: u64,
     grants: BTreeMap<String, DelegatedAdminGrant>,
+    #[serde(default)]
+    approvals: BTreeMap<String, DelegatedAdminApproval>,
 }
 
 impl Default for DelegatedAdminSnapshot {
@@ -492,6 +554,7 @@ impl Default for DelegatedAdminSnapshot {
             schema_version: SCHEMA_VERSION,
             next_generation: 1,
             grants: BTreeMap::new(),
+            approvals: BTreeMap::new(),
         }
     }
 }
@@ -507,7 +570,7 @@ impl DelegatedAdminStore {
     /// Load a store and fail closed if durable state exists but cannot be read,
     /// decoded, or validated.
     pub fn load(path: PathBuf) -> Result<Self, DelegatedAdminError> {
-        let snapshot = match std::fs::read(&path) {
+        let mut snapshot = match std::fs::read(&path) {
             Ok(bytes) => {
                 serde_json::from_slice::<DelegatedAdminSnapshot>(&bytes).map_err(|error| {
                     DelegatedAdminError::CorruptState(format!("{}: {error}", path.display()))
@@ -523,6 +586,9 @@ impl DelegatedAdminStore {
                 )))
             }
         };
+        if snapshot.schema_version == LEGACY_SCHEMA_VERSION {
+            snapshot.schema_version = SCHEMA_VERSION;
+        }
         validate_snapshot(&snapshot)?;
         Ok(Self {
             path: Some(path),
@@ -621,16 +687,28 @@ impl DelegatedAdminStore {
         }
 
         let previous = snapshot.clone();
-        let grant = snapshot
-            .grants
-            .get_mut(grant_id)
-            .expect("grant was resolved under the same lock");
-        grant.state = GrantState::Revoked {
-            revoked_at: now_ms(),
-            revoked_by_identity_id: supervisor.identity_id.clone(),
-            reason,
+        let result = {
+            let grant = snapshot
+                .grants
+                .get_mut(grant_id)
+                .expect("grant was resolved under the same lock");
+            grant.state = GrantState::Revoked {
+                revoked_at: now_ms(),
+                revoked_by_identity_id: supervisor.identity_id.clone(),
+                reason,
+            };
+            grant.clone()
         };
-        let result = grant.clone();
+        for approval in snapshot
+            .approvals
+            .values_mut()
+            .filter(|approval| approval.grant_id == grant_id && approval.state.is_active())
+        {
+            approval.state = ApprovalState::Invalidated {
+                invalidated_at: now_ms(),
+                reason: "delegated grant revoked".into(),
+            };
+        }
         if let Err(error) = self.persist(&snapshot) {
             *snapshot = previous;
             return Err(error);
@@ -667,6 +745,129 @@ impl DelegatedAdminStore {
             .filter(|grant| grant.state.is_active())
             .cloned()
             .collect()
+    }
+
+    pub fn get_approval(&self, approval_id: &str) -> Option<DelegatedAdminApproval> {
+        self.lock().approvals.get(approval_id).cloned()
+    }
+
+    pub fn issue_exact_approval(
+        &self,
+        grant_id: &str,
+        supervisor: &SupervisorAuthority,
+        operation: AdminOperation,
+        target: &AdminTarget,
+    ) -> Result<DelegatedAdminApproval, DelegatedAdminError> {
+        if !operation.is_destructive() {
+            return Err(DelegatedAdminError::InvalidAppointment(
+                "exact approvals are only valid for destructive delegated operations".into(),
+            ));
+        }
+        let mut snapshot = self.lock();
+        let grant = snapshot
+            .grants
+            .get(grant_id)
+            .cloned()
+            .ok_or_else(|| DelegatedAdminError::GrantNotFound(grant_id.into()))?;
+        if !grant.state.is_active() {
+            return Err(DelegatedAdminError::GrantRevoked(grant_id.into()));
+        }
+        validate_current_supervisor(&grant, supervisor)?;
+        if !operation_allowed_for_role(grant.role, operation) {
+            return Err(DelegatedAdminError::OperationForbidden(operation));
+        }
+        if !grant.permitted_operations.contains(&operation) {
+            return Err(DelegatedAdminError::OperationNotGranted(operation));
+        }
+        validate_target(grant.role, &grant.scope, operation, target)?;
+
+        let previous = snapshot.clone();
+        let approval = ExactApproval {
+            approval_id: uuid::Uuid::new_v4().simple().to_string(),
+            operation,
+            target_fingerprint: target.fingerprint(),
+            approved_by_identity_id: supervisor.identity_id.clone(),
+            supervisor_generation: supervisor.authority_generation,
+        };
+        let record = DelegatedAdminApproval {
+            approval: approval.clone(),
+            grant_id: grant.grant_id,
+            grant_generation: grant.grant_generation,
+            actor_identity_id: grant.actor_identity_id,
+            target: target.clone(),
+            issued_at: now_ms(),
+            state: ApprovalState::Active,
+        };
+        snapshot
+            .approvals
+            .insert(approval.approval_id.clone(), record.clone());
+        if let Err(error) = self.persist(&snapshot) {
+            *snapshot = previous;
+            return Err(error);
+        }
+        Ok(record)
+    }
+
+    pub fn consume_exact_approval(
+        &self,
+        approval_id: &str,
+        actor_identity_id: &str,
+        current_supervisor: &SupervisorAuthority,
+        operation: AdminOperation,
+        target: &AdminTarget,
+    ) -> Result<ExactApproval, DelegatedAdminError> {
+        let mut snapshot = self.lock();
+        let record = snapshot
+            .approvals
+            .get(approval_id)
+            .cloned()
+            .ok_or_else(|| DelegatedAdminError::ApprovalNotFound(approval_id.into()))?;
+        if !record.state.is_active() {
+            return Err(DelegatedAdminError::ApprovalUsed(approval_id.into()));
+        }
+        let grant = snapshot
+            .grants
+            .get(&record.grant_id)
+            .cloned()
+            .ok_or_else(|| DelegatedAdminError::GrantNotFound(record.grant_id.clone()))?;
+        if !grant.state.is_active() {
+            return Err(DelegatedAdminError::GrantRevoked(grant.grant_id));
+        }
+        validate_current_supervisor(&grant, current_supervisor)?;
+        if record.grant_generation != grant.grant_generation
+            || record.actor_identity_id != actor_identity_id
+            || record.target != *target
+            || record.approval.operation != operation
+            || record.approval.target_fingerprint != target.fingerprint()
+            || record.approval.approved_by_identity_id != current_supervisor.identity_id
+            || record.approval.supervisor_generation != current_supervisor.authority_generation
+        {
+            return Err(DelegatedAdminError::ApprovalMismatch(
+                "grant, actor, operation, target, supervisor, and generation must all match".into(),
+            ));
+        }
+        if !operation_allowed_for_role(grant.role, operation) {
+            return Err(DelegatedAdminError::OperationForbidden(operation));
+        }
+        if !grant.permitted_operations.contains(&operation) {
+            return Err(DelegatedAdminError::OperationNotGranted(operation));
+        }
+        validate_target(grant.role, &grant.scope, operation, target)?;
+
+        let previous = snapshot.clone();
+        snapshot
+            .approvals
+            .get_mut(approval_id)
+            .expect("approval was resolved under the same lock")
+            .state = ApprovalState::Consumed {
+            consumed_at: now_ms(),
+            consumed_by_identity_id: actor_identity_id.into(),
+        };
+        if let Err(error) = self.persist(&snapshot) {
+            *snapshot = previous;
+            return Err(error);
+        }
+        Ok(record.approval)
     }
 
     /// Resolve and authorize an effective delegated grant.
@@ -1029,6 +1230,53 @@ fn validate_snapshot(snapshot: &DelegatedAdminSnapshot) -> Result<(), DelegatedA
             DelegatedAdminError::CorruptState(format!(
                 "grant '{}' failed validation: {error}",
                 grant.grant_id
+            ))
+        })?;
+    }
+    for (key, approval) in &snapshot.approvals {
+        if key != &approval.approval.approval_id || key.trim().is_empty() {
+            return Err(DelegatedAdminError::CorruptState(
+                "approval map key does not match approval id".into(),
+            ));
+        }
+        let grant = snapshot.grants.get(&approval.grant_id).ok_or_else(|| {
+            DelegatedAdminError::CorruptState(format!(
+                "approval '{}' references an unknown grant",
+                approval.approval.approval_id
+            ))
+        })?;
+        if approval.grant_generation != grant.grant_generation
+            || approval.actor_identity_id != grant.actor_identity_id
+            || !approval.approval.operation.is_destructive()
+            || approval.approval.target_fingerprint != approval.target.fingerprint()
+            || approval.approval.approved_by_identity_id != grant.delegator.identity_id
+            || approval.approval.supervisor_generation != grant.delegator.authority_generation
+        {
+            return Err(DelegatedAdminError::CorruptState(format!(
+                "approval '{}' does not match its grant and exact target",
+                approval.approval.approval_id
+            )));
+        }
+        if !operation_allowed_for_role(grant.role, approval.approval.operation)
+            || !grant
+                .permitted_operations
+                .contains(&approval.approval.operation)
+        {
+            return Err(DelegatedAdminError::CorruptState(format!(
+                "approval '{}' names an operation outside its grant",
+                approval.approval.approval_id
+            )));
+        }
+        validate_target(
+            grant.role,
+            &grant.scope,
+            approval.approval.operation,
+            &approval.target,
+        )
+        .map_err(|error| {
+            DelegatedAdminError::CorruptState(format!(
+                "approval '{}' has an invalid target: {error}",
+                approval.approval.approval_id
             ))
         })?;
     }
@@ -1627,6 +1875,77 @@ mod tests {
         assert_eq!(audit.delegating_supervisor_identity_id, "captain-alpha");
         assert_eq!(audit.exact_approval_id.as_deref(), Some("approval-1"));
         assert_eq!(audit.safety_evidence_id.as_deref(), Some("safety-2"));
+    }
+
+    #[test]
+    fn exact_session_cleanup_approval_is_durable_actor_bound_and_one_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delegated-admin.json");
+        let target = AdminTarget::CrewSession {
+            ship_slug: "alpha".into(),
+            session_id: "crew-alpha".into(),
+        };
+        let approval_id = {
+            let store = DelegatedAdminStore::load(path.clone()).unwrap();
+            let grant = store
+                .appoint(ship_appointment(
+                    "admin-a",
+                    "alpha",
+                    operations(&[AdminOperation::CleanupSession]),
+                ))
+                .unwrap();
+            store
+                .issue_exact_approval(
+                    &grant.grant_id,
+                    &captain("alpha", 7),
+                    AdminOperation::CleanupSession,
+                    &target,
+                )
+                .unwrap()
+                .approval
+                .approval_id
+        };
+
+        let reloaded = DelegatedAdminStore::load(path.clone()).unwrap();
+        assert!(reloaded
+            .get_approval(&approval_id)
+            .is_some_and(|approval| approval.state.is_active()));
+        let wrong_actor = reloaded
+            .consume_exact_approval(
+                &approval_id,
+                "admin-b",
+                &captain("alpha", 7),
+                AdminOperation::CleanupSession,
+                &target,
+            )
+            .unwrap_err();
+        assert_eq!(wrong_actor.code(), "approvalMismatch");
+        reloaded
+            .consume_exact_approval(
+                &approval_id,
+                "admin-a",
+                &captain("alpha", 7),
+                AdminOperation::CleanupSession,
+                &target,
+            )
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .consume_exact_approval(
+                    &approval_id,
+                    "admin-a",
+                    &captain("alpha", 7),
+                    AdminOperation::CleanupSession,
+                    &target,
+                )
+                .unwrap_err()
+                .code(),
+            "approvalUsed"
+        );
+        assert!(DelegatedAdminStore::load(path)
+            .unwrap()
+            .get_approval(&approval_id)
+            .is_some_and(|approval| matches!(approval.state, ApprovalState::Consumed { .. })));
     }
 
     #[test]

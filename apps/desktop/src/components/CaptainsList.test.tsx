@@ -376,6 +376,36 @@ describe("CaptainsList expansion (crew + subagent tree)", () => {
     expect(states.querySelectorAll("span")).toHaveLength(8);
   });
 
+  it("shows durable administrative roles without presenting Crew as captains", () => {
+    act(() => {
+      const current = useCaptain.getState().claims.cap00001;
+      useCaptain.setState({
+        claims: {
+          ...useCaptain.getState().claims,
+          cap00001: {
+            ...current,
+            crew: current.crew.map((crew) =>
+              crew.terminalId === "crewrun0"
+                ? { ...crew, delegatedRole: "shipAdmin" as const }
+                : crew,
+            ),
+          },
+        },
+      });
+    });
+    render(<CaptainsList />);
+    fireEvent.click(within(row("cap00001")).getByLabelText(/Expand crew and subagents/));
+
+    const crewRow = document.querySelector<HTMLElement>(
+      '[data-crew-row="crewrun0"]',
+    );
+    expect(crewRow).toBeTruthy();
+    expect(within(crewRow!).getByTitle("Durable Ship Admin").textContent).toBe(
+      "Ship Admin",
+    );
+    expect(document.querySelectorAll("[data-captain-row]")).toHaveLength(2);
+  });
+
   it("shows the muted subagent hint for a captain with no session/crew yet", () => {
     render(<CaptainsList />);
     fireEvent.click(within(row("bbb00001")).getByLabelText(/Expand crew and subagents/));

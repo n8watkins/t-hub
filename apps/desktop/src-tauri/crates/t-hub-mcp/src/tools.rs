@@ -246,7 +246,8 @@ fn schema_close_terminal() -> Value {
         "type": "object",
         "properties": {
             "sessionId": { "type": "string", "description": "Session/terminal id to close (kills the tmux session th_<id> and its process tree)." },
-            "force": { "type": "boolean", "description": "Operator escape (default false). When the liveness probe times out under a degraded control plane, close normally REFUSES (retryable). Set force:true to reap a session you KNOW is dead: it re-probes once and reaps unless the re-probe CONFIRMS the session Alive. WARNING: under a sustained wedge a live-but-slow session's re-probe also times out (indistinguishable from dead) and force WILL reap it - use force ONLY when you believe the session is dead. Try a normal close first." }
+            "force": { "type": "boolean", "description": "Operator escape (default false). When the liveness probe times out under a degraded control plane, close normally REFUSES (retryable). Set force:true to reap a session you KNOW is dead: it re-probes once and reaps unless the re-probe CONFIRMS the session Alive. WARNING: under a sustained wedge a live-but-slow session's re-probe also times out (indistinguishable from dead) and force WILL reap it - use force ONLY when you believe the session is dead. Try a normal close first." },
+            "approvalId": { "type": "string", "minLength": 1, "description": "One-time exact approval issued by the delegating supervisor. Required only when a Ship Admin or Fleet Admin performs this cleanup." }
         },
         "required": ["sessionId"],
         "additionalProperties": false
@@ -473,6 +474,114 @@ fn schema_dispatch_preflight() -> Value {
             }
         },
         "required": ["projectId", "requestedLanes", "integrationContracts"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_admin_operation() -> Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "inspectStatus",
+            "maintainSession",
+            "cleanupSession",
+            "recoverResource",
+            "maintainWorktree",
+            "cleanupWorktree",
+            "prepareRetirement",
+            "buildCrossCaptainReport",
+            "maintainFleetResource"
+        ]
+    })
+}
+
+fn schema_list_admin_grants() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+fn schema_appoint_admin() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "actorSessionId": { "type": "string", "minLength": 1 },
+            "role": { "type": "string", "enum": ["shipAdmin", "fleetAdmin"] },
+            "permittedOperations": {
+                "type": "array",
+                "items": schema_admin_operation(),
+                "minItems": 1,
+                "uniqueItems": true
+            }
+        },
+        "required": ["actorSessionId", "role", "permittedOperations"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_revoke_admin() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "grantId": { "type": "string", "minLength": 1 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+        },
+        "required": ["grantId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_admin_target() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "crewSession" },
+                    "shipSlug": { "type": "string", "minLength": 1 },
+                    "sessionId": { "type": "string", "minLength": 1 }
+                },
+                "required": ["kind", "shipSlug", "sessionId"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "captain" },
+                    "shipSlug": { "type": "string", "minLength": 1 },
+                    "captainIdentityId": { "type": "string", "minLength": 1 }
+                },
+                "required": ["kind", "shipSlug", "captainIdentityId"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "worktree" },
+                    "shipSlug": { "type": "string", "minLength": 1 },
+                    "worktreeId": { "type": "string", "minLength": 1 }
+                },
+                "required": ["kind", "shipSlug", "worktreeId"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn schema_approve_admin_action() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "grantId": { "type": "string", "minLength": 1 },
+            "operation": {
+                "type": "string",
+                "enum": ["cleanupSession", "cleanupWorktree"]
+            },
+            "target": schema_admin_target()
+        },
+        "required": ["grantId", "operation", "target"],
         "additionalProperties": false
     })
 }
@@ -897,6 +1006,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_dispatch_preflight,
         },
         ToolDef {
+            name: "list_admin_grants",
+            tier: Tier::Read,
+            summary: "List the caller's durable Ship Admin or Fleet Admin grants, including scope, generation, permitted operations, and revocation state.",
+            input_schema: schema_list_admin_grants,
+        },
+        ToolDef {
             name: "get_agent",
             tier: Tier::Read,
             summary: "Get the full durable record for one agent session, including its assignment.",
@@ -1004,6 +1119,24 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Record immutable exact-commit evidence for implemented, reviewed, tested, complete, integrated, packaged, installed, and live-verified states. Complete is derived only from review plus acceptance testing.",
             input_schema: schema_record_agent_delivery,
+        },
+        ToolDef {
+            name: "appoint_admin",
+            tier: Tier::Organization,
+            summary: "Appoint one Crew identity as a durable Ship Admin or Fleet Admin within the authenticated supervisor's exact authority.",
+            input_schema: schema_appoint_admin,
+        },
+        ToolDef {
+            name: "approve_admin_action",
+            tier: Tier::Organization,
+            summary: "Issue a durable one-time approval for one destructive delegated operation bound to the exact grant, actor, target, supervisor, and authority generation.",
+            input_schema: schema_approve_admin_action,
+        },
+        ToolDef {
+            name: "revoke_admin",
+            tier: Tier::Organization,
+            summary: "Revoke one durable administrative grant while retaining its audit tombstone.",
+            input_schema: schema_revoke_admin,
         },
         ToolDef {
             name: "register_project",
@@ -1623,6 +1756,46 @@ mod tests {
                 "start_agent must require {required}"
             );
         }
+    }
+
+    #[test]
+    fn delegated_admin_tools_expose_durable_role_scope_without_general_authority() {
+        let list = find("list_admin_grants").unwrap().to_mcp();
+        assert_eq!(list["annotations"]["t-hubTier"], "read");
+        assert_eq!(list["annotations"]["confirmationRequired"], false);
+
+        let appoint = find("appoint_admin").unwrap();
+        assert_eq!(appoint.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let schema = (appoint.input_schema)();
+        assert_eq!(
+            schema["required"],
+            json!(["actorSessionId", "role", "permittedOperations"])
+        );
+        let operations = schema["properties"]["permittedOperations"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        for forbidden in [
+            "directImplementation",
+            "grantAdministrativeRole",
+            "assumeCaptainAuthority",
+            "approveGeneralReservedAction",
+        ] {
+            assert!(!operations.iter().any(|operation| operation == forbidden));
+        }
+
+        let revoke = find("revoke_admin").unwrap().to_mcp();
+        assert_eq!(revoke["annotations"]["t-hubTier"], "organization");
+
+        let approve = find("approve_admin_action").unwrap();
+        assert_eq!(approve.to_mcp()["annotations"]["t-hubTier"], "organization");
+        assert_eq!(
+            (approve.input_schema)()["required"],
+            json!(["grantId", "operation", "target"])
+        );
+        assert_eq!(
+            (find("close_terminal").unwrap().input_schema)()["properties"]["approvalId"]["type"],
+            "string"
+        );
     }
 
     #[test]
