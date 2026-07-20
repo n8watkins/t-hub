@@ -49,6 +49,8 @@ No `captains.json*` backup files were found under `/home/natkins/.t-hub`.
 
 The repository-local desktop version was `0.3.104` before the release-candidate bump.
 
+The repository-local desktop version is now `0.3.105`.
+
 The installed application identity could not be verified from repository-local state.
 
 ## Verification
@@ -67,8 +69,16 @@ Rust formatting and `git diff --check` passed.
 
 ## Release status
 
-The implementation changes are locally verified and committed through `6dbb5fe`.
+The implementation changes are locally verified and committed through `1115035`.
 
-The next local release-candidate action is the patch version bump.
+The release-candidate version bump is committed in `30dc360`.
+
+The final active-path audit cleanup is committed in `1115035`.
+
+The MCP-focused suite passed with 15 library tests and 74 binary tests.
+
+The final full Rust library run passed with 914 tests and 2 ignored tests.
+
+The final formatting and diff checks passed.
 
 The branch ancestry mismatch against `efd3271` still requires an explicit integration decision before release.
