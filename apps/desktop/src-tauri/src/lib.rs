@@ -46,6 +46,7 @@ mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal 
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
             // ---------------------------------------------------------------------------
 mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
+mod cortana_reconcile; // pure fail-closed planning for the durable Cortana singleton
 mod engine_supervisor; // managed Kokoro lifecycle: spawn/health-watch/auto-restart + auto-fallback to Piper (default-off flag; proposal /tmp/flap-probe/LIFECYCLE-PROPOSAL.md)
 mod scribe; // Scribe voice-gate: v1 status endpoint via ~/.scribe/control.json, status.json fallback ("is the general dictating?")
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
