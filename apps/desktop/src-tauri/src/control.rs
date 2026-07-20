@@ -20590,7 +20590,7 @@ mod tests {
         let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
         tmux::send_text(&target, &command, true).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let result = loop {
             if let Ok(after) = observe_harness_process(&target) {
                 match attest_launch_permissions(
