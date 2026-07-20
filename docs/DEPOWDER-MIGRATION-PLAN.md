@@ -4,7 +4,11 @@
 
 This document is the decision-complete implementation plan for retiring Powder from T-Hub for now.
 
-The implementation baseline is the independently reviewed integration commit `efd3271a4efcde2b801a4b07fa4316560b8d9d15`.
+The original implementation baseline was the independently reviewed integration commit `efd3271a4efcde2b801a4b07fa4316560b8d9d15`.
+
+The release baseline is now the verified depowder branch `fix/captain-control-runtime`.
+
+The approved integration head remains preserved and reachable, but it is not merged into the release baseline because it contains Powder-era integration work and conflicts with the completed depowder changes.
 
 Do not reset the repository to the historical pre-Powder commit.
 
@@ -275,7 +279,9 @@ Before implementation begins, record the exact live terminal list, worktree list
 
 Use one owner for the control-plane lane because the registry, dispatch, lifecycle, and reconciliation code overlap heavily.
 
-Start a new migration branch from `efd3271a4efcde2b801a4b07fa4316560b8d9d15`.
+The implementation has been completed on the verified depowder branch `fix/captain-control-runtime`.
+
+Do not merge or rebase the release baseline onto `efd3271a4efcde2b801a4b07fa4316560b8d9d15` without explicit authorization.
 
 Cherry-pick this plan document's commit onto that branch if the branch does not already contain it.
 
@@ -445,7 +451,7 @@ The migration is complete only when all of the following are true.
 2. Confirm the canonical repository and list every worktree before creating a branch or editing files.
 3. Confirm `efd3271a4efcde2b801a4b07fa4316560b8d9d15` exists and remains clean in its integration worktree.
 4. Record the current registry and terminal state through read-only T-Hub operations.
-5. Create an isolated migration worktree and branch from `efd3271a4efcde2b801a4b07fa4316560b8d9d15`.
+5. Use the verified depowder branch as the migration implementation baseline.
 6. Cherry-pick this document's commit if needed.
 7. Begin only Phase 1 and keep the control-plane lane single-owner until its interface is frozen and reviewed.
 8. Commit every verified logical change separately with clear messages and no agent co-author.
