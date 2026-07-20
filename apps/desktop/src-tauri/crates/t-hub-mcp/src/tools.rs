@@ -456,9 +456,11 @@ fn schema_start_agent() -> Value {
             "directory": { "type": "string" },
             "harness": { "type": "string", "enum": ["codex", "claude"] },
             "name": { "type": "string" },
-            "workspaceTabId": { "type": "string" }
+            "workspaceTabId": { "type": "string" },
+            "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$", "description": "Exact commit checked out in the clean dispatch worktree." },
+            "visibleProductBug": { "type": "boolean", "description": "True when acceptance requires packaged GUI E2E evidence." }
         },
-        "required": ["requestId", "captainSessionId", "assignment", "directory"],
+        "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug"],
         "additionalProperties": false
     })
 }

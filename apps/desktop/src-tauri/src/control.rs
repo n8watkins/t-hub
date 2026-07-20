@@ -4997,7 +4997,7 @@ impl CaptainsRegistry {
     }
 
     pub fn insert_agent_session(&self, record: AgentSessionRecord) -> Result<(), String> {
-        record.validate()?;
+        record.validate_for_dispatch()?;
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
@@ -20418,6 +20418,8 @@ fn start_agent(
             "harness",
             "name",
             "workspaceTabId",
+            "sourceCommit",
+            "visibleProductBug",
         ],
     )?;
     arg_str(args, "requestId")
@@ -20432,6 +20434,13 @@ fn start_agent(
     let directory = arg_str(args, "directory")
         .filter(|value| !value.trim().is_empty())
         .ok_or("start_agent requires a non-empty 'directory'")?;
+    let source_commit = arg_str(args, "sourceCommit")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'sourceCommit'")?;
+    let visible_product_bug = args
+        .get("visibleProductBug")
+        .and_then(Value::as_bool)
+        .ok_or("start_agent requires a boolean 'visibleProductBug'")?;
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -20462,6 +20471,8 @@ fn start_agent(
         .map_err(|error| format!("start_agent: could not detect worktree: {error}"))?
         .into_iter()
         .find(|worktree| files::posix_form(&worktree.path) == checkout);
+    git::require_clean_exact_baseline(&checkout, &source_commit)
+        .map_err(|error| format!("start_agent: baseline rejected: {error}"))?;
     let harness_name = arg_str(args, "harness")
         .unwrap_or_else(|| captain.harness.clone().unwrap_or_else(|| "codex".into()));
     let harness_name = harness_name.trim().to_ascii_lowercase();
@@ -20498,7 +20509,10 @@ fn start_agent(
         resume_point: None,
         runtime_state: RuntimeState::Starting,
         work_stage: crate::agent_session::WorkStage::Assigned,
-        delivery: None,
+        delivery: Some(crate::agent_session::DeliveryProvenance::new(
+            source_commit,
+            visible_product_bug,
+        )),
         created_at: now,
         updated_at: now,
     };
@@ -22732,6 +22746,16 @@ mod tests {
         sh_git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
         assert!(wt.exists(), "worktree dir created");
         (base, repo, wt)
+    }
+
+    fn exact_head(cwd: &std::path::Path) -> String {
+        let (ok, stdout, stderr) = git::run_git_for_test(
+            cwd.to_str().expect("UTF-8 test path"),
+            &["rev-parse", "HEAD"],
+        )
+        .expect("git rev-parse spawns");
+        assert!(ok, "git rev-parse failed: {stderr}");
+        stdout.trim().to_string()
     }
 
     #[cfg(not(windows))]
@@ -28401,7 +28425,10 @@ mod tests {
                 resume_point: None,
                 runtime_state: crate::agent_session::RuntimeState::Starting,
                 work_stage: crate::agent_session::WorkStage::Assigned,
-                delivery: None,
+                delivery: Some(crate::agent_session::DeliveryProvenance::new(
+                    "1111111111111111111111111111111111111111",
+                    false,
+                )),
                 created_at: 2,
                 updated_at: 2,
             })
@@ -28445,17 +28472,14 @@ mod tests {
     #[test]
     fn start_agent_persists_before_a_launch_failure_and_records_unavailable() {
         let ctx = test_ctx("secret");
-        let repo = git::worktree_list(env!("CARGO_MANIFEST_DIR"))
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("test repository worktree")
-            .path;
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-start".into(),
                 name: "Start Project".into(),
-                repo_root: repo.clone(),
+                repo_root: repo_root.to_string_lossy().to_string(),
                 remote_url: None,
                 default_branch: None,
                 powder: None,
@@ -28477,7 +28501,9 @@ mod tests {
                 "requestId": "start-agent-test",
                 "captainSessionId": "captain-start",
                 "assignment": "Do one bounded change",
-                "directory": repo
+                "directory": repo,
+                "sourceCommit": source_commit,
+                "visibleProductBug": false
             }),
         )
         .unwrap_err();
@@ -28496,6 +28522,7 @@ mod tests {
             events.last().map(|event| event.kind.as_str()),
             Some("unavailable")
         );
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -28505,17 +28532,14 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("start-agent-success").with_apply_sink(sink);
-        let repo = git::worktree_list(env!("CARGO_MANIFEST_DIR"))
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("test repository worktree")
-            .path;
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-start-success".into(),
                 name: "Start Success Project".into(),
-                repo_root: repo.clone(),
+                repo_root: repo_root.to_string_lossy().to_string(),
                 remote_url: None,
                 default_branch: None,
                 powder: None,
@@ -28547,7 +28571,9 @@ mod tests {
                 "captainSessionId": "captain-start-success",
                 "assignment": "Do one bounded change",
                 "directory": repo,
-                "harness": "codex"
+                "harness": "codex",
+                "sourceCommit": source_commit,
+                "visibleProductBug": false
             }),
         )
         .unwrap();
@@ -28575,6 +28601,7 @@ mod tests {
         assert_eq!(event.runtime_state, Some(RuntimeState::Running));
 
         reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

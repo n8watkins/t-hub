@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { controlRequest } from "../ipc/controlClient";
+import { gitInfo, type GitInfo } from "../ipc/git";
 
 interface StartAgentDialogProps {
   open: boolean;
@@ -22,6 +23,37 @@ export function StartAgentDialog({
   const [requestId, setRequestId] = useState(() => crypto.randomUUID());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checkout, setCheckout] = useState<GitInfo | null>(null);
+  const [baselineError, setBaselineError] = useState<string | null>(null);
+  const [visibleProductBug, setVisibleProductBug] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    setCheckout(null);
+    setBaselineError(null);
+    void gitInfo(directory)
+      .then((info) => {
+        if (!active) return;
+        if (!info.isRepo || !info.headCommit) {
+          setBaselineError("The directory does not have a resolvable Git commit.");
+          return;
+        }
+        if (info.dirtyCount > 0) {
+          setBaselineError(
+            "The checkout has uncommitted work. Preserve it and dispatch from a clean worktree.",
+          );
+          return;
+        }
+        setCheckout(info);
+      })
+      .catch((cause) => {
+        if (active) setBaselineError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      active = false;
+    };
+  }, [directory, open]);
 
   if (!open) return null;
 
@@ -29,6 +61,10 @@ export function StartAgentDialog({
     const trimmed = assignment.trim();
     if (!trimmed) {
       setError("Assignment is required.");
+      return;
+    }
+    if (!checkout?.headCommit) {
+      setError(baselineError ?? "The exact source commit is still being resolved.");
       return;
     }
     setBusy(true);
@@ -40,6 +76,8 @@ export function StartAgentDialog({
         assignment: trimmed,
         directory,
         harness,
+        sourceCommit: checkout.headCommit,
+        visibleProductBug,
       });
       setAssignment("");
       setRequestId(crypto.randomUUID());
@@ -89,6 +127,17 @@ export function StartAgentDialog({
         <div className="mb-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
           Directory: <span className="font-mono">{directory}</span>
         </div>
+        <div className="mb-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+          Source baseline:{" "}
+          <span className="font-mono">
+            {checkout?.headCommit?.slice(0, 12) ?? (baselineError ? "Unavailable" : "Resolving...")}
+          </span>
+        </div>
+        {baselineError && (
+          <p role="alert" className="mb-3 text-xs text-red-400">
+            {baselineError}
+          </p>
+        )}
         <label className="mb-4 block text-xs">
           Harness
           <select
@@ -100,6 +149,20 @@ export function StartAgentDialog({
             <option value="codex">Codex</option>
             <option value="claude">Claude</option>
           </select>
+        </label>
+        <label className="mb-4 flex items-start gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={visibleProductBug}
+            onChange={(event) => setVisibleProductBug(event.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Visible product bug
+            <span className="mt-0.5 block" style={{ color: "var(--th-fg-muted)" }}>
+              Requires packaged GUI end-to-end acceptance evidence before completion.
+            </span>
+          </span>
         </label>
         {error && (
           <p role="alert" className="mb-3 text-xs text-red-400">
@@ -113,7 +176,7 @@ export function StartAgentDialog({
           <button
             type="button"
             onClick={() => void submit()}
-            disabled={busy}
+            disabled={busy || !checkout?.headCommit || baselineError !== null}
             className="rounded px-3 py-2 text-xs font-semibold disabled:opacity-50"
             style={{ background: "var(--th-accent)", color: "var(--th-accent-fg, var(--th-fg))" }}
           >
