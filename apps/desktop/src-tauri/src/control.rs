@@ -24772,6 +24772,7 @@ mod tests {
         tmux::send_text(&target, &command, true).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut next_retry = Instant::now() + Duration::from_secs(1);
         let result = loop {
             if let Ok(after) = observe_harness_process(&target) {
                 match attest_launch_permissions(
@@ -24780,8 +24781,17 @@ mod tests {
                     &after,
                     PermMode::BypassPermissions,
                 ) {
-                    Err(crate::harness::LaunchAttestationError::StaleEvidence)
-                        if Instant::now() < deadline => {}
+                    Err(crate::harness::LaunchAttestationError::StaleEvidence) => {
+                        let now = Instant::now();
+                        assert!(
+                            now < deadline,
+                            "fake Harness did not produce process evidence"
+                        );
+                        if now >= next_retry {
+                            tmux::send_text(&target, &command, true).unwrap();
+                            next_retry = now + Duration::from_secs(1);
+                        }
+                    }
                     result => break result,
                 }
             }
