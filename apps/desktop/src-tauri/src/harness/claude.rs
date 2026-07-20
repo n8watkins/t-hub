@@ -44,6 +44,15 @@ impl HarnessAdapter for ClaudeHarness {
         format!("claude --resume {}", sh_single_quote(session_id))
     }
 
+    fn resume_argv_with_permissions(&self, session_id: &str, perm: PermMode) -> String {
+        let flags = self.permission_map(perm).join(" ");
+        if flags.is_empty() {
+            self.resume_argv(session_id)
+        } else {
+            format!("claude --resume {} {flags}", sh_single_quote(session_id))
+        }
+    }
+
     fn exec_turn_argv(&self, prompt: &str, resume: Option<&str>, perm: PermMode) -> String {
         // Claude's headless print mode. Phase 1 crews are Codex `exec`; this
         // Claude form exists for symmetry/tests and does NOT change any live
@@ -71,8 +80,7 @@ impl HarnessAdapter for ClaudeHarness {
             PermMode::AcceptEdits => {
                 vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
             }
-            // Default posture is the absence of any override (today's behavior).
-            PermMode::Default => vec![],
+            PermMode::Default => vec!["--permission-mode".to_string(), "default".to_string()],
         }
     }
 
@@ -106,6 +114,10 @@ mod tests {
         // No-regression lock: the recall path emits exactly this for a Claude row.
         let a = ClaudeHarness;
         assert_eq!(a.resume_argv("abc-123"), "claude --resume 'abc-123'");
+        assert_eq!(
+            a.resume_argv_with_permissions("abc-123", PermMode::Default),
+            "claude --resume 'abc-123' --permission-mode default"
+        );
     }
 
     #[test]
@@ -119,7 +131,10 @@ mod tests {
             a.permission_map(PermMode::AcceptEdits),
             vec!["--permission-mode", "acceptEdits"]
         );
-        assert_eq!(a.permission_map(PermMode::Default), Vec::<String>::new());
+        assert_eq!(
+            a.permission_map(PermMode::Default),
+            vec!["--permission-mode", "default"]
+        );
     }
 
     #[test]
@@ -131,7 +146,7 @@ mod tests {
         );
         assert_eq!(
             a.exec_turn_argv("go", Some("id-1"), PermMode::Default),
-            "claude --resume 'id-1' -p 'go'"
+            "claude --resume 'id-1' -p --permission-mode default 'go'"
         );
     }
 

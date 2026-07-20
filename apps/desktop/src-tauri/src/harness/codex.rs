@@ -53,6 +53,15 @@ impl HarnessAdapter for CodexHarness {
         format!("codex resume {}", sh_single_quote(session_id))
     }
 
+    fn resume_argv_with_permissions(&self, session_id: &str, perm: PermMode) -> String {
+        let flags = self.permission_map(perm).join(" ");
+        if flags.is_empty() {
+            self.resume_argv(session_id)
+        } else {
+            format!("codex resume {flags} {}", sh_single_quote(session_id))
+        }
+    }
+
     fn exec_turn_argv(&self, prompt: &str, resume: Option<&str>, perm: PermMode) -> String {
         // Headless one-turn pipeline, tee'd into the journal via the tap:
         //   fresh:  codex exec        --json <perm> '<prompt>' | t-hub-agent --codex-tap
@@ -121,6 +130,13 @@ mod tests {
         assert_eq!(
             a.resume_argv("019f5390-6497-75c2-ad90-e721d1b6d1d5"),
             "codex resume '019f5390-6497-75c2-ad90-e721d1b6d1d5'"
+        );
+        assert_eq!(
+            a.resume_argv_with_permissions(
+                "019f5390-6497-75c2-ad90-e721d1b6d1d5",
+                PermMode::Default
+            ),
+            "codex resume --sandbox read-only '019f5390-6497-75c2-ad90-e721d1b6d1d5'"
         );
     }
 

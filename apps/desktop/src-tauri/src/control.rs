@@ -2252,14 +2252,26 @@ impl CaptainsRegistry {
         provider_session_id: Option<&str>,
     ) {
         let Some(provider) = provider else { return };
+        let provider_changed = captain.provider.as_deref() != Some(provider);
         captain.provider = Some(provider.to_string());
-        captain.provider_session_id = provider_session_id.map(str::to_string);
-        captain.claude_uuid = if provider == "claude" {
-            provider_session_id.map(str::to_string)
-        } else {
-            None
-        };
-        captain.conversation_id = provider_session_id.map(str::to_string);
+        captain.harness = Some(provider.to_string());
+        // A freshly resumed runtime may be verifiably live before its provider
+        // conversation id reaches the status bridge. Preserve the durable anchor
+        // when the provider is unchanged and no newer runtime-derived value is
+        // available. Clearing it here would turn a safe terminal rebind into a
+        // conversation reset during exactly the startup-recovery window that
+        // needs continuity most.
+        if let Some(provider_session_id) = provider_session_id {
+            captain.provider_session_id = Some(provider_session_id.to_string());
+            captain.claude_uuid = (provider == "claude").then(|| provider_session_id.to_string());
+            captain.conversation_id = Some(provider_session_id.to_string());
+        } else if provider_changed {
+            captain.provider_session_id = None;
+            captain.claude_uuid = None;
+            captain.conversation_id = None;
+        } else if provider != "claude" {
+            captain.claude_uuid = None;
+        }
     }
 
     /// Bump seq + persist iff `changed`, then package the [`ClaimOutcome`]. The guard
@@ -2440,7 +2452,7 @@ impl CaptainsRegistry {
                         terminal_id: Some(terminal_id.to_string()),
                         project_id: None,
                         assignment: None,
-                        harness: None,
+                        harness: provider.map(str::to_string),
                         conversation_id: provider_session_id.map(str::to_string),
                         resume_point: None,
                         workspace_tab_ids,
@@ -4559,7 +4571,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        "spawn_terminal" | "ensure_cortana" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -5845,6 +5857,11 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
+        // App-owned Cortana startup recovery. This is deliberately not exposed
+        // through the MCP catalog: only the trusted in-process UI may create the
+        // apex runtime automatically. The handler itself re-checks host provenance
+        // before it inspects or changes any runtime.
+        "ensure_cortana" => ensure_cortana(ctx, args, trusted_internal),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
         "attach_captain" => attach_captain(ctx, args, caller, trusted_internal),
         "dispatch_crew" => dispatch_crew(ctx, args, caller, trusted_internal),
@@ -7337,6 +7354,296 @@ fn detected_harness(terminal_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone)]
+struct CortanaRuntime {
+    terminal_id: String,
+    harness: String,
+    current_control: bool,
+}
+
+fn orchestrator_home(args: &Value) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(path) = arg_str(args, "testOrchestratorHome") {
+        return Ok(path.trim_end_matches('/').to_string());
+    }
+    #[cfg(not(test))]
+    let _ = args;
+    files::user_home_path().map(|home| format!("{home}/.t-hub/orchestrator"))
+}
+
+fn cortana_runtimes_in_home(
+    ctx: &ControlContext,
+    home: &str,
+) -> Result<Vec<CortanaRuntime>, String> {
+    let panes = tmux::pane_info().map_err(|error| {
+        retryable_error(format!(
+            "ensure_cortana: terminal inspection failed: {error}"
+        ))
+    })?;
+    let mut runtimes = std::collections::HashMap::new();
+    for pane in panes {
+        if pane.cwd.trim_end_matches('/') != home.trim_end_matches('/') {
+            continue;
+        }
+        let harness = pane.command.trim().to_ascii_lowercase();
+        if !matches!(harness.as_str(), "codex" | "claude") {
+            continue;
+        }
+        let terminal_id = pane
+            .session
+            .strip_prefix("th_")
+            .unwrap_or(&pane.session)
+            .to_string();
+        let token =
+            tmux::session_environment(&pane.session, "T_HUB_CONTROL_TOKEN").map_err(|error| {
+                retryable_error(format!(
+                    "ensure_cortana: capability inspection failed for '{terminal_id}': {error}"
+                ))
+            })?;
+        runtimes
+            .entry(terminal_id.clone())
+            .or_insert(CortanaRuntime {
+                terminal_id,
+                harness,
+                current_control: token
+                    .as_deref()
+                    .is_some_and(|token| ct_token_eq(token, &ctx.token)),
+            });
+    }
+    Ok(runtimes.into_values().collect())
+}
+
+fn cortana_record(ctx: &ControlContext) -> Option<CaptainRecord> {
+    ctx.captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+}
+
+fn claim_cortana_runtime(
+    ctx: &ControlContext,
+    terminal_id: &str,
+    harness: &str,
+) -> Result<CaptainRecord, String> {
+    let result = claim_captain(
+        ctx,
+        &json!({
+            "captainSessionId": terminal_id,
+            "role": "cortana",
+            "provider": harness,
+        }),
+        None,
+        true,
+    )?;
+    serde_json::from_value(result["captain"].clone())
+        .map_err(|error| format!("ensure_cortana: invalid claim result: {error}"))
+}
+
+fn cortana_response(action: &str, captain: CaptainRecord, spawned: bool, resumed: bool) -> Value {
+    json!({
+        "accepted": "ensure_cortana",
+        "action": action,
+        "terminalId": captain.terminal_id,
+        "spawned": spawned,
+        "resumed": resumed,
+        "capability": "control",
+        "harness": captain.harness,
+        "harnessPermission": "default",
+        "captain": captain,
+        "audited": true,
+    })
+}
+
+fn rollback_cortana_spawn(ctx: &ControlContext, terminal_id: &str, error: String) -> String {
+    match close_terminal(ctx, &json!({ "sessionId": terminal_id })) {
+        Ok(_) => error,
+        Err(rollback) => format!("{error}; spawned Cortana rollback also failed: {rollback}"),
+    }
+}
+
+/// App-owned startup recovery. The provision mutex makes concurrent launch
+/// attempts one operation, and all runtime decisions fail closed on ambiguity.
+fn ensure_cortana(
+    ctx: &ControlContext,
+    args: &Value,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    if !trusted_internal {
+        return Err("acl: ensure_cortana requires the trusted in-process app host".into());
+    }
+    let home = orchestrator_home(args)?;
+    if home.is_empty() || !home.starts_with('/') {
+        return Err("ensure_cortana: orchestrator home must be an absolute POSIX path".into());
+    }
+    std::fs::create_dir_all(files::to_host_path(&home))
+        .map_err(|error| format!("ensure_cortana: could not create '{home}': {error}"))?;
+
+    let _provision = ctx.captains.provision_guard();
+    let incumbent = cortana_record(ctx);
+    let incumbent_id = incumbent
+        .as_ref()
+        .and_then(|captain| captain.terminal_id.clone());
+    let mut alternatives: Vec<CortanaRuntime> = cortana_runtimes_in_home(ctx, &home)?
+        .into_iter()
+        .filter(|runtime| incumbent_id.as_deref() != Some(runtime.terminal_id.as_str()))
+        .collect();
+
+    if let Some(id) = incumbent_id.as_deref() {
+        match tmux::session_liveness(&tmux_target(id)) {
+            tmux::SessionLiveness::Unknown => {
+                return Err(retryable_error(format!(
+                    "ensure_cortana: incumbent '{id}' could not be verified alive or gone"
+                )))
+            }
+            tmux::SessionLiveness::Alive => {
+                let harness = incumbent
+                    .as_ref()
+                    .and_then(|captain| captain.provider.as_deref().or(captain.harness.as_deref()))
+                    .map(str::to_string)
+                    .or_else(|| detected_harness(id))
+                    .unwrap_or_else(|| "codex".to_string());
+                if !matches!(harness.as_str(), "codex" | "claude") {
+                    return Err(format!(
+                        "ensure_cortana: unsupported incumbent harness '{harness}'"
+                    ));
+                }
+                let live = tmux::harness_liveness(&tmux_target(id), &harness);
+                if live == tmux::SessionLiveness::Unknown {
+                    return Err(retryable_error(format!(
+                        "ensure_cortana: incumbent '{id}' could not be verified as a live {harness} runtime"
+                    )));
+                }
+                let token = tmux::session_environment(&tmux_target(id), "T_HUB_CONTROL_TOKEN")
+                    .map_err(|error| {
+                        retryable_error(format!(
+                            "ensure_cortana: incumbent capability inspection failed: {error}"
+                        ))
+                    })?;
+                let authorized = token
+                    .as_deref()
+                    .is_some_and(|token| ct_token_eq(token, &ctx.token));
+                if live == tmux::SessionLiveness::Alive && authorized {
+                    if !alternatives.is_empty() {
+                        return Err("ensure_cortana: healthy incumbent plus another reserved-home runtime; refusing ambiguous repair".into());
+                    }
+                    let captain = claim_cortana_runtime(ctx, id, &harness)?;
+                    return Ok(cortana_response("adopted", captain, false, false));
+                }
+            }
+            tmux::SessionLiveness::Gone => {}
+        }
+    }
+
+    if alternatives.iter().any(|runtime| !runtime.current_control) {
+        return Err("ensure_cortana: an unregistered runtime without the current control capability occupies the reserved home; refusing silent elevation".into());
+    }
+    if alternatives.len() > 1 {
+        return Err("ensure_cortana: multiple authorized runtimes occupy the reserved home; refusing ambiguous repair".into());
+    }
+
+    let durable_harness = incumbent
+        .as_ref()
+        .and_then(|captain| captain.provider.as_deref().or(captain.harness.as_deref()))
+        .unwrap_or("codex")
+        .to_string();
+    if !matches!(durable_harness.as_str(), "codex" | "claude") {
+        return Err(format!(
+            "ensure_cortana: unsupported durable harness '{durable_harness}'"
+        ));
+    }
+    if let Some(candidate) = alternatives.pop() {
+        if incumbent.is_some() && candidate.harness != durable_harness {
+            return Err(format!(
+                "ensure_cortana: candidate harness '{}' differs from durable '{}'",
+                candidate.harness, durable_harness
+            ));
+        }
+        if let Some(old_id) = incumbent_id.as_deref() {
+            close_terminal(ctx, &json!({ "sessionId": old_id })).map_err(|error| format!(
+                "ensure_cortana: candidate is healthy but incumbent '{old_id}' could not be retired: {error}"
+            ))?;
+        }
+        let captain = claim_cortana_runtime(ctx, &candidate.terminal_id, &candidate.harness)?;
+        return Ok(cortana_response("restored", captain, false, true));
+    }
+
+    let anchor = incumbent
+        .as_ref()
+        .and_then(|captain| {
+            captain
+                .provider_session_id
+                .as_deref()
+                .or(captain.conversation_id.as_deref())
+                .or(captain.claude_uuid.as_deref())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let harness = Harness::from_provider(&durable_harness);
+    let startup_command = anchor.map_or_else(
+        || harness.adapter().fresh_argv_with_permissions(
+            "You are Cortana, T-Hub's singleton apex orchestrator. Read the durable fleet registry before acting and preserve ship boundaries.",
+            PermMode::Default,
+        ),
+        |id| harness.adapter().resume_argv_with_permissions(id, PermMode::Default),
+    );
+    #[cfg(test)]
+    let startup_command = arg_str(args, "testStartupCommand").unwrap_or(startup_command);
+    ctx.governor
+        .check_spawn(live_session_count(), Instant::now())
+        .map_err(|refusal| refusal.message)?;
+    let mut spawn_args = json!({
+        "cwd": home,
+        "name": "Cortana",
+        "startupCommand": startup_command,
+        "capability": "control",
+    });
+    if ctx.tabs.has_tab("captains-reserved") {
+        spawn_args["tabId"] = json!("captains-reserved");
+    } else {
+        spawn_args["tabName"] = json!("Captains");
+    }
+    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let id = spawned["id"]
+        .as_str()
+        .ok_or("ensure_cortana: spawn returned no terminal id")?
+        .to_string();
+    if let Err(error) = wait_for_harness_started(&id, harness.as_provider()) {
+        return Err(rollback_cortana_spawn(
+            ctx,
+            &id,
+            format!("ensure_cortana: startup failed: {error}"),
+        ));
+    }
+    if let Some(old_id) = incumbent_id.as_deref() {
+        if let Err(error) = close_terminal(ctx, &json!({ "sessionId": old_id })) {
+            return Err(rollback_cortana_spawn(
+                ctx,
+                &id,
+                format!("ensure_cortana: incumbent '{old_id}' could not be retired: {error}"),
+            ));
+        }
+    }
+    let captain = match claim_cortana_runtime(ctx, &id, harness.as_provider()) {
+        Ok(captain) => captain,
+        Err(error) => {
+            return Err(rollback_cortana_spawn(
+                ctx,
+                &id,
+                format!("ensure_cortana: durable claim failed: {error}"),
+            ))
+        }
+    };
+    let action = if incumbent.is_none() {
+        "started"
+    } else if anchor.is_some() {
+        "restored"
+    } else {
+        "replaced"
+    };
+    Ok(cortana_response(action, captain, true, anchor.is_some()))
 }
 
 fn trusted_provider_session_id(
@@ -15139,6 +15446,47 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    #[test]
+    fn ensure_cortana_starts_once_then_adopts_the_authorized_runtime() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-control").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4242".into();
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let (bin_dir, startup) = test_harness_command("codex");
+        let args = json!({
+            "testOrchestratorHome": home,
+            "testStartupCommand": startup,
+        });
+
+        let first = dispatch(&ctx, "ensure_cortana", &args).expect("first startup");
+        assert_eq!(first["action"], "started");
+        assert_eq!(first["spawned"], true);
+        let first_id = first["terminalId"].as_str().unwrap().to_string();
+        let second = dispatch(&ctx, "ensure_cortana", &args).expect("second startup");
+        assert_eq!(second["action"], "adopted");
+        assert_eq!(second["spawned"], false);
+        assert_eq!(second["terminalId"], first_id);
+        assert_eq!(
+            ctx.captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana)
+                .count(),
+            1
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": first_id })).unwrap();
+        std::fs::remove_dir_all(bin_dir).unwrap();
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
