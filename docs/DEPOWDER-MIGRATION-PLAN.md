@@ -111,6 +111,7 @@ Add one primary Captain operation.
 
 ```text
 start_agent(
+  requestId,
   captainSessionId,
   assignment,
   directory,
@@ -120,7 +121,11 @@ start_agent(
 )
 ```
 
-`captainSessionId`, `assignment`, and `directory` are required.
+`requestId`, `captainSessionId`, `assignment`, and `directory` are required.
+
+`requestId` is stable across retries of one accepted launch attempt and is deduplicated through the existing T-Hub request cache.
+
+A duplicate `requestId` must replay the original outcome without creating another agent record or terminal.
 
 `directory` must already exist and must resolve inside the Captain's registered Project repository or one of its Git worktrees.
 
@@ -210,6 +215,8 @@ The error must recommend the relevant agent operation and must perform no networ
 The CLI may retain a hidden `th powder` tombstone for that release.
 
 The tombstone must return the stable JSON error envelope, `error.kind` equal to `powder_retired`, and process exit code 4.
+
+Exit code 4 is deliberate because a retired operation is a compatibility and operational failure, not an authorization or confirmation gate.
 
 Removed Powder tools must disappear from the MCP catalog immediately so models stop selecting them.
 
@@ -357,8 +364,9 @@ Do not install, restart, publish, push, or release without separate General auth
 
 ### Registry and migration tests
 
-- Load a real-shaped schema-17 fixture containing active, completed, cleanup-pending, and ambiguous Powder records.
-- Prove the fixture loads without opening a network connection.
+- Load sanitized real-shaped schema-13 and current schema-16 fixtures containing active, completed, cleanup-pending, and ambiguous Powder records.
+- Prove both legacy fixtures load without opening a network connection and migrate to schema 17 on the first successful write.
+- Load a schema-17 fixture as the migrated-output compatibility case.
 - Prove assignments, provider conversations, directories, worktrees, branches, checkpoints, and Captain ownership survive migration.
 - Prove legacy fields survive a read and write cycle without becoming authoritative.
 - Prove a registry backup is created before the first migration write.
