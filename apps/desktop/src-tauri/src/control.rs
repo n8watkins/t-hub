@@ -4749,12 +4749,16 @@ impl CaptainsRegistry {
         if let Some(stage) = stage {
             current.agent_sessions[agent_index].work_stage = stage;
         }
+        let runtime_state = current.agent_sessions[agent_index].runtime_state;
+        let work_stage = current.agent_sessions[agent_index].work_stage;
         current.agent_checkpoints.push(checkpoint.clone());
         current.agent_events.push(AgentEvent {
             cursor,
             agent_session_id: agent_session_id.to_string(),
             kind: "checkpoint".into(),
             created_at: checkpoint.created_at,
+            runtime_state: Some(runtime_state),
+            work_stage: Some(work_stage),
             checkpoint: Some(checkpoint.clone()),
         });
         if current.agent_checkpoints.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
@@ -4815,7 +4819,7 @@ impl CaptainsRegistry {
         agent_session_id: &str,
         workspace_tab_id: Option<String>,
     ) -> Result<AgentSessionRecord, String> {
-        self.update_agent_session(agent_session_id, |agent| {
+        self.update_agent_session_with_event(agent_session_id, "started", |agent| {
             agent.workspace_tab_id = workspace_tab_id;
             agent.runtime_state = RuntimeState::Running;
             agent.updated_at = now_ms();
@@ -4823,7 +4827,7 @@ impl CaptainsRegistry {
     }
 
     pub fn mark_agent_unavailable(&self, agent_session_id: &str) -> Result<(), String> {
-        self.update_agent_session(agent_session_id, |agent| {
+        self.update_agent_session_with_event(agent_session_id, "unavailable", |agent| {
             agent.runtime_state = RuntimeState::Unavailable;
             agent.work_stage = crate::agent_session::WorkStage::Stopped;
             agent.updated_at = now_ms();
@@ -4836,15 +4840,16 @@ impl CaptainsRegistry {
         agent_session_id: &str,
         stage: crate::agent_session::WorkStage,
     ) -> Result<AgentSessionRecord, String> {
-        self.update_agent_session(agent_session_id, |agent| {
+        self.update_agent_session_with_event(agent_session_id, "stage_changed", |agent| {
             agent.work_stage = stage;
             agent.updated_at = now_ms();
         })
     }
 
-    fn update_agent_session(
+    fn update_agent_session_with_event(
         &self,
         agent_session_id: &str,
+        kind: &str,
         update: impl FnOnce(&mut AgentSessionRecord),
     ) -> Result<AgentSessionRecord, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
@@ -4858,7 +4863,22 @@ impl CaptainsRegistry {
         update(agent);
         agent.validate()?;
         let result = agent.clone();
-        current.seq = current.seq.saturating_add(1);
+        let cursor = current.seq.saturating_add(1);
+        current.agent_events.push(AgentEvent {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            kind: kind.to_string(),
+            created_at: result.updated_at,
+            runtime_state: Some(result.runtime_state),
+            work_stage: Some(result.work_stage),
+            checkpoint: None,
+        });
+        if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_events.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_events.drain(0..overflow);
+        }
+        current.seq = cursor;
         self.commit_mutation(current, previous)?;
         Ok(result)
     }
@@ -10089,7 +10109,7 @@ fn governor_gate(
 ) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" | "commission_captain" | "dispatch_crew" => {
+        "spawn_terminal" | "start_agent" | "commission_captain" | "dispatch_crew" => {
             ctx.governor.check_spawn(live_session_count(), now)
         }
         "close_terminal" => ctx.governor.check_destructive(now),
@@ -10960,14 +10980,12 @@ fn list_agents(
     if captain_session_id.is_none() && project_id.is_none() {
         return Err("list_agents requires 'captainSessionId' or 'projectId'".into());
     }
-    if args
+    let state = args
         .get("state")
         .and_then(Value::as_str)
-        .is_some_and(|state| state != "active")
-    {
-        return Err(
-            "list_agents state must be 'active' until removed-agent history is available".into(),
-        );
+        .unwrap_or("active");
+    if !matches!(state, "active" | "removed") {
+        return Err("list_agents state must be 'active' or 'removed'".into());
     }
     let caller_ship = authorize_agent_filter(
         ctx,
@@ -10990,6 +11008,10 @@ fn list_agents(
                 && project_id
                     .as_deref()
                     .is_none_or(|project| agent.project_id == project)
+                && (state == "removed"
+                    && agent.work_stage == crate::agent_session::WorkStage::Stopped
+                    || state == "active"
+                        && agent.work_stage != crate::agent_session::WorkStage::Stopped)
                 && caller_ship.as_deref().is_none_or(|ship| {
                     ctx.captains
                         .captain_for_session(&agent.captain_session_id)
@@ -11165,12 +11187,14 @@ fn agent_events(
     let events: Vec<_> = available.iter().take(limit).cloned().collect();
     let count = events.len();
     let next_cursor = events.last().map(|event| event.cursor).unwrap_or(after);
+    let oldest_cursor = available.first().map(|event| event.cursor).unwrap_or(after);
     Ok(json!({
         "events": events,
         "count": count,
         "cursor": after.to_string(),
         "nextCursor": next_cursor.to_string(),
         "eventCursor": event_cursor,
+        "cursorExpired": after.saturating_add(1) < oldest_cursor,
         "hasMore": available.len() > count,
     }))
 }
@@ -19266,6 +19290,7 @@ fn start_agent(
         "cwd": checkout,
         "name": arg_str(args, "name").unwrap_or_else(|| format!("Agent - {agent_session_id}")),
         "startupCommand": launch,
+        "spawnedBy": captain_session_id,
     });
     if let Some(tab_id) = arg_str(args, "workspaceTabId") {
         spawn_args["tabId"] = json!(tab_id);
@@ -27229,6 +27254,11 @@ mod tests {
             .expect("agent record persisted before launch");
         assert_eq!(agent.runtime_state, RuntimeState::Unavailable);
         assert_eq!(agent.work_stage, crate::agent_session::WorkStage::Stopped);
+        let events = ctx.captains.snapshot().agent_events;
+        assert_eq!(
+            events.last().map(|event| event.kind.as_str()),
+            Some("unavailable")
+        );
     }
 
     #[test]
@@ -27297,6 +27327,15 @@ mod tests {
         assert!(agent.provider_conversation_id.is_none());
         assert_eq!(response["runtimeState"], "running");
         assert!(response.get("providerConversationId").is_none());
+        let event = ctx
+            .captains
+            .snapshot()
+            .agent_events
+            .into_iter()
+            .find(|event| event.agent_session_id == agent_session_id)
+            .expect("started lifecycle event");
+        assert_eq!(event.kind, "started");
+        assert_eq!(event.runtime_state, Some(RuntimeState::Running));
 
         reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
     }

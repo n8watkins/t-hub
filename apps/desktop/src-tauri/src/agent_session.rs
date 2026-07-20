@@ -139,6 +139,10 @@ pub struct AgentEvent {
     pub kind: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<RuntimeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_stage: Option<WorkStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<AgentCheckpoint>,
 }
 
