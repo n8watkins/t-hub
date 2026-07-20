@@ -33599,6 +33599,12 @@ mod tests {
     #[test]
     fn ship_admin_executes_own_ship_operations_and_denies_foreign_or_reserved_targets() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let captain_alpha = format!("ca{}", &nonce[..6]);
+        let captain_beta = format!("cb{}", &nonce[..6]);
+        let admin_session = format!("aa{}", &nonce[..6]);
+        let peer_alpha = format!("pa{}", &nonce[..6]);
+        let peer_beta = format!("pb{}", &nonce[..6]);
         let audit_dir = std::env::temp_dir().join(format!(
             "t-hub-admin-execute-audit-{}",
             uuid::Uuid::new_v4().simple()
@@ -33606,34 +33612,36 @@ mod tests {
         let ctx =
             test_ctx("admin-execute-ship").with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
         ctx.captains
-            .claim_test("captain-alpha", Some("alpha"), vec![])
+            .claim_test(&captain_alpha, Some("alpha"), vec![])
             .unwrap();
         ctx.captains
-            .claim_test("captain-beta", Some("beta"), vec![])
+            .claim_test(&captain_beta, Some("beta"), vec![])
             .unwrap();
-        for crew in ["admin-alpha", "peer-alpha"] {
-            ctx.captains.record_crew("captain-alpha", crew).unwrap();
+        for crew in [&admin_session, &peer_alpha] {
+            ctx.captains.record_crew(&captain_alpha, crew).unwrap();
         }
-        ctx.captains
-            .record_crew("captain-beta", "peer-beta")
-            .unwrap();
-        let session_ids = ["admin-alpha", "peer-alpha", "peer-beta"];
+        ctx.captains.record_crew(&captain_beta, &peer_beta).unwrap();
+        let session_ids = [
+            admin_session.as_str(),
+            peer_alpha.as_str(),
+            peer_beta.as_str(),
+        ];
         for session_id in session_ids {
             create_test_tmux_session(&tmux_target(session_id)).unwrap();
         }
         let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
         ctx.identity
-            .bind_tile(&captain_identity.id, "captain-alpha")
+            .bind_tile(&captain_identity.id, &captain_alpha)
             .unwrap();
         let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&admin_identity.id, "admin-alpha")
+            .bind_tile(&admin_identity.id, &admin_session)
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
         appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "admin-alpha",
+                "actorSessionId": admin_session,
                 "role": "shipAdmin",
                 "permittedOperations": [
                     "maintainSession",
@@ -33651,7 +33659,7 @@ mod tests {
             &ctx,
             &json!({
                 "operation": "maintainSession",
-                "target": { "kind": "session", "sessionId": "admin-alpha" }
+                "target": { "kind": "session", "sessionId": admin_session }
             }),
             Some(&admin),
             false,
@@ -33660,14 +33668,14 @@ mod tests {
         assert_eq!(own["outcome"]["outcome"], "maintained");
         assert_eq!(
             own["outcome"]["maintainedSessions"][0]["sessionId"],
-            "admin-alpha"
+            admin_session
         );
 
         let sibling = execute_admin_operation(
             &ctx,
             &json!({
                 "operation": "recoverResource",
-                "target": { "kind": "session", "sessionId": "peer-alpha" }
+                "target": { "kind": "session", "sessionId": peer_alpha }
             }),
             Some(&admin),
             false,
@@ -33679,7 +33687,7 @@ mod tests {
             &ctx,
             &json!({
                 "operation": "prepareRetirement",
-                "target": { "kind": "session", "sessionId": "peer-alpha" }
+                "target": { "kind": "session", "sessionId": peer_alpha }
             }),
             Some(&admin),
             false,
@@ -33695,7 +33703,7 @@ mod tests {
             &ctx,
             &json!({
                 "operation": "maintainSession",
-                "target": { "kind": "session", "sessionId": "peer-beta" }
+                "target": { "kind": "session", "sessionId": peer_beta }
             }),
             Some(&admin),
             false,
@@ -33759,10 +33767,16 @@ mod tests {
     #[test]
     fn fleet_admin_maintains_captains_without_crossing_into_crew_or_general_authority() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
-        let ctx = test_ctx("admin-execute-fleet");
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let cortana_session = format!("co{}", &nonce[..6]);
+        let captain_alpha = format!("ca{}", &nonce[..6]);
+        let captain_beta = format!("cb{}", &nonce[..6]);
+        let fleet_admin_session = format!("fa{}", &nonce[..6]);
+        let peer_beta = format!("pb{}", &nonce[..6]);
+        let ctx = test_ctx(&format!("admin-execute-fleet-{}", &nonce[..8]));
         ctx.captains
             .claim_provider(
-                "cortana1",
+                &cortana_session,
                 None,
                 FleetRole::Cortana,
                 Some("codex"),
@@ -33773,19 +33787,27 @@ mod tests {
             )
             .unwrap();
         ctx.captains
-            .claim_test("capalpha", Some("alpha"), vec![])
+            .claim_test(&captain_alpha, Some("alpha"), vec![])
             .unwrap();
         ctx.captains
-            .claim_test("capbeta", Some("beta"), vec![])
+            .claim_test(&captain_beta, Some("beta"), vec![])
             .unwrap();
-        ctx.captains.record_crew("capalpha", "fleet-admin").unwrap();
-        ctx.captains.record_crew("capbeta", "peer-beta").unwrap();
-        for session_id in ["fleet-admin", "capalpha", "capbeta", "peer-beta"] {
+        ctx.captains
+            .record_crew(&captain_alpha, &fleet_admin_session)
+            .unwrap();
+        ctx.captains.record_crew(&captain_beta, &peer_beta).unwrap();
+        let session_ids = [
+            fleet_admin_session.as_str(),
+            captain_alpha.as_str(),
+            captain_beta.as_str(),
+            peer_beta.as_str(),
+        ];
+        for session_id in session_ids {
             create_test_tmux_session(&tmux_target(session_id)).unwrap();
         }
         let cortana_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
         ctx.identity
-            .bind_tile(&cortana_identity.id, "cortana1")
+            .bind_tile(&cortana_identity.id, &cortana_session)
             .unwrap();
         ctx.captains
             .begin_cortana_recovery("fleet-admin-test")
@@ -33795,20 +33817,20 @@ mod tests {
                 "fleet-admin-test",
                 &cortana_identity.id,
                 1,
-                "cortana1",
+                &cortana_session,
                 "codex",
                 None,
             )
             .unwrap();
         let fleet_admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&fleet_admin_identity.id, "fleet-admin")
+            .bind_tile(&fleet_admin_identity.id, &fleet_admin_session)
             .unwrap();
         let cortana = resolve_identity(&ctx, &cortana_identity.secret).unwrap();
         appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "fleet-admin",
+                "actorSessionId": fleet_admin_session,
                 "role": "fleetAdmin",
                 "permittedOperations": [
                     "maintainFleetResource",
@@ -33845,7 +33867,7 @@ mod tests {
             &ctx,
             &json!({
                 "operation": "prepareRetirement",
-                "target": { "kind": "session", "sessionId": "capbeta" }
+                "target": { "kind": "session", "sessionId": captain_beta }
             }),
             Some(&fleet_admin),
             false,
@@ -33857,7 +33879,7 @@ mod tests {
             &ctx,
             &json!({
                 "operation": "recoverResource",
-                "target": { "kind": "session", "sessionId": "peer-beta" }
+                "target": { "kind": "session", "sessionId": peer_beta }
             }),
             Some(&fleet_admin),
             false,
@@ -33877,7 +33899,7 @@ mod tests {
         .unwrap_err();
         assert!(general_denied.contains("targetOutOfScope"));
 
-        for session_id in ["fleet-admin", "capalpha", "capbeta", "peer-beta"] {
+        for session_id in session_ids {
             reap_test_tmux_session(&tmux_target(session_id)).unwrap();
         }
     }
