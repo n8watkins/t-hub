@@ -90,6 +90,72 @@ function adoptSync(args: ControlApply["args"]): boolean {
   return true;
 }
 
+function tabReports(tabs: ReturnType<typeof useWorkspace.getState>["tabs"]): TabReport[] {
+  return tabs.map((t) => ({
+    schemaVersion: 1,
+    id: t.id,
+    name: t.name,
+    kind: t.kind ?? (t.id === "captains-reserved" ? "captain" : "work"),
+    tileIds: t.order,
+  }));
+}
+
+/**
+ * Hydrate the UI from the server registry before the first layout report.
+ *
+ * A Captain-only registry is an invalid recovered state: the UI always keeps
+ * at least one work tab, and live terminals need a work tab to render. Keep a
+ * locally persisted work layout in that case and repair the server from it.
+ * This also lets setTerminals() surface pre-existing sessions while the first
+ * control request is still in flight.
+ */
+export async function bootstrapWorkspaceTabs(): Promise<void> {
+  try {
+    const res = (await controlRequest("list_tabs")) as {
+      seq?: unknown;
+      activeTabId?: unknown;
+      tabs?: unknown;
+    };
+    if (typeof res.seq !== "number" || !Array.isArray(res.tabs) || res.tabs.length === 0) {
+      return;
+    }
+
+    const serverTabs = res.tabs as TabReport[];
+    lastSeq = res.seq;
+    const local = useWorkspace.getState();
+    const localWork = local.tabs.filter((tab) => tab.id !== "captains-reserved");
+    const serverWork = serverTabs.filter((tab) => tab.id !== "captains-reserved");
+
+    if (serverWork.length === 0 && localWork.length > 0) {
+      const { reportWorkspaceTabs } = await import("./client");
+      const repaired = await reportWorkspaceTabs(
+        tabReports(local.tabs),
+        local.activeTabId,
+        res.seq,
+      );
+      if (typeof repaired.seq === "number") lastSeq = repaired.seq;
+      if (repaired.stale && Array.isArray(repaired.tabs)) {
+        adoptingRegistry = true;
+        try {
+          useWorkspace.getState().adoptRegistry(repaired.tabs);
+        } finally {
+          adoptingRegistry = false;
+        }
+      }
+      return;
+    }
+
+    adoptingRegistry = true;
+    try {
+      useWorkspace.getState().adoptRegistry(serverTabs);
+    } finally {
+      adoptingRegistry = false;
+    }
+  } catch {
+    // The local layout remains usable if the control channel is unavailable.
+  }
+}
+
 // The last captains-registry revision this window adopted. Guards against a
 // stale snapshot applying over a newer one (the boot fetch racing a live
 // sync_captains forward). The server seq is persisted, so it is monotonic even
@@ -486,22 +552,21 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
 function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
+  let bootstrapping = true;
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
+    if (bootstrapping) {
+      pending = true;
+      return;
+    }
     if (inFlight) {
       pending = true;
       return;
     }
     inFlight = true;
     const { tabs, activeTabId } = useWorkspace.getState();
-    const payload = tabs.map((t) => ({
-      schemaVersion: 1 as const,
-      id: t.id,
-      name: t.name,
-      kind: t.kind ?? (t.id === "captains-reserved" ? "captain" : "work"),
-      tileIds: t.order,
-    }));
+    const payload = tabReports(tabs);
     void import("./client")
       .then((m) => m.reportWorkspaceTabs(payload, activeTabId, lastSeq))
       .then((res: TabReportResult | void) => {
@@ -537,8 +602,12 @@ function startTabReporter(): void {
       report();
     }
   });
-  // Initial snapshot so list_tabs reflects the default tab before any change.
-  report();
+  // Read the authoritative registry before the first report so a cold webview
+  // cannot overwrite server-side workspaces with its boot-time local snapshot.
+  void bootstrapWorkspaceTabs().finally(() => {
+    bootstrapping = false;
+    report();
+  });
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).
