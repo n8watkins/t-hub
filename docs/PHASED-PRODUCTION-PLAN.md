@@ -4,6 +4,7 @@
 > context and do not describe current T-Hub runtime requirements.
 > The active post-Powder model is defined by
 > [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
+> Powder boards, cards, claims, runs, and Crew dispatch below are historical compatibility evidence unless a section explicitly identifies a current agent-session contract.
 
 **Updated:** 2026-07-17.
 **Plan source:** `9d7c9f9` on `fix/captain-control-runtime` plus the General-directed scoped-autonomy integration recorded by this change.
@@ -30,8 +31,8 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 - **Assignment:** The durable responsibility given to one Captain within a Project.
 - **Captain:** A durable agent identity responsible for an Assignment and any Crew it creates.
 - **Workspace:** A coherent workstream or feature grouping controlled by a Captain.
-- **Crew:** A bounded worker agent assigned to a Workspace, worktree, and normally a Powder card.
-- **Powder board:** The authoritative work ledger containing cards, claims, runs, work logs, input requests, completion evidence, and events.
+- **Crew:** A bounded worker agent assigned to a Workspace, worktree, and durable agent-session record.
+- **Powder board:** A historical work ledger retained only for compatibility evidence and migration interpretation.
 - **Harness:** The agent runner, initially Codex or Claude Code, with future adapters such as a GLM-compatible runner.
 - **Provider:** The model or account provider used by a Harness.
 - **History:** The provider-agnostic catalog of resumable and archived agent sessions.
@@ -57,16 +58,16 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 16. The initial Codex default is the user's configured `gpt-5.6-sol` with medium reasoning effort.
 17. The control plane should be CLI-first, with MCP retained as an optional thin adapter over the same operations.
 18. History, lifecycle telemetry, voice, notifications, and settings should be provider-agnostic.
-19. Powder remains authoritative for card and run execution state, while T-Hub remains authoritative for runtime identity, terminals, Workspaces, and owned resources.
-20. Raw CPU, RAM, process, and context samples remain local to T-Hub rather than turning Powder into a telemetry database.
+19. T-Hub remains authoritative for durable agent-session assignments, work stage, checkpoints, runtime identity, terminals, Workspaces, and owned resources.
+20. Raw CPU, RAM, process, and context samples remain local to T-Hub rather than turning an external compatibility service into a telemetry database.
 21. Agent work state and runtime health are independent axes governed by [STATUS-MODEL.md](./STATUS-MODEL.md).
 22. Worktree identity, ownership, freshness, and cleanup safety are computed once by the backend under [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
 23. Agent authority, supervision, evidence, dialogue, escalation, review, and completion follow [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md).
-24. This phased plan governs strategy and dependencies, Powder is the executable backlog and work ledger, T-Hub inbox messages carry durable dialogue, lifecycle events carry attention and runtime transitions, and Git plus verification artifacts provide technical proof.
+24. This phased plan governs strategy and dependencies, durable agent-session records and bounded checkpoints carry active assignment state, T-Hub inbox messages carry durable dialogue, lifecycle events carry attention and runtime transitions, and Git plus verification artifacts provide technical proof.
 25. Terminal typing is an inspected compatibility path rather than an authoritative message or acknowledgement channel.
-26. Every material review finding belongs in this plan even when its implementation is deferred, while only independently executable near-term units belong on the Powder backlog.
-27. A change belongs in Powder only when it improves Powder's generic ledger, concurrency, authorization, or retry contract for every client rather than accommodating a T-Hub-specific workflow.
-28. T-Hub must fail closed when a required Powder guarantee is unavailable and must not simulate that guarantee with a read-then-write race.
+26. Every material review finding belongs in this plan even when its implementation is deferred, while only independently executable near-term units belong in an explicitly authorized agent-session assignment.
+27. A change belongs in the active roadmap only when its owner, durable assignment, proof plan, and exit gate are explicit rather than implied by historical backlog artifacts.
+28. T-Hub must fail closed when a required durable-session or external compatibility guarantee is unavailable and must not simulate that guarantee with a read-then-write race.
 29. Every changed packaged build receives a new version across all authoritative version files before it is built, and one version may identify only one exact source commit.
 30. Focused regression tests run during implementation, while the comprehensive quality gate runs at integration, pull-request, packaged-acceptance, and release boundaries.
 31. Durable authority role, provider-neutral work profile, and resolved Harness runtime are separate concepts; changing a model never changes General, Cortana, Captain, Crew, or reviewer authority.
@@ -75,8 +76,8 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 34. Captain autonomy uses typed scoped delegation rather than a blanket Captain role exception or fleet-wide control.
 35. Durable organizational identity, T-Hub capability, scoped grants, and Harness-local execution permission are separate authority axes, and none silently expands another.
 36. A live control-capable Captain without a Project may consume only an exact one-time existing-repository bootstrap approval with `maxUses=1` that was issued by the General or by Cortana under an exact pre-existing issuance delegation and binds the Captain's durable identity, current session generation, ship, canonical root, Assignment, protected profile identifier, existing board, operation, request digest, and expiry.
-37. `register_project` must not receive a blanket Captain exception because its current transaction can create or initialize Git and update Project metadata or Powder bindings before or after the present role check.
-38. Appturnity is the first installed end-user reproduction for the self-bootstrap slice, and no Appturnity Crew may be dispatched until its Project, Captain, Assignment, protected profile, and Powder board link are authoritatively persisted and reread.
+37. `register_project` must not receive a blanket Captain exception because its current transaction can create or initialize Git and update Project metadata or external compatibility bindings before or after the present role check.
+38. Appturnity is the first installed end-user reproduction for the self-bootstrap slice, and no Appturnity agent session may start implementation until its Project, Captain, Assignment, protected profile, and any compatibility binding are authoritatively persisted and reread.
 39. Named authority profiles are visible templates that expand into explicit T34 grant records; `captain-standard`, `captain-project-builder`, and `captain-delivery` are distinct from T33 Harness and model work profiles, while `captain-production-operator` is never a default standing grant and normally resolves to exact one-time approvals.
 40. No standing or delegated Captain profile may authorize protected profile endpoint or credential-command mutation, system-global software installation, or public external repository creation; where supported, only a separately reviewed exact General one-time approval may authorize a narrow instance, while credential reading or export and cross-Project authority remain absolute denials.
 41. T35 atomically consumes the one-time bootstrap approval into an immutable operation-owned recovery lease before its first mutation; only the same durable Captain, ship, request digest, root, Assignment, profile, board, and operation may resume it through a verified replacement-generation handoff, and no new or changed request inherits that authority.
@@ -87,10 +88,10 @@ This plan is the consolidated forward roadmap.
 Record product decisions, dependencies, phase status, parallelization constraints, test doctrine, and exit gates here.
 Do not turn the plan into a high-frequency task log.
 
-Powder is the executable backlog.
-Represent independently assignable work as cards with acceptance criteria, proof plans, claims, runs, work logs, blockers, and completion evidence.
-Use separate cards and isolated worktrees for parallel lanes, with one declared integration owner.
-A Powder card cannot override this plan or another canonical authority contract.
+Durable agent-session assignments and bounded checkpoints are the active work record.
+Represent independently assignable work with an explicit Assignment, isolated worktree when needed, proof plan, owner, dependency, and exit gate.
+Use separate agent sessions and isolated worktrees for parallel lanes, with one declared integration owner.
+Historical cards and runs cannot override this plan or another canonical authority contract.
 
 The T-Hub inbox is the durable dialogue layer for instructions, blockers, decisions, permissions, review findings, completion reports, and peer coordination that require delivery or acknowledgement.
 Lifecycle events provide event-driven attention and runtime-health transitions without requiring periodic model polling.
@@ -113,7 +114,10 @@ Agent orchestration exposed the highest-risk races because Captains and Crew cre
 The Powder-generic findings are not caused only by agents and remain worthwhile for CI runners, human operators, integrations, and any other concurrent Powder clients.
 The T-Hub findings are primarily orchestration-product responsibilities and should not be pushed into Powder.
 
-### Powder-Generic Change Register
+### Powder-Generic Change Register (Historical)
+
+> This register preserves the former external-ledger integration contract and its review evidence.
+> It is not an active T-Hub implementation queue or an instruction to create cards, claims, runs, or external mutations.
 
 | ID | Required generic change | Why it is broadly useful | Orchestration relationship | Dependency and exit condition | Recommended Powder card |
 | --- | --- | --- | --- | --- | --- |
@@ -283,9 +287,13 @@ Later integration order is:
 
 Phase 2 is the earliest numbered phase with unblocked partial work, but its complete activation requires the Phase 3 B1 identity interface.
 Phase 3 is the earliest foundational dependency whose completion unlocks the largest downstream set.
-Phase 8A remains the authorized immediate product vertical slice because the installed Captain path already reached its evidence boundary, but it may exit only through the P1 through P4, T1 through T3, and T17 safety gates.
+The former Phase 8A flow remains historical evidence because the installed Captain path reached its Powder-backed evidence boundary.
+Current product work must use the durable agent-session lifecycle and its active safety gates.
 
-## Current Baseline
+## Current Baseline (Historical Runtime Evidence)
+
+> The following baseline records a retired Powder-backed acceptance run.
+> Use the active agent-session contracts and current installed evidence for present work.
 
 The local Powder authority is healthy on WSL at `127.0.0.1:4017`.
 Windows reaches Powder privately through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
@@ -810,9 +818,12 @@ The compact new-codebase flow must retain one reviewed operation identity across
 - No unwanted Workspace is created merely because a Captain exists.
 - Preflight and rollback behavior remain understandable at every boundary.
 
-## Phase 8A - Single-Captain Powder Stage 1 Acceptance
+## Phase 8A - Single-Captain Powder Stage 1 Acceptance (Historical)
 
-**Status:** Active and blocked from shipment on P1 through P4, T1 through T3, and T17.
+> This section is retained as evidence from the retired Powder-backed acceptance flow.
+> It is not a current exit gate, dispatch procedure, or authorization to mutate external state.
+
+**Status:** Historical and superseded by the durable agent-session lifecycle and its current exit gates.
 Installed `0.3.103` passed Project binding, Captain control capability, WSL cwd, Crew dispatch, durable binding, exact checkout, live Codex Harness, claim, heartbeat, release, rollback, and cleanup checks.
 The Stage 1 retry correctly withheld its sentinel because T-Hub has no sanctioned operation to append or read attributed work-log evidence or complete the Crew card with proof.
 The next Phase 8A implementation may add bounded evidence reads and the fail-closed T-Hub surfaces, but it must not ship card-only automated completion.
@@ -855,9 +866,12 @@ Prove one complete installed Codex Captain and Crew lifecycle against the local 
 - No stale claim, active run, or disposable terminal remains after cleanup.
 - An owned acceptance worktree is removed only through T18; otherwise it remains safely retained with an explicit non-cleaned status and resume path.
 
-## Phase 8B - Multi-Captain and Cross-Harness Acceptance
+## Phase 8B - Multi-Captain and Cross-Harness Acceptance (Historical)
 
-**Status:** Blocked on Phase 8A, Phases 2 through 6, and the T7 through T11 identity, routing, inbox, and shared-catalog gates.
+> This section is retained as evidence from the retired Powder-backed acceptance flow.
+> Current multi-Captain work follows the Assignment, inbox, lifecycle, checkpoint, and owned-resource contracts.
+
+**Status:** Historical and superseded by the durable agent-session lifecycle and its current exit gates.
 
 ### Goal
 
@@ -1188,7 +1202,9 @@ Make the validated product safe, traceable, installable, and understandable.
 Parallel work should use isolated worktrees, explicit file ownership, separate Powder cards, and one integration owner.
 Parallel lanes must not edit the same registry schema, migration, or core lifecycle file without an agreed boundary.
 
-### Tranche P - Generic Powder Contract Dependencies
+### Tranche P - Generic Powder Contract Dependencies (Historical)
+
+> These lanes describe retired external-ledger work and are preserved for migration context only.
 
 These lanes belong in the Powder repository and must be designed for every Powder client rather than for T-Hub alone:
 
@@ -1351,7 +1367,7 @@ The current application boundary does not protect against a malicious process ru
 Strong isolation requires separate OS users, containers, or a broker that keeps tmux and credentials outside agent-readable state.
 Recommended initial decision: document the same-user trust boundary and defer hard isolation until the core workflow passes acceptance.
 
-### Powder Board Cardinality
+### Historical Powder Board Cardinality
 
 A Project may eventually need more than one Powder board.
 Recommended schema: support one default board plus optional Assignment-specific bindings without forcing the UI to expose multiple boards initially.
@@ -1399,7 +1415,7 @@ Recommended policy: do not enforce a hard limit until packaged 1, 4, 8, and 16-s
 No product question blocks Phase 1 or Phase 2.
 The following questions can be resolved before their dependent phases:
 
-1. Should the first UI expose Assignment-specific Powder boards, or support them only in the schema and Advanced settings?
+1. Should the first UI expose Assignment-specific compatibility bindings, or support them only in the schema and Advanced settings?
 2. Should message-body retention default to thirty days, or should the General choose a different local retention period?
 3. Does the General want hard same-user isolation before public distribution, or is the documented local trust boundary acceptable for the first production release?
 4. Which GLM Harness or OpenAI-compatible runner should become the third adapter after Codex and Claude parity is complete?
@@ -1414,13 +1430,13 @@ The recommended UI answer is to preserve provider-specific detail in Agent integ
 ## Zero-Context Resume Checklist
 
 1. Load the active workspace `AGENTS.md` instructions supplied to the session and read this document.
-2. Read `docs/CAPTAIN-POWDER-HANDOFF.md`, `docs/ORCHESTRATOR-OPERATING-MODEL.md`, `skills/captain/SKILL.md`, `docs/POWDER-INTEGRATION.md`, and `docs/PERFORMANCE-BENCHMARK.md` for the active phase.
+2. Read `docs/DEPOWDER-MIGRATION-PLAN.md`, `docs/ORCHESTRATOR-OPERATING-MODEL.md`, `docs/AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md`, and `docs/PERFORMANCE-BENCHMARK.md` for the active phase.
 3. Run `git status --short --branch` and preserve `.lavish/` plus `docs/DECK-AGENTS-DESIGN.md`.
 4. Run `git log --oneline -12` and inspect work after this plan.
 5. Confirm the installed Windows PID, executable path, version, and hash rather than assuming source is deployed.
 6. Confirm the active phase and its dependencies.
 7. Reproduce the relevant user-visible behavior before editing a bug fix.
-8. Use an isolated worktree and Powder card for parallel implementation.
+8. Use an isolated worktree and explicit durable agent-session Assignment for parallel implementation.
 9. Run the phase-specific tests and global quality gates.
 10. Commit the verified logical change with a clear message and no automatic co-author line.
 11. Update this plan only when product decisions, dependencies, or phase status materially change.

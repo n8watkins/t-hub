@@ -7,7 +7,7 @@
 ## Precedence and Related Contracts
 
 The [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) is the active
-post-Powder product decision for agent sessions.
+post-Powder product decision for durable agent sessions.
 The [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) remains useful for
 historical sequencing and evidence, but its Powder-specific sections are not
 live product requirements.
@@ -16,6 +16,7 @@ roadmap, durable agent-session records, T-Hub control plane, CLI, MCP adapter,
 and user interface must implement consistently.
 Canonical precedence is scope-based rather than a single global ordering.
 The phased plan wins for product decisions and dependencies, the handoff wins only for verified current runtime facts, the operating model wins for organizational lifecycle, and this contract wins for agent authority and messaging behavior.
+Powder boards, cards, claims, runs, and Crew dispatch are historical compatibility concepts unless a newer contract explicitly reintroduces one.
 No runtime fact or narrower contract may override an explicit product decision or General authorization.
 When canonical scopes genuinely conflict, stop the affected action, record the conflict, and update the phased plan with the resolved decision.
 
@@ -189,7 +190,7 @@ Automatic classification from prompt text is deferred until explicit profile sel
 
 | Concern | Authoritative source | Not sufficient by itself |
 | --- | --- | --- |
-| Product decisions and dependencies | Phased plan and canonical contracts | Conversation memory or an isolated card |
+| Product decisions and dependencies | Phased plan and canonical contracts | Conversation memory or an isolated planning artifact |
 | Agent assignment and progress | T-Hub agent-session record and bounded checkpoints | Terminal transcript or Captain self-report |
 | Runtime identity and ownership | T-Hub Project, Assignment, Captain, Workspace, agent, terminal, and resource records | Folder name, tab location, or current working directory |
 | Durable dialogue | T-Hub inbox message and acknowledgement state | Unacknowledged terminal typing |

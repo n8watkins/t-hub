@@ -47,6 +47,9 @@ These documents preserve rationale and prior findings but are not active backlog
 - [PERF-AND-DRAG-WORKLOG.md](./PERF-AND-DRAG-WORKLOG.md) is the historical master worklog for the earlier drag and freeze investigation.
 - [HANDOFF.md](./HANDOFF.md) is an older historical handoff and must not replace the active agent-session contracts.
 - [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) and [CAPTAIN-SIDEBAR-PRD.md](./CAPTAIN-SIDEBAR-PRD.md) preserve earlier Captain UI slices that now feed the broader phased plan.
+- [APPTURNITY-PROJECT-LINK-CORTANA-RUNBOOK.md](./APPTURNITY-PROJECT-LINK-CORTANA-RUNBOOK.md) is a historical Powder-bound registration and dispatch runbook, not current operational authority.
+- [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) is a historical Powder execution record, not a current agent-session procedure.
+- Powder-era material in [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is historical unless the section explicitly points to the active durable agent-session contracts.
 
 ## Archived or Abandoned Experiments
 

@@ -5,10 +5,11 @@
 > Captain-commissioning workflow.
 > Preserve it as an evidence record; use the active agent-session contracts for
 > current work.
+> No instruction in this document authorizes current registration, binding, card creation, claim, run, Crew dispatch, installation, or deployment.
 
 ## Status and intended reader
 
-This is an operational handoff for the active T-Hub Cortana.
+This is a historical operational handoff for the T-Hub Cortana runtime that was active when the Appturnity investigation was recorded.
 It was requested by the General on 2026-07-17 so Cortana can remove the control-plane block preventing the Appturnity deep review.
 It is written for an agent with no access to the conversation that produced it.
 It does not replace Cortana's fleet-coordination goal or the T-Hub Captain's active implementation goal.
@@ -16,7 +17,7 @@ Cortana must reconcile this work with those goals before assigning or changing T
 
 ## Mission
 
-Make the existing Appturnity WSL checkout an authoritative T-Hub Project, bind that Project to the existing Powder `appturnity` repository, attach the already-running Appturnity Captain, and prepare authoritative review cards.
+The historical mission was to make the existing Appturnity WSL checkout an authoritative T-Hub Project, bind that Project to the existing Powder `appturnity` repository, attach the already-running Appturnity Captain, and prepare authoritative review cards.
 
 The intended result is:
 
@@ -56,7 +57,7 @@ The following facts were observed through the installed T-Hub control surface an
 - It is not the registration target.
 - It must not be normalized into, copied over, cleaned, reset, staged, committed, registered, or used as a Crew worktree.
 
-### Powder state
+### Historical Powder state
 
 - Protected connection profile: `n8desktop-wsl`.
 - Powder repository: `appturnity`.
@@ -267,7 +268,7 @@ The implementation owner must provide at least these tests.
 - Existing T-Hub and Powder Projects retain their current roots and bindings.
 - Persistence failure cannot return a false successful registration.
 
-#### Powder binding tests
+#### Historical Powder binding tests
 
 - Registration can bind the existing `n8desktop-wsl/appturnity` repository.
 - An absent board fails without creating a Project that falsely claims a binding.
@@ -348,7 +349,7 @@ After attachment, verify:
 4. `project_board_snapshot` for `d3f3535d` resolves the `appturnity` board and reports its current cards honestly.
 5. A Captain checkpoint records the new authoritative state.
 
-### Phase 8: Prepare Powder review cards
+### Historical Phase 8: Prepare Powder review cards
 
 The observed Appturnity board has zero cards.
 `dispatch_crew` requires an authoritative card in the bound board.
@@ -448,7 +449,7 @@ Do not use source-only success to proceed.
 Keep Appturnity unbound and Crew undispatched.
 Return the exact failed gate to the implementation owner and preserve recoverable state.
 
-### Powder card creation is unavailable
+### Historical Powder card creation is unavailable
 
 The Project and Captain attachment may still be completed.
 Record card creation as the remaining blocker.
