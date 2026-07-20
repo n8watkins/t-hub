@@ -734,6 +734,74 @@ pub struct PaneInfo {
     pub cwd: String,
 }
 
+/// One exact Codex rollout currently held open by a process under a T-Hub pane.
+///
+/// The rollout path is provider evidence, not identity by itself. History parses
+/// and verifies the versioned filename before using its native conversation ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveCodexRollout {
+    pub terminal_id: String,
+    pub path: String,
+}
+
+/// Discover live Codex rollout files in one bounded WSL process invocation.
+///
+/// Codex does not currently publish its fresh interactive thread ID into tmux's
+/// session environment. Its process keeps the exact rollout open, so inspecting
+/// file descriptors under each pane's bounded four-level process tree provides an
+/// exact runtime join without guessing from cwd, timestamps, or display text.
+/// This is called only when History is requested, never from a background poll.
+pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
+    let script = format!(
+        "tmux -L {sock} list-panes -a -F \
+'#{{session_name}}|#{{pane_pid}}' 2>/dev/null \
+| while IFS='|' read -r session root; do \
+pids=\"$root\"; frontier=\"$root\"; \
+for depth in 1 2 3 4; do next=\"\"; \
+for parent in $frontier; do kids=$(pgrep -P \"$parent\" 2>/dev/null); \
+next=\"$next $kids\"; done; pids=\"$pids $next\"; frontier=\"$next\"; done; \
+for pid in $pids; do for fd in /proc/$pid/fd/*; do \
+target=$(readlink \"$fd\" 2>/dev/null) || continue; \
+case \"$target\" in */.codex/sessions/*/rollout-*.jsonl) \
+printf '%s|%s\\n' \"$session\" \"$target\";; esac; done; done; done \
+| sort -u",
+        sock = socket()
+    );
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "active-codex-rollouts",
+                code: None,
+                message: format!("failed to inspect Codex runtime identity: {e}"),
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_no_server(&stderr) || stderr.contains("error connecting to") {
+            return Ok(Vec::new());
+        }
+        return Err(TmuxError {
+            op: "active-codex-rollouts",
+            code: output.status.code(),
+            message: stderr.trim().to_string(),
+        });
+    }
+    let mut rollouts = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((session, path)) = line.split_once('|') else {
+            continue;
+        };
+        let terminal_id = session.trim().strip_prefix("th_").unwrap_or(session.trim());
+        if !terminal_id.is_empty() && !path.trim().is_empty() {
+            rollouts.push(ActiveCodexRollout {
+                terminal_id: terminal_id.to_string(),
+                path: path.trim().to_string(),
+            });
+        }
+    }
+    Ok(rollouts)
+}
+
 /// List every pane's `session_name|pane_current_command|pane_current_path`.
 ///
 /// Unlike [`list_sessions`], this needs a tmux FORMAT (`#{...}`). A bare

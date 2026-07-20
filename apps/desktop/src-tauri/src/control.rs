@@ -3205,6 +3205,9 @@ type MetricsFn = Arc<dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + S
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
+    /// Provider-neutral conversation catalog. One cache is shared across every
+    /// control connection so History scans never become per-request WSL churn.
+    history: Arc<crate::history::HistoryService>,
     /// A snapshot accessor over the supervision reducer. Boxed closure so this
     /// module does not need to name the `AgentBridge` internals; the closure
     /// borrows the shared `Mutex<Supervisor>` inside the bridge.
@@ -5738,6 +5741,8 @@ fn dispatch_with_caller(
         "wsl_health" => wsl_health(ctx),
         "recent_sessions" => recent_sessions(),
         "invalidate_recent_cache" => invalidate_recent_cache(),
+        "history_list" => history_list(ctx, args),
+        "invalidate_history_cache" => invalidate_history_cache(ctx),
         // "Is the general dictating?" - reads the Scribe voice-gate status file
         // (fails open to listening=false when it can't tell). Lets agents defer
         // a spoken cue / a barge-in while the user is talking.
@@ -6218,6 +6223,249 @@ fn scribe_status() -> Result<Value, String> {
 fn invalidate_recent_cache() -> Result<Value, String> {
     crate::recent::invalidate_recent_cache();
     Ok(Value::Bool(true))
+}
+
+/// `history_list` (read tier): provider-neutral, exact-identity conversation
+/// catalog. Provider transcripts remain read-only evidence; durable registry
+/// metadata joins only on Harness plus an exact native conversation identity.
+fn history_list(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let filter = if args.is_null() {
+        crate::history::HistoryFilter::default()
+    } else {
+        serde_json::from_value::<crate::history::HistoryFilter>(args.clone())
+            .map_err(|error| format!("history_invalid_filter: {error}"))?
+    };
+    let associations = history_associations(ctx);
+    let list = ctx.history.list(&filter, &associations)?;
+    serde_json::to_value(list).map_err(|error| error.to_string())
+}
+
+/// Drop only T-Hub's in-memory History scan cache. Provider transcripts and
+/// registry records are never changed.
+fn invalidate_history_cache(ctx: &ControlContext) -> Result<Value, String> {
+    ctx.history.invalidate();
+    Ok(Value::Bool(true))
+}
+
+fn history_harness(
+    provider: Option<&str>,
+    harness: Option<&str>,
+    claude_uuid: Option<&str>,
+) -> Option<crate::history::Harness> {
+    match provider.or(harness).map(str::trim) {
+        Some("claude") => Some(crate::history::Harness::Claude),
+        Some("codex") => Some(crate::history::Harness::Codex),
+        Some(_) => None,
+        None if claude_uuid.is_some() => Some(crate::history::Harness::Claude),
+        None => None,
+    }
+}
+
+fn history_identity_values(
+    harness: crate::history::Harness,
+    provider_session_id: Option<&str>,
+    conversation_id: Option<&str>,
+    claude_uuid: Option<&str>,
+) -> Vec<String> {
+    let mut identities = std::collections::BTreeSet::new();
+    for value in [provider_session_id, conversation_id] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            identities.insert(value.to_string());
+        }
+    }
+    if harness == crate::history::Harness::Claude {
+        if let Some(value) = claude_uuid.map(str::trim).filter(|value| !value.is_empty()) {
+            identities.insert(value.to_string());
+        }
+    }
+    identities.into_iter().collect()
+}
+
+fn history_registry_liveness(
+    expected_active: bool,
+    terminal_id: Option<&str>,
+    live_sessions: &Result<std::collections::HashSet<String>, String>,
+) -> crate::history::AssociationLiveness {
+    if !expected_active || terminal_id.is_none() {
+        return crate::history::AssociationLiveness::Inactive;
+    }
+    match live_sessions {
+        Ok(live) => {
+            if live.contains(&tmux_target(terminal_id.expect("checked above"))) {
+                crate::history::AssociationLiveness::Active
+            } else {
+                crate::history::AssociationLiveness::Inactive
+            }
+        }
+        Err(_) => crate::history::AssociationLiveness::Unknown,
+    }
+}
+
+/// Build exact active and durable joins without using cwd as identity.
+///
+/// Registry associations contribute organizational metadata. Runtime evidence
+/// covers ordinary non-Crew tiles: Claude's status bridge provides the exact UUID,
+/// while Codex exposes its exact open rollout through one bounded process scan.
+fn history_associations(ctx: &ControlContext) -> Vec<crate::history::HistoryAssociation> {
+    let live_sessions = tmux::list_sessions()
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .map_err(|error| error.to_string());
+    let snapshot = ctx.captains.snapshot();
+    let project_names = snapshot
+        .projects
+        .iter()
+        .map(|project| (project.project_id.as_str(), project.name.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut associations = Vec::new();
+    for captain in &snapshot.captains {
+        let harness = history_harness(
+            captain.provider.as_deref(),
+            captain.harness.as_deref(),
+            captain.claude_uuid.as_deref(),
+        );
+        if let Some(harness) = harness {
+            let liveness = history_registry_liveness(
+                matches!(captain.state, ClaimState::Active),
+                captain.terminal_id.as_deref(),
+                &live_sessions,
+            );
+            for conversation_id in history_identity_values(
+                harness,
+                captain.provider_session_id.as_deref(),
+                captain.conversation_id.as_deref(),
+                captain.claude_uuid.as_deref(),
+            ) {
+                associations.push(crate::history::HistoryAssociation {
+                    harness,
+                    conversation_id,
+                    terminal_id: captain.terminal_id.clone(),
+                    liveness,
+                    project_id: captain.project_id.clone(),
+                    project_name: captain
+                        .project_id
+                        .as_deref()
+                        .and_then(|id| project_names.get(id).copied())
+                        .map(str::to_string),
+                    captain_id: Some(captain.ship_slug.clone()),
+                    role: Some(captain.role.label().to_string()),
+                    workspace_id: (captain.workspace_tab_ids.len() == 1)
+                        .then(|| captain.workspace_tab_ids[0].clone()),
+                    worktree_id: None,
+                    branch: None,
+                });
+            }
+        }
+        for crew in &captain.crew {
+            let Some(harness) = history_harness(
+                crew.provider.as_deref(),
+                crew.harness.as_deref(),
+                crew.claude_uuid.as_deref(),
+            ) else {
+                continue;
+            };
+            let liveness = history_registry_liveness(
+                matches!(crew.state, CrewState::Active),
+                Some(&crew.terminal_id),
+                &live_sessions,
+            );
+            for conversation_id in history_identity_values(
+                harness,
+                crew.provider_session_id.as_deref(),
+                crew.conversation_id.as_deref(),
+                crew.claude_uuid.as_deref(),
+            ) {
+                associations.push(crate::history::HistoryAssociation {
+                    harness,
+                    conversation_id,
+                    terminal_id: Some(crew.terminal_id.clone()),
+                    liveness,
+                    project_id: captain.project_id.clone(),
+                    project_name: captain
+                        .project_id
+                        .as_deref()
+                        .and_then(|id| project_names.get(id).copied())
+                        .map(str::to_string),
+                    captain_id: Some(captain.ship_slug.clone()),
+                    role: Some("crew".to_string()),
+                    workspace_id: None,
+                    worktree_id: None,
+                    branch: crew.branch.clone(),
+                });
+            }
+        }
+    }
+
+    let mut runtime = Vec::<(crate::history::Harness, String, String)>::new();
+    if let Ok(live) = &live_sessions {
+        for status in ctx.status.all() {
+            let Some(tmux_session) = status.tmux_session.as_deref() else {
+                continue;
+            };
+            if live.contains(tmux_session) {
+                runtime.push((
+                    crate::history::Harness::Claude,
+                    status.session_id,
+                    tmux_session
+                        .strip_prefix("th_")
+                        .unwrap_or(tmux_session)
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if let Ok(rollouts) = tmux::active_codex_rollouts() {
+        for rollout in rollouts
+            .into_iter()
+            .take(crate::history::HISTORY_ENTRY_LIMIT)
+        {
+            if let Ok(conversation_id) =
+                crate::history::codex_conversation_id_from_path(std::path::Path::new(&rollout.path))
+            {
+                runtime.push((
+                    crate::history::Harness::Codex,
+                    conversation_id,
+                    rollout.terminal_id,
+                ));
+            }
+        }
+    }
+    runtime.sort();
+    runtime.dedup();
+    for (harness, conversation_id, terminal_id) in runtime {
+        let exact_runtime_already_joined = associations.iter().any(|association| {
+            association.harness == harness
+                && association.conversation_id == conversation_id
+                && association.terminal_id.as_deref() == Some(terminal_id.as_str())
+        });
+        if exact_runtime_already_joined {
+            continue;
+        }
+        associations.push(crate::history::HistoryAssociation {
+            harness,
+            conversation_id,
+            terminal_id: Some(terminal_id),
+            liveness: crate::history::AssociationLiveness::Active,
+            project_id: None,
+            project_name: None,
+            captain_id: None,
+            role: None,
+            workspace_id: None,
+            worktree_id: None,
+            branch: None,
+        });
+    }
+    associations.sort_by(|left, right| {
+        left.harness
+            .cmp(&right.harness)
+            .then_with(|| left.conversation_id.cmp(&right.conversation_id))
+            .then_with(|| left.terminal_id.cmp(&right.terminal_id))
+    });
+    associations.dedup();
+    associations
 }
 
 /// `archive_recent_project`: the Recent list's × made durable. Moves the project
@@ -10696,6 +10944,9 @@ fn close_terminal_with_policy(
     // retired too, so its secret stops resolving and the identity store does not
     // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
     ctx.identity.retire_tile(tile_id)?;
+    // The provider transcript remains intact and is now resumable. Force the next
+    // History read to observe any final transcript write immediately.
+    ctx.history.invalidate();
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -10855,6 +11106,7 @@ impl ControlContext {
     ) -> Self {
         Self {
             status,
+            history: crate::history::HistoryService::from_env(),
             supervisor,
             files: Arc::new(files::FileIndexState::new()),
             apply_sink: None,
@@ -10931,6 +11183,13 @@ impl ControlContext {
     /// [`new`](Self::new).
     pub fn with_captains_registry(mut self, captains: Arc<CaptainsRegistry>) -> Self {
         self.captains = captains;
+        self
+    }
+
+    /// Replace the History service. Tests use isolated provider roots; production
+    /// keeps the provider-home service created by [`new`](Self::new).
+    pub fn with_history_service(mut self, history: Arc<crate::history::HistoryService>) -> Self {
+        self.history = history;
         self
     }
 
@@ -16543,12 +16802,66 @@ mod tests {
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("list_terminals"), CommandTier::Read);
         assert_eq!(required_tier("get_status"), CommandTier::Read);
+        assert_eq!(required_tier("history_list"), CommandTier::Read);
+        assert_eq!(required_tier("invalidate_history_cache"), CommandTier::Read);
         // Comms-plane Phase 2 (review H1): `inbox_ack` mutates + compacts durable
         // receipt state, so it must require the control token (Organization) and be
         // audited - NOT fall through to the read tier. `inbox_status` is counts-only
         // and stays Read.
         assert_eq!(required_tier("inbox_ack"), CommandTier::Organization);
         assert_eq!(required_tier("inbox_status"), CommandTier::Read);
+    }
+
+    #[test]
+    fn history_list_control_contract_discovers_codex_without_hiding_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join(".claude/projects/repo");
+        let codex_root = temp.path().join(".codex/sessions/2026/07/20");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::write(
+            claude_root.join("claude-control.jsonl"),
+            r#"{"type":"user","cwd":"/same","message":{"content":"Claude control"}}"#,
+        )
+        .unwrap();
+        let codex_id = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            codex_root.join(format!(
+                "rollout-2026-07-20T10-00-00-{codex_id}.jsonl"
+            )),
+            format!(
+                "{}\n{}",
+                json!({"type":"session_meta","payload":{"id":codex_id,"cwd":"/same","model_provider":"openai"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Codex control"}})
+            ),
+        )
+        .unwrap();
+        let history = Arc::new(crate::history::HistoryService::new(
+            temp.path().join(".claude/projects"),
+            temp.path().join(".codex/sessions"),
+            std::time::Duration::from_secs(60),
+        ));
+        let ctx = test_ctx("history-list").with_history_service(history);
+
+        let value = dispatch(&ctx, "history_list", &json!({"limit": 10})).unwrap();
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+        assert!(value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["harness"] == "codex" && entry["conversationId"] == codex_id));
+        assert!(value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["harness"] == "claude" && entry["conversationId"] == "claude-control"
+            ));
+        assert_eq!(value["sources"].as_array().unwrap().len(), 2);
     }
 
     #[test]
