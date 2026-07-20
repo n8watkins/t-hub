@@ -374,47 +374,6 @@ fn schema_register_project() -> Value {
     })
 }
 
-#[allow(dead_code)]
-fn schema_bind_project_powder() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "projectId": { "type": "string", "description": "Durable T-Hub project id from list_projects." },
-            "repository": { "type": "string", "description": "Canonical Powder repository name." },
-            "connectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
-        },
-        "required": ["projectId", "repository"],
-        "additionalProperties": false
-    })
-}
-
-#[allow(dead_code)]
-fn schema_list_powder_boards() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "connectionProfile": { "type": "string", "minLength": 1, "description": "Protected Powder endpoint profile name; defaults to 'default'." },
-            "offset": { "type": "integer", "minimum": 0, "description": "Zero-based result offset; defaults to 0." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum boards to return; defaults to 100." }
-        },
-        "additionalProperties": false
-    })
-}
-
-#[allow(dead_code)]
-fn schema_project_board_snapshot() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "terminalId": { "type": "string", "minLength": 1, "description": "Focused T-Hub terminal id. Durable Captain or Crew ownership wins over cwd." },
-            "cwd": { "type": "string", "description": "Optional fallback WSL cwd for an ordinary terminal; T-Hub resolves its canonical Git main worktree." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum repository-scoped cards to return; defaults to 1000." }
-        },
-        "required": ["terminalId"],
-        "additionalProperties": false
-    })
-}
-
 fn schema_captain_bootstrap() -> Value {
     json!({
         "type": "object",
@@ -532,44 +491,6 @@ fn schema_attach_captain() -> Value {
             "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Existing project Work Workspace ids this Captain owns. No current-tab inference occurs." }
         },
         "required": ["captainSessionId", "projectId", "assignment"],
-        "additionalProperties": false
-    })
-}
-
-#[allow(dead_code)]
-fn schema_powder_status() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "projectId": { "type": "string", "description": "Registered Project id." }
-        },
-        "required": ["projectId"],
-        "additionalProperties": false
-    })
-}
-
-#[allow(dead_code)]
-fn schema_dispatch_crew() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
-            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
-            "cardId": { "type": "string", "description": "Ready Powder card to claim before starting work." },
-            "task": { "type": "string", "description": "Bounded Crew assignment for this card." },
-            "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Crew harness. Defaults to the Captain harness." },
-            "worktreePath": { "type": "string", "description": "Existing Git worktree of the Captain project. Defaults to the main worktree." },
-            "branch": { "type": "string", "description": "Branch recorded in the durable Crew manifest." },
-            "ttlSeconds": { "type": "integer", "minimum": 300, "maximum": 86400, "description": "Initial Powder claim TTL. Defaults to 3600." },
-            "workspaceTabId": { "type": "string", "description": "Exact existing Work Workspace owned by this Captain. Omit only when exactly one owned candidate exists." },
-            "tabId": { "type": "string", "description": "Compatibility alias for workspaceTabId." },
-            "tabName": { "type": "string", "description": "Compatibility selector for one uniquely named existing Work Workspace owned by this Captain. It never creates a Workspace." }
-        },
-        "required": ["cardId", "task"],
-        "anyOf": [
-            { "required": ["captainSessionId"] },
-            { "required": ["shipSlug"] }
-        ],
         "additionalProperties": false
     })
 }
