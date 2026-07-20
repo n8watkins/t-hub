@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 17,
+  "seq": 108,
+  "captains": [
+    {
+      "shipSlug": "aurora",
+      "assignmentId": "assignment:project-aurora:aurora",
+      "displayName": "Aurora",
+      "role": "captain",
+      "provider": "codex",
+      "providerSessionId": "00000000-0000-7000-8000-000000000017",
+      "terminalId": "tile-aurora-captain",
+      "projectId": "project-aurora",
+      "assignment": "Coordinate the Aurora implementation",
+      "harness": "codex",
+      "conversationId": "conversation-aurora-17",
+      "resumePoint": "checkpoint-aurora-17",
+      "workspaceTabIds": ["workspace-aurora"],
+      "crew": [
+        {
+          "terminalId": "tile-aurora-worker",
+          "provider": "codex",
+          "providerSessionId": "00000000-0000-7000-8000-000000000018",
+          "conversationId": "conversation-aurora-worker-17",
+          "resumePoint": "worker-checkpoint-17",
+          "task": "Review the schema fixture contract",
+          "harness": "codex",
+          "workspaceTabId": "workspace-aurora",
+          "state": { "kind": "active" }
+        }
+      ],
+      "state": { "kind": "active" }
+    }
+  ],
+  "agentSessions": [
+    {
+      "agentSessionId": "agent-aurora-17",
+      "captainSessionId": "tile-aurora-captain",
+      "projectId": "project-aurora",
+      "assignment": "Review the schema fixture contract",
+      "directory": "/sanitized/workspaces/aurora",
+      "worktreePath": "/sanitized/worktrees/aurora-worker",
+      "branch": "migration/registry-fixtures",
+      "workspaceTabId": "workspace-aurora",
+      "harness": "codex",
+      "provider": "codex",
+      "providerConversationId": "conversation-agent-aurora-17",
+      "resumePoint": "agent-checkpoint-17",
+      "runtimeState": "idle",
+      "workStage": "working",
+      "createdAt": 1700000010000,
+      "updatedAt": 1700000015000
+    }
+  ],
+  "agentCheckpoints": [
+    {
+      "cursor": 7,
+      "agentSessionId": "agent-aurora-17",
+      "authorSessionId": "tile-aurora-captain",
+      "summary": "Fixture load completed before any external coordination.",
+      "createdAt": 1700000015000
+    }
+  ],
+  "agentEvents": [
+    {
+      "cursor": 7,
+      "agentSessionId": "agent-aurora-17",
+      "kind": "checkpoint",
+      "createdAt": 1700000015000,
+      "checkpoint": {
+        "cursor": 7,
+        "agentSessionId": "agent-aurora-17",
+        "authorSessionId": "tile-aurora-captain",
+        "summary": "Fixture load completed before any external coordination.",
+        "createdAt": 1700000015000
+      }
+    }
+  ],
+  "projects": [
+    {
+      "projectId": "project-aurora",
+      "name": "Aurora",
+      "repoRoot": "/sanitized/workspaces/aurora",
+      "remoteUrl": "https://example.invalid/aurora.git",
+      "defaultBranch": "main",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000015000
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "captains-reserved",
+      "name": "Captain Workspace",
+      "kind": "captain",
+      "tileIds": ["tile-aurora-captain"]
+    },
+    {
+      "id": "workspace-aurora",
+      "name": "Aurora Work",
+      "kind": "work",
+      "owner": {
+        "projectId": "project-aurora",
+        "assignmentId": "assignment:project-aurora:aurora",
+        "shipSlug": "aurora"
+      },
+      "tileIds": ["tile-aurora-worker"]
+    }
+  ],
+  "pendingFleetOperations": [],
+  "retiredFleetTileIds": [],
+  "pendingDispatchClaims": [],
+  "pendingDispatchReleases": []
+}

@@ -39,14 +39,23 @@ beforeEach(() => {
   useCaptain.setState({
     captainIds: ["cap00001"],
     activeCaptainId: "cap00001",
-    claims: {},
+    claims: {
+      cap00001: {
+        terminalId: "cap00001",
+        shipSlug: "appturnity",
+        assignmentId: "assignment:project:appturnity",
+        displayName: "monorepo-app",
+        workspaceTabIds: ["t1"],
+        crew: [],
+      },
+    },
     open: false,
     anchorMenuOpen: false,
   });
 });
 
 describe("CommandPalette Summon captain identity", () => {
-  it("uses the STABLE identity (cwd basename), never the tab name or Claude title", () => {
+  it("uses durable Captain identity, never the tab name or Claude title", () => {
     // cap00001 has a junk Claude title and no rename, and its tab "Backend" is
     // a grouping - the entry must read the cwd basename "monorepo-app", not the
     // tab name and not "task notification".
@@ -62,9 +71,17 @@ describe("CommandPalette Summon captain identity", () => {
     expect(document.body.textContent).not.toContain("task notification");
   });
 
-  it("prefers the user rename over the cwd basename", () => {
+  it("uses the durable renamed display name", () => {
     act(() => {
-      useWorkspace.getState().setTerminalLabel("cap00001", "Flagship");
+      useCaptain.setState({
+        claims: {
+          ...useCaptain.getState().claims,
+          cap00001: {
+            ...useCaptain.getState().claims.cap00001,
+            displayName: "Flagship",
+          },
+        },
+      });
       useWorkspace.getState().setClaudeTitle("cap00001", "task notification");
     });
     act(() => openKeyboardPalette());

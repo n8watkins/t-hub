@@ -59,41 +59,16 @@ function clampGeometry(
   return { x, y, width, height };
 }
 
-/** The last non-empty segment of a cwd (tolerant of either separator + trailing
- *  slashes) - the folder/worktree the session lives in. */
-function cwdBasename(cwd: string | undefined): string {
-  if (!cwd) return "";
-  const parts = cwd
-    .replace(/[/\\]+$/, "")
-    .split(/[/\\]+/)
-    .filter(Boolean);
-  return parts[parts.length - 1] ?? "";
-}
-
-/** The STABLE captain identity, derivation order: the user's RENAME first, then
- *  the cwd basename (the folder/worktree the session lives in), then the
- *  WORKSPACE TAB name, then the short id. cwd beats the tab name because a tab
- *  is a GROUPING, not a per-captain identity: several unrelated captains can
- *  share one tab (e.g. an "appturnity" tab holding an appturnity session, the
- *  orchestrator, and the t-hub captain), and preferring the tab name collapsed
- *  them all to "appturnity". Their cwds are distinct, so cwd-first keeps them
- *  apart (orchestrator, t-hub-app, monorepo-app, appturnity). It DELIBERATELY
- *  never uses the volatile Claude-suggested session title (which shows junk like
- *  "task notification") - identity must be stable across turns. Pure function so
- *  callers pass already-subscribed values (the sidebar rows) or use the hook
- *  below (the overlay + deck). */
+/** Resolve one user-facing Captain name from durable registry identity only. */
 export function stableCaptainIdentity(
-  userLabel: string | undefined,
-  workspaceName: string | undefined,
-  cwd: string | undefined,
+  displayName: string | undefined,
+  shipSlug: string | undefined,
   terminalId: string,
 ): string {
-  const named = (userLabel ?? "").trim();
+  const named = (displayName ?? "").trim();
   if (named) return named;
-  const base = cwdBasename(cwd);
-  if (base) return base;
-  const ws = (workspaceName ?? "").trim();
-  if (ws) return ws;
+  const slug = (shipSlug ?? "").trim();
+  if (slug) return slug;
   return terminalId.slice(0, 8);
 }
 
@@ -104,10 +79,8 @@ export function stableCaptainIdentity(
  *  titlebar dropdown, the deck tiles, and the palette so a captain reads
  *  identically everywhere. */
 export function useCaptainDisplayLabel(terminalId: string): string {
-  const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
-  const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
-  const workspaceName = useWorkspaceNameForTerminal(terminalId);
-  return stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
+  const claim = useCaptain((s) => s.claims[terminalId]);
+  return stableCaptainIdentity(claim?.displayName, claim?.shipSlug, terminalId);
 }
 
 /** The NAME of the workspace tab holding `terminalId`'s tile, or undefined

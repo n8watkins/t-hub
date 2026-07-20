@@ -1,12 +1,9 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ShipWheel, X } from "lucide-react";
 import {
-  bindProjectPowder,
   commissionCaptain,
-  listPowderBoards,
   listProjects,
   registerProject,
-  type PowderBoard,
   type RegisteredProject,
 } from "../ipc/projects";
 import {
@@ -32,10 +29,6 @@ export function CaptainCommissionDialog({
 }: CaptainCommissionDialogProps) {
   const [mode, setMode] = useState<ProjectMode>("saved");
   const [projects, setProjects] = useState<RegisteredProject[]>([]);
-  const [powderProfiles, setPowderProfiles] = useState<string[]>([]);
-  const [powderProfilesError, setPowderProfilesError] = useState<string | null>(
-    null,
-  );
   const [wslHome, setWslHome] = useState("");
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
   const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
@@ -46,12 +39,6 @@ export function CaptainCommissionDialog({
   const [projectName, setProjectName] = useState("");
   const [newParent, setNewParent] = useState("");
   const [newName, setNewName] = useState("");
-  const [powderRepository, setPowderRepository] = useState("");
-  const [connectionProfile, setConnectionProfile] = useState("");
-  const [powderBoards, setPowderBoards] = useState<PowderBoard[]>([]);
-  const [powderBoardsLoading, setPowderBoardsLoading] = useState(false);
-  const [powderBoardsError, setPowderBoardsError] = useState<string | null>(null);
-  const [powderBoardsRetry, setPowderBoardsRetry] = useState(0);
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -65,8 +52,6 @@ export function CaptainCommissionDialog({
       .then((catalog) => {
         if (cancelled) return;
         setProjects(catalog.projects);
-        setPowderProfiles(catalog.powderProfiles ?? []);
-        setPowderProfilesError(catalog.powderProfilesError ?? null);
         setWslHome(catalog.wslHome ?? "");
         setWslHomeError(catalog.wslHomeError ?? null);
         setNewParent((current) => current || catalog.wslHome || "/home");
@@ -74,15 +59,6 @@ export function CaptainCommissionDialog({
         setProjectId((current) => current || first?.projectId || "");
         setRepoRoot((current) => current || catalog.wslHome || first?.repoRoot || "/home");
         if (catalog.projects.length === 0) setMode("existing");
-        if (catalog.powderProfiles?.length === 1) {
-          setConnectionProfile(catalog.powderProfiles[0]);
-        } else if ((catalog.powderProfiles?.length ?? 0) > 1) {
-          setConnectionProfile((current) =>
-            catalog.powderProfiles?.includes(current) ? current : "",
-          );
-        } else if (!catalog.powderProfilesError) {
-          setConnectionProfile((current) => current || "default");
-        }
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
@@ -96,57 +72,6 @@ export function CaptainCommissionDialog({
     () => projects.find((project) => project.projectId === projectId),
     [projectId, projects],
   );
-
-  useEffect(() => {
-    if (mode !== "saved" || !selected) return;
-    setPowderRepository(selected.powder?.repository ?? "");
-    setConnectionProfile(selected.powder?.connectionProfile ?? "default");
-  }, [mode, selected]);
-
-  useEffect(() => {
-    if (!open) return;
-    const profile = connectionProfile.trim();
-    if (!profile) {
-      setPowderBoards([]);
-      setPowderBoardsLoading(false);
-      setPowderBoardsError(null);
-      return;
-    }
-    let cancelled = false;
-    setPowderBoards([]);
-    setPowderBoardsLoading(true);
-    setPowderBoardsError(null);
-    void loadAllPowderBoards(profile)
-      .then((boards) => {
-        if (!cancelled) setPowderBoards(boards);
-      })
-      .catch((cause) => {
-        if (!cancelled) {
-          setPowderBoardsError(cause instanceof Error ? cause.message : String(cause));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setPowderBoardsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [connectionProfile, open, powderBoardsRetry]);
-
-  useEffect(() => {
-    if (powderBoardsLoading || powderBoardsError) return;
-    const savedBinding =
-      mode === "saved" &&
-      selected?.powder?.connectionProfile === connectionProfile
-        ? selected.powder.repository
-        : "";
-    setPowderRepository((current) => {
-      if (powderBoards.some((board) => board.name === current)) return current;
-      if (savedBinding) return savedBinding;
-      if (powderBoards.length === 1) return powderBoards[0].name;
-      return "";
-    });
-  }, [connectionProfile, mode, powderBoards, powderBoardsError, powderBoardsLoading, selected]);
 
   useEffect(() => {
     if (mode !== "existing" || !repoRoot) return;
@@ -174,14 +99,6 @@ export function CaptainCommissionDialog({
   const submit = async () => {
     if (!assignment.trim()) {
       setError("Assignment is required.");
-      return;
-    }
-    if (!powderRepository.trim()) {
-      setError("Powder board is required.");
-      return;
-    }
-    if (!connectionProfile.trim()) {
-      setError("Select a Powder connection profile under Advanced.");
       return;
     }
     if (mode === "existing") {
@@ -214,8 +131,6 @@ export function CaptainCommissionDialog({
           repoRoot: repoRoot.trim(),
           name: projectName.trim() || undefined,
           ...(folderGit.isRepo ? {} : { initializeGit: true }),
-          powderRepository: powderRepository.trim(),
-          powderConnectionProfile: connectionProfile.trim() || "default",
         });
       } else if (mode === "new") {
         project = await registerProject({
@@ -223,23 +138,10 @@ export function CaptainCommissionDialog({
           name: newName.trim(),
           createDirectory: true,
           initializeGit: true,
-          powderRepository: powderRepository.trim(),
-          powderConnectionProfile: connectionProfile.trim() || "default",
         });
       } else {
         if (!selected) throw new Error("Select a saved codebase.");
         project = selected;
-        if (
-          !selected.powder ||
-          selected.powder.repository !== powderRepository.trim() ||
-          selected.powder.connectionProfile !== connectionProfile.trim()
-        ) {
-          project = await bindProjectPowder({
-            projectId: selected.projectId,
-            repository: powderRepository.trim(),
-            connectionProfile: connectionProfile.trim() || "default",
-          });
-        }
       }
       await commissionCaptain({
         projectId: project.projectId,
@@ -316,7 +218,6 @@ export function CaptainCommissionDialog({
                 }}
                 onClick={() => {
                   setMode(value);
-                  if (value !== "saved") setPowderRepository("");
                   setError(null);
                 }}
               >
@@ -434,97 +335,6 @@ export function CaptainCommissionDialog({
             </label>
           )}
 
-          <Field label="Powder board">
-            <select
-              aria-label="Powder board"
-              value={powderRepository}
-              onChange={(event) => setPowderRepository(event.target.value)}
-              className={inputClass}
-              style={fieldStyle}
-              disabled={powderBoardsLoading || !!powderBoardsError || !connectionProfile.trim()}
-            >
-              {powderBoardsLoading ? (
-                <option value="">Loading Powder boards...</option>
-              ) : powderBoardsError ? (
-                <option value="">Powder boards unavailable</option>
-              ) : powderBoards.length === 0 && !powderRepository ? (
-                <option value="">No Powder boards found for this profile</option>
-              ) : (
-                <>
-                  {powderBoards.length !== 1 && <option value="">Select Powder board</option>}
-                  {mode === "saved" &&
-                    powderRepository &&
-                    !powderBoards.some((board) => board.name === powderRepository) && (
-                      <option value={powderRepository}>
-                        {powderRepository} (current binding)
-                      </option>
-                    )}
-                  {powderBoards.map((board) => (
-                    <option key={board.name} value={board.name}>
-                      {board.name} ({board.tier}, {board.cardCount} cards)
-                    </option>
-                  ))}
-                </>
-              )}
-            </select>
-            {powderBoardsError && (
-              <div role="alert" className="mt-1 flex items-center justify-between gap-2 text-xs text-amber-300">
-                <span>Could not load Powder boards: {powderBoardsError}</span>
-                <button
-                  type="button"
-                  className="rounded border px-2 py-1"
-                  style={{ borderColor: "var(--th-border)" }}
-                  onClick={() => setPowderBoardsRetry((value) => value + 1)}
-                >
-                  Retry
-                </button>
-              </div>
-            )}
-          </Field>
-
-          <details
-            className="rounded border px-3 py-2"
-            style={{ borderColor: "var(--th-border)" }}
-          >
-            <summary
-              className="cursor-pointer text-xs font-medium"
-              style={{ color: "var(--th-fg-muted)" }}
-            >
-              Advanced
-            </summary>
-            <div className="mt-3 space-y-2">
-              <Field label="Powder connection profile">
-                {powderProfiles.length > 0 ? (
-                  <select
-                    aria-label="Powder connection profile"
-                    value={connectionProfile}
-                    onChange={(event) => setConnectionProfile(event.target.value)}
-                    className={inputClass}
-                    style={fieldStyle}
-                  >
-                    {!connectionProfile && <option value="">Select profile</option>}
-                    {powderProfiles.map((profile) => (
-                      <option key={profile} value={profile}>
-                        {profile}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    aria-label="Powder connection profile"
-                    value={connectionProfile}
-                    onChange={(event) => setConnectionProfile(event.target.value)}
-                    className={inputClass}
-                    style={fieldStyle}
-                  />
-                )}
-              </Field>
-              {powderProfilesError && (
-                <p className="text-xs text-amber-300">{powderProfilesError}</p>
-              )}
-            </div>
-          </details>
-
           <Field label="Assignment">
             <textarea
               aria-label="Assignment"
@@ -565,8 +375,6 @@ export function CaptainCommissionDialog({
             mode={mode}
             selected={selected}
             repoRoot={repoRoot}
-            powderRepository={powderRepository}
-            connectionProfile={connectionProfile}
             assignment={assignment}
             harness={harness}
             folderGit={folderGit}
@@ -598,7 +406,7 @@ export function CaptainCommissionDialog({
               color: "var(--th-accent-fg, var(--th-fg))",
             }}
             onClick={() => void submit()}
-            disabled={busy || powderBoardsLoading || !!powderBoardsError || !powderRepository.trim()}
+            disabled={busy}
           >
             {busy ? "Creating..." : "Create Captain"}
           </button>
@@ -606,23 +414,6 @@ export function CaptainCommissionDialog({
       </div>
     </div>
   );
-}
-
-async function loadAllPowderBoards(connectionProfile: string): Promise<PowderBoard[]> {
-  const boards: PowderBoard[] = [];
-  let offset = 0;
-  for (;;) {
-    const page = await listPowderBoards({ connectionProfile, offset, limit: 500 });
-    if (page.connectionProfile !== connectionProfile) {
-      throw new Error("Powder returned boards for a different connection profile.");
-    }
-    boards.push(...page.boards);
-    if (!page.hasMore) return boards;
-    if (page.nextOffset === undefined || page.nextOffset <= offset) {
-      throw new Error("Powder board pagination did not advance.");
-    }
-    offset = page.nextOffset;
-  }
 }
 
 function previewNewCodebaseDestination(parent: string, name: string): string {
@@ -648,8 +439,6 @@ function ReviewSummary({
   mode,
   selected,
   repoRoot,
-  powderRepository,
-  connectionProfile,
   assignment,
   harness,
   folderGit,
@@ -661,8 +450,6 @@ function ReviewSummary({
   mode: ProjectMode;
   selected?: RegisteredProject;
   repoRoot: string;
-  powderRepository: string;
-  connectionProfile: string;
   assignment: string;
   harness: "codex" | "claude";
   folderGit: GitInfo | null;
@@ -736,16 +523,9 @@ function ReviewSummary({
           <>
             <ReviewRow label="Git" value="Initialize with main as the default branch" />
             <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
-            <ReviewRow
-              label="External effects"
-              value="Use an existing Powder board; no remote or board will be created"
-            />
+            <ReviewRow label="External effects" value="No remote service calls" />
           </>
         )}
-        <ReviewRow
-          label="Powder"
-          value={`${powderRepository.trim() || "Not selected"} via ${connectionProfile.trim() || "Not selected"}`}
-        />
         <ReviewRow label="Assignment" value={assignment.trim() || "Required"} />
         <ReviewRow label="Harness" value={harness === "codex" ? "Codex" : "Claude"} />
         <ReviewRow label="Permissions" value="Unrestricted" />

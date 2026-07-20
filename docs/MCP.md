@@ -1,8 +1,9 @@
 # T-Hub MCP server
 
-The local **MCP server** lets Claude drive T-Hub — list terminals, read
-session status + the supervision tree, check WSL health, search files, and
-perform safe organization actions — within the PRD §11.2 permission tiers
+The local **MCP server** lets an agent drive T-Hub - list terminals, read
+session status and the supervision tree, check WSL health, search files,
+register Projects, start agent sessions, record checkpoints, and perform safe
+organization actions - within the PRD §11.2 permission tiers
 (PRD §9.6, §13 "1.5 — Automation and preview").
 
 This document covers the architecture, the control-channel contract, the tool
@@ -149,7 +150,7 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; optional `spawnedBy` records the worktree terminal as a captain's crew |
 | `remove_worktree` | Organization | temporarily unavailable | source `0.3.88` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
 | `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all; optional `spawnedBy` records the session as a captain's crew |
-| `commission_captain` | **Process-changing** | **confirmation required** | starts a new control-capability Codex or Claude Captain and binds it to a registered, Powder-verified project |
+| `commission_captain` | **Process-changing** | **confirmation required** | starts a new control-capability Codex or Claude Captain and binds it to a registered Project |
 | `attach_captain` | **Process-changing** | **confirmation required** | attaches an existing live harness only when it already holds the current control capability; read-only terminals are refused without changing their token |
 | `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
 | `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
@@ -228,13 +229,33 @@ It is the ONE source of truth the UI and MCP both read; ship files remain the ca
 The contract mirrors the tab registry, with one difference (it is **persistent**):
 
 - **Overlay pinning is visual only.** A pin changes the local summon overlay without claiming authority, changing capability, or moving the terminal.
-- **Commissioning and attachment create authority explicitly.** `commission_captain` starts a new control-capability harness, while `attach_captain` accepts only an existing harness that already holds the current control token. Both require a registered project and a successful protected Powder preflight.
+- **Commissioning and attachment create authority explicitly.** `commission_captain` starts a new control-capability harness, while `attach_captain` accepts only an existing harness that already holds the current control token. Both require a registered Project; neither requires Powder.
 - **Claims remain registry-first.** `claim_captain`, commissioning, attachment, and release mutate the registry before forwarding the authoritative claim snapshot under `args.sync` on a `sync_captains` `control://apply`. The UI keeps overlay MRU membership as independent view state.
 - **`spawnedBy` links crew.** `spawn_terminal` and `create_worktree` accept a `spawnedBy` captain session id and record the spawned session under that captain's `crew` (an unclaimed `spawnedBy` never fails the spawn - `crewRecorded: false` tells the caller to `claim_captain` first). This is what makes the sidebar's crew counts and per-crewmate rows real rather than a count of Task-tool subagents.
 - **Lifecycle cleanup is server-side.** `close_terminal` drops the dead session from the registry - a captain's death releases its claim, a crewmate's death leaves every crew list. `close_tab` prunes the closed tab from every captain's `workspaceTabIds` (the claim survives; a captain can control zero tabs). Each cleanup forwards a `sync_captains` snapshot.
 - **Survives restarts.** Unlike tabs (which the frontend re-seeds on boot), the captains registry is written through to `~/.t-hub/captains.json` (override `T_HUB_CAPTAINS_FILE`; the dev build isolates it under `~/.t-hub-dev`) on every mutation, including the revision, and reloaded on launch. localStorage keeps only view state (overlay geometry, MRU order). A missing or corrupt file starts empty and heals on the first write.
 
 At boot the UI fetches `list_captains` and adds live commissioned Captains to the overlay without turning unrelated local overlay pins into claims.
+
+### Agent-session operations
+
+`register_project` records the canonical Git repository and does not contact an
+external planning service.
+`commission_captain` starts a project-aware Captain from the registered Project,
+assignment, and selected harness.
+`start_agent` starts one durable agent session in an existing Project checkout.
+The session record contains the Captain relationship, assignment, directory,
+detected worktree and branch, harness, runtime state, and work stage.
+`list_agents`, `get_agent`, `agent_events`, and `captain_bootstrap` provide
+bounded recovery reads, while `agent_checkpoint` records concise local progress
+or handoff evidence.
+These operations are the normal replacement for Powder cards, claims, runs,
+work logs, and completion mutations.
+
+Retired Powder operation names are retained only as compatibility tombstones in
+the control and CLI layers for the migration release.
+They are not advertised in the MCP catalog, make no network request, and return
+the structured `powder_retired` error.
 
 ---
 
@@ -362,6 +383,9 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub --lib cont
 cargo build -p t-hub-mcp --manifest-path apps/desktop/src-tauri/Cargo.toml          # the binary the e2e spawns
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to-end
 ```
+
+For the canonical clean-target workspace gate, run `apps/desktop/scripts/workspace_gate.sh` from the repository root.
+The gate builds `t-hub-mcp` before `cargo test --workspace` so the real-binary MCP E2E tests do not depend on a prior command having populated the target directory.
 
 ---
 

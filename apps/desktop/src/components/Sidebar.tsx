@@ -203,7 +203,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             its live terminal tile. Hidden entirely while no agent exists. */}
         {agentCount > 0 && (
           <Section
-            title="Agents"
+            title="Captain Workspace"
             count={agentCount}
             className="border-b"
             collapsible
@@ -217,8 +217,8 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
                   const ws = useWorkspace.getState();
                   ws.setActiveTab(ws.ensureCaptainsTab());
                 }}
-                aria-label="Open Captains workspace"
-                title="Open Captains workspace"
+                aria-label="Open Captain Workspace"
+                title="Open Captain Workspace"
                 className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
               >
                 <LayoutGrid size={13} aria-hidden />

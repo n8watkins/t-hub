@@ -33,6 +33,7 @@
 //! transport scheduler that exploits this is implemented in [`transport`]
 //! (filled in by a subagent); `main` wires the pieces together.
 
+mod codex;
 mod dispatch;
 mod gate;
 mod hook;
@@ -42,7 +43,12 @@ mod registry;
 mod transport;
 
 use std::io::Write;
+use std::process::Command;
 use std::sync::Arc;
+
+use anyhow::{bail, Context};
+use serde_json::json;
+use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 /// CLI surface.
 ///
@@ -53,6 +59,12 @@ use std::sync::Arc;
 /// - `--statusline`    Statusline ingest: read Claude's statusline JSON from
 ///                     stdin, append a `StatusSnapshot` journal entry, echo a
 ///                     short readout to stdout, exit 0. Never blocks Claude.
+/// - `--codex-tap`     Structured Codex lifecycle ingest: read Codex `exec
+///                     --json` or mirrored app-server JSONL from stdin and append
+///                     normalized, credential-safe lifecycle events.
+/// - `--codex-unobserved` Record one credential-safe degraded marker for an
+///                        interactive Codex TUI in its exact owning tmux pane
+///                        when structured telemetry is unavailable.
 /// - `--gate` item-3 Pillar C: the BLOCKING `PreToolUse` gate - reads the hook JSON
 ///   on stdin, classifies the Bash command, and DENIES an outward-facing action a
 ///   crew may not take (fail-closed).
@@ -76,6 +88,11 @@ enum Mode {
     /// Statusline ingest: read Claude's statusline JSON from stdin, journal a
     /// `StatusSnapshot`, echo a readout, exit 0.
     Statusline,
+    /// Structured Codex lifecycle ingest for headless and interactive telemetry.
+    CodexTap,
+    /// Explicit degraded marker for an interactive Codex TUI without lifecycle
+    /// telemetry, bound to its exact owning tmux pane.
+    CodexUnobserved,
     /// item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the hook JSON on stdin,
     /// classifies the Bash command, resolves the caller's capability class from the
     /// app, and DENIES an outward-facing action a crew may not take (or a significant
@@ -99,6 +116,8 @@ fn parse_args() -> Args {
                 }
             },
             "--statusline" => mode = Mode::Statusline,
+            "--codex-tap" => mode = Mode::CodexTap,
+            "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
@@ -144,6 +163,30 @@ fn main() {
             // Always exit 0 — never fail Claude's statusline render.
             std::process::exit(0);
         }
+
+        // ------------------------------------------------------------------
+        // --codex-tap: structured Codex lifecycle ingest.
+        // ------------------------------------------------------------------
+        Mode::CodexTap => match codex::run(args.journal_dir.as_deref()) {
+            Ok(outcome) if outcome.turn_failed => std::process::exit(1),
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("t-hub-agent --codex-tap: {error:#}");
+                std::process::exit(1);
+            }
+        },
+
+        // ------------------------------------------------------------------
+        // --codex-unobserved: record an explicit, pane-bound degraded marker.
+        // This operation must succeed before the shell guard execs Codex.
+        // ------------------------------------------------------------------
+        Mode::CodexUnobserved => match run_codex_unobserved(args.journal_dir.as_deref()) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("t-hub-agent --codex-unobserved: {error:#}");
+                std::process::exit(1);
+            }
+        },
 
         // ------------------------------------------------------------------
         // --gate: the BLOCKING PreToolUse gate (item-3 Pillar C). Emits a deny
@@ -202,10 +245,154 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, or --statusline.",
+                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, --codex-tap, or --codex-unobserved.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxProvenance {
+    session_name: String,
+    session_id: String,
+    session_created: u64,
+    window_id: String,
+    pane_id: String,
+    pane_pid: u32,
+}
+
+fn run_codex_unobserved(journal_dir: Option<&str>) -> anyhow::Result<()> {
+    let provenance = observe_tmux_provenance()?;
+    let dir = journal::resolve_journal_dir(journal_dir);
+    let journal =
+        journal::Journal::open(&dir).with_context(|| format!("opening journal at {dir:?}"))?;
+    let entry = EventJournalEntry {
+        seq: 0,
+        timestamp_ms: now_ms(),
+        source: JournalSource::Agent,
+        entity_id: Some(format!(
+            "codex-unobserved:{}:{}",
+            provenance.session_id, provenance.pane_id
+        )),
+        event_type: JournalEventType::AgentCommand,
+        payload: json!({
+            "schema": "t-hub.codex.unobserved.v1",
+            "provider": "codex",
+            "provider_version": "0.144.4",
+            "session_id": format!(
+                "codex-unobserved:{}:{}",
+                provenance.session_id, provenance.pane_id
+            ),
+            "lifecycle": "telemetry_health",
+            "tmux_session": provenance.session_name.clone(),
+            "runtime_health": "degraded",
+            "agent_status": "unknown",
+            "transport": "unavailable",
+            "telemetry": {
+                "transport": "unavailable",
+                "quality": "stale",
+                "runtime_health": "degraded",
+                "detail": "interactive_tui_lifecycle_unsupported",
+            },
+            "tmux": {
+                "session_name": provenance.session_name,
+                "session_id": provenance.session_id,
+                "session_created": provenance.session_created,
+                "window_id": provenance.window_id,
+                "pane_id": provenance.pane_id,
+                "pane_pid": provenance.pane_pid,
+            }
+        }),
+        result: None,
+    };
+    journal
+        .append(entry)
+        .context("appending interactive Codex degraded marker")?;
+    Ok(())
+}
+
+fn observe_tmux_provenance() -> anyhow::Result<TmuxProvenance> {
+    const FORMAT: &str =
+        "#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t#{pane_id}\t#{pane_pid}";
+    const MAX_OUTPUT_BYTES: usize = 512;
+
+    let expected_pane = std::env::var("TMUX_PANE")
+        .context("interactive Codex degraded marker requires TMUX_PANE")?;
+    validate_prefixed_number("tmux pane id", &expected_pane, '%')?;
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "-t", &expected_pane, FORMAT])
+        .output()
+        .context("reading owning tmux pane")?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        bail!("owning tmux pane is unavailable");
+    }
+    if output.stdout.is_empty() || output.stdout.len() > MAX_OUTPUT_BYTES {
+        bail!("owning tmux pane returned invalid provenance");
+    }
+    let line = std::str::from_utf8(&output.stdout)
+        .context("owning tmux pane returned non-UTF-8 provenance")?
+        .trim_end_matches(['\r', '\n']);
+    if line.contains(['\r', '\n']) {
+        bail!("owning tmux pane returned ambiguous provenance");
+    }
+    let fields = line.split('\t').collect::<Vec<_>>();
+    let [session_name, session_id, session_created, window_id, pane_id, pane_pid] =
+        fields.as_slice()
+    else {
+        bail!("owning tmux pane returned incomplete provenance");
+    };
+    if session_name.is_empty()
+        || session_name.len() > 128
+        || !session_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("owning tmux session name is invalid");
+    }
+    validate_prefixed_number("tmux session id", session_id, '$')?;
+    validate_prefixed_number("tmux window id", window_id, '@')?;
+    validate_prefixed_number("tmux pane id", pane_id, '%')?;
+    if *pane_id != expected_pane {
+        bail!("owning tmux pane identity changed");
+    }
+    let session_created = parse_positive_number("tmux session creation time", session_created)?;
+    let pane_pid = u32::try_from(parse_positive_number("tmux pane pid", pane_pid)?)
+        .context("tmux pane pid is out of range")?;
+    Ok(TmuxProvenance {
+        session_name: (*session_name).to_string(),
+        session_id: (*session_id).to_string(),
+        session_created,
+        window_id: (*window_id).to_string(),
+        pane_id: (*pane_id).to_string(),
+        pane_pid,
+    })
+}
+
+fn validate_prefixed_number(field: &str, value: &str, prefix: char) -> anyhow::Result<()> {
+    let digits = value
+        .strip_prefix(prefix)
+        .filter(|digits| !digits.is_empty() && digits.len() <= 20)
+        .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()));
+    if digits.is_none() {
+        bail!("{field} is invalid");
+    }
+    Ok(())
+}
+
+fn parse_positive_number(field: &str, value: &str) -> anyhow::Result<u64> {
+    let parsed = value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .with_context(|| format!("{field} is invalid"))?;
+    Ok(parsed)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

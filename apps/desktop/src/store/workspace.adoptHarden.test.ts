@@ -11,6 +11,7 @@ import {
   useWorkspace,
   CAPTAINS_TAB_ID,
   CAPTAINS_TAB_NAME,
+  registerCaptainRegistry,
   type WorkspaceTab,
 } from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
@@ -43,6 +44,7 @@ function placedIds(): Set<string> {
 
 describe("adopt-harden: debris never reaches the canvas once the server is authoritative", () => {
   beforeEach(() => {
+    registerCaptainRegistry(() => []);
     seed([{ id: "t1", name: "Workspace 1", order: ["a", "b"] }], "t1", false);
   });
 
@@ -101,5 +103,23 @@ describe("adopt-harden: debris never reaches the canvas once the server is autho
     expect(useWorkspace.getState().tabs.find((t) => t.id === "t1")?.order).toContain(
       "preexisting",
     );
+  });
+
+  it("recovers ordinary shells out of Captain Workspace during a cold boot", () => {
+    seed(
+      [{ id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: ["ordinary-shell"] }],
+      CAPTAINS_TAB_ID,
+      false,
+    );
+
+    useWorkspace.getState().setTerminals([term("ordinary-shell")]);
+
+    const state = useWorkspace.getState();
+    expect(state.tabs.find((tab) => tab.id === CAPTAINS_TAB_ID)?.order).toEqual([]);
+    expect(state.tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
+    expect(state.tabs.find((tab) => tab.id !== CAPTAINS_TAB_ID)?.order).toEqual([
+      "ordinary-shell",
+    ]);
+    expect(state.activeTabId).not.toBe(CAPTAINS_TAB_ID);
   });
 });

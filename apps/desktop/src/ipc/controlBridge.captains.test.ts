@@ -127,6 +127,8 @@ describe("adoptCaptainsSnapshot seq guard", () => {
         seq: 10,
         captains: [{
           ...claim("capA", ["t1"]),
+          assignmentId: "assignment:project-a:alpha",
+          displayName: "Alpha Lead",
           provider: "claude",
           harness: "claude",
           providerSessionId: "claude-session",
@@ -136,6 +138,10 @@ describe("adoptCaptainsSnapshot seq guard", () => {
             provider: "codex",
             harness: "codex",
             providerSessionId: "codex-thread",
+            harnessPermission: "bypassPermissions",
+            tHubCapability: "read",
+            workspaceTabId: "t1",
+            state: { kind: "needsAssignment", since: 42 },
           }],
         }],
       }),
@@ -147,12 +153,18 @@ describe("adoptCaptainsSnapshot seq guard", () => {
       harness: "claude",
       providerSessionId: "claude-session",
       claudeUuid: "claude-session",
+      assignmentId: "assignment:project-a:alpha",
+      displayName: "Alpha Lead",
     });
     expect(adopted.crew[0]).toMatchObject({
       terminalId: "crewCodex",
       provider: "codex",
       harness: "codex",
       providerSessionId: "codex-thread",
+      harnessPermission: "bypassPermissions",
+      tHubCapability: "read",
+      workspaceTabId: "t1",
+      state: { kind: "needsAssignment", since: 42 },
     });
   });
 

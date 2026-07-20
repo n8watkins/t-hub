@@ -1,7 +1,7 @@
 // TilePanel — the per-tile body SWITCHER for the non-terminal views.
 //
 // A project tile (Tile.tsx) is a little workbench with a Terminal / Files /
-// Run + Preview / Board tab bar. The Terminal view is special: its xterm is not
+// Run + Preview tab bar. The Terminal view is special: its xterm is not
 // a child
 // of the tile — the persistent pool (TerminalPool.tsx) renders each terminal
 // once in an overlay and positions it over the tile's empty placeholder, so a
@@ -13,9 +13,6 @@
 //   - files   -> <FilePanel root={cwd} />            (this project's tree/reader)
 //   - preview -> <RunPreviewPanel terminalId cwd />
 //                 One guided managed-runner, output, and preview lifecycle.
-//   - board   -> <BoardPanel terminalId cwd />
-//                 Resolves the durable Project and its protected Powder binding
-//                 through one backend snapshot. Credentials never enter the UI.
 //
 // Tile.tsx only renders TilePanel when the active tab is NOT "terminal" (for the
 // terminal tab it renders the pool placeholder instead), so this component never
@@ -24,7 +21,6 @@ import type { ReactElement } from "react";
 import type { TerminalId } from "../ipc/types";
 import type { PanelTab } from "../store/panels";
 import { FilePanel } from "./FilePanel";
-import { BoardPanel } from "./BoardPanel";
 import { RunPreviewPanel } from "./RunPreviewPanel";
 
 export interface TilePanelProps {
@@ -57,7 +53,5 @@ export function TilePanel({
       );
     case "preview":
       return <RunPreviewPanel terminalId={terminalId} cwd={cwd} />;
-    case "board":
-      return <BoardPanel terminalId={terminalId} cwd={cwd} />;
   }
 }

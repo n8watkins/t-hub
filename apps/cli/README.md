@@ -113,6 +113,11 @@ name over the loopback channel:
 | `th tabs` | `list_tabs` | |
 | `th health` | `wsl_health` | |
 | `th events` | `__subscribe_events` | streams the event bus until Ctrl-C |
+| `th agents start` | `start_agent` | starts one durable Codex or Claude agent in an existing Project checkout |
+| `th agents list` | `list_agents` | bounded agent summaries by Captain or Project |
+| `th agents show` | `get_agent` | full durable agent record |
+| `th agents checkpoint` | `agent_checkpoint` | appends a bounded resume checkpoint |
+| `th agents events` | `agent_events` | reads lifecycle and checkpoint events after a cursor |
 
 ## Worktree lifecycle (treehouse-style)
 

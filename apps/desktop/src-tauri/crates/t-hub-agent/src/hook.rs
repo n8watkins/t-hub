@@ -114,8 +114,16 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
         }
     };
 
-    // 3. Build the entry.
-    let entry = build_entry(hook_name, &payload);
+    // 3. Build the entry. Codex permission hooks are normalized before they
+    // reach durable storage so raw commands, tool arguments, and reasons never
+    // become production signals or credential-bearing journal data.
+    let entry = if crate::codex::is_codex_hook(&payload) {
+        let (pane, tmux_session) = resolve_tmux_pane();
+        crate::codex::entry_from_hook(hook_name, &payload, pane, tmux_session)
+            .unwrap_or_else(|| build_entry(hook_name, &serde_json::Value::Null))
+    } else {
+        build_entry(hook_name, &payload)
+    };
 
     // 4. Open journal and append.
     let dir: PathBuf = crate::journal::resolve_journal_dir(journal_dir);
@@ -171,7 +179,7 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 ///
 /// Best-effort and side-effect-free on failure: a missing tmux / unset env / a
 /// non-zero exit all collapse to `None` so a statusline render is never blocked.
-fn resolve_tmux_pane() -> (Option<String>, Option<String>) {
+pub(crate) fn resolve_tmux_pane() -> (Option<String>, Option<String>) {
     // `$TMUX_PANE` is the pane the statusline runs in (set by tmux for any process
     // it spawned). Absent ⇒ not running under tmux; nothing to resolve.
     let pane = match std::env::var("TMUX_PANE") {
