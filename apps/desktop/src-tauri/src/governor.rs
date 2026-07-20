@@ -128,6 +128,21 @@ pub struct ReservationPolicy {
     pub recovery: usize,
 }
 
+/// The durable intent attached to an admitted agent runtime.
+///
+/// A privileged purpose may fill only its matching reserved slot. It does not
+/// itself grant the administrative role, which still requires an explicit
+/// supervisor appointment and durable grant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdmissionPurpose {
+    #[default]
+    Ordinary,
+    FleetAdmin,
+    ShipAdmin,
+    Recovery,
+}
+
 impl Default for ReservationPolicy {
     fn default() -> Self {
         Self {

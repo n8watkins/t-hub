@@ -809,6 +809,10 @@ pub struct AgentSessionRecord {
     pub integration_contracts: Vec<crate::governor::IntegrationContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_capacity: Option<crate::governor::CapacityReport>,
+    /// Capacity class admitted for this durable runtime. Administrative values
+    /// are intent only and do not grant a role without a separate appointment.
+    #[serde(default)]
+    pub admission_purpose: crate::governor::AdmissionPurpose,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -995,6 +999,7 @@ mod tests {
             lane_claim: None,
             integration_contracts: Vec::new(),
             dispatch_capacity: None,
+            admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
             created_at: 10,
             updated_at: 10,
         }

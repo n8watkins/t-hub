@@ -289,7 +289,8 @@ fn schema_spawn_terminal() -> Value {
             "tabName": { "type": "string", "description": "Optional target workspace tab, by name: reused if it exists, created (hidden - the user's active tab is NOT switched) if not." },
             "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." },
             "spawnedBy": { "type": "string", "description": "Optional captain session id: records the spawned session as that captain's CREW in the captains registry (requires the captain to have claim_captain'd; an unclaimed id records nothing - crewRecorded: false)." },
-            "capability": { "type": "string", "enum": ["read", "control"], "description": "Capability the new session is granted (item-3 least-privilege, default \"read\"): \"read\" spawns a pure-work crew that can observe but not spawn/type/kill; \"control\" is a deliberate, audited elevation for a session that must orchestrate (e.g. a captain/orchestrator). Omitted defaults to \"read\"." }
+            "capability": { "type": "string", "enum": ["read", "control"], "description": "Capability the new session is granted (item-3 least-privilege, default \"read\"): \"read\" spawns a pure-work crew that can observe but not spawn/type/kill; \"control\" is a deliberate, audited elevation for a session that must orchestrate (e.g. a captain/orchestrator). Omitted defaults to \"read\"." },
+            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "description": "Capacity class for this Crew spawn. Omitted defaults to ordinary. Fleet-admin and recovery require General/Cortana authority. Ship-admin requires the same owning Captain named in spawnedBy. This reserves capacity only; the supervisor must still appoint the durable role explicitly." }
         },
         "additionalProperties": false
     })
@@ -320,7 +321,8 @@ fn schema_create_worktree() -> Value {
             "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." },
             "startupCommand": { "type": "string", "description": "Optional command the worktree terminal runs inside an interactive login shell it execs back into (e.g. claude --resume <id>) - same contract and exec path as spawn_terminal's startupCommand. Omitted boots a bare shell in the worktree dir." },
             "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." },
-            "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the worktree terminal is granted (item-3 least-privilege, default \"read\"): same contract as spawn_terminal's capability - \"control\" is a deliberate, audited elevation." }
+            "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the worktree terminal is granted (item-3 least-privilege, default \"read\"): same contract as spawn_terminal's capability - \"control\" is a deliberate, audited elevation." },
+            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "description": "Capacity class for the spawned Crew terminal, with the same supervisor-authorization contract as spawn_terminal." }
         },
         "required": ["repoRoot", "worktreePath"],
         "additionalProperties": false
@@ -851,7 +853,8 @@ fn schema_start_agent() -> Value {
             "mutableFiles": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "mutableSchemas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "mutableInterfaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
-            "integrationContracts": { "type": "array", "items": schema_integration_contract() }
+            "integrationContracts": { "type": "array", "items": schema_integration_contract() },
+            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "default": "ordinary", "description": "Durable capacity intent for this agent. Admin and recovery purposes consume only their matching reserved slot and require supervisor authority. The value is persisted on the AgentSession but does not grant the role without a separate appointment." }
         },
         "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug", "laneId", "dependencies", "mutableFiles", "mutableSchemas", "mutableInterfaces", "integrationContracts"],
         "additionalProperties": false
@@ -1865,6 +1868,15 @@ mod tests {
                 "start_agent must require {required}"
             );
         }
+        assert_eq!(
+            start["properties"]["admissionPurpose"]["enum"],
+            json!(["ordinary", "fleet-admin", "ship-admin", "recovery"])
+        );
+        let spawn = (find("spawn_terminal").unwrap().input_schema)();
+        assert_eq!(
+            spawn["properties"]["admissionPurpose"]["enum"],
+            json!(["ordinary", "fleet-admin", "ship-admin", "recovery"])
+        );
     }
 
     #[test]

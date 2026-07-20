@@ -355,6 +355,13 @@ fn start_control_listener(
         .with_authz(authz)
         .with_delegated_admin(delegated_admin);
     control::recover_pending_fleet_operations(&ctx);
+    // The local webview spawn command shares the exact same admission lock and
+    // capacity evidence as the control listener. Keeping a cloned context as
+    // managed state prevents the UI path from racing or bypassing fleet reserves.
+    {
+        use tauri::Manager;
+        app.manage(std::sync::Arc::new(ctx.clone()));
+    }
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(

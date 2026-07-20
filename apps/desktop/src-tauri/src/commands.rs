@@ -356,10 +356,14 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
 }
 
 #[tauri::command]
-pub async fn spawn_terminal(
+pub fn spawn_terminal(
     app: tauri::AppHandle,
+    admission_context: tauri::State<'_, std::sync::Arc<crate::control::ControlContext>>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
+    let _admission = admission_context
+        .admit_ui_spawn()
+        .map_err(|refusal| refusal.message)?;
     // The terminal id IS the tmux session's own suffix, so the id is stable and
     // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
     // after a reload (which strips `th_` off the session name), and the

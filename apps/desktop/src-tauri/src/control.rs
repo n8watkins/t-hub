@@ -8026,6 +8026,39 @@ pub fn captains_path() -> PathBuf {
 /// tests/proofs. Returns the bridge's "not connected" error until the agent attaches.
 type MetricsFn = Arc<dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync>;
 
+/// Resolve the provider's authoritative concurrent-session ceiling.
+///
+/// Production reads an explicit operator/provider value rather than treating the
+/// governor's unrelated machine-process limit as provider evidence. Tests replace
+/// this closure to exercise unavailable and exhausted provider states without
+/// mutating the process environment.
+type ProviderCapacityFn = Arc<dyn Fn() -> Result<usize, String> + Send + Sync>;
+
+/// Enumerate the authoritative tmux session registry for admission.
+///
+/// The indirection is a failure-injection seam. A failed enumeration is an
+/// unavailable capacity observation, never an observation of zero sessions.
+type LiveSessionsFn = Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnPurpose {
+    Ordinary,
+    Cortana,
+    FleetAdmin,
+    ShipAdmin,
+    Recovery,
+}
+
+/// An admitted spawn holds the shared capacity lock until its tmux create (and
+/// any durable state transition surrounding it) has completed. This makes the
+/// live-count, reservation, rate-token, and process creation one serialized
+/// operation instead of a check-then-spawn race.
+#[derive(Debug)]
+pub(crate) struct SpawnAdmissionGuard<'a> {
+    _lock: std::sync::MutexGuard<'a, ()>,
+    _capacity: crate::governor::CapacityReport,
+}
+
 const DISPATCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -8158,6 +8191,11 @@ pub struct ControlContext {
     /// in headless tests; `lib.rs` wires it from `AgentBridge`. See [`MetricsFn`]
     /// for why this is the canonical source on the Windows-host topology.
     metrics: Option<MetricsFn>,
+    /// Authoritative provider capacity evidence. Missing or invalid evidence
+    /// refuses admission instead of defaulting to the governor's machine cap.
+    provider_capacity: ProviderCapacityFn,
+    /// Authoritative tmux enumeration, injectable only for deterministic tests.
+    live_sessions: LiveSessionsFn,
     /// The CORE's addressable tab registry (TASK C / #22). Read by `list_tabs`,
     /// updated optimistically by `new_tab` / `move_tile` / named placement, and
     /// replaced wholesale by the frontend's `report_workspace_tabs` up-sync. Shared
@@ -8283,6 +8321,14 @@ impl ControlContext {
         };
         (self.supervisor)(&mut take);
         out.expect("supervisor closure always runs")
+    }
+
+    /// Admit a local webview terminal spawn through the same held lock, evidence,
+    /// provider, reservation, and rate gates as a control-socket spawn.
+    pub(crate) fn admit_ui_spawn(
+        &self,
+    ) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
+        admit_spawn(self, SpawnPurpose::Ordinary)
     }
 }
 
@@ -10438,27 +10484,27 @@ fn spawn_env_with_identity(
     Ok((env, Some(identity)))
 }
 
-/// The authoritative count of live `th_*` tmux sessions, reconciled from the tmux
-/// source of truth on every spawn (never a free-running counter that drifts when a
-/// session dies without a `close_terminal`).
+/// Read the authoritative tmux registry and include durable Crew records that are
+/// still in `Starting` before their tmux session exists.
 ///
-/// Fails OPEN (returns 0) when tmux cannot be queried, because the hard constraint
-/// is that a transient tmux hiccup must NOT block legitimate orchestration - and
-/// the spawn-rate token bucket still bounds runaway spawning to 20/min regardless
-/// of the count, so the concurrent cap/ceiling degrading to the rate limiter is a
-/// bounded, deliberate fallback. The failure is logged (not silent) so a query
-/// outage that softens the cap is observable in the audit/stderr trail.
-fn live_session_count() -> usize {
-    match tmux::list_sessions() {
-        Ok(sessions) => sessions.iter().filter(|n| n.starts_with("th_")).count(),
-        Err(e) => {
-            eprintln!(
-                "t-hub-control: could not derive live-session count from tmux ({e}); \
-                 spawn concurrent-cap/ceiling fall back to the spawn-rate limiter for this spawn"
-            );
-            0
-        }
-    }
+/// A failed tmux enumeration is propagated. Returning zero here would erase both
+/// the concurrent ceiling and reserved-slot policy during the exact outage in
+/// which the process source of truth cannot be checked.
+fn live_session_count(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> Result<usize, String> {
+    let sessions = (ctx.live_sessions)()
+        .map_err(|error| format!("tmux session evidence unavailable: {error}"))?;
+    let live = sessions
+        .iter()
+        .filter(|session| session.starts_with("th_"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let durable_pending = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent.runtime_state == RuntimeState::Starting)
+        .filter(|agent| !live.contains(&tmux_target(&agent.agent_session_id)))
+        .count();
+    Ok(live.len().saturating_add(durable_pending))
 }
 
 /// Whether a `send_keys` payload carries a process-signal / kill-style key. The
@@ -10483,19 +10529,122 @@ fn is_kill_key(k: &str) -> bool {
 /// concurrent-session cap + spawn rate; `close_terminal` and kill-style `send_keys`
 /// by the destructive throttle; `send_text` and benign `send_keys` are not
 /// throttled (only audited).
-fn governor_gate(
-    ctx: &ControlContext,
+fn governor_gate<'a>(
+    ctx: &'a ControlContext,
     command: &str,
     args: &Value,
-) -> Result<(), crate::governor::Refusal> {
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Option<SpawnAdmissionGuard<'a>>, crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" | "start_agent" | "commission_captain" | "dispatch_crew" => {
-            ctx.governor.check_spawn(live_session_count(), now)
+        // start_agent owns the same admission guard inside its implementation so
+        // direct test/internal calls cannot bypass the atomic check. Cortana only
+        // reserves when reconciliation actually needs a replacement runtime.
+        "start_agent" | "reconcile_cortana" => Ok(None),
+        "spawn_terminal"
+        | "commission_captain"
+        | "dispatch_crew"
+        | "create_worktree"
+        | "add_worktree_workspace" => {
+            let purpose = requested_spawn_purpose(command, args, caller, trusted_internal)?;
+            admit_spawn(ctx, purpose).map(Some)
         }
-        "close_terminal" => ctx.governor.check_destructive(now),
-        "send_keys" if keys_are_kill_style(args) => ctx.governor.check_destructive(now),
-        _ => Ok(()),
+        "close_terminal" => ctx.governor.check_destructive(now).map(|()| None),
+        "send_keys" if keys_are_kill_style(args) => {
+            ctx.governor.check_destructive(now).map(|()| None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn requested_spawn_purpose(
+    command: &str,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<SpawnPurpose, crate::governor::Refusal> {
+    let requested = arg_str(args, "admissionPurpose")
+        .or_else(|| arg_str(args, "admission_purpose"))
+        .unwrap_or_else(|| "ordinary".into());
+    let deny = |message: &str| crate::governor::Refusal {
+        code: "refused-role",
+        message: format!("spawn refused: {message}"),
+    };
+    match requested.trim().to_ascii_lowercase().as_str() {
+        "ordinary" => Ok(SpawnPurpose::Ordinary),
+        "fleet-admin" => {
+            if !matches!(
+                command,
+                "spawn_terminal" | "create_worktree" | "start_agent"
+            ) {
+                return Err(deny(
+                    "fleet-admin admission is only valid for a Crew terminal spawn",
+                ));
+            }
+            if caller_is_apex(caller, trusted_internal) {
+                Ok(SpawnPurpose::FleetAdmin)
+            } else {
+                Err(deny(
+                    "fleet-admin reserved capacity requires General or Cortana authority",
+                ))
+            }
+        }
+        "ship-admin" => {
+            if !matches!(
+                command,
+                "spawn_terminal" | "create_worktree" | "start_agent"
+            ) {
+                return Err(deny(
+                    "ship-admin admission is only valid for a Crew terminal spawn",
+                ));
+            }
+            let Some(caller) = caller else {
+                return Err(deny(
+                    "ship-admin reserved capacity requires an identified owning Captain",
+                ));
+            };
+            let spawned_by = if command == "start_agent" {
+                arg_str(args, "captainSessionId")
+            } else {
+                arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"))
+            }
+            .filter(|value| !value.trim().is_empty());
+            if caller.fleet_role == Some(FleetRole::Captain)
+                && caller.tile.as_deref() == spawned_by.as_deref()
+                && caller.ship_slug.is_some()
+            {
+                Ok(SpawnPurpose::ShipAdmin)
+            } else {
+                Err(deny(
+                    "ship-admin reserved capacity requires the same owning Captain in spawnedBy",
+                ))
+            }
+        }
+        "recovery" => {
+            if caller_is_apex(caller, trusted_internal) {
+                Ok(SpawnPurpose::Recovery)
+            } else {
+                Err(deny(
+                    "recovery reserved capacity requires General or Cortana authority",
+                ))
+            }
+        }
+        "cortana" => Err(deny(
+            "Cortana reserved capacity is available only to singleton reconciliation",
+        )),
+        other => Err(deny(&format!("unknown admissionPurpose '{other}'"))),
+    }
+}
+
+fn durable_admission_purpose(purpose: SpawnPurpose) -> crate::governor::AdmissionPurpose {
+    match purpose {
+        SpawnPurpose::Ordinary | SpawnPurpose::Cortana => {
+            crate::governor::AdmissionPurpose::Ordinary
+        }
+        SpawnPurpose::FleetAdmin => crate::governor::AdmissionPurpose::FleetAdmin,
+        SpawnPurpose::ShipAdmin => crate::governor::AdmissionPurpose::ShipAdmin,
+        SpawnPurpose::Recovery => crate::governor::AdmissionPurpose::Recovery,
     }
 }
 
@@ -10714,26 +10863,42 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 
     // Phase 1 fleet gate: budget + rate limits for process-changing commands only.
     // Read/Organization tiers never touch the governor.
-    if tier == CommandTier::ProcessChanging {
-        if let Err(refusal) = governor_gate(ctx, &req.command, &req.args) {
-            // A pre-side-effect gate refusal is not an applied outcome: release the
-            // reservation so a retry after the budget frees can still succeed
-            // (rather than being permanently stuck replaying the refusal).
-            if let Some(id) = &request_id {
-                ctx.requests.cancel(id);
+    let spawn_producing_organization_command = matches!(
+        req.command.as_str(),
+        "create_worktree" | "add_worktree_workspace"
+    );
+    let _spawn_admission =
+        if tier == CommandTier::ProcessChanging || spawn_producing_organization_command {
+            match governor_gate(
+                ctx,
+                &req.command,
+                &req.args,
+                caller.as_ref(),
+                trusted_internal,
+            ) {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    // A pre-side-effect gate refusal is not an applied outcome: release the
+                    // reservation so a retry after the budget frees can still succeed
+                    // (rather than being permanently stuck replaying the refusal).
+                    if let Some(id) = &request_id {
+                        ctx.requests.cancel(id);
+                    }
+                    audit_command(ctx, &req, tier, cap, refusal.code, None);
+                    ctx.fanout.emit_event(
+                        "control://governor",
+                        &json!({
+                            "command": req.command.as_str(),
+                            "decision": refusal.code,
+                            "error": refusal.message.as_str(),
+                        }),
+                    );
+                    return ControlResponse::err(refusal.message);
+                }
             }
-            audit_command(ctx, &req, tier, cap, refusal.code, None);
-            ctx.fanout.emit_event(
-                "control://governor",
-                &json!({
-                    "command": req.command.as_str(),
-                    "decision": refusal.code,
-                    "error": refusal.message.as_str(),
-                }),
-            );
-            return ControlResponse::err(refusal.message);
-        }
-    }
+        } else {
+            None
+        };
 
     // Dispatch, then record the outcome under the requestId (if any) so a later
     // retry replays exactly this result. `finish` returns the outcome back. The caller
@@ -14187,9 +14352,8 @@ fn reconcile_cortana_inner(
     if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
         return Err("reconcile_cortana: no UI is connected to adopt a recovered runtime".into());
     }
-    ctx.governor
-        .check_spawn(live_session_count(), Instant::now())
-        .map_err(|refusal| refusal.message)?;
+    let _admission = admit_spawn(ctx, SpawnPurpose::Cortana)
+        .map_err(|refusal| format!("reconcile_cortana: {}", refusal.message))?;
     let harness_name = arg_str(args, "harness")
         .or_else(|| durable.harness.clone())
         .unwrap_or_else(|| "codex".into())
@@ -21759,7 +21923,7 @@ fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (boo
     let load_healthy = metrics.load_avg[0].is_finite()
         && metrics.load_avg[0] <= (cpu_count.saturating_mul(2)) as f32;
     let memory_known = metrics.mem_total_kib > 0;
-    let memory_healthy = !memory_known || metrics.mem_available_kib >= 512 * 1024;
+    let memory_healthy = memory_known && metrics.mem_available_kib >= 512 * 1024;
     let memory_slots = if memory_known {
         usize::try_from(metrics.mem_available_kib / (512 * 1024)).unwrap_or(0)
     } else {
@@ -21838,43 +22002,24 @@ fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usiz
     (fleet_admin_actors.len(), ship_admin_scopes.len())
 }
 
-fn dispatch_runtime_capacity(
+fn provider_capacity_evidence(ctx: &ControlContext) -> Result<usize, String> {
+    (ctx.provider_capacity)()
+        .and_then(|capacity| {
+            (capacity > 0)
+                .then_some(capacity.min(crate::governor::HARD_SESSION_CEILING))
+                .ok_or_else(|| "provider capacity evidence reported a zero ceiling".to_string())
+        })
+        .map_err(|error| format!("provider capacity evidence unavailable: {error}"))
+}
+
+fn runtime_capacity_from_evidence(
     ctx: &ControlContext,
     snapshot: &CaptainsSnapshot,
-    project_id: &str,
+    live_sessions: usize,
+    available_worktrees: usize,
 ) -> Result<crate::governor::RuntimeCapacity, String> {
-    let live_sessions = live_session_count();
     let (machine_healthy, machine_session_capacity) = dispatch_machine_evidence(ctx, live_sessions);
-    let provider_session_capacity = std::env::var("T_HUB_PROVIDER_SESSION_CAPACITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| ctx.governor.max_sessions())
-        .min(crate::governor::HARD_SESSION_CEILING);
-    let active_directories = snapshot
-        .agent_sessions
-        .iter()
-        .filter(|agent| {
-            !matches!(
-                agent.work_stage,
-                crate::agent_session::WorkStage::Complete
-                    | crate::agent_session::WorkStage::Stopped
-            )
-        })
-        .map(|agent| files::posix_form(&agent.directory))
-        .collect::<BTreeSet<_>>();
-    let project = snapshot
-        .projects
-        .iter()
-        .find(|project| project.project_id == project_id)
-        .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
-    let available_worktrees = git::worktree_list(&files::posix_form(&project.repo_root))
-        .map_err(|error| format!("dispatch preflight: could not inspect worktrees: {error}"))?
-        .into_iter()
-        .map(|worktree| files::posix_form(&worktree.path))
-        .filter(|path| !active_directories.contains(path))
-        .collect::<BTreeSet<_>>()
-        .len();
+    let provider_session_capacity = provider_capacity_evidence(ctx)?;
     let active_captains = snapshot
         .captains
         .iter()
@@ -21914,6 +22059,125 @@ fn dispatch_runtime_capacity(
         live_ship_admins,
         live_recovery_sessions,
     })
+}
+
+fn prospective_capacity(
+    mut capacity: crate::governor::RuntimeCapacity,
+    purpose: SpawnPurpose,
+) -> crate::governor::RuntimeCapacity {
+    match purpose {
+        SpawnPurpose::Ordinary => {}
+        SpawnPurpose::Cortana => {
+            capacity.live_cortana = capacity.live_cortana.saturating_add(1);
+        }
+        SpawnPurpose::FleetAdmin => {
+            capacity.live_fleet_admins = capacity.live_fleet_admins.saturating_add(1);
+        }
+        SpawnPurpose::ShipAdmin => {
+            capacity.live_ship_admins = capacity.live_ship_admins.saturating_add(1);
+        }
+        SpawnPurpose::Recovery => {
+            capacity.live_recovery_sessions = capacity.live_recovery_sessions.saturating_add(1);
+        }
+    }
+    capacity
+}
+
+fn admit_spawn(
+    ctx: &ControlContext,
+    purpose: SpawnPurpose,
+) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
+    let lock = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let capacity = evaluate_spawn_capacity(ctx, purpose)?;
+    Ok(SpawnAdmissionGuard {
+        _lock: lock,
+        _capacity: capacity,
+    })
+}
+
+/// Evaluate and consume one spawn admission while the caller holds
+/// `dispatch_admission`. Keeping this separate lets start_agent validate identity,
+/// exact baseline, and lane arguments under the atomic lock before it consumes a
+/// rate token.
+fn evaluate_spawn_capacity(
+    ctx: &ControlContext,
+    purpose: SpawnPurpose,
+) -> Result<crate::governor::CapacityReport, crate::governor::Refusal> {
+    let snapshot = ctx.captains.snapshot();
+    let live_sessions =
+        live_session_count(ctx, &snapshot).map_err(|message| crate::governor::Refusal {
+            code: "refused-evidence",
+            message: format!("spawn refused: {message}"),
+        })?;
+    let capacity = runtime_capacity_from_evidence(
+        ctx,
+        &snapshot,
+        live_sessions,
+        crate::governor::HARD_SESSION_CEILING,
+    )
+    .map_err(|message| crate::governor::Refusal {
+        code: "refused-provider",
+        message: format!("spawn refused: {message}"),
+    })?;
+    let request = crate::governor::DispatchPreflight {
+        requested_lanes: vec![crate::governor::LaneClaim {
+            lane_id: "spawn-admission".into(),
+            owner_id: "spawn-admission".into(),
+            dependencies: Some(BTreeSet::new()),
+            mutable_files: BTreeSet::new(),
+            mutable_schemas: BTreeSet::new(),
+            mutable_interfaces: BTreeSet::new(),
+        }],
+        active_lanes: Vec::new(),
+        satisfied_dependencies: BTreeSet::new(),
+        integration_contracts: Vec::new(),
+        capacity: prospective_capacity(capacity, purpose),
+    };
+    let capacity = ctx
+        .governor
+        .preflight_dispatch(&request)
+        .map_err(|refusal| crate::governor::Refusal {
+            code: refusal.code.as_str(),
+            message: refusal.message,
+        })?;
+    ctx.governor.check_spawn(live_sessions, Instant::now())?;
+    Ok(capacity)
+}
+
+fn dispatch_runtime_capacity(
+    ctx: &ControlContext,
+    snapshot: &CaptainsSnapshot,
+    project_id: &str,
+) -> Result<crate::governor::RuntimeCapacity, String> {
+    let live_sessions = live_session_count(ctx, snapshot)?;
+    let active_directories = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| {
+            !matches!(
+                agent.work_stage,
+                crate::agent_session::WorkStage::Complete
+                    | crate::agent_session::WorkStage::Stopped
+            )
+        })
+        .map(|agent| files::posix_form(&agent.directory))
+        .collect::<BTreeSet<_>>();
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
+    let available_worktrees = git::worktree_list(&files::posix_form(&project.repo_root))
+        .map_err(|error| format!("dispatch preflight: could not inspect worktrees: {error}"))?
+        .into_iter()
+        .map(|worktree| files::posix_form(&worktree.path))
+        .filter(|path| !active_directories.contains(path))
+        .collect::<BTreeSet<_>>()
+        .len();
+    runtime_capacity_from_evidence(ctx, snapshot, live_sessions, available_worktrees)
 }
 
 fn parse_integration_contracts(
@@ -22012,6 +22276,7 @@ fn start_agent(
             "mutableSchemas",
             "mutableInterfaces",
             "integrationContracts",
+            "admissionPurpose",
         ],
     )?;
     arg_str(args, "requestId")
@@ -22041,7 +22306,10 @@ fn start_agent(
     let mutable_schemas = string_set_arg(args, "mutableSchemas", "start_agent")?;
     let mutable_interfaces = string_set_arg(args, "mutableInterfaces", "start_agent")?;
     let integration_contracts = parse_integration_contracts(args, "start_agent")?;
-    let admission = ctx
+    let spawn_purpose = requested_spawn_purpose("start_agent", args, caller, trusted_internal)
+        .map_err(|refusal| format!("start_agent: {}", refusal.message))?;
+    let admission_purpose = durable_admission_purpose(spawn_purpose);
+    let admission_lock = ctx
         .dispatch_admission
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -22141,6 +22409,12 @@ fn start_agent(
         })?;
     git::require_clean_exact_baseline(&checkout, &source_commit)
         .map_err(|error| format!("start_agent: baseline changed during admission: {error}"))?;
+    let admission_capacity = evaluate_spawn_capacity(ctx, spawn_purpose)
+        .map_err(|refusal| format!("start_agent: {}", refusal.message))?;
+    let _admission = SpawnAdmissionGuard {
+        _lock: admission_lock,
+        _capacity: admission_capacity,
+    };
     let now = now_ms();
     let record = AgentSessionRecord {
         agent_session_id: agent_session_id.clone(),
@@ -22166,14 +22440,13 @@ fn start_agent(
         lane_claim: Some(lane_claim),
         integration_contracts,
         dispatch_capacity: Some(dispatch_capacity.clone()),
+        admission_purpose,
         created_at: now,
         updated_at: now,
     };
     ctx.captains.insert_agent_session(record)?;
     #[cfg(test)]
     ctx.captains.pause_dispatch("start_agent_admitted");
-    drop(admission);
-
     let launch = crew_launch_argv(harness, &assignment);
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -23408,6 +23681,28 @@ impl ControlContext {
         supervisor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync>,
         token: String,
     ) -> Self {
+        #[cfg(not(test))]
+        let provider_capacity: ProviderCapacityFn = Arc::new(|| {
+            let raw = std::env::var("T_HUB_PROVIDER_SESSION_CAPACITY").map_err(|_| {
+                "provider capacity evidence unavailable: set T_HUB_PROVIDER_SESSION_CAPACITY"
+                    .to_string()
+            })?;
+            raw.trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(|value| value.min(crate::governor::HARD_SESSION_CEILING))
+                .ok_or_else(|| {
+                    "provider capacity evidence is invalid: T_HUB_PROVIDER_SESSION_CAPACITY must be a positive integer"
+                        .to_string()
+                })
+        });
+        // Most existing unit tests exercise unrelated control behavior. They get
+        // explicit deterministic provider evidence, while dedicated regressions
+        // replace this closure with unavailable and exhausted evidence.
+        #[cfg(test)]
+        let provider_capacity: ProviderCapacityFn =
+            Arc::new(|| Ok(crate::governor::HARD_SESSION_CEILING));
         Self {
             status,
             supervisor,
@@ -23415,6 +23710,8 @@ impl ControlContext {
             apply_sink: None,
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
+            provider_capacity,
+            live_sessions: Arc::new(|| tmux::list_sessions().map_err(|error| error.to_string())),
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
             dispatch_reservations: Arc::new(DispatchReservations::default()),
@@ -23457,6 +23754,24 @@ impl ControlContext {
     #[cfg(test)]
     pub fn with_governor(mut self, governor: Arc<SpawnGovernor>) -> Self {
         self.governor = governor;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_provider_capacity(
+        mut self,
+        provider_capacity: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.provider_capacity = Arc::new(provider_capacity);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_live_sessions(
+        mut self,
+        live_sessions: impl Fn() -> Result<Vec<String>, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.live_sessions = Arc::new(live_sessions);
         self
     }
 
@@ -23610,6 +23925,62 @@ mod tests {
                 .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)));
         ctx.host_token = token.to_string();
         ctx
+    }
+
+    fn seed_starting_agent(ctx: &ControlContext, agent_session_id: &str) {
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "capacity-project".into(),
+                name: "Capacity Project".into(),
+                repo_root: "/tmp/capacity-project".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("capacity-captain", Some("capacity-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "capacity-ship",
+                "capacity-project",
+                "Capacity assignment",
+                "codex",
+            )
+            .unwrap();
+        let (lane_claim, dispatch_capacity) =
+            test_dispatch_evidence("capacity-lane", agent_session_id);
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: agent_session_id.into(),
+                captain_session_id: "capacity-captain".into(),
+                project_id: "capacity-project".into(),
+                assignment: "Pending durable start".into(),
+                directory: "/tmp/capacity-agent".into(),
+                worktree_path: None,
+                branch: None,
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Starting,
+                work_stage: crate::agent_session::WorkStage::Assigned,
+                delivery: Some(crate::agent_session::DeliveryProvenance::new(
+                    "1111111111111111111111111111111111111111",
+                    false,
+                )),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
     }
 
     fn test_harness_command(harness: &str) -> (std::path::PathBuf, String) {
@@ -30409,6 +30780,7 @@ mod tests {
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -30530,6 +30902,7 @@ mod tests {
                 lane_claim: Some(interface_lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(interface_dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -30561,6 +30934,7 @@ mod tests {
                 lane_claim: Some(incomplete_lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(incomplete_dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -30589,6 +30963,7 @@ mod tests {
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -30892,6 +31267,234 @@ mod tests {
     }
 
     #[test]
+    fn spawn_admission_fails_closed_without_tmux_evidence_and_preserves_rate_token() {
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evidence = available.clone();
+        let ctx = test_ctx("tmux-evidence")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(move || {
+                if evidence.load(Ordering::SeqCst) {
+                    Ok(Vec::new())
+                } else {
+                    Err("injected enumeration outage".into())
+                }
+            });
+
+        let refused = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        assert_eq!(refused.code, "refused-evidence");
+        assert!(refused.message.contains("injected enumeration outage"));
+
+        available.store(true, Ordering::SeqCst);
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            "an evidence refusal must not consume the sole rate token"
+        );
+    }
+
+    #[test]
+    fn spawn_admission_fails_closed_without_provider_evidence_and_at_provider_limit() {
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evidence = available.clone();
+        let ctx = test_ctx("provider-evidence")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_provider_capacity(move || {
+                if evidence.load(Ordering::SeqCst) {
+                    Ok(128)
+                } else {
+                    Err("injected provider outage".into())
+                }
+            });
+        let unavailable = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        assert_eq!(unavailable.code, "refused-provider");
+        assert!(unavailable.message.contains("injected provider outage"));
+        available.store(true, Ordering::SeqCst);
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            "a provider-evidence refusal must not consume the sole rate token"
+        );
+
+        let at_limit = test_ctx("provider-limit")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(vec!["th_live0001".into()]))
+            .with_provider_capacity(|| Ok(1));
+        let refusal = admit_spawn(&at_limit, SpawnPurpose::Cortana).unwrap_err();
+        assert_eq!(refusal.code, "provider-capacity");
+    }
+
+    #[test]
+    fn durable_starting_agent_consumes_capacity_before_tmux_exists() {
+        let ctx = test_ctx("pending-start")
+            .with_governor(Arc::new(SpawnGovernor::new(5, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(Vec::new()));
+        seed_starting_agent(&ctx, "pending1");
+
+        assert_eq!(
+            live_session_count(&ctx, &ctx.captains.snapshot()).unwrap(),
+            1
+        );
+        let refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        assert_eq!(refusal.code, "reserved-capacity");
+
+        let same_runtime_visible = test_ctx("pending-visible")
+            .with_governor(Arc::new(SpawnGovernor::new(8, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(vec!["th_pending2".into()]));
+        seed_starting_agent(&same_runtime_visible, "pending2");
+        assert_eq!(
+            live_session_count(
+                &same_runtime_visible,
+                &same_runtime_visible.captains.snapshot()
+            )
+            .unwrap(),
+            1,
+            "a Starting record whose tmux session is visible must not be double counted"
+        );
+    }
+
+    #[test]
+    fn reserved_purposes_fill_only_their_authorized_slot() {
+        let ctx = test_ctx("reserved-purpose")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(vec!["th_existing".into()]));
+        let ordinary = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        assert_eq!(ordinary.code, "reserved-capacity");
+        assert!(admit_spawn(&ctx, SpawnPurpose::FleetAdmin).is_ok());
+        assert!(admit_spawn(&ctx, SpawnPurpose::Recovery).is_ok());
+        assert!(admit_spawn(&ctx, SpawnPurpose::Cortana).is_ok());
+    }
+
+    #[test]
+    fn privileged_admission_purposes_require_the_delegating_supervisor() {
+        let crew = ResolvedIdentity {
+            session_id: "crew-identity".into(),
+            mint_role: crate::identity::Role::Crew,
+            tile: Some("crew-tile".into()),
+            ship_slug: Some("ship-one".into()),
+            fleet_role: None,
+            claude_uuid: None,
+        };
+        assert!(requested_spawn_purpose(
+            "start_agent",
+            &json!({"captainSessionId": "captain-one", "admissionPurpose": "fleet-admin"}),
+            Some(&crew),
+            false,
+        )
+        .is_err());
+        assert!(requested_spawn_purpose(
+            "start_agent",
+            &json!({"captainSessionId": "captain-one", "admissionPurpose": "recovery"}),
+            Some(&crew),
+            false,
+        )
+        .is_err());
+
+        let captain = ResolvedIdentity {
+            session_id: "captain-identity".into(),
+            mint_role: crate::identity::Role::Captain,
+            tile: Some("captain-one".into()),
+            ship_slug: Some("ship-one".into()),
+            fleet_role: Some(FleetRole::Captain),
+            claude_uuid: None,
+        };
+        assert_eq!(
+            requested_spawn_purpose(
+                "start_agent",
+                &json!({"captainSessionId": "captain-one", "admissionPurpose": "ship-admin"}),
+                Some(&captain),
+                false,
+            )
+            .unwrap(),
+            SpawnPurpose::ShipAdmin
+        );
+        assert!(requested_spawn_purpose(
+            "start_agent",
+            &json!({"captainSessionId": "sibling-captain", "admissionPurpose": "ship-admin"}),
+            Some(&captain),
+            false,
+        )
+        .is_err());
+
+        let cortana = ResolvedIdentity {
+            session_id: "cortana-identity".into(),
+            mint_role: crate::identity::Role::Cortana,
+            tile: Some("cortana-one".into()),
+            ship_slug: Some("fleet".into()),
+            fleet_role: Some(FleetRole::Cortana),
+            claude_uuid: None,
+        };
+        assert_eq!(
+            requested_spawn_purpose(
+                "start_agent",
+                &json!({"captainSessionId": "captain-one", "admissionPurpose": "fleet-admin"}),
+                Some(&cortana),
+                false,
+            )
+            .unwrap(),
+            SpawnPurpose::FleetAdmin
+        );
+    }
+
+    #[test]
+    fn generic_spawn_admission_is_atomic_through_runtime_creation_window() {
+        let live = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let evidence = live.clone();
+        let ctx = test_ctx("atomic-generic")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(move || Ok(evidence.lock().unwrap().clone()));
+        let (held_tx, held_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let first_ctx = ctx.clone();
+        let first_live = live.clone();
+        let first = std::thread::spawn(move || {
+            let guard = admit_spawn(&first_ctx, SpawnPurpose::FleetAdmin).unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            first_live.lock().unwrap().push("th_newadmin".into());
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        let second_ctx = ctx.clone();
+        let second = std::thread::spawn(move || {
+            admit_spawn(&second_ctx, SpawnPurpose::Ordinary)
+                .expect_err("ordinary admission must be refused")
+        });
+        assert!(ctx.dispatch_admission.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        let refusal = second.join().unwrap();
+        assert_eq!(refusal.code, "reserved-capacity");
+    }
+
+    #[test]
+    fn create_worktree_organization_command_cannot_bypass_spawn_capacity() {
+        let ctx = test_ctx("worktree-cap")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| {
+                Ok(vec![
+                    "th_live0001".into(),
+                    "th_live0002".into(),
+                    "th_live0003".into(),
+                    "th_live0004".into(),
+                ])
+            });
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "worktree-cap",
+                "create_worktree",
+                json!({"repoRoot": "/tmp/repo", "worktreePath": "/tmp/worktree"}),
+            ),
+        );
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert!(error.contains("dispatch refused"), "got: {error}");
+        assert!(
+            !error.contains("repoRoot"),
+            "handler ran before admission: {error}"
+        );
+    }
+
+    #[test]
     fn dispatch_preflight_admits_six_independent_lanes_with_available_capacity() {
         let ctx =
             test_ctx("dispatch-six").with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)));
@@ -31050,6 +31653,7 @@ mod tests {
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -31247,7 +31851,8 @@ mod tests {
                 "mutableFiles": ["src/start-failure.rs"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
-                "integrationContracts": []
+                "integrationContracts": [],
+                "admissionPurpose": "fleet-admin"
             }),
         )
         .unwrap_err();
@@ -31261,6 +31866,10 @@ mod tests {
             .expect("agent record persisted before launch");
         assert_eq!(agent.runtime_state, RuntimeState::Unavailable);
         assert_eq!(agent.work_stage, crate::agent_session::WorkStage::Stopped);
+        assert_eq!(
+            agent.admission_purpose,
+            crate::governor::AdmissionPurpose::FleetAdmin
+        );
         let events = ctx.captains.snapshot().agent_events;
         assert_eq!(
             events.last().map(|event| event.kind.as_str()),
