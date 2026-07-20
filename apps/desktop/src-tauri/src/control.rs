@@ -10817,6 +10817,7 @@ fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .collect();
     records.sort_by(|left, right| left.agent_session_id.cmp(&right.agent_session_id));
     let total = records.len();
+    let digest = crate::agent_session::snapshot_digest(&records)?;
     let page: Vec<Value> = records
         .into_iter()
         .skip(cursor)
@@ -10830,7 +10831,6 @@ fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         })
         .collect();
     let next_cursor = (cursor + page.len()).min(total);
-    let digest = crate::agent_session::snapshot_digest(&page)?;
     Ok(json!({
         "agents": page,
         "count": page.len(),
@@ -10902,15 +10902,17 @@ fn agent_events(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     }
     let event_cursor = snapshot
         .agent_events
-        .last()
+        .iter()
+        .filter(|event| event.agent_session_id == agent_session_id)
         .map(|event| event.cursor)
+        .max()
         .unwrap_or(after);
-    let events: Vec<_> = snapshot
+    let available: Vec<_> = snapshot
         .agent_events
         .into_iter()
         .filter(|event| event.agent_session_id == agent_session_id && event.cursor > after)
-        .take(limit)
         .collect();
+    let events: Vec<_> = available.iter().take(limit).cloned().collect();
     let count = events.len();
     let next_cursor = events.last().map(|event| event.cursor).unwrap_or(after);
     Ok(json!({
@@ -10919,7 +10921,7 @@ fn agent_events(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "cursor": after.to_string(),
         "nextCursor": next_cursor.to_string(),
         "eventCursor": event_cursor,
-        "hasMore": next_cursor < event_cursor,
+        "hasMore": available.len() > count,
     }))
 }
 
