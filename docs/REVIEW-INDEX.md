@@ -13,13 +13,14 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 
 ## Canonical Current Documents
 
-1. [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) defines the active post-Powder agent-session model and compatibility boundary.
-2. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is supporting roadmap context; Powder-specific sections are historical.
-3. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and agent-session operating model.
-4. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, agent-session evidence, durable dialogue, escalation, review, and completion across the agent organization.
-5. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
-6. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
-7. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
+1. [POST-POWDER-ROADMAP.md](./POST-POWDER-ROADMAP.md) defines the active agent-session roadmap and acceptance gates.
+2. [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) defines the post-Powder agent-session model and compatibility boundary.
+3. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is supporting roadmap context; Powder-specific sections are historical.
+4. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and agent-session operating model.
+5. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, agent-session evidence, durable dialogue, escalation, review, and completion across the agent organization.
+6. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
+7. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
+8. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
 
 ## Current Supporting Specifications
 
@@ -32,6 +33,7 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 - [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md) remains the interaction and path-convention design, while the unified worktree contract governs status and safety.
 - [SESSION_AWARENESS.md](./SESSION_AWARENESS.md) records the existing Claude-oriented event spine, while the two-axis status model governs provider-neutral semantics.
 - [SMOKE-TEST.md](./SMOKE-TEST.md) is a useful regression checklist, but version-specific assertions must be checked against the current phased plan before use.
+- [AGENT-SESSION-SMOKE-0.3.106.md](./AGENT-SESSION-SMOKE-0.3.106.md) is the current version-specific release smoke procedure.
 
 ## Historical Reviews and Shipped Plans
 

@@ -183,7 +183,7 @@ After restart, run the full durable-context recovery sequence before taking acti
 
 - Codex MCP registration is user-global and takes effect for new Codex sessions.
 - The WSL-side MCP binary is installed at `~/.t-hub/bin/t-hub-mcp`; producing it automatically from the Windows release pipeline remains future release work.
-- Codex lifecycle production and provider-aware recovery remain incomplete until the repository's PR-B and PR-C work lands.
+- Provider identity convergence and full provider-aware restart recovery remain release gates tracked in `docs/POST-POWDER-ROADMAP.md`.
 - T-Hub control authority comes from the spawned session capability, not from the presence of the skill or MCP registration.
 - Retired Powder command names may return a structured `powder_retired` compatibility error.
 - Do not start new Powder-backed work or treat legacy Powder fields as current authority.
