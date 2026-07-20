@@ -438,7 +438,7 @@ fn schema_list_agents() -> Value {
             "projectId": { "type": "string" },
             "cursor": { "type": "string", "pattern": "^[0-9]+$", "default": "0" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
-            "state": { "type": "string", "enum": ["active"] }
+            "state": { "type": "string", "enum": ["active", "removed"] }
         },
         "anyOf": [
             { "required": ["captainSessionId"] },
@@ -1161,6 +1161,13 @@ mod tests {
                 "retired tool is still advertised: {name}"
             );
         }
+    }
+
+    #[test]
+    fn agent_listing_schema_exposes_removed_history_filter() {
+        let schema = (find("list_agents").unwrap().input_schema)();
+        let state = schema["properties"]["state"]["enum"].as_array().unwrap();
+        assert_eq!(state, &vec![json!("active"), json!("removed")]);
     }
 
     #[test]
