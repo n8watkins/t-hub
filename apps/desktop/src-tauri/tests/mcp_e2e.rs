@@ -28,13 +28,14 @@ const HELPER_LIFETIME: Duration = Duration::from_secs(60);
 const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
-const POWDER_TOOLS: [(&str, &str); 4] = [
-    ("append_crew_powder_work_log", "organization"),
-    ("read_crew_powder_evidence", "read"),
-    ("review_crew_powder_criterion", "organization"),
-    ("complete_crew_powder", "process-changing"),
+const RETIRED_POWDER_TOOLS: [&str; 4] = [
+    "append_crew_powder_work_log",
+    "read_crew_powder_evidence",
+    "review_crew_powder_criterion",
+    "complete_crew_powder",
 ];
 
+#[allow(dead_code)]
 const FORBIDDEN_AUTHORITY_FIELDS: [&str; 22] = [
     "card",
     "cardId",
@@ -1177,6 +1178,9 @@ fn wait_for_path(path: &Path, label: &str) {
     }
 }
 
+// Historical integration fixture retained for reference only. Retired Powder
+// operations must never be exercised by the active MCP E2E suite.
+#[cfg(any())]
 #[test]
 fn powder_tools_reach_real_authenticated_dispatcher() {
     let bin = locate_mcp_binary();
@@ -1586,24 +1590,11 @@ fn end_to_end_mcp_round_trip() {
             "tools/list missing baseline tool {required}"
         );
     }
-    for (name, tier) in POWDER_TOOLS {
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap_or_else(|| panic!("tools/list missing {name}"));
-        assert_eq!(tool["annotations"]["t-hubTier"], tier, "{name}");
-        assert_eq!(
-            tool["annotations"]["confirmationRequired"],
-            name == "complete_crew_powder",
-            "{name}"
+    for name in RETIRED_POWDER_TOOLS {
+        assert!(
+            tools.iter().all(|tool| tool["name"] != name),
+            "retired Powder tool {name} must not be advertised"
         );
-        assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
-        for field in FORBIDDEN_AUTHORITY_FIELDS {
-            assert!(
-                tool["inputSchema"]["properties"].get(field).is_none(),
-                "{name} must not expose {field} substitution"
-            );
-        }
     }
 
     let health = mcp.request(json!({

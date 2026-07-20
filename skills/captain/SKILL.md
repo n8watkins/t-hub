@@ -40,12 +40,12 @@ Treat model conversation history as a cache, never as the source of truth.
 Run this recovery sequence at initial bootstrap and after compaction, `/new`, conversation replacement, T-Hub restart, or WSL restart.
 
 1. Load the T-Hub captain manifest for the current terminal or ship when one exists.
-2. Resolve the registered project, canonical repository root, assignment, Powder repository binding, and ship slug from that manifest.
+2. Resolve the registered project, canonical repository root, assignment, and ship slug from that manifest.
 3. Reconcile the manifest against `list_terminals`, `list_captains`, live terminal reads, Git worktrees, and provider conversation identifiers.
-4. When Powder is configured, read the ship's active cards, runs, claims, work logs, blockers, and awaiting-input records before accepting new work.
+4. Read the ship's durable agent sessions, checkpoints, events, blockers, branches, and worktrees before accepting new work.
 5. Classify saved crew as live, recoverable, orphaned, or removed from observed evidence; never assume liveness from saved state alone.
-6. Produce a one-screen resume point containing the assignment, active crew, Powder work, pending decisions, branches or PRs, blockers, and next ordered action.
-7. Refuse to staff new crew while the project, ship, capability, or Powder claim state is ambiguous.
+6. Produce a one-screen resume point containing the assignment, active agents, pending decisions, branches or PRs, blockers, and next ordered action.
+7. Refuse to staff new agents while the project, ship, capability, or ownership state is ambiguous.
 
 Until the structured T-Hub manifest is available, use the legacy ship file described below as the durable fallback.
 
@@ -86,17 +86,16 @@ Use separate tabs for separate projects, not for every worktree.
 ## Staff Crew
 
 1. Decompose the assignment into independent tasks with non-overlapping ownership where practical.
-2. Require an authoritative Powder card mapped to the Captain project's Powder repository before staffing.
-3. Select the project's canonical checkout or prepare an isolated Git worktree with a short branch and an explicit path.
-4. Do not use `create_worktree`, `spawn_terminal`, raw tmux, Codex collaboration subagents, or Claude subagents to start durable Crew.
-5. Call `dispatch_crew` with the Captain address, Powder `cardId`, full task brief, `worktreePath`, branch, shared project tab, and `harness: "codex"` or `harness: "claude"`.
-6. Treat `dispatch_crew` as one transaction that validates the project checkout, validates and claims the Powder card, persists the Crew binding, launches the selected harness, verifies harness liveness, and rolls back on failure.
-7. Do not send a second prose brief after dispatch because the task passed to `dispatch_crew` is the authoritative launch prompt.
-8. Read the terminal after dispatch and verify that the selected harness is active and the prompt contains the expected ship, card, run, checkout, and Captain session.
-9. Add the returned terminal, worktree, branch, harness, conversation identifier, Powder card, and run to the durable roster immediately.
-10. If dispatch reports incomplete rollback, stop staffing and reconcile the retained Crew binding and Powder claim before retrying.
+2. Select the project's canonical checkout or prepare an isolated Git worktree with a short branch and an explicit path.
+3. Start each durable agent through `start_agent` with a stable `requestId`, the owning Captain session, an explicit assignment, an existing directory, and the selected harness.
+4. Treat the assignment passed to `start_agent` as the authoritative launch prompt.
+5. Verify the returned agent session ID, directory, worktree, branch, harness, runtime state, work stage, and assignment-delivery result.
+6. Add the returned agent session, worktree, branch, harness, and conversation identifier to the durable roster immediately.
+7. Use `list_agents`, `get_agent`, and `agent_events` for bounded supervision.
+8. Ask agents to use `agent_checkpoint` for concise progress and handoff summaries.
+9. Treat launch failure, unavailable state, missing terminal, and stale ownership as honest failure states requiring reconciliation.
 
-Build the `task` passed to `dispatch_crew` as one concise brief containing scope, constraints, definition of done, owned files or boundaries, required tests, commit and push expectations, escalation rules, and the exact final completion command `touch /tmp/t-hub-crew-done/<ship-slug>/<crew-name>.done`.
+Build the `assignment` passed to `start_agent` as one concise brief containing scope, constraints, definition of done, owned files or boundaries, required tests, commit and push expectations, escalation rules, and the exact final completion command `touch /tmp/t-hub-crew-done/<ship-slug>/<crew-name>.done`.
 
 Use the same dispatch flow for Codex and Claude Crew.
 Choose the harness deliberately from task needs and repository policy rather than inheriting it accidentally from the Captain.
@@ -186,5 +185,5 @@ After restart, run the full durable-context recovery sequence before taking acti
 - The WSL-side MCP binary is installed at `~/.t-hub/bin/t-hub-mcp`; producing it automatically from the Windows release pipeline remains future release work.
 - Codex lifecycle production and provider-aware recovery remain incomplete until the repository's PR-B and PR-C work lands.
 - T-Hub control authority comes from the spawned session capability, not from the presence of the skill or MCP registration.
-- Powder-backed projects require a configured production endpoint and agent-authorized Powder MCP surface.
-- Never emulate a Powder claim locally or dispatch new Powder-backed work while authoritative claim state is unavailable.
+- Retired Powder command names may return a structured `powder_retired` compatibility error.
+- Do not start new Powder-backed work or treat legacy Powder fields as current authority.
