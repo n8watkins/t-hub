@@ -24195,6 +24195,9 @@ mod tests {
         ))
     }
 
+    const SCHEMA_13_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-13.json");
+    const SCHEMA_17_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-17.json");
+
     /// A crew ref's tile ids, for concise assertions.
     fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
         rec.crew.iter().map(|c| c.terminal_id.clone()).collect()
@@ -26249,6 +26252,88 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.schema_version, CAPTAINS_SCHEMA_VERSION);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_13_fixture_loads_without_network_access() {
+        let path = captains_tmp("schema-13-fixture-load");
+        std::fs::write(&path, SCHEMA_13_REGISTRY_FIXTURE).unwrap();
+
+        let snapshot = CaptainsRegistry::read_snapshot(&path).unwrap();
+        assert_eq!(snapshot.schema_version, 13);
+        assert_eq!(snapshot.captains[0].ship_slug, "aurora");
+        assert_eq!(
+            snapshot.captains[0].crew[0].terminal_id,
+            "tile-aurora-worker"
+        );
+        assert_eq!(
+            snapshot.projects[0].remote_url.as_deref(),
+            Some("https://example.invalid/aurora.git")
+        );
+
+        let loaded = CaptainsRegistry::load(path.clone());
+        assert_eq!(loaded.snapshot().seq, 41);
+        assert!(loaded.snapshot().agent_sessions.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_13_fixture_first_write_creates_migration_backup() {
+        let path = captains_tmp("schema-13-fixture-migration-backup");
+        std::fs::write(&path, SCHEMA_13_REGISTRY_FIXTURE).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        registry
+            .claim_provider(
+                "tile-lyra-captain",
+                Some("lyra"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        let prefix = format!("{file_name}.migration-v17.");
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            SCHEMA_13_REGISTRY_FIXTURE
+        );
+
+        for backup in backups {
+            let _ = std::fs::remove_file(backup.path());
+        }
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_17_fixture_loads_without_network_access() {
+        let path = captains_tmp("schema-17-fixture-load");
+        std::fs::write(&path, SCHEMA_17_REGISTRY_FIXTURE).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.schema_version, 17);
+        assert_eq!(snapshot.seq, 108);
+        assert_eq!(
+            snapshot.agent_sessions[0].agent_session_id,
+            "agent-aurora-17"
+        );
+        assert_eq!(snapshot.agent_checkpoints[0].cursor, 7);
+        assert_eq!(snapshot.agent_events[0].kind, "checkpoint");
+
         let _ = std::fs::remove_file(path);
     }
 
