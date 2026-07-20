@@ -16659,6 +16659,7 @@ fn commission_captain(
         .dispatch_admission
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let _provision = ctx.captains.provision_guard();
     if let Some(response) =
         inspect_commission_contract(ctx, &project, &ship_slug, &assignment, harness)?
@@ -16748,7 +16749,11 @@ fn commission_captain(
     }
     let identity = match ctx
         .identity
-        .mint_for(crate::identity::Role::Captain, Some(ship_slug.clone()))
+        .mint_and_bind(
+            crate::identity::Role::Captain,
+            Some(ship_slug.clone()),
+            &terminal_id,
+        )
     {
         Ok(identity) => identity,
         Err(error) => {
@@ -16775,15 +16780,6 @@ fn commission_captain(
             .captains
             .abort_close_terminal_operation(&operation.operation_id);
         return Err(error);
-    }
-    if let Err(error) = ctx.identity.bind_tile(&identity.id, &terminal_id) {
-        let _ = ctx.identity.retire(&identity.id);
-        let _ = ctx
-            .captains
-            .abort_close_terminal_operation(&operation.operation_id);
-        return Err(format!(
-            "commission_captain: identity binding failed before tmux startup: {error}"
-        ));
     }
     let tmux_cwd = files::posix_form(&project.repo_root);
     let pane = crate::commands::pane_command(None, Some(&startup_command));
@@ -16839,17 +16835,14 @@ fn commission_captain(
         ctx.captains
             .fail_next_persist("commission binding persistence failure");
     }
-    let claim = {
-        let _identity_transaction = ctx.tabs.identity_transaction();
-        claim_captain_locked(
-            ctx,
-            &claim_args,
-            None,
-            true,
-            Some((&project.project_id, &assignment, harness.as_provider())),
-            false,
-        )
-    };
+    let claim = claim_captain_locked(
+        ctx,
+        &claim_args,
+        None,
+        true,
+        Some((&project.project_id, &assignment, harness.as_provider())),
+        false,
+    );
     if let Err(error) = claim {
         let _ = tmux::kill_session_tree(&tmux_session);
         let _ = ctx.identity.retire(&identity.id);
@@ -16977,6 +16970,8 @@ fn attach_captain(
         .map(|value| slugify_ship(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
+    // Global lock order: identity transaction precedes fleet provisioning.
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let _provision = ctx.captains.provision_guard();
     if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
@@ -17012,7 +17007,6 @@ fn attach_captain(
             captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 || captain.ship_slug == ship_slug
         });
-    let _identity_transaction = ctx.tabs.identity_transaction();
     let previous_workspace = ctx.tabs.workspace_for_tile(&terminal_id);
     claim_captain_locked(
         ctx,
@@ -25867,7 +25861,9 @@ fn spawn_terminal_with_private_pane_command_and_id(
         ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref())
     };
 
-    if placed_tab.is_none() {
+    // A headless client may have no Work tab yet. Placement can be adopted by
+    // the UI later; only exact placement is a hard requirement.
+    if placed_tab.is_none() && require_exact_tab {
         let _ = tmux::kill_session_tree(&tmux_session);
         ctx.tabs.retire_tile_locked(&id);
         if let Some(identity) = &minted_identity {
