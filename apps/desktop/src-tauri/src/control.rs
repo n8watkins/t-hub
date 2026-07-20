@@ -9576,6 +9576,7 @@ struct AuthenticatedCaptainAuthority {
     generation: ScopedAuthorityGeneration,
 }
 
+#[cfg(test)]
 fn enforce_removed_crew_powder_cleanup_authority(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
@@ -16312,6 +16313,7 @@ fn bound_powder_cleanup_reality(
     }
 }
 
+#[cfg(test)]
 fn validate_historical_powder_release(
     scope: &CrewPowderScope,
     card: &powder::CardEvidence,
@@ -16365,6 +16367,7 @@ fn validate_historical_powder_release(
     Ok(())
 }
 
+#[cfg(test)]
 fn historical_powder_read_error(
     crew_session_id: &str,
     evidence_kind: &str,
@@ -16578,6 +16581,7 @@ fn release_crew_powder_binding(ctx: &ControlContext, crew_session_id: &str) -> O
     release_crew_powder_binding_guarded(ctx, crew_session_id)
 }
 
+#[cfg(test)]
 fn finalize_crew_powder_cleanup(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -16589,6 +16593,7 @@ fn finalize_crew_powder_cleanup(
     finalize_crew_powder_cleanup_guarded(ctx, crew_session_id, preserve_crew_on_powder_failure)
 }
 
+#[cfg(test)]
 fn finalize_crew_powder_cleanup_guarded(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -16737,11 +16742,13 @@ pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
 /// client every 15 seconds creates needless process churn. Entries expire to
 /// observe healthy profile changes, and callers invalidate immediately after an
 /// upstream or authorization failure so rotated credentials recover next poll.
+#[cfg(test)]
 struct TimedProfileCache<T> {
     entries: std::collections::HashMap<String, (Instant, T)>,
     ttl: Duration,
 }
 
+#[cfg(test)]
 impl<T> TimedProfileCache<T> {
     fn new(ttl: Duration) -> Self {
         Self {
@@ -16781,6 +16788,7 @@ impl<T> TimedProfileCache<T> {
     }
 }
 
+#[cfg(test)]
 fn powder_event_poll_interval() -> Duration {
     let seconds = std::env::var("T_HUB_POWDER_EVENT_POLL_SECS")
         .ok()
@@ -16796,6 +16804,7 @@ fn powder_event_poll_interval() -> Duration {
 /// Captain or Project.  A release-reclaim ABA can replace that binding while the
 /// original release response is ambiguous, and recovery must not touch the
 /// replacement's profile or repository.
+#[cfg(test)]
 fn recover_pending_dispatch_release(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
@@ -16814,6 +16823,7 @@ fn recover_pending_dispatch_release(
     recover_pending_dispatch_release_guarded(ctx, &current)
 }
 
+#[cfg(test)]
 fn ensure_recovery_terminal_gone(crew_session_id: &str) -> Result<(), String> {
     let target = tmux_target(crew_session_id);
     match tmux::session_liveness(&target) {
@@ -16838,6 +16848,7 @@ fn ensure_recovery_terminal_gone(crew_session_id: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn clear_confirmed_dispatch_release_and_retire(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
@@ -16853,6 +16864,7 @@ fn clear_confirmed_dispatch_release_and_retire(
     Ok(())
 }
 
+#[cfg(test)]
 fn recover_pending_dispatch_release_guarded(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
@@ -16861,6 +16873,7 @@ fn recover_pending_dispatch_release_guarded(
     clear_confirmed_dispatch_release_and_retire(ctx, recovery)
 }
 
+#[cfg(test)]
 fn apply_pending_dispatch_release_effect_guarded(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
@@ -16965,6 +16978,7 @@ fn apply_pending_dispatch_release_effect_guarded(
     Ok(())
 }
 
+#[cfg(test)]
 fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
     for recovery in ctx.captains.snapshot().pending_dispatch_releases {
         if ctx
@@ -16993,6 +17007,7 @@ fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
     }
 }
 
+#[cfg(test)]
 fn reconcile_powder_leases(ctx: &ControlContext) {
     reconcile_pending_dispatch_releases(ctx);
     let snapshot = ctx.captains.snapshot();
@@ -17111,6 +17126,7 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
     }
 }
 
+#[cfg(test)]
 fn reconcile_powder_events(ctx: &ControlContext, clients: &mut TimedProfileCache<powder::Client>) {
     let snapshot = ctx.captains.snapshot();
     for project in &snapshot.projects {
@@ -17226,6 +17242,7 @@ fn apply_powder_events(
     cursor
 }
 
+#[cfg(test)]
 fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, error: String) {
     ctx.fanout.emit_event(
         "control://powder",
