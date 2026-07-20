@@ -21,6 +21,7 @@ mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
+pub mod delegated_admin; // durable Ship Admin and Fleet Admin grants, scope, revocation, and audit attribution
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
