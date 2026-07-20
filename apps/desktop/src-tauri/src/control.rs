@@ -2804,6 +2804,7 @@ pub struct CaptainsRegistry {
     #[cfg(test)]
     powder_operation_wait_hook: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
     #[cfg(test)]
+    #[allow(dead_code)]
     historical_scope_capture_hook: Mutex<Option<HistoricalScopeCaptureHook>>,
     #[cfg(test)]
     dispatch_barrier: Mutex<Option<DispatchBarrier>>,
@@ -2841,6 +2842,7 @@ struct CrewPowderOperationGuard<'a> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 struct HistoricalScopeCaptureHook {
     authenticated: std::sync::mpsc::SyncSender<String>,
     resume: std::sync::mpsc::Receiver<()>,
@@ -4154,6 +4156,7 @@ impl CaptainsRegistry {
             .cloned()
     }
 
+    #[allow(dead_code)]
     fn close_operation_owns_dispatch_release(&self, recovery: &PendingDispatchRelease) -> bool {
         self.lock()
             .pending_fleet_operations
@@ -6933,6 +6936,7 @@ impl CaptainsRegistry {
 
     /// Clear only an exact Active binding after Powder authoritatively confirms
     /// its release. Pending/completed proof state and live Crew are never erased.
+    #[allow(dead_code)]
     fn clear_released_crew_powder_binding(
         &self,
         crew_session_id: &str,
@@ -6985,6 +6989,7 @@ impl CaptainsRegistry {
     /// part of the scope used for remote evidence is still exact. Remote reads stay
     /// outside registry locks; this final durable mutation fails closed if ownership,
     /// Project identity, Project Powder authority, or the Removed Crew row changed.
+    #[allow(dead_code)]
     fn compare_and_clear_released_removed_crew_powder_binding(
         &self,
         expected: &CrewPowderScope,
@@ -7223,6 +7228,7 @@ impl CaptainsRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
     }
 
+    #[allow(dead_code)]
     fn set_historical_scope_capture_hook(
         &self,
         authenticated: std::sync::mpsc::SyncSender<String>,
@@ -7251,6 +7257,7 @@ impl CaptainsRegistry {
         )
     }
 
+    #[allow(dead_code)]
     fn test_remove_captain_and_project(
         &self,
         ship_slug: &str,
@@ -7275,6 +7282,7 @@ impl CaptainsRegistry {
         self.commit_mutation(g, previous)
     }
 
+    #[allow(dead_code)]
     fn test_restore_captain_and_project(
         &self,
         captain: CaptainRecord,
@@ -7298,6 +7306,7 @@ impl CaptainsRegistry {
         self.commit_mutation(g, previous)
     }
 
+    #[allow(dead_code)]
     fn pause_before_historical_scope_capture(&self, crew_session_id: &str) {
         let mut hook = self
             .historical_scope_capture_hook
@@ -9569,6 +9578,7 @@ fn revalidate_target_lifecycle_authority(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 struct AuthenticatedCaptainAuthority {
     terminal_id: String,
     ship_slug: String,
@@ -9577,6 +9587,7 @@ struct AuthenticatedCaptainAuthority {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn enforce_removed_crew_powder_cleanup_authority(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
@@ -13244,6 +13255,7 @@ fn rollback_crew_dispatch(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn require_confirmed_powder_release(crew_session_id: &str, closed: &Value) -> Result<(), String> {
     let release = closed.get("powderRelease").ok_or_else(|| {
         format!(
@@ -14220,6 +14232,7 @@ struct CrewPowderScope {
     captain_role: FleetRole,
     captain_terminal_id: Option<String>,
     captain_state: ClaimState,
+    #[allow(dead_code)]
     authenticated_captain_terminal_id: Option<String>,
     project_id: String,
     project_repo_root: String,
@@ -14464,6 +14477,7 @@ fn exact_powder_scope_indices(
     Ok((captain_index, crew_index))
 }
 
+#[allow(dead_code)]
 fn resolve_historical_removed_crew_powder_scope(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -14697,6 +14711,7 @@ fn bound_powder_reality(
     Ok(BoundPowderReality::Active)
 }
 
+#[allow(dead_code)]
 fn observed_completion_digest(scope: &CrewPowderScope) -> String {
     let marker = format!(
         "observed-completion\0{}\0{}\0{}",
@@ -16247,6 +16262,7 @@ fn require_live_crew_harness(scope: &CrewPowderScope, command: &str) -> Result<(
     }
 }
 
+#[allow(dead_code)]
 fn renew_crew_powder_binding(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -16283,6 +16299,7 @@ fn renew_crew_powder_binding_guarded(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum PowderCleanupDisposition {
     AlreadyCompleted,
     AlreadyReleased,
@@ -16292,12 +16309,14 @@ enum PowderCleanupDisposition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum BoundPowderCleanupReality {
     Active,
     Completed,
     Released,
 }
 
+#[allow(dead_code)]
 fn bound_powder_cleanup_reality(
     scope: &CrewPowderScope,
     card: &powder::CardEvidence,
@@ -16314,6 +16333,7 @@ fn bound_powder_cleanup_reality(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn validate_historical_powder_release(
     scope: &CrewPowderScope,
     card: &powder::CardEvidence,
@@ -16368,6 +16388,7 @@ fn validate_historical_powder_release(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn historical_powder_read_error(
     crew_session_id: &str,
     evidence_kind: &str,
@@ -16387,6 +16408,7 @@ fn historical_powder_read_error(
     }
 }
 
+#[allow(dead_code)]
 fn powder_cleanup_disposition(
     state: &PowderWorkState,
     reality: BoundPowderCleanupReality,
@@ -16408,6 +16430,7 @@ fn powder_cleanup_disposition(
     }
 }
 
+#[allow(dead_code)]
 fn release_crew_powder_binding_guarded(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -16789,6 +16812,7 @@ impl<T> TimedProfileCache<T> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn powder_event_poll_interval() -> Duration {
     let seconds = std::env::var("T_HUB_POWDER_EVENT_POLL_SECS")
         .ok()
@@ -17127,6 +17151,7 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn reconcile_powder_events(ctx: &ControlContext, clients: &mut TimedProfileCache<powder::Client>) {
     let snapshot = ctx.captains.snapshot();
     for project in &snapshot.projects {
@@ -17171,6 +17196,7 @@ fn reconcile_powder_events(ctx: &ControlContext, clients: &mut TimedProfileCache
     }
 }
 
+#[allow(dead_code)]
 fn apply_powder_events(
     ctx: &ControlContext,
     project: &ProjectRecord,
@@ -17243,6 +17269,7 @@ fn apply_powder_events(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, error: String) {
     ctx.fanout.emit_event(
         "control://powder",
@@ -19759,6 +19786,7 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     close_terminal_with_policy(ctx, args, false, None)
 }
 
+#[allow(dead_code)]
 fn retain_crew_binding_after_powder_failure(
     preserve_on_failure: bool,
     cleanup_was_pending: bool,
@@ -41675,6 +41703,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
+    #[allow(dead_code)]
     enum HistoricalProjectScopeRace {
         ProfileRebind,
         RepositoryRebind,
@@ -41705,6 +41734,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn assert_removed_crew_historical_cleanup_scope_race(race: HistoricalProjectScopeRace) {
         let server = LoopbackPowderServer::start(2);
         {
@@ -41896,6 +41926,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
+    #[allow(dead_code)]
     enum HistoricalScopeAba {
         CaptainReleaseReclaim,
         CrewWork,
@@ -41916,6 +41947,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn assert_removed_crew_historical_cleanup_rejects_aba(race: HistoricalScopeAba) {
         let server = LoopbackPowderServer::start(2);
         {

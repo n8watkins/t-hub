@@ -78,6 +78,7 @@ pub struct Claim {
 /// The tag is derived from protected profile material and must never be
 /// accepted through ordinary string comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum EndpointIdentityVerificationError {
     MissingCredential,
     MalformedIdentity,
@@ -834,6 +835,7 @@ impl Client {
 
     /// Verifies a persisted HMAC-SHA-256 endpoint identity without exposing or
     /// comparing the protected endpoint as a formatted string.
+    #[allow(dead_code)]
     pub fn verify_endpoint_identity(
         &self,
         identity: &str,
@@ -2951,6 +2953,7 @@ fn public_endpoint_origin(base_url: &str) -> String {
     format!("{scheme}://{authority}")
 }
 
+#[allow(dead_code)]
 fn decode_endpoint_identity_tag(
     identity: &str,
 ) -> Result<[u8; 32], EndpointIdentityVerificationError> {
@@ -2971,6 +2974,7 @@ fn decode_endpoint_identity_tag(
     Ok(tag)
 }
 
+#[allow(dead_code)]
 fn endpoint_identity_hex_digit(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
