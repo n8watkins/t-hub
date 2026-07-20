@@ -156,6 +156,11 @@ Worktree removal and reuse remain unavailable until one authoritative worktree s
 The CLI and MCP adapters serialize the same request and response schemas and do not make independent authorization decisions.
 
 Delivery output must preserve `implemented`, `reviewed`, `tested`, `complete`, `integrated`, `packaged`, `installed`, and `live-verified` as separate facts.
+Every new `integrated` evidence object must include the authenticated integration owner and the ordered, bounded, unique lane inputs whose exact baseline and resulting commits produced the canonical integration.
+Legacy integration evidence without a manifest remains readable but must not report the `integrated` state.
+Every new `packaged` evidence object must include the branch, exact source baseline and source commit, exact Git tree, version, installer SHA-256, build time, signature status, artifact ID, and reference.
+The artifact `recordedAt` field is the server audit time, while `manifest.builtAt` is the asserted build completion time in Unix epoch milliseconds and must fall between the integration and artifact record times, inclusive.
+Legacy artifact evidence without a complete manifest remains readable but must not report the `packaged` state.
 
 ## Testing Requirements
 

@@ -11856,6 +11856,64 @@ fn evidence_string(evidence: &Value, field: &str, state: &str) -> Result<String,
         })
 }
 
+fn validate_registered_integration_inputs(
+    ctx: &ControlContext,
+    target_agent: &AgentSessionRecord,
+    manifest: &crate::agent_session::IntegrationManifest,
+) -> Result<(), String> {
+    let snapshot = ctx.captains.snapshot();
+    for input in &manifest.inputs {
+        let registered = snapshot
+            .agent_sessions
+            .iter()
+            .find(|agent| agent.agent_session_id == input.agent_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "record_agent_delivery integrated manifest agentSessionId '{}' is not registered",
+                    input.agent_session_id
+                )
+            })?;
+        if registered.project_id != target_agent.project_id {
+            return Err(format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' belongs to a different project",
+                input.agent_session_id
+            ));
+        }
+        if registered
+            .lane_claim
+            .as_ref()
+            .map(|lane| lane.lane_id.as_str())
+            != Some(input.lane_id.as_str())
+        {
+            return Err(format!(
+                "record_agent_delivery integrated manifest laneId '{}' does not match agentSessionId '{}'",
+                input.lane_id, input.agent_session_id
+            ));
+        }
+        let delivery = registered.delivery.as_ref().ok_or_else(|| {
+            format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' has no delivery provenance",
+                input.agent_session_id
+            )
+        })?;
+        if delivery.source_baseline != input.source_baseline
+            || delivery.resulting_commit.as_deref() != Some(input.resulting_commit.as_str())
+        {
+            return Err(format!(
+                "record_agent_delivery integrated manifest commits do not match agentSessionId '{}'",
+                input.agent_session_id
+            ));
+        }
+        if !delivery.states().complete {
+            return Err(format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' is not complete",
+                input.agent_session_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn record_agent_delivery(
     ctx: &ControlContext,
     args: &Value,
@@ -11944,27 +12002,57 @@ fn record_agent_delivery(
                     "canonicalBaseline",
                     "canonicalCommit",
                     "reference",
+                    "manifest",
                 ],
             )?;
+            let manifest = serde_json::from_value::<crate::agent_session::IntegrationManifest>(
+                evidence
+                    .get("manifest")
+                    .cloned()
+                    .ok_or("record_agent_delivery integrated requires evidence.manifest")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery integrated manifest is invalid: {error}")
+            })?;
+            let source_commit = evidence_string(evidence, "sourceCommit", &state)?;
+            manifest.validate_for_source_commit(&source_commit)?;
+            if manifest.integration_owner_identity != actor_identity {
+                return Err(
+                    "record_agent_delivery integrated manifest.integrationOwnerIdentity must equal the authenticated actor identity"
+                        .into(),
+                );
+            }
+            validate_registered_integration_inputs(ctx, &agent, &manifest)?;
             AgentDeliveryUpdate::Integrated(crate::agent_session::IntegrationEvidence {
-                source_commit: evidence_string(evidence, "sourceCommit", &state)?,
+                source_commit,
                 canonical_baseline: evidence_string(evidence, "canonicalBaseline", &state)?,
                 canonical_commit: evidence_string(evidence, "canonicalCommit", &state)?,
                 reference: evidence_string(evidence, "reference", &state)?,
                 recorded_at,
+                manifest: Some(manifest),
             })
         }
         "packaged" => {
             let evidence = required_delivery_evidence(
                 args,
                 &state,
-                &["artifactId", "sourceBaseline", "reference"],
+                &["artifactId", "sourceBaseline", "reference", "manifest"],
             )?;
+            let manifest = serde_json::from_value::<crate::agent_session::ArtifactManifest>(
+                evidence
+                    .get("manifest")
+                    .cloned()
+                    .ok_or("record_agent_delivery packaged requires evidence.manifest")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery packaged manifest is invalid: {error}")
+            })?;
             AgentDeliveryUpdate::Packaged(crate::agent_session::ArtifactEvidence {
                 artifact_id: evidence_string(evidence, "artifactId", &state)?,
                 source_baseline: evidence_string(evidence, "sourceBaseline", &state)?,
                 reference: evidence_string(evidence, "reference", &state)?,
                 recorded_at,
+                manifest: Some(manifest),
             })
         }
         "installed" => {
@@ -30361,6 +30449,90 @@ mod tests {
         ctx.captains
             .record_crew("captain-delivery", "agent-delivery")
             .unwrap();
+        ctx.captains
+            .record_crew("captain-delivery", "agent-interface")
+            .unwrap();
+        ctx.captains
+            .record_crew("captain-delivery", "agent-incomplete")
+            .unwrap();
+        let mut interface_delivery = crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+        interface_delivery
+            .record_implementation("4444444444444444444444444444444444444444")
+            .unwrap();
+        interface_delivery
+            .record_review(crate::agent_session::ReviewEvidence {
+                commit: "4444444444444444444444444444444444444444".into(),
+                reviewer_identity: "reviewer-interface".into(),
+                reference: "review://interface".into(),
+                recorded_at: 2,
+            })
+            .unwrap();
+        interface_delivery
+            .record_acceptance_test(crate::agent_session::AcceptanceTestEvidence {
+                commit: "4444444444444444444444444444444444444444".into(),
+                runner_identity: "tester-interface".into(),
+                reference: "test://interface".into(),
+                environment: crate::agent_session::AcceptanceEnvironment::Source,
+                recorded_at: 2,
+            })
+            .unwrap();
+        let (interface_lane_claim, interface_dispatch_capacity) =
+            test_dispatch_evidence("shared-interface", "agent-interface");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-interface".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Define the shared interface".into(),
+                directory: "/tmp/project-delivery-interface".into(),
+                worktree_path: None,
+                branch: Some("shared-interface".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Exited,
+                work_stage: crate::agent_session::WorkStage::Complete,
+                delivery: Some(interface_delivery),
+                lane_claim: Some(interface_lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(interface_dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+        let mut incomplete_delivery =
+            crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+        incomplete_delivery
+            .record_implementation("6666666666666666666666666666666666666666")
+            .unwrap();
+        let (incomplete_lane_claim, incomplete_dispatch_capacity) =
+            test_dispatch_evidence("incomplete-lane", "agent-incomplete");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-incomplete".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Incomplete lane".into(),
+                directory: "/tmp/project-delivery-incomplete".into(),
+                worktree_path: None,
+                branch: Some("incomplete-lane".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Idle,
+                work_stage: crate::agent_session::WorkStage::Working,
+                delivery: Some(incomplete_delivery),
+                lane_claim: Some(incomplete_lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(incomplete_dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
         let (lane_claim, dispatch_capacity) =
             test_dispatch_evidence("lane-delivery", "agent-delivery");
         ctx.captains
@@ -30397,6 +30569,7 @@ mod tests {
             .bind_tile(&captain_identity.id, "captain-delivery")
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let integration_owner_identity = captain.session_id.clone();
         let agent_identity = ctx
             .identity
             .mint_for(crate::identity::Role::Crew, Some("delivery-ship".into()))
@@ -30466,7 +30639,7 @@ mod tests {
         assert_eq!(complete["deliveryStates"]["installed"], false);
         assert_eq!(complete["agent"]["workStage"], "complete");
 
-        let integrated = dispatch_with_caller(
+        let missing_manifest = dispatch_with_caller(
             &ctx,
             "record_agent_delivery",
             &json!({
@@ -30482,10 +30655,185 @@ mod tests {
             Some(&captain),
             false,
         )
+        .unwrap_err();
+        assert!(missing_manifest.contains("manifest"));
+
+        let integration_evidence = |owner: &str| {
+            json!({
+                "sourceCommit": RESULT,
+                "canonicalBaseline": "main",
+                "canonicalCommit": CANONICAL,
+                "reference": "git://integration",
+                "manifest": {
+                    "integrationOwnerIdentity": owner,
+                    "inputs": [
+                        {
+                            "laneId": "shared-interface",
+                            "agentSessionId": "agent-interface",
+                            "sourceBaseline": BASELINE,
+                            "resultingCommit": "4444444444444444444444444444444444444444"
+                        },
+                        {
+                            "laneId": "lane-delivery",
+                            "agentSessionId": "agent-delivery",
+                            "sourceBaseline": BASELINE,
+                            "resultingCommit": RESULT
+                        }
+                    ]
+                }
+            })
+        };
+        let forged_owner = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": integration_evidence("forged-owner")
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(forged_owner.contains("authenticated actor identity"));
+
+        let mut invented_agent = integration_evidence(&integration_owner_identity);
+        invented_agent["manifest"]["inputs"][0]["agentSessionId"] = json!("invented-agent");
+        let invented_agent = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": invented_agent
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(invented_agent.contains("is not registered"));
+
+        let mut wrong_lane = integration_evidence(&integration_owner_identity);
+        wrong_lane["manifest"]["inputs"][0]["laneId"] = json!("invented-lane");
+        let wrong_lane = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": wrong_lane
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(wrong_lane.contains("does not match"));
+
+        let mut wrong_commits = integration_evidence(&integration_owner_identity);
+        wrong_commits["manifest"]["inputs"][0]["sourceBaseline"] =
+            json!("9999999999999999999999999999999999999999");
+        let wrong_commits = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": wrong_commits
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(wrong_commits.contains("commits do not match"));
+
+        let mut incomplete_input = integration_evidence(&integration_owner_identity);
+        incomplete_input["manifest"]["inputs"][0]["laneId"] = json!("incomplete-lane");
+        incomplete_input["manifest"]["inputs"][0]["agentSessionId"] = json!("agent-incomplete");
+        incomplete_input["manifest"]["inputs"][0]["resultingCommit"] =
+            json!("6666666666666666666666666666666666666666");
+        let incomplete_input = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": incomplete_input
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(incomplete_input.contains("is not complete"));
+
+        let integrated = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": integration_evidence(&integration_owner_identity)
+            }),
+            Some(&captain),
+            false,
+        )
         .unwrap();
         assert_eq!(integrated["deliveryStates"]["complete"], true);
         assert_eq!(integrated["deliveryStates"]["integrated"], true);
         assert_eq!(integrated["deliveryStates"]["packaged"], false);
+        assert_eq!(
+            integrated["agent"]["delivery"]["integration"]["manifest"]["inputs"][0]["laneId"],
+            "shared-interface"
+        );
+        let integration_recorded_at = integrated["agent"]["delivery"]["integration"]["recordedAt"]
+            .as_u64()
+            .unwrap();
+
+        let missing_artifact_manifest = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "packaged",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "sourceBaseline": CANONICAL,
+                    "reference": "artifact://windows/installer"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(missing_artifact_manifest.contains("manifest"));
+
+        let packaged = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "packaged",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "sourceBaseline": CANONICAL,
+                    "reference": "artifact://windows/installer",
+                    "manifest": {
+                        "branch": "main",
+                        "sourceCommit": CANONICAL,
+                        "gitTree": "5555555555555555555555555555555555555555",
+                        "version": "0.3.107",
+                        "installerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "builtAt": integration_recorded_at,
+                        "signatureStatus": "verified"
+                    }
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(packaged["deliveryStates"]["integrated"], true);
+        assert_eq!(packaged["deliveryStates"]["packaged"], true);
+        assert_eq!(packaged["deliveryStates"]["installed"], false);
 
         let status = get_agent(
             &ctx,
@@ -30496,6 +30844,7 @@ mod tests {
         .unwrap();
         assert_eq!(status["deliveryStates"]["complete"], true);
         assert_eq!(status["deliveryStates"]["integrated"], true);
+        assert_eq!(status["deliveryStates"]["packaged"], true);
         assert_eq!(status["deliveryStates"]["liveVerified"], false);
         let events = agent_events(
             &ctx,
