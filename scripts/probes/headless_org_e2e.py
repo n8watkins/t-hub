@@ -103,6 +103,25 @@ def main():
     active_name = next(t["name"] for t in lt["tabs"] if t["id"] == active_before)
     print(f"  user's active tab: '{active_name}' ({active_before})")
 
+    # A Captain-only report is an invalid main-window layout. The reserved
+    # Captain Workspace is not a canvas for ordinary terminals, so the server
+    # must reject this before it can strand live sessions out of the UI.
+    err = c.err(
+        "report_workspace_tabs",
+        {
+            "tabs": [
+                {
+                    "id": "captains-reserved",
+                    "name": "Captain Workspace",
+                    "kind": "captain",
+                    "tileIds": [],
+                }
+            ],
+            "activeTabId": "captains-reserved",
+        },
+    )
+    check("Captain-only layout report is refused", "at least one Work Workspace" in err, err)
+
     # ===== Requirement 1: spawn into a NAMED HIDDEN tab, no focus steal ======
     print("\n[1] spawn_terminal tabName=e2e-hidden while another tab is focused")
     r = c.ok("spawn_terminal", {"cwd": "/tmp", "name": "ho-probe", "tabName": "e2e-hidden"})
