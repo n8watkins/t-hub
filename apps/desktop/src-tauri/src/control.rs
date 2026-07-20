@@ -27257,7 +27257,11 @@ mod tests {
             })
             .unwrap();
         ctx.captains
-            .claim_test("captain-start-success", Some("captain-start-success"), vec![])
+            .claim_test(
+                "captain-start-success",
+                Some("captain-start-success"),
+                vec![],
+            )
             .unwrap();
         ctx.captains
             .bind_ship_context(
