@@ -21,7 +21,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/ensure-thub-codex.sh"
 FAILED=0
-EXPECTED_ENV_VARS='["T_HUB_CONTROL_ADDR","T_HUB_CONTROL_TOKEN","T_HUB_SESSION_TOKEN"]'
+EXPECTED_ENV_VARS='["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"]'
 
 pass() { echo "  ok   - $1"; }
 fail() { echo "  FAIL - $1" >&2; FAILED=1; }
@@ -89,9 +89,9 @@ if codex mcp get t-hub --json | jq -e --argjson expected "$EXPECTED_ENV_VARS" '
   .transport.env_vars == $expected and
   (.transport.env == null or .transport.env == {})
 ' >/dev/null; then
-  pass "registration inherits the three T-Hub capability variables"
+  pass "registration inherits the two stable T-Hub identity variables"
 else
-  fail "registration does not inherit the three T-Hub capability variables"
+  fail "registration does not inherit the two stable T-Hub identity variables"
 fi
 if grep -Fq 'sentinel-' "$WORK/config.toml"; then
   fail "registration persisted a capability variable value"
@@ -169,8 +169,7 @@ if codex mcp get t-hub --json | jq -e '
     .enabled == true and .disabled_reason == null and .transport.args == [] and
   (.transport.env == null or .transport.env == {}) and
   .transport.env_vars == [
-    "T_HUB_CONTROL_ADDR",
-    "T_HUB_CONTROL_TOKEN",
+    "T_HUB_CONTROL_FILE",
     "T_HUB_SESSION_TOKEN"
   ] and .transport.cwd == null and
   .enabled_tools == null and .disabled_tools == null and
@@ -272,7 +271,7 @@ HIDDEN_LEGACY_SNAP="$WORK/config.hidden-legacy-snapshot.toml"
 HIDDEN_LEGACY_EXPECTED="$WORK/config.hidden-legacy-expected.toml"
 cp -p "$WORK/config.toml" "$HIDDEN_LEGACY_SNAP"
 cp -p "$WORK/config.toml" "$HIDDEN_LEGACY_EXPECTED"
-sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_ADDR\", \"T_HUB_CONTROL_TOKEN\", \"T_HUB_SESSION_TOKEN\"]" "$HIDDEN_LEGACY_EXPECTED"
+sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_FILE\", \"T_HUB_SESSION_TOKEN\"]" "$HIDDEN_LEGACY_EXPECTED"
 if ! T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
   fail "same-command registration with hidden Codex policy was refused"
 elif cmp -s "$HIDDEN_LEGACY_EXPECTED" "$WORK/config.toml"; then
@@ -292,7 +291,7 @@ cp -p "$NESTED_POLICY_BASE" "$WORK/config.toml"
 
 # --- 9. disabled canonical registration is not reported ready ---------------
 codex mcp add t-hub -- "$FAKE_BIN" >/dev/null
-sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_ADDR\", \"T_HUB_CONTROL_TOKEN\", \"T_HUB_SESSION_TOKEN\"]\nenabled = false" "$WORK/config.toml"
+sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_FILE\", \"T_HUB_SESSION_TOKEN\"]\nenabled = false" "$WORK/config.toml"
 DISABLED_SNAP="$WORK/config.disabled-snapshot.toml"
 cp -p "$WORK/config.toml" "$DISABLED_SNAP"
 if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then

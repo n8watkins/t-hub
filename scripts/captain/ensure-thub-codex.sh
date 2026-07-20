@@ -9,10 +9,11 @@
 # SCOPE DIFFERENCE from the Claude provisioner (document it, don't "fix" it):
 # Codex MCP registration is USER-GLOBAL (`$CODEX_HOME/config.toml`, default
 # `~/.codex/config.toml`), NOT per-repo like Claude's `.mcp.json`. Least-privilege
-# still holds: the item-3 capability env (a READ token by default) is injected at
-# the tmux SESSION level. Codex only passes named variables to stdio MCP children,
-# so this registration declares the three T-Hub variable names without storing
-# their values (t-hub-mcp resolves `$T_HUB_CONTROL_TOKEN` first).
+# still holds: the session gets stable discovery plus a durable identity reference.
+# Codex only passes named variables to stdio MCP children,
+# so this registration declares the two stable T-Hub variable names without storing
+# their values. The stable discovery-file path and durable session identity are
+# sufficient; rotating addresses and tier credentials are never stored here.
 #
 # NEVER rewrite config.toml wholesale. The live file carries user-authored
 # `[hooks]` and `[hooks.state]` trust blocks that a rewrite could clobber (plan
@@ -55,8 +56,8 @@ if ! "$BIN" --list-tools >/dev/null 2>&1; then
 fi
 
 CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
-ENV_VARS_JSON='["T_HUB_CONTROL_ADDR","T_HUB_CONTROL_TOKEN","T_HUB_SESSION_TOKEN"]'
-ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]'
+ENV_VARS_JSON='["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"]'
+ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]'
 install -d -m 700 "$(dirname "$CONFIG")"
 exec 9>"${CONFIG}.t-hub.lock"
 flock -x 9
@@ -98,8 +99,7 @@ if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e --arg bin "$BIN" '
   .transport.type == "stdio" and .transport.command == $bin and
   .transport.args == [] and (.transport.env == null or .transport.env == {}) and
   .transport.env_vars == [
-    "T_HUB_CONTROL_ADDR",
-    "T_HUB_CONTROL_TOKEN",
+    "T_HUB_CONTROL_FILE",
     "T_HUB_SESSION_TOKEN"
   ] and .transport.cwd == null
 ' >/dev/null; then
@@ -142,6 +142,9 @@ if [ -n "$CURRENT" ] && ! "$LEGACY_MATCH" && ! printf '%s' "$CURRENT" | jq -e '
   .transport.type == "stdio" and .transport.args == [] and
   (.transport.env == null or .transport.env == {}) and
   (.transport.env_vars == [] or .transport.env_vars == [
+    "T_HUB_CONTROL_FILE",
+    "T_HUB_SESSION_TOKEN"
+  ] or .transport.env_vars == [
     "T_HUB_CONTROL_ADDR",
     "T_HUB_CONTROL_TOKEN",
     "T_HUB_SESSION_TOKEN"

@@ -499,6 +499,19 @@ impl IdentityStore {
             .cloned()
     }
 
+    /// Count identity records bound to one terminal.
+    ///
+    /// A control-lease renewal uses this to reject ambiguous duplicate identity
+    /// bindings instead of letting iteration order choose which durable bearer
+    /// represents the terminal.
+    pub fn count_for_tile(&self, tile: &str) -> usize {
+        self.lock()
+            .identities
+            .values()
+            .filter(|identity| identity.session_tile.as_deref() == Some(tile))
+            .count()
+    }
+
     /// Count of minted identities (observability / tests).
     pub fn len(&self) -> usize {
         self.lock().identities.len()

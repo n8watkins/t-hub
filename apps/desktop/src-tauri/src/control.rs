@@ -20,12 +20,13 @@
 //! does not match the per-launch secret is rejected before dispatch.
 //!
 //! ## Discovery + auth
-//! On startup we bind `127.0.0.1:0` (an ephemeral port), generate a per-launch
-//! token, and write both to a small handshake file (`~/.t-hub/control.json`,
-//! mode `0600` on unix). The MCP binary reads that file to learn where to connect
-//! and which token to present. `T_HUB_CONTROL_ADDR` + `T_HUB_CONTROL_TOKEN`
-//! override discovery for tests / harnesses. Binding to loopback keeps the
-//! channel host-local (PRD §11.3: expose only what T-Hub needs).
+//! On startup we bind `127.0.0.1:0` (an ephemeral port) and atomically publish the
+//! address plus an ambient read credential to one stable authoritative handshake
+//! file. The MCP binary reads that file to connect. A commissioned Captain then
+//! proves its durable session identity to acquire a short-lived scoped control
+//! lease. `T_HUB_CONTROL_ADDR` + `T_HUB_CONTROL_TOKEN` remain legacy overrides for
+//! tests and harnesses. Binding to loopback keeps the channel host-local (PRD
+//! §11.3: expose only what T-Hub needs).
 //!
 //! ## Permission tiers (PRD §11.2)
 //! Read + Organization tools are dispatched here. Process-changing and
@@ -40,7 +41,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -68,10 +69,10 @@ use crate::{
 };
 
 /// A single control request: a command name + free-form JSON args, authenticated
-/// by the per-launch `token`.
+/// by an ambient tier token or identity-bound scoped lease.
 #[derive(Debug, Deserialize)]
 pub struct ControlRequest {
-    /// Per-launch shared secret (see the handshake file).
+    /// Ambient read token, trusted host control token, or scoped Captain lease.
     #[serde(default)]
     pub token: String,
     /// The command/tool name to dispatch (e.g. `list_terminals`).
@@ -196,15 +197,12 @@ impl ControlResponse {
 
 /// The handshake record written so the MCP binary can find + authenticate to the
 /// listener. Serialized to `~/.t-hub/control.json`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ControlHandshake {
     /// `127.0.0.1:<port>` the listener bound to.
     pub addr: String,
-    /// Per-launch shared secret the client must present. Backward-compatible: this
-    /// is the full-power **control** token by default (every existing caller that
-    /// reads `token` keeps full power). The Phase 3 harden flag
-    /// (`T_HUB_CONTROL_HARDEN`, default OFF) flips it to publish only the read token
-    /// here; Phase 2 never flips it.
+    /// Ambient read-only secret the client may present for discovery and lease
+    /// renewal. The shared full-power control token is never serialized here.
     pub token: String,
     /// Per-launch **read** capability token (socket-gate Phase 2). Grants the Read
     /// tier only. Added alongside `token` so a least-privilege consumer can discover
@@ -219,6 +217,16 @@ pub struct ControlHandshake {
     /// when absent so older handshake readers/files stay parseable.
     #[serde(default)]
     pub protocol_version: u32,
+    /// Per-app-process listener identity. A port-only rebind keeps this value;
+    /// an app restart replaces it.
+    #[serde(default)]
+    pub instance_id: String,
+    /// Monotonic listener generation within one app process.
+    #[serde(default)]
+    pub listener_generation: u64,
+    /// Epoch-ms publication timestamp for diagnostics and future-skew checks.
+    #[serde(default)]
+    pub published_at: u64,
     /// In-process-only full-power **control** token for the TRUSTED local frontend.
     /// The app's own webview drives terminals through the in-process `control_request`
     /// command, which must authenticate with full control even under Phase 3 hardening
@@ -8250,6 +8258,60 @@ struct DispatchReservationGuard {
     key: Option<DispatchReservationKey>,
 }
 
+/// Short-lived authority minted for one exact durable Captain identity.
+///
+/// The secret exists only in the app and MCP process memories. It is never part
+/// of discovery, durable identity state, audit arguments, or global provider
+/// configuration.
+#[derive(Clone)]
+struct CaptainControlLease {
+    identity_id: String,
+    terminal_id: String,
+    ship_slug: String,
+    project_id: String,
+    generation: ScopedAuthorityGeneration,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct CaptainControlLeases {
+    by_secret: Mutex<HashMap<String, CaptainControlLease>>,
+}
+
+const CAPTAIN_CONTROL_LEASE_TTL: Duration = Duration::from_secs(90);
+
+impl CaptainControlLeases {
+    fn issue(&self, lease: CaptainControlLease) -> String {
+        let secret = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut leases = self
+            .by_secret
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        leases.retain(|_, existing| existing.expires_at > Instant::now());
+        leases.insert(secret.clone(), lease);
+        secret
+    }
+
+    fn get(&self, secret: &str) -> Option<CaptainControlLease> {
+        if secret.is_empty() {
+            return None;
+        }
+        let mut leases = self
+            .by_secret
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        leases.retain(|_, existing| existing.expires_at > Instant::now());
+        leases
+            .iter()
+            .find(|(candidate, _)| ct_token_eq(candidate, secret))
+            .map(|(_, lease)| lease.clone())
+    }
+}
+
 impl DispatchReservations {
     fn acquire(
         self: &Arc<Self>,
@@ -8433,11 +8495,13 @@ pub struct ControlContext {
     /// trusted UI from a terminal that merely possesses the shared control token.
     host_token: String,
     /// The loopback address the listener bound to (`127.0.0.1:<port>`), set in
-    /// [`start`] after bind. Injected (with a capability token) into the
-    /// environment of spawned sessions so their in-session MCP/clients authenticate
-    /// as the capability the spawn was granted (Phase 2b). Empty in headless tests
-    /// (then no capability env is injected, and spawns behave exactly as before).
+    /// [`start`] after bind. Its presence gates injection of the stable discovery
+    /// path into spawned sessions. The rotating value itself is not injected.
+    /// Empty in headless tests.
     addr: String,
+    /// Stable identifier and monotonic generation for discovery publication.
+    listener_instance_id: String,
+    listener_generation: Arc<AtomicU64>,
     /// Fleet spawn budget + rate limits (socket-gate Phase 1). Shared `Arc` so one
     /// fleet-wide budget is enforced across every connection handler thread.
     /// Consulted from [`dispatch_authenticated`] for the ProcessChanging tier only.
@@ -8462,6 +8526,10 @@ pub struct ControlContext {
     /// one store. Persistent across restarts (`identities.json`); an ephemeral
     /// in-memory one in headless tests.
     identity: Arc<crate::identity::IdentityStore>,
+    /// Ephemeral, identity-bound Captain control leases. A listener rebind keeps
+    /// this store; an app restart intentionally drops it so the durable identity
+    /// must prove itself again against current registry and liveness state.
+    control_leases: Arc<CaptainControlLeases>,
     /// Comms-plane Phase 2: the durable inbox (per-recipient segmented store + seq +
     /// receipt state machine). Shared `Arc` so the fleet notifier (first client)
     /// enqueues/drains and the `inbox_ack`/`inbox_status` handlers reach the same
@@ -8518,6 +8586,24 @@ pub fn handshake_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".t-hub").join("control.json")
+}
+
+/// Convert the Windows-hosted authoritative discovery path into the spelling a
+/// WSL terminal can read. POSIX paths (development and pure-WSL runs) are kept
+/// unchanged. This is a stable path only; it never contains a listener address
+/// or credential value.
+fn wsl_discovery_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        return format!("/mnt/{drive}/{}", raw[3..].trim_start_matches('/'));
+    }
+    raw
+}
+
+pub(crate) fn discovery_file_for_spawn() -> String {
+    wsl_discovery_path(&handshake_path())
 }
 
 /// Resolve the persistent server-key file: `$T_HUB_SERVER_KEY_FILE` if set, else
@@ -8696,6 +8782,7 @@ pub fn persistent_read_key() -> String {
 /// `hardened_*` tests) pins every one of those webview token paths, including
 /// reconnect-after-rebind, so the flip cannot silently re-break attach. See
 /// `docs/SOCKET-AUTH-DESIGN.md`.
+#[cfg(test)]
 fn phase3_harden_enabled() -> bool {
     std::env::var("T_HUB_CONTROL_HARDEN")
         // Ratified default-ON: only an explicit `0`/`false` disables hardening.
@@ -8710,6 +8797,7 @@ fn phase3_harden_enabled() -> bool {
 /// back to the control token even when hardening is ON, so a context that never
 /// minted a read token (e.g. a bare probe server) is never locked out. Pure so it
 /// is directly unit-testable.
+#[cfg(test)]
 fn select_published_token<'a>(
     control_token: &'a str,
     read_token: &'a str,
@@ -8832,24 +8920,31 @@ fn wake_accept(addr: &str) {
 pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
-    // Phase 2b: record the bound loopback address on the context so `spawn_terminal`
-    // can inject it (with a capability token) into the sessions it spawns.
+    if ctx.read_token.is_empty() {
+        ctx.read_token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+    }
+    // Record that discovery is live before spawned sessions receive its stable path.
     ctx.addr = addr.to_string();
-    // Phase 2 / Phase 3: `token` stays the full-power control token by DEFAULT
-    // (the app's own frontend authenticates to this socket with the published token,
-    // so publishing read-only breaks terminal attach - see the 2026-07-07 incident
-    // note on `phase3_harden_enabled`). Opt in with `T_HUB_CONTROL_HARDEN=1` to
-    // publish only the read token; elevated sessions then receive the control token
-    // via the Phase 2b spawn-tree env injection (T_HUB_CONTROL_ADDR +
-    // T_HUB_CONTROL_TOKEN), not this file. `read_token` is always published so a
-    // least-privilege consumer can discover a read-only credential.
-    let harden = phase3_harden_enabled();
+    // The stable discovery record is always ambient read-only. The trusted
+    // in-process frontend receives its credential through skipped fields below,
+    // while durable Captains prove identity to acquire a scoped lease.
+    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let handshake = ControlHandshake {
         addr: addr.to_string(),
-        token: select_published_token(&ctx.token, &ctx.read_token, harden).to_string(),
+        // Discovery is always ambient read-only. Durable Captains reacquire an
+        // identity-bound scoped lease; the shared global control credential is
+        // never published through this stable file.
+        token: ctx.read_token.clone(),
         read_token: ctx.read_token.clone(),
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
+        instance_id: ctx.listener_instance_id.clone(),
+        listener_generation,
+        published_at: now_ms(),
         // The full-power control token, carried ONLY in this returned struct (never
         // serialized - see the field's `#[serde(skip_serializing)]`). Under Phase 3
         // hardening `token` above is the read token, so the trusted local frontend
@@ -9813,6 +9908,10 @@ fn effective_tier(command: &str, args: &Value) -> CommandTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Capability {
     ReadOnly,
+    /// A short-lived lease bound to one exact, currently active Captain
+    /// identity. It admits the same command tiers as the legacy global control
+    /// token, while downstream identity ACLs keep its authority ship-scoped.
+    ScopedControl,
     Full,
 }
 
@@ -9823,6 +9922,7 @@ impl Capability {
     fn allows(self, tier: CommandTier) -> bool {
         match self {
             Capability::Full => true,
+            Capability::ScopedControl => true,
             Capability::ReadOnly => tier == CommandTier::Read,
         }
     }
@@ -9831,6 +9931,7 @@ impl Capability {
     fn tier_label(self) -> &'static str {
         match self {
             Capability::Full => "control",
+            Capability::ScopedControl => "control",
             Capability::ReadOnly => "read",
         }
     }
@@ -9931,6 +10032,163 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
         fleet_role,
         claude_uuid,
     })
+}
+
+#[derive(Clone)]
+struct CaptainLeaseAuthority {
+    identity_id: String,
+    terminal_id: String,
+    ship_slug: String,
+    project_id: String,
+    generation: ScopedAuthorityGeneration,
+}
+
+/// Derive renewable Captain authority only from current durable state.
+///
+/// Possession of a read token, an old global control token, or a historical
+/// mint-time Captain role is insufficient. The exact identity, terminal, active
+/// Captain claim, Project binding, uniqueness, and live tmux session must agree.
+fn captain_lease_authority(
+    ctx: &ControlContext,
+    caller: &ResolvedIdentity,
+) -> Result<CaptainLeaseAuthority, String> {
+    let terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or("control_reauthentication_required: identity is not terminal-bound")?;
+    if caller.mint_role != crate::identity::Role::Captain
+        || caller.fleet_role != Some(FleetRole::Captain)
+        || ctx.identity.count_for_tile(terminal_id) != 1
+    {
+        return Err(
+            "control_reauthentication_required: identity is not the unique active Captain for this terminal"
+                .into(),
+        );
+    }
+
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let matches = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain.role == FleetRole::Captain
+                && captain.state == ClaimState::Active
+                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && caller
+                    .ship_slug
+                    .as_deref()
+                    .is_some_and(|ship| captain.ship_slug == ship)
+        })
+        .collect::<Vec<_>>();
+    let captain = match matches.as_slice() {
+        [captain] => *captain,
+        _ => {
+            return Err(
+                "control_reauthentication_required: Captain registry binding is missing or ambiguous"
+                    .into(),
+            );
+        }
+    };
+    let project_id = captain
+        .project_id
+        .as_deref()
+        .ok_or("control_reauthentication_required: Captain has no active Project binding")?;
+    if snapshot
+        .projects
+        .iter()
+        .filter(|project| project.project_id == project_id)
+        .count()
+        != 1
+    {
+        return Err(
+            "control_reauthentication_required: Captain Project binding is missing or ambiguous"
+                .into(),
+        );
+    }
+
+    let live = (ctx.live_sessions)().map_err(|error| {
+        format!("control_reauthentication_required: Captain liveness is unavailable: {error}")
+    })?;
+    let target = tmux_target(terminal_id);
+    if !live
+        .iter()
+        .any(|session| session == terminal_id || session == &target)
+    {
+        return Err(
+            "control_reauthentication_required: Captain terminal is not alive; durable identity was preserved"
+                .into(),
+        );
+    }
+
+    Ok(CaptainLeaseAuthority {
+        identity_id: caller.session_id.clone(),
+        terminal_id: terminal_id.to_string(),
+        ship_slug: captain.ship_slug.clone(),
+        project_id: project_id.to_string(),
+        generation: generations.scoped(registry_epoch, &captain.ship_slug, terminal_id, project_id),
+    })
+}
+
+fn renew_captain_control_lease(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    if !ctx.peer_is_loopback {
+        return Err(
+            "control_reauthentication_required: Captain lease renewal is loopback-only".into(),
+        );
+    }
+    if trusted_internal {
+        return Err(
+            "control_reauthentication_required: trusted host transport does not use Captain leases"
+                .into(),
+        );
+    }
+    let caller = caller.ok_or(
+        "control_reauthentication_required: durable session identity could not be verified",
+    )?;
+    let authority = captain_lease_authority(ctx, caller)?;
+    let expires_at = Instant::now() + CAPTAIN_CONTROL_LEASE_TTL;
+    let secret = ctx.control_leases.issue(CaptainControlLease {
+        identity_id: authority.identity_id,
+        terminal_id: authority.terminal_id.clone(),
+        ship_slug: authority.ship_slug.clone(),
+        project_id: authority.project_id.clone(),
+        generation: authority.generation,
+        expires_at,
+    });
+    Ok(json!({
+        "lease": secret,
+        "expiresAt": now_ms().saturating_add(CAPTAIN_CONTROL_LEASE_TTL.as_millis() as u64),
+        "terminalId": authority.terminal_id,
+        "shipSlug": authority.ship_slug,
+        "projectId": authority.project_id,
+        "capability": "control",
+    }))
+}
+
+fn resolve_captain_control_lease(
+    ctx: &ControlContext,
+    presented: &str,
+    caller: Option<&ResolvedIdentity>,
+) -> Option<Capability> {
+    let caller = caller?;
+    let lease = ctx.control_leases.get(presented)?;
+    if caller.session_id != lease.identity_id
+        || caller.tile.as_deref() != Some(lease.terminal_id.as_str())
+        || caller.ship_slug.as_deref() != Some(lease.ship_slug.as_str())
+    {
+        return None;
+    }
+    let authority = captain_lease_authority(ctx, caller).ok()?;
+    (authority.identity_id == lease.identity_id
+        && authority.terminal_id == lease.terminal_id
+        && authority.ship_slug == lease.ship_slug
+        && authority.project_id == lease.project_id
+        && authority.generation == lease.generation)
+        .then_some(Capability::ScopedControl)
 }
 
 /// A Cortana bearer is apex only while all durable singleton facts agree on the
@@ -10557,32 +10815,19 @@ fn spawn_capability(args: &Value) -> Capability {
     }
 }
 
-/// The capability-token env injected into a spawned session so its in-session
-/// MCP/clients authenticate as the capability the spawn was granted (Phase 2b).
+/// Environment passed to a spawned session for durable control discovery.
 ///
-/// DEFAULT is the READ token (item-3 inverted least-privilege, [`spawn_capability`]):
-/// an untagged spawn is a pure-work crew that can observe but not spawn/type/kill.
-/// Only an explicit `capability:"control"` by the (necessarily Full) caller injects
-/// the full control token. An empty read token (a bare-probe / headless context that
-/// never minted one) falls back to the control token so it is never locked out,
-/// matching `select_published_token`'s safe fallback.
-///
-/// Injects BOTH `T_HUB_CONTROL_ADDR` and `T_HUB_CONTROL_TOKEN` because the MCP's
-/// env override is all-or-nothing (it needs both, else it falls back to
-/// `control.json` and ignores the env token). Empty when the bound addr is unknown
-/// (headless tests) - then nothing is injected and the session behaves as before.
-fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
+/// Only the stable authoritative file path is populated. Rotating endpoint and
+/// tier credential variables are explicitly blanked so inherited process state
+/// cannot override discovery or leak the shared global control capability.
+fn elevation_env(ctx: &ControlContext, _args: &Value) -> Vec<(String, String)> {
     if ctx.addr.is_empty() {
         return Vec::new();
     }
-    let token = match spawn_capability(args) {
-        Capability::Full => ctx.token.clone(),
-        Capability::ReadOnly if !ctx.read_token.is_empty() => ctx.read_token.clone(),
-        Capability::ReadOnly => ctx.token.clone(),
-    };
     vec![
-        ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
-        ("T_HUB_CONTROL_TOKEN".to_string(), token),
+        ("T_HUB_CONTROL_FILE".to_string(), discovery_file_for_spawn()),
+        ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+        ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
     ]
 }
 
@@ -11093,10 +11338,6 @@ fn audit_command(
 /// command - allowed or refused - lands in the audit log with its `tokenTier`, and
 /// a refusal is mirrored live onto the event fanout.
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
-    let Some(cap) = resolve_capability(ctx, &req.token) else {
-        return ControlResponse::err("unauthorized: bad control token");
-    };
-
     // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
     // token carried on the request (`req.session`), if any. IDENTIFICATION only
     // (`resolve_identity` is not authorization); the per-command ACL wiring consumes it.
@@ -11104,6 +11345,11 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     let caller = resolve_identity(ctx, &req.session);
     let trusted_internal =
         ctx.peer_is_loopback && !req.host.is_empty() && ct_token_eq(&req.host, &ctx.host_token);
+    let Some(cap) = resolve_capability(ctx, &req.token)
+        .or_else(|| resolve_captain_control_lease(ctx, &req.token, caller.as_ref()))
+    else {
+        return ControlResponse::err("unauthorized: bad control token");
+    };
 
     // item-3 §2.4: the effective tier is args-refined - an UNSCOPED `inbox_status`
     // (fleet-wide enumeration) is Organization even though its base tier is Read.
@@ -11160,7 +11406,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // Every untrusted Organization or ProcessChanging request must also present a
     // currently valid per-session identity.
     // Only the exact in-process host provenance may omit that identity.
-    if cap == Capability::Full
+    if matches!(cap, Capability::Full | Capability::ScopedControl)
         && tier != CommandTier::Read
         && !trusted_internal
         && caller
@@ -11207,6 +11453,17 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         );
         return ControlResponse::err(message);
     }
+
+    // Renewal is deliberately a Read-tier authentication operation. It accepts
+    // only the ambient read credential plus the durable session secret, then
+    // derives all control authority from live server state. No global control
+    // token crosses this response boundary.
+    if req.command == "renew_captain_control_lease" {
+        return match renew_captain_control_lease(ctx, caller.as_ref(), trusted_internal) {
+            Ok(result) => ControlResponse::ok(result),
+            Err(error) => ControlResponse::err(error),
+        };
+    }
     let delegated_control_access = if tier == CommandTier::Read
         || inbox_self_ack
         || crew_self_work_log
@@ -11219,7 +11476,9 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     };
     let delegated_capability = match cap {
         Capability::ReadOnly => crate::delegated_admin::ControlCapability::ReadOnly,
-        Capability::Full => crate::delegated_admin::ControlCapability::Full,
+        Capability::ScopedControl | Capability::Full => {
+            crate::delegated_admin::ControlCapability::Full
+        }
     };
     if let Err(error) = crate::delegated_admin::require_control_capability(
         delegated_capability,
@@ -11637,13 +11896,16 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
         .map_err(|e| format!("rebind_control: failed to spawn serve loop: {e}"))?;
 
     // Publish the fresh addr atomically (temp+rename), KEEPING tokens.
-    let harden = phase3_harden_enabled();
+    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let handshake = ControlHandshake {
         addr: new_addr.clone(),
-        token: select_published_token(&ctx.token, &ctx.read_token, harden).to_string(),
+        token: ctx.read_token.clone(),
         read_token: ctx.read_token.clone(),
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
+        instance_id: ctx.listener_instance_id.clone(),
+        listener_generation,
+        published_at: now_ms(),
         local_control_token: ctx.token.clone(),
         local_host_token: ctx.host_token.clone(),
     };
@@ -15855,12 +16117,6 @@ fn discover_cortana_runtimes(
                 .or_else(|| detected_harness(&terminal_id))
                 .unwrap_or_else(|| "codex".into())
         };
-        let control = tmux::session_environment(&pane.session, "T_HUB_CONTROL_TOKEN")
-            .map_err(|error| {
-                retryable_error(format!(
-                    "reconcile_cortana: control capability inspection failed for '{terminal_id}': {error}"
-                ))
-            })?;
         let session_token =
             tmux::session_environment(&pane.session, crate::identity::SESSION_TOKEN_ENV).map_err(
                 |error| {
@@ -15872,6 +16128,9 @@ fn discover_cortana_runtimes(
         let identity = session_token
             .as_deref()
             .and_then(|token| ctx.identity.resolve(token));
+        let trusted_cortana_identity = identity
+            .as_ref()
+            .is_some_and(|identity| identity.role == crate::identity::Role::Cortana);
         let generation = tmux::session_environment(&pane.session, CORTANA_GENERATION_ENV)
             .map_err(|error| {
                 retryable_error(format!(
@@ -15902,11 +16161,10 @@ fn discover_cortana_runtimes(
                 provider_session_id,
                 terminal: runtime_evidence(tmux::session_liveness(&target)),
                 harness_process: runtime_evidence(tmux::harness_liveness(&target, &harness)),
-                current_control_capability: control
-                    .as_deref()
-                    .is_some_and(|token| ct_token_eq(token, &ctx.token)),
-                trusted_cortana_identity: identity
-                    .is_some_and(|identity| identity.role == crate::identity::Role::Cortana),
+                // A durable Cortana identity can reacquire scoped authority. The
+                // rotating global token is intentionally absent from its env.
+                current_control_capability: trusted_cortana_identity,
+                trusted_cortana_identity,
             },
         );
     }
@@ -16747,14 +17005,11 @@ fn commission_captain(
     if spawn_capability(&spawn_args) == Capability::Full {
         audit_control_spawn(ctx, "commission_captain", &spawn_args);
     }
-    let identity = match ctx
-        .identity
-        .mint_and_bind(
-            crate::identity::Role::Captain,
-            Some(ship_slug.clone()),
-            &terminal_id,
-        )
-    {
+    let identity = match ctx.identity.mint_and_bind(
+        crate::identity::Role::Captain,
+        Some(ship_slug.clone()),
+        &terminal_id,
+    ) {
         Ok(identity) => identity,
         Err(error) => {
             let _ = ctx
@@ -26876,11 +27131,14 @@ impl ControlContext {
                 uuid::Uuid::new_v4().simple()
             ),
             addr: String::new(),
+            listener_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+            listener_generation: Arc::new(AtomicU64::new(0)),
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
             requests: Arc::new(RequestCache::new()),
             rebind: Arc::new(RebindController::new(REBIND_MIN_INTERVAL)),
             identity: Arc::new(crate::identity::IdentityStore::ephemeral()),
+            control_leases: Arc::new(CaptainControlLeases::default()),
             inbox: Arc::new(crate::inbox::Inbox::ephemeral()),
             authz: Arc::new(crate::authz::AuthzStore::ephemeral()),
             delegated_admin: Arc::new(crate::delegated_admin::DelegatedAdminStore::ephemeral()),
@@ -30460,6 +30718,9 @@ mod tests {
             read_token: "rdonly".into(),
             pid: 42,
             protocol_version: PROTOCOL_VERSION,
+            instance_id: "instance".into(),
+            listener_generation: 1,
+            published_at: 123,
             local_control_token: "full".into(),
             local_host_token: "host".into(),
         };
@@ -36367,8 +36628,8 @@ mod tests {
             tmux::session_environment(&tmux_target(agent_session_id), "T_HUB_CONTROL_TOKEN")
                 .unwrap()
                 .as_deref(),
-            Some("read-start-agent-success"),
-            "ordinary implementation lanes must remain read-only"
+            Some(""),
+            "ordinary implementation lanes must not persist rotating credentials"
         );
         let event = ctx
             .captains
@@ -36445,8 +36706,8 @@ mod tests {
             tmux::session_environment(&tmux_target(agent_session_id), "T_HUB_CONTROL_TOKEN")
                 .unwrap()
                 .as_deref(),
-            Some("start-fleet-admin"),
-            "an authorized administrative lane must receive control capability"
+            Some(""),
+            "an administrative lane must reacquire scoped authority from durable identity"
         );
         assert!(
             tmux::session_environment(&tmux_target(agent_session_id), "GH_CONFIG_DIR")
@@ -39392,6 +39653,10 @@ mod tests {
             .unwrap()
             .to_string();
         wait_for_harness_started(&control_id, "codex").unwrap();
+        // Compatibility fixture for a terminal spawned before Package 0. New
+        // terminals never receive this rotating global credential.
+        tmux::set_session_environment(&tmux_target(&control_id), "T_HUB_CONTROL_TOKEN", &ctx.token)
+            .unwrap();
         let attached = dispatch(
             &ctx,
             "attach_captain",
@@ -39512,6 +39777,10 @@ mod tests {
             .unwrap()
             .to_string();
         wait_for_harness_started(&captain_id, "codex").unwrap();
+        // Exercise the rollback behavior through the legacy attach path without
+        // restoring global-token persistence for newly spawned terminals.
+        tmux::set_session_environment(&tmux_target(&captain_id), "T_HUB_CONTROL_TOKEN", &ctx.token)
+            .unwrap();
         sink.calls.lock().unwrap().clear();
         captains.fail_next_persist("attach bind persistence failure");
 
@@ -41640,6 +41909,53 @@ mod tests {
         }
     }
 
+    fn captain_lease_fixture(
+        live: bool,
+    ) -> (
+        ControlContext,
+        Arc<CaptainsRegistry>,
+        Arc<crate::identity::IdentityStore>,
+        crate::identity::SessionIdentity,
+    ) {
+        let captains = Arc::new(CaptainsRegistry::new());
+        captains
+            .upsert_project(ProjectRecord {
+                project_id: "lease-project".into(),
+                name: "Lease Project".into(),
+                repo_root: "/tmp/lease-project".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        captains
+            .claim_test("lease-captain", Some("lease-ship"), vec![])
+            .unwrap();
+        captains
+            .bind_ship_context("lease-ship", "lease-project", "Package 0", "codex")
+            .unwrap();
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let identity = identities
+            .mint_and_bind(
+                crate::identity::Role::Captain,
+                Some("lease-ship".into()),
+                "lease-captain",
+            )
+            .unwrap();
+        let sessions = if live {
+            vec![tmux_target("lease-captain")]
+        } else {
+            Vec::new()
+        };
+        let ctx = test_ctx("global-control")
+            .with_captains_registry(captains.clone())
+            .with_identity_store(identities.clone())
+            .with_live_sessions(move || Ok(sessions.clone()));
+        (ctx, captains, identities, identity)
+    }
+
     #[test]
     fn normal_captain_fanout_burst_not_refused_at_gate() {
         // THE most important test (design spec): a captain fanning out 6 crew in an
@@ -42597,6 +42913,9 @@ mod tests {
             read_token: read.into(),
             pid: 7,
             protocol_version: PROTOCOL_VERSION,
+            instance_id: "instance".into(),
+            listener_generation: 1,
+            published_at: 123,
             local_control_token: full.into(),
             local_host_token: "host".into(),
         };
@@ -42664,38 +42983,25 @@ mod tests {
             "published token must resolve to read-only"
         );
 
-        // Spawn-tree env injection, DEFAULT (untagged): the READ token, so a crew
-        // resolves to ReadOnly - the root move. BYPASS-WOULD-FAIL: revert the inverted
-        // default and this injects the control token and the assert goes RED.
+        // Spawn-tree injection carries only stable discovery and explicitly
+        // scrubs rotating address and token values.
         let mut ctx = ctx;
         ctx.addr = "127.0.0.1:4242".to_string();
         let env = elevation_env(&ctx, &json!({}));
-        let injected = env
+        assert!(env
             .iter()
-            .find(|(k, _)| k == "T_HUB_CONTROL_TOKEN")
-            .map(|(_, v)| v.clone())
-            .expect("spawn env injects T_HUB_CONTROL_TOKEN");
-        assert_eq!(
-            injected, ctx.read_token,
-            "default spawn must inject the READ token"
-        );
-        assert_eq!(
-            resolve_capability(&ctx, &injected),
-            Some(Capability::ReadOnly),
-            "default-spawned crew must resolve to read-only"
-        );
+            .any(|(key, value)| key == "T_HUB_CONTROL_FILE" && !value.is_empty()));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "T_HUB_CONTROL_ADDR" && value.is_empty()));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "T_HUB_CONTROL_TOKEN" && value.is_empty()));
 
-        // Explicit opt-in: `capability:"control"` carries the full token.
+        // An explicit capability request does not put a shared credential back
+        // into the child environment.
         let up = elevation_env(&ctx, &json!({"capability": "control"}));
-        assert_eq!(
-            up[1],
-            ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone())
-        );
-        assert_eq!(
-            resolve_capability(&ctx, &up[1].1),
-            Some(Capability::Full),
-            "an explicit control spawn grants full control"
-        );
+        assert_eq!(up, env);
     }
 
     #[test]
@@ -42728,6 +43034,9 @@ mod tests {
             read_token: ctx.read_token.clone(),
             pid: 1,
             protocol_version: PROTOCOL_VERSION,
+            instance_id: "instance".into(),
+            listener_generation: 1,
+            published_at: 123,
             local_control_token: ctx.token.clone(),
             local_host_token: ctx.host_token.clone(),
         };
@@ -42761,38 +43070,33 @@ mod tests {
     }
 
     #[test]
-    fn elevation_env_defaults_read_and_upgrades_to_control() {
+    fn elevation_env_passes_only_stable_discovery_and_scrubs_rotating_values() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        // item-3 inverted default: an untagged spawn injects the READ token.
         let def = elevation_env(&ctx, &json!({}));
-        assert_eq!(
-            def,
-            vec![
-                (
-                    "T_HUB_CONTROL_ADDR".to_string(),
-                    "127.0.0.1:4242".to_string()
-                ),
-                ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()),
-            ]
-        );
-        // A typo'd / unknown capability also fails SAFE to read (never leaks control).
+        assert_eq!(def[0].0, "T_HUB_CONTROL_FILE");
+        assert!(!def[0].1.is_empty());
+        assert_eq!(def[1], ("T_HUB_CONTROL_ADDR".to_string(), String::new()));
+        assert_eq!(def[2], ("T_HUB_CONTROL_TOKEN".to_string(), String::new()));
         let typo = elevation_env(&ctx, &json!({"capability": "conrtol"}));
-        assert_eq!(
-            typo[1],
-            ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string())
-        );
-        // Explicit opt-in: `capability:"control"` injects the full control token.
+        assert_eq!(typo, def);
         let up = elevation_env(&ctx, &json!({"capability": "control"}));
-        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
-        // Empty read token (bare-probe context) falls back to the control token so it
-        // is never locked out.
-        ctx.read_token = String::new();
-        let fb = elevation_env(&ctx, &json!({}));
-        assert_eq!(fb[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
+        assert_eq!(up, def);
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
         assert!(elevation_env(&ctx, &json!({"capability": "control"})).is_empty());
+    }
+
+    #[test]
+    fn windows_discovery_path_is_stable_and_wsl_readable() {
+        assert_eq!(
+            wsl_discovery_path(Path::new(r"C:\Users\natha\.t-hub\control.json")),
+            "/mnt/c/Users/natha/.t-hub/control.json"
+        );
+        assert_eq!(
+            wsl_discovery_path(Path::new("/home/natkins/.t-hub/control.json")),
+            "/home/natkins/.t-hub/control.json"
+        );
     }
 
     #[test]
@@ -42828,11 +43132,17 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
         let (env, minted) =
             spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
-        // The tier token is injected; the item-3 default is the READ token ...
+        // Rotating tier and endpoint values are scrubbed.
         assert!(env
             .iter()
-            .any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "read-t"));
-        // ... PLUS a per-session token alongside it (comms-plane Phase 2).
+            .any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v.is_empty()));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "T_HUB_CONTROL_ADDR" && v.is_empty()));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "T_HUB_CONTROL_FILE" && !v.is_empty()));
+        // The durable per-session token is injected alongside stable discovery.
         let session_token = env
             .iter()
             .find(|(k, _)| k == crate::identity::SESSION_TOKEN_ENV)
@@ -42860,7 +43170,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_session_identity_is_bound_before_launch_and_prebind_failure_rolls_back() {
+    fn requested_control_does_not_elevate_the_prebound_crew_identity() {
         let mut ctx = test_ctx("identity-prebind");
         ctx.addr = "127.0.0.1:4242".to_string();
         let (_, minted) = spawn_env_with_identity(
@@ -42884,16 +43194,21 @@ mod tests {
         store.fail_persist_after(1);
         let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
         failing.addr = "127.0.0.1:4242".to_string();
-        let error = spawn_env_with_identity(
+        let (_, identity) = spawn_env_with_identity(
             &failing,
             &json!({"capability": "control"}),
             "spawn_terminal",
             Some("fa654321"),
         )
-        .unwrap_err();
-        assert!(error.contains("identity pre-binding persistence failed"));
-        assert!(store.is_empty());
-        assert!(crate::identity::IdentityStore::load(path.clone()).is_empty());
+        .unwrap();
+        let identity = identity.unwrap();
+        assert_eq!(identity.role, crate::identity::Role::Crew);
+        assert_eq!(identity.session_tile.as_deref(), Some("fa654321"));
+        assert_eq!(store.count_for_tile("fa654321"), 1);
+        assert_eq!(
+            crate::identity::IdentityStore::load(path.clone()).count_for_tile("fa654321"),
+            1
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -43169,6 +43484,253 @@ mod tests {
         assert_eq!(control.result.unwrap()["capability"], "control");
         let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
         assert_eq!(read.result.unwrap()["capability"], "read");
+    }
+
+    #[test]
+    fn durable_captain_renews_an_identity_bound_control_lease() {
+        let (ctx, captains, identities, identity) = captain_lease_fixture(true);
+        let before = captains.snapshot();
+        let renewed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "read-global-control",
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(renewed.ok, "{:?}", renewed.error);
+        let result = renewed.result.unwrap();
+        let lease = result["lease"].as_str().unwrap();
+        assert_ne!(lease, ctx.token);
+        assert_ne!(lease, ctx.read_token);
+        assert_eq!(result["terminalId"], "lease-captain");
+        assert_eq!(result["shipSlug"], "lease-ship");
+        assert_eq!(result["projectId"], "lease-project");
+        assert_eq!(captains.snapshot().captains, before.captains);
+        assert_eq!(captains.snapshot().projects, before.projects);
+
+        let capability = dispatch_authenticated(
+            &ctx,
+            req_session(lease, &identity.secret, "my_capability", json!({})),
+        );
+        assert_eq!(capability.result.unwrap()["capability"], "control");
+
+        let foreign = identities
+            .mint_and_bind(
+                crate::identity::Role::Captain,
+                Some("foreign-ship".into()),
+                "foreign-captain",
+            )
+            .unwrap();
+        let stolen = dispatch_authenticated(
+            &ctx,
+            req_session(lease, &foreign.secret, "my_capability", json!({})),
+        );
+        assert_eq!(
+            stolen.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+
+        identities.revoke(&identity.id).unwrap();
+        let revoked = dispatch_authenticated(
+            &ctx,
+            req_session(lease, &identity.secret, "my_capability", json!({})),
+        );
+        assert_eq!(
+            revoked.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+    }
+
+    #[test]
+    fn captain_lease_renewal_rejects_dead_released_crew_and_duplicate_identities() {
+        let (dead_ctx, _, _, dead_identity) = captain_lease_fixture(false);
+        let dead = dispatch_authenticated(
+            &dead_ctx,
+            req_session(
+                "read-global-control",
+                &dead_identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(dead
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not alive")));
+
+        let (released_ctx, captains, _, released_identity) = captain_lease_fixture(true);
+        captains.release("lease-ship").unwrap();
+        let released = dispatch_authenticated(
+            &released_ctx,
+            req_session(
+                "read-global-control",
+                &released_identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(released
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing or ambiguous")
+                || error.contains("unique active Captain")));
+
+        let (duplicate_ctx, _, identities, identity) = captain_lease_fixture(true);
+        identities
+            .mint_and_bind(
+                crate::identity::Role::Captain,
+                Some("lease-ship".into()),
+                "lease-captain",
+            )
+            .unwrap();
+        let duplicate = dispatch_authenticated(
+            &duplicate_ctx,
+            req_session(
+                "read-global-control",
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(duplicate
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unique active Captain")));
+
+        let crew_store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = crew_store
+            .mint_and_bind(
+                crate::identity::Role::Crew,
+                Some("lease-ship".into()),
+                "lease-captain",
+            )
+            .unwrap();
+        let crew_ctx = test_ctx("global-control")
+            .with_identity_store(crew_store)
+            .with_live_sessions(|| Ok(vec!["th_lease-captain".into()]));
+        let crew_result = dispatch_authenticated(
+            &crew_ctx,
+            req_session(
+                "read-global-control",
+                &crew.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(crew_result.error.as_deref().is_some_and(|error| {
+            error.contains("unique active Captain") || error.contains("registry binding")
+        }));
+
+        let (removed_ctx, _, removed_identities, removed_identity) = captain_lease_fixture(true);
+        removed_identities.retire(&removed_identity.id).unwrap();
+        let removed = dispatch_authenticated(
+            &removed_ctx,
+            req_session(
+                "read-global-control",
+                &removed_identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(removed.error.as_deref().is_some_and(|error| {
+            error.contains("durable session identity could not be verified")
+        }));
+
+        let (expired_ctx, _, _, expired_identity) = captain_lease_fixture(true);
+        expired_ctx.control_leases.by_secret.lock().unwrap().insert(
+            "expired-lease".into(),
+            CaptainControlLease {
+                identity_id: expired_identity.id.clone(),
+                terminal_id: "lease-captain".into(),
+                ship_slug: "lease-ship".into(),
+                project_id: "lease-project".into(),
+                generation: expired_ctx.captains.test_scoped_authority_generation(
+                    "lease-ship",
+                    "lease-captain",
+                    "lease-project",
+                ),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        let expired = dispatch_authenticated(
+            &expired_ctx,
+            req_session(
+                "expired-lease",
+                &expired_identity.secret,
+                "my_capability",
+                Value::Null,
+            ),
+        );
+        assert_eq!(
+            expired.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+    }
+
+    #[test]
+    fn captain_identity_reacquires_after_control_context_restart_and_credential_rotation() {
+        let (first, captains, identities, identity) = captain_lease_fixture(true);
+        let initial = dispatch_authenticated(
+            &first,
+            req_session(
+                "read-global-control",
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        let old_lease = initial.result.unwrap()["lease"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let restarted = test_ctx("rotated-global-control")
+            .with_captains_registry(captains.clone())
+            .with_identity_store(identities)
+            .with_live_sessions(|| Ok(vec![tmux_target("lease-captain")]));
+        let stale = dispatch_authenticated(
+            &restarted,
+            req_session(&old_lease, &identity.secret, "my_capability", Value::Null),
+        );
+        assert_eq!(
+            stale.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+
+        let renewed = dispatch_authenticated(
+            &restarted,
+            req_session(
+                "read-rotated-global-control",
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(renewed.ok, "{:?}", renewed.error);
+        let result = renewed.result.unwrap();
+        let new_lease = result["lease"].as_str().unwrap();
+        assert_ne!(new_lease, old_lease);
+        let bootstrap = dispatch_authenticated(
+            &restarted,
+            req_session(
+                new_lease,
+                &identity.secret,
+                "captain_bootstrap",
+                json!({"captainSessionId": "lease-captain"}),
+            ),
+        );
+        assert!(bootstrap.ok, "{:?}", bootstrap.error);
+        let bootstrap = bootstrap.result.unwrap();
+        assert_eq!(bootstrap["captain"]["terminalId"], "lease-captain");
+        assert_eq!(bootstrap["captain"]["shipSlug"], "lease-ship");
+        assert_eq!(bootstrap["captain"]["assignment"], "Package 0");
+        assert_eq!(bootstrap["project"]["projectId"], "lease-project");
+        assert_eq!(bootstrap["agentCount"], 0);
+        assert_eq!(bootstrap["recoverySource"], "captains-registry");
+        assert_eq!(captains.snapshot().captains.len(), 1);
+        assert_eq!(captains.snapshot().projects.len(), 1);
     }
 
     #[test]

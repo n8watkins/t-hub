@@ -117,16 +117,10 @@ fn control_endpoint(app: &tauri::AppHandle) -> Result<std::sync::Arc<ControlEndp
         })
 }
 
-/// item-3 §2.1.1 piece 3: build the capability env a UI-spawned terminal is granted
-/// under the inverted least-privilege default, SCRUBBING any inherited control token
-/// by injecting the chosen token explicitly at the tmux session level. Returns the
-/// env pairs plus whether this is a control-capability (elevated) spawn.
+/// Build stable discovery and durable identity environment for a UI Crew spawn.
 ///
-/// Default READ - only an explicit `capability:"control"` injects the in-process
-/// full token. An empty read token (a context that never minted one) falls back to
-/// the full token so it is never locked out, mirroring `control::elevation_env`. When
-/// no control endpoint is bound yet, nothing is injected (there is no addr to
-/// orchestrate against, so it fails SAFE).
+/// Rotating address and tier credential values are always scrubbed. A UI Crew
+/// cannot turn a requested capability label into a Captain control lease.
 fn ui_spawn_capability_env(
     app: &tauri::AppHandle,
     opts: &SpawnOptions,
@@ -138,6 +132,12 @@ fn ui_spawn_capability_env(
     ),
     String,
 > {
+    // Preserve the input field for wire compatibility, but never convert a Crew
+    // request into Captain authority.
+    let _requested_control = opts
+        .capability
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("control"));
     // LOW-1: the scrub is UNCONDITIONAL - env-inheritance must never decide a
     // session's capability. When the control endpoint is unresolvable / unbound (a
     // pre-bind race, no live control server), we still explicitly BLANK
@@ -148,6 +148,7 @@ fn ui_spawn_capability_env(
         let mut env = vec![
             ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
             ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+            ("T_HUB_CONTROL_FILE".to_string(), String::new()),
             (
                 crate::identity::SESSION_TOKEN_ENV.to_string(),
                 String::new(),
@@ -159,26 +160,11 @@ fn ui_spawn_capability_env(
     let Ok(endpoint) = control_endpoint(app) else {
         return Ok((scrub(), false, None));
     };
-    let addr = endpoint.addr();
-    if addr.is_empty() {
+    if endpoint.addr().is_empty() {
         return Ok((scrub(), false, None));
     }
-    let is_control = opts
-        .capability
-        .as_deref()
-        .map(|c| c.eq_ignore_ascii_case("control"))
-        .unwrap_or(false);
-    let token = if is_control {
-        endpoint.token().to_string()
-    } else if !endpoint.read_token().is_empty() {
-        endpoint.read_token().to_string()
-    } else {
-        // Bare-probe fallback: no read token minted, so the read default cannot be
-        // honored; use the full token rather than lock the session out.
-        endpoint.token().to_string()
-    };
-    // Set BOTH explicitly at the session level so they override (scrub) any inherited
-    // values. The MCP env override is all-or-nothing, so both must be present.
+    // Pass only the stable authoritative file location. Address and tier
+    // credentials are rediscovered or reacquired in memory by the MCP process.
     let identity_store = app
         .try_state::<std::sync::Arc<crate::identity::IdentityStore>>()
         .map(|state| state.inner().clone());
@@ -190,8 +176,12 @@ fn ui_spawn_capability_env(
         return Err("UI Crew spawn requires the identity store; refusing to launch without credential withholding".into());
     }
     let mut env = vec![
-        ("T_HUB_CONTROL_ADDR".to_string(), addr),
-        ("T_HUB_CONTROL_TOKEN".to_string(), token),
+        (
+            "T_HUB_CONTROL_FILE".to_string(),
+            crate::control::discovery_file_for_spawn(),
+        ),
+        ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+        ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
     ];
     if let Some(identity) = &identity {
         env.push((
@@ -199,7 +189,7 @@ fn ui_spawn_capability_env(
             identity.secret.clone(),
         ));
     }
-    Ok((env, is_control, identity))
+    Ok((env, false, identity))
 }
 
 /// item-3 §2.1.1 piece 4: audit a UI control-capability spawn against the SHARED

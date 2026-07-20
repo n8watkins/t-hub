@@ -1,13 +1,12 @@
 //! Client side of the loopback control channel: the bridge from `tools/call` to
 //! the running T-Hub app.
 //!
-//! Discovery: read the handshake file the app wrote (`$T_HUB_CONTROL_FILE`, or
-//! `~/.t-hub/control.json`) for the `addr` + `token`, or take both from
-//! `$T_HUB_CONTROL_ADDR` + `$T_HUB_CONTROL_TOKEN` (used by the proof harness and
-//! when the app's path differs). These inputs are captured once into a
-//! [`Discovery`] value at startup so the rest of the crate resolves endpoints
-//! from an injected config rather than process-global env (which keeps the tests
-//! hermetic under parallel execution). Each call opens a short-lived TCP
+//! Discovery reads the stable authoritative handshake at `$T_HUB_CONTROL_FILE`
+//! (falling back to `~/.t-hub/control.json` only for legacy callers). Address and
+//! ambient read authentication come from that file. A durable Captain proves its
+//! `$T_HUB_SESSION_TOKEN` to acquire a short-lived identity-bound control lease,
+//! held only in this process. Legacy explicit address and token overrides remain
+//! available for proof harnesses. Each call opens a short-lived TCP
 //! connection to `addr`, sends one NDJSON request line, and reads one NDJSON
 //! response line. Connections are not pooled - `tools/call` is infrequent and a
 //! fresh connection keeps the client stateless and robust to app restarts.
@@ -17,6 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -104,17 +104,41 @@ fn ensure_request_id(command: &str, args: &Value) -> (Value, Option<String>) {
 }
 
 /// How T-Hub's control channel was located + authenticated.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlEndpoint {
     pub addr: String,
     pub token: String,
 }
 
+impl std::fmt::Debug for ControlEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlEndpoint")
+            .field("addr", &self.addr)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The on-disk handshake the app writes. We only need `addr` + `token`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Handshake {
     addr: String,
     token: String,
+    #[serde(default)]
+    protocol_version: u32,
+    #[serde(default)]
+    instance_id: String,
+    #[serde(default)]
+    listener_generation: u64,
+    #[serde(default)]
+    published_at: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedLease {
+    token: String,
+    expires_at: u64,
 }
 
 /// The inputs used to locate the control channel, captured up front so that
@@ -123,7 +147,7 @@ struct Handshake {
 /// [`Discovery::from_env`]; tests construct it directly, which keeps them
 /// hermetic (no shared `T_HUB_CONTROL_*` env mutation that could race across
 /// threads when the suite runs in parallel).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Discovery {
     /// Explicit control address override (`$T_HUB_CONTROL_ADDR`).
     pub addr: Option<String>,
@@ -136,6 +160,11 @@ pub struct Discovery {
     /// it is read from `$HOME`/`$USERPROFILE` at resolution time. Tests set this
     /// to keep the default-path branch off the real environment.
     pub home: Option<PathBuf>,
+    /// Durable session credential used to prove identity during scoped lease
+    /// renewal. Captured once from `T_HUB_SESSION_TOKEN`.
+    pub session: Option<String>,
+    /// Current identity-bound lease, held only in MCP process memory.
+    pub(crate) lease: Arc<Mutex<Option<CachedLease>>>,
 }
 
 impl Discovery {
@@ -153,6 +182,10 @@ impl Discovery {
             // Resolved lazily in `handshake_path` so the default branch still
             // honors the live environment in production.
             home: None,
+            session: std::env::var("T_HUB_SESSION_TOKEN")
+                .ok()
+                .and_then(non_empty),
+            lease: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -163,11 +196,8 @@ impl Discovery {
     /// the handshake file is missing, so the MCP server can surface "T-Hub is
     /// not running" as a tool error rather than crashing.
     pub fn resolve(&self) -> Result<ControlEndpoint, String> {
-        // 1. Explicit addr + token override - used by the proof harness and the
-        //    app's spawn-tree env injection (`T_HUB_CONTROL_ADDR` +
-        //    `T_HUB_CONTROL_TOKEN`). The fast path while the app stays bound; if it
-        //    later goes stale (restart onto a new port), `resolve_and_call` falls
-        //    back to `resolve_from_file` instead of re-trusting this pair.
+        // 1. Explicit addr + token override, retained for proof harnesses and
+        //    already-running legacy sessions. New app spawns use the stable file.
         if let (Some(addr), Some(token)) = (&self.addr, &self.token) {
             if !addr.is_empty() && !token.is_empty() {
                 return Ok(ControlEndpoint {
@@ -184,11 +214,9 @@ impl Discovery {
     /// Read the endpoint from the handshake file ONLY, ignoring any
     /// `$T_HUB_CONTROL_ADDR`/`$T_HUB_CONTROL_TOKEN` override.
     ///
-    /// This is the recovery path after a transport failure: the app rebinds to a
-    /// fresh ephemeral port on every restart and rewrites control.json, but a
-    /// session's MCP captured the old addr+token in its env at spawn time. Once
-    /// that env pin points at a dead port, the live endpoint lives only in the
-    /// file - so we re-read it here rather than re-trusting the stale env pair.
+    /// This is the normal discovery path for new sessions and the recovery path
+    /// after a legacy transport pin fails. The app atomically rewrites the file
+    /// whenever the listener address changes.
     pub fn resolve_from_file(&self) -> Result<ControlEndpoint, String> {
         let path = self.handshake_path();
         let body = std::fs::read_to_string(&path).map_err(|e| {
@@ -200,6 +228,38 @@ impl Discovery {
         })?;
         let hs: Handshake = serde_json::from_str(&body)
             .map_err(|e| format!("malformed control handshake at {}: {e}", path.display()))?;
+        let socket: SocketAddr = hs.addr.parse().map_err(|_| {
+            format!(
+                "malformed control handshake at {}: addr is not a socket address",
+                path.display()
+            )
+        })?;
+        if !socket.ip().is_loopback() {
+            return Err(format!(
+                "unsafe control handshake at {}: addr is not loopback",
+                path.display()
+            ));
+        }
+        if hs.protocol_version > 2 {
+            return Err(format!(
+                "unsupported control handshake protocol {} at {}",
+                hs.protocol_version,
+                path.display()
+            ));
+        }
+        if !hs.instance_id.is_empty() && hs.listener_generation == 0 {
+            return Err(format!(
+                "invalid control handshake at {}: listener generation is zero",
+                path.display()
+            ));
+        }
+        let now = epoch_ms();
+        if hs.published_at > now.saturating_add(5 * 60 * 1000) {
+            return Err(format!(
+                "invalid control handshake at {}: publication time is in the future",
+                path.display()
+            ));
+        }
         Ok(ControlEndpoint {
             addr: hs.addr,
             token: hs.token,
@@ -208,9 +268,7 @@ impl Discovery {
 
     /// Whether an explicit env pin (`$T_HUB_CONTROL_ADDR` + `$T_HUB_CONTROL_TOKEN`)
     /// is in force - i.e. [`resolve`](Self::resolve) returned that pair rather than the
-    /// file. The env token is the credential the app injected at spawn (a control-tier
-    /// session gets the FULL token), so it must be PRESERVED across a port rotation,
-    /// never swapped for control.json's (read-only, under item-3 harden) token.
+    /// file. This is compatibility state for sessions created before Package 0.
     pub fn has_env_pin(&self) -> bool {
         matches!(
             (&self.addr, &self.token),
@@ -222,14 +280,9 @@ impl Discovery {
     /// running app just published in control.json, but KEEPING the env token when an
     /// env pin is in force.
     ///
-    /// This is the core stale-pin fix. A restart/install rotates the control PORT but
-    /// not the token (adopt-first), while control.json under item-3 hardening carries
-    /// only the READ token. The old recovery re-read BOTH fields wholesale
-    /// ([`resolve_from_file`](Self::resolve_from_file)), so a fully-authorized control
-    /// session silently degraded to read-only after any restart. Keeping the env token
-    /// lets the control session reach the fresh port with its real capability; if that
-    /// token is genuinely refused (a real rotation), the caller surfaces a loud error
-    /// rather than a silent downgrade.
+    /// Port-only legacy recovery keeps the pinned credential while adopting the
+    /// fresh address. If the credential also rotated, a durable Captain exchanges
+    /// its session identity for a scoped lease in memory.
     ///
     /// With NO env pin (the app's own / a probe path that never had one), there is no
     /// token to preserve, so the file's token is adopted as before.
@@ -250,17 +303,91 @@ impl Discovery {
         if let Some(p) = &self.file {
             return p.clone();
         }
-        let home = self
-            .home
-            .clone()
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(PathBuf::from)
-            })
+        if let Some(home) = &self.home {
+            return home.join(".t-hub").join("control.json");
+        }
+        // Existing WSL Captain processes may predate T_HUB_CONTROL_FILE. Their
+        // inherited Windows USERPROFILE still identifies the authoritative host
+        // home, while HOME points at the stale WSL shadow that caused Package 0.
+        #[cfg(not(windows))]
+        if let Some(profile) = std::env::var_os("USERPROFILE")
+            .and_then(|value| windows_profile_to_wsl_path(&value.to_string_lossy()))
+        {
+            return profile.join(".t-hub").join("control.json");
+        }
+        #[cfg(not(windows))]
+        if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+            if let Some(path) = unique_windows_control_file(PathBuf::from("/mnt/c/Users")) {
+                return path;
+            }
+            // Ambiguous or missing Windows discovery must fail closed. Falling
+            // back to HOME here would resurrect the stale WSL shadow path.
+            return PathBuf::from("/mnt/c/Users/.t-hub/control.json");
+        }
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         home.join(".t-hub").join("control.json")
     }
+
+    fn session_token(&self) -> &str {
+        self.session.as_deref().unwrap_or("")
+    }
+
+    fn cached_lease_endpoint(&self, endpoint: &ControlEndpoint) -> Option<ControlEndpoint> {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        if lease.expires_at <= epoch_ms().saturating_add(5_000) {
+            return None;
+        }
+        Some(ControlEndpoint {
+            addr: endpoint.addr.clone(),
+            token: lease.token,
+        })
+    }
+
+    fn cache_lease(&self, _endpoint: &ControlEndpoint, token: String, expires_at: u64) {
+        *self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(CachedLease { token, expires_at });
+    }
+}
+
+fn windows_profile_to_wsl_path(profile: &str) -> Option<PathBuf> {
+    let normalized = profile.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'/' {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    Some(PathBuf::from(format!(
+        "/mnt/{drive}/{}",
+        normalized[3..].trim_start_matches('/')
+    )))
+}
+
+#[cfg(not(windows))]
+fn unique_windows_control_file(users_root: PathBuf) -> Option<PathBuf> {
+    let mut candidates = std::fs::read_dir(users_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(".t-hub").join("control.json"))
+        .filter(|path| path.is_file());
+    let only = candidates.next()?;
+    candidates.next().is_none().then_some(only)
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The app's response envelope: `{ok, result?, error?}`.
@@ -482,6 +609,84 @@ fn wedge_detector() -> std::sync::MutexGuard<'static, WedgeDetector> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+fn renew_captain_endpoint(
+    discovery: &Discovery,
+    budget: CallBudget,
+) -> Result<ControlEndpoint, String> {
+    if discovery.session_token().is_empty() {
+        return Err("control_reauthentication_required: T_HUB_SESSION_TOKEN is unavailable".into());
+    }
+    let endpoint = discovery.resolve_from_file()?;
+    let response = call_classified(
+        &endpoint,
+        "renew_captain_control_lease",
+        &Value::Null,
+        budget,
+        Some(discovery),
+    )
+    .map_err(|error| error.into_message("renew_captain_control_lease", 1, false))?;
+    let lease = response
+        .get("lease")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("control_protocol: lease renewal omitted its scoped credential")?;
+    let expires_at = response
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .ok_or("control_protocol: lease renewal omitted its expiry")?;
+    discovery.cache_lease(&endpoint, lease.to_string(), expires_at);
+    Ok(ControlEndpoint {
+        addr: endpoint.addr,
+        token: lease.to_string(),
+    })
+}
+
+fn endpoint_with_available_lease(
+    discovery: &Discovery,
+    endpoint: ControlEndpoint,
+    budget: CallBudget,
+    renew: bool,
+) -> ControlEndpoint {
+    if let Some(cached) = discovery.cached_lease_endpoint(&endpoint) {
+        return cached;
+    }
+    if renew {
+        if let Ok(leased) = renew_captain_endpoint(discovery, budget) {
+            return leased;
+        }
+    }
+    endpoint
+}
+
+/// Recover after a credential rejection at a reachable endpoint. The ambient
+/// read credential is tried first so read operations remain available. Only a
+/// second authorization refusal triggers durable identity reauthentication.
+fn recover_after_auth_rejection(
+    discovery: &Discovery,
+    command: &str,
+    args: &Value,
+    budget: CallBudget,
+) -> Result<Value, String> {
+    let ambient = discovery.resolve_from_file()?;
+    match call_classified(&ambient, command, args, budget, Some(discovery)) {
+        Ok(value)
+            if command == "my_capability"
+                && value.get("capability").and_then(Value::as_str) == Some("read") =>
+        {
+            let leased = renew_captain_endpoint(discovery, budget)?;
+            call_classified(&leased, command, args, budget, Some(discovery))
+                .map_err(|error| error.into_message(command, 3, true))
+        }
+        Ok(value) => Ok(value),
+        Err(CallError::App(message)) if is_auth_rejection(&message) => {
+            let leased = renew_captain_endpoint(discovery, budget)?;
+            call_classified(&leased, command, args, budget, Some(discovery))
+                .map_err(|error| error.into_message(command, 3, true))
+        }
+        Err(error) => Err(error.into_message(command, 2, true)),
+    }
+}
+
 /// Resolve the control endpoint and run one command, transparently recovering
 /// from an app restart.
 ///
@@ -492,15 +697,10 @@ fn wedge_detector() -> std::sync::MutexGuard<'static, WedgeDetector> {
 /// control.json and retry once against it, instead of wrongly concluding "T-Hub
 /// is down".
 ///
-/// STALE-PIN FIX: the retry KEEPS the pinned env token (see
-/// [`Discovery::refreshed_endpoint`]). A restart rotates the port but not the
-/// token (adopt-first), while control.json - under item-3 hardening - publishes
-/// only the READ token. The old recovery re-read BOTH fields wholesale, so a
-/// fully-authorized control session silently degraded to read-only after any
-/// restart. If the kept env token is genuinely REFUSED at the fresh addr (a real
-/// token rotation), we surface a loud, cause-naming error rather than a silent
-/// read-only downgrade. App-level rejections are otherwise returned verbatim (a
-/// new endpoint won't change them).
+/// A legacy port-only retry keeps its pinned token for compatibility. A durable
+/// Captain also reauthenticates through its session identity and replaces any
+/// stale global credential with a short-lived scoped lease. The ambient token
+/// from discovery is used only to reach that renewal operation.
 pub fn resolve_and_call(
     discovery: &Discovery,
     command: &str,
@@ -533,6 +733,12 @@ fn resolve_and_call_with_deadline(
     // recovery path.
     let (args, request_id) = ensure_request_id(command, args);
     let endpoint = discovery.resolve()?;
+    let endpoint = endpoint_with_available_lease(
+        discovery,
+        endpoint,
+        budget.initial_attempt(),
+        !discovery.has_env_pin() && !discovery.session_token().is_empty(),
+    );
     if Instant::now() >= budget.deadline {
         return Err(timeout_message(command, 0, "discovery"));
     }
@@ -551,7 +757,11 @@ fn resolve_and_call_with_deadline(
             // The app answered (rejected the command) - the transport is healthy, so
             // end any wedge episode.
             wedge_detector().on_success();
-            Err(msg)
+            if is_auth_rejection(&msg) && !discovery.session_token().is_empty() {
+                recover_after_auth_rejection(discovery, command, &args, budget)
+            } else {
+                Err(msg)
+            }
         }
         Err(CallError::Protocol(msg)) => {
             wedge_detector().on_success();
@@ -578,7 +788,10 @@ fn resolve_and_call_with_deadline(
             let fresh = discovery
                 .refreshed_endpoint()
                 .ok()
-                .filter(|f| f.addr != endpoint.addr || f.token != endpoint.token);
+                .filter(|f| f.addr != endpoint.addr || f.token != endpoint.token)
+                .map(|fresh| {
+                    endpoint_with_available_lease(discovery, fresh, budget.initial_attempt(), false)
+                });
 
             // Spawn-class command: the transport failure is AMBIGUOUS (the command may
             // have applied server-side before the response leg died - Incident A/B/D),
@@ -612,7 +825,7 @@ fn resolve_and_call_with_deadline(
                     &args,
                     id,
                     first_msg,
-                    discovery.has_env_pin(),
+                    (discovery, discovery.has_env_pin()),
                     budget,
                 );
                 if r.is_ok() {
@@ -626,7 +839,7 @@ fn resolve_and_call_with_deadline(
             // having ACTUALLY TRIED and still-failing is the one the wedge decision is
             // based on (F2: NOT the possibly-stale env pin we started from).
             if let Some(f) = fresh {
-                match call_classified(&f, command, &args, budget, None) {
+                match call_classified(&f, command, &args, budget, Some(discovery)) {
                     Ok(v) => {
                         wedge_detector().on_success();
                         Ok(v)
@@ -638,7 +851,9 @@ fn resolve_and_call_with_deadline(
                         // an AUTH refusal, that means a REAL token rotation - surface the
                         // stale-pin cause loudly instead of the terse "unauthorized"
                         // (never a silent read-only slide onto control.json's token).
-                        if discovery.has_env_pin() && is_auth_rejection(&msg) {
+                        if !discovery.session_token().is_empty() && is_auth_rejection(&msg) {
+                            recover_after_auth_rejection(discovery, command, &args, budget)
+                        } else if discovery.has_env_pin() && is_auth_rejection(&msg) {
                             Err(stale_env_token_error(&msg))
                         } else {
                             Err(msg)
@@ -696,7 +911,7 @@ fn maybe_heal_and_retry(
 ) -> Result<Value, String> {
     if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
         if let Some(healed) = try_bridge_rebind(discovery, &tried, budget.deadline) {
-            return match call_classified(&healed, command, args, budget, None) {
+            return match call_classified(&healed, command, args, budget, Some(discovery)) {
                 Ok(v) => {
                     wedge_detector().on_success();
                     Ok(v)
@@ -705,8 +920,18 @@ fn maybe_heal_and_retry(
                 // so an AUTH refusal here means a REAL token rotation - name it loudly
                 // rather than returning the terse "unauthorized" (mirrors the primary
                 // stale-pin path; never a silent read-only slide).
-                Err(CallError::App(msg)) if discovery.has_env_pin() && is_auth_rejection(&msg) => {
-                    Err(stale_env_token_error(&msg))
+                Err(CallError::App(msg)) if is_auth_rejection(&msg) => {
+                    if discovery.session_token().is_empty() {
+                        if discovery.has_env_pin() {
+                            Err(stale_env_token_error(&msg))
+                        } else {
+                            Err(msg)
+                        }
+                    } else {
+                        let leased = renew_captain_endpoint(discovery, budget)?;
+                        call_classified(&leased, command, args, budget, Some(discovery))
+                            .map_err(|error| error.into_message(command, 4, true))
+                    }
                 }
                 Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => Err(msg),
                 Err(CallError::PartialResponse) => Err(partial_response_message()),
@@ -783,13 +1008,20 @@ fn resolve_ambiguous_request(
     args: &Value,
     request_id: &str,
     first_err: String,
-    has_env_pin: bool,
+    auth: (&Discovery, bool),
     budget: CallBudget,
 ) -> Result<Value, String> {
+    let (discovery, has_env_pin) = auth;
     let status_args = serde_json::json!({ "requestId": request_id });
     let mut reissue_state = MutationReissueState::NotAttempted;
     loop {
-        match call_classified(endpoint, "get_request_status", &status_args, budget, None) {
+        match call_classified(
+            endpoint,
+            "get_request_status",
+            &status_args,
+            budget,
+            Some(discovery),
+        ) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
                 Some("completed") => {
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -831,7 +1063,7 @@ fn resolve_ambiguous_request(
                         ));
                     }
                     reissue_state = MutationReissueState::Attempted;
-                    match call_classified(endpoint, command, args, budget, None) {
+                    match call_classified(endpoint, command, args, budget, Some(discovery)) {
                         Ok(value) => return Ok(value),
                         Err(CallError::App(msg)) if has_env_pin && is_auth_rejection(&msg) => {
                             return Err(stale_env_token_error(&msg));
@@ -852,6 +1084,18 @@ fn resolve_ambiguous_request(
             // get_request_status (no server-side cache, so no idempotency guarantee):
             // don't guess, surface the original error.
             Err(CallError::App(msg)) => {
+                if has_env_pin && is_auth_rejection(&msg) && !discovery.session_token().is_empty() {
+                    let leased = renew_captain_endpoint(discovery, budget)?;
+                    return resolve_ambiguous_request(
+                        &leased,
+                        command,
+                        args,
+                        request_id,
+                        first_err,
+                        (discovery, false),
+                        budget,
+                    );
+                }
                 if has_env_pin && is_auth_rejection(&msg) {
                     return Err(stale_env_token_error(&msg));
                 }
@@ -914,7 +1158,11 @@ fn call_classified(
     // enforce the plane ACLs against an unforgeable-across-sessions identity. Absent for
     // a session that never minted one (a legacy/host context) - the server then treats
     // the caller as the trusted control-token host and the cross-ship ACL fails open.
-    let session = std::env::var("T_HUB_SESSION_TOKEN").unwrap_or_default();
+    let session = discovery
+        .map(Discovery::session_token)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var("T_HUB_SESSION_TOKEN").unwrap_or_default());
     let request = serde_json::json!({
         "token": endpoint.token,
         "session": session,
@@ -2519,6 +2767,74 @@ mod tests {
     }
 
     #[test]
+    fn explicit_authoritative_file_ignores_stale_wsl_home_shadow_across_atomic_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-cross-path-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let wsl_home = dir.join("wsl-home");
+        let shadow = wsl_home.join(".t-hub/control.json");
+        let authoritative = dir.join("windows-home/.t-hub/control.json");
+        std::fs::create_dir_all(shadow.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(authoritative.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shadow,
+            r#"{"addr":"127.0.0.1:45949","token":"STALE","pid":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &authoritative,
+            r#"{"addr":"127.0.0.1:56192","token":"CURRENT","pid":2}"#,
+        )
+        .unwrap();
+        let discovery = Discovery {
+            file: Some(authoritative.clone()),
+            home: Some(wsl_home),
+            ..Default::default()
+        };
+        let current = discovery.resolve_from_file().unwrap();
+        assert_eq!(current.addr, "127.0.0.1:56192");
+        assert_eq!(current.token, "CURRENT");
+
+        let replacement = authoritative.with_extension("json.tmp.test");
+        std::fs::write(
+            &replacement,
+            r#"{"addr":"127.0.0.1:56193","token":"CURRENT-2","pid":2}"#,
+        )
+        .unwrap();
+        std::fs::rename(replacement, &authoritative).unwrap();
+        let rebound = discovery.resolve_from_file().unwrap();
+        assert_eq!(rebound.addr, "127.0.0.1:56193");
+        assert_eq!(rebound.token, "CURRENT-2");
+        assert_eq!(
+            std::fs::read_to_string(shadow).unwrap(),
+            r#"{"addr":"127.0.0.1:45949","token":"STALE","pid":1}"#
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn legacy_wsl_process_resolves_one_unambiguous_windows_control_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-windows-users-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let current = dir.join("natha/.t-hub/control.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "{}").unwrap();
+        assert_eq!(unique_windows_control_file(dir.clone()), Some(current));
+
+        let foreign = dir.join("foreign/.t-hub/control.json");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, "{}").unwrap();
+        assert_eq!(unique_windows_control_file(dir.clone()), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resolve_endpoint_prefers_addr_token_override() {
         let discovery = Discovery {
             addr: Some("127.0.0.1:1".into()),
@@ -2606,19 +2922,101 @@ mod tests {
     }
 
     #[test]
-    fn resolve_and_call_reports_a_real_token_rotation_loudly() {
-        // A REAL rotation (a fresh install / token reset), distinct from a mere port
-        // rotation: the pinned env token no longer authenticates at the fresh addr. The
-        // recovery must NOT silently adopt control.json's read-only token; it surfaces a
-        // clear error naming the stale env pin so the operator restarts/re-spawns.
+    fn current_windows_handshake_acquires_scoped_lease_without_global_token_env() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-current-handshake-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        let (live_addr, captured) = scripted_server(vec![
+            Some(r#"{"ok":true,"result":{"lease":"CURRENT-scoped","expiresAt":9999999999999}}"#),
+            Some(r#"{"ok":true,"result":{"capability":"control"}}"#),
+        ]);
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"addr":"{live_addr}","token":"CURRENT-read","pid":1,"protocol_version":2,"instance_id":"current","listener_generation":1}}"#
+            ),
+        )
+        .unwrap();
+        let discovery = Discovery {
+            file: Some(file),
+            session: Some("captain-session".into()),
+            ..Default::default()
+        };
+        let result = resolve_and_call(&discovery, "my_capability", &Value::Null).unwrap();
+        assert_eq!(result["capability"], "control");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["token"], "CURRENT-read");
+        assert_eq!(requests[0]["command"], "renew_captain_control_lease");
+        assert_eq!(requests[1]["token"], "CURRENT-scoped");
+        assert!(requests.iter().all(|request| request["token"] != "global"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn port_only_rebind_reuses_identity_lease_at_fresh_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-lease-rebind-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        let (live_addr, captured) =
+            scripted_server(vec![Some(r#"{"ok":true,"result":{"ok":true}}"#)]);
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{live_addr}","token":"READ","pid":1}}"#),
+        )
+        .unwrap();
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead);
+        let discovery = Discovery {
+            addr: Some(dead_addr),
+            token: Some("OLD-global".into()),
+            file: Some(file),
+            session: Some("captain-session".into()),
+            ..Default::default()
+        };
+        discovery.cache_lease(
+            &ControlEndpoint {
+                addr: "127.0.0.1:1".into(),
+                token: "ignored".into(),
+            },
+            "SCOPED-port-lease".into(),
+            9_999_999_999_999,
+        );
+        let result = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap();
+        assert_eq!(result["ok"], true);
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "port-only rebind must not mint a new lease"
+        );
+        assert_eq!(requests[0]["token"], "SCOPED-port-lease");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_and_call_reauthenticates_the_same_identity_after_real_token_rotation() {
+        // A real global credential rotation must recover through the durable
+        // session identity without returning or adopting the new global token.
         let dir = std::env::temp_dir().join(format!("th-mcp-rot2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("control.json");
 
-        // The live app on a fresh port refuses the (now rotated-away) env token.
-        let (live_addr, _cap) = scripted_server(vec![Some(
-            r#"{"ok":false,"error":"unauthorized: bad control token"}"#,
-        )]);
+        let (live_addr, captured) = scripted_server(vec![
+            Some(r#"{"ok":false,"error":"unauthorized: bad control token"}"#),
+            Some(r#"{"ok":true,"result":{"capability":"read"}}"#),
+            Some(r#"{"ok":true,"result":{"lease":"SCOPED-lease","expiresAt":9999999999999}}"#),
+            Some(r#"{"ok":true,"result":{"capability":"control"}}"#),
+        ]);
         std::fs::write(
             &file,
             format!(r#"{{"addr":"{live_addr}","token":"READ-tok","pid":1}}"#),
@@ -2633,15 +3031,22 @@ mod tests {
             addr: Some(dead_addr),
             token: Some("STALE-tok".into()),
             file: Some(file.clone()),
+            session: Some("durable-session-secret".into()),
             ..Default::default()
         };
 
-        let err = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap_err();
-        let lower = err.to_lowercase();
-        assert!(
-            lower.contains("stale") && lower.contains("read-only"),
-            "must name the stale env pin + refuse the read-only fallback: {err}"
-        );
+        let result = resolve_and_call(&discovery, "my_capability", &Value::Null).unwrap();
+        assert_eq!(result["capability"], "control");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[0]["token"], "STALE-tok");
+        assert_eq!(requests[1]["token"], "READ-tok");
+        assert_eq!(requests[2]["command"], "renew_captain_control_lease");
+        assert_eq!(requests[2]["token"], "READ-tok");
+        assert_eq!(requests[2]["session"], "durable-session-secret");
+        assert_eq!(requests[3]["token"], "SCOPED-lease");
+        assert!(requests
+            .iter()
+            .all(|request| request["token"] != "NEW-global"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
