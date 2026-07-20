@@ -1693,7 +1693,7 @@ mod tests {
         let old = service
             .list_for_assignment(
                 &HistoryFilter::default(),
-                &[association.clone()],
+                std::slice::from_ref(&association),
                 "ship",
                 "project-old",
                 "assignment-old",
@@ -1708,7 +1708,7 @@ mod tests {
             let rebound = service
                 .list_for_assignment(
                     &HistoryFilter::default(),
-                    &[association.clone()],
+                    std::slice::from_ref(&association),
                     "ship",
                     project,
                     assignment,
