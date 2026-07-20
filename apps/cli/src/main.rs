@@ -14,6 +14,7 @@ mod admin;
 mod agents;
 mod args;
 mod control;
+mod history;
 mod powder;
 mod render;
 mod worktree;
@@ -48,6 +49,7 @@ struct CliError {
     code: u8,
     kind: &'static str,
     message: String,
+    retryable: bool,
 }
 
 impl CliError {
@@ -56,6 +58,7 @@ impl CliError {
             code: exit::USAGE,
             kind: "usage",
             message: message.into(),
+            retryable: false,
         }
     }
 
@@ -64,6 +67,7 @@ impl CliError {
             code: exit::GATED,
             kind: "gated",
             message: message.into(),
+            retryable: false,
         }
     }
 
@@ -72,6 +76,7 @@ impl CliError {
             code: exit::SERVER_ERROR,
             kind: "powder_retired",
             message: message.into(),
+            retryable: false,
         }
     }
 
@@ -82,6 +87,7 @@ impl CliError {
             code: exit::SERVER_ERROR,
             kind: "git_error",
             message: message.into(),
+            retryable: false,
         }
     }
 }
@@ -96,13 +102,18 @@ impl From<ControlError> for CliError {
                 code: exit::APP_DOWN,
                 kind: "app_down",
                 message: m,
+                retryable: false,
             },
             ControlError::Protocol(m) => CliError {
                 code: exit::PROTOCOL,
                 kind: "protocol",
                 message: m,
+                retryable: false,
             },
-            ControlError::Server(m) => {
+            ControlError::Server {
+                message: m,
+                retryable,
+            } => {
                 if let Some(message) = m.strip_prefix("powder_retired:") {
                     CliError::powder_retired(message)
                 } else if let Some(kind) = powder_mutation_error_kind(&m) {
@@ -110,18 +121,21 @@ impl From<ControlError> for CliError {
                         code: exit::SERVER_ERROR,
                         kind,
                         message: m,
+                        retryable,
                     }
                 } else if is_gated(&m) {
                     CliError {
                         code: exit::GATED,
                         kind: "gated",
                         message: m,
+                        retryable,
                     }
                 } else {
                     CliError {
                         code: exit::SERVER_ERROR,
                         kind: "server_error",
                         message: m,
+                        retryable,
                     }
                 }
             }
@@ -223,6 +237,7 @@ fn command_label(args: &[String]) -> String {
         },
         Some("powder") => powder::command_label(&args[1..]),
         Some("agents") => agents::command_label(&args[1..]),
+        Some("history") => history::command_label(&args[1..]),
         Some("admin") => admin::command_label(&args[1..]),
         Some(c) => c.to_string(),
     }
@@ -245,6 +260,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "events" | "watch" => cmd_events(rest),
         "powder" => powder::run(rest),
         "agents" => agents::run(rest),
+        "history" => history::run(rest),
         "admin" => admin::run(rest),
         other => Err(CliError::usage(format!(
             "unknown command '{other}'. Run `th --help` for the command list."
@@ -558,6 +574,7 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                     .as_deref()
                     .unwrap_or("lease source unavailable")
             ),
+            retryable: false,
         });
     }
 
@@ -794,11 +811,15 @@ fn emit_json_ok(command: &str, data: Value) {
 /// Emit the stable failure envelope: `{ ok:false, command, data:null, error }`.
 /// The `error.code` matches the process exit code, so agents can read either.
 fn emit_json_err(command: &str, e: &CliError) {
+    let mut error = json!({ "code": e.code, "kind": e.kind, "message": e.message });
+    if e.retryable {
+        error["retryable"] = Value::Bool(true);
+    }
     let env = json!({
         "ok": false,
         "command": command,
         "data": Value::Null,
-        "error": { "code": e.code, "kind": e.kind, "message": e.message },
+        "error": error,
     });
     println!("{}", serde_json::to_string_pretty(&env).unwrap_or_default());
 }
@@ -842,25 +863,46 @@ impl Flags {
                 if let Some((name, val)) = rest.split_once('=') {
                     let name = format!("--{name}");
                     match name.as_str() {
-                        "--json" => json = true,
-                        "--all" => all = true,
+                        "--json" | "--all" => {
+                            return Err(CliError::usage(format!(
+                                "boolean option '{name}' does not accept a value"
+                            )));
+                        }
                         _ => {
+                            if val.is_empty() {
+                                return Err(CliError::usage(format!(
+                                    "{name} expects a non-empty value"
+                                )));
+                            }
                             opts.insert(name, val.to_string());
                         }
                     }
                 } else if a == "--json" {
+                    if json {
+                        return Err(CliError::usage("option '--json' may be provided only once"));
+                    }
                     json = true;
                 } else if a == "--all" {
+                    if all {
+                        return Err(CliError::usage("option '--all' may be provided only once"));
+                    }
                     all = true;
                 } else if value_set.contains(a.as_str()) {
                     // `--flag value` form.
                     let val = args
                         .get(i + 1)
                         .ok_or_else(|| CliError::usage(format!("{a} expects a value")))?;
+                    if val.is_empty() || val.starts_with("--") {
+                        return Err(CliError::usage(format!("{a} expects a non-empty value")));
+                    }
                     opts.insert(a.clone(), val.clone());
                     i += 1;
                 } else {
-                    bools.insert(a.clone());
+                    if !bools.insert(a.clone()) {
+                        return Err(CliError::usage(format!(
+                            "option '{a}' may be provided only once"
+                        )));
+                    }
                 }
             } else {
                 pos.push(a.clone());
@@ -915,6 +957,9 @@ commands:\n\
   health                    WSL host snapshot                  [--json]\n\
   events                    stream the control event bus (Ctrl-C to stop)\n\
   agents                    preflight, start, and supervise durable agent sessions\n\
+  history [list]            list provider-neutral conversation History [--json]\n\
+  history focus <historyId> focus one exact active conversation\n\
+  history resume <historyId> --request-id ID --confirm [--tab TAB] [--json]\n\
   admin                     manage durable Ship and Fleet Admin grants\n\
 \n\
 flags:\n\
@@ -966,9 +1011,12 @@ mod tests {
             "malformed",
             "timeout",
         ] {
-            let error: CliError = ControlError::Server(format!(
-                "Powder completion: Powder mutation state '{state}': bounded detail"
-            ))
+            let error: CliError = ControlError::Server {
+                message: format!(
+                    "Powder completion: Powder mutation state '{state}': bounded detail"
+                ),
+                retryable: false,
+            }
             .into();
             assert_eq!(error.code, exit::SERVER_ERROR);
             assert_eq!(error.kind, format!("powder_mutation_{state}"));
@@ -977,7 +1025,11 @@ mod tests {
 
     #[test]
     fn unrelated_server_errors_keep_the_existing_kind() {
-        let error: CliError = ControlError::Server("ordinary failure".into()).into();
+        let error: CliError = ControlError::Server {
+            message: "ordinary failure".into(),
+            retryable: false,
+        }
+        .into();
         assert_eq!(error.code, exit::SERVER_ERROR);
         assert_eq!(error.kind, "server_error");
     }

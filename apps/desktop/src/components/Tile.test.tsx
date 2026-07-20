@@ -137,6 +137,147 @@ describe("Tile Run and Preview entry point", () => {
   });
 });
 
+describe("Tile responsive header controls", () => {
+  it("keeps stable tab names while rendering icon, full, and short variants", () => {
+    const header = renderTile("cap00001");
+    const tabs = [
+      { label: "Terminal", short: "Term", pressed: "true" },
+      { label: "Files", short: "Files", pressed: "false" },
+      { label: "Run + Preview", short: "Run", pressed: "false" },
+    ];
+
+    for (const tab of tabs) {
+      const button = within(header).getByRole("button", {
+        name: tab.label,
+      });
+      expect(button.getAttribute("title")).toBe(`${tab.label} view`);
+      expect(button.getAttribute("aria-pressed")).toBe(tab.pressed);
+      expect(button.classList.contains("h-6")).toBe(true);
+      expect(button.querySelector(".th-tab-icon")?.getAttribute("aria-hidden")).toBe(
+        "true",
+      );
+      expect(button.querySelector(".th-tab-label")?.textContent).toBe(tab.label);
+      const short = button.querySelector(".th-tab-label-short");
+      expect(short?.textContent).toBe(tab.short);
+      expect(short?.getAttribute("aria-hidden")).toBe("true");
+    }
+
+    expect(within(header).queryByRole("button", { name: "Terminal view" })).toBeNull();
+    expect(within(header).queryByRole("button", { name: "Board" })).toBeNull();
+    expect(header.querySelector(".th-tab-list")).toBeTruthy();
+  });
+
+  it("switches views without changing the tab names", () => {
+    const header = renderTile("cap00001");
+    const files = within(header).getByRole("button", { name: "Files" });
+
+    act(() => {
+      fireEvent.click(files);
+    });
+
+    expect(usePanels.getState().tab.cap00001).toBe("files");
+    expect(files.getAttribute("aria-pressed")).toBe("true");
+    expect(within(header).getByRole("button", { name: "Terminal" })).toBeTruthy();
+  });
+
+  it("gives every persistent header action a 24px target", () => {
+    const header = renderTile("cap00001");
+    const actions = [
+      "Refresh terminal",
+      "Kill and restart session",
+      "Terminal colors",
+      "Fullscreen tile",
+      "Kill session",
+    ];
+
+    for (const name of actions) {
+      const button = within(header).getByRole("button", { name });
+      expect(button.classList.contains("th-header-control")).toBe(true);
+      expect(button.classList.contains("h-6")).toBe(true);
+      expect(button.classList.contains("w-6")).toBe(true);
+    }
+  });
+
+  it("marks dual Captain and Cortana identity for minimum-width compaction", () => {
+    useWorkspace.setState((state) => ({
+      terminals: {
+        ...state.terminals,
+        cap00001: { ...state.terminals.cap00001, title: "codex" },
+      },
+    }));
+    useCaptain.setState({
+      orchestratorId: "cap00001",
+      captainIds: ["cap00001"],
+    });
+    const header = renderTile("cap00001");
+    const root = header.closest<HTMLElement>('[data-tile-id="cap00001"]');
+
+    expect(root?.dataset.captain).toBe("1");
+    expect(root?.dataset.orchestrator).toBe("1");
+    expect(header.querySelector(".th-client-icon")).toBeTruthy();
+    expect(header.querySelector(".th-captain-marker")).toBeTruthy();
+    expect(header.querySelector(".th-tile-title")?.textContent).toBe("Cortana");
+  });
+
+  it("limits size containment to the header and keeps floating surfaces and the body outside", () => {
+    const header = renderTile("cap00001");
+    const root = header.closest<HTMLElement>('[data-tile-id="cap00001"]');
+    const container = header.parentElement;
+    const body = root?.lastElementChild;
+
+    expect(root).toBeTruthy();
+    expect(container?.classList.contains("th-tile-header-container")).toBe(true);
+    expect(container?.parentElement).toBe(root);
+    expect(container?.children).toHaveLength(1);
+    expect(root?.classList.contains("th-tile-container")).toBe(false);
+    expect(body).toBeTruthy();
+    expect(body?.parentElement).toBe(root);
+    expect(container?.contains(body ?? null)).toBe(false);
+
+    act(() => {
+      fireEvent.contextMenu(header);
+    });
+    const menu = within(document.body)
+      .getByText("Terminal ID")
+      .closest<HTMLElement>(".fixed.z-50");
+    expect(menu).toBeTruthy();
+    expect(container?.contains(menu ?? null)).toBe(false);
+
+    act(() => {
+      fireEvent.click(within(menu!).getByTitle("Copy Terminal ID"));
+    });
+    const toast = within(document.body).getByRole("status");
+    expect(container?.contains(toast)).toBe(false);
+
+    act(() => {
+      fireEvent.contextMenu(header);
+    });
+    const restartItem = within(document.body).getByText("Kill & restart session");
+    act(() => {
+      fireEvent.click(restartItem);
+    });
+    const dialog = within(document.body).getByRole("alertdialog");
+    expect(container?.contains(dialog)).toBe(false);
+
+    const colorButton = within(header).getByRole("button", {
+      name: "Terminal colors",
+    });
+    vi.spyOn(colorButton, "getBoundingClientRect").mockReturnValue({
+      right: 115,
+      bottom: 45,
+    } as DOMRect);
+    act(() => {
+      fireEvent.click(colorButton);
+    });
+    const colorMenu = within(document.body)
+      .getByText("Reset to theme")
+      .closest<HTMLElement>(".fixed.z-50");
+    expect(colorMenu).toBeTruthy();
+    expect(container?.contains(colorMenu ?? null)).toBe(false);
+    expect(colorMenu?.style.left).toBe("8px");
+  });
+});
+
 describe("Tile header context menu: IDs + Mark as Cortana", () => {
   /** Right-click the header to open the context menu, then return the menu's
    *  root (it renders fixed to the document, not inside the header). */
@@ -288,6 +429,17 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     });
     menu = openMenu("cap00001");
     expect(within(menu).getByText("Unmark Cortana")).toBeTruthy();
+  });
+
+  it("keeps kill and restart available when the narrow header hides it", () => {
+    const menu = openMenu("cap00001");
+    act(() => {
+      fireEvent.click(within(menu).getByText("Kill & restart session"));
+    });
+
+    const dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.textContent).toContain("Kill & restart this session?");
   });
 
   it("marking Cortana from the menu sets the designation and flashes the next-steps hint", () => {

@@ -26,6 +26,15 @@ use serde_json::Value;
 /// invalidation, retry, bridge recovery, and ambiguous-response lookup, must
 /// finish within this wall-clock budget.
 const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn response_timeout_for_command(command: &str) -> Duration {
+    match command {
+        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
+        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        _ => CONTROL_DEADLINE,
+    }
+}
 
 /// A single endpoint gets only a short slice of the overall budget so an
 /// inherited port that accepts but stays silent cannot consume the recovery
@@ -41,7 +50,11 @@ const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 fn is_idempotent_command(command: &str) -> bool {
     matches!(
         command,
-        "spawn_terminal" | "create_worktree" | "commission_captain" | "dispatch_crew"
+        "spawn_terminal"
+            | "create_worktree"
+            | "commission_captain"
+            | "dispatch_crew"
+            | "history_resume"
     )
 }
 
@@ -258,6 +271,59 @@ struct ControlResponse {
     result: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    retryable: bool,
+}
+
+const RETRYABLE_CONTROL_ERROR_MARKER: &str = "\u{1}retryable-control\u{1}";
+
+fn encode_control_error(message: String, retryable: bool) -> String {
+    if retryable {
+        format!("{RETRYABLE_CONTROL_ERROR_MARKER}{message}")
+    } else {
+        message
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlCallError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ControlCallError {
+    fn from_encoded(message: String) -> Self {
+        match message.strip_prefix(RETRYABLE_CONTROL_ERROR_MARKER) {
+            Some(clean) => Self {
+                message: clean.to_string(),
+                retryable: true,
+            },
+            None => Self {
+                message,
+                retryable: false,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ControlCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for ControlCallError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl PartialEq<&str> for ControlCallError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
 }
 
 /// Why a single control round-trip failed, so the retry layer can tell a moved
@@ -333,7 +399,7 @@ fn unavailable_message(
 fn timeout_message(command: &str, attempts: u8, stage: &str) -> String {
     format!(
         "control_timeout: command '{command}' failed within its {}s recovery deadline during {stage} after {attempts} attempt(s); retry_state=exhausted",
-        CONTROL_DEADLINE.as_secs()
+        response_timeout_for_command(command).as_secs()
     )
 }
 
@@ -439,8 +505,15 @@ pub fn resolve_and_call(
     discovery: &Discovery,
     command: &str,
     args: &Value,
-) -> Result<Value, String> {
-    resolve_and_call_with_deadline(discovery, command, args, CONTROL_DEADLINE, ATTEMPT_TIMEOUT)
+) -> Result<Value, ControlCallError> {
+    resolve_and_call_with_deadline(
+        discovery,
+        command,
+        args,
+        response_timeout_for_command(command),
+        ATTEMPT_TIMEOUT,
+    )
+    .map_err(ControlCallError::from_encoded)
 }
 
 fn resolve_and_call_with_deadline(
@@ -682,6 +755,16 @@ fn unknown_after_reissue_message(command: &str, request_id: &str) -> String {
     )
 }
 
+fn pending_request_message(command: &str, request_id: &str, first_err: &str) -> String {
+    format!(
+        "PENDING: the request was accepted (requestId '{request_id}') and is \
+         still materializing after {}s - re-issue '{command}' with the same \
+         requestId for its final outcome (do NOT create a new requestId). \
+         (Original client-deadline note: {first_err})",
+        response_timeout_for_command(command).as_secs()
+    )
+}
+
 /// Resolve an ambiguous spawn-class transport failure (ask #1/#2): the command was
 /// possibly accepted but its response leg failed. Query `get_request_status` for
 /// the SAME `request_id` and act on the authoritative answer:
@@ -723,15 +806,12 @@ fn resolve_ambiguous_request(
                         // PENDING, not failed (ask #2): the app ACCEPTED the spawn and
                         // is still materializing it (e.g. a Windows memory trough slowed
                         // it past our deadline). Hand back the resolvable requestId with
-                        // an unambiguous "accepted/pending" framing so the caller polls
-                        // get_request_status rather than reading this as a spawn failure
-                        // and guessing/retrying.
-                        return Err(format!(
-                            "PENDING: the request was accepted (requestId '{request_id}') and is \
-                             still materializing after {}s - poll get_request_status with that \
-                             requestId for its final outcome (do NOT re-issue the command). \
-                             (Original client-deadline note: {first_err})",
-                            CONTROL_DEADLINE.as_secs()
+                        // an unambiguous "accepted/pending" framing. MCP does not
+                        // expose the internal status command, so recovery reissues
+                        // the same command with the same idempotency key.
+                        return Err(encode_control_error(
+                            pending_request_message(command, request_id, &first_err),
+                            true,
                         ));
                     }
                     sleep_within(budget.deadline, Duration::from_millis(200));
@@ -957,9 +1037,11 @@ fn call_classified(
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
-        Err(CallError::App(resp.error.unwrap_or_else(|| {
-            "control command failed (no error message)".to_string()
-        })))
+        Err(CallError::App(encode_control_error(
+            resp.error
+                .unwrap_or_else(|| "control command failed (no error message)".to_string()),
+            resp.retryable,
+        )))
     }
 }
 
@@ -1893,6 +1975,34 @@ mod tests {
     }
 
     #[test]
+    fn history_resume_keeps_its_request_id_and_long_response_window() {
+        let args = serde_json::json!({
+            "historyId": "history:v1:one",
+            "requestId": "history-request-one"
+        });
+        let (normalized, request_id) = ensure_request_id("history_resume", &args);
+        assert_eq!(normalized, args);
+        assert_eq!(request_id.as_deref(), Some("history-request-one"));
+        assert_eq!(
+            response_timeout_for_command("history_resume"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("history_list"),
+            CONTROL_DEADLINE
+        );
+        assert!(timeout_message("history_resume", 1, "read").contains("120s"));
+        let pending = pending_request_message(
+            "history_resume",
+            "history-request-one",
+            "control_timeout: response lost",
+        );
+        assert!(pending.contains("after 120s"));
+        assert!(pending.contains("re-issue 'history_resume' with the same requestId"));
+        assert!(!pending.contains("poll get_request_status"));
+    }
+
+    #[test]
     fn non_idempotent_call_does_not_inject_a_request_id() {
         let (addr, captured) = scripted_server(vec![Some(r#"{"ok":true,"result":{}}"#)]);
         resolve_and_call(&discovery_for(addr), "list_tabs", &Value::Null).unwrap();
@@ -2343,6 +2453,32 @@ mod tests {
         };
         let err = call(&ep, "list_tabs", &Value::Null).unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn resolve_and_call_preserves_retryable_error_metadata() {
+        let addr = fake_server(
+            "tok",
+            r#"{"ok":false,"error":"history_resume_failed: placement uncertain","retryable":true}"#,
+        );
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("tok".into()),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call(
+            &discovery,
+            "history_resume",
+            &serde_json::json!({
+                "historyId": "history:v1:one",
+                "requestId": "request-one"
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.retryable);
+        assert_eq!(error.message, "history_resume_failed: placement uncertain");
     }
 
     #[test]

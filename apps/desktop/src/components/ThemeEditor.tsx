@@ -1350,11 +1350,11 @@ function LayoutTab() {
     <Group title="Layout">
       <SliderRow
         label="Tile header height"
-        hint="Height of the header bar at the top of each tile (px)."
+        hint="Height of the header bar at the top of each tile (px). Dense two-row headers reserve at least 52px."
         k="tileHeaderHeight"
         value={c.tileHeaderHeight}
-        min={16}
-        max={40}
+        min={30}
+        max={80}
         suffix="px"
         set={setChromeToken}
       />

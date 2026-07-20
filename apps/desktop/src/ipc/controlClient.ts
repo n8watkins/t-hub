@@ -36,7 +36,45 @@ export function controlRequest(
   command: string,
   args: Record<string, unknown> = {},
 ): Promise<unknown> {
-  return invoke("control_request", { command, args });
+  return invoke("control_request", { command, args }).catch((reason: unknown) => {
+    if (isControlRequestFailure(reason)) {
+      throw new ControlRequestError(reason.message, reason.retryable);
+    }
+    throw reason;
+  });
+}
+
+interface ControlRequestFailure {
+  message: string;
+  retryable: boolean;
+}
+
+export class ControlRequestError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "ControlRequestError";
+    this.retryable = retryable;
+  }
+}
+
+function isControlRequestFailure(reason: unknown): reason is ControlRequestFailure {
+  return (
+    typeof reason === "object" &&
+    reason !== null &&
+    "message" in reason &&
+    typeof reason.message === "string" &&
+    "retryable" in reason &&
+    typeof reason.retryable === "boolean"
+  );
+}
+
+export function isRetryableControlError(reason: unknown): boolean {
+  return (
+    (reason instanceof ControlRequestError && reason.retryable) ||
+    (isControlRequestFailure(reason) && reason.retryable)
+  );
 }
 
 // --- control event hub -----------------------------------------------------

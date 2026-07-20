@@ -1750,10 +1750,18 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     deleteTerminal: (id) => {
       // Destructive: kill the tmux session for good (terminates its process
-      // tree) via the backend, then drop the tile. Dynamic import as above.
+      // tree) via the backend, then refresh History from the surviving provider
+      // transcript. Dynamic imports keep the store web/test safe.
       void import("../ipc/client")
         .then((m) => m.killTerminal(id))
-        .catch((err) => console.error("killTerminal failed", err));
+        .then(() => import("../ipc/history"))
+        .then((m) => m.invalidateHistoryCache())
+        .catch((err) => console.error("killTerminal or History refresh failed", err))
+        .finally(() => {
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(new Event("t-hub:history-changed"));
+          }
+        });
       get().remove(id);
     },
 
@@ -1972,6 +1980,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           window.dispatchEvent(new Event("t-hub:recent-changed"));
         }
       };
+      const refreshHistory = (): void => {
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new Event("t-hub:history-changed"));
+        }
+      };
       // RECALL-FIRST: drop the daemon's Recent cache, THEN force the re-fetch — the
       // dispatch is chained AFTER the invalidate resolves so RecentList re-scans a
       // freshly-dropped cache, not the stale 15s-TTL one (a brand-new project closed
@@ -1993,11 +2006,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // is never reaped here. Fire-and-forget (mirrors deleteTerminal); a kill error
       // is logged, not surfaced.
       void import("../ipc/client").then((m) => {
-        for (const tid of ids) {
-          m.killTerminal(tid).catch((err) =>
-            console.error("killTerminal failed (closeWorkspace)", err),
-          );
-        }
+        void Promise.allSettled(ids.map((tid) => m.killTerminal(tid)))
+          .then(() => import("../ipc/history"))
+          .then((history) => history.invalidateHistoryCache())
+          .catch((err) => console.error("History refresh failed (closeWorkspace)", err))
+          .finally(refreshHistory);
+      }).catch((err) => {
+        console.error("killTerminal import failed (closeWorkspace)", err);
+        refreshHistory();
       });
 
       // Layout removal/prune/persist (also deletes the tiles from `terminals`, so

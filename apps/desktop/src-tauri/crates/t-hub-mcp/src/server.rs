@@ -189,9 +189,13 @@ fn tool_ok(result: &Value) -> Value {
 }
 
 /// Wrap a tool failure as MCP tool-call content with `isError: true`.
-fn tool_error(message: &str) -> Value {
+fn tool_error(error: &control_client::ControlCallError) -> Value {
     json!({
-        "content": [ { "type": "text", "text": message } ],
+        "content": [ { "type": "text", "text": &error.message } ],
+        "structuredContent": {
+            "message": &error.message,
+            "retryable": error.retryable,
+        },
         "isError": true
     })
 }
@@ -200,6 +204,23 @@ fn tool_error(message: &str) -> Value {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn tool_error_preserves_retryable_metadata() {
+        let error = control_client::ControlCallError {
+            message: "history_resume_failed: placement uncertain".into(),
+            retryable: true,
+        };
+
+        let result = tool_error(&error);
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["retryable"], true);
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "history_resume_failed: placement uncertain"
+        );
+    }
 
     /// Drive the server with one or more request lines and collect the response
     /// lines (parsed as JSON). Uses a `Discovery` that points at a nonexistent

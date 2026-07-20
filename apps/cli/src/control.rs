@@ -25,6 +25,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// One ordinary control call, including endpoint discovery time, stale-endpoint
 /// invalidation, and one retry, must finish within this wall-clock budget.
 const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A connected endpoint gets only a short slice of the overall budget. This is
 /// what prevents an inherited port that accepts but never answers from consuming
@@ -52,7 +53,7 @@ pub enum ControlError {
     /// Discovery or connect failed — the app is not reachable (exit 3).
     AppDown(String),
     /// The app answered `ok:false` (exit 4, or 5 when the message is a gate).
-    Server(String),
+    Server { message: String, retryable: bool },
     /// Malformed frame, or a handshake protocol-version mismatch (exit 6).
     Protocol(String),
 }
@@ -77,6 +78,8 @@ struct Response {
     error: Option<String>,
     #[serde(rename = "errorKind", default)]
     error_kind: Option<String>,
+    #[serde(default)]
+    retryable: bool,
 }
 
 /// Resolve the control endpoint: env overrides first, then the handshake file.
@@ -173,7 +176,12 @@ fn handshake_path() -> PathBuf {
 /// error. The app's own error string is preserved verbatim (so gating /
 /// confirmation messages surface unchanged).
 pub fn call(ep: &Endpoint, command: &str, args: Value) -> Result<Value, ControlError> {
-    call_with_deadline(ep, command, &args, CONTROL_DEADLINE, ATTEMPT_TIMEOUT)
+    let deadline = match command {
+        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
+        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        _ => CONTROL_DEADLINE,
+    };
+    call_with_deadline(ep, command, &args, deadline, ATTEMPT_TIMEOUT)
 }
 
 fn call_with_deadline(
@@ -186,29 +194,33 @@ fn call_with_deadline(
     let remaining = overall.saturating_sub(ep.discovery_elapsed);
     let deadline = Instant::now() + remaining;
     if remaining.is_zero() {
-        return Err(timeout_error(command, 0, "discovery"));
+        return Err(timeout_error(command, 0, "discovery", overall));
     }
 
     match call_once(ep, command, args, deadline, attempt_timeout) {
         Ok(value) => Ok(value),
-        Err(CallFailure::Server(message)) => Err(ControlError::Server(message)),
+        Err(CallFailure::Server { message, retryable }) => {
+            Err(ControlError::Server { message, retryable })
+        }
         Err(CallFailure::Protocol(message)) => Err(ControlError::Protocol(message)),
         Err(first) => {
             if Instant::now() >= deadline {
-                return Err(timeout_error(command, 1, first.stage()));
+                return Err(timeout_error(command, 1, first.stage(), overall));
             }
             let refreshed = refresh_endpoint(ep)?;
             if refreshed.addr == ep.addr {
-                return Err(first.into_control_error(command, 1, false));
+                return Err(first.into_control_error(command, 1, false, overall));
             }
             match call_once(&refreshed, command, args, deadline, attempt_timeout) {
                 Ok(value) => Ok(value),
-                Err(CallFailure::Server(message)) => Err(ControlError::Server(message)),
+                Err(CallFailure::Server { message, retryable }) => {
+                    Err(ControlError::Server { message, retryable })
+                }
                 Err(CallFailure::Protocol(message)) => Err(ControlError::Protocol(message)),
                 Err(second) if Instant::now() >= deadline || second.is_timeout() => {
-                    Err(timeout_error(command, 2, second.stage()))
+                    Err(timeout_error(command, 2, second.stage(), overall))
                 }
-                Err(second) => Err(second.into_control_error(command, 2, true)),
+                Err(second) => Err(second.into_control_error(command, 2, true, overall)),
             }
         }
     }
@@ -233,7 +245,7 @@ fn refresh_endpoint(ep: &Endpoint) -> Result<Endpoint, ControlError> {
 enum CallFailure {
     Transport(&'static str),
     Timeout(&'static str),
-    Server(String),
+    Server { message: String, retryable: bool },
     Protocol(String),
 }
 
@@ -241,7 +253,7 @@ impl CallFailure {
     fn stage(&self) -> &'static str {
         match self {
             CallFailure::Transport(stage) | CallFailure::Timeout(stage) => stage,
-            CallFailure::Server(_) => "server",
+            CallFailure::Server { .. } => "server",
             CallFailure::Protocol(_) => "protocol",
         }
     }
@@ -255,22 +267,25 @@ impl CallFailure {
         command: &str,
         attempts: u8,
         endpoint_replaced: bool,
+        overall: Duration,
     ) -> ControlError {
         match self {
-            CallFailure::Timeout(stage) => timeout_error(command, attempts, stage),
+            CallFailure::Timeout(stage) => timeout_error(command, attempts, stage, overall),
             CallFailure::Transport(stage) => ControlError::AppDown(format!(
                 "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
             )),
-            CallFailure::Server(message) => ControlError::Server(message),
+            CallFailure::Server { message, retryable } => {
+                ControlError::Server { message, retryable }
+            }
             CallFailure::Protocol(message) => ControlError::Protocol(message),
         }
     }
 }
 
-fn timeout_error(command: &str, attempts: u8, stage: &str) -> ControlError {
+fn timeout_error(command: &str, attempts: u8, stage: &str, overall: Duration) -> ControlError {
     ControlError::AppDown(format!(
         "control_timeout: command '{command}' failed within its {}s recovery deadline during {stage} after {attempts} attempt(s); retry_state=exhausted",
-        CONTROL_DEADLINE.as_secs()
+        overall.as_secs()
     ))
 }
 
@@ -419,16 +434,19 @@ fn call_once(
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
-        Err(CallFailure::Server(match resp.error_kind.as_deref() {
-            Some("powder_retired") => format!(
-                "powder_retired:{}",
-                resp.error
-                    .unwrap_or_else(|| "Powder operation is retired".to_string())
-            ),
-            _ => resp
-                .error
-                .unwrap_or_else(|| "control command failed (no error message)".to_string()),
-        }))
+        Err(CallFailure::Server {
+            message: match resp.error_kind.as_deref() {
+                Some("powder_retired") => format!(
+                    "powder_retired:{}",
+                    resp.error
+                        .unwrap_or_else(|| "Powder operation is retired".to_string())
+                ),
+                _ => resp
+                    .error
+                    .unwrap_or_else(|| "control command failed (no error message)".to_string()),
+            },
+            retryable: resp.retryable,
+        })
     }
 }
 
@@ -483,6 +501,16 @@ mod tests {
     use std::net::TcpListener;
     use std::process::Command;
     use std::thread;
+
+    #[test]
+    fn timeout_message_uses_the_selected_command_budget() {
+        let ControlError::AppDown(message) =
+            timeout_error("history_resume", 1, "read", LONG_ORCHESTRATION_TIMEOUT)
+        else {
+            panic!("timeout must remain an app-down error");
+        };
+        assert!(message.contains("120s recovery deadline"));
+    }
 
     fn handshake_file(body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

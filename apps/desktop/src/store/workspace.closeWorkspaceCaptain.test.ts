@@ -16,6 +16,9 @@ vi.mock("../ipc/client", () => ({
 vi.mock("../ipc/recent", () => ({
   invalidateRecentCache: () => Promise.resolve(),
 }));
+vi.mock("../ipc/history", () => ({
+  invalidateHistoryCache: () => Promise.resolve(),
+}));
 
 import {
   useWorkspace,

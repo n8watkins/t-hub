@@ -146,9 +146,13 @@ The supervisory workflow is active through the shared control operation catalog.
 - `th agents preflight` evaluates an exact source commit, lane identity, dependencies, mutable files, schemas, interfaces, integration contracts, and reserved runtime capacity without launching an agent.
 - `th agents start` requires the same exact dispatch baseline and concurrency contract and rejects a dirty checkout, abbreviated commit, stale commit, resource collision, missing ordering contract, or exhausted reserved capacity.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
-- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, and `cleanup-session` expose durable delegated administration through the same authorization service used by MCP and control clients.
+- `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
 - `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
 - `th admin cleanup-session` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
+- `th admin maintain-session` performs bounded non-destructive maintenance on one exact live T-Hub session after revalidating the current grant, actor, supervisor, and target ownership.
+- `th admin recover-resource` accepts a session, ship, or worktree target and either performs bounded maintenance or records an authoritative recovery plan when direct mutation is unsafe.
+- `th admin prepare-retirement` accepts a session, ship, or worktree target and records a deterministic readiness plan without performing a destructive action.
+- `th admin maintain-fleet-resource` accepts a fleet, ship, or Captain-session target and remains restricted to Fleet Admin grants without exposing Crew implementation direction.
 - `th worktree prune` is reporting-only even when the compatibility `--yes` flag is supplied.
 
 Worktree removal and reuse remain unavailable until one authoritative worktree safety service can prove ownership, integration, retention, and removability for the exact target.

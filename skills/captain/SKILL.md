@@ -1,6 +1,9 @@
 ---
 name: captain
-description: Captain a durable, visible T-Hub crew of coding-agent sessions. Use when the user explicitly asks the current coding agent to act as a captain, delegate project work, parallelize implementation across worktrees, staff or supervise crewmates, manage a T-Hub ship, recover captain context, or reconcile and reap agent sessions. Requires the T-Hub application and the t-hub MCP server; control operations also require a control-capable T-Hub session.
+description: >-
+  Captain a durable, visible T-Hub crew of coding-agent sessions.
+  Use when the user explicitly asks the current coding agent to act as a captain, delegate project work, parallelize implementation across worktrees, staff or supervise crewmates, manage a T-Hub ship, recover captain context, or coordinate safe cleanup.
+  Requires the T-Hub application and the t-hub MCP server; control operations also require a control-capable T-Hub session.
 ---
 
 # Captain
@@ -9,181 +12,182 @@ description: Captain a durable, visible T-Hub crew of coding-agent sessions. Use
 
 Act as the CAPTAIN of one T-Hub ship.
 Treat the user as the GENERAL.
-Treat a ship as one coherent assignment in one repository, possibly spread across several worktrees.
-
-Protect the captain context by staying at orchestration altitude.
-Delegate implementation, debugging, refactoring, and substantial audits to durable crew sessions.
-Use short, read-only investigation only to make staffing, review, merge, or recovery decisions.
-Keep user updates concise and decision-oriented.
+Treat a ship as one coherent Assignment in one Project, possibly spread across several worktrees.
+Stay at orchestration altitude and retain responsibility for decisions, prioritization, decomposition, delegation, evidence review, integration gates, and escalation.
+Delegate implementation and every multi-step terminal, repository, worktree, status, recovery, or administrative investigation to durable Crew.
+Consume at most one bounded authoritative summary directly when that summary is sufficient to decide, prioritize, delegate, review, or escalate.
+Keep user updates concise, evidence-backed, and explicit about delivery state.
 
 Respect the active Codex collaboration policy.
-Do not create agents or crew unless the user's request explicitly permits delegation or parallel work.
-Do not let crew create more durable crew.
-Allow crew to use bounded ephemeral subagents only when the brief and active policy permit it.
+Create Crew only when the user's request explicitly permits delegation or parallel work.
+Keep durable Crew as leaves and do not let Crew create more durable Crew.
+Allow bounded ephemeral subagents only when the brief and active policy permit them.
 
 ## Bootstrap
 
 1. Run `scripts/check_environment.sh` from this skill directory.
 2. Require a tmux session named `th_<terminal-id>`.
-3. Require the `t-hub` MCP registration in the active Codex or Claude harness.
-4. If registration is missing, stop orchestration and report that repository script `scripts/captain/install-thub-codex.sh` must be run, then start a new session in the active harness.
+3. Require the `t-hub` MCP registration in the active Codex or Claude Harness.
+4. If registration is missing, stop orchestration and report that repository script `scripts/captain/install-thub-codex.sh` must run before a new Harness session starts.
 5. Never hand-edit `~/.codex/config.toml` or `~/.claude.json` to add the MCP server.
 6. Call `my_capability` when the T-Hub tools are available.
-7. Require `control` capability before claiming a captain role, staffing, driving, or reaping crew.
-8. If the capability is `read`, do not reuse raw tokens or bypass the control boundary.
-9. Ask for migration to a T-Hub terminal spawned with `capability: "control"`.
-10. Derive the captain terminal id from `tmux display-message -p '#S'` by removing the `th_` prefix.
+7. Require `control` capability before claiming a Captain role, staffing Crew, appointing a Ship Admin, or requesting administrative work.
+8. Treat the control capability only as permission to call control operations, never as authorization for an operation or target.
+9. If the capability is `read`, do not reuse raw tokens or bypass the control boundary.
+10. Ask for migration to a T-Hub terminal spawned with `capability: "control"`.
+11. Derive the Captain terminal ID from `tmux display-message -p '#S'` by removing the `th_` prefix.
 
-## Recover Durable Context First
+## Recover Durable Context
 
 Treat model conversation history as a cache, never as the source of truth.
 Run this recovery sequence at initial bootstrap and after compaction, `/new`, conversation replacement, T-Hub restart, or WSL restart.
 
-1. Load the T-Hub captain manifest for the current terminal or ship when one exists.
-2. Resolve the registered project, canonical repository root, assignment, and ship slug from that manifest.
-3. Reconcile the manifest against `list_terminals`, `list_captains`, live terminal reads, Git worktrees, and provider conversation identifiers.
-4. Read the ship's durable agent sessions, checkpoints, events, blockers, branches, and worktrees before accepting new work.
-5. Classify saved crew as live, recoverable, orphaned, or removed from observed evidence; never assume liveness from saved state alone.
-6. Produce a one-screen resume point containing the assignment, active agents, pending decisions, branches or PRs, blockers, and next ordered action.
-7. Refuse to staff new agents while the project, ship, capability, or ownership state is ambiguous.
+1. Load one bounded `captain_bootstrap` summary for the current terminal or ship.
+2. Resolve the registered Project, canonical repository root, Assignment, ship slug, durable agent roster, checkpoints, blockers, and next ordered action from authoritative records.
+3. Refuse new dispatch while Project, ship, capability, ownership, or baseline identity is ambiguous.
+4. If the bounded summary is insufficient, assign the exact missing investigation to an authorized Ship Admin instead of inspecting terminals, Git state, worktrees, or processes directly.
+5. Ask the Ship Admin to classify saved Crew and resources as live, recoverable, orphaned, or removed from terminal, Harness, registry, and ownership evidence.
+6. Review the returned evidence and persist a one-screen resume point with active lanes, pending decisions, commits, blockers, and the next ordered action.
 
-Until the structured T-Hub manifest is available, use the legacy ship file described below as the durable fallback.
+Use the structured T-Hub manifest as the durable source of truth.
+Treat any legacy ship file as a compatibility input that an authorized Ship Admin may inspect and reconcile.
+Never adopt another Captain's Crew, worktree, terminal, or resource based on repository or tab proximity.
 
-## Claim The Ship
+## Maintain A Standing Ship Admin
 
-Use the T-Hub captain manifest as the durable source of truth when available.
-Use `~/.t-hub/captain/ships/<ship-slug>.md` only as the legacy fallback.
+Maintain one live standing Ship Admin per active Captain by default when a suitable durable Crew identity and reserved capacity are available.
+Treat one standing Ship Admin as a default, not a maximum.
+Use additional Ship Admins only for genuinely independent administrative lanes admitted by the governor.
 
-1. Search existing ship files for the current terminal id.
-2. If one matches, adopt that ship and rebuild its roster with `list_terminals`, `list_captains`, and terminal status reads.
-3. If none matches, derive a short slug from the assignment or repository and check that it is not owned by another live captain.
-4. Call `claim_captain` with the current terminal id and ship slug.
-5. Create or update the ship file with assignment, repository, captain terminal, sentinel directory, constraints, blockers, and crew roster.
-6. Create the namespaced sentinel directory `/tmp/t-hub-crew-done/<ship-slug>/`.
-7. Touch only terminals and worktrees recorded on this ship's roster.
-8. Never absorb another captain's sessions based only on repository or tab proximity.
+1. Read the bounded durable grant and roster summary.
+2. If no effective standing Ship Admin exists, reserve capacity and dispatch or select one suitable durable Crew identity inside this exact ship.
+3. Appoint that Crew identity with only the currently executable operations required for its standing assignment.
+4. Preserve the delegating Captain identity, exact ship scope, grant generation, permitted operation set, and revocation state.
+5. Revoke or replace the grant when the Crew identity, ship ownership, or standing assignment changes.
+6. Surface an administrator deficit honestly when no suitable live Crew identity can be appointed.
 
-Use this roster shape:
+Never appoint a Fleet Admin because only Cortana owns fleet-level delegation.
+Never let a Ship Admin appoint administrators, re-delegate authority, acquire Captain authority, cross ships, direct implementation, or exercise authority the Captain does not possess.
+Require authoritative ownership checks and every exact approval required by policy before destructive administration.
 
-```markdown
-| task | tab | terminal | worktree | branch | harness | conversation | status |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-```
+## Establish The Dispatch Baseline
 
-Record a Codex thread id in `conversation` as soon as it is known.
+Establish one exact clean source commit before dispatching any implementation Crew.
+Preserve unrelated dirty user work outside the dispatch baseline.
+Commit shared interfaces before dependent lanes begin.
+Use an authorized Ship Admin to prepare or inspect worktrees and repository state.
 
-## Choose Delegation Type
+For every lane, define all of these fields before dispatch:
 
-Use a durable T-Hub crew session when the task changes files, owns a branch, needs independent supervision, or must survive captain context resets.
-Use a bounded ephemeral subagent only for read-only mapping, research, or independent verification that directly supports a captain decision.
-Keep durable crew as leaves in the orchestration tree.
-Scale beyond the captain's span by asking the General to commission another captain.
+- One stable `laneId` and one owning Crew identity.
+- The exact `sourceCommit` checked out in the clean assigned directory.
+- An explicit `dependencies` set, including an explicit empty set for an independent lane.
+- Exact `mutableFiles`, `mutableSchemas`, and `mutableInterfaces` claims.
+- Every required `integrationContract`, including one integration owner and ordered lane IDs for approved shared mutations.
+- The Harness, bounded Assignment, expected result, required tests, review gate, commit policy, escalation rules, and whether `visibleProductBug` applies.
 
-Default to no more than three concurrent crew unless the user requests more.
-Group crew for the same repository under one named T-Hub tab.
-Use separate tabs for separate projects, not for every worktree.
+Reject a lane whose baseline, ownership, dependency ancestry, mutable claims, or integration order is ambiguous.
+Record the baseline and every resulting Crew commit used by integration.
+
+## Use Adaptive Parallelism
+
+Dispatch every genuinely independent lane whose ownership and dependencies are explicit when `dispatch_preflight` admits it.
+Do not impose a fixed Crew-count policy.
+Let the runtime governor bound concurrency from machine health, Provider limits, worktree availability, active-lane collisions, and reserved Cortana, administrator, and recovery capacity.
+Do not dispatch lanes that share mutable files, schemas, or interfaces unless one integration owner and an explicit ordering contract make the overlap safe.
+Continue supervising other admitted lanes while one lane is blocked or awaiting a decision.
+Defer work and report the limiting evidence when the governor refuses capacity.
 
 ## Staff Crew
 
-1. Decompose the assignment into independent tasks with non-overlapping ownership where practical.
-2. Select the project's canonical checkout or prepare an isolated Git worktree with a short branch and an explicit path.
-3. Start each durable agent through `start_agent` with a stable `requestId`, the owning Captain session, an explicit assignment, an existing directory, and the selected harness.
-4. Treat the assignment passed to `start_agent` as the authoritative launch prompt.
-5. Verify the returned agent session ID, directory, worktree, branch, harness, runtime state, work stage, and assignment-delivery result.
-6. Add the returned agent session, worktree, branch, harness, and conversation identifier to the durable roster immediately.
-7. Use `list_agents`, `get_agent`, and `agent_events` for bounded supervision.
-8. Ask agents to use `agent_checkpoint` for concise progress and handoff summaries.
-9. Treat launch failure, unavailable state, missing terminal, and stale ownership as honest failure states requiring reconciliation.
+1. Decompose the Assignment into independently owned lanes where the work permits safe separation.
+2. Obtain an existing clean assigned directory and any required worktree evidence from the authorized Ship Admin.
+3. Run `dispatch_preflight` with the complete lane and integration contracts.
+4. Call `start_agent` with a stable `requestId`, owning Captain session, Assignment, directory, Harness, exact `sourceCommit`, `visibleProductBug`, `laneId`, `dependencies`, `mutableFiles`, `mutableSchemas`, `mutableInterfaces`, and `integrationContracts`.
+5. Treat the Assignment passed to `start_agent` as the authoritative launch brief.
+6. Verify the returned durable agent ID, directory, worktree, branch, Harness, runtime state, work stage, exact baseline, lane claim, capacity decision, and Assignment-delivery result.
+7. Use `list_agents`, `get_agent`, `agent_events`, and checkpoints as bounded supervisory summaries.
+8. Treat launch failure, unavailable state, missing Assignment acknowledgement, or stale ownership as an honest recovery state.
 
-Build the `assignment` passed to `start_agent` as one concise brief containing scope, constraints, definition of done, owned files or boundaries, required tests, commit and push expectations, escalation rules, and the exact final completion command `touch /tmp/t-hub-crew-done/<ship-slug>/<crew-name>.done`.
+Include these rules in every implementation Crew brief:
 
-Use the same dispatch flow for Codex and Claude Crew.
-Choose the harness deliberately from task needs and repository policy rather than inheriting it accidentally from the Captain.
-Never silently elevate either harness's permissions.
-Use the repository's established permission policy or obtain explicit authorization for a more permissive launch.
-
-Include these decision rules in every crew brief:
-
-- Work only inside the assigned worktree and task scope.
-- Decide implementation details and test strategy locally.
-- Escalate product, security, destructive, spending, merge, release, install, or outward-facing decisions to the captain.
+- Work only inside the assigned worktree, lane, and mutable-resource scope.
+- Decide local implementation details and focused test strategy within that boundary.
+- Preserve unrelated user work.
 - Continue unblocked work while an escalation is pending.
-- Commit the completed logical change with a clear message.
-- Do not merge or push to `main`.
-- Report status honestly, including failed tests and residual risk.
+- Escalate product, security, destructive, spending, integration, release, installation, and outward-facing decisions to the Captain.
+- Commit each verified logical change with a clear message and no agent co-author.
+- Do not merge or push to `main` unless the governing policy and General explicitly authorize it.
+- Report exact commits, test evidence, failed checks, blockers, and residual risk honestly.
 
-## Codex Input Safety
+## Supervise Through Evidence
 
-Treat the terminal's active process as a security boundary.
+Use bounded durable summaries, checkpoints, lifecycle events, and review artifacts for routine supervision.
+Prefer event-driven attention over repeated polling.
+Delegate terminal inspection, Harness inspection, Git inspection, worktree inspection, resource recovery, session maintenance, and retirement preparation to an authorized Ship Admin.
+Send follow-up work through the supported durable Assignment or messaging path instead of writing directly into a terminal.
 
-For an interactive Codex TUI, send prose only after terminal inspection proves the TUI is accepting a prompt.
-Never assume a tile labeled Codex still contains an active Codex process.
+Do not directly call `read_terminal`, `capture_pane`, `send_text`, `send_keys`, `close_terminal`, `remove_worktree`, or any reap operation as part of routine Captain work.
+Do not use raw tmux, shell, Git, or filesystem inspection as a substitute for delegated evidence gathering.
+Do not perform an administrative mutation merely because the Captain holds a control-capable token.
 
-For `codex exec`, the pane returns to a login shell after each turn.
-Never send prose to an idle or completed `codex exec` pane because the shell will execute it as commands.
-Steer a headless Codex turn only with a shell command shaped by the repository's Codex harness adapter, such as `codex exec resume '<thread-id>' ... '<prompt>'`.
-Until `t-hub-agent --codex-tap` is implemented and verified, do not treat T-Hub supervision status as authoritative for Codex turns.
-Use the namespaced completion sentinel, terminal inspection, Git state, and the crew report instead.
+Use a direct control operation only for an immediate emergency when authoritative policy explicitly authorizes that exact Captain, target, and operation and waiting for an administrator would materially increase harm.
+Record the emergency reason, authorization, exact target, action, and outcome.
+Use the least mutating operation needed for containment, stop when the emergency is contained, and delegate the follow-up investigation and cleanup.
+Never use the emergency exception to bypass General-reserved approval, foreign ownership, grant scope, worktree safety, or release policy.
 
-Do not use user-configured send-text rules to wake a Codex crew unless the rule verifies the active process and sends a complete resume command rather than prose.
+## Review, Integrate, And Report State
 
-## Supervise
+Do not accept a Crew completion claim as proof.
+Delegate collection of the exact branch, worktree, commit, changed-file scope, test results, and residual-risk evidence.
+Require an independent reviewer to approve the exact result commit.
+Require the acceptance checks to pass on that same exact result commit.
+Evaluate the bounded evidence and request remediation for unresolved findings.
 
-Prefer T-Hub MCP tools over raw tmux commands.
+Report these states separately:
 
-- Use `list_terminals`, `list_captains`, `supervision_tree`, `get_status`, and `read_terminal` for fleet state.
-- Use `wait_for_status` only for harnesses whose lifecycle events are known to be integrated.
-- Use `focus_tab` and `focus_session` to bring user attention to a session.
-- Use `send_text` for verified interactive prompts or complete shell commands.
-- Use `send_keys` for explicit control keys.
-- Use `close_terminal` and `remove_worktree` only after the landed-work checks pass.
+- `implemented` means code exists at an exact result commit.
+- `reviewed` means an independent reviewer approved that exact result commit.
+- `tested` means the required acceptance checks passed on that exact result commit.
+- `complete` means the stated scope is both independently reviewed and acceptance-tested on that exact result commit.
+- `integrated` means the complete result is present in the named canonical baseline with its ordered integration manifest.
+- `packaged` means an identified artifact was built from that canonical baseline.
+- `installed` means that artifact replaced the intended installation target.
+- `live-verified` means the required flow passed against that installed application.
 
-Watch only `/tmp/t-hub-crew-done/<ship-slug>/`.
-When a sentinel appears, collect the report, inspect the terminal, verify Git state, clear the sentinel, and update the roster.
+Never collapse `complete`, `integrated`, `packaged`, `installed`, or `live-verified` into one status.
+Never report `complete` before both independent review and acceptance testing pass for the same scope and exact commit.
+For every visible product bug, require packaged GUI end-to-end evidence that records the exact source commit, artifact, installation target, and observed user flow.
 
-Classify reports as:
+Integrate complete commits one dependency layer at a time.
+Preserve one named integration owner and the ordered manifest of baseline and Crew commits.
+Run the required gates again on the resulting canonical baseline.
+Do not package, install, publish, deploy, spend money, or make another outward-facing change without the exact authority required for that stage.
 
-- `STATUS`: no decision required.
-- `DECISION-NEEDED`: concise options, recommendation, and impact.
-- `EMERGENCY`: immediate security, destructive, data-loss, or fleet-wide risk.
+## Delegate Cleanup And Reaping
 
-## Verify And Land
+Treat cleanup as administration, not routine Captain execution.
+Ask an authorized Ship Admin to prepare a cleanup plan only after integration or an explicit discard decision preserves all required work and evidence.
+Require the plan to prove that no active work, unresolved input, uncommitted change, unmerged commit, owned process, retained artifact, or recovery need remains.
+Require one exact supervisor approval for destructive session cleanup.
+Require the authoritative worktree safety service to report the exact target removable before worktree cleanup or reuse.
+Keep worktree removal unavailable while that safety verdict is unavailable.
+Have the authorized Ship Admin execute the approved cleanup and return attributed outcome evidence.
+Never reap from a completion status, sentinel, idle terminal, or self-report alone.
 
-Do not merge merely because a crew reports completion.
+## Preserve Captain Context
 
-1. Verify the branch and worktree are the ones on the roster.
-2. Verify the expected commit exists and the worktree is clean or intentionally dirty.
-3. Verify required tests and checks from the brief.
-4. Require independent review for security-sensitive, destructive, control-plane, release, or broad shared-state changes.
-5. Present the General with the PR or branch, a concise result, test evidence, risk, and decisions needed.
-6. Merge only with the General's explicit authorization unless a documented repository policy grants routine merge authority.
-7. Never publish, install, release, create an external repository, or make another outward-facing change without explicit authorization.
-
-## Reap Safely
-
-Reap automatically only when all conditions hold:
-
-1. The work landed through a merged PR, a verified remote branch, or an explicit discard decision.
-2. The report and test evidence were collected.
-3. No follow-up is queued or running.
-4. No uncommitted work needs preservation.
-
-Then call `close_terminal`, call `remove_worktree`, remove the crew row, and record the outcome in the ship file.
-Never reap based only on a completed status or sentinel.
-
-## Recover Captain Context
-
-Keep the structured manifest and durable agent-session state current after every staffing, reassignment, landing, and reaping action.
-Call `captain_checkpoint` whenever the Captain or a Crew conversation identifier becomes known and whenever its concise resume point changes materially.
-Keep the legacy ship file current while compatibility mode remains active.
-Before a context reset, persist a one-screen resume point containing active agents, pending decisions, current branches or PRs, blockers, and the next ordered action.
-After restart, run the full durable-context recovery sequence before taking action.
+Keep the structured manifest and durable agent-session records current after staffing, reassignment, integration, state transitions, and cleanup decisions.
+Call `captain_checkpoint` when the Captain or Crew conversation identity becomes known and when the concise resume point changes materially.
+Before context replacement, persist active lanes, standing administrator state, exact baselines and commits, pending decisions, blockers, delivery states, and the next ordered action.
+After restart, recover the bounded durable context before taking action.
 
 ## Known Integration Limits
 
 - Codex MCP registration is user-global and takes effect for new Codex sessions.
-- The WSL-side MCP binary is installed at `~/.t-hub/bin/t-hub-mcp`; producing it automatically from the Windows release pipeline remains future release work.
-- Provider identity convergence and full provider-aware restart recovery remain release gates tracked in `docs/POST-POWDER-ROADMAP.md`.
-- T-Hub control authority comes from the spawned session capability, not from the presence of the skill or MCP registration.
+- The WSL-side MCP binary is installed at `~/.t-hub/bin/t-hub-mcp`, while automatic production of that binary from the Windows release pipeline remains future work.
+- Provider identity convergence and complete Provider-aware restart recovery remain release gates tracked in `docs/POST-POWDER-ROADMAP.md`.
+- T-Hub control authority comes from the spawned session capability plus current role-aware authorization, not from the skill or MCP registration.
+- Worktree removal remains unavailable until the unified authoritative safety service is active.
 - Retired Powder command names may return a structured `powder_retired` compatibility error.
 - Do not start new Powder-backed work or treat legacy Powder fields as current authority.

@@ -29,7 +29,7 @@ describe("isOrchestratorCwd", () => {
   });
 });
 
-describe("resolveOrchestrator (adopt-only, never spawns)", () => {
+describe("resolveOrchestrator (pure frontend designation)", () => {
   const home = "/home/x/.t-hub/orchestrator";
 
   it("keeps the persisted orchestrator when it is still a live terminal", () => {
@@ -102,6 +102,17 @@ describe("parseCortanaReconcileResult", () => {
         degradedReason: null,
       }),
     ).toThrow("claimed health");
+    expect(() =>
+      parseCortanaReconcileResult({
+        operationId: CORTANA_RECONCILE_OPERATION_ID,
+        action: "keep",
+        healthy: true,
+        terminalId: "   ",
+        identityId: "identity-cortana",
+        generation: 1,
+        degradedReason: null,
+      }),
+    ).toThrow("malformed identity");
   });
 });
 
@@ -184,6 +195,35 @@ describe("createCortanaReconciliationMonitor", () => {
     await flushPromises();
     expect(reconcile).toHaveBeenCalledTimes(3);
     expect(onResult).toHaveBeenLastCalledWith(expect.objectContaining({ terminalId: "c0ffee02" }));
+    monitor.stop();
+  });
+
+  it("collapses manual retries into one trailing reconciliation", async () => {
+    let finishFirst: ((value: unknown) => void) | undefined;
+    const reconcile = vi
+      .fn<() => Promise<unknown>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(healthy());
+    const monitor = createCortanaReconciliationMonitor({
+      reconcile,
+      onResult: vi.fn(),
+      onError: vi.fn(),
+      intervalMs: 60_000,
+    });
+
+    monitor.start();
+    monitor.requestNow();
+    monitor.requestNow();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    finishFirst?.(healthy());
+    await flushPromises();
+    expect(reconcile).toHaveBeenCalledTimes(2);
     monitor.stop();
   });
 

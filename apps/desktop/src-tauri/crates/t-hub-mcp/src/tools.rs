@@ -12,13 +12,14 @@
 //!     `list_captains`, `list_projects`,
 //!     `list_fleet_watches`, `read_terminal`,
 //!     `my_capability`.
-//!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
+//!   - **Organization** (allowed, audited): `focus_session`, `history_list`,
+//!     `history_focus`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
 //!     `captain_bootstrap` and the agent-session operations.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
-//!     `start_agent`,
+//!     `history_resume`, `start_agent`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
 //!
@@ -165,6 +166,43 @@ fn schema_focus_session() -> Value {
             "sessionId": { "type": "string", "description": "Session to focus (switches tab + focuses its tile)." }
         },
         "required": ["sessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_list() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Optional case-insensitive label, path, or preview filter." },
+            "harness": { "type": "string", "enum": ["claude", "codex"], "description": "Optional exact Harness filter." },
+            "includeArchived": { "type": "boolean", "description": "Include archived conversations (default true)." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum rows to return (default 100)." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_focus() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "historyId": { "type": "string", "minLength": 1, "description": "Opaque exact History identity returned by history_list." }
+        },
+        "required": ["historyId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_resume() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "historyId": { "type": "string", "minLength": 1, "description": "Opaque exact History identity returned by history_list." },
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_:-]+$", "description": "Stable idempotency key retained through ambiguous response recovery." },
+            "targetTabId": { "type": "string", "minLength": 1, "description": "Optional existing destination workspace tab." }
+        },
+        "required": ["historyId", "requestId"],
         "additionalProperties": false
     })
 }
@@ -573,6 +611,64 @@ fn schema_approve_admin_action() -> Value {
                 "additionalProperties": false
             }
         ]
+    })
+}
+
+fn schema_execute_admin_operation() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "maintainSession",
+                    "recoverResource",
+                    "prepareRetirement",
+                    "maintainFleetResource"
+                ]
+            },
+            "target": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "fleet" }
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "ship" },
+                            "shipSlug": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "shipSlug"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "session" },
+                            "sessionId": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "sessionId"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "worktree" },
+                            "path": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["kind", "path"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        },
+        "required": ["operation", "target"],
+        "additionalProperties": false
     })
 }
 
@@ -1121,6 +1217,18 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         // ---- Organization tier -----------------------------------------
         ToolDef {
+            name: "history_list",
+            tier: Tier::Organization,
+            summary: "List the provider-neutral History catalog with exact continuity and action compatibility.",
+            input_schema: schema_history_list,
+        },
+        ToolDef {
+            name: "history_focus",
+            tier: Tier::Organization,
+            summary: "Focus the unique live terminal for one exact active History identity.",
+            input_schema: schema_history_focus,
+        },
+        ToolDef {
             name: "focus_session",
             tier: Tier::Organization,
             summary: "Focus a session: switch to its tab and focus its tile.",
@@ -1205,6 +1313,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_approve_admin_action,
         },
         ToolDef {
+            name: "execute_admin_operation",
+            tier: Tier::Organization,
+            summary: "Execute a bounded role-authorized Ship Admin or Fleet Admin maintenance operation, or prepare an authoritative recovery or retirement plan when mutation is unsafe.",
+            input_schema: schema_execute_admin_operation,
+        },
+        ToolDef {
             name: "revoke_admin",
             tier: Tier::Organization,
             summary: "Revoke one durable administrative grant while retaining its audit tombstone.",
@@ -1235,6 +1349,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
             input_schema: schema_spawn_terminal,
+        },
+        ToolDef {
+            name: "history_resume",
+            tier: Tier::ProcessChanging,
+            summary: "Resume one exact provider conversation using backend-owned Harness, identity, cwd, and command selection.",
+            input_schema: schema_history_resume,
         },
         ToolDef {
             name: "start_agent",
@@ -1332,11 +1452,14 @@ mod tests {
             "read_terminal",
             "scribe_status",
             "focus_session",
+            "history_list",
+            "history_focus",
             "move_tile",
             "rename_tab",
             "new_tab",
             "focus_tab",
             "spawn_terminal",
+            "history_resume",
             "send_text",
             "send_keys",
             "close_terminal",
@@ -1412,13 +1535,13 @@ mod tests {
             .unwrap()
             .contains(&json!("manifest")));
         assert_eq!(
-            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
-                ["inputs"]["maxItems"],
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]["inputs"]
+                ["maxItems"],
             256
         );
         assert_eq!(
-            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
-                ["inputs"]["items"]["additionalProperties"],
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]["inputs"]
+                ["items"]["additionalProperties"],
             false
         );
         let packaged = schema["oneOf"]
@@ -1437,8 +1560,7 @@ mod tests {
             "^[0-9a-fA-F]{64}$"
         );
         assert_eq!(
-            packaged["properties"]["evidence"]["properties"]["manifest"]
-                ["additionalProperties"],
+            packaged["properties"]["evidence"]["properties"]["manifest"]["additionalProperties"],
             false
         );
     }
@@ -1475,6 +1597,38 @@ mod tests {
         assert!(desc.contains("CONFIRMATION REQUIRED"), "desc: {desc}");
         assert_eq!(mcp["annotations"]["confirmationRequired"], true);
         assert_eq!(mcp["annotations"]["t-hubTier"], "process-changing");
+    }
+
+    #[test]
+    fn history_tools_expose_exact_identity_schemas_and_tiers() {
+        let list = find("history_list").unwrap();
+        assert_eq!(list.to_mcp()["annotations"]["t-hubTier"], "organization");
+        assert_eq!((list.input_schema)()["properties"]["limit"]["maximum"], 500);
+
+        let focus = find("history_focus").unwrap();
+        assert_eq!(focus.to_mcp()["annotations"]["t-hubTier"], "organization");
+        assert_eq!((focus.input_schema)()["required"], json!(["historyId"]));
+        assert_eq!(
+            (focus.input_schema)()["properties"]["historyId"]["minLength"],
+            1
+        );
+
+        let resume = find("history_resume").unwrap();
+        let advertised = resume.to_mcp();
+        assert_eq!(advertised["annotations"]["t-hubTier"], "process-changing");
+        assert_eq!(advertised["annotations"]["confirmationRequired"], true);
+        assert_eq!(
+            (resume.input_schema)()["required"],
+            json!(["historyId", "requestId"])
+        );
+        assert_eq!(
+            (resume.input_schema)()["properties"]["historyId"]["minLength"],
+            1
+        );
+        assert_eq!(
+            (resume.input_schema)()["properties"]["targetTabId"]["minLength"],
+            1
+        );
     }
 
     #[test]
@@ -1921,6 +2075,30 @@ mod tests {
             approve_schema["oneOf"][1]["required"],
             json!(["grantId", "operation", "target"])
         );
+
+        let execute = find("execute_admin_operation").unwrap();
+        assert_eq!(execute.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let execute_schema = (execute.input_schema)();
+        assert_eq!(execute_schema["required"], json!(["operation", "target"]));
+        assert_eq!(
+            execute_schema["properties"]["operation"]["enum"],
+            json!([
+                "maintainSession",
+                "recoverResource",
+                "prepareRetirement",
+                "maintainFleetResource"
+            ])
+        );
+        let target_variants = execute_schema["properties"]["target"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(target_variants.len(), 4);
+        assert!(target_variants.iter().all(|variant| {
+            !matches!(
+                variant["properties"]["kind"]["const"].as_str(),
+                Some("generalReserved" | "implementation")
+            )
+        }));
         assert_eq!(
             (find("close_terminal").unwrap().input_schema)()["properties"]["approvalId"]["type"],
             "string"

@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -43,17 +44,16 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This bounds memory, parsing work, and any structured error derived from a peer.
 const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Commissioning and dispatch cross bounded git, tmux, and harness-start
-/// operations. Their response window must outlive the server's normal request
-/// phase so the client receives the authoritative result instead of abandoning a
-/// mutation that is still running.
+/// Commissioning, dispatch, and Cortana recovery cross bounded git, tmux, and
+/// harness-start operations. Their response window must outlive the server's
+/// normal request phase so the client receives the authoritative result instead
+/// of abandoning a mutation that is still running.
 const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" | "start_agent" | "reconcile_cortana" => {
-            LONG_ORCHESTRATION_TIMEOUT
-        }
+        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
+        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
 }
@@ -186,7 +186,7 @@ enum RequestError {
     Transport(&'static str),
     Timeout(&'static str),
     EndpointChanged(String),
-    App(String),
+    App { message: String, retryable: bool },
     Protocol(String),
 }
 
@@ -195,7 +195,7 @@ impl RequestError {
         match self {
             RequestError::Transport(stage) | RequestError::Timeout(stage) => stage,
             RequestError::EndpointChanged(_) => "endpoint refresh",
-            RequestError::App(_) => "server",
+            RequestError::App { .. } => "server",
             RequestError::Protocol(_) => "protocol",
         }
     }
@@ -230,7 +230,9 @@ fn request_with_deadline(
         Some(endpoint),
     ) {
         Ok(value) => Ok(value),
-        Err(RequestError::App(message)) => Err(message),
+        Err(RequestError::App { message, retryable }) => {
+            Err(encode_control_error(message, retryable))
+        }
         Err(RequestError::Protocol(message)) => Err(message),
         Err(first) if first.retryable() => {
             if Instant::now() >= deadline {
@@ -258,7 +260,9 @@ fn request_with_deadline(
                 Some(endpoint),
             ) {
                 Ok(value) => Ok(value),
-                Err(RequestError::App(message)) => Err(message),
+                Err(RequestError::App { message, retryable }) => {
+                    Err(encode_control_error(message, retryable))
+                }
                 Err(RequestError::Protocol(message)) => Err(message),
                 Err(second) => Err(failure_message(command, 2, &second, true, overall)),
             }
@@ -281,6 +285,38 @@ fn failure_message(
     format!(
         "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
     )
+}
+
+const RETRYABLE_CONTROL_ERROR_MARKER: &str = "\u{1}retryable-control\u{1}";
+
+fn encode_control_error(message: String, retryable: bool) -> String {
+    if retryable {
+        format!("{RETRYABLE_CONTROL_ERROR_MARKER}{message}")
+    } else {
+        message
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlRequestError {
+    message: String,
+    retryable: bool,
+}
+
+impl ControlRequestError {
+    fn from_encoded(message: String) -> Self {
+        match message.strip_prefix(RETRYABLE_CONTROL_ERROR_MARKER) {
+            Some(clean) => Self {
+                message: clean.to_string(),
+                retryable: true,
+            },
+            None => Self {
+                message,
+                retryable: false,
+            },
+        }
+    }
 }
 
 fn timeout_message(command: &str, attempts: u8, stage: &str, overall: Duration) -> String {
@@ -421,12 +457,17 @@ fn request_once(
     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     } else {
-        Err(RequestError::App(
-            resp.get("error")
+        Err(RequestError::App {
+            message: resp
+                .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("control_request: unknown error")
                 .to_string(),
-        ))
+            retryable: resp
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 }
 
@@ -439,7 +480,7 @@ pub async fn control_request(
     endpoint: tauri::State<'_, Arc<ControlEndpoint>>,
     command: String,
     args: Option<Value>,
-) -> Result<Value, String> {
+) -> Result<Value, ControlRequestError> {
     // ASYNC + spawn_blocking — `request` does a BLOCKING socket round-trip whose
     // duration is the backend command's runtime. control_request is the transport
     // for recent/git/usage/codex/files; as a SYNC command it ran on the main UI
@@ -453,7 +494,11 @@ pub async fn control_request(
     let args = args.unwrap_or(Value::Null);
     tauri::async_runtime::spawn_blocking(move || request(&ep, &command, &args))
         .await
-        .map_err(|e| format!("control_request: task join failed: {e}"))?
+        .map_err(|error| ControlRequestError {
+            message: format!("control_request: task join failed: {error}"),
+            retryable: true,
+        })?
+        .map_err(ControlRequestError::from_encoded)
 }
 
 /// The production [`EventEmitter`]: writes every backend event to the control
@@ -886,6 +931,10 @@ mod tests {
             response_timeout_for_command("reconcile_cortana"),
             LONG_ORCHESTRATION_TIMEOUT
         );
+        assert_eq!(
+            response_timeout_for_command("history_resume"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
     }
 
     #[test]
@@ -918,8 +967,46 @@ mod tests {
         )
         .unwrap_err();
         server.join().unwrap();
-        assert!(matches!(error, RequestError::App(message) if
-            message == "commissioning failed after rollback"));
+        assert!(
+            matches!(error, RequestError::App { message, retryable: false } if
+            message == "commissioning failed after rollback")
+        );
+    }
+
+    #[test]
+    fn retryable_backend_error_remains_structured_for_the_webview() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            let mut writer = stream;
+            writer
+                .write_all(
+                    b"{\"ok\":false,\"error\":\"history_resume_failed: placement uncertain\",\"retryable\":true}\n",
+                )
+                .unwrap();
+        });
+
+        let error = request_with_deadline(
+            &test_endpoint(addr, None),
+            "history_resume",
+            &json!({"requestId": "request-one"}),
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        let structured = ControlRequestError::from_encoded(error);
+        assert!(structured.retryable);
+        assert_eq!(
+            structured.message,
+            "history_resume_failed: placement uncertain"
+        );
     }
 
     #[test]

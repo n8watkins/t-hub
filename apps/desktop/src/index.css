@@ -106,7 +106,9 @@ body {
  *   data-header-hover "1" => compact: header collapsed, revealed on tile hover
  */
 .th-tile-header {
-  height: var(--th-tile-header-h);
+  /* The tab list is 30px tall around its 24px buttons. Smaller saved theme
+   * values therefore render at a safe 30px instead of clipping the switcher. */
+  height: max(var(--th-tile-header-h), 30px);
   overflow: hidden;
 }
 /* Fully hidden header. */
@@ -120,8 +122,125 @@ body {
   transition: height 120ms ease, opacity 120ms ease;
 }
 [data-header-hover="1"]:hover .th-tile-header {
-  height: var(--th-tile-header-h);
+  height: max(var(--th-tile-header-h), 30px);
   opacity: 1;
+}
+
+/*
+ * Responsive tile-header densities. Each header has its own named CSS size
+ * container, so these tiers key off the INDIVIDUAL tile's width - a narrow tile
+ * in a dense grid compacts while a wide one keeps full labels, and no
+ * JS/resize listeners are involved. The view-switcher tabs
+ * degrade full label -> short label -> icon only; the identity chips that can
+ * regrow elsewhere (git branch, work name) drop out at the narrow tier; the
+ * secondary recovery controls (refresh / kill+restart, both also in the
+ * right-click menu) drop out only at the minimum tile width. Below 360px the
+ * controls and identity use the top half while the icon tabs use the bottom
+ * half. The default 52px header stays stable across tiers; a smaller custom
+ * height expands to the documented 52px floor only when the two-row tier needs
+ * it.
+ *
+ * Tier boundaries (outer tile width): >=680 roomy, 460-679 medium, 360-459
+ * narrow, 240-359 two-row narrow, and <240 minimum. The named container is the
+ * inner width after the tile's two 1px borders, so each query is offset by 2px.
+ * The tiers were chosen against the measured chrome: full switcher+controls need
+ * ~450px beyond the identity, short labels ~360px, and one-row icon-only chrome
+ * needs ~240px.
+ */
+.th-tile-header-container {
+  container-name: tile-header;
+  container-type: inline-size;
+  width: 100%;
+  min-width: 0;
+  flex: none;
+}
+/* Roomy (default): icon + full label; the short label is the hidden alternate. */
+.th-tab-label-short {
+  display: none;
+}
+/* Medium: swap the full label for the short one; tighten the pill padding. */
+@container tile-header (max-width: 677px) {
+  .th-context-meter {
+    display: none;
+  }
+  .th-tab-label {
+    display: none;
+  }
+  .th-tab-label-short {
+    display: inline;
+  }
+  .th-tab {
+    gap: 0.125rem;
+    padding-inline: 0.25rem;
+  }
+  .th-tile-header {
+    gap: 0.375rem;
+  }
+  /* Cortana's crown already communicates the stronger role. Hiding the
+   * redundant Captain anchor in the dual-role case protects the short-label
+   * boundary without losing identity. */
+  [data-orchestrator="1"] .th-captain-marker {
+    display: none;
+  }
+}
+/* Narrow: icon-only tabs; drop the git chip + work name; tighten the gaps.
+ * (The tab's aria-label/title keep carrying the full view name.) */
+@container tile-header (max-width: 457px) {
+  .th-tab-label,
+  .th-tab-label-short {
+    display: none;
+  }
+  .th-tab {
+    width: 1.5rem;
+    height: 1.5rem;
+    justify-content: center;
+    padding-inline: 0;
+  }
+  .th-git-chip,
+  .th-work-name {
+    display: none;
+  }
+  .th-tile-header {
+    gap: 0.25rem;
+  }
+}
+/* Extra narrow: split the same fixed-height header into two compact rows.
+ * Identity and controls keep a 24px top row; icon tabs occupy the bottom row.
+ * This prevents the 160px minimum tile width from clipping primary controls. */
+@container tile-header (max-width: 357px) {
+  .th-tile-header {
+    /* Two 24px rows, the tab-list's 2px border, and the header's 1px border need
+     * 51px. Keep the established 52px default as the responsive floor. */
+    height: max(var(--th-tile-header-h), 52px);
+    padding-bottom: 26px;
+  }
+  [data-header-hover="1"] .th-tile-header {
+    height: 0;
+  }
+  [data-header-hover="1"]:hover .th-tile-header {
+    height: max(var(--th-tile-header-h), 52px);
+  }
+  .th-tab-list {
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    padding: 0;
+    transform: translateX(-50%);
+  }
+}
+/* Minimum width: secondary recovery actions remain in the context menu, while
+ * tighter padding and gaps preserve identity plus colors/fullscreen/close. */
+@container tile-header (max-width: 237px) {
+  .th-ctl-secondary {
+    display: none;
+  }
+  .th-tile-header {
+    gap: 0.125rem;
+    padding-inline: 0.25rem;
+  }
+  .th-tile-title {
+    display: none;
+  }
 }
 
 /* Accent-following hover for the resize gutters' indicator line + the new-

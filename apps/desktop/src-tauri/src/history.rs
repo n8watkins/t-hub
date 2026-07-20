@@ -1,17 +1,19 @@
-#![allow(dead_code)]
-
-//! Provider-neutral History identity and transcript adapter foundation.
+//! Provider-neutral History identity, transcript adapters, and bounded catalog.
 //!
-//! This module deliberately does not expose a command yet.
-//! It locks the native Claude and Codex identity boundary before the catalog is
-//! connected to control, MCP, CLI, or UI surfaces.
-//! The temporary dead-code allowance is removed when the reviewed catalog API
-//! connects this foundation to its first production caller.
-//! Legacy `recent_sessions` remains unchanged until exact actions and durable
-//! organizational joins are available.
+//! `history_list` consumes this module through the control service. Legacy
+//! Claude-only Recent operations remain available as compatibility surfaces while
+//! the desktop migrates to exact Harness plus native conversation identity.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Serialize;
+mod catalog;
+
+pub use catalog::{
+    degrade_runtime_evidence, mark_entry_recovery_required, AssociationLiveness,
+    HistoryAssociation, HistoryBinding, HistoryFilter, HistoryPendingResume,
+    HistoryResumeOperation, HistoryService, HISTORY_ENTRY_LIMIT,
+};
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -23,7 +25,7 @@ pub const HISTORY_LABEL_MAX_CHARS: usize = 120;
 pub const HISTORY_LAST_TEXT_MAX_CHARS: usize = 240;
 pub const HISTORY_REASON_MAX_CHARS: usize = 240;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     Claude,
@@ -46,7 +48,7 @@ pub struct ActionCompatibility {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ActionStatus {
     Supported,
@@ -65,7 +67,7 @@ pub struct HistoryActions {
     pub unarchive: ActionCompatibility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ContinuityState {
     Active,
@@ -369,6 +371,10 @@ fn codex_filename_identity(path: &Path) -> Result<String, String> {
         return Err("Codex rollout filename identity is not a UUID".to_string());
     }
     Ok(identity.to_string())
+}
+
+pub(crate) fn codex_conversation_id_from_path(path: &Path) -> Result<String, String> {
+    codex_filename_identity(path)
 }
 
 pub fn parse_codex_rollout(

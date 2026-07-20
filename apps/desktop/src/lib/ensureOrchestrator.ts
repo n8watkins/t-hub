@@ -19,8 +19,7 @@ export const ORCHESTRATOR_CWD_SUFFIX = ".t-hub/orchestrator";
  *  untouched, and a captain's own derived identity logic never sees it. */
 export const ORCHESTRATOR_DISPLAY_NAME = "Cortana";
 
-/** Shared by every desktop window and restart so concurrent startup attempts
- *  reconcile under one idempotent backend operation identity. */
+/** A stable identifier retained for parser and monitor contract fixtures. */
 export const CORTANA_RECONCILE_OPERATION_ID = "t-hub.desktop.cortana.startup.v1";
 
 /**
@@ -40,6 +39,10 @@ export interface CortanaReconcileResult {
   degradedReason: string | null;
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 /** Fail closed on a malformed reconciliation response. */
 export function parseCortanaReconcileResult(value: unknown): CortanaReconcileResult {
   if (!value || typeof value !== "object") {
@@ -48,11 +51,11 @@ export function parseCortanaReconcileResult(value: unknown): CortanaReconcileRes
   const result = value as Record<string, unknown>;
   const actions = new Set(["keep", "adopt", "recover", "create", "degraded"]);
   if (
-    typeof result.operationId !== "string" ||
+    !isNonEmptyString(result.operationId) ||
     !actions.has(String(result.action)) ||
     typeof result.healthy !== "boolean" ||
-    (result.terminalId !== null && typeof result.terminalId !== "string") ||
-    (result.identityId !== null && typeof result.identityId !== "string") ||
+    (result.terminalId !== null && !isNonEmptyString(result.terminalId)) ||
+    (result.identityId !== null && !isNonEmptyString(result.identityId)) ||
     typeof result.generation !== "number" ||
     !Number.isSafeInteger(result.generation) ||
     result.generation < 0 ||
@@ -99,6 +102,7 @@ export interface CortanaReconciliationMonitorOptions {
 
 export interface CortanaReconciliationMonitor {
   start: () => void;
+  requestNow: () => void;
   observeTerminals: (terminals: Record<string, OrchestratorTerminal>) => void;
   stop: () => void;
 }
@@ -164,6 +168,10 @@ export function createCortanaReconciliationMonitor({
       run();
       timer = globalThis.setInterval(run, intervalMs);
     },
+    requestNow() {
+      if (!started || stopped) return;
+      run();
+    },
     observeTerminals(terminals) {
       if (stopped || !terminalId) return;
       const terminal = terminals[terminalId];
@@ -192,7 +200,7 @@ export function createCortanaReconciliationMonitor({
  * creation and recovery always belong to backend reconciliation. Precedence:
  *   1. the persisted orchestrator, if it is still a live terminal - keep it;
  *   2. else a live terminal whose cwd is the orchestrator home - adopt it;
- *   3. else null - leave it (no spawn).
+ *   3. else null - leave it for the backend result to populate.
  * Returns the id to DESIGNATE, or null to make no change. Pure + idempotent:
  * a second call with the same inputs designates the same id.
  */

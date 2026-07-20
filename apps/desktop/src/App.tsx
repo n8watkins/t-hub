@@ -3,8 +3,8 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
 import { useCaptain, agentOrder } from "./store/captain";
 import {
-  CORTANA_RECONCILE_OPERATION_ID,
   createCortanaReconciliationMonitor,
+  type CortanaReconciliationMonitor,
 } from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -17,6 +17,10 @@ import { initWindowSync, isSatellite } from "./lib/windows";
 import { useWindowMaximized } from "./lib/windowMaximized";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
 import { controlRequest } from "./ipc/controlClient";
+import {
+  createCortanaRecoveryOperation,
+  cortanaFailureMessage,
+} from "./lib/cortanaStartup";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -130,6 +134,9 @@ function useTitlebarReveal(
 }
 
 export default function App() {
+  const [cortanaRecoveryError, setCortanaRecoveryError] = useState<string | null>(null);
+  const [cortanaRecoveryOperation] = useState(createCortanaRecoveryOperation);
+  const cortanaReconciliationMonitor = useRef<CortanaReconciliationMonitor | null>(null);
   // A satellite starts with the supervision sidebar hidden — it's a focused
   // terminal canvas, not the full command center. The main window restores the
   // user's persisted collapse mode (#1: full / rail / hidden).
@@ -137,7 +144,6 @@ export default function App() {
     SATELLITE ? "hidden" : loadSidebarMode(),
   );
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
-  const [cortanaRecoveryProblem, setCortanaRecoveryProblem] = useState<string | null>(null);
 
   // --- Sidebar wiring (feat/projects-sidebar, Agent A) ---------------------
   // The sidebar is pure Projects navigation + Recent recall now. Two callbacks:
@@ -213,38 +219,68 @@ export default function App() {
   }, []);
 
   // Cortana lifetime reconciliation (main window only): the backend atomically
-  // keeps, adopts, recovers, or creates exactly one durable supervisor. The
-  // frontend reacts to observed terminal death and periodically asks the backend
-  // to verify harness liveness. The monitor deduplicates overlapping signals and
-  // never polls the model, its transcript, or token usage.
+  // keeps, adopts, recovers, or creates exactly one durable supervisor. Each
+  // authoritative result advances to a fresh operation identity for the next
+  // health check. Ambiguous transport failures retain the current identity so a
+  // retry can recover the cached result without applying the mutation twice.
   useEffect(() => {
     if (SATELLITE) return;
+    let authoritativeTerminalId: string | null = null;
     const monitor = createCortanaReconciliationMonitor({
-      reconcile: () =>
-        controlRequest("reconcile_cortana", {
-          operationId: CORTANA_RECONCILE_OPERATION_ID,
-        }),
-      onResult: (result) => {
-        setCortanaRecoveryProblem(
-          result.healthy
-            ? null
-            : (result.degradedReason ?? "Cortana identity evidence is ambiguous."),
-        );
+      reconcile: () => {
+        const operationId = cortanaRecoveryOperation.currentId();
+        return controlRequest("reconcile_cortana", {
+          operationId,
+          requestId: operationId,
+        });
       },
-      onError: (cause) => {
-        setCortanaRecoveryProblem(cause instanceof Error ? cause.message : String(cause));
+      onResult: (result) => {
+        cortanaRecoveryOperation.authoritativeResult();
+        if (!result.healthy) {
+          authoritativeTerminalId = null;
+          setCortanaRecoveryError(
+            cortanaFailureMessage(
+              result.degradedReason ?? "Cortana identity evidence is ambiguous.",
+            ),
+          );
+          return;
+        }
+        if (!result.terminalId) {
+          authoritativeTerminalId = null;
+          setCortanaRecoveryError("Cortana recovery returned no authoritative terminal.");
+          return;
+        }
+
+        authoritativeTerminalId = result.terminalId;
+        setCortanaRecoveryError(null);
+        const workspace = useWorkspace.getState();
+        if (workspace.terminals[result.terminalId]) {
+          workspace.moveTileToCaptainsTab(result.terminalId);
+        }
+      },
+      onError: (error) => {
+        cortanaRecoveryOperation.failure(error);
+        console.error("Cortana recovery failed", error);
+        setCortanaRecoveryError(cortanaFailureMessage(error));
       },
     });
+    cortanaReconciliationMonitor.current = monitor;
     monitor.start();
     monitor.observeTerminals(useWorkspace.getState().terminals);
     const unsubscribe = useWorkspace.subscribe((state) => {
       monitor.observeTerminals(state.terminals);
+      if (authoritativeTerminalId && state.terminals[authoritativeTerminalId]) {
+        state.moveTileToCaptainsTab(authoritativeTerminalId);
+      }
     });
     return () => {
       unsubscribe();
       monitor.stop();
+      if (cortanaReconciliationMonitor.current === monitor) {
+        cortanaReconciliationMonitor.current = null;
+      }
     };
-  }, []);
+  }, [cortanaRecoveryOperation]);
 
   // Keep every designated supervisor tile in the reserved Captains workspace.
   // The backend reconciliation and captains registry are authoritative for
@@ -257,10 +293,11 @@ export default function App() {
         if (terminals[id]) ws.moveTileToCaptainsTab(id);
       }
     };
-    // Terminals may already be seeded when this runs; check now, then watch.
     run(useWorkspace.getState().terminals);
-    const unsub = useWorkspace.subscribe((s) => run(s.terminals));
-    return unsub;
+    const unsubscribe = useWorkspace.subscribe((state) => run(state.terminals));
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   const maximized = useWindowMaximized();
@@ -365,6 +402,21 @@ export default function App() {
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
+      {cortanaRecoveryError && !SATELLITE && (
+        <div
+          className="absolute left-1/2 top-10 z-50 flex -translate-x-1/2 items-center gap-3 rounded border border-red-700/70 bg-red-950/95 px-4 py-2 text-xs text-red-100 shadow-lg"
+          role="alert"
+        >
+          <span>Cortana startup failed: {cortanaRecoveryError}</span>
+          <button
+            type="button"
+            className="rounded bg-red-800 px-2 py-1 font-medium hover:bg-red-700"
+            onClick={() => cortanaReconciliationMonitor.current?.requestNow()}
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {/* Lifecycle keybinds (feat/lifecycle): Ctrl/Cmd+Shift+W deletes the focused
           terminal's session behind a confirm (Ctrl/Cmd+W still detaches). Renders
           only its confirm dialog when armed. */}
@@ -415,16 +467,6 @@ export default function App() {
           {...barHover}
         >
           <Titlebar satellite={SATELLITE} onToggleSidebar={cycleSidebarMode} />
-        </div>
-      )}
-
-      {cortanaRecoveryProblem && (
-        <div
-          role="alert"
-          className="border-y border-amber-400/40 bg-amber-950/80 px-3 py-2 text-xs text-amber-100"
-        >
-          <span className="font-semibold">Cortana recovery is degraded.</span>{" "}
-          {cortanaRecoveryProblem}
         </div>
       )}
 

@@ -773,6 +773,44 @@ pub fn reassert_window_size_latest(name: &str) {
     );
 }
 
+/// Perform bounded, non-destructive maintenance on one exact live session.
+///
+/// Unlike [`reassert_window_size_latest`], this administrative path reports an
+/// error when the exact mutation cannot be confirmed. Callers can therefore
+/// distinguish a maintained session from a missing or indeterminate target and
+/// record an honest operation outcome.
+pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
+    if name.is_empty() || name.len() > 128 || !name.starts_with("th_") {
+        return Err(TmuxError {
+            op: "maintain-session",
+            code: None,
+            message: "session target must be one exact T-Hub tmux session".into(),
+        });
+    }
+    match session_liveness(name) {
+        SessionLiveness::Alive => {}
+        SessionLiveness::Gone => {
+            return Err(TmuxError {
+                op: "maintain-session",
+                code: None,
+                message: "session is definitively gone".into(),
+            });
+        }
+        SessionLiveness::Unknown => {
+            return Err(TmuxError {
+                op: "maintain-session",
+                code: None,
+                message: "session liveness is indeterminate; retry without mutating it".into(),
+            });
+        }
+    }
+    run(
+        "maintain-session",
+        &["set-option", "-t", name, "window-size", "latest"],
+    )?;
+    Ok(())
+}
+
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so
@@ -931,6 +969,108 @@ pub struct PaneInfo {
     pub cwd: String,
 }
 
+/// One exact Codex rollout currently held open by a process under a T-Hub pane.
+///
+/// The rollout path is provider evidence, not identity by itself. History parses
+/// and verifies the versioned filename before using its native conversation ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveCodexRollout {
+    pub terminal_id: String,
+    pub path: String,
+}
+
+/// Discover live Codex rollout files in one bounded WSL process invocation.
+///
+/// Codex does not currently publish its fresh interactive thread ID into tmux's
+/// session environment. Its process keeps the exact rollout open, so inspecting
+/// file descriptors under each pane's bounded four-level process tree provides an
+/// exact runtime join without guessing from cwd, timestamps, or display text.
+/// This is called only when History is requested, never from a background poll.
+fn active_codex_rollouts_script() -> String {
+    format!(
+        "set -o pipefail; pane_count=0; result_count=0; \
+tmux -L {sock} list-panes -a -F '#{{session_name}}|#{{pane_pid}}' \
+| while IFS='|' read -r session root; do \
+pane_count=$((pane_count + 1)); \
+if [ \"$pane_count\" -gt 512 ]; then echo 'active-codex-rollouts: pane bound exceeded' >&2; exit 70; fi; \
+case \"$root\" in ''|*[!0-9]*) echo 'active-codex-rollouts: invalid pane pid' >&2; exit 71;; esac; \
+pids=\"$root\"; frontier=\"$root\"; process_count=1; \
+for depth in 1 2 3 4; do next=\"\"; \
+for parent in $frontier; do kids=$(pgrep -P \"$parent\" 2>/dev/null); rc=$?; \
+if [ \"$rc\" -gt 1 ]; then echo 'active-codex-rollouts: process scan failed' >&2; exit 72; fi; \
+for kid in $kids; do process_count=$((process_count + 1)); \
+if [ \"$process_count\" -gt 256 ]; then echo 'active-codex-rollouts: process bound exceeded' >&2; exit 73; fi; \
+next=\"$next $kid\"; done; done; pids=\"$pids $next\"; frontier=\"$next\"; done; \
+for parent in $frontier; do kids=$(pgrep -P \"$parent\" 2>/dev/null); rc=$?; \
+if [ \"$rc\" -gt 1 ]; then echo 'active-codex-rollouts: process depth probe failed' >&2; exit 76; fi; \
+if [ \"$rc\" -eq 0 ] && [ -n \"$kids\" ]; then echo 'active-codex-rollouts: process depth bound exceeded' >&2; exit 77; fi; done; \
+for pid in $pids; do [ -d \"/proc/$pid/fd\" ] || continue; fd_count=0; \
+for fd in /proc/$pid/fd/*; do [ -L \"$fd\" ] || continue; fd_count=$((fd_count + 1)); \
+if [ \"$fd_count\" -gt 512 ]; then echo 'active-codex-rollouts: fd bound exceeded' >&2; exit 74; fi; \
+target=$(readlink \"$fd\" 2>/dev/null); rc=$?; \
+if [ \"$rc\" -ne 0 ]; then [ -d \"/proc/$pid\" ] || continue; \
+echo 'active-codex-rollouts: fd inspection failed' >&2; exit 75; fi; \
+case \"$target\" in */.codex/sessions/*/rollout-*.jsonl) \
+result_count=$((result_count + 1)); \
+if [ \"$result_count\" -gt 512 ]; then echo 'active-codex-rollouts: result bound exceeded' >&2; exit 78; fi; \
+printf '%s|%s\\n' \"$session\" \"$target\";; esac; done; done; done | sort -u",
+        sock = socket()
+    )
+}
+
+pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
+    let script = active_codex_rollouts_script();
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "active-codex-rollouts",
+                code: None,
+                message: format!("failed to inspect Codex runtime identity: {e}"),
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_no_server(&stderr) || stderr.contains("error connecting to") {
+            return Ok(Vec::new());
+        }
+        return Err(TmuxError {
+            op: "active-codex-rollouts",
+            code: output.status.code(),
+            message: stderr.trim().to_string(),
+        });
+    }
+    let mut rollouts = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((session, path)) = line.split_once('|') else {
+            return Err(TmuxError {
+                op: "active-codex-rollouts",
+                code: None,
+                message: "runtime scan returned a malformed identity row".into(),
+            });
+        };
+        let terminal_id = session.trim().strip_prefix("th_").unwrap_or(session.trim());
+        if terminal_id.is_empty() || path.trim().is_empty() || path.contains('|') {
+            return Err(TmuxError {
+                op: "active-codex-rollouts",
+                code: None,
+                message: "runtime scan returned an invalid identity row".into(),
+            });
+        }
+        if rollouts.len() >= 512 {
+            return Err(TmuxError {
+                op: "active-codex-rollouts",
+                code: None,
+                message: "runtime scan result bound exceeded".into(),
+            });
+        }
+        rollouts.push(ActiveCodexRollout {
+            terminal_id: terminal_id.to_string(),
+            path: path.trim().to_string(),
+        });
+    }
+    Ok(rollouts)
+}
+
 /// List every pane's `session_name|pane_current_command|pane_current_path`.
 ///
 /// Unlike [`list_sessions`], this needs a tmux FORMAT (`#{...}`). A bare
@@ -1012,8 +1152,8 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
 }
 
 /// Build the `bash -lc <script>` command used by [`pane_info`]. On Windows this
-/// goes through `wsl.exe` (CREATE_NO_WINDOW so no console flashes); on unix it
-/// runs `sh -c` directly. The single-quoted tmux format inside `script` is what
+/// goes through `wsl.exe` (CREATE_NO_WINDOW so no console flashes); on Unix it
+/// runs `bash -lc` directly. The single-quoted tmux format inside `script` is what
 /// protects `#{...}` from being eaten as a shell comment.
 ///
 /// CRITICAL: pass `-e` (alias `--exec`) so wsl.exe runs `bash` DIRECTLY. Without
@@ -1040,8 +1180,8 @@ fn pane_info_command(script: &str) -> Command {
 
 #[cfg(unix)]
 fn pane_info_command(script: &str) -> Command {
-    let mut c = Command::new("sh");
-    c.arg("-c").arg(script);
+    let mut c = Command::new("bash");
+    c.arg("-lc").arg(script);
     c
 }
 
@@ -1145,6 +1285,29 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_scans_use_bash_for_pipefail_semantics() {
+        let command = pane_info_command("set -o pipefail; printf ok");
+        assert_eq!(command.get_program(), "bash");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["-lc", "set -o pipefail; printf ok"]
+        );
+    }
+
+    #[test]
+    fn active_codex_scan_fails_closed_beyond_its_process_depth_bound() {
+        let script = active_codex_rollouts_script();
+        assert!(script.contains("process depth probe failed"));
+        assert!(script.contains("process depth bound exceeded"));
+        assert!(script.contains("for parent in $frontier"));
+        assert!(script.contains("result bound exceeded"));
+    }
 
     /// True when a real `tmux` binary is reachable for the tests below. These
     /// tests drive a live tmux server on the isolated socket, so they can only

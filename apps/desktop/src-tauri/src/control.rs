@@ -7771,10 +7771,15 @@ enum RequestSlot {
     /// A first caller reserved this id and is running the command now. A
     /// concurrent duplicate (a retry that raced the original, Incident B) sees
     /// this and must NOT run the command again.
-    InFlight { since: std::time::Instant },
+    InFlight {
+        since: std::time::Instant,
+        signature: String,
+        reservation: u64,
+    },
     /// The command finished; its outcome is cached for replay to a retry.
     Done {
         at: std::time::Instant,
+        signature: String,
         outcome: Result<Value, String>,
     },
 }
@@ -7830,6 +7835,7 @@ struct RequestCacheInner {
     slots: std::collections::HashMap<String, RequestSlot>,
     /// Insertion order of ids, for capacity eviction (oldest first).
     order: std::collections::VecDeque<String>,
+    next_reservation: u64,
 }
 
 impl RequestCache {
@@ -7872,11 +7878,11 @@ impl RequestCache {
         ttl: std::time::Duration,
         inflight_reap: std::time::Duration,
     ) {
-        let RequestCacheInner { slots, order } = inner;
+        let RequestCacheInner { slots, order, .. } = inner;
         order.retain(|id| {
             let expired = match slots.get(id) {
                 Some(RequestSlot::Done { at, .. }) => now.duration_since(*at) >= ttl,
-                Some(RequestSlot::InFlight { since }) => {
+                Some(RequestSlot::InFlight { since, .. }) => {
                     now.duration_since(*since) >= inflight_reap
                 }
                 None => true,
@@ -7891,7 +7897,21 @@ impl RequestCache {
     /// Reserve `id` for a first caller, or report that it is a duplicate/in-flight.
     /// The reservation (InFlight) and the completed-outcome lookup are one atomic
     /// step so two racing retries can never both reserve the same id.
+    #[cfg(test)]
     fn begin(&self, id: &str) -> BeginOutcome {
+        self.begin_bound(id, "")
+    }
+
+    #[cfg(test)]
+    fn begin_bound(&self, id: &str, signature: &str) -> BeginOutcome {
+        self.begin_bound_with_reservation(id, signature).0
+    }
+
+    fn begin_bound_with_reservation(
+        &self,
+        id: &str,
+        signature: &str,
+    ) -> (BeginOutcome, Option<u64>) {
         let now = std::time::Instant::now();
         let mut inner = self.lock();
         // M1 full fix: was THIS id a reservation that just aged out? Capture it
@@ -7900,16 +7920,54 @@ impl RequestCache {
         // (FreshAfterReap) that must re-probe reality before re-applying.
         let reaped = matches!(
             inner.slots.get(id),
-            Some(RequestSlot::InFlight { since }) if now.duration_since(*since) >= self.inflight_reap
+            Some(RequestSlot::InFlight { since, .. }) if now.duration_since(*since) >= self.inflight_reap
         );
         Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
         match inner.slots.get(id) {
-            Some(RequestSlot::Done { outcome, .. }) => BeginOutcome::Duplicate(outcome.clone()),
-            Some(RequestSlot::InFlight { .. }) => BeginOutcome::InFlight,
+            Some(RequestSlot::Done {
+                signature: existing,
+                outcome,
+                ..
+            }) => {
+                if existing == signature {
+                    (BeginOutcome::Duplicate(outcome.clone()), None)
+                } else {
+                    (
+                        BeginOutcome::Duplicate(Err(
+                            "request_conflict: requestId is already bound to a different command or argument set"
+                                .to_string(),
+                        )),
+                        None,
+                    )
+                }
+            }
+            Some(RequestSlot::InFlight {
+                signature: existing,
+                ..
+            }) => {
+                if existing == signature {
+                    (BeginOutcome::InFlight, None)
+                } else {
+                    (
+                        BeginOutcome::Duplicate(Err(
+                            "request_conflict: requestId is already bound to a different command or argument set"
+                                .to_string(),
+                        )),
+                        None,
+                    )
+                }
+            }
             None => {
-                inner
-                    .slots
-                    .insert(id.to_string(), RequestSlot::InFlight { since: now });
+                inner.next_reservation = inner.next_reservation.saturating_add(1).max(1);
+                let reservation = inner.next_reservation;
+                inner.slots.insert(
+                    id.to_string(),
+                    RequestSlot::InFlight {
+                        since: now,
+                        signature: signature.to_string(),
+                        reservation,
+                    },
+                );
                 inner.order.push_back(id.to_string());
                 // Capacity bound: evict the oldest COMPLETED entries (never an
                 // in-flight reservation) until back under the cap.
@@ -7928,9 +7986,9 @@ impl RequestCache {
                     }
                 }
                 if reaped {
-                    BeginOutcome::FreshAfterReap
+                    (BeginOutcome::FreshAfterReap, Some(reservation))
                 } else {
-                    BeginOutcome::Fresh
+                    (BeginOutcome::Fresh, Some(reservation))
                 }
             }
         }
@@ -7939,8 +7997,55 @@ impl RequestCache {
     /// Record the outcome of a request reserved by [`begin`](Self::begin), and
     /// return it (cloned) so the caller can respond with the very value now cached
     /// for any future retry.
+    #[cfg(test)]
     fn finish(&self, id: &str, outcome: Result<Value, String>) -> Result<Value, String> {
+        let (reservation, signature, absent) = {
+            let inner = self.lock();
+            match inner.slots.get(id) {
+                Some(RequestSlot::InFlight {
+                    reservation,
+                    signature,
+                    ..
+                }) => (Some(*reservation), Some(signature.clone()), false),
+                None => (None, None, true),
+                Some(RequestSlot::Done { .. }) => (None, None, false),
+            }
+        };
+        match reservation {
+            Some(reservation) => self.finish_reserved(
+                id,
+                reservation,
+                signature.as_deref().expect("in-flight signature"),
+                outcome,
+            ),
+            None if absent => self.finish_reserved(id, 0, "", outcome),
+            None => outcome,
+        }
+    }
+
+    fn finish_reserved(
+        &self,
+        id: &str,
+        reservation: u64,
+        original_signature: &str,
+        outcome: Result<Value, String>,
+    ) -> Result<Value, String> {
         let mut inner = self.lock();
+        let signature = match inner.slots.get(id) {
+            Some(RequestSlot::InFlight {
+                signature,
+                reservation: current,
+                ..
+            }) if *current == reservation => signature.clone(),
+            // A status query may reap an old reservation before its legitimate
+            // handler returns. With no replacement owner, preserve that late
+            // authoritative result under its original signature.
+            None => original_signature.to_string(),
+            // A reaped request may finish after a replacement reserved the same
+            // id. Never let that stale completion overwrite or complete the newer
+            // reservation/outcome.
+            _ => return outcome,
+        };
         // M2: normally `begin` already put the id in `order`, so we must NOT
         // double-insert. BUT if the reservation outlived the reap window (a
         // >`inflight_reap` handler still running), `evict_expired` already dropped
@@ -7955,6 +8060,7 @@ impl RequestCache {
             id.to_string(),
             RequestSlot::Done {
                 at: std::time::Instant::now(),
+                signature,
                 outcome: outcome.clone(),
             },
         );
@@ -7965,11 +8071,26 @@ impl RequestCache {
     /// pre-side-effect gate (the spawn governor) refuses a reserved request, so a
     /// later retry (after budget frees) is not permanently stuck seeing InFlight /
     /// a cached refusal. A no-op if the id already completed.
+    #[cfg(test)]
     fn cancel(&self, id: &str) {
         let mut inner = self.lock();
         if matches!(inner.slots.get(id), Some(RequestSlot::InFlight { .. })) {
             inner.slots.remove(id);
             inner.order.retain(|x| x != id);
+        }
+    }
+
+    fn cancel_reserved(&self, id: &str, reservation: u64) {
+        let mut inner = self.lock();
+        if matches!(
+            inner.slots.get(id),
+            Some(RequestSlot::InFlight {
+                reservation: current,
+                ..
+            }) if *current == reservation
+        ) {
+            inner.slots.remove(id);
+            inner.order.retain(|entry| entry != id);
         }
     }
 
@@ -8172,6 +8293,9 @@ impl Drop for DispatchReservationGuard {
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
+    /// Provider-neutral conversation catalog. One cache is shared across every
+    /// control connection so History scans never become per-request WSL churn.
+    history: Arc<crate::history::HistoryService>,
     /// A snapshot accessor over the supervision reducer. Boxed closure so this
     /// module does not need to name the `AgentBridge` internals; the closure
     /// borrows the shared `Mutex<Supervisor>` inside the bridge.
@@ -9560,7 +9684,9 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "start_agent" | "reconcile_cortana" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
+        "spawn_terminal" | "history_resume" | "start_agent" | "reconcile_cortana"
+        | "commission_captain" | "attach_captain" | "dispatch_crew"
+        | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -9568,7 +9694,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "abort_session" | "plane_admin" => {
             CommandTier::ProcessChanging
         }
-        "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
+        "focus_session" | "history_focus" | "history_list" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "agent_checkpoint" | "report_workspace_tabs" | "watch_fleet"
@@ -9595,7 +9721,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "inbox_ack"
         // comms-plane Phase 3: `authorize` records a durable governance artifact
         // (mutating, audited); only the general originates (enforced by the handler ACL).
-        | "authorize" | "appoint_admin" | "approve_admin_action" | "revoke_admin" | "record_agent_delivery" => {
+        | "authorize" | "appoint_admin" | "approve_admin_action" | "execute_admin_operation" | "revoke_admin" | "record_agent_delivery" => {
             CommandTier::Organization
         }
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
@@ -10543,6 +10669,7 @@ fn governor_gate<'a>(
         // reserves when reconciliation actually needs a replacement runtime.
         "start_agent" | "reconcile_cortana" => Ok(None),
         "spawn_terminal"
+        | "history_resume"
         | "commission_captain"
         | "dispatch_crew"
         | "create_worktree"
@@ -10827,8 +10954,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     } else {
         None
     };
+    let mut request_reservation = None;
+    let mut request_signature_value = None;
     if let Some(id) = &request_id {
-        match ctx.requests.begin(id) {
+        let signature = request_signature(&req.command, &req.args);
+        let (begin, reservation) = ctx.requests.begin_bound_with_reservation(id, &signature);
+        request_reservation = reservation;
+        request_signature_value = Some(signature);
+        match begin {
             // This exact request already completed: replay its stored outcome. Do
             // NOT re-run, re-charge, or re-audit - the side effect is already done.
             BeginOutcome::Duplicate(outcome) => return replay_response(outcome),
@@ -10854,7 +10987,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             // created do we fall through and apply fresh (the original truly died).
             BeginOutcome::FreshAfterReap => {
                 if let Some(outcome) = reprobe_reaped_request(ctx, &req.command, &req.args) {
-                    let outcome = ctx.requests.finish(id, outcome);
+                    let outcome = ctx.requests.finish_reserved(
+                        id,
+                        request_reservation.expect("fresh reservation"),
+                        request_signature_value
+                            .as_deref()
+                            .expect("reserved request has a signature"),
+                        outcome,
+                    );
                     return replay_response(outcome);
                 }
             }
@@ -10882,7 +11022,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     // reservation so a retry after the budget frees can still succeed
                     // (rather than being permanently stuck replaying the refusal).
                     if let Some(id) = &request_id {
-                        ctx.requests.cancel(id);
+                        ctx.requests.cancel_reserved(
+                            id,
+                            request_reservation.expect("reserved id reaches governor"),
+                        );
                     }
                     audit_command(ctx, &req, tier, cap, refusal.code, None);
                     ctx.fanout.emit_event(
@@ -10912,7 +11055,25 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         trusted_internal,
     );
     let outcome = match &request_id {
-        Some(id) => ctx.requests.finish(id, outcome),
+        Some(id)
+            if outcome
+                .as_ref()
+                .is_err_and(|error| error.starts_with(RETRYABLE_ERROR_MARKER)) =>
+        {
+            ctx.requests.cancel_reserved(
+                id,
+                request_reservation.expect("reserved id reaches retryable dispatch outcome"),
+            );
+            outcome
+        }
+        Some(id) => ctx.requests.finish_reserved(
+            id,
+            request_reservation.expect("reserved id reaches dispatch"),
+            request_signature_value
+                .as_deref()
+                .expect("reserved request has a signature"),
+            outcome,
+        ),
         None => outcome,
     };
     let response = match outcome {
@@ -10965,6 +11126,11 @@ fn is_idempotent_command(command: &str) -> bool {
             | "dispatch_crew"
             | "start_agent"
     )
+}
+
+fn request_signature(command: &str, args: &Value) -> String {
+    let normalized = json!({ "command": command, "args": args });
+    format!("{:x}", sha2::Sha256::digest(normalized.to_string()))
 }
 
 /// M1 full fix: when an InFlight reservation was REAPED (presumed dead after the
@@ -11226,13 +11392,15 @@ fn dispatch_with_caller(
         "get_status" => get_status(ctx, args),
         // Idempotency (ask #1): "what happened to request X?" - resolves an
         // ambiguous spawn-class response leg without guessing (Read tier).
-        "get_request_status" => get_request_status(ctx, args),
+        "get_request_status" => get_request_status(ctx, args, caller, trusted_internal),
         "wait_for_status" => wait_for_status(ctx, args),
         "supervision_tree" => supervision_tree(ctx, args),
         "supervision_session_ids" => supervision_session_ids(ctx),
         "wsl_health" => wsl_health(ctx),
         "recent_sessions" => recent_sessions(),
         "invalidate_recent_cache" => invalidate_recent_cache(),
+        "history_list" => history_list(ctx, args, caller, trusted_internal),
+        "invalidate_history_cache" => invalidate_history_cache(ctx),
         // "Is the general dictating?" - reads the Scribe voice-gate status file
         // (fails open to listening=false when it can't tell). Lets agents defer
         // a spoken cue / a barge-in while the user is talking.
@@ -11288,6 +11456,7 @@ fn dispatch_with_caller(
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
         "focus_session" => organization_apply(ctx, "focus_session", args),
+        "history_focus" => history_focus(ctx, args, caller, trusted_internal),
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
         // forward the registry snapshot for the UI to render from.
@@ -11325,6 +11494,7 @@ fn dispatch_with_caller(
         "record_agent_delivery" => record_agent_delivery(ctx, args, caller, trusted_internal),
         "appoint_admin" => appoint_admin(ctx, args, caller, trusted_internal),
         "approve_admin_action" => approve_admin_action(ctx, args, caller, trusted_internal),
+        "execute_admin_operation" => execute_admin_operation(ctx, args, caller, trusted_internal),
         "revoke_admin" => revoke_admin(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
@@ -11357,6 +11527,7 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args, caller, trusted_internal),
+        "history_resume" => history_resume(ctx, args, caller, trusted_internal),
         "start_agent" => start_agent(ctx, args, caller, trusted_internal),
         "reconcile_cortana" => reconcile_cortana(ctx, args, trusted_internal),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
@@ -11438,6 +11609,7 @@ fn enforce_delegated_admin_command(
             | "capture_pane"
             | "create_worktree"
             | "close_terminal"
+            | "execute_admin_operation"
             | "list_admin_grants"
     ) {
         return Ok(());
@@ -12359,19 +12531,120 @@ fn get_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 ///                                                did NOT land under this id, so a
 ///                                                retry with the same id is safe.
 /// Args: `requestId` (required).
-fn get_request_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn get_request_status(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
     let request_id = arg_str(args, "requestId")
         .or_else(|| arg_str(args, "request_id"))
         .ok_or("get_request_status requires a 'requestId' argument")?;
     let body = match ctx.requests.status(&request_id) {
-        RequestStatus::Unknown => json!({ "requestId": request_id, "status": "unknown" }),
+        RequestStatus::Unknown => match ctx.history.resume_operation(&request_id) {
+            Ok(Some(operation)) => {
+                authorize_history_request_status(
+                    ctx,
+                    caller,
+                    trusted_internal,
+                    operation.authorized_ship_slug.as_deref(),
+                    operation.authorized_project_id.as_deref(),
+                    operation.authorized_assignment_id.as_deref(),
+                )?;
+                match exact_history_runtime_liveness(
+                    ctx,
+                    operation.harness,
+                    &operation.conversation_id,
+                    &operation.terminal_id,
+                ) {
+                    crate::history::AssociationLiveness::Active => json!({
+                        "requestId": request_id,
+                        "status": "completed",
+                        "ok": true,
+                        "durable": true,
+                        "result": {
+                            "accepted": "history_resume",
+                            "requestId": operation.request_id,
+                            "historyId": operation.history_id,
+                            "harness": operation.harness,
+                            "conversationId": operation.conversation_id,
+                            "terminalId": operation.terminal_id,
+                            "tabId": operation.actual_tab_id,
+                            "status": "active",
+                            "replayed": true,
+                        },
+                    }),
+                    crate::history::AssociationLiveness::Inactive => json!({
+                        "requestId": request_id,
+                        "status": "completed",
+                        "ok": false,
+                        "durable": true,
+                        "error": "history_previous_resume_closed: the resumed terminal is closed or now hosts a different conversation",
+                    }),
+                    crate::history::AssociationLiveness::Unknown => json!({
+                        "requestId": request_id,
+                        "status": "inFlight",
+                        "durable": true,
+                        "retryable": true,
+                    }),
+                }
+            }
+            Ok(None) => match ctx.history.pending_resume(&request_id) {
+                Ok(Some(pending)) => {
+                    authorize_history_request_status(
+                        ctx,
+                        caller,
+                        trusted_internal,
+                        pending.authorized_ship_slug.as_deref(),
+                        pending.authorized_project_id.as_deref(),
+                        pending.authorized_assignment_id.as_deref(),
+                    )?;
+                    json!({
+                        "requestId": request_id,
+                        "status": "inFlight",
+                        "durable": true,
+                        "retryable": true,
+                    })
+                }
+                Ok(None) => json!({ "requestId": request_id, "status": "unknown" }),
+                Err(error) => json!({
+                    "requestId": request_id,
+                    "status": "completed",
+                    "ok": false,
+                    "durable": true,
+                    "error": error,
+                }),
+            },
+            Err(error) => json!({
+                "requestId": request_id,
+                "status": "completed",
+                "ok": false,
+                "durable": true,
+                "error": error,
+            }),
+        },
         RequestStatus::InFlight => json!({ "requestId": request_id, "status": "inFlight" }),
-        RequestStatus::Completed(Ok(result)) => json!({
-            "requestId": request_id,
-            "status": "completed",
-            "ok": true,
-            "result": result,
-        }),
+        RequestStatus::Completed(Ok(result)) => {
+            if result.get("accepted").and_then(Value::as_str) == Some("history_resume") {
+                let operation = ctx.history.resume_operation(&request_id)?.ok_or(
+                    "history_recovery_required: completed History request has no durable operation",
+                )?;
+                authorize_history_request_status(
+                    ctx,
+                    caller,
+                    trusted_internal,
+                    operation.authorized_ship_slug.as_deref(),
+                    operation.authorized_project_id.as_deref(),
+                    operation.authorized_assignment_id.as_deref(),
+                )?;
+            }
+            json!({
+                "requestId": request_id,
+                "status": "completed",
+                "ok": true,
+                "result": result,
+            })
+        }
         RequestStatus::Completed(Err(error)) => json!({
             "requestId": request_id,
             "status": "completed",
@@ -12545,7 +12818,7 @@ fn parse_target_statuses(args: &Value) -> Result<Vec<String>, String> {
 
 /// `supervision_session_ids`: every session id the supervision reducer knows.
 /// Mirrors the `supervision_session_ids` Tauri command; returns a JSON array of ids
-/// (server-split M1 — the supervision/status read surface moves onto the socket).
+/// (server-split M1 - the supervision/status read surface moves onto the socket).
 fn supervision_session_ids(ctx: &ControlContext) -> Result<Value, String> {
     let ids = ctx.with_supervisor(|s| s.session_ids());
     serde_json::to_value(ids).map_err(|e| e.to_string())
@@ -12575,7 +12848,7 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
     }))
 }
 
-/// `recent_sessions` (server-split M3 — first overlay source over the wire): the
+/// `recent_sessions` (server-split M3 - first overlay source over the wire): the
 /// daemon's recent recallable Claude sessions, so a thin client gets the Recent
 /// list remotely. Mirrors the `recent_sessions` Tauri command (same
 /// `RecentSession[]` shape), reusing its shared scan cache. When the daemon runs
@@ -12603,6 +12876,1178 @@ fn scribe_status() -> Result<Value, String> {
 fn invalidate_recent_cache() -> Result<Value, String> {
     crate::recent::invalidate_recent_cache();
     Ok(Value::Bool(true))
+}
+
+/// `history_list` (organization tier): provider-neutral, exact-identity conversation
+/// catalog. Provider transcripts remain read-only evidence; durable registry
+/// metadata joins only on Harness plus an exact native conversation identity.
+fn history_list(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "history_list")?;
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "history_list")?;
+    let filter = if args.is_null() {
+        crate::history::HistoryFilter::default()
+    } else {
+        serde_json::from_value::<crate::history::HistoryFilter>(args.clone())
+            .map_err(|error| format!("history_invalid_filter: {error}"))?
+    };
+    let evidence = history_associations(ctx);
+    let mut list = match &authority {
+        WorkspaceMutationAuthority::Assignment(owner) => ctx.history.list_for_assignment(
+            &filter,
+            &evidence.associations,
+            &owner.ship_slug,
+            &owner.project_id,
+            &owner.assignment_id,
+        )?,
+        WorkspaceMutationAuthority::Apex => ctx.history.list(&filter, &evidence.associations)?,
+    };
+    if evidence.claude_runtime_uncertain {
+        crate::history::degrade_runtime_evidence(
+            &mut list,
+            crate::history::Harness::Claude,
+            "Claude active-runtime discovery was unavailable; resume is fail-closed.",
+        )?;
+    }
+    if evidence.codex_runtime_uncertain {
+        crate::history::degrade_runtime_evidence(
+            &mut list,
+            crate::history::Harness::Codex,
+            "Codex active-runtime discovery was unavailable; resume is fail-closed.",
+        )?;
+    }
+    if ctx.history.durable_state_error().is_some() {
+        for harness in [
+            crate::history::Harness::Claude,
+            crate::history::Harness::Codex,
+        ] {
+            crate::history::degrade_runtime_evidence(
+                &mut list,
+                harness,
+                "Durable History resume state is unavailable; resume is fail-closed.",
+            )?;
+        }
+    }
+    serde_json::to_value(list).map_err(|error| error.to_string())
+}
+
+/// Drop only T-Hub's in-memory History scan cache. Provider transcripts and
+/// registry records are never changed.
+fn invalidate_history_cache(ctx: &ControlContext) -> Result<Value, String> {
+    notify_history_changed(ctx, "cache-invalidated");
+    Ok(Value::Bool(true))
+}
+
+fn notify_history_changed(ctx: &ControlContext, reason: &str) {
+    ctx.history.invalidate();
+    ctx.fanout.emit_event(
+        "history://changed",
+        &json!({ "reason": reason, "at": now_ms() }),
+    );
+}
+
+fn history_harness(
+    provider: Option<&str>,
+    harness: Option<&str>,
+    claude_uuid: Option<&str>,
+) -> Option<crate::history::Harness> {
+    match provider.or(harness).map(str::trim) {
+        Some("claude") => Some(crate::history::Harness::Claude),
+        Some("codex") => Some(crate::history::Harness::Codex),
+        Some(_) => None,
+        None if claude_uuid.is_some() => Some(crate::history::Harness::Claude),
+        None => None,
+    }
+}
+
+fn history_identity_values(
+    harness: crate::history::Harness,
+    provider_session_id: Option<&str>,
+    conversation_id: Option<&str>,
+    claude_uuid: Option<&str>,
+) -> Vec<String> {
+    let mut identities = std::collections::BTreeSet::new();
+    for value in [provider_session_id, conversation_id] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            identities.insert(value.to_string());
+        }
+    }
+    if harness == crate::history::Harness::Claude {
+        if let Some(value) = claude_uuid.map(str::trim).filter(|value| !value.is_empty()) {
+            identities.insert(value.to_string());
+        }
+    }
+    identities.into_iter().collect()
+}
+
+fn history_registry_liveness(
+    expected_active: bool,
+    terminal_id: Option<&str>,
+    live_sessions: &Result<std::collections::HashSet<String>, String>,
+) -> crate::history::AssociationLiveness {
+    if !expected_active || terminal_id.is_none() {
+        return crate::history::AssociationLiveness::Inactive;
+    }
+    match live_sessions {
+        Ok(live) => {
+            if live.contains(&tmux_target(terminal_id.expect("checked above"))) {
+                // A surviving tmux shell does not prove that the recorded Harness
+                // still owns the pane. Exact Claude/Codex runtime evidence below
+                // must promote this association to Active.
+                crate::history::AssociationLiveness::Unknown
+            } else {
+                crate::history::AssociationLiveness::Inactive
+            }
+        }
+        Err(_) => crate::history::AssociationLiveness::Unknown,
+    }
+}
+
+fn merge_history_association(
+    associations: &mut Vec<crate::history::HistoryAssociation>,
+    candidate: crate::history::HistoryAssociation,
+) {
+    let Some(existing_index) = associations.iter().position(|association| {
+        association.harness == candidate.harness
+            && association.conversation_id == candidate.conversation_id
+            && association.terminal_id == candidate.terminal_id
+    }) else {
+        associations.push(candidate);
+        return;
+    };
+    let mut merged = associations[existing_index].clone();
+    for (current, next) in [
+        (&mut merged.project_id, candidate.project_id.clone()),
+        (&mut merged.project_name, candidate.project_name.clone()),
+        (&mut merged.captain_id, candidate.captain_id.clone()),
+        (&mut merged.assignment_id, candidate.assignment_id.clone()),
+        (&mut merged.role, candidate.role.clone()),
+        (&mut merged.workspace_id, candidate.workspace_id.clone()),
+        (&mut merged.worktree_id, candidate.worktree_id.clone()),
+        (&mut merged.branch, candidate.branch.clone()),
+    ] {
+        match (current.as_ref(), next) {
+            (Some(left), Some(right)) if left != &right => {
+                associations.push(candidate);
+                return;
+            }
+            (None, Some(value)) => *current = Some(value),
+            _ => {}
+        }
+    }
+    merged.liveness = match (merged.liveness, candidate.liveness) {
+        (crate::history::AssociationLiveness::Active, _)
+        | (_, crate::history::AssociationLiveness::Active) => {
+            crate::history::AssociationLiveness::Active
+        }
+        (crate::history::AssociationLiveness::Unknown, _)
+        | (_, crate::history::AssociationLiveness::Unknown) => {
+            crate::history::AssociationLiveness::Unknown
+        }
+        _ => crate::history::AssociationLiveness::Inactive,
+    };
+    associations[existing_index] = merged;
+}
+
+/// Build exact active and durable joins without using cwd as identity.
+///
+/// Registry associations contribute organizational metadata. Runtime evidence
+/// covers ordinary non-Crew tiles: Claude's status bridge provides the exact UUID,
+/// while Codex exposes its exact open rollout through one bounded process scan.
+struct HistoryAssociationEvidence {
+    associations: Vec<crate::history::HistoryAssociation>,
+    claude_runtime_uncertain: bool,
+    codex_runtime_uncertain: bool,
+}
+
+fn history_associations(ctx: &ControlContext) -> HistoryAssociationEvidence {
+    let live_sessions = tmux::list_sessions()
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .map_err(|error| error.to_string());
+    let snapshot = ctx.captains.snapshot();
+    let project_names = snapshot
+        .projects
+        .iter()
+        .map(|project| (project.project_id.as_str(), project.name.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let live_sessions_uncertain = live_sessions.is_err();
+    let mut associations = Vec::new();
+    for captain in &snapshot.captains {
+        let harness = history_harness(
+            captain.provider.as_deref(),
+            captain.harness.as_deref(),
+            captain.claude_uuid.as_deref(),
+        );
+        if let Some(harness) = harness {
+            let liveness = history_registry_liveness(
+                matches!(captain.state, ClaimState::Active),
+                captain.terminal_id.as_deref(),
+                &live_sessions,
+            );
+            for conversation_id in history_identity_values(
+                harness,
+                captain.provider_session_id.as_deref(),
+                captain.conversation_id.as_deref(),
+                captain.claude_uuid.as_deref(),
+            ) {
+                merge_history_association(
+                    &mut associations,
+                    crate::history::HistoryAssociation {
+                        harness,
+                        conversation_id,
+                        terminal_id: captain.terminal_id.clone(),
+                        liveness,
+                        project_id: captain.project_id.clone(),
+                        project_name: captain
+                            .project_id
+                            .as_deref()
+                            .and_then(|id| project_names.get(id).copied())
+                            .map(str::to_string),
+                        captain_id: Some(captain.ship_slug.clone()),
+                        assignment_id: Some(captain.assignment_id.clone()),
+                        role: Some(captain.role.label().to_string()),
+                        workspace_id: (captain.workspace_tab_ids.len() == 1)
+                            .then(|| captain.workspace_tab_ids[0].clone()),
+                        worktree_id: None,
+                        branch: None,
+                    },
+                );
+            }
+        }
+        for crew in &captain.crew {
+            let Some(harness) = history_harness(
+                crew.provider.as_deref(),
+                crew.harness.as_deref(),
+                crew.claude_uuid.as_deref(),
+            ) else {
+                continue;
+            };
+            let liveness = history_registry_liveness(
+                matches!(crew.state, CrewState::Active),
+                Some(&crew.terminal_id),
+                &live_sessions,
+            );
+            for conversation_id in history_identity_values(
+                harness,
+                crew.provider_session_id.as_deref(),
+                crew.conversation_id.as_deref(),
+                crew.claude_uuid.as_deref(),
+            ) {
+                merge_history_association(
+                    &mut associations,
+                    crate::history::HistoryAssociation {
+                        harness,
+                        conversation_id,
+                        terminal_id: Some(crew.terminal_id.clone()),
+                        liveness,
+                        project_id: captain.project_id.clone(),
+                        project_name: captain
+                            .project_id
+                            .as_deref()
+                            .and_then(|id| project_names.get(id).copied())
+                            .map(str::to_string),
+                        captain_id: Some(captain.ship_slug.clone()),
+                        assignment_id: Some(captain.assignment_id.clone()),
+                        role: Some("crew".to_string()),
+                        workspace_id: None,
+                        worktree_id: None,
+                        branch: crew.branch.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    // Durable agent-session records outlive legacy Crew membership removal.
+    // Joining them keeps a closed conversation associated with its Project,
+    // Captain, Workspace, and worktree so an authorized History resume remains
+    // possible after the terminal has been reaped.
+    for agent in &snapshot.agent_sessions {
+        let Some(conversation_id) = agent
+            .provider_conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+        else {
+            continue;
+        };
+        let Some(harness) = history_harness(Some(&agent.provider), Some(&agent.harness), None)
+        else {
+            continue;
+        };
+        let exact_captain = snapshot.captains.iter().find(|captain| {
+            captain.terminal_id.as_deref() == Some(agent.captain_session_id.as_str())
+                && captain.project_id.as_deref() == Some(agent.project_id.as_str())
+        });
+        let project_captains = snapshot
+            .captains
+            .iter()
+            .filter(|captain| captain.project_id.as_deref() == Some(agent.project_id.as_str()))
+            .collect::<Vec<_>>();
+        let captain =
+            exact_captain.or_else(|| (project_captains.len() == 1).then_some(project_captains[0]));
+        let expected_active = !matches!(
+            agent.runtime_state,
+            crate::agent_session::RuntimeState::Exited
+                | crate::agent_session::RuntimeState::Unavailable
+        );
+        associations.retain(|association| {
+            !(association.harness == harness
+                && association.conversation_id == conversation_id
+                && association.terminal_id.as_deref() == Some(agent.agent_session_id.as_str()))
+        });
+        merge_history_association(
+            &mut associations,
+            crate::history::HistoryAssociation {
+                harness,
+                conversation_id: conversation_id.to_string(),
+                terminal_id: Some(agent.agent_session_id.clone()),
+                liveness: history_registry_liveness(
+                    expected_active,
+                    Some(&agent.agent_session_id),
+                    &live_sessions,
+                ),
+                project_id: Some(agent.project_id.clone()),
+                project_name: project_names
+                    .get(agent.project_id.as_str())
+                    .copied()
+                    .map(str::to_string),
+                captain_id: captain.map(|captain| captain.ship_slug.clone()),
+                assignment_id: captain.map(|captain| captain.assignment_id.clone()),
+                role: Some("crew".to_string()),
+                workspace_id: agent.workspace_tab_id.clone(),
+                // A filesystem path is useful context but is not an authoritative
+                // durable worktree identity. Preserve branch/workspace metadata and
+                // leave this field unset until the registry carries a real ID.
+                worktree_id: None,
+                branch: agent.branch.clone(),
+            },
+        );
+    }
+
+    let resume_operations = ctx.history.resume_operations();
+    for binding in ctx.history.bindings() {
+        let operation = resume_operations
+            .iter()
+            .filter(|operation| {
+                operation.history_id == binding.history_id
+                    && operation.harness == binding.harness
+                    && operation.conversation_id == binding.conversation_id
+                    && operation.terminal_id == binding.terminal_id
+            })
+            .max_by_key(|operation| operation.recorded_at_ms);
+        // The latest durable resume binding is authoritative for this conversation.
+        // It supersedes inactive registry records from the pre-resume terminal.
+        associations.retain(|association| {
+            !(association.harness == binding.harness
+                && association.conversation_id == binding.conversation_id)
+        });
+        associations.push(crate::history::HistoryAssociation {
+            harness: binding.harness,
+            conversation_id: binding.conversation_id,
+            terminal_id: Some(binding.terminal_id.clone()),
+            liveness: match tmux::session_liveness(&tmux_target(&binding.terminal_id)) {
+                // A live pane or matching process name is not exact conversation
+                // proof. The runtime scan below performs the only Active promotion.
+                tmux::SessionLiveness::Alive => crate::history::AssociationLiveness::Unknown,
+                tmux::SessionLiveness::Gone => crate::history::AssociationLiveness::Inactive,
+                tmux::SessionLiveness::Unknown => crate::history::AssociationLiveness::Unknown,
+            },
+            project_id: operation.and_then(|operation| operation.authorized_project_id.clone()),
+            project_name: operation
+                .and_then(|operation| operation.authorized_project_id.as_deref())
+                .and_then(|project_id| project_names.get(project_id).copied())
+                .map(str::to_string),
+            captain_id: operation.and_then(|operation| operation.authorized_ship_slug.clone()),
+            assignment_id: operation
+                .and_then(|operation| operation.authorized_assignment_id.clone()),
+            role: operation
+                .and_then(|operation| operation.authorized_ship_slug.as_ref())
+                .map(|_| "resumed".to_string()),
+            workspace_id: operation.and_then(|operation| operation.actual_tab_id.clone()),
+            worktree_id: None,
+            branch: None,
+        });
+    }
+
+    let claude_panes = tmux::pane_info();
+    let mut claude_runtime_uncertain = live_sessions_uncertain || claude_panes.is_err();
+    let mut runtime = Vec::<(crate::history::Harness, String, String)>::new();
+    if let (Ok(live), Ok(panes)) = (&live_sessions, &claude_panes) {
+        for status in ctx.status.all() {
+            let Some(tmux_session) = status.tmux_session.as_deref() else {
+                continue;
+            };
+            if live.contains(tmux_session) {
+                match panes.iter().find(|pane| pane.session == tmux_session) {
+                    Some(pane) if pane.command.eq_ignore_ascii_case("claude") => runtime.push((
+                        crate::history::Harness::Claude,
+                        status.session_id,
+                        tmux_session
+                            .strip_prefix("th_")
+                            .unwrap_or(tmux_session)
+                            .to_string(),
+                    )),
+                    Some(pane)
+                        if matches!(
+                            pane.command.trim().to_ascii_lowercase().as_str(),
+                            "bash" | "cmd" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh"
+                        ) => {}
+                    Some(_) | None => claude_runtime_uncertain = true,
+                }
+            }
+        }
+    }
+    let codex_rollouts = tmux::active_codex_rollouts();
+    let mut codex_runtime_uncertain = codex_rollouts.is_err();
+    if let Ok(rollouts) = &codex_rollouts {
+        codex_runtime_uncertain |= rollouts.len() > crate::history::HISTORY_ENTRY_LIMIT;
+        for rollout in rollouts.iter().take(crate::history::HISTORY_ENTRY_LIMIT) {
+            match crate::history::codex_conversation_id_from_path(std::path::Path::new(
+                &rollout.path,
+            )) {
+                Ok(conversation_id) => runtime.push((
+                    crate::history::Harness::Codex,
+                    conversation_id,
+                    rollout.terminal_id.clone(),
+                )),
+                Err(_) => codex_runtime_uncertain = true,
+            }
+        }
+    }
+    runtime.sort();
+    runtime.dedup();
+    for (harness, conversation_id, terminal_id) in runtime {
+        if let Some(existing) = associations.iter_mut().find(|association| {
+            association.harness == harness
+                && association.conversation_id == conversation_id
+                && association.terminal_id.as_deref() == Some(terminal_id.as_str())
+        }) {
+            existing.liveness = crate::history::AssociationLiveness::Active;
+            continue;
+        }
+        associations.push(crate::history::HistoryAssociation {
+            harness,
+            conversation_id,
+            terminal_id: Some(terminal_id),
+            liveness: crate::history::AssociationLiveness::Active,
+            project_id: None,
+            project_name: None,
+            captain_id: None,
+            assignment_id: None,
+            role: None,
+            workspace_id: None,
+            worktree_id: None,
+            branch: None,
+        });
+    }
+    associations.sort_by(|left, right| {
+        left.harness
+            .cmp(&right.harness)
+            .then_with(|| left.conversation_id.cmp(&right.conversation_id))
+            .then_with(|| left.terminal_id.cmp(&right.terminal_id))
+    });
+    associations.dedup();
+    HistoryAssociationEvidence {
+        associations,
+        claude_runtime_uncertain,
+        codex_runtime_uncertain: live_sessions_uncertain || codex_runtime_uncertain,
+    }
+}
+
+fn exact_history_runtime_liveness(
+    ctx: &ControlContext,
+    harness: crate::history::Harness,
+    conversation_id: &str,
+    terminal_id: &str,
+) -> crate::history::AssociationLiveness {
+    let evidence = history_associations(ctx);
+    if evidence.associations.iter().any(|association| {
+        association.harness == harness
+            && association.conversation_id == conversation_id
+            && association.terminal_id.as_deref() == Some(terminal_id)
+            && association.liveness == crate::history::AssociationLiveness::Active
+    }) {
+        return crate::history::AssociationLiveness::Active;
+    }
+    if evidence.associations.iter().any(|association| {
+        association.terminal_id.as_deref() == Some(terminal_id)
+            && association.liveness == crate::history::AssociationLiveness::Active
+            && (association.harness != harness || association.conversation_id != conversation_id)
+    }) {
+        return crate::history::AssociationLiveness::Inactive;
+    }
+    match tmux::session_liveness(&tmux_target(terminal_id)) {
+        tmux::SessionLiveness::Gone => return crate::history::AssociationLiveness::Inactive,
+        tmux::SessionLiveness::Unknown => return crate::history::AssociationLiveness::Unknown,
+        tmux::SessionLiveness::Alive => {}
+    }
+    if tmux::harness_liveness(&tmux_target(terminal_id), harness.canonical())
+        == tmux::SessionLiveness::Gone
+    {
+        return crate::history::AssociationLiveness::Inactive;
+    }
+    // Even with a healthy scan, a just-started Harness may not have published its
+    // exact conversation identity yet. Only exact evidence above may say Active.
+    crate::history::AssociationLiveness::Unknown
+}
+
+fn history_entry(
+    ctx: &ControlContext,
+    args: &Value,
+) -> Result<
+    (
+        crate::history::HistoryEntry,
+        Vec<crate::history::HistoryAssociation>,
+    ),
+    String,
+> {
+    let history_id = arg_str(args, "historyId")
+        .or_else(|| arg_str(args, "history_id"))
+        .ok_or("history_invalid_request: historyId is required")?;
+    let evidence = history_associations(ctx);
+    let mut entry = ctx
+        .history
+        .find(&history_id, &evidence.associations)?
+        .ok_or_else(|| "history_missing: History conversation was not found".to_string())?;
+    let runtime_uncertain = match entry.harness {
+        crate::history::Harness::Claude => evidence.claude_runtime_uncertain,
+        crate::history::Harness::Codex => evidence.codex_runtime_uncertain,
+    };
+    if entry.continuity_state == crate::history::ContinuityState::Resumable
+        && (runtime_uncertain || ctx.history.durable_state_error().is_some())
+    {
+        crate::history::mark_entry_recovery_required(
+            &mut entry,
+            "Active-runtime or durable resume evidence is unavailable.",
+        );
+    }
+    Ok((entry, evidence.associations))
+}
+
+fn exact_active_history_terminal(
+    entry: &crate::history::HistoryEntry,
+    associations: &[crate::history::HistoryAssociation],
+) -> Result<String, String> {
+    let terminals = associations
+        .iter()
+        .filter(|association| {
+            association.harness == entry.harness
+                && association.conversation_id == entry.conversation_id
+                && association.liveness == crate::history::AssociationLiveness::Active
+        })
+        .filter_map(|association| association.terminal_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if terminals.len() != 1 {
+        return Err(
+            "history_unavailable: conversation has no unique authoritative live terminal"
+                .to_string(),
+        );
+    }
+    let terminal_id = terminals.into_iter().next().expect("checked one terminal");
+    if tmux::harness_liveness(&tmux_target(&terminal_id), entry.harness.canonical())
+        != tmux::SessionLiveness::Alive
+    {
+        return Err(
+            "history_unavailable: the expected Harness is no longer verifiably active in the conversation terminal"
+                .to_string(),
+        );
+    }
+    Ok(terminal_id)
+}
+
+/// Focus an exact active History identity. The frontend cannot nominate a tile.
+fn history_focus(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "history_focus")?;
+    let (entry, associations) = history_entry(ctx, args)?;
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "history_focus")?;
+    enforce_history_entry_owner(&authority, &entry, &associations)?;
+    if entry.continuity_state != crate::history::ContinuityState::Active
+        || entry.actions.focus.status != crate::history::ActionStatus::Supported
+    {
+        return Err("history_unavailable: conversation is not active".to_string());
+    }
+    let terminal_id = exact_active_history_terminal(&entry, &associations)?;
+    enforce_session_access(ctx, caller, trusted_internal, &terminal_id)?;
+    let applied = organization_apply(ctx, "focus_session", &json!({ "sessionId": terminal_id }))?;
+    let applied = applied
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !applied {
+        return Err(
+            "history_unavailable: the active conversation has no connected UI tile to focus".into(),
+        );
+    }
+    Ok(json!({
+        "accepted": "history_focus",
+        "historyId": entry.history_id,
+        "terminalId": terminal_id,
+        "status": "focused",
+        "applied": true,
+    }))
+}
+
+fn history_request_id(args: &Value) -> Result<String, String> {
+    let request_id = arg_str(args, "requestId")
+        .or_else(|| arg_str(args, "request_id"))
+        .ok_or("history_invalid_request: requestId is required")?;
+    let valid = !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'));
+    if !valid {
+        return Err(
+            "history_invalid_request: requestId must be 1-128 ASCII identifier characters"
+                .to_string(),
+        );
+    }
+    Ok(request_id)
+}
+
+fn history_resume_command(entry: &crate::history::HistoryEntry) -> String {
+    let harness = match entry.harness {
+        crate::history::Harness::Claude => Harness::Claude,
+        crate::history::Harness::Codex => Harness::Codex,
+    };
+    harness.adapter().resume_argv(&entry.conversation_id)
+}
+
+fn history_resume_owner(
+    authority: &WorkspaceMutationAuthority,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match authority {
+        WorkspaceMutationAuthority::Apex => (None, None, None),
+        WorkspaceMutationAuthority::Assignment(owner) => (
+            Some(owner.ship_slug.clone()),
+            Some(owner.project_id.clone()),
+            Some(owner.assignment_id.clone()),
+        ),
+    }
+}
+
+fn enforce_history_resume_owner(
+    authority: &WorkspaceMutationAuthority,
+    ship_slug: Option<&str>,
+    project_id: Option<&str>,
+    assignment_id: Option<&str>,
+) -> Result<(), String> {
+    let WorkspaceMutationAuthority::Assignment(owner) = authority else {
+        return Ok(());
+    };
+    if ship_slug == Some(owner.ship_slug.as_str())
+        && project_id == Some(owner.project_id.as_str())
+        && assignment_id == Some(owner.assignment_id.as_str())
+    {
+        Ok(())
+    } else {
+        Err(
+            "acl: history_resume durable operation does not belong to the caller's current Project Assignment"
+                .into(),
+        )
+    }
+}
+
+fn enforce_history_entry_owner(
+    authority: &WorkspaceMutationAuthority,
+    entry: &crate::history::HistoryEntry,
+    associations: &[crate::history::HistoryAssociation],
+) -> Result<(), String> {
+    let WorkspaceMutationAuthority::Assignment(owner) = authority else {
+        return Ok(());
+    };
+    if associations.iter().any(|association| {
+        association.harness == entry.harness
+            && association.conversation_id == entry.conversation_id
+            && association.captain_id.as_deref() == Some(owner.ship_slug.as_str())
+            && association.project_id.as_deref() == Some(owner.project_id.as_str())
+            && association.assignment_id.as_deref() == Some(owner.assignment_id.as_str())
+    }) {
+        Ok(())
+    } else {
+        Err(
+            "acl: History conversation does not belong to the caller's current Project Assignment"
+                .into(),
+        )
+    }
+}
+
+fn authorize_history_request_status(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    ship_slug: Option<&str>,
+    project_id: Option<&str>,
+    assignment_id: Option<&str>,
+) -> Result<(), String> {
+    let authority =
+        workspace_mutation_authority(ctx, caller, trusted_internal, "get_request_status")?;
+    enforce_history_resume_owner(&authority, ship_slug, project_id, assignment_id)
+}
+
+fn validate_history_resume_target(
+    ctx: &ControlContext,
+    authority: &WorkspaceMutationAuthority,
+    target_tab: Option<&str>,
+) -> Result<(), String> {
+    if let Some(tab_id) = target_tab {
+        if !ctx.tabs.has_tab(tab_id) {
+            return Err(format!(
+                "history_invalid_request: unknown targetTabId '{tab_id}'"
+            ));
+        }
+        enforce_workspace_owner(ctx, authority, tab_id, "history_resume")
+    } else if matches!(authority, WorkspaceMutationAuthority::Assignment(_)) {
+        Err("history_invalid_request: a Captain must select an owned targetTabId".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn mint_history_terminal_id(ctx: &ControlContext) -> Result<String, String> {
+    for _ in 0..16 {
+        let candidate = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        if ctx.tabs.workspace_for_tile(&candidate).is_some() {
+            continue;
+        }
+        match tmux::session_liveness(&tmux_target(&candidate)) {
+            tmux::SessionLiveness::Gone => return Ok(candidate),
+            tmux::SessionLiveness::Alive => continue,
+            tmux::SessionLiveness::Unknown => {
+                return Err(retryable_error(
+                    "history_recovery_required: terminal identity availability is unknown",
+                ));
+            }
+        }
+    }
+    Err("history_capacity: could not allocate a unique terminal identity".into())
+}
+
+fn finish_history_resume(
+    ctx: &ControlContext,
+    pending: &crate::history::HistoryPendingResume,
+    actual_tab_id: Option<String>,
+    replayed: bool,
+) -> Result<Value, String> {
+    let binding = crate::history::HistoryBinding {
+        history_id: pending.history_id.clone(),
+        harness: pending.harness,
+        conversation_id: pending.conversation_id.clone(),
+        terminal_id: pending.terminal_id.clone(),
+    };
+    let operation = crate::history::HistoryResumeOperation {
+        request_id: pending.request_id.clone(),
+        history_id: pending.history_id.clone(),
+        harness: pending.harness,
+        conversation_id: pending.conversation_id.clone(),
+        terminal_id: pending.terminal_id.clone(),
+        target_tab_id: pending.target_tab_id.clone(),
+        actual_tab_id: actual_tab_id.clone(),
+        authorized_ship_slug: pending.authorized_ship_slug.clone(),
+        authorized_project_id: pending.authorized_project_id.clone(),
+        authorized_assignment_id: pending.authorized_assignment_id.clone(),
+        recorded_at_ms: now_ms(),
+    };
+    ctx.history.record_resume(binding, operation)?;
+    notify_history_changed(ctx, "conversation-resumed");
+    Ok(json!({
+        "accepted": "history_resume",
+        "requestId": pending.request_id,
+        "historyId": pending.history_id,
+        "harness": pending.harness,
+        "conversationId": pending.conversation_id,
+        "terminalId": pending.terminal_id,
+        "tabId": actual_tab_id,
+        "status": "active",
+        "replayed": replayed,
+    }))
+}
+
+const HISTORY_PENDING_RUNTIME_PROOF_GRACE_MS: u64 = 120_000;
+
+fn history_pending_runtime_proof_expired(pending: &crate::history::HistoryPendingResume) -> bool {
+    now_ms().saturating_sub(pending.reserved_at_ms) >= HISTORY_PENDING_RUNTIME_PROOF_GRACE_MS
+}
+
+fn reap_history_pending_terminal(
+    ctx: &ControlContext,
+    pending: &crate::history::HistoryPendingResume,
+) -> Result<(), String> {
+    if tmux::session_liveness(&tmux_target(&pending.terminal_id)) == tmux::SessionLiveness::Gone {
+        return Ok(());
+    }
+    let close_error = close_terminal(ctx, &json!({ "sessionId": pending.terminal_id })).err();
+    match tmux::session_liveness(&tmux_target(&pending.terminal_id)) {
+        tmux::SessionLiveness::Gone => Ok(()),
+        tmux::SessionLiveness::Alive | tmux::SessionLiveness::Unknown => {
+            Err(retryable_error(format!(
+                "history_recovery_required: could not reap the unproven reserved terminal{}",
+                close_error
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            )))
+        }
+    }
+}
+
+/// Resume one exact provider conversation. The backend owns cwd, Harness, native
+/// identity, and executable command; callers provide only the opaque History ID,
+/// stable request ID, and optional destination tab.
+fn history_resume(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "history_resume")?;
+    let request_id = history_request_id(args)?;
+    let history_id = arg_str(args, "historyId")
+        .or_else(|| arg_str(args, "history_id"))
+        .ok_or("history_invalid_request: historyId is required")?;
+    let target_tab = arg_str(args, "targetTabId")
+        .or_else(|| arg_str(args, "target_tab_id"))
+        .or_else(|| arg_str(args, "tabId"));
+    let authority = workspace_mutation_authority(ctx, caller, trusted_internal, "history_resume")?;
+
+    if let Some(operation) = ctx.history.resume_operation(&request_id)? {
+        let target_matches = operation.target_tab_id == target_tab
+            || (operation
+                .target_tab_id
+                .as_deref()
+                .is_some_and(|tab_id| !ctx.tabs.has_tab(tab_id))
+                && operation
+                    .actual_tab_id
+                    .as_deref()
+                    .is_some_and(|tab_id| ctx.tabs.has_tab(tab_id)));
+        if operation.history_id != history_id || !target_matches {
+            return Err(
+                "request_conflict: requestId is already bound to a different History resume".into(),
+            );
+        }
+        enforce_history_resume_owner(
+            &authority,
+            operation.authorized_ship_slug.as_deref(),
+            operation.authorized_project_id.as_deref(),
+            operation.authorized_assignment_id.as_deref(),
+        )?;
+        return match exact_history_runtime_liveness(
+            ctx,
+            operation.harness,
+            &operation.conversation_id,
+            &operation.terminal_id,
+        ) {
+            crate::history::AssociationLiveness::Active => Ok(json!({
+                "accepted": "history_resume",
+                "requestId": request_id,
+                "historyId": operation.history_id,
+                "harness": operation.harness,
+                "conversationId": operation.conversation_id,
+                "terminalId": operation.terminal_id,
+                "tabId": operation.actual_tab_id,
+                "status": "active",
+                "replayed": true,
+            })),
+            crate::history::AssociationLiveness::Inactive => Err(
+                "history_previous_resume_closed: this request already completed and its terminal is closed or replaced; start a new resume request"
+                    .into(),
+            ),
+            crate::history::AssociationLiveness::Unknown => Err(retryable_error(
+                "history_recovery_required: previous resume terminal liveness is unavailable",
+            )),
+        };
+    }
+
+    if let Some(pending) = ctx.history.pending_resume(&request_id)? {
+        let reserved_target_missing = pending
+            .target_tab_id
+            .as_deref()
+            .is_some_and(|tab_id| !ctx.tabs.has_tab(tab_id));
+        if pending.history_id != history_id
+            || (pending.target_tab_id != target_tab && !reserved_target_missing)
+        {
+            return Err(
+                "request_conflict: requestId is already bound to a different History resume".into(),
+            );
+        }
+        enforce_history_resume_owner(
+            &authority,
+            pending.authorized_ship_slug.as_deref(),
+            pending.authorized_project_id.as_deref(),
+            pending.authorized_assignment_id.as_deref(),
+        )?;
+        if reserved_target_missing {
+            let actual_tab_id = ctx.tabs.workspace_for_tile(&pending.terminal_id);
+            let runtime = exact_history_runtime_liveness(
+                ctx,
+                pending.harness,
+                &pending.conversation_id,
+                &pending.terminal_id,
+            );
+            if runtime == crate::history::AssociationLiveness::Active {
+                if let Some(actual_tab_id) = actual_tab_id.as_deref() {
+                    if enforce_workspace_owner(ctx, &authority, actual_tab_id, "history_resume")
+                        .is_ok()
+                    {
+                        return finish_history_resume(
+                            ctx,
+                            &pending,
+                            Some(actual_tab_id.to_string()),
+                            true,
+                        )
+                        .map_err(retryable_error);
+                    }
+                }
+            }
+            if runtime == crate::history::AssociationLiveness::Unknown
+                && !history_pending_runtime_proof_expired(&pending)
+            {
+                return Err(retryable_error(
+                    "history_recovery_required: the reserved target Workspace closed before exact runtime identity was available",
+                ));
+            }
+            reap_history_pending_terminal(ctx, &pending)?;
+            return match ctx.history.cancel_resume_reservation(&pending) {
+                Ok(()) => Err(
+                    "history_invalid_request: the reserved target Workspace was closed; start a new request with an existing targetTabId"
+                        .into(),
+                ),
+                Err(error) => Err(retryable_error(error)),
+            };
+        }
+        validate_history_resume_target(ctx, &authority, target_tab.as_deref())?;
+        match exact_history_runtime_liveness(
+            ctx,
+            pending.harness,
+            &pending.conversation_id,
+            &pending.terminal_id,
+        ) {
+            crate::history::AssociationLiveness::Unknown
+                if !history_pending_runtime_proof_expired(&pending) =>
+            {
+                return Err(retryable_error(
+                    "history_recovery_required: reserved terminal exact runtime identity is not available yet",
+                ));
+            }
+            crate::history::AssociationLiveness::Active => {
+                let actual_tab_id =
+                    ctx.tabs
+                        .workspace_for_tile(&pending.terminal_id)
+                        .or_else(|| match pending.target_tab_id.as_deref() {
+                            Some(tab_id) => {
+                                ctx.tabs.place_tile_exact(&pending.terminal_id, tab_id).ok()
+                            }
+                            None => ctx
+                                .tabs
+                                .place_tile_with_fallback(&pending.terminal_id, None),
+                        });
+                let Some(actual_tab_id) = actual_tab_id else {
+                    if !history_pending_runtime_proof_expired(&pending) {
+                        return Err(retryable_error(
+                            "history_recovery_required: resumed terminal has no recoverable Workspace placement",
+                        ));
+                    }
+                    reap_history_pending_terminal(ctx, &pending)?;
+                    return match ctx.history.cancel_resume_reservation(&pending) {
+                        Ok(()) => Err(
+                            "history_placement_unavailable: the resumed terminal could not be placed; start a new request"
+                                .into(),
+                        ),
+                        Err(error) => Err(retryable_error(error)),
+                    };
+                };
+                enforce_workspace_owner(ctx, &authority, &actual_tab_id, "history_resume")?;
+                return finish_history_resume(ctx, &pending, Some(actual_tab_id), true)
+                    .map_err(retryable_error);
+            }
+            crate::history::AssociationLiveness::Unknown => {
+                reap_history_pending_terminal(ctx, &pending)?;
+                return match ctx.history.cancel_resume_reservation(&pending) {
+                    Ok(()) => Err(
+                        "history_runtime_unproven: the reserved terminal never produced exact conversation evidence; start a new request"
+                            .into(),
+                    ),
+                    Err(error) => Err(retryable_error(error)),
+                };
+            }
+            crate::history::AssociationLiveness::Inactive => {
+                // A fallback shell, closed pane, or replaced conversation cannot
+                // satisfy this reservation. Reap it, then reuse the same durable
+                // request and exact terminal identity for one clean relaunch below.
+                reap_history_pending_terminal(ctx, &pending)?;
+                if tmux::session_liveness(&tmux_target(&pending.terminal_id))
+                    != tmux::SessionLiveness::Gone
+                {
+                    return Err(retryable_error(
+                        "history_recovery_required: stale reserved terminal is not yet gone",
+                    ));
+                }
+            }
+        }
+    }
+    validate_history_resume_target(ctx, &authority, target_tab.as_deref())?;
+    let (entry, associations) = history_entry(ctx, args)?;
+    enforce_history_entry_owner(&authority, &entry, &associations)?;
+
+    if entry.continuity_state != crate::history::ContinuityState::Resumable
+        || entry.actions.resume.status != crate::history::ActionStatus::Supported
+    {
+        return Err("history_unavailable: conversation is not resumable".to_string());
+    }
+    let pending = match ctx.history.pending_resume(&request_id)? {
+        Some(pending) => {
+            if pending.history_id != entry.history_id
+                || pending.harness != entry.harness
+                || pending.conversation_id != entry.conversation_id
+            {
+                return Err(
+                    "request_conflict: durable reservation does not match current History identity"
+                        .into(),
+                );
+            }
+            pending
+        }
+        None => {
+            let (authorized_ship_slug, authorized_project_id, authorized_assignment_id) =
+                history_resume_owner(&authority);
+            let pending = crate::history::HistoryPendingResume {
+                request_id: request_id.clone(),
+                history_id: entry.history_id.clone(),
+                harness: entry.harness,
+                conversation_id: entry.conversation_id.clone(),
+                terminal_id: mint_history_terminal_id(ctx)?,
+                target_tab_id: target_tab.clone(),
+                authorized_ship_slug,
+                authorized_project_id,
+                authorized_assignment_id,
+                reserved_at_ms: now_ms(),
+            };
+            if let Err(error) = ctx.history.reserve_resume(pending.clone()) {
+                return Err(if error.starts_with("history_resume_in_flight:") {
+                    retryable_error(error)
+                } else {
+                    error
+                });
+            }
+            pending
+        }
+    };
+    let mut spawn_args = json!({
+        "cwd": entry.cwd.clone(),
+        "startupCommand": history_resume_command(&entry),
+    });
+    if let Some(tab_id) = target_tab.as_deref() {
+        spawn_args["tabId"] = json!(tab_id);
+    }
+    let spawned = match spawn_terminal_with_private_pane_command_and_id(
+        ctx,
+        &spawn_args,
+        None,
+        false,
+        target_tab.is_some(),
+        true,
+        Some(&pending.terminal_id),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            return match tmux::session_liveness(&tmux_target(&pending.terminal_id)) {
+                tmux::SessionLiveness::Gone => {
+                    match ctx.history.cancel_resume_reservation(&pending) {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(retryable_error(format!(
+                            "{error}; durable reservation cleanup also failed: {cleanup}"
+                        ))),
+                    }
+                }
+                tmux::SessionLiveness::Alive | tmux::SessionLiveness::Unknown => Err(
+                    retryable_error(format!(
+                        "history_recovery_required: spawn outcome is ambiguous and remains durably reserved: {error}"
+                    )),
+                ),
+            };
+        }
+    };
+    let terminal_id = spawned
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("history_resume_failed: spawn returned no terminal identity")?
+        .to_string();
+    let actual_tab_id = spawned
+        .get("tabId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if terminal_id != pending.terminal_id {
+        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        return Err(retryable_error(
+            "history_recovery_required: spawn returned a terminal other than its durable reservation",
+        ));
+    }
+    if actual_tab_id.is_none() {
+        let rollback = close_terminal(ctx, &json!({ "sessionId": terminal_id.clone() }));
+        let message = format!(
+            "history_resume_failed: spawned terminal has no Workspace placement{}",
+            rollback
+                .err()
+                .map(|rollback| format!("; spawned terminal rollback also failed: {rollback}"))
+                .unwrap_or_default()
+        );
+        return match tmux::session_liveness(&tmux_target(&terminal_id)) {
+            tmux::SessionLiveness::Gone => match ctx.history.cancel_resume_reservation(&pending) {
+                Ok(()) => Err(message),
+                Err(cleanup) => Err(retryable_error(format!(
+                    "{message}; durable reservation cleanup also failed: {cleanup}"
+                ))),
+            },
+            tmux::SessionLiveness::Alive | tmux::SessionLiveness::Unknown => {
+                Err(retryable_error(message))
+            }
+        };
+    }
+    if let Err(error) = finish_history_resume(ctx, &pending, actual_tab_id.clone(), false) {
+        let rollback = close_terminal(ctx, &json!({ "sessionId": terminal_id.clone() }));
+        let message = format!(
+            "{error}{}",
+            rollback
+                .err()
+                .map(|rollback| format!("; spawned terminal rollback also failed: {rollback}"))
+                .unwrap_or_default(),
+        );
+        return match tmux::session_liveness(&tmux_target(&terminal_id)) {
+            tmux::SessionLiveness::Gone => match ctx.history.cancel_resume_reservation(&pending) {
+                Ok(()) => Err(message),
+                Err(cleanup) => Err(retryable_error(format!(
+                    "{message}; durable reservation cleanup also failed: {cleanup}"
+                ))),
+            },
+            tmux::SessionLiveness::Alive | tmux::SessionLiveness::Unknown => {
+                Err(retryable_error(message))
+            }
+        };
+    }
+    Ok(json!({
+        "accepted": "history_resume",
+        "requestId": request_id,
+        "historyId": entry.history_id,
+        "harness": entry.harness,
+        "conversationId": entry.conversation_id,
+        "terminalId": terminal_id,
+        "tabId": actual_tab_id,
+        "status": "active",
+        "replayed": false,
+    }))
 }
 
 /// `archive_recent_project`: the Recent list's × made durable. Moves the project
@@ -14385,7 +15830,11 @@ fn reconcile_cortana_inner(
                 PermMode::Default,
             )
         },
-        |provider_session_id| harness.adapter().resume_argv(provider_session_id),
+        |provider_session_id| {
+            harness
+                .adapter()
+                .resume_argv_with_permissions(provider_session_id, PermMode::Default)
+        },
     );
     #[cfg(test)]
     let startup_command =
@@ -14676,6 +16125,9 @@ fn commission_captain(
         );
     }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    #[cfg(test)]
+    let terminal_id = arg_str(args, "testTerminalId").unwrap_or_else(|| suffix[..8].to_string());
+    #[cfg(not(test))]
     let terminal_id = suffix[..8].to_string();
     let operation = ctx.captains.prepare_commission_operation(
         &terminal_id,
@@ -20149,6 +21601,606 @@ fn list_admin_grants(
     }))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum AdminExecutionTargetInput {
+    Fleet,
+    Ship {
+        #[serde(rename = "shipSlug")]
+        ship_slug: String,
+    },
+    Session {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    Worktree {
+        path: String,
+    },
+    GeneralReserved {
+        action: String,
+    },
+    Implementation {
+        #[serde(rename = "shipSlug")]
+        ship_slug: String,
+        #[serde(rename = "assignmentId")]
+        assignment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminExecutionResource {
+    Fleet,
+    Ship(String),
+    Session(String),
+    Worktree(String),
+    Forbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAdminExecutionTarget {
+    authorization_target: crate::delegated_admin::AdminTarget,
+    resource: AdminExecutionResource,
+}
+
+fn exact_active_captain_for_ship(
+    ctx: &ControlContext,
+    ship_slug: &str,
+) -> Result<CaptainRecord, String> {
+    if ship_slug.trim().is_empty() {
+        return Err("execute_admin_operation shipSlug must not be empty".into());
+    }
+    let matching = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .filter(|captain| {
+            captain.role == FleetRole::Captain
+                && captain.state == ClaimState::Active
+                && captain.ship_slug == ship_slug
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [captain] => Ok(captain.clone()),
+        [] => Err(format!(
+            "execute_admin_operation ship '{ship_slug}' has no active authoritative Captain"
+        )),
+        _ => Err(format!(
+            "execute_admin_operation ship '{ship_slug}' has ambiguous Captain ownership"
+        )),
+    }
+}
+
+fn resolve_admin_worktree_target(
+    ctx: &ControlContext,
+    requested_path: &str,
+) -> Result<ResolvedAdminExecutionTarget, String> {
+    let requested_path = files::posix_form(requested_path.trim());
+    if requested_path.is_empty() || !Path::new(&requested_path).is_absolute() {
+        return Err("execute_admin_operation worktree path must be absolute".into());
+    }
+    let snapshot = ctx.captains.snapshot();
+    let mut matches = Vec::new();
+    for project in &snapshot.projects {
+        let worktrees = git::worktree_list(&files::posix_form(&project.repo_root))?;
+        if let Some(worktree) = worktrees
+            .into_iter()
+            .find(|worktree| files::posix_form(&worktree.path) == requested_path)
+        {
+            for captain in snapshot.captains.iter().filter(|captain| {
+                captain.role == FleetRole::Captain
+                    && captain.state == ClaimState::Active
+                    && captain.project_id.as_deref() == Some(project.project_id.as_str())
+            }) {
+                matches.push((captain.ship_slug.clone(), worktree.path.clone()));
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [(ship_slug, path)] => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Worktree {
+                ship_slug: ship_slug.clone(),
+                worktree_id: files::posix_form(path),
+            },
+            resource: AdminExecutionResource::Worktree(files::posix_form(path)),
+        }),
+        [] => Err(format!(
+            "execute_admin_operation worktree '{requested_path}' has no active authoritative ship owner"
+        )),
+        _ => Err(format!(
+            "execute_admin_operation worktree '{requested_path}' has ambiguous ship ownership"
+        )),
+    }
+}
+
+fn resolve_admin_execution_target(
+    ctx: &ControlContext,
+    input: &AdminExecutionTargetInput,
+) -> Result<ResolvedAdminExecutionTarget, String> {
+    match input {
+        AdminExecutionTargetInput::Fleet => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Fleet,
+            resource: AdminExecutionResource::Fleet,
+        }),
+        AdminExecutionTargetInput::Ship { ship_slug } => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            Ok(ResolvedAdminExecutionTarget {
+                authorization_target: crate::delegated_admin::AdminTarget::Ship {
+                    ship_slug: captain.ship_slug.clone(),
+                },
+                resource: AdminExecutionResource::Ship(captain.ship_slug),
+            })
+        }
+        AdminExecutionTargetInput::Session { session_id } => {
+            let session_id = session_id.strip_prefix("th_").unwrap_or(session_id).trim();
+            if session_id.is_empty() {
+                return Err("execute_admin_operation sessionId must not be empty".into());
+            }
+            Ok(ResolvedAdminExecutionTarget {
+                authorization_target: delegated_admin_target_for_terminal(ctx, session_id)?,
+                resource: AdminExecutionResource::Session(session_id.to_string()),
+            })
+        }
+        AdminExecutionTargetInput::Worktree { path } => resolve_admin_worktree_target(ctx, path),
+        AdminExecutionTargetInput::GeneralReserved { action } => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::GeneralReserved {
+                action: action.clone(),
+            },
+            resource: AdminExecutionResource::Forbidden,
+        }),
+        AdminExecutionTargetInput::Implementation {
+            ship_slug,
+            assignment_id,
+        } => Ok(ResolvedAdminExecutionTarget {
+            authorization_target: crate::delegated_admin::AdminTarget::Implementation {
+                ship_slug: ship_slug.clone(),
+                assignment_id: assignment_id.clone(),
+            },
+            resource: AdminExecutionResource::Forbidden,
+        }),
+    }
+}
+
+fn revalidate_admin_execution_authority(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+) -> Result<(), String> {
+    let grant = ctx
+        .delegated_admin
+        .get(&audit.grant_id)
+        .filter(|grant| {
+            grant.state.is_active()
+                && grant.grant_generation == audit.grant_generation
+                && grant.actor_identity_id == audit.actor_identity_id
+        })
+        .ok_or("delegated admin: exact grant changed before administrative execution")?;
+    let supervisor = current_delegating_supervisor(ctx, &grant);
+    let actor = current_admin_actor(ctx, &grant);
+    ctx.delegated_admin
+        .authorize(
+            &crate::delegated_admin::AdminActor {
+                identity_id: audit.actor_identity_id.clone(),
+                session_tile: audit.actor_session_tile.clone(),
+                ..actor
+            },
+            &supervisor,
+            audit.operation,
+            &audit.target,
+            &crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{}: {error}", error.code()))
+}
+
+fn revalidate_admin_execution_target(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<(), String> {
+    let current = match &target.resource {
+        AdminExecutionResource::Fleet => crate::delegated_admin::AdminTarget::Fleet,
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            crate::delegated_admin::AdminTarget::Ship {
+                ship_slug: captain.ship_slug,
+            }
+        }
+        AdminExecutionResource::Session(session_id) => {
+            delegated_admin_target_for_terminal(ctx, session_id)?
+        }
+        AdminExecutionResource::Worktree(path) => {
+            resolve_admin_worktree_target(ctx, path)?.authorization_target
+        }
+        AdminExecutionResource::Forbidden => audit.target.clone(),
+    };
+    if current != audit.target {
+        return Err(
+            "delegated admin: exact target ownership changed before administrative execution"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn revalidate_admin_effect_session(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+    session_id: &str,
+) -> Result<(), String> {
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    let current_session = delegated_admin_target_for_terminal(ctx, session_id)?;
+    match (&audit.target, &current_session) {
+        (
+            crate::delegated_admin::AdminTarget::Fleet,
+            crate::delegated_admin::AdminTarget::Captain { .. },
+        ) => Ok(()),
+        (
+            crate::delegated_admin::AdminTarget::Ship { ship_slug },
+            crate::delegated_admin::AdminTarget::Captain {
+                ship_slug: current, ..
+            }
+            | crate::delegated_admin::AdminTarget::CrewSession {
+                ship_slug: current, ..
+            },
+        ) if ship_slug == current => Ok(()),
+        (expected, current) if expected == current => Ok(()),
+        _ => Err(
+            "delegated admin: administrative session target changed ownership before mutation"
+                .into(),
+        ),
+    }
+}
+
+fn session_liveness_label(liveness: tmux::SessionLiveness) -> &'static str {
+    match liveness {
+        tmux::SessionLiveness::Alive => "alive",
+        tmux::SessionLiveness::Gone => "gone",
+        tmux::SessionLiveness::Unknown => "unknown",
+    }
+}
+
+fn admin_session_ids_for_target(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Vec<String>, String> {
+    let snapshot = ctx.captains.snapshot();
+    let mut sessions = match &target.resource {
+        AdminExecutionResource::Session(session_id) => vec![session_id.clone()],
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            let mut sessions = captain.terminal_id.into_iter().collect::<Vec<_>>();
+            if audit.delegated_role == crate::delegated_admin::DelegatedAdminRole::ShipAdmin {
+                sessions.extend(
+                    captain
+                        .crew
+                        .into_iter()
+                        .filter(|crew| !matches!(crew.state, CrewState::Removed { .. }))
+                        .map(|crew| crew.terminal_id),
+                );
+            }
+            sessions
+        }
+        AdminExecutionResource::Fleet => snapshot
+            .captains
+            .into_iter()
+            .filter(|captain| {
+                captain.role == FleetRole::Captain && captain.state == ClaimState::Active
+            })
+            .filter_map(|captain| captain.terminal_id)
+            .collect(),
+        AdminExecutionResource::Worktree(_) | AdminExecutionResource::Forbidden => Vec::new(),
+    };
+    sessions.sort();
+    sessions.dedup();
+    Ok(sessions)
+}
+
+fn maintain_admin_sessions(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Value, String> {
+    let session_ids = admin_session_ids_for_target(ctx, audit, target)?;
+    if session_ids.is_empty() {
+        return Err("execute_admin_operation target has no authoritative session resources".into());
+    }
+    let mut maintained = Vec::new();
+    let mut recovery_plan = Vec::new();
+    for session_id in session_ids {
+        let tmux_session = tmux_target(&session_id);
+        let liveness = tmux::session_liveness(&tmux_session);
+        match liveness {
+            tmux::SessionLiveness::Alive => {
+                revalidate_admin_effect_session(ctx, audit, target, &session_id)?;
+                revalidate_admin_execution_authority(ctx, audit)?;
+                tmux::maintain_session(&tmux_session).map_err(|error| {
+                    format!("session '{session_id}' maintenance failed: {error}")
+                })?;
+                maintained.push(json!({
+                    "sessionId": session_id,
+                    "tmuxSession": tmux_session,
+                    "outcome": "maintained",
+                }));
+            }
+            tmux::SessionLiveness::Gone | tmux::SessionLiveness::Unknown => {
+                recovery_plan.push(json!({
+                    "sessionId": session_id,
+                    "tmuxSession": tmux_session,
+                    "observedLiveness": session_liveness_label(liveness),
+                    "requiredSupervisorDecision": "replaceOrRetireRuntime",
+                }));
+            }
+        }
+    }
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    Ok(json!({
+        "outcome": if recovery_plan.is_empty() { "maintained" } else { "recoveryPrepared" },
+        "maintainedSessions": maintained,
+        "recoveryPlan": recovery_plan,
+    }))
+}
+
+fn recover_admin_worktree(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    path: &str,
+) -> Result<Value, String> {
+    revalidate_admin_execution_target(
+        ctx,
+        audit,
+        &ResolvedAdminExecutionTarget {
+            authorization_target: audit.target.clone(),
+            resource: AdminExecutionResource::Worktree(path.to_string()),
+        },
+    )?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let info = git::git_info_cached(path);
+    if !info.is_repo || info.worktree_root.as_deref() != Some(path) {
+        return Err(format!(
+            "execute_admin_operation worktree '{path}' no longer resolves as the exact Git worktree"
+        ));
+    }
+    let recovery_required = info.head_commit.is_none();
+    Ok(json!({
+        "outcome": if recovery_required { "recoveryPrepared" } else { "resourceReconciled" },
+        "worktree": {
+            "path": path,
+            "branch": info.branch,
+            "headCommit": info.head_commit,
+            "dirtyCount": info.dirty_count,
+            "isLinkedWorktree": info.is_linked_worktree,
+        },
+        "recoveryPlan": recovery_required.then(|| json!({
+            "requiredSupervisorDecision": "selectAuthoritativeBaseline",
+            "preserveDirtyWork": info.dirty_count > 0,
+        })),
+    }))
+}
+
+fn retirement_plan_id(
+    audit: &crate::delegated_admin::AdminAuditContext,
+    blockers: &[Value],
+) -> String {
+    let canonical = serde_json::to_vec(&json!({
+        "grantId": audit.grant_id,
+        "grantGeneration": audit.grant_generation,
+        "target": audit.target,
+        "blockers": blockers,
+    }))
+    .expect("retirement plan inputs are serializable");
+    format!("sha256:{:x}", Sha256::digest(canonical))
+}
+
+fn prepare_admin_retirement(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    target: &ResolvedAdminExecutionTarget,
+) -> Result<Value, String> {
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let mut blockers = Vec::new();
+    match &target.resource {
+        AdminExecutionResource::Session(session_id) => {
+            let liveness = tmux::session_liveness(&tmux_target(session_id));
+            if !matches!(liveness, tmux::SessionLiveness::Gone) {
+                blockers.push(json!({
+                    "kind": "sessionNotStopped",
+                    "sessionId": session_id,
+                    "liveness": session_liveness_label(liveness),
+                }));
+            }
+            if let crate::delegated_admin::AdminTarget::Captain {
+                captain_identity_id,
+                ..
+            } = &audit.target
+            {
+                let dependent_grants = ctx
+                    .delegated_admin
+                    .grants_delegated_by(captain_identity_id)
+                    .into_iter()
+                    .filter(|grant| grant.state.is_active())
+                    .count();
+                if dependent_grants > 0 {
+                    blockers.push(json!({
+                        "kind": "activeDependentGrants",
+                        "count": dependent_grants,
+                    }));
+                }
+            }
+        }
+        AdminExecutionResource::Ship(ship_slug) => {
+            let captain = exact_active_captain_for_ship(ctx, ship_slug)?;
+            if let Some(session_id) = &captain.terminal_id {
+                blockers.push(json!({
+                    "kind": "activeCaptain",
+                    "sessionId": session_id,
+                }));
+            }
+            let active_crew = captain
+                .crew
+                .iter()
+                .filter(|crew| !matches!(crew.state, CrewState::Removed { .. }))
+                .count();
+            if active_crew > 0 {
+                blockers.push(json!({
+                    "kind": "activeCrew",
+                    "count": active_crew,
+                }));
+            }
+            let active_grants = ctx
+                .delegated_admin
+                .active_grants()
+                .into_iter()
+                .filter(|grant| {
+                    matches!(
+                        &grant.scope,
+                        crate::delegated_admin::AdminScope::Ship { ship_slug: scope }
+                            if scope == ship_slug
+                    )
+                })
+                .count();
+            if active_grants > 0 {
+                blockers.push(json!({
+                    "kind": "activeAdministrativeGrants",
+                    "count": active_grants,
+                }));
+            }
+        }
+        AdminExecutionResource::Worktree(path) => {
+            let info = git::git_info_cached(path);
+            if info.dirty_count > 0 {
+                blockers.push(json!({
+                    "kind": "dirtyWorktree",
+                    "dirtyCount": info.dirty_count,
+                }));
+            }
+            let leased_sessions = tmux::pane_info()
+                .map_err(|error| format!("retirement lease inspection failed: {error}"))?
+                .into_iter()
+                .filter(|pane| {
+                    pane.cwd == *path
+                        || pane
+                            .cwd
+                            .strip_prefix(path)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+                .map(|pane| pane.session)
+                .collect::<Vec<_>>();
+            if !leased_sessions.is_empty() {
+                blockers.push(json!({
+                    "kind": "liveSessionLeases",
+                    "sessions": leased_sessions,
+                }));
+            }
+        }
+        AdminExecutionResource::Fleet | AdminExecutionResource::Forbidden => {
+            return Err(
+                "execute_admin_operation target is not valid for retirement preparation".into(),
+            );
+        }
+    }
+    revalidate_admin_execution_target(ctx, audit, target)?;
+    revalidate_admin_execution_authority(ctx, audit)?;
+    let plan_id = retirement_plan_id(audit, &blockers);
+    Ok(json!({
+        "outcome": "retirementPrepared",
+        "planId": plan_id,
+        "ready": blockers.is_empty(),
+        "blockers": blockers,
+        "destructiveActionPerformed": false,
+    }))
+}
+
+fn execute_admin_operation(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(args, "execute_admin_operation", &["operation", "target"])?;
+    require_socket_identity(caller, trusted_internal, "execute_admin_operation")?;
+    let caller = caller
+        .ok_or("execute_admin_operation requires the exact delegated Crew session identity")?;
+    let operation = serde_json::from_value::<crate::delegated_admin::AdminOperation>(
+        args.get("operation")
+            .cloned()
+            .ok_or("execute_admin_operation requires an operation")?,
+    )
+    .map_err(|error| format!("execute_admin_operation operation is invalid: {error}"))?;
+    if !matches!(
+        operation,
+        crate::delegated_admin::AdminOperation::MaintainSession
+            | crate::delegated_admin::AdminOperation::RecoverResource
+            | crate::delegated_admin::AdminOperation::PrepareRetirement
+            | crate::delegated_admin::AdminOperation::MaintainFleetResource
+    ) {
+        return Err("execute_admin_operation supports maintainSession, recoverResource, prepareRetirement, or maintainFleetResource only".into());
+    }
+    let target_input = serde_json::from_value::<AdminExecutionTargetInput>(
+        args.get("target")
+            .cloned()
+            .ok_or("execute_admin_operation requires a target")?,
+    )
+    .map_err(|error| format!("execute_admin_operation target is invalid: {error}"))?;
+    let target = resolve_admin_execution_target(ctx, &target_input)?;
+    let audit = authorize_delegated_admin(
+        ctx,
+        caller,
+        operation,
+        target.authorization_target.clone(),
+        crate::delegated_admin::AdminSafeguards::default(),
+    )?;
+    let result = match operation {
+        crate::delegated_admin::AdminOperation::MaintainSession => {
+            if !matches!(target.resource, AdminExecutionResource::Session(_)) {
+                Err("execute_admin_operation maintainSession requires a session target".into())
+            } else {
+                maintain_admin_sessions(ctx, &audit, &target)
+            }
+        }
+        crate::delegated_admin::AdminOperation::RecoverResource => match &target.resource {
+            AdminExecutionResource::Worktree(path) => recover_admin_worktree(ctx, &audit, path),
+            AdminExecutionResource::Forbidden => {
+                Err("execute_admin_operation cannot recover a forbidden target".into())
+            }
+            _ => maintain_admin_sessions(ctx, &audit, &target),
+        },
+        crate::delegated_admin::AdminOperation::PrepareRetirement => {
+            prepare_admin_retirement(ctx, &audit, &target)
+        }
+        crate::delegated_admin::AdminOperation::MaintainFleetResource => {
+            if !matches!(
+                target.resource,
+                AdminExecutionResource::Fleet
+                    | AdminExecutionResource::Ship(_)
+                    | AdminExecutionResource::Session(_)
+            ) {
+                Err("execute_admin_operation maintainFleetResource requires a fleet, ship, or Captain session target".into())
+            } else {
+                maintain_admin_sessions(ctx, &audit, &target)
+            }
+        }
+        _ => unreachable!(),
+    }
+    .map(|outcome| {
+        json!({
+            "accepted": "execute_admin_operation",
+            "operation": operation,
+            "target": target.authorization_target,
+            "outcome": outcome,
+            "delegatedAdmin": audit,
+            "audited": true,
+        })
+    });
+    record_delegated_admin_execution_outcome(ctx, &audit, &result);
+    result
+}
+
 fn authorize_delegated_admin(
     ctx: &ControlContext,
     caller: &ResolvedIdentity,
@@ -20197,6 +22249,46 @@ fn record_delegated_admin_outcome<T>(
     let audit_value = json!({
         "authorization": audit,
         "outcome": decision,
+        "error": result.as_ref().err(),
+    });
+    ctx.audit.record(
+        "delegated_admin_operation",
+        "organization",
+        decision,
+        &audit_value,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: "delegated",
+            session: audit.actor_session_tile.as_deref(),
+            spawned_by: None,
+            error: result.as_ref().err().map(String::as_str),
+        },
+    );
+}
+
+/// Record the bounded typed result of an explicit administration command.
+///
+/// Other delegated reads intentionally use [`record_delegated_admin_outcome`]
+/// without serializing their result because terminal scrollback and status
+/// payloads may contain sensitive or unbounded user data.
+fn record_delegated_admin_execution_outcome(
+    ctx: &ControlContext,
+    audit: &crate::delegated_admin::AdminAuditContext,
+    result: &Result<Value, String>,
+) {
+    let decision = if result.is_ok() {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    let audit_value = json!({
+        "authorization": audit,
+        "outcome": decision,
+        "result": result.as_ref().ok(),
         "error": result.as_ref().err(),
     });
     ctx.audit.record(
@@ -22395,7 +24487,10 @@ fn start_agent(
         active_lanes: active_dispatch_lanes(&snapshot, &project.project_id),
         satisfied_dependencies,
         integration_contracts: integration_contracts.clone(),
-        capacity: dispatch_runtime_capacity(ctx, &snapshot, &project.project_id)?,
+        capacity: prospective_capacity(
+            dispatch_runtime_capacity(ctx, &snapshot, &project.project_id)?,
+            spawn_purpose,
+        ),
     };
     let dispatch_capacity = ctx
         .governor
@@ -23521,6 +25616,9 @@ fn close_terminal_with_policy(
         // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
         ctx.identity.retire_tile(tile_id)?;
     }
+    // The provider transcript remains intact and is now resumable. Force the next
+    // History read to observe any final transcript write immediately.
+    notify_history_changed(ctx, "terminal-closed");
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -23705,6 +25803,7 @@ impl ControlContext {
             Arc::new(|| Ok(crate::governor::HARD_SESSION_CEILING));
         Self {
             status,
+            history: crate::history::HistoryService::from_env(),
             supervisor,
             files: Arc::new(files::FileIndexState::new()),
             apply_sink: None,
@@ -23804,6 +25903,13 @@ impl ControlContext {
     /// [`new`](Self::new).
     pub fn with_captains_registry(mut self, captains: Arc<CaptainsRegistry>) -> Self {
         self.captains = captains;
+        self
+    }
+
+    /// Replace the History service. Tests use isolated provider roots; production
+    /// keeps the provider-home service created by [`new`](Self::new).
+    pub fn with_history_service(mut self, history: Arc<crate::history::HistoryService>) -> Self {
+        self.history = history;
         self
     }
 
@@ -24136,6 +26242,7 @@ mod tests {
         tmux::send_text(&target, &command, true).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut next_retry = Instant::now() + Duration::from_secs(1);
         let result = loop {
             if let Ok(after) = observe_harness_process(&target) {
                 match attest_launch_permissions(
@@ -24145,10 +26252,15 @@ mod tests {
                     PermMode::BypassPermissions,
                 ) {
                     Err(crate::harness::LaunchAttestationError::StaleEvidence) => {
+                        let now = Instant::now();
                         assert!(
-                            Instant::now() < deadline,
-                            "fake Harness did not replace the foreground shell"
+                            now < deadline,
+                            "fake Harness did not produce process evidence"
                         );
+                        if now >= next_retry {
+                            tmux::send_text(&target, &command, true).unwrap();
+                            next_retry = now + Duration::from_secs(1);
+                        }
                     }
                     result => break result,
                 }
@@ -31495,6 +33607,35 @@ mod tests {
     }
 
     #[test]
+    fn history_resume_cannot_bypass_spawn_capacity() {
+        let ctx = test_ctx("history-cap")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| {
+                Ok(vec![
+                    "th_live0001".into(),
+                    "th_live0002".into(),
+                    "th_live0003".into(),
+                    "th_live0004".into(),
+                ])
+            });
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "history-cap",
+                "history_resume",
+                json!({"entryId": "history-entry"}),
+            ),
+        );
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert!(error.contains("dispatch refused"), "got: {error}");
+        assert!(
+            !error.contains("entryId"),
+            "handler ran before admission: {error}"
+        );
+    }
+
+    #[test]
     fn dispatch_preflight_admits_six_independent_lanes_with_available_capacity() {
         let ctx =
             test_ctx("dispatch-six").with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)));
@@ -31879,6 +34020,81 @@ mod tests {
     }
 
     #[test]
+    fn start_agent_uses_matching_reserved_capacity_in_project_preflight() {
+        let ctx = test_ctx("reserved-start")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(Vec::new()));
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let repo = worktree.to_string_lossy().to_string();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-reserved-start".into(),
+                name: "Reserved Start Project".into(),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test(
+                "captain-reserved-start",
+                Some("captain-reserved-start"),
+                vec![],
+            )
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-reserved-start",
+                "project-reserved-start",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+
+        let ordinary_refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        assert_eq!(ordinary_refusal.code, "reserved-capacity");
+
+        let error = dispatch(
+            &ctx,
+            "start_agent",
+            &json!({
+                "requestId": "reserved-start-agent-test",
+                "captainSessionId": "captain-reserved-start",
+                "assignment": "Start the standing Fleet Admin",
+                "directory": repo,
+                "sourceCommit": source_commit,
+                "visibleProductBug": false,
+                "laneId": "reserved-fleet-admin-lane",
+                "dependencies": [],
+                "mutableFiles": ["src/reserved-admin.rs"],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": [],
+                "admissionPurpose": "fleet-admin"
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("no UI is connected"), "got: {error}");
+        let agent = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .next()
+            .expect("Fleet Admin persisted after reserved admission");
+        assert_eq!(
+            agent.admission_purpose,
+            crate::governor::AdmissionPurpose::FleetAdmin
+        );
+        assert_eq!(agent.runtime_state, RuntimeState::Unavailable);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn start_agent_records_running_after_launch_without_inventing_provider_identity() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
@@ -32096,6 +34312,314 @@ mod tests {
         .unwrap_err();
         assert!(revoked.contains("no active administrative grant"));
         reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
+    fn ship_admin_executes_own_ship_operations_and_denies_foreign_or_reserved_targets() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let captain_alpha = format!("ca{}", &nonce[..6]);
+        let captain_beta = format!("cb{}", &nonce[..6]);
+        let admin_session = format!("aa{}", &nonce[..6]);
+        let peer_alpha = format!("pa{}", &nonce[..6]);
+        let peer_beta = format!("pb{}", &nonce[..6]);
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-admin-execute-audit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx =
+            test_ctx("admin-execute-ship").with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.captains
+            .claim_test(&captain_alpha, Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .claim_test(&captain_beta, Some("beta"), vec![])
+            .unwrap();
+        for crew in [&admin_session, &peer_alpha] {
+            ctx.captains.record_crew(&captain_alpha, crew).unwrap();
+        }
+        ctx.captains.record_crew(&captain_beta, &peer_beta).unwrap();
+        let session_ids = [
+            admin_session.as_str(),
+            peer_alpha.as_str(),
+            peer_beta.as_str(),
+        ];
+        for session_id in session_ids {
+            create_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, &captain_alpha)
+            .unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, &admin_session)
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": admin_session,
+                "role": "shipAdmin",
+                "permittedOperations": [
+                    "maintainSession",
+                    "recoverResource",
+                    "prepareRetirement"
+                ]
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+
+        let own = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainSession",
+                "target": { "kind": "session", "sessionId": admin_session }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(own["outcome"]["outcome"], "maintained");
+        assert_eq!(
+            own["outcome"]["maintainedSessions"][0]["sessionId"],
+            admin_session
+        );
+
+        let sibling = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "session", "sessionId": peer_alpha }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sibling["outcome"]["outcome"], "maintained");
+
+        let retirement = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "prepareRetirement",
+                "target": { "kind": "session", "sessionId": peer_alpha }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(retirement["outcome"]["outcome"], "retirementPrepared");
+        assert_eq!(retirement["outcome"]["ready"], false);
+        assert!(retirement["outcome"]["planId"]
+            .as_str()
+            .is_some_and(|plan| plan.starts_with("sha256:")));
+
+        let foreign = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainSession",
+                "target": { "kind": "session", "sessionId": peer_beta }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(foreign.contains("targetOutOfScope"));
+
+        let reserved = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "generalReserved", "action": "installRelease" }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(reserved.contains("targetOutOfScope"));
+
+        let implementation = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": {
+                    "kind": "implementation",
+                    "shipSlug": "alpha",
+                    "assignmentId": "assignment-1"
+                }
+            }),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(implementation.contains("targetOutOfScope"));
+
+        let records = read_audit(&audit_dir);
+        let operation_records = records
+            .iter()
+            .filter(|record| record["command"] == "delegated_admin_operation")
+            .collect::<Vec<_>>();
+        assert_eq!(operation_records.len(), 3);
+        assert_eq!(
+            operation_records[0]["args"]["authorization"]["actorIdentityId"],
+            admin_identity.id
+        );
+        assert_eq!(
+            operation_records[0]["args"]["authorization"]["delegatingSupervisorIdentityId"],
+            captain_identity.id
+        );
+        assert_eq!(
+            operation_records[0]["args"]["result"]["outcome"]["outcome"],
+            "maintained"
+        );
+
+        for session_id in session_ids {
+            reap_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        std::fs::remove_dir_all(audit_dir).ok();
+    }
+
+    #[test]
+    fn fleet_admin_maintains_captains_without_crossing_into_crew_or_general_authority() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let cortana_session = format!("co{}", &nonce[..6]);
+        let captain_alpha = format!("ca{}", &nonce[..6]);
+        let captain_beta = format!("cb{}", &nonce[..6]);
+        let fleet_admin_session = format!("fa{}", &nonce[..6]);
+        let peer_beta = format!("pb{}", &nonce[..6]);
+        let ctx = test_ctx(&format!("admin-execute-fleet-{}", &nonce[..8]));
+        ctx.captains
+            .claim_provider(
+                &cortana_session,
+                None,
+                FleetRole::Cortana,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        ctx.captains
+            .claim_test(&captain_alpha, Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .claim_test(&captain_beta, Some("beta"), vec![])
+            .unwrap();
+        ctx.captains
+            .record_crew(&captain_alpha, &fleet_admin_session)
+            .unwrap();
+        ctx.captains.record_crew(&captain_beta, &peer_beta).unwrap();
+        let session_ids = [
+            fleet_admin_session.as_str(),
+            captain_alpha.as_str(),
+            captain_beta.as_str(),
+            peer_beta.as_str(),
+        ];
+        for session_id in session_ids {
+            create_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
+        let cortana_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        ctx.identity
+            .bind_tile(&cortana_identity.id, &cortana_session)
+            .unwrap();
+        ctx.captains
+            .begin_cortana_recovery("fleet-admin-test")
+            .unwrap();
+        ctx.captains
+            .commit_cortana_runtime(
+                "fleet-admin-test",
+                &cortana_identity.id,
+                1,
+                &cortana_session,
+                "codex",
+                None,
+            )
+            .unwrap();
+        let fleet_admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&fleet_admin_identity.id, &fleet_admin_session)
+            .unwrap();
+        let cortana = resolve_identity(&ctx, &cortana_identity.secret).unwrap();
+        appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": fleet_admin_session,
+                "role": "fleetAdmin",
+                "permittedOperations": [
+                    "maintainFleetResource",
+                    "recoverResource",
+                    "prepareRetirement"
+                ]
+            }),
+            Some(&cortana),
+            false,
+        )
+        .unwrap();
+        let fleet_admin = resolve_identity(&ctx, &fleet_admin_identity.secret).unwrap();
+
+        let maintained = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainFleetResource",
+                "target": { "kind": "fleet" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(maintained["outcome"]["outcome"], "maintained");
+        assert_eq!(
+            maintained["outcome"]["maintainedSessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let retirement = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "prepareRetirement",
+                "target": { "kind": "session", "sessionId": captain_beta }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap();
+        assert_eq!(retirement["outcome"]["ready"], false);
+
+        let crew_denied = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "recoverResource",
+                "target": { "kind": "session", "sessionId": peer_beta }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(crew_denied.contains("targetOutOfScope"));
+
+        let general_denied = execute_admin_operation(
+            &ctx,
+            &json!({
+                "operation": "maintainFleetResource",
+                "target": { "kind": "generalReserved", "action": "approveRelease" }
+            }),
+            Some(&fleet_admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(general_denied.contains("targetOutOfScope"));
+
+        for session_id in session_ids {
+            reap_test_tmux_session(&tmux_target(session_id)).unwrap();
+        }
     }
 
     #[test]
@@ -32585,6 +35109,24 @@ mod tests {
         )
         .unwrap_err()
         .contains("cannot re-delegate authority"));
+
+        let maintained = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "admin-boundaries",
+                &admin_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "maintainSession",
+                    "target": { "kind": "session", "sessionId": "admin-alpha" }
+                }),
+            ),
+        );
+        assert!(
+            maintained.ok,
+            "role-authorized maintenance route failed: {:?}",
+            maintained.error
+        );
 
         let grants = dispatch_authenticated(
             &ctx,
@@ -33437,7 +35979,8 @@ mod tests {
             .with_tab_registry(Arc::clone(&tabs))
             .with_apply_sink(sink.clone());
         let (harness_bin_dir, harness_command) = test_harness_command("codex");
-        let sessions_before = tmux::list_sessions().unwrap_or_default();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let terminal_id = suffix[..8].to_string();
         let identities_before = context.identity.len();
 
         let error = dispatch(
@@ -33451,15 +35994,22 @@ mod tests {
                 "workspaceTabIds": ["commission-work"],
                 "testStartupCommand": harness_command,
                 "testSkipPowderHealth": true,
-                "testFailCommitPersist": true
+                "testFailCommitPersist": true,
+                "testTerminalId": terminal_id
             }),
         )
         .unwrap_err();
-        assert!(error.contains("commission binding persistence failure"));
+        assert!(
+            error.contains("commission binding persistence failure"),
+            "got: {error}"
+        );
         assert!(captains.snapshot().captains.is_empty());
         assert!(captains.snapshot().pending_fleet_operations.is_empty());
         assert_eq!(context.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap_or_default(), sessions_before);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&terminal_id)),
+            tmux::SessionLiveness::Gone
+        );
         assert!(tabs
             .snapshot()
             .iter()
@@ -36188,22 +38738,286 @@ mod tests {
             required_tier("close_terminal"),
             CommandTier::ProcessChanging
         );
+        assert_eq!(
+            required_tier("history_resume"),
+            CommandTier::ProcessChanging
+        );
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
         assert_eq!(
             required_tier("complete_crew_powder"),
             CommandTier::ProcessChanging
         );
         assert_eq!(required_tier("new_tab"), CommandTier::Organization);
+        assert_eq!(required_tier("history_focus"), CommandTier::Organization);
         assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("list_terminals"), CommandTier::Read);
         assert_eq!(required_tier("get_status"), CommandTier::Read);
+        assert_eq!(required_tier("history_list"), CommandTier::Organization);
+        assert_eq!(required_tier("invalidate_history_cache"), CommandTier::Read);
         // Comms-plane Phase 2 (review H1): `inbox_ack` mutates + compacts durable
         // receipt state, so it must require the control token (Organization) and be
         // audited - NOT fall through to the read tier. `inbox_status` is counts-only
         // and stays Read.
         assert_eq!(required_tier("inbox_ack"), CommandTier::Organization);
         assert_eq!(required_tier("inbox_status"), CommandTier::Read);
+    }
+
+    #[test]
+    fn history_list_control_contract_discovers_codex_without_hiding_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join(".claude/projects/repo");
+        let codex_root = temp.path().join(".codex/sessions/2026/07/20");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::write(
+            claude_root.join("claude-control.jsonl"),
+            r#"{"type":"user","cwd":"/same","message":{"content":"Claude control"}}"#,
+        )
+        .unwrap();
+        let codex_id = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            codex_root.join(format!(
+                "rollout-2026-07-20T10-00-00-{codex_id}.jsonl"
+            )),
+            format!(
+                "{}\n{}",
+                json!({"type":"session_meta","payload":{"id":codex_id,"cwd":"/same","model_provider":"openai"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Codex control"}})
+            ),
+        )
+        .unwrap();
+        let history = Arc::new(crate::history::HistoryService::new(
+            temp.path().join(".claude/projects"),
+            temp.path().join(".codex/sessions"),
+            std::time::Duration::from_secs(60),
+        ));
+        let ctx = test_ctx("history-list").with_history_service(history);
+
+        let value = dispatch(&ctx, "history_list", &json!({"limit": 10})).unwrap();
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+        assert!(value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["harness"] == "codex" && entry["conversationId"] == codex_id));
+        assert!(value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["harness"] == "claude" && entry["conversationId"] == "claude-control"
+            ));
+        assert_eq!(value["sources"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn authenticated_history_list_is_scoped_to_an_active_captain_assignment() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join(".claude/projects");
+        let codex_root = temp.path().join(".codex/sessions/2026/07/20");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let ids = [
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            std::fs::write(
+                codex_root.join(format!(
+                    "rollout-2026-07-20T10-00-0{index}-{id}.jsonl"
+                )),
+                format!(
+                    "{}\n{}",
+                    json!({"type":"session_meta","payload":{"id":id,"cwd":format!("/repo-{index}"),"model_provider":"openai"}}),
+                    json!({"type":"event_msg","payload":{"type":"user_message","message":format!("Task {index}")}})
+                ),
+            )
+            .unwrap();
+        }
+        let history = Arc::new(crate::history::HistoryService::new(
+            claude_root,
+            temp.path().join(".codex/sessions"),
+            std::time::Duration::from_secs(60),
+        ));
+        let registry = Arc::new(CaptainsRegistry::new());
+        for (index, (ship, terminal, id)) in
+            [("ship-a", "cap-a", ids[0]), ("ship-b", "cap-b", ids[1])]
+                .into_iter()
+                .enumerate()
+        {
+            let project_id = format!("project-{index}");
+            registry
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.clone(),
+                    name: project_id.clone(),
+                    repo_root: format!("/repo-{index}"),
+                    remote_url: None,
+                    default_branch: None,
+                    powder: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .unwrap();
+            registry
+                .claim_provider(
+                    terminal,
+                    Some(ship),
+                    FleetRole::Captain,
+                    Some("codex"),
+                    Some(id),
+                    vec![],
+                    &|_| false,
+                    &|_| tmux::SessionLiveness::Gone,
+                )
+                .unwrap();
+            registry
+                .bind_ship_context(ship, &project_id, "History test", "codex")
+                .unwrap();
+        }
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Captain,
+            "ship-a",
+            "cap-a",
+        );
+        let crew = mint_session(&identities, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let ctx = test_ctx("ctrl")
+            .with_history_service(history)
+            .with_captains_registry(Arc::clone(&registry))
+            .with_identity_store(identities);
+
+        let denied = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &crew, "history_list", json!({"limit": 10})),
+        );
+        assert!(!denied.ok);
+
+        let scoped = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "history_list", json!({"limit": 10})),
+        );
+        assert!(scoped.ok, "Captain History list failed: {:?}", scoped.error);
+        let entries = scoped.result.unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["conversationId"], ids[0]);
+        assert_eq!(entries[0]["captainId"], "ship-a");
+
+        registry.release("ship-a").unwrap();
+        let released = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "history_list", json!({"limit": 10})),
+        );
+        assert!(!released.ok, "released Captain retained History access");
+    }
+
+    #[test]
+    fn history_resume_command_is_selected_only_from_exact_backend_harness() {
+        let codex_id = "22222222-2222-4222-8222-222222222222";
+        let codex = crate::history::parse_codex_rollout(
+            std::path::Path::new(
+                "rollout-2026-07-20T10-00-00-22222222-2222-4222-8222-222222222222.jsonl",
+            ),
+            &json!({"type":"session_meta","payload":{"id":codex_id,"cwd":"/repo"}}).to_string(),
+            1,
+        )
+        .unwrap()
+        .entry;
+        let claude = crate::history::parse_claude_transcript(
+            std::path::Path::new("claude-exact.jsonl"),
+            r#"{"type":"user","cwd":"/repo","message":{"content":"task"}}"#,
+            1,
+            false,
+        )
+        .unwrap()
+        .entry;
+
+        assert_eq!(
+            history_resume_command(&codex),
+            "codex resume '22222222-2222-4222-8222-222222222222'"
+        );
+        assert_eq!(
+            history_resume_command(&claude),
+            "claude --resume 'claude-exact'"
+        );
+    }
+
+    #[test]
+    fn fresh_history_resume_scope_rejects_a_rebound_project_assignment() {
+        let id = "22222222-2222-4222-8222-222222222222";
+        let entry = crate::history::parse_codex_rollout(
+            std::path::Path::new(
+                "rollout-2026-07-20T10-00-00-22222222-2222-4222-8222-222222222222.jsonl",
+            ),
+            &json!({"type":"session_meta","payload":{"id":id,"cwd":"/repo-old"}}).to_string(),
+            1,
+        )
+        .unwrap()
+        .entry;
+        let association = crate::history::HistoryAssociation {
+            harness: crate::history::Harness::Codex,
+            conversation_id: id.to_string(),
+            terminal_id: Some("term0001".to_string()),
+            liveness: crate::history::AssociationLiveness::Inactive,
+            project_id: Some("project-old".to_string()),
+            project_name: Some("Old Project".to_string()),
+            captain_id: Some("ship".to_string()),
+            assignment_id: Some("assignment-old".to_string()),
+            role: Some("crew".to_string()),
+            workspace_id: Some("workspace-old".to_string()),
+            worktree_id: None,
+            branch: None,
+        };
+        assert!(enforce_history_entry_owner(
+            &WorkspaceMutationAuthority::Assignment(FleetWorkspaceOwner {
+                project_id: "project-old".to_string(),
+                assignment_id: "assignment-old".to_string(),
+                ship_slug: "ship".to_string(),
+            }),
+            &entry,
+            std::slice::from_ref(&association),
+        )
+        .is_ok());
+        assert!(enforce_history_entry_owner(
+            &WorkspaceMutationAuthority::Assignment(FleetWorkspaceOwner {
+                project_id: "project-new".to_string(),
+                assignment_id: "assignment-new".to_string(),
+                ship_slug: "ship".to_string(),
+            }),
+            &entry,
+            &[association],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pending_history_runtime_proof_has_a_bounded_grace_period() {
+        let pending = crate::history::HistoryPendingResume {
+            request_id: "request-one".to_string(),
+            history_id: "history:v1:one".to_string(),
+            harness: crate::history::Harness::Codex,
+            conversation_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            terminal_id: "term0001".to_string(),
+            target_tab_id: Some("workspace".to_string()),
+            authorized_ship_slug: None,
+            authorized_project_id: None,
+            authorized_assignment_id: None,
+            reserved_at_ms: now_ms(),
+        };
+        assert!(!history_pending_runtime_proof_expired(&pending));
+        let expired = crate::history::HistoryPendingResume {
+            reserved_at_ms: now_ms().saturating_sub(HISTORY_PENDING_RUNTIME_PROOF_GRACE_MS),
+            ..pending
+        };
+        assert!(history_pending_runtime_proof_expired(&expired));
     }
 
     #[test]
@@ -37331,6 +40145,16 @@ mod tests {
             ("plane_admin", json!({"op": "purge", "recipient": "target"})),
             ("plane_send", json!({"recipient": "target", "text": "x"})),
             ("inbox_ack", json!({"sessionId": "target", "seq": 0})),
+            ("history_list", json!({"limit": 10})),
+            ("history_focus", json!({"historyId": "history:v1:target"})),
+            (
+                "history_resume",
+                json!({
+                    "historyId": "history:v1:target",
+                    "requestId": "history-provenance",
+                    "targetTabId": "target"
+                }),
+            ),
         ];
 
         for (command, args) in cases {
@@ -37991,6 +40815,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn history_resume_uses_its_durable_ledger_instead_of_the_generic_cache() {
+        assert!(!is_idempotent_command("history_resume"));
+        assert!(is_idempotent_command("spawn_terminal"));
+    }
+
+    #[test]
     fn request_cache_replays_a_completed_outcome() {
         let cache = RequestCache::new();
         // First sighting reserves the id and must run the command.
@@ -38006,6 +40836,24 @@ mod tests {
                 panic!("a completed id must replay, not reap-and-re-reserve")
             }
             BeginOutcome::InFlight => panic!("a completed id must replay, not report InFlight"),
+        }
+    }
+
+    #[test]
+    fn request_cache_rejects_reusing_an_id_for_different_arguments() {
+        let cache = RequestCache::new();
+        assert!(matches!(
+            cache.begin_bound("history-request", "resume:one"),
+            BeginOutcome::Fresh
+        ));
+        cache
+            .finish("history-request", Ok(json!({"terminalId": "one"})))
+            .unwrap();
+        match cache.begin_bound("history-request", "resume:two") {
+            BeginOutcome::Duplicate(Err(error)) => {
+                assert!(error.starts_with("request_conflict:"));
+            }
+            _ => panic!("a requestId must remain bound to its original arguments"),
         }
     }
 
@@ -38166,34 +41014,82 @@ mod tests {
     }
 
     #[test]
-    fn request_cache_finish_after_reap_does_not_leak_the_entry() {
-        // M2: a handler that outlives the reap window has its reservation evicted
-        // from BOTH maps; a late finish() must re-establish `order` membership so
-        // the recorded outcome is still TTL/capacity-evictable - never a permanent
-        // leak that breaches the cap and reports `completed` forever.
+    fn request_cache_stale_completion_cannot_overwrite_replacement_reservation() {
+        // A handler that outlives the reap window must not complete the replacement
+        // reservation created for the same request ID.
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        let (first, first_reservation) = cache.begin_bound_with_reservation("x", "resume:one");
+        assert!(matches!(first, BeginOutcome::Fresh));
+        let first_reservation = first_reservation.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (replacement, replacement_reservation) =
+            cache.begin_bound_with_reservation("x", "resume:one");
+        assert!(matches!(replacement, BeginOutcome::FreshAfterReap));
+        let replacement_reservation = replacement_reservation.unwrap();
+
+        let _ = cache.finish_reserved(
+            "x",
+            first_reservation,
+            "resume:one",
+            Ok(json!({"id": "stale"})),
+        );
+        assert!(
+            matches!(cache.status("x"), RequestStatus::InFlight),
+            "a stale completion must leave the replacement reservation in flight"
+        );
+        cache.cancel_reserved("x", first_reservation);
+        assert!(matches!(cache.status("x"), RequestStatus::InFlight));
+
+        let _ = cache.finish_reserved(
+            "x",
+            replacement_reservation,
+            "resume:one",
+            Ok(json!({"id": "replacement"})),
+        );
+        match cache.status("x") {
+            RequestStatus::Completed(Ok(value)) => {
+                assert_eq!(value["id"], "replacement");
+            }
+            _ => panic!("the replacement reservation must own the completed outcome"),
+        }
+    }
+
+    #[test]
+    fn request_cache_preserves_a_late_completion_when_no_replacement_owns_the_id() {
         let cache = RequestCache::with_bounds(
             1,
             std::time::Duration::from_secs(600),
             std::time::Duration::from_millis(1),
         );
-        cache.begin("x");
+        let (begin, reservation) = cache.begin_bound_with_reservation("late", "reconcile:one");
+        assert!(matches!(begin, BeginOutcome::Fresh));
+        let reservation = reservation.expect("fresh request reservation");
+
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // status() reaps the stale InFlight "x" from slots AND order.
-        assert!(matches!(cache.status("x"), RequestStatus::Unknown));
-        // The handler finally finishes, AFTER its reservation was reaped.
-        let _ = cache.finish("x", Ok(json!({"id": "x"})));
-        assert!(
-            matches!(cache.status("x"), RequestStatus::Completed(_)),
-            "outcome preserved"
+        assert!(matches!(cache.status("late"), RequestStatus::Unknown));
+        let _ = cache.finish_reserved(
+            "late",
+            reservation,
+            "reconcile:one",
+            Ok(json!({"id": "late"})),
         );
-        // Crucially, "x" is back in `order`: capacity pressure now evicts it. With
-        // the leak unfixed, "x" would linger in `slots` forever (never in `order`).
-        cache.begin("y");
-        let _ = cache.finish("y", Ok(json!({"id": "y"})));
-        assert!(
-            matches!(cache.status("x"), RequestStatus::Unknown),
-            "finish must re-establish order membership so the entry stays evictable (M2)"
-        );
+
+        assert!(matches!(
+            cache.begin_bound("late", "reconcile:one"),
+            BeginOutcome::Duplicate(Ok(_))
+        ));
+        assert!(matches!(
+            cache.begin_bound("late", "reconcile:other"),
+            BeginOutcome::Duplicate(Err(_))
+        ));
+
+        cache.begin("new");
+        let _ = cache.finish("new", Ok(json!({"id": "new"})));
+        assert!(matches!(cache.status("late"), RequestStatus::Unknown));
     }
 
     #[test]

@@ -811,6 +811,19 @@ impl AgentBridge {
             self.emit_session(sid);
         }
 
+        // Preserve the terminal supervision status for the event emitted above,
+        // then remove stale runtime identity evidence. History must never promote
+        // an ended Harness to Active from an old statusline snapshot.
+        if matches!(
+            entry.event_type,
+            t_hub_protocol::JournalEventType::SessionEnd
+        ) {
+            if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
+            {
+                status_bridge.evict(sid);
+            }
+        }
+
         affected
     }
 
@@ -1777,14 +1790,18 @@ mod tests {
         // EMITTED payload from the `consume_journal_entry` → `emit_session` path.
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
         bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
         rec.events.lock().clear();
 
         // Clean-completed path: a main-agent Stop with no outstanding subagents
         // classifies Completed, and SessionEnd keeps that terminal status.
         bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::SessionStart));
+        status_bridge.ingest("o1", &serde_json::json!({"cwd":"/repo"}), 1);
         bridge.consume_journal_entry(&entry(2, "o1", None, JournalEventType::Stop));
         bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::SessionEnd));
+        assert!(status_bridge.get("o1").is_none());
 
         // The LAST session://status emit for this session — the one the UI renders
         // after the session ends — must be the terminal status, never `unknown`.

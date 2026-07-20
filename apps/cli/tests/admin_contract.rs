@@ -157,3 +157,66 @@ fn exact_session_approval_and_cleanup_are_forwarded_without_authority_expansion(
     assert_eq!(request["args"]["approvalId"], "approval-1");
     assert_eq!(request["args"]["force"], false);
 }
+
+#[test]
+fn bounded_admin_operations_forward_typed_authoritative_targets() {
+    let cases = [
+        (
+            vec!["admin", "maintain-session", "crew-1", "--json"],
+            serde_json::json!({
+                "operation": "maintainSession",
+                "target": { "kind": "session", "sessionId": "crew-1" },
+            }),
+        ),
+        (
+            vec![
+                "admin",
+                "recover-resource",
+                "worktree",
+                "/tmp/worktree-1",
+                "--json",
+            ],
+            serde_json::json!({
+                "operation": "recoverResource",
+                "target": { "kind": "worktree", "path": "/tmp/worktree-1" },
+            }),
+        ),
+        (
+            vec!["admin", "prepare-retirement", "ship", "alpha", "--json"],
+            serde_json::json!({
+                "operation": "prepareRetirement",
+                "target": { "kind": "ship", "shipSlug": "alpha" },
+            }),
+        ),
+        (
+            vec!["admin", "maintain-fleet-resource", "fleet", "--json"],
+            serde_json::json!({
+                "operation": "maintainFleetResource",
+                "target": { "kind": "fleet" },
+            }),
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let (output, request) = cli_with_server(&args);
+        assert!(output.status.success());
+        assert_eq!(request["command"], "execute_admin_operation");
+        assert_eq!(request["args"], expected);
+    }
+}
+
+#[test]
+fn admin_operation_kinds_are_strict_before_endpoint_discovery() {
+    let output = cli(&[
+        "admin",
+        "recover-resource",
+        "implementation",
+        "assignment-1",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        envelope(&output)["error"]["message"],
+        "th admin recover-resource: kind must be session, ship, worktree"
+    );
+}
