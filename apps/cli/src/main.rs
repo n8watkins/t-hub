@@ -10,6 +10,7 @@
 //! stable machine envelope, output is bounded + sorted, and the shell exit code
 //! is a stable taxonomy agents can branch on (see [`exit`]).
 
+mod agents;
 mod control;
 mod powder;
 mod render;
@@ -209,6 +210,7 @@ fn command_label(args: &[String]) -> String {
             _ => "worktree".to_string(),
         },
         Some("powder") => powder::command_label(&args[1..]),
+        Some("agents") => agents::command_label(&args[1..]),
         Some(c) => c.to_string(),
     }
 }
@@ -229,6 +231,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "health" => cmd_health(rest),
         "events" | "watch" => cmd_events(rest),
         "powder" => powder::run(rest),
+        "agents" => agents::run(rest),
         other => Err(CliError::usage(format!(
             "unknown command '{other}'. Run `th --help` for the command list."
         ))),
@@ -1032,6 +1035,7 @@ commands:\n\
   tabs                      list workspace tabs                [--json]\n\
   health                    WSL host snapshot                  [--json]\n\
   events                    stream the control event bus (Ctrl-C to stop)\n\
+  agents                    start and supervise durable agent sessions\n\
   powder                    Crew-bound Powder evidence lifecycle\n\
 \n\
 flags:\n\
