@@ -205,6 +205,66 @@ pub(crate) fn require_clean_exact_baseline(cwd: &str, expected: &str) -> Result<
     Ok(())
 }
 
+/// Require one exact commit to be reachable from another exact commit.
+///
+/// Dispatch dependency evidence uses this gate to prove that a dependent lane's
+/// source baseline already contains every completed dependency result. Both
+/// revisions must be full object IDs so abbreviated or symbolic revisions can
+/// never change meaning between preflight and launch. The underlying Git call is
+/// bounded by [`git_cmd_timeout`] through [`run_git`].
+pub(crate) fn require_commit_ancestor(
+    cwd: &str,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<(), String> {
+    for (field, commit) in [("ancestor", ancestor), ("descendant", descendant)] {
+        if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "{field} commit must be an exact 40- or 64-character Git commit"
+            ));
+        }
+        let revision = format!("{commit}^{{commit}}");
+        let (ok, stdout, stderr) = run_git(cwd, &["rev-parse", "--verify", &revision])?;
+        if !ok {
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            return Err(format!(
+                "{field} commit '{commit}' is not a commit in this repository: {detail}"
+            ));
+        }
+        let resolved = first_line_opt(&stdout)
+            .ok_or_else(|| format!("git returned no commit while verifying {field}"))?;
+        if !resolved.eq_ignore_ascii_case(commit) {
+            return Err(format!(
+                "{field} commit '{commit}' did not resolve to the same exact commit '{resolved}'"
+            ));
+        }
+    }
+
+    let (ok, stdout, stderr) =
+        run_git(cwd, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    if ok {
+        return Ok(());
+    }
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    Err(format!(
+        "commit '{ancestor}' is not an ancestor of source commit '{descendant}'{suffix}"
+    ))
+}
+
 /// Initialize a new repository in an existing directory after the caller has
 /// obtained explicit user authorization. Refuses to touch an existing `.git`
 /// entry, including a malformed one, so this operation never rewrites version
@@ -1636,6 +1696,55 @@ detached
         assert!(require_clean_exact_baseline(&cwd, &head)
             .unwrap_err()
             .contains("separate clean worktree"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dispatch_dependency_requires_exact_ancestor_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-dispatch-ancestry-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = root.to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            let (ok, stdout, stderr) = run_git_for_test(&cwd, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        run(&["init", "-q"]);
+        std::fs::write(root.join("tracked.txt"), "first\n").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&[
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "first",
+        ]);
+        let ancestor = run(&["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::write(root.join("tracked.txt"), "second\n").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&[
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "second",
+        ]);
+        let descendant = run(&["rev-parse", "HEAD"]).trim().to_string();
+
+        require_commit_ancestor(&cwd, &ancestor, &descendant).unwrap();
+        assert!(require_commit_ancestor(&cwd, &descendant, &ancestor)
+            .unwrap_err()
+            .contains("is not an ancestor"));
+        assert!(require_commit_ancestor(&cwd, &ancestor[..12], &descendant)
+            .unwrap_err()
+            .contains("exact 40- or 64-character"));
         std::fs::remove_dir_all(root).ok();
     }
 }

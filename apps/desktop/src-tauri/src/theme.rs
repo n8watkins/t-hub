@@ -15,7 +15,7 @@
 //!   - event   `theme://changed` — payload is the theme JSON String.
 //!
 //! Persistence path: `~/.config/t-hub/theme.json` (honoring `XDG_CONFIG_HOME`
-//! / `CLAUDE_CONFIG_DIR`'s parent is not used — this is our own dir). We reuse
+//! and the direct `T_HUB_CONFIG_DIR` override). We reuse
 //! the project's proven HOME-based resolution rather than the Tauri path plugin
 //! so it behaves identically inside WSL and in tests.
 
@@ -59,13 +59,16 @@ impl ThemeState {
     }
 }
 
-/// `~/.config/t-hub` (honoring `XDG_CONFIG_HOME`), the dir we persist into.
-/// Returns `None` only when none of `XDG_CONFIG_HOME` / `HOME` / `USERPROFILE` is
-/// set. `USERPROFILE` is the Windows home — without it the app (which runs ON
-/// Windows, where `HOME` is unset) could never resolve a config dir, so every theme
-/// read/write failed with "could not resolve a config dir" — on a tight loop, that
-/// was a steady error/log storm.
+/// `~/.config/t-hub` (honoring `XDG_CONFIG_HOME`), the directory we persist into.
+/// `T_HUB_CONFIG_DIR` directly overrides the complete directory so a side-by-side
+/// development build can isolate both theme and shared workspace layout state.
+/// Returns `None` only when no override or home directory can be resolved.
 fn config_dir() -> Option<PathBuf> {
+    if let Some(config) = std::env::var_os("T_HUB_CONFIG_DIR") {
+        if !config.is_empty() {
+            return Some(PathBuf::from(config));
+        }
+    }
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return Some(Path::new(&xdg).join("t-hub"));
@@ -95,8 +98,9 @@ fn read_persisted() -> Option<String> {
 /// here does NOT prevent the in-memory update or the change event — a theme that
 /// can't be written to disk still applies for the session.
 fn write_persisted(json: &str) -> Result<(), String> {
-    let path = theme_file()
-        .ok_or_else(|| "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string())?;
+    let path = theme_file().ok_or_else(|| {
+        "could not resolve a config dir (no T_HUB_CONFIG_DIR / XDG_CONFIG_HOME / HOME)".to_string()
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -138,11 +142,11 @@ pub async fn set_theme(app: tauri::AppHandle, theme: String) -> Result<(), Strin
     Ok(())
 }
 
-// --- Shared workspace layout (#9: persist workspaces across variants) ----------
-// A single `~/.config/t-hub/workspaces.json` shared by ALL variants (prod + dev),
-// a sibling of theme.json. The per-variant SQLite copy (db.rs) stays the PRIMARY
-// durable store; this shared file is what carries your workspace layout across a
-// dev↔prod switch — adopted on a fresh variant whose per-variant copy is empty.
+// --- Portable workspace layout (#9) --------------------------------------------
+// The file is a sibling of theme.json. Production keeps the historical
+// `~/.config/t-hub/workspaces.json` default, while devbuild points the complete
+// config directory at isolated state. The per-variant SQLite copy remains the
+// primary durable store.
 
 /// Full path to the shared (all-variants) workspace layout file.
 fn shared_layout_file() -> Option<PathBuf> {
@@ -164,8 +168,9 @@ pub async fn load_shared_layout() -> Result<Option<String>, String> {
 /// Write the shared workspace layout JSON (best-effort, creating the dir as needed).
 #[tauri::command]
 pub async fn save_shared_layout(layout: String) -> Result<(), String> {
-    let path = shared_layout_file()
-        .ok_or_else(|| "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string())?;
+    let path = shared_layout_file().ok_or_else(|| {
+        "could not resolve a config dir (no T_HUB_CONFIG_DIR / XDG_CONFIG_HOME / HOME)".to_string()
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -178,26 +183,26 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
 
-    // `XDG_CONFIG_HOME` is process-global, so the tests can't safely run in
+    // `T_HUB_CONFIG_DIR` is process-global, so the tests can't safely run in
     // parallel even with distinct paths (one test's set_var would change the dir
     // another is mid-resolving). This lock serializes them; a per-call counter
     // also gives each its own dir so a crash never leaks state into the next.
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// Run a closure with a clean, isolated config dir via XDG_CONFIG_HOME, then
+    /// Run a closure with a clean, isolated direct config override, then
     /// restore the prior env. Serialized across tests via ENV_LOCK.
     fn with_temp_config<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("t-hub-theme-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let prev = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let prev = std::env::var_os("T_HUB_CONFIG_DIR");
+        std::env::set_var("T_HUB_CONFIG_DIR", &dir);
         let out = f();
         match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
+            Some(v) => std::env::set_var("T_HUB_CONFIG_DIR", v),
+            None => std::env::remove_var("T_HUB_CONFIG_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
         out

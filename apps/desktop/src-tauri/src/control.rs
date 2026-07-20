@@ -8298,6 +8298,12 @@ pub struct ControlContext {
     /// dispatch. The reservation spans all Powder reads, spawn, claim,
     /// attestation, and transactional rollback work.
     dispatch_reservations: Arc<DispatchReservations>,
+    /// Serializes modern Crew admission from its authoritative snapshot through
+    /// exact-baseline verification, dependency ancestry, governor preflight, and
+    /// durable insertion. This closes the check-then-insert race where two
+    /// concurrent starts could otherwise observe the same free capacity and
+    /// mutable resources before either record became visible.
+    dispatch_admission: Arc<Mutex<()>>,
     /// The orchestrator-wake watch registry. Armed by `watch_fleet` / cleared by
     /// `unwatch_fleet`; read by the [`crate::fleet::FleetNotifier`] wired in
     /// `setup()`, which shares the same `Arc`. In-memory only (a watch is
@@ -10429,12 +10435,17 @@ fn crew_empty_gh_config_dir() -> String {
 /// string is built with explicit forward slashes (NOT `PathBuf::join`, which
 /// emits `\` on a Windows binary), so the result is ALWAYS a backslash-free POSIX
 /// path.
+#[cfg(feature = "devbuild")]
+const CREW_GH_CONFIG_SUBDIR: &str = ".t-hub-dev/crew-gh-empty";
+#[cfg(not(feature = "devbuild"))]
+const CREW_GH_CONFIG_SUBDIR: &str = ".t-hub/crew-gh-empty";
+
 fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
     let base = home
         .filter(|h| h.starts_with('/'))
         .unwrap_or("/tmp")
         .trim_end_matches('/');
-    format!("{base}/.t-hub/crew-gh-empty")
+    format!("{base}/{CREW_GH_CONFIG_SUBDIR}")
 }
 
 /// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
@@ -12018,6 +12029,64 @@ fn evidence_string(evidence: &Value, field: &str, state: &str) -> Result<String,
         })
 }
 
+fn validate_registered_integration_inputs(
+    ctx: &ControlContext,
+    target_agent: &AgentSessionRecord,
+    manifest: &crate::agent_session::IntegrationManifest,
+) -> Result<(), String> {
+    let snapshot = ctx.captains.snapshot();
+    for input in &manifest.inputs {
+        let registered = snapshot
+            .agent_sessions
+            .iter()
+            .find(|agent| agent.agent_session_id == input.agent_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "record_agent_delivery integrated manifest agentSessionId '{}' is not registered",
+                    input.agent_session_id
+                )
+            })?;
+        if registered.project_id != target_agent.project_id {
+            return Err(format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' belongs to a different project",
+                input.agent_session_id
+            ));
+        }
+        if registered
+            .lane_claim
+            .as_ref()
+            .map(|lane| lane.lane_id.as_str())
+            != Some(input.lane_id.as_str())
+        {
+            return Err(format!(
+                "record_agent_delivery integrated manifest laneId '{}' does not match agentSessionId '{}'",
+                input.lane_id, input.agent_session_id
+            ));
+        }
+        let delivery = registered.delivery.as_ref().ok_or_else(|| {
+            format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' has no delivery provenance",
+                input.agent_session_id
+            )
+        })?;
+        if delivery.source_baseline != input.source_baseline
+            || delivery.resulting_commit.as_deref() != Some(input.resulting_commit.as_str())
+        {
+            return Err(format!(
+                "record_agent_delivery integrated manifest commits do not match agentSessionId '{}'",
+                input.agent_session_id
+            ));
+        }
+        if !delivery.states().complete {
+            return Err(format!(
+                "record_agent_delivery integrated manifest agentSessionId '{}' is not complete",
+                input.agent_session_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn record_agent_delivery(
     ctx: &ControlContext,
     args: &Value,
@@ -12106,27 +12175,57 @@ fn record_agent_delivery(
                     "canonicalBaseline",
                     "canonicalCommit",
                     "reference",
+                    "manifest",
                 ],
             )?;
+            let manifest = serde_json::from_value::<crate::agent_session::IntegrationManifest>(
+                evidence
+                    .get("manifest")
+                    .cloned()
+                    .ok_or("record_agent_delivery integrated requires evidence.manifest")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery integrated manifest is invalid: {error}")
+            })?;
+            let source_commit = evidence_string(evidence, "sourceCommit", &state)?;
+            manifest.validate_for_source_commit(&source_commit)?;
+            if manifest.integration_owner_identity != actor_identity {
+                return Err(
+                    "record_agent_delivery integrated manifest.integrationOwnerIdentity must equal the authenticated actor identity"
+                        .into(),
+                );
+            }
+            validate_registered_integration_inputs(ctx, &agent, &manifest)?;
             AgentDeliveryUpdate::Integrated(crate::agent_session::IntegrationEvidence {
-                source_commit: evidence_string(evidence, "sourceCommit", &state)?,
+                source_commit,
                 canonical_baseline: evidence_string(evidence, "canonicalBaseline", &state)?,
                 canonical_commit: evidence_string(evidence, "canonicalCommit", &state)?,
                 reference: evidence_string(evidence, "reference", &state)?,
                 recorded_at,
+                manifest: Some(manifest),
             })
         }
         "packaged" => {
             let evidence = required_delivery_evidence(
                 args,
                 &state,
-                &["artifactId", "sourceBaseline", "reference"],
+                &["artifactId", "sourceBaseline", "reference", "manifest"],
             )?;
+            let manifest = serde_json::from_value::<crate::agent_session::ArtifactManifest>(
+                evidence
+                    .get("manifest")
+                    .cloned()
+                    .ok_or("record_agent_delivery packaged requires evidence.manifest")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery packaged manifest is invalid: {error}")
+            })?;
             AgentDeliveryUpdate::Packaged(crate::agent_session::ArtifactEvidence {
                 artifact_id: evidence_string(evidence, "artifactId", &state)?,
                 source_baseline: evidence_string(evidence, "sourceBaseline", &state)?,
                 reference: evidence_string(evidence, "reference", &state)?,
                 recorded_at,
+                manifest: Some(manifest),
             })
         }
         "installed" => {
@@ -14969,14 +15068,41 @@ fn detected_harness(terminal_id: &str) -> Option<String> {
 
 const CORTANA_GENERATION_ENV: &str = "T_HUB_CORTANA_GENERATION";
 
+#[cfg(feature = "devbuild")]
+const CORTANA_HOME_DEFAULT: &str = ".t-hub-dev/orchestrator";
+#[cfg(not(feature = "devbuild"))]
+const CORTANA_HOME_DEFAULT: &str = ".t-hub/orchestrator";
+
+fn resolve_orchestrator_home(user_home: &str, configured: Option<&str>) -> Result<String, String> {
+    let requested = configured
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(CORTANA_HOME_DEFAULT)
+        .trim_end_matches('/');
+    if requested.is_empty()
+        || requested.contains('\\')
+        || requested
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Err("T_HUB_CORTANA_HOME must be a safe POSIX directory path".to_string());
+    }
+    if requested.starts_with('/') {
+        return Ok(requested.to_string());
+    }
+    Ok(format!("{}/{}", user_home.trim_end_matches('/'), requested))
+}
+
 fn orchestrator_home(args: &Value) -> Result<String, String> {
     #[cfg(test)]
     if let Some(path) = arg_str(args, "testOrchestratorHome") {
         return Ok(path.trim_end_matches('/').to_string());
     }
-    #[cfg(not(test))]
     let _ = args;
-    files::user_home_path().map(|home| format!("{home}/.t-hub/orchestrator"))
+    let user_home = files::user_home_path()?;
+    resolve_orchestrator_home(
+        &user_home,
+        std::env::var("T_HUB_CORTANA_HOME").ok().as_deref(),
+    )
 }
 
 fn runtime_evidence(value: tmux::SessionLiveness) -> crate::cortana_reconcile::RuntimeEvidence {
@@ -15005,8 +15131,14 @@ fn discover_cortana_runtimes(
         let terminal_id = pane
             .session
             .strip_prefix("th_")
-            .unwrap_or(&pane.session)
+            .ok_or_else(|| {
+                format!(
+                    "reconcile_cortana: reserved-scope runtime session '{}' is not an exact T-Hub terminal target",
+                    pane.session
+                )
+            })?
             .to_string();
+        exact_cortana_tmux_target(&terminal_id)?;
         if by_terminal.contains_key(&terminal_id) {
             continue;
         }
@@ -15097,11 +15229,226 @@ fn claim_cortana_runtime(
         .map_err(|error| format!("reconcile_cortana: invalid Fleet claim result: {error}"))
 }
 
+fn exact_cortana_tmux_target(terminal_id: &str) -> Result<String, String> {
+    if terminal_id.len() != 8
+        || !terminal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "reconcile_cortana: discovered terminal id '{terminal_id}' is outside the exact T-Hub target contract"
+        ));
+    }
+    Ok(format!("th_{terminal_id}"))
+}
+
+fn audit_cortana_runtime_mutation(
+    ctx: &ControlContext,
+    decision: &str,
+    operation_id: &str,
+    requested_terminal_ids: &[String],
+    affected_terminal_ids: &[String],
+    error: Option<&str>,
+) {
+    let quarantined_terminal_ids = if decision.starts_with("quarantine") {
+        affected_terminal_ids
+    } else {
+        &[]
+    };
+    let migrated_terminal_ids = if decision.starts_with("generation-migrat") {
+        affected_terminal_ids
+    } else {
+        &[]
+    };
+    let args = json!({
+        "operationId": operation_id,
+        "requestedTerminalIds": requested_terminal_ids,
+        "affectedTerminalIds": affected_terminal_ids,
+        "quarantinedTerminalIds": quarantined_terminal_ids,
+        "migratedTerminalIds": migrated_terminal_ids,
+        "authorityClaimed": false,
+    });
+    ctx.audit.record(
+        "reconcile_cortana_runtime_mutation",
+        CommandTier::ProcessChanging.label(),
+        decision,
+        &args,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: Capability::Full.tier_label(),
+            session: None,
+            spawned_by: None,
+            error,
+        },
+    );
+}
+
+fn quarantine_cortana_runtimes(
+    ctx: &ControlContext,
+    operation_id: &str,
+    requested_terminal_ids: &[String],
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<Vec<String>, String> {
+    let requested = requested_terminal_ids
+        .iter()
+        .map(|terminal_id| {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.terminal_id == *terminal_id)
+                .ok_or_else(|| {
+                    format!(
+                        "reconcile_cortana: quarantine target '{terminal_id}' was not present in the authoritative discovery snapshot"
+                    )
+                })?;
+            let target = exact_cortana_tmux_target(terminal_id)?;
+            Ok((candidate, target))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut quarantined = Vec::new();
+    let mut failures = Vec::new();
+    for (candidate, target) in &requested {
+        let kill = tmux::kill_session_tree(target);
+        match tmux::session_liveness(target) {
+            tmux::SessionLiveness::Gone => {
+                quarantined.push(candidate.terminal_id.clone());
+            }
+            tmux::SessionLiveness::Alive => failures.push(format!(
+                "runtime '{}' remained alive after exact quarantine: {kill:?}",
+                candidate.terminal_id
+            )),
+            tmux::SessionLiveness::Unknown => failures.push(retryable_error(format!(
+                "runtime '{}' has uncertain liveness after exact quarantine: {kill:?}",
+                candidate.terminal_id
+            ))),
+        }
+    }
+    quarantined.sort();
+    for terminal_id in &quarantined {
+        ctx.tabs.retire_tile_locked(terminal_id);
+        if let Err(error) = ctx.captains.remove_session(terminal_id) {
+            failures.push(format!(
+                "runtime '{terminal_id}' was stopped but its Fleet session state could not be retired: {error}"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        let identity_ids = requested
+            .iter()
+            .filter_map(|(candidate, _)| candidate.identity_id.as_deref())
+            .filter(|identity_id| durable.identity_id.as_deref() != Some(*identity_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        for identity_id in identity_ids {
+            if let Err(error) = ctx.identity.retire(identity_id) {
+                failures.push(format!(
+                    "quarantined Cortana identity '{identity_id}' could not be revoked: {error}"
+                ));
+            }
+        }
+    }
+    let error = (!failures.is_empty()).then(|| failures.join("; "));
+    audit_cortana_runtime_mutation(
+        ctx,
+        if error.is_some() {
+            "quarantine-failed"
+        } else {
+            "quarantined"
+        },
+        operation_id,
+        requested_terminal_ids,
+        &quarantined,
+        error.as_deref(),
+    );
+    if let Some(error) = error {
+        return Err(format!(
+            "reconcile_cortana: exact duplicate quarantine did not complete: {error}"
+        ));
+    }
+    Ok(quarantined)
+}
+
+fn migrate_generation_zero_runtime(
+    ctx: &ControlContext,
+    operation_id: &str,
+    authoritative: &crate::cortana_reconcile::CortanaRuntimeCandidate,
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+) -> Result<(), String> {
+    let Some(legacy) = candidates.iter().find(|candidate| {
+        candidate.terminal_id == authoritative.terminal_id && candidate.generation == 0
+    }) else {
+        return Ok(());
+    };
+    let target = exact_cortana_tmux_target(&legacy.terminal_id)?;
+    let requested = vec![legacy.terminal_id.clone()];
+    if let Err(error) = tmux::set_session_environment(&target, CORTANA_GENERATION_ENV, "1") {
+        let message = format!(
+            "generation-zero runtime '{}' could not be migrated before authority claim: {error}",
+            legacy.terminal_id
+        );
+        audit_cortana_runtime_mutation(
+            ctx,
+            "generation-migration-failed",
+            operation_id,
+            &requested,
+            &[],
+            Some(&message),
+        );
+        return Err(message);
+    }
+    let observed = match tmux::session_environment(&target, CORTANA_GENERATION_ENV) {
+        Ok(observed) => observed,
+        Err(error) => {
+            let message = format!(
+                "generation-zero runtime '{}' could not be verified after migration: {error}",
+                legacy.terminal_id
+            );
+            audit_cortana_runtime_mutation(
+                ctx,
+                "generation-migration-failed",
+                operation_id,
+                &requested,
+                &[],
+                Some(&message),
+            );
+            return Err(message);
+        }
+    };
+    if observed.as_deref() != Some("1") {
+        let message = format!(
+            "generation-zero runtime '{}' did not retain generation 1 before authority claim",
+            legacy.terminal_id
+        );
+        audit_cortana_runtime_mutation(
+            ctx,
+            "generation-migration-failed",
+            operation_id,
+            &requested,
+            &[],
+            Some(&message),
+        );
+        return Err(message);
+    }
+    audit_cortana_runtime_mutation(
+        ctx,
+        "generation-migrated",
+        operation_id,
+        &requested,
+        &requested,
+        None,
+    );
+    Ok(())
+}
+
 fn cortana_reconcile_response(
     operation_id: &str,
     action: crate::cortana_reconcile::CortanaReconcileAction,
     durable: crate::cortana_reconcile::CortanaDurableIdentity,
     retired: Vec<String>,
+    quarantined: Vec<String>,
     reason: Option<String>,
 ) -> Value {
     json!({
@@ -15116,6 +15463,7 @@ fn cortana_reconcile_response(
         "providerSessionId": durable.provider_session_id,
         "recovery": durable.recovery,
         "retiredTerminalIds": retired,
+        "quarantinedTerminalIds": quarantined,
         "degradedReason": reason,
         "audited": true,
     })
@@ -15199,6 +15547,17 @@ fn reconcile_cortana_inner(
     }
     let plan = crate::cortana_reconcile::plan_reconciliation(&durable, operation_id, &candidates);
     if plan.action == crate::cortana_reconcile::CortanaReconcileAction::Degraded {
+        let quarantined = if plan.quarantine_terminal_ids.is_empty() {
+            Vec::new()
+        } else {
+            quarantine_cortana_runtimes(
+                ctx,
+                operation_id,
+                &plan.quarantine_terminal_ids,
+                &candidates,
+                &durable,
+            )?
+        };
         let reason = plan
             .degraded_reason
             .clone()
@@ -15209,8 +15568,26 @@ fn reconcile_cortana_inner(
             plan.action,
             ctx.captains.cortana_identity(),
             Vec::new(),
+            quarantined,
             Some(reason),
         ));
+    }
+
+    if let Some(candidate) = plan.authoritative.as_ref() {
+        if let Err(error) =
+            migrate_generation_zero_runtime(ctx, operation_id, candidate, &candidates)
+        {
+            let reason = format!("reconcile_cortana: {error}");
+            ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
+            return Ok(cortana_reconcile_response(
+                operation_id,
+                crate::cortana_reconcile::CortanaReconcileAction::Degraded,
+                ctx.captains.cortana_identity(),
+                Vec::new(),
+                Vec::new(),
+                Some(reason),
+            ));
+        }
     }
 
     for terminal_id in &plan.retire_terminal_ids {
@@ -15243,6 +15620,7 @@ fn reconcile_cortana_inner(
             plan.action,
             durable,
             plan.retire_terminal_ids,
+            Vec::new(),
             None,
         ));
     }
@@ -15440,6 +15818,7 @@ fn reconcile_cortana_inner(
         operation_id,
         plan.action,
         durable,
+        Vec::new(),
         Vec::new(),
         None,
     ))
@@ -22997,6 +23376,64 @@ fn parse_integration_contracts(
     .map_err(|error| format!("{command} integrationContracts are invalid: {error}"))
 }
 
+fn validate_dependency_result_ancestry(
+    snapshot: &CaptainsSnapshot,
+    project_id: &str,
+    dependencies: &BTreeSet<String>,
+    checkout: &str,
+    source_commit: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut satisfied = BTreeSet::new();
+    for dependency in dependencies {
+        let completed = snapshot
+            .agent_sessions
+            .iter()
+            .filter(|agent| agent.project_id == project_id)
+            .filter(|agent| {
+                agent
+                    .lane_claim
+                    .as_ref()
+                    .is_some_and(|lane| lane.lane_id == *dependency)
+            })
+            .filter(|agent| {
+                agent
+                    .delivery_states()
+                    .is_some_and(|states| states.complete)
+            })
+            .collect::<Vec<_>>();
+        if completed.is_empty() {
+            return Err(format!(
+                "start_agent: dependency '{dependency}' has no complete lane in project '{project_id}'"
+            ));
+        }
+
+        let mut result_commits = BTreeSet::new();
+        for agent in completed {
+            let resulting_commit = agent
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.resulting_commit.as_deref())
+                .ok_or_else(|| {
+                    format!(
+                        "start_agent: dependency '{dependency}' has complete delivery without an exact resulting commit"
+                    )
+                })?;
+            result_commits.insert(resulting_commit.to_string());
+        }
+        for resulting_commit in result_commits {
+            git::require_commit_ancestor(checkout, &resulting_commit, source_commit).map_err(
+                |error| {
+                    format!(
+                        "start_agent: dependency '{dependency}' result '{resulting_commit}' is not present in sourceCommit '{source_commit}': {error}"
+                    )
+                },
+            )?;
+        }
+        satisfied.insert(dependency.clone());
+    }
+    Ok(satisfied)
+}
+
 fn start_agent(
     ctx: &ControlContext,
     args: &Value,
@@ -23052,6 +23489,10 @@ fn start_agent(
     let mutable_schemas = string_set_arg(args, "mutableSchemas", "start_agent")?;
     let mutable_interfaces = string_set_arg(args, "mutableInterfaces", "start_agent")?;
     let integration_contracts = parse_integration_contracts(args, "start_agent")?;
+    let admission = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -23114,6 +23555,13 @@ fn start_agent(
             break candidate;
         }
     };
+    let satisfied_dependencies = validate_dependency_result_ancestry(
+        &snapshot,
+        &project.project_id,
+        &dependencies,
+        &checkout,
+        &source_commit,
+    )?;
     let lane_claim = crate::governor::LaneClaim {
         lane_id,
         owner_id: agent_session_id.clone(),
@@ -23122,17 +23570,6 @@ fn start_agent(
         mutable_schemas,
         mutable_interfaces,
     };
-    let satisfied_dependencies = snapshot
-        .agent_sessions
-        .iter()
-        .filter(|agent| agent.project_id == project.project_id)
-        .filter(|agent| {
-            agent
-                .delivery_states()
-                .is_some_and(|states| states.complete)
-        })
-        .filter_map(|agent| agent.lane_claim.as_ref().map(|lane| lane.lane_id.clone()))
-        .collect();
     let preflight = crate::governor::DispatchPreflight {
         requested_lanes: vec![lane_claim.clone()],
         active_lanes: active_dispatch_lanes(&snapshot, &project.project_id),
@@ -23150,6 +23587,8 @@ fn start_agent(
                 refusal.message
             )
         })?;
+    git::require_clean_exact_baseline(&checkout, &source_commit)
+        .map_err(|error| format!("start_agent: baseline changed during admission: {error}"))?;
     let now = now_ms();
     let record = AgentSessionRecord {
         agent_session_id: agent_session_id.clone(),
@@ -23179,6 +23618,9 @@ fn start_agent(
         updated_at: now,
     };
     ctx.captains.insert_agent_session(record)?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("start_agent_admitted");
+    drop(admission);
 
     let launch = crew_launch_argv(harness, &assignment);
     let mut spawn_args = json!({
@@ -24428,6 +24870,7 @@ impl ControlContext {
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
             dispatch_reservations: Arc::new(DispatchReservations::default()),
+            dispatch_admission: Arc::new(Mutex::new(())),
             fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
@@ -24672,10 +25115,15 @@ mod tests {
         reap_test_tmux_session(target).unwrap_or_else(|error| panic!("{error}"));
     }
 
-    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+    fn create_test_tmux_session_with_env(
+        target: &str,
+        cwd: &str,
+        command: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match tmux::new_session_with_env(target, "/tmp", None, &[]) {
+            match tmux::new_session_with_env(target, cwd, command, env) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.message == "server exited unexpectedly" => {
                     match tmux::session_liveness(target) {
@@ -24693,6 +25141,10 @@ mod tests {
                 Err(error) => return Err(error.to_string()),
             }
         }
+    }
+
+    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+        create_test_tmux_session_with_env(target, "/tmp", None, &[])
     }
 
     /// Serialize process-attestation fixtures and keep an anchor alive while a
@@ -25717,6 +26169,34 @@ mod tests {
             .preflight_dispatch(&request)
             .unwrap();
         (lane, capacity)
+    }
+
+    fn completed_delivery(
+        baseline: &str,
+        resulting_commit: &str,
+    ) -> crate::agent_session::DeliveryProvenance {
+        let mut delivery = crate::agent_session::DeliveryProvenance::new(baseline, false);
+        delivery
+            .record_implementation(resulting_commit.to_string())
+            .unwrap();
+        delivery
+            .record_review(crate::agent_session::ReviewEvidence {
+                commit: resulting_commit.to_string(),
+                reviewer_identity: "independent-reviewer".into(),
+                reference: "review://dependency".into(),
+                recorded_at: 2,
+            })
+            .unwrap();
+        delivery
+            .record_acceptance_test(crate::agent_session::AcceptanceTestEvidence {
+                commit: resulting_commit.to_string(),
+                runner_identity: "acceptance-runner".into(),
+                reference: "test://dependency".into(),
+                environment: crate::agent_session::AcceptanceEnvironment::Source,
+                recorded_at: 2,
+            })
+            .unwrap();
+        delivery
     }
 
     #[cfg(not(windows))]
@@ -31466,6 +31946,90 @@ mod tests {
         ctx.captains
             .record_crew("captain-delivery", "agent-delivery")
             .unwrap();
+        ctx.captains
+            .record_crew("captain-delivery", "agent-interface")
+            .unwrap();
+        ctx.captains
+            .record_crew("captain-delivery", "agent-incomplete")
+            .unwrap();
+        let mut interface_delivery = crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+        interface_delivery
+            .record_implementation("4444444444444444444444444444444444444444")
+            .unwrap();
+        interface_delivery
+            .record_review(crate::agent_session::ReviewEvidence {
+                commit: "4444444444444444444444444444444444444444".into(),
+                reviewer_identity: "reviewer-interface".into(),
+                reference: "review://interface".into(),
+                recorded_at: 2,
+            })
+            .unwrap();
+        interface_delivery
+            .record_acceptance_test(crate::agent_session::AcceptanceTestEvidence {
+                commit: "4444444444444444444444444444444444444444".into(),
+                runner_identity: "tester-interface".into(),
+                reference: "test://interface".into(),
+                environment: crate::agent_session::AcceptanceEnvironment::Source,
+                recorded_at: 2,
+            })
+            .unwrap();
+        let (interface_lane_claim, interface_dispatch_capacity) =
+            test_dispatch_evidence("shared-interface", "agent-interface");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-interface".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Define the shared interface".into(),
+                directory: "/tmp/project-delivery-interface".into(),
+                worktree_path: None,
+                branch: Some("shared-interface".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Exited,
+                work_stage: crate::agent_session::WorkStage::Complete,
+                delivery: Some(interface_delivery),
+                lane_claim: Some(interface_lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(interface_dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+        let mut incomplete_delivery =
+            crate::agent_session::DeliveryProvenance::new(BASELINE, false);
+        incomplete_delivery
+            .record_implementation("6666666666666666666666666666666666666666")
+            .unwrap();
+        let (incomplete_lane_claim, incomplete_dispatch_capacity) =
+            test_dispatch_evidence("incomplete-lane", "agent-incomplete");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-incomplete".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Incomplete lane".into(),
+                directory: "/tmp/project-delivery-incomplete".into(),
+                worktree_path: None,
+                branch: Some("incomplete-lane".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Idle,
+                work_stage: crate::agent_session::WorkStage::Working,
+                delivery: Some(incomplete_delivery),
+                lane_claim: Some(incomplete_lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(incomplete_dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
         let (lane_claim, dispatch_capacity) =
             test_dispatch_evidence("lane-delivery", "agent-delivery");
         ctx.captains
@@ -31502,6 +32066,7 @@ mod tests {
             .bind_tile(&captain_identity.id, "captain-delivery")
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let integration_owner_identity = captain.session_id.clone();
         let agent_identity = ctx
             .identity
             .mint_for(crate::identity::Role::Crew, Some("delivery-ship".into()))
@@ -31571,7 +32136,7 @@ mod tests {
         assert_eq!(complete["deliveryStates"]["installed"], false);
         assert_eq!(complete["agent"]["workStage"], "complete");
 
-        let integrated = dispatch_with_caller(
+        let missing_manifest = dispatch_with_caller(
             &ctx,
             "record_agent_delivery",
             &json!({
@@ -31587,10 +32152,185 @@ mod tests {
             Some(&captain),
             false,
         )
+        .unwrap_err();
+        assert!(missing_manifest.contains("manifest"));
+
+        let integration_evidence = |owner: &str| {
+            json!({
+                "sourceCommit": RESULT,
+                "canonicalBaseline": "main",
+                "canonicalCommit": CANONICAL,
+                "reference": "git://integration",
+                "manifest": {
+                    "integrationOwnerIdentity": owner,
+                    "inputs": [
+                        {
+                            "laneId": "shared-interface",
+                            "agentSessionId": "agent-interface",
+                            "sourceBaseline": BASELINE,
+                            "resultingCommit": "4444444444444444444444444444444444444444"
+                        },
+                        {
+                            "laneId": "lane-delivery",
+                            "agentSessionId": "agent-delivery",
+                            "sourceBaseline": BASELINE,
+                            "resultingCommit": RESULT
+                        }
+                    ]
+                }
+            })
+        };
+        let forged_owner = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": integration_evidence("forged-owner")
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(forged_owner.contains("authenticated actor identity"));
+
+        let mut invented_agent = integration_evidence(&integration_owner_identity);
+        invented_agent["manifest"]["inputs"][0]["agentSessionId"] = json!("invented-agent");
+        let invented_agent = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": invented_agent
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(invented_agent.contains("is not registered"));
+
+        let mut wrong_lane = integration_evidence(&integration_owner_identity);
+        wrong_lane["manifest"]["inputs"][0]["laneId"] = json!("invented-lane");
+        let wrong_lane = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": wrong_lane
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(wrong_lane.contains("does not match"));
+
+        let mut wrong_commits = integration_evidence(&integration_owner_identity);
+        wrong_commits["manifest"]["inputs"][0]["sourceBaseline"] =
+            json!("9999999999999999999999999999999999999999");
+        let wrong_commits = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": wrong_commits
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(wrong_commits.contains("commits do not match"));
+
+        let mut incomplete_input = integration_evidence(&integration_owner_identity);
+        incomplete_input["manifest"]["inputs"][0]["laneId"] = json!("incomplete-lane");
+        incomplete_input["manifest"]["inputs"][0]["agentSessionId"] = json!("agent-incomplete");
+        incomplete_input["manifest"]["inputs"][0]["resultingCommit"] =
+            json!("6666666666666666666666666666666666666666");
+        let incomplete_input = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": incomplete_input
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(incomplete_input.contains("is not complete"));
+
+        let integrated = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": integration_evidence(&integration_owner_identity)
+            }),
+            Some(&captain),
+            false,
+        )
         .unwrap();
         assert_eq!(integrated["deliveryStates"]["complete"], true);
         assert_eq!(integrated["deliveryStates"]["integrated"], true);
         assert_eq!(integrated["deliveryStates"]["packaged"], false);
+        assert_eq!(
+            integrated["agent"]["delivery"]["integration"]["manifest"]["inputs"][0]["laneId"],
+            "shared-interface"
+        );
+        let integration_recorded_at = integrated["agent"]["delivery"]["integration"]["recordedAt"]
+            .as_u64()
+            .unwrap();
+
+        let missing_artifact_manifest = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "packaged",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "sourceBaseline": CANONICAL,
+                    "reference": "artifact://windows/installer"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(missing_artifact_manifest.contains("manifest"));
+
+        let packaged = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "packaged",
+                "evidence": {
+                    "artifactId": "installer-1",
+                    "sourceBaseline": CANONICAL,
+                    "reference": "artifact://windows/installer",
+                    "manifest": {
+                        "branch": "main",
+                        "sourceCommit": CANONICAL,
+                        "gitTree": "5555555555555555555555555555555555555555",
+                        "version": "0.3.107",
+                        "installerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "builtAt": integration_recorded_at,
+                        "signatureStatus": "verified"
+                    }
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(packaged["deliveryStates"]["integrated"], true);
+        assert_eq!(packaged["deliveryStates"]["packaged"], true);
+        assert_eq!(packaged["deliveryStates"]["installed"], false);
 
         let status = get_agent(
             &ctx,
@@ -31601,6 +32341,7 @@ mod tests {
         .unwrap();
         assert_eq!(status["deliveryStates"]["complete"], true);
         assert_eq!(status["deliveryStates"]["integrated"], true);
+        assert_eq!(status["deliveryStates"]["packaged"], true);
         assert_eq!(status["deliveryStates"]["liveVerified"], false);
         let events = agent_events(
             &ctx,
@@ -31686,6 +32427,252 @@ mod tests {
     }
 
     #[test]
+    fn start_agent_rejects_dependency_result_missing_from_source_baseline() {
+        let ctx = test_ctx("dependency-ancestry");
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let initial_commit = exact_head(&worktree);
+        std::fs::write(worktree.join("source.txt"), "dependent source\n").unwrap();
+        let worktree_path = worktree.to_string_lossy().to_string();
+        let run = |cwd: &str, args: &[&str]| {
+            let (ok, stdout, stderr) = git::run_git_for_test(cwd, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        run(&worktree_path, &["add", "source.txt"]);
+        run(
+            &worktree_path,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "dependent source",
+            ],
+        );
+        let source_commit = exact_head(&worktree);
+
+        let repo_path = repo_root.to_string_lossy().to_string();
+        std::fs::write(repo_root.join("dependency.txt"), "dependency result\n").unwrap();
+        run(&repo_path, &["add", "dependency.txt"]);
+        run(
+            &repo_path,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "divergent dependency result",
+            ],
+        );
+        let dependency_result = exact_head(&repo_root);
+
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-dependency".into(),
+                name: "Dependency Project".into(),
+                repo_root: repo_path,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-dependency", Some("captain-dependency"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-dependency",
+                "project-dependency",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+        let (lane_claim, dispatch_capacity) =
+            test_dispatch_evidence("dependency-lane", "dependency-agent");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "dependency-agent".into(),
+                captain_session_id: "captain-dependency".into(),
+                project_id: "project-dependency".into(),
+                assignment: "Build dependency".into(),
+                directory: repo_root.to_string_lossy().to_string(),
+                worktree_path: None,
+                branch: Some("main".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Exited,
+                work_stage: crate::agent_session::WorkStage::Complete,
+                delivery: Some(completed_delivery(&initial_commit, &dependency_result)),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+
+        let mut ancestor_snapshot = ctx.captains.snapshot();
+        ancestor_snapshot.agent_sessions[0].delivery =
+            Some(completed_delivery(&initial_commit, &initial_commit));
+        assert_eq!(
+            validate_dependency_result_ancestry(
+                &ancestor_snapshot,
+                "project-dependency",
+                &BTreeSet::from(["dependency-lane".to_string()]),
+                &worktree_path,
+                &source_commit,
+            )
+            .unwrap(),
+            BTreeSet::from(["dependency-lane".to_string()])
+        );
+
+        let error = start_agent(
+            &ctx,
+            &json!({
+                "requestId": "dependency-ancestry-rejected",
+                "captainSessionId": "captain-dependency",
+                "assignment": "Build dependent lane",
+                "directory": worktree_path,
+                "sourceCommit": source_commit,
+                "visibleProductBug": false,
+                "laneId": "dependent-lane",
+                "dependencies": ["dependency-lane"],
+                "mutableFiles": ["src/dependent.rs"],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": []
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("dependency-lane"), "got: {error}");
+        assert!(
+            error.contains("not present in sourceCommit"),
+            "got: {error}"
+        );
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn concurrent_start_agent_admission_cannot_double_claim_a_checkout() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "concurrent_start_agent_admission_cannot_double_claim_a_checkout: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("atomic-start-agent").with_apply_sink(sink);
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let checkout = worktree.to_string_lossy().to_string();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-atomic-start".into(),
+                name: "Atomic Start Project".into(),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-atomic-start", Some("captain-atomic-start"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-atomic-start",
+                "project-atomic-start",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+
+        let args = json!({
+            "requestId": "atomic-start-first",
+            "captainSessionId": "captain-atomic-start",
+            "assignment": "Own the shared checkout",
+            "directory": checkout,
+            "harness": "codex",
+            "sourceCommit": source_commit,
+            "visibleProductBug": false,
+            "laneId": "atomic-lane-first",
+            "dependencies": [],
+            "mutableFiles": ["src/shared.rs"],
+            "mutableSchemas": [],
+            "mutableInterfaces": [],
+            "integrationContracts": []
+        });
+        let (reached, wait_for_admission) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_start) = std::sync::mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "start_agent_admitted",
+            reached,
+            resume: continue_start,
+        }));
+        let first_ctx = ctx.clone();
+        let first_args = args.clone();
+        let first = std::thread::spawn(move || start_agent(&first_ctx, &first_args, None, true));
+        assert_eq!(
+            wait_for_admission
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first start did not reach durable admission"),
+            "start_agent_admitted"
+        );
+        assert!(ctx.dispatch_admission.try_lock().is_err());
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+
+        let mut second_args = args;
+        second_args["requestId"] = json!("atomic-start-second");
+        second_args["laneId"] = json!("atomic-lane-second");
+        let second_ctx = ctx.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = start_agent(&second_ctx, &second_args, None, true);
+            finished_tx.send(result).unwrap();
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        resume.send(()).unwrap();
+        let first_result = first.join().unwrap().unwrap();
+        let second_error = finished_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        second.join().unwrap();
+        assert!(
+            second_error.contains("already owned"),
+            "got: {second_error}"
+        );
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        let agent_session_id = first_result["agentSessionId"].as_str().unwrap();
+        reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn start_agent_persists_before_a_launch_failure_and_records_unavailable() {
         let ctx = test_ctx("secret");
         let (base, repo_root, worktree) = scratch_repo_with_worktree();
@@ -31722,7 +32709,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-failure",
                 "dependencies": [],
-                "mutableFiles": ["src"],
+                "mutableFiles": ["src/start-failure.rs"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
@@ -31798,7 +32785,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-success",
                 "dependencies": [],
-                "mutableFiles": ["src"],
+                "mutableFiles": ["src/start-success.rs"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
@@ -32807,6 +33794,379 @@ mod tests {
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn duplicate_cortana_runtimes_are_quarantined_and_next_reconcile_recovers() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-quarantine-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut ctx = test_ctx("cortana-quarantine")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.addr = "127.0.0.1:4244".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-quarantine-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let mut terminal_ids = (0..2)
+            .map(|_| uuid::Uuid::new_v4().simple().to_string()[..8].to_string())
+            .collect::<Vec<_>>();
+        ctx.identity
+            .bind_tile(&identity.id, &terminal_ids[0])
+            .unwrap();
+        let environment = vec![
+            ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+            (
+                crate::identity::SESSION_TOKEN_ENV.into(),
+                identity.secret.clone(),
+            ),
+            (CORTANA_GENERATION_ENV.into(), "7".into()),
+        ];
+        for terminal_id in &terminal_ids {
+            let target = exact_cortana_tmux_target(terminal_id).unwrap();
+            create_test_tmux_session_with_env(
+                &target,
+                home.to_str().unwrap(),
+                Some(&harness_command),
+                &environment,
+            )
+            .unwrap();
+            wait_for_harness_started(terminal_id, "codex").unwrap();
+        }
+        terminal_ids.sort();
+
+        let degraded = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-quarantine-1",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(degraded["action"], "degraded");
+        assert_eq!(degraded["healthy"], false);
+        assert_eq!(
+            degraded["quarantinedTerminalIds"],
+            serde_json::to_value(&terminal_ids).unwrap()
+        );
+        assert!(terminal_ids
+            .iter()
+            .all(|terminal_id| tmux::session_liveness(
+                &exact_cortana_tmux_target(terminal_id).unwrap()
+            ) == tmux::SessionLiveness::Gone));
+        assert!(ctx.captains.cortana_identity().identity_id.is_none());
+        assert!(ctx.identity.resolve(&identity.secret).is_none());
+        let quarantine_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "quarantined")
+            .expect("duplicate quarantine must have a distinct audit record");
+        assert_eq!(
+            quarantine_audit["args"]["quarantinedTerminalIds"],
+            serde_json::to_value(&terminal_ids).unwrap()
+        );
+        assert_eq!(quarantine_audit["args"]["authorityClaimed"], false);
+
+        let recovered = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-quarantine-2",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "create");
+        assert_eq!(recovered["healthy"], true);
+        assert_eq!(recovered["generation"], 1);
+        assert!(recovered["identityId"].as_str().is_some());
+        assert_ne!(recovered["identityId"], identity.id);
+        let recovered_terminal = recovered["terminalId"].as_str().unwrap();
+        dispatch(
+            &ctx,
+            "close_terminal",
+            &json!({ "sessionId": recovered_terminal }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn quarantine_revokes_candidate_identities_except_the_durable_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-identity-quarantine-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-identity-quarantine")
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        let durable_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let foreign_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let durable_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let foreign_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity
+            .bind_tile(&durable_identity.id, &durable_terminal)
+            .unwrap();
+        ctx.identity
+            .bind_tile(&foreign_identity.id, &foreign_terminal)
+            .unwrap();
+        for terminal_id in [&durable_terminal, &foreign_terminal] {
+            create_test_tmux_session(&exact_cortana_tmux_target(terminal_id).unwrap()).unwrap();
+        }
+        let candidates = vec![
+            crate::cortana_reconcile::CortanaRuntimeCandidate {
+                terminal_id: durable_terminal.clone(),
+                identity_id: Some(durable_identity.id.clone()),
+                generation: 4,
+                harness: "codex".into(),
+                provider_session_id: None,
+                terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                current_control_capability: true,
+                trusted_cortana_identity: true,
+            },
+            crate::cortana_reconcile::CortanaRuntimeCandidate {
+                terminal_id: foreign_terminal.clone(),
+                identity_id: Some(foreign_identity.id.clone()),
+                generation: 4,
+                harness: "codex".into(),
+                provider_session_id: None,
+                terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                current_control_capability: true,
+                trusted_cortana_identity: true,
+            },
+        ];
+        let durable = crate::cortana_reconcile::CortanaDurableIdentity {
+            identity_id: Some(durable_identity.id.clone()),
+            generation: 4,
+            terminal_id: Some(durable_terminal.clone()),
+            harness: Some("codex".into()),
+            ..Default::default()
+        };
+        let requested = vec![durable_terminal, foreign_terminal];
+
+        let quarantined = quarantine_cortana_runtimes(
+            &ctx,
+            "cortana-identity-quarantine-1",
+            &requested,
+            &candidates,
+            &durable,
+        )
+        .unwrap();
+
+        let mut expected = requested;
+        expected.sort();
+        assert_eq!(quarantined, expected);
+        assert!(ctx.identity.resolve(&durable_identity.secret).is_some());
+        assert!(ctx.identity.resolve(&foreign_identity.secret).is_none());
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn generation_zero_cortana_is_migrated_in_tmux_before_adoption() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-generation")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        let target = exact_cortana_tmux_target(&terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    identity.secret.clone(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "0".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+
+        let adopted = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-1",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(adopted["action"], "adopt");
+        assert_eq!(adopted["healthy"], true);
+        assert_eq!(adopted["generation"], 1);
+        assert_eq!(adopted["identityId"], identity.id);
+        assert_eq!(adopted["terminalId"], terminal_id);
+        assert_eq!(
+            tmux::session_environment(&target, CORTANA_GENERATION_ENV).unwrap(),
+            Some("1".into())
+        );
+        let migration_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "generation-migrated")
+            .expect("generation migration must have a distinct audit record");
+        assert_eq!(
+            migration_audit["args"]["migratedTerminalIds"],
+            json!([terminal_id])
+        );
+        assert_eq!(migration_audit["args"]["authorityClaimed"], false);
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn generation_zero_update_failure_is_degraded_without_claiming_authority() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-failure-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-generation-failure")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-failure-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        let target = exact_cortana_tmux_target(&terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    identity.secret.clone(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "0".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+        tmux::fail_next_session_environment_set_for(&target);
+
+        let degraded = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-failure-1",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(degraded["action"], "degraded");
+        assert_eq!(degraded["healthy"], false);
+        assert!(degraded["degradedReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("could not be migrated before authority claim")));
+        assert_eq!(
+            tmux::session_environment(&target, CORTANA_GENERATION_ENV).unwrap(),
+            Some("0".into())
+        );
+        let durable = ctx.captains.cortana_identity();
+        assert!(durable.identity_id.is_none());
+        assert_eq!(durable.generation, 0);
+        assert!(matches!(
+            durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Degraded { .. }
+        ));
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        let failed_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "generation-migration-failed")
+            .expect("failed generation migration must have a distinct audit record");
+        assert_eq!(failed_audit["args"]["authorityClaimed"], false);
+
+        let recovered = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-failure-2",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "adopt");
+        assert_eq!(recovered["generation"], 1);
+        assert_eq!(recovered["identityId"], identity.id);
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
     }
 
     #[test]
@@ -36924,26 +38284,45 @@ mod tests {
         // A POSIX-absolute HOME (WSL-launched app) is used verbatim.
         assert_eq!(
             crew_gh_config_dir_from_home(Some("/home/natkins")),
-            "/home/natkins/.t-hub/crew-gh-empty"
+            format!("/home/natkins/{CREW_GH_CONFIG_SUBDIR}")
         );
         // A trailing slash is normalized (no doubled `//`).
         assert_eq!(
             crew_gh_config_dir_from_home(Some("/home/natkins/")),
-            "/home/natkins/.t-hub/crew-gh-empty"
+            format!("/home/natkins/{CREW_GH_CONFIG_SUBDIR}")
         );
         // A Windows USERPROFILE-style value is REJECTED (the crux of the bug): it
         // falls back to a fixed POSIX path, never a backslash/drive path.
         for windows_home in [r"C:\Users\natha", r"C:\Users\natha\", r"D:\home"] {
             let dir = crew_gh_config_dir_from_home(Some(windows_home));
-            assert_eq!(dir, "/tmp/.t-hub/crew-gh-empty");
+            assert_eq!(dir, format!("/tmp/{CREW_GH_CONFIG_SUBDIR}"));
             assert!(!dir.contains('\\'), "no backslash: {dir}");
             assert!(!dir.contains(":\\"), "no drive path: {dir}");
         }
         // An absent HOME also falls back to the POSIX path (native-Windows launch).
         assert_eq!(
             crew_gh_config_dir_from_home(None),
-            "/tmp/.t-hub/crew-gh-empty"
+            format!("/tmp/{CREW_GH_CONFIG_SUBDIR}")
         );
+    }
+
+    #[test]
+    fn orchestrator_home_is_scoped_and_rejects_traversal() {
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", None).unwrap(),
+            format!("/home/tester/{CORTANA_HOME_DEFAULT}")
+        );
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", Some(".t-hub-dev/custom-orchestrator"))
+                .unwrap(),
+            "/home/tester/.t-hub-dev/custom-orchestrator"
+        );
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", Some("/srv/t-hub/cortana")).unwrap(),
+            "/srv/t-hub/cortana"
+        );
+        assert!(resolve_orchestrator_home("/home/tester", Some("../production")).is_err());
+        assert!(resolve_orchestrator_home("/home/tester", Some(r"C:\production")).is_err());
     }
 
     #[test]

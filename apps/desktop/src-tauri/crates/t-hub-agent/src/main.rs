@@ -76,7 +76,7 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 struct Args {
     /// Which mode to run in.
     mode: Mode,
-    /// Override the journal directory (default: `~/.t-hub/journal`).
+    /// Override the journal directory (then `T_HUB_AGENT_JOURNAL_DIR`, then `~/.t-hub/journal`).
     journal_dir: Option<String>,
 }
 

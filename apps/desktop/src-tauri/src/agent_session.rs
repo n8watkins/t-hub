@@ -6,10 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 pub const MAX_ASSIGNMENT_BYTES: usize = 16 * 1024;
 pub const MAX_CHECKPOINT_BYTES: usize = 4 * 1024;
 pub const MAX_EVIDENCE_REFERENCE_BYTES: usize = 16 * 1024;
+pub const MAX_INTEGRATION_INPUTS: usize = 256;
+pub const MAX_INTEGRATION_ID_BYTES: usize = 1024;
 pub const MAX_EVENT_BATCH: usize = 128;
 pub const MAX_CHECKPOINT_HISTORY: usize = 4096;
 
@@ -95,6 +98,78 @@ pub struct AcceptanceTestEvidence {
     pub recorded_at: u64,
 }
 
+/// One ordered lane input incorporated by an integration owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntegrationInput {
+    pub lane_id: String,
+    pub agent_session_id: String,
+    pub source_baseline: String,
+    pub resulting_commit: String,
+}
+
+/// The complete ordered set of lane commits used to produce an integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IntegrationManifest {
+    pub integration_owner_identity: String,
+    pub inputs: Vec<IntegrationInput>,
+}
+
+impl IntegrationManifest {
+    pub(crate) fn validate_for_source_commit(&self, source_commit: &str) -> Result<(), String> {
+        validate_bounded_identifier(
+            "integration.manifest.integrationOwnerIdentity",
+            &self.integration_owner_identity,
+        )?;
+        if self.inputs.is_empty() {
+            return Err("delivery provenance integration.manifest.inputs must not be empty".into());
+        }
+        if self.inputs.len() > MAX_INTEGRATION_INPUTS {
+            return Err(format!(
+                "delivery provenance integration.manifest.inputs must contain at most {MAX_INTEGRATION_INPUTS} entries"
+            ));
+        }
+
+        let mut lane_ids = BTreeSet::new();
+        let mut agent_session_ids = BTreeSet::new();
+        let mut contains_source_commit = false;
+        for (index, input) in self.inputs.iter().enumerate() {
+            let prefix = format!("integration.manifest.inputs[{index}]");
+            validate_bounded_identifier(&format!("{prefix}.laneId"), &input.lane_id)?;
+            validate_bounded_identifier(
+                &format!("{prefix}.agentSessionId"),
+                &input.agent_session_id,
+            )?;
+            validate_commit(&format!("{prefix}.sourceBaseline"), &input.source_baseline)?;
+            validate_commit(
+                &format!("{prefix}.resultingCommit"),
+                &input.resulting_commit,
+            )?;
+            if !lane_ids.insert(input.lane_id.as_str()) {
+                return Err(format!(
+                    "delivery provenance integration.manifest laneId '{}' must be unique",
+                    input.lane_id
+                ));
+            }
+            if !agent_session_ids.insert(input.agent_session_id.as_str()) {
+                return Err(format!(
+                    "delivery provenance integration.manifest agentSessionId '{}' must be unique",
+                    input.agent_session_id
+                ));
+            }
+            contains_source_commit |= input.resulting_commit == source_commit;
+        }
+        if !contains_source_commit {
+            return Err(
+                "delivery provenance integration.manifest must contain an input whose resultingCommit equals integration.sourceCommit"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IntegrationEvidence {
@@ -103,6 +178,31 @@ pub struct IntegrationEvidence {
     pub canonical_commit: String,
     pub reference: String,
     pub recorded_at: u64,
+    /// Missing only on integration evidence written before manifests were required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<IntegrationManifest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ArtifactSignatureStatus {
+    Unsigned,
+    SignedUnverified,
+    Verified,
+}
+
+/// Immutable build facts that bind an installer to its exact source and output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactManifest {
+    pub branch: String,
+    pub source_commit: String,
+    pub git_tree: String,
+    pub version: String,
+    pub installer_sha256: String,
+    /// Unix epoch milliseconds at build completion.
+    pub built_at: u64,
+    pub signature_status: ArtifactSignatureStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +212,57 @@ pub struct ArtifactEvidence {
     pub source_baseline: String,
     pub reference: String,
     pub recorded_at: u64,
+    /// Missing only on artifact evidence written before build manifests were required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<ArtifactManifest>,
+}
+
+impl ArtifactEvidence {
+    fn validate_complete_manifest(&self, integration: &IntegrationEvidence) -> Result<(), String> {
+        let manifest = self
+            .manifest
+            .as_ref()
+            .ok_or("new artifact evidence requires artifact.manifest")?;
+        validate_commit("artifact.sourceBaseline", &self.source_baseline)?;
+        validate_bounded_identifier("artifact.manifest.branch", &manifest.branch)?;
+        if manifest.branch != integration.canonical_baseline {
+            return Err(
+                "delivery provenance artifact.manifest.branch must equal integration.canonicalBaseline"
+                    .into(),
+            );
+        }
+        validate_commit("artifact.manifest.sourceCommit", &manifest.source_commit)?;
+        if self.source_baseline != integration.canonical_commit
+            || manifest.source_commit != integration.canonical_commit
+        {
+            return Err(
+                "delivery provenance artifact sourceBaseline and manifest.sourceCommit must equal integration.canonicalCommit"
+                    .into(),
+            );
+        }
+        validate_git_object("artifact.manifest.gitTree", &manifest.git_tree)?;
+        validate_bounded_identifier("artifact.manifest.version", &manifest.version)?;
+        validate_sha256(
+            "artifact.manifest.installerSha256",
+            &manifest.installer_sha256,
+        )?;
+        if manifest.built_at == 0 {
+            return Err("delivery provenance artifact.manifest.builtAt must be positive".into());
+        }
+        if manifest.built_at < integration.recorded_at {
+            return Err(
+                "delivery provenance artifact.manifest.builtAt must not precede integration.recordedAt"
+                    .into(),
+            );
+        }
+        if manifest.built_at > self.recorded_at {
+            return Err(
+                "delivery provenance artifact.manifest.builtAt must not follow artifact.recordedAt"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +368,9 @@ impl DeliveryProvenance {
                     && !integration.canonical_baseline.trim().is_empty()
                     && validate_commit("integration.canonicalCommit", &integration.canonical_commit).is_ok()
                     && validate_reference("integration.reference", &integration.reference).is_ok()
+                    && integration.manifest.as_ref().is_some_and(|manifest|
+                        manifest.validate_for_source_commit(&integration.source_commit).is_ok()
+                    )
                     && integration.recorded_at >= completed_at
         );
         let packaged = matches!(
@@ -226,6 +380,7 @@ impl DeliveryProvenance {
                     && !artifact.artifact_id.trim().is_empty()
                     && artifact.source_baseline == integration.canonical_commit
                     && validate_reference("artifact.reference", &artifact.reference).is_ok()
+                    && artifact.validate_complete_manifest(integration).is_ok()
                     && artifact.recorded_at >= integration.recorded_at
         );
         let installed = matches!(
@@ -306,6 +461,11 @@ impl DeliveryProvenance {
     }
 
     pub fn record_integration(&mut self, evidence: IntegrationEvidence) -> Result<(), String> {
+        evidence
+            .manifest
+            .as_ref()
+            .ok_or("new integration evidence requires integration.manifest")?
+            .validate_for_source_commit(&evidence.source_commit)?;
         let mut next = self.clone();
         set_once(&mut next.integration, evidence, "integrated")?;
         next.validate()?;
@@ -314,6 +474,17 @@ impl DeliveryProvenance {
     }
 
     pub fn record_artifact(&mut self, evidence: ArtifactEvidence) -> Result<(), String> {
+        if !self.states().integrated {
+            return Err(
+                "delivery provenance cannot be packaged before it has valid integration evidence"
+                    .into(),
+            );
+        }
+        let integration = self
+            .integration
+            .as_ref()
+            .ok_or("delivery provenance cannot be packaged before it is integrated")?;
+        evidence.validate_complete_manifest(integration)?;
         let mut next = self.clone();
         set_once(&mut next.artifact, evidence, "packaged")?;
         next.validate()?;
@@ -422,6 +593,9 @@ impl DeliveryProvenance {
             )?;
             validate_commit("integration.canonicalCommit", &integration.canonical_commit)?;
             validate_reference("integration.reference", &integration.reference)?;
+            if let Some(manifest) = &integration.manifest {
+                manifest.validate_for_source_commit(&integration.source_commit)?;
+            }
             let completed_at = self
                 .independent_review
                 .as_ref()
@@ -467,6 +641,9 @@ impl DeliveryProvenance {
                 }
             }
             validate_reference("artifact.reference", &artifact.reference)?;
+            if artifact.manifest.is_some() {
+                artifact.validate_complete_manifest(integration)?;
+            }
             if artifact.recorded_at < integration.recorded_at {
                 return Err("artifact.recordedAt must not precede integration evidence".into());
             }
@@ -553,6 +730,16 @@ fn validate_nonempty(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_bounded_identifier(field: &str, value: &str) -> Result<(), String> {
+    validate_nonempty(field, value)?;
+    if value.len() > MAX_INTEGRATION_ID_BYTES {
+        return Err(format!(
+            "delivery provenance {field} must be at most {MAX_INTEGRATION_ID_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_reference(field: &str, value: &str) -> Result<(), String> {
     validate_nonempty(field, value)?;
     if value.len() > MAX_EVIDENCE_REFERENCE_BYTES {
@@ -567,6 +754,24 @@ fn validate_commit(field: &str, commit: &str) -> Result<(), String> {
     if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!(
             "delivery provenance {field} must be an exact 40- or 64-character Git commit"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_object(field: &str, value: &str) -> Result<(), String> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "delivery provenance {field} must be an exact 40- or 64-character hexadecimal Git object ID"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(field: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "delivery provenance {field} must be an exact 64-character hexadecimal SHA-256"
         ));
     }
     Ok(())
@@ -768,6 +973,7 @@ mod tests {
     const SOURCE_BASELINE: &str = "1111111111111111111111111111111111111111";
     const RESULT_COMMIT: &str = "2222222222222222222222222222222222222222";
     const CANONICAL_COMMIT: &str = "3333333333333333333333333333333333333333";
+    const OTHER_RESULT_COMMIT: &str = "4444444444444444444444444444444444444444";
 
     fn record() -> AgentSessionRecord {
         AgentSessionRecord {
@@ -868,6 +1074,23 @@ mod tests {
             canonical_commit: CANONICAL_COMMIT.into(),
             reference: "git://main/integration".into(),
             recorded_at: 22,
+            manifest: Some(IntegrationManifest {
+                integration_owner_identity: "integration-owner-1".into(),
+                inputs: vec![
+                    IntegrationInput {
+                        lane_id: "shared-interface".into(),
+                        agent_session_id: "agent-interface".into(),
+                        source_baseline: SOURCE_BASELINE.into(),
+                        resulting_commit: OTHER_RESULT_COMMIT.into(),
+                    },
+                    IntegrationInput {
+                        lane_id: "implementation".into(),
+                        agent_session_id: "agent-implementation".into(),
+                        source_baseline: SOURCE_BASELINE.into(),
+                        resulting_commit: RESULT_COMMIT.into(),
+                    },
+                ],
+            }),
         }
     }
 
@@ -877,6 +1100,16 @@ mod tests {
             source_baseline: CANONICAL_COMMIT.into(),
             reference: "artifact://windows/release".into(),
             recorded_at: 23,
+            manifest: Some(ArtifactManifest {
+                branch: "main".into(),
+                source_commit: CANONICAL_COMMIT.into(),
+                git_tree: "5555555555555555555555555555555555555555".into(),
+                version: "0.3.107".into(),
+                installer_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                built_at: 22,
+                signature_status: ArtifactSignatureStatus::Verified,
+            }),
         }
     }
 
@@ -963,7 +1196,171 @@ mod tests {
         assert_eq!(value["sourceBaseline"], SOURCE_BASELINE);
         assert_eq!(value["resultingCommit"], RESULT_COMMIT);
         assert_eq!(value["integration"]["canonicalCommit"], CANONICAL_COMMIT);
+        assert_eq!(
+            value["integration"]["manifest"]["inputs"][0]["laneId"],
+            "shared-interface"
+        );
+        assert_eq!(
+            value["integration"]["manifest"]["inputs"][1]["laneId"],
+            "implementation"
+        );
+        assert_eq!(value["artifact"]["manifest"]["branch"], "main");
+        assert_eq!(value["artifact"]["manifest"]["signatureStatus"], "verified");
         assert_eq!(value["liveVerification"]["verifierKind"], "aiAgent");
+    }
+
+    #[test]
+    fn legacy_integration_without_a_manifest_loads_but_is_not_integrated() {
+        let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, false);
+        delivery.record_implementation(RESULT_COMMIT).unwrap();
+        delivery.record_review(review()).unwrap();
+        delivery.record_acceptance_test(source_test()).unwrap();
+        delivery.record_integration(integration()).unwrap();
+        let mut value = serde_json::to_value(delivery).unwrap();
+        value["integration"]
+            .as_object_mut()
+            .unwrap()
+            .remove("manifest");
+
+        let legacy: DeliveryProvenance = serde_json::from_value(value).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.states().complete);
+        assert!(!legacy.states().integrated);
+        assert!(legacy.integration.unwrap().manifest.is_none());
+    }
+
+    #[test]
+    fn new_integrations_require_a_valid_complete_ordered_manifest() {
+        let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, false);
+        delivery.record_implementation(RESULT_COMMIT).unwrap();
+        delivery.record_review(review()).unwrap();
+        delivery.record_acceptance_test(source_test()).unwrap();
+
+        let mut missing = integration();
+        missing.manifest = None;
+        assert!(delivery.record_integration(missing).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut empty = integration();
+        empty.manifest.as_mut().unwrap().inputs.clear();
+        assert!(delivery.record_integration(empty).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut duplicate_lane = integration();
+        duplicate_lane.manifest.as_mut().unwrap().inputs[1].lane_id = "shared-interface".into();
+        assert!(delivery.record_integration(duplicate_lane).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut duplicate_agent = integration();
+        duplicate_agent.manifest.as_mut().unwrap().inputs[1].agent_session_id =
+            "agent-interface".into();
+        assert!(delivery.record_integration(duplicate_agent).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut malformed_commit = integration();
+        malformed_commit.manifest.as_mut().unwrap().inputs[0].source_baseline = "main".into();
+        assert!(delivery.record_integration(malformed_commit).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut missing_source = integration();
+        missing_source.manifest.as_mut().unwrap().inputs[1].resulting_commit =
+            CANONICAL_COMMIT.into();
+        assert!(delivery.record_integration(missing_source).is_err());
+        assert!(delivery.integration.is_none());
+
+        let mut oversized = integration();
+        let input = oversized.manifest.as_ref().unwrap().inputs[0].clone();
+        oversized.manifest.as_mut().unwrap().inputs = vec![input; MAX_INTEGRATION_INPUTS + 1];
+        assert!(delivery.record_integration(oversized).is_err());
+        assert!(delivery.integration.is_none());
+
+        delivery.record_integration(integration()).unwrap();
+        assert!(delivery.states().integrated);
+    }
+
+    #[test]
+    fn legacy_artifact_without_a_manifest_loads_but_is_not_packaged() {
+        let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, false);
+        delivery.record_implementation(RESULT_COMMIT).unwrap();
+        delivery.record_review(review()).unwrap();
+        delivery.record_acceptance_test(source_test()).unwrap();
+        delivery.record_integration(integration()).unwrap();
+        delivery.record_artifact(artifact()).unwrap();
+        let mut value = serde_json::to_value(delivery).unwrap();
+        value["artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("manifest");
+
+        let legacy: DeliveryProvenance = serde_json::from_value(value).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.states().integrated);
+        assert!(!legacy.states().packaged);
+        assert!(legacy.artifact.unwrap().manifest.is_none());
+    }
+
+    #[test]
+    fn new_artifacts_require_complete_exact_build_provenance() {
+        let sha256_source = "b".repeat(64);
+        let mut sha256_integration = integration();
+        sha256_integration.canonical_commit = sha256_source.clone();
+        let mut sha256_artifact = artifact();
+        sha256_artifact.source_baseline = sha256_source.clone();
+        sha256_artifact.manifest.as_mut().unwrap().source_commit = sha256_source;
+        sha256_artifact.manifest.as_mut().unwrap().git_tree = "c".repeat(64);
+        sha256_artifact
+            .validate_complete_manifest(&sha256_integration)
+            .unwrap();
+
+        let mut delivery = DeliveryProvenance::new(SOURCE_BASELINE, false);
+        delivery.record_implementation(RESULT_COMMIT).unwrap();
+        delivery.record_review(review()).unwrap();
+        delivery.record_acceptance_test(source_test()).unwrap();
+        delivery.record_integration(integration()).unwrap();
+
+        let mut missing = artifact();
+        missing.manifest = None;
+        assert!(delivery.record_artifact(missing).is_err());
+        assert!(delivery.artifact.is_none());
+
+        let mut wrong_branch = artifact();
+        wrong_branch.manifest.as_mut().unwrap().branch = "release".into();
+        assert!(delivery.record_artifact(wrong_branch).is_err());
+
+        let mut wrong_source = artifact();
+        wrong_source.manifest.as_mut().unwrap().source_commit = RESULT_COMMIT.into();
+        assert!(delivery.record_artifact(wrong_source).is_err());
+
+        let mut short_tree = artifact();
+        short_tree.manifest.as_mut().unwrap().git_tree = "5".repeat(39);
+        assert!(delivery.record_artifact(short_tree).is_err());
+
+        let mut short_installer_hash = artifact();
+        short_installer_hash
+            .manifest
+            .as_mut()
+            .unwrap()
+            .installer_sha256 = "a".repeat(63);
+        assert!(delivery.record_artifact(short_installer_hash).is_err());
+
+        let mut non_hex_installer_hash = artifact();
+        non_hex_installer_hash
+            .manifest
+            .as_mut()
+            .unwrap()
+            .installer_sha256 = "z".repeat(64);
+        assert!(delivery.record_artifact(non_hex_installer_hash).is_err());
+
+        let mut future_build = artifact();
+        future_build.manifest.as_mut().unwrap().built_at = future_build.recorded_at + 1;
+        assert!(delivery.record_artifact(future_build).is_err());
+
+        let mut pre_integration_build = artifact();
+        pre_integration_build.manifest.as_mut().unwrap().built_at = integration().recorded_at - 1;
+        assert!(delivery.record_artifact(pre_integration_build).is_err());
+
+        delivery.record_artifact(artifact()).unwrap();
+        assert!(delivery.states().packaged);
     }
 
     #[test]

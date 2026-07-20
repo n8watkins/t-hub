@@ -252,3 +252,99 @@ fn start_sends_the_exact_baseline_and_adaptive_lane_contract() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn delivery_forwards_the_ordered_integration_manifest_without_rewriting_it() {
+    let baseline = "a".repeat(40);
+    let interface_commit = "b".repeat(40);
+    let result_commit = "c".repeat(40);
+    let canonical_commit = "d".repeat(40);
+    let evidence = serde_json::json!({
+        "sourceCommit": result_commit,
+        "canonicalBaseline": "main",
+        "canonicalCommit": canonical_commit,
+        "reference": "git://main/integration",
+        "manifest": {
+            "integrationOwnerIdentity": "captain-identity-1",
+            "inputs": [
+                {
+                    "laneId": "shared-interface",
+                    "agentSessionId": "agent-interface",
+                    "sourceBaseline": baseline,
+                    "resultingCommit": interface_commit
+                },
+                {
+                    "laneId": "implementation",
+                    "agentSessionId": "agent-implementation",
+                    "sourceBaseline": baseline,
+                    "resultingCommit": result_commit
+                }
+            ]
+        }
+    })
+    .to_string();
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "delivery",
+        "agent-implementation",
+        "integrated",
+        "--evidence-json",
+        &evidence,
+        "--json",
+    ]);
+
+    assert!(output.status.success());
+    assert_eq!(request["command"], "record_agent_delivery");
+    assert_eq!(request["args"]["state"], "integrated");
+    assert_eq!(
+        request["args"]["evidence"]["manifest"]["inputs"][0]["laneId"],
+        "shared-interface"
+    );
+    assert_eq!(
+        request["args"]["evidence"]["manifest"]["inputs"][1]["laneId"],
+        "implementation"
+    );
+}
+
+#[test]
+fn delivery_forwards_the_complete_artifact_manifest_without_rewriting_it() {
+    let source_commit = "c".repeat(40);
+    let git_tree = "d".repeat(40);
+    let installer_sha256 = "a".repeat(64);
+    let evidence = serde_json::json!({
+        "artifactId": "t-hub-dev-0.3.107",
+        "sourceBaseline": source_commit,
+        "reference": "artifact://windows/installer",
+        "manifest": {
+            "branch": "main",
+            "sourceCommit": source_commit,
+            "gitTree": git_tree,
+            "version": "0.3.107",
+            "installerSha256": installer_sha256,
+            "builtAt": 1_784_525_600_000_u64,
+            "signatureStatus": "verified"
+        }
+    })
+    .to_string();
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "delivery",
+        "agent-implementation",
+        "packaged",
+        "--evidence-json",
+        &evidence,
+        "--json",
+    ]);
+
+    assert!(output.status.success());
+    assert_eq!(request["command"], "record_agent_delivery");
+    assert_eq!(request["args"]["state"], "packaged");
+    assert_eq!(
+        request["args"]["evidence"]["manifest"]["installerSha256"],
+        "a".repeat(64)
+    );
+    assert_eq!(
+        request["args"]["evidence"]["manifest"]["signatureStatus"],
+        "verified"
+    );
+}

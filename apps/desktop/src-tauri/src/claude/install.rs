@@ -255,6 +255,7 @@ pub fn install_hooks_events(
 /// strip predicate matches the legacy marker, that re-install removes the stale
 /// `termhub` entries and rewrites them under the current marker + resolved agent
 /// path (the migration). We never WRITE anything but the current marker.
+#[cfg(not(feature = "devbuild"))]
 pub fn reconcile_managed_hooks() -> Result<()> {
     // Same default the UI passes to the install command ("t-hub-agent"); the
     // installer resolves it to a concrete absolute path inside WSL.

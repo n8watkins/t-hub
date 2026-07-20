@@ -640,6 +640,7 @@ fn schema_agent_checkpoint() -> Value {
 
 fn schema_record_agent_delivery() -> Value {
     let commit = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$" });
+    let installer_sha256 = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{64}$" });
     let reference = json!({ "type": "string", "minLength": 1, "maxLength": 16384 });
     json!({
         "type": "object",
@@ -719,9 +720,56 @@ fn schema_record_agent_delivery() -> Value {
                             "sourceCommit": commit.clone(),
                             "canonicalBaseline": { "type": "string", "minLength": 1 },
                             "canonicalCommit": commit.clone(),
-                            "reference": reference.clone()
+                            "reference": reference.clone(),
+                            "manifest": {
+                                "type": "object",
+                                "properties": {
+                                    "integrationOwnerIdentity": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1024
+                                    },
+                                    "inputs": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 256,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "laneId": {
+                                                    "type": "string",
+                                                    "minLength": 1,
+                                                    "maxLength": 1024
+                                                },
+                                                "agentSessionId": {
+                                                    "type": "string",
+                                                    "minLength": 1,
+                                                    "maxLength": 1024
+                                                },
+                                                "sourceBaseline": commit.clone(),
+                                                "resultingCommit": commit.clone()
+                                            },
+                                            "required": [
+                                                "laneId",
+                                                "agentSessionId",
+                                                "sourceBaseline",
+                                                "resultingCommit"
+                                            ],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "required": ["integrationOwnerIdentity", "inputs"],
+                                "additionalProperties": false
+                            }
                         },
-                        "required": ["sourceCommit", "canonicalBaseline", "canonicalCommit", "reference"],
+                        "required": [
+                            "sourceCommit",
+                            "canonicalBaseline",
+                            "canonicalCommit",
+                            "reference",
+                            "manifest"
+                        ],
                         "additionalProperties": false
                     }
                 }
@@ -734,9 +782,42 @@ fn schema_record_agent_delivery() -> Value {
                         "properties": {
                             "artifactId": { "type": "string", "minLength": 1 },
                             "sourceBaseline": commit.clone(),
-                            "reference": reference.clone()
+                            "reference": reference.clone(),
+                            "manifest": {
+                                "type": "object",
+                                "properties": {
+                                    "branch": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1024
+                                    },
+                                    "sourceCommit": commit.clone(),
+                                    "gitTree": commit.clone(),
+                                    "version": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 1024
+                                    },
+                                    "installerSha256": installer_sha256,
+                                    "builtAt": { "type": "integer", "minimum": 1 },
+                                    "signatureStatus": {
+                                        "type": "string",
+                                        "enum": ["unsigned", "signedUnverified", "verified"]
+                                    }
+                                },
+                                "required": [
+                                    "branch",
+                                    "sourceCommit",
+                                    "gitTree",
+                                    "version",
+                                    "installerSha256",
+                                    "builtAt",
+                                    "signatureStatus"
+                                ],
+                                "additionalProperties": false
+                            }
                         },
-                        "required": ["artifactId", "sourceBaseline", "reference"],
+                        "required": ["artifactId", "sourceBaseline", "reference", "manifest"],
                         "additionalProperties": false
                     }
                 }
@@ -1376,6 +1457,46 @@ mod tests {
             ]
         );
         assert_eq!(schema["oneOf"].as_array().unwrap().len(), states.len());
+        let integrated = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["state"]["const"] == "integrated")
+            .unwrap();
+        assert!(integrated["properties"]["evidence"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("manifest")));
+        assert_eq!(
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
+                ["inputs"]["maxItems"],
+            256
+        );
+        assert_eq!(
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
+                ["inputs"]["items"]["additionalProperties"],
+            false
+        );
+        let packaged = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["state"]["const"] == "packaged")
+            .unwrap();
+        assert!(packaged["properties"]["evidence"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("manifest")));
+        assert_eq!(
+            packaged["properties"]["evidence"]["properties"]["manifest"]["properties"]
+                ["installerSha256"]["pattern"],
+            "^[0-9a-fA-F]{64}$"
+        );
+        assert_eq!(
+            packaged["properties"]["evidence"]["properties"]["manifest"]
+                ["additionalProperties"],
+            false
+        );
     }
 
     #[test]

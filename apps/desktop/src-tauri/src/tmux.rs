@@ -48,6 +48,10 @@ static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
     std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| default_socket_name().into())
 });
 
+#[cfg(test)]
+static FAIL_NEXT_SESSION_ENVIRONMENT_TARGET: LazyLock<std::sync::Mutex<Option<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
 /// The compiled-in default socket name: `"t-hub"` in a normal build, but
 /// `"t-hub-test"` under `cfg(test)` so the test binary is isolated from the live
 /// app's socket (see [`SOCKET_NAME`]).
@@ -347,6 +351,61 @@ pub fn session_environment(name: &str, key: &str) -> Result<Option<String>, Tmux
     }
 }
 
+/// Set one value in a live tmux session's private environment.
+///
+/// The command uses argv values rather than a shell and is bounded by the same
+/// timeout as every other tmux control operation. Environment names are
+/// validated here so callers cannot accidentally ask tmux to interpret an
+/// option or malformed assignment as the variable name.
+pub fn set_session_environment(name: &str, key: &str, value: &str) -> Result<(), TmuxError> {
+    let valid_key = !key.is_empty()
+        && key.len() <= 128
+        && key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        });
+    if !valid_key {
+        return Err(TmuxError {
+            op: "set-environment",
+            code: None,
+            message: "environment name must be a valid identifier no longer than 128 bytes".into(),
+        });
+    }
+    if name.is_empty() || name.len() > 128 || value.len() > 4096 || value.contains('\0') {
+        return Err(TmuxError {
+            op: "set-environment",
+            code: None,
+            message: "session target or environment value is outside the bounded input contract"
+                .into(),
+        });
+    }
+    #[cfg(test)]
+    {
+        let mut failure = FAIL_NEXT_SESSION_ENVIRONMENT_TARGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failure.as_deref() == Some(name) {
+            *failure = None;
+            return Err(TmuxError {
+                op: "set-environment",
+                code: None,
+                message: "injected session environment update failure".into(),
+            });
+        }
+    }
+    run(
+        "set-environment",
+        &["set-environment", "-t", name, key, value],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_session_environment_set_for(name: &str) {
+    *FAIL_NEXT_SESSION_ENVIRONMENT_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.to_string());
+}
+
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
 /// per-session environment variables via tmux `-e` (socket-gate Phase 2b).
 ///
@@ -364,6 +423,22 @@ pub fn session_environment(name: &str, key: &str) -> Result<Option<String>, Tmux
 /// inherited global env, this is also how item-3's UI spawn path SCRUBS an inherited
 /// `T_HUB_CONTROL_TOKEN` (it sets its own value at the session level). `env` empty ⇒
 /// a plain login-shell session with no injected capability env.
+fn session_env_with_agent_journal(
+    env: &[(String, String)],
+    configured_journal: Option<String>,
+) -> Vec<(String, String)> {
+    let mut effective = env.to_vec();
+    if !effective
+        .iter()
+        .any(|(key, _)| key == "T_HUB_AGENT_JOURNAL_DIR")
+    {
+        if let Some(journal) = configured_journal.filter(|value| !value.trim().is_empty()) {
+            effective.push(("T_HUB_AGENT_JOURNAL_DIR".to_string(), journal));
+        }
+    }
+    effective
+}
+
 pub fn new_session_with_env(
     name: &str,
     cwd: &str,
@@ -384,7 +459,12 @@ pub fn new_session_with_env(
     // Session environment (`-e KEY=VALUE`, socket-gate Phase 2b). Pre-format so the
     // backing strings outlive `args`. tmux ≥3.2 supports `-e`; this codebase already
     // targets ≥3.4 (see the geometry note above).
-    let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let effective_env =
+        session_env_with_agent_journal(env, std::env::var("T_HUB_AGENT_JOURNAL_DIR").ok());
+    let env_pairs: Vec<String> = effective_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
     for pair in &env_pairs {
         args.push("-e");
         args.push(pair);
@@ -1268,6 +1348,32 @@ mod tests {
         assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
     }
 
+    #[test]
+    fn session_environment_inherits_isolated_agent_journal() {
+        let inherited = session_env_with_agent_journal(
+            &[("EXISTING".to_string(), "value".to_string())],
+            Some(".t-hub-dev/journal".to_string()),
+        );
+        assert!(inherited.iter().any(|(key, value)| {
+            key == "T_HUB_AGENT_JOURNAL_DIR" && value == ".t-hub-dev/journal"
+        }));
+
+        let explicit = session_env_with_agent_journal(
+            &[(
+                "T_HUB_AGENT_JOURNAL_DIR".to_string(),
+                "/explicit/journal".to_string(),
+            )],
+            Some(".t-hub-dev/journal".to_string()),
+        );
+        assert_eq!(
+            explicit,
+            vec![(
+                "T_HUB_AGENT_JOURNAL_DIR".to_string(),
+                "/explicit/journal".to_string()
+            )]
+        );
+    }
+
     // NB: the generic `output_with_timeout` bound (kill-a-hung-child, fast
     // pass-through, no-serialization, large dual-pipe drain) is exercised in
     // `bounded_exec.rs`, which now OWNS that shared helper. The tests below cover
@@ -1305,6 +1411,38 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    #[test]
+    fn session_environment_setter_roundtrips_on_exact_session() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::session_environment_setter_roundtrips_on_exact_session: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", None, &[]).unwrap();
+
+        set_session_environment(&session.name, "T_HUB_TEST_GENERATION", "1").unwrap();
+
+        assert_eq!(
+            session_environment(&session.name, "T_HUB_TEST_GENERATION").unwrap(),
+            Some("1".into())
+        );
+    }
+
+    #[test]
+    fn session_environment_setter_rejects_unbounded_or_invalid_input() {
+        let invalid_name = set_session_environment("target", "-bad", "1").unwrap_err();
+        assert_eq!(invalid_name.op, "set-environment");
+        assert!(invalid_name.message.contains("valid identifier"));
+
+        let oversized_value = "x".repeat(4097);
+        let invalid_value =
+            set_session_environment("target", "VALID_NAME", &oversized_value).unwrap_err();
+        assert_eq!(invalid_value.op, "set-environment");
+        assert!(invalid_value.message.contains("bounded input contract"));
     }
 
     #[test]
