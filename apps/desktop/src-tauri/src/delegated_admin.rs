@@ -803,6 +803,21 @@ impl DelegatedAdminStore {
         )
     }
 
+    /// Invalidate grants delegated by the Captain authority for one exact ship.
+    pub fn invalidate_ship_delegator(
+        &self,
+        ship_slug: &str,
+        reason: impl Into<String>,
+    ) -> Result<Vec<DelegatedAdminGrant>, DelegatedAdminError> {
+        self.invalidate_matching(
+            |grant| {
+                grant.delegator.role == DelegatingSupervisorRole::Captain
+                    && grant.delegator.ship_slug.as_deref() == Some(ship_slug)
+            },
+            reason.into(),
+        )
+    }
+
     fn invalidate_matching(
         &self,
         predicate: impl Fn(&DelegatedAdminGrant) -> bool,
