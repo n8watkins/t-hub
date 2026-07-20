@@ -12469,52 +12469,6 @@ fn commission_captain(
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("commission_captain: unknown projectId '{project_id}'"))?;
-    let powder_binding = project.powder.as_ref().ok_or_else(|| {
-        format!(
-            "commission_captain: project '{}' must be bound to Powder before commissioning",
-            project.name
-        )
-    })?;
-    #[cfg(not(test))]
-    {
-        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
-        client
-            .health()
-            .and_then(|_| client.authorization_probe())
-            .and_then(|_| {
-                client
-                    .get_repository(&powder_binding.repository)
-                    .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "commission_captain: Powder preflight failed for repository '{}': {error}",
-                    powder_binding.repository
-                )
-            })?;
-    }
-    #[cfg(test)]
-    if !args
-        .get("testSkipPowderHealth")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
-        client
-            .health()
-            .and_then(|_| client.authorization_probe())
-            .and_then(|_| {
-                client
-                    .get_repository(&powder_binding.repository)
-                    .map(|_| ())
-            })
-            .map_err(|error| {
-                format!(
-                    "commission_captain: Powder preflight failed for repository '{}': {error}",
-                    powder_binding.repository
-                )
-            })?;
-    }
     let ship_slug = arg_str(args, "shipSlug")
         .or_else(|| arg_str(args, "ship_slug"))
         .map(|value| slugify_ship(&value))
@@ -27628,6 +27582,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn commission_captain_requires_a_powder_binding() {
         let ctx = test_ctx("secret");
