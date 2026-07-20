@@ -11175,6 +11175,14 @@ fn get_agent(
     let agent_session_id = arg_str(args, "agentSessionId")
         .filter(|value| !value.trim().is_empty())
         .ok_or("get_agent requires a non-empty 'agentSessionId'")?;
+    let initial = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .find(|agent| agent.agent_session_id == agent_session_id)
+        .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
+    authorize_agent(ctx, &initial, caller, trusted_internal, "get_agent")?;
     reconcile_agent_runtime(ctx, &agent_session_id);
     let agent = ctx
         .captains
@@ -11183,7 +11191,6 @@ fn get_agent(
         .into_iter()
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
-    authorize_agent(ctx, &agent, caller, trusted_internal, "get_agent")?;
     serde_json::to_value(agent).map_err(|error| format!("get_agent serialization failed: {error}"))
 }
 
