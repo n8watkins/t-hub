@@ -15657,7 +15657,9 @@ fn claim_cortana_runtime(
     ctx: &ControlContext,
     candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
 ) -> Result<CaptainRecord, String> {
-    let result = claim_captain(
+    // reconcile_cortana already owns the shared identity transaction.  Use the
+    // internal claim path to avoid recursively taking the non-reentrant lock.
+    let result = claim_captain_locked(
         ctx,
         &json!({
             "captainSessionId": candidate.terminal_id,
@@ -15665,6 +15667,8 @@ fn claim_cortana_runtime(
             "provider": candidate.harness,
             "providerSessionId": candidate.provider_session_id,
         }),
+        None,
+        true,
         None,
         true,
     )?;
