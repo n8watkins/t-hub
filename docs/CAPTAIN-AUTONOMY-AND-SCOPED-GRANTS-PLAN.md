@@ -1,5 +1,10 @@
 # Captain Autonomy and Scoped Grants Integration Plan
 
+> Historical planning record: the Powder-binding and Powder-card sections below
+> describe pre-retirement design work.
+> The active model uses durable agent sessions and local checkpoints as defined
+> in [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
+
 ## Status and intended consumer
 
 This document is a General-requested integration plan for the agent already working on the current T-Hub goal.

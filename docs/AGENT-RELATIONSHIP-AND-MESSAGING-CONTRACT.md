@@ -1,15 +1,19 @@
 # Agent Relationship and Messaging Contract
 
 **Status:** Canonical.
-**Scope:** General, Cortana, Captains, peer Captains, Crew, and bounded ephemeral subagents.
+**Scope:** General, Cortana, Captains, peer Captains, durable agent sessions, and bounded ephemeral subagents.
 **Purpose:** Define authority, supervision, work evidence, durable dialogue, escalation, recovery, and completion without treating terminal text, model memory, or one subsystem as the whole truth.
 
 ## Precedence and Related Contracts
 
-The [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) remains authoritative for product decisions, sequencing, dependencies, testing doctrine, and phase exit gates.
-Powder is the executable backlog and work ledger for authorized implementation.
-The [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) records verified runtime evidence and the current zero-context resume point.
-This document defines the invariant relationship and messaging rules that the roadmap, Powder cards, T-Hub control plane, CLI, MCP adapter, and user interface must implement consistently.
+The [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) is the active
+post-Powder product decision for agent sessions.
+The [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) remains useful for
+historical sequencing and evidence, but its Powder-specific sections are not
+live product requirements.
+This document defines the invariant relationship and messaging rules that the
+roadmap, durable agent-session records, T-Hub control plane, CLI, MCP adapter,
+and user interface must implement consistently.
 Canonical precedence is scope-based rather than a single global ordering.
 The phased plan wins for product decisions and dependencies, the handoff wins only for verified current runtime facts, the operating model wins for organizational lifecycle, and this contract wins for agent authority and messaging behavior.
 No runtime fact or narrower contract may override an explicit product decision or General authorization.
@@ -18,7 +22,7 @@ When canonical scopes genuinely conflict, stop the affected action, record the c
 The following subsystem contracts remain authoritative within their scopes:
 
 - [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines Cortana and organizational lifecycle.
-- [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) defines Powder and T-Hub state ownership.
+- [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) defines the active agent-session state ownership and migration boundary.
 - [STATUS-MODEL.md](./STATUS-MODEL.md) defines work state and runtime health as separate axes.
 - [cli-contract.md](./cli-contract.md) defines the CLI-first machine and human interface.
 - [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines worktree identity, ownership, and cleanup safety.
@@ -34,16 +38,22 @@ The phased plan records product direction, settled decisions, dependencies, para
 It is not a high-frequency task tracker.
 Update it when a decision, dependency, phase status, critical risk, or exit gate materially changes.
 
-### 2. Powder backlog
+### 2. Durable agent sessions
 
-Powder is the executable backlog.
-Each implementation unit that can be independently assigned must have an authoritative Powder card before Crew dispatch.
-The card records scope, acceptance criteria, dependencies, ownership, claim, run, work logs, input requests, proof, and completion state.
-Multiple parallel lanes require separate cards, isolated worktrees, non-overlapping ownership, and one declared integration owner.
+T-Hub is the durable supervisor for agent sessions, not a task manager.
+Each independently started agent receives an explicit assignment, a Captain
+relationship, a directory, and a durable session record.
+The record contains runtime state, work stage, Git context when detected, and
+bounded human-readable checkpoints.
+Multiple parallel sessions require isolated worktrees, non-overlapping
+ownership, and one declared integration owner.
 
-A Powder card cannot override a product decision, authorization boundary, security rule, or phase dependency from a canonical contract.
-When newly discovered work changes roadmap sequencing or an exit gate, update the phased plan as well as the Powder backlog.
-Routine implementation progress belongs in Powder rather than the phased plan.
+An agent session record cannot override a product decision, authorization
+boundary, security rule, or phase dependency from a canonical contract.
+When newly discovered work changes roadmap sequencing or an exit gate, update
+the active plan.
+Routine implementation progress belongs in bounded session checkpoints rather
+than in a task board.
 
 ### 3. Runtime communication and evidence
 
@@ -56,7 +66,7 @@ The current handoff records the verified resume point across all layers.
 The normal authority path is:
 
 ```text
-General -> Cortana -> Captain -> Crew
+General -> Cortana -> Captain -> agent session
 ```
 
 This path defines responsibility and control authority.
@@ -72,41 +82,52 @@ The General may delegate bounded routine decisions explicitly, but silence never
 
 Cortana is the General's permanent lightweight operational coordinator.
 Cortana commissions, locates, monitors, recovers, and retires Captains within the operating model.
-Cortana does not decompose a Captain's Assignment, direct that Captain's Crew, approve implementation details, or act as a Captain-of-Captains.
+Cortana does not decompose a Captain's Assignment, direct that Captain's agent
+sessions, approve implementation details, or act as a Captain-of-Captains.
 Cortana may surface conflicts and route messages without acquiring another identity's authority.
 
 ### Captain
 
 A Captain owns one durable Assignment within one Project.
 A Captain may control zero, one, or several coherent Workspaces.
-A Captain decomposes its Assignment into Powder cards, selects Crew Harnesses, assigns worktrees and branches, establishes file ownership, defines tests and exit gates, resolves dependencies, reviews evidence, and closes owned work safely.
-A Captain has control authority only over its own ship and Crew.
+A Captain decomposes its Assignment into agent-session assignments, selects
+Harnesses, assigns worktrees and branches, establishes file ownership, defines
+tests and exit gates, resolves dependencies, reviews evidence, and closes owned
+work safely.
+A Captain has control authority only over its own ship and agent sessions.
 A Captain must remain at orchestration altitude and must not use continuous terminal watching as a substitute for structured evidence.
 
 ### Peer Captains
 
 Captains are peers even when they work in the same Project.
 They may communicate about dependencies, overlapping files, blockers, shared interfaces, integration order, or technical advice.
-Peer messaging grants no authority over another Captain's Assignment, Crew, terminal, worktree, Powder claim, resources, checkpoint, or retirement.
-Materially transferred work requires an explicit Assignment change or Powder card ownership transfer.
+Peer messaging grants no authority over another Captain's Assignment, agent
+session, terminal, worktree, resources, checkpoint, or retirement.
+Materially transferred work requires an explicit Assignment change or agent
+session ownership transfer.
 
-### Crew
+### Agent sessions
 
-Crew are bounded leaf workers assigned to one card, run, worktree, branch, scope, and Captain.
-Crew decide local implementation details and focused test strategy inside that boundary.
-Crew do not create durable Crew or manage other Crew.
+Agent sessions are bounded leaf workers assigned to one Assignment, worktree,
+branch, scope, and Captain.
+Agents decide local implementation details and focused test strategy inside that
+boundary.
+Agent sessions do not create durable agent sessions or manage other agents.
 Work that requires another orchestration layer receives another commissioned Captain rather than an informal Crew hierarchy.
 
 ### Bounded ephemeral subagents
 
-A Captain or Crew may use bounded ephemeral subagents only when active policy permits it.
+A Captain or agent may use bounded ephemeral subagents only when active policy permits it.
 Ephemeral subagents are appropriate for read-only research, mapping, or independent verification that does not require durable ownership.
-They do not receive durable Powder claims, worktrees, or authority merely because they were spawned by an authorized identity.
+They do not receive durable assignments, worktrees, or authority merely because
+they were spawned by an authorized identity.
 
 ## Authority, Work Profile, and Runtime Resolution
 
 T-Hub separates durable authority role, provider-neutral work profile, and resolved Harness runtime.
-General, Cortana, Captain, Crew, reviewer, and ephemeral-subagent authority comes only from durable identity and the applicable Assignment, card, run, and control capability.
+General, Cortana, Captain, agent, reviewer, and ephemeral-subagent authority
+comes only from durable identity, the applicable Assignment, and control
+capability.
 Provider, Harness, model, reasoning effort, permission mode, latency, price, or context size never grants or removes authority.
 
 The versioned work-profile catalog initially defines:
@@ -142,22 +163,26 @@ Temporary, promotional, account-specific, preview, or uncertain model availabili
 Runtime resolution uses this precedence:
 
 1. An explicit General decision for the exact commissioning or dispatch.
-2. An authorized Captain override inside its Assignment and card boundary.
+2. An authorized Captain override inside its Assignment boundary.
 3. Assignment routing policy.
 4. Project routing policy.
 5. User-wide T-Hub routing policy.
 6. The versioned built-in adapter default.
 
 Before any process starts, T-Hub must show the requested profile, preferred provider policy, resolved provider, Harness, exact model, reasoning effort, effective local permission mode, fallback policy, and any degraded capability.
-The Captain or Crew binding must persist the profile-catalog version, requested profile, resolution inputs, exact resolved runtime, fallback outcome, and runtime replacement history.
+The Captain or agent binding must persist the profile-catalog version, requested
+profile, resolution inputs, exact resolved runtime, fallback outcome, and runtime
+replacement history.
 Existing sessions remain pinned to their resolved runtime until an explicit replacement or recovery operation changes it.
 
 An unavailable model must either fail visibly or use one bounded fallback that was displayed and authorized by policy.
 T-Hub must not silently downgrade capability, increase cost class, change provider, weaken permissions, or substitute a conversation identity.
 A cross-provider fallback starts a fresh runtime from a durable checkpoint and never treats a Claude conversation ID as a Codex thread ID or the reverse.
 
-Powder remains provider-neutral and requires no model-routing changes.
-Powder records scope, acceptance, card and run state, claims, evidence, and completion, while T-Hub owns profile selection, runtime resolution, dispatch, identity, fallback, and display.
+Agent sessions remain provider-neutral and require no model-routing changes.
+T-Hub records assignment, runtime, work stage, checkpoints, and Git evidence,
+while T-Hub owns profile selection, runtime resolution, identity, fallback, and
+display.
 Automatic classification from prompt text is deferred until explicit profile selection has produced enough T-Hub-specific evaluation evidence to justify it.
 
 ## Source-of-Truth Matrix
@@ -165,11 +190,11 @@ Automatic classification from prompt text is deferred until explicit profile sel
 | Concern | Authoritative source | Not sufficient by itself |
 | --- | --- | --- |
 | Product decisions and dependencies | Phased plan and canonical contracts | Conversation memory or an isolated card |
-| Executable backlog and card/run execution state | Powder card, claim, run, work log, input request, and completion record | Terminal transcript or Captain self-report |
-| Runtime identity and ownership | T-Hub Project, Assignment, Captain, Workspace, Crew, terminal, and resource records | Folder name, tab location, or current working directory |
+| Agent assignment and progress | T-Hub agent-session record and bounded checkpoints | Terminal transcript or Captain self-report |
+| Runtime identity and ownership | T-Hub Project, Assignment, Captain, Workspace, agent, terminal, and resource records | Folder name, tab location, or current working directory |
 | Durable dialogue | T-Hub inbox message and acknowledgement state | Unacknowledged terminal typing |
 | Agent work state | Structured Harness lifecycle observations under the status model | Output activity or silence |
-| Runtime health | T-Hub terminal, process, Harness, and owned-resource evidence | Powder card status |
+| Runtime health | T-Hub terminal, process, Harness, and owned-resource evidence | Work stage or checkpoint text |
 | Technical correctness | Git commits, diffs, tests, CI, review, builds, and packaged acceptance | Work log or completion message |
 | Release identity | Reviewed source commit, build identity, installer hash, installed hash, and runtime evidence | Version string alone |
 
@@ -178,19 +203,20 @@ It must not silently choose the most reassuring observation.
 
 ## Communication Channels
 
-### Powder work ledger
+### Agent-session evidence
 
-Powder records durable work facts rather than conversational traffic.
-A Crew work log should record start, meaningful milestones, blockers, test outcomes, final evidence, and residual risk.
-Work logs must remain concise, attributed, linked to the exact card and run, bounded, and safe to review later.
-They must not contain secrets, credentials, hidden reasoning, private chain-of-thought, or large raw logs.
+T-Hub records durable work facts rather than conversational traffic.
+An agent checkpoint should record meaningful progress, blockers, test outcomes,
+handoff context, and residual risk.
+Checkpoints must remain concise, attributed, bounded, and safe to review later.
+They must not contain secrets, credentials, hidden reasoning, private
+chain-of-thought, or large raw logs.
 
-Powder comments may hold low-frequency human-facing context.
-Powder input requests represent a durable decision boundary that pauses or blocks authoritative work.
-Powder completion represents verified card and run execution state, not merely the end of a model turn.
-
-Powder must not become the general chat transport.
-Using work logs for every conversational exchange would create polling latency, audit noise, poor acknowledgement semantics, and an unreadable evidence history.
+Checkpoint history is not a task board, dependency graph, estimate, priority,
+or completion authority.
+Using checkpoints for every conversational exchange would create polling
+latency, audit noise, poor acknowledgement semantics, and an unreadable
+evidence history.
 
 ### T-Hub durable inbox
 
@@ -199,7 +225,8 @@ Messages may represent instructions, status requiring attention, blockers, decis
 Messages must target durable role identities and use terminal bindings only as delivery routes.
 
 Each message must carry a stable message ID, sender, recipient, type, priority, creation time, and delivery state.
-When applicable, it must also reference the Project, Assignment, Workspace, Crew, Powder card, and Powder run.
+When applicable, it must also reference the Project, Assignment, Workspace, and
+agent session.
 Retryable delivery must use the stable message ID as an idempotency key.
 
 The message lifecycle distinguishes enqueued, delivering, delivered, read, accepted, declined, completed, failed, retrying, expired, cancelled, and superseded states.
@@ -231,21 +258,23 @@ System-generated lifecycle notices are a separate trusted producer and never gra
 
 | Sender | Recipient | Allowed message classes | Authority effect |
 | --- | --- | --- | --- |
-| General | Cortana, any Captain, or any Crew | Instruction, decision, approval request response, clarification, stop, recovery, or emergency | Final authority, but scope and ownership changes must also update the Assignment or Powder card |
+| General | Cortana, any Captain, or any agent | Instruction, decision, approval request response, clarification, stop, recovery, or emergency | Final authority, but scope and ownership changes must also update the Assignment or agent session |
 | Cortana | General | Fleet status, health, recovery, retirement request, or decision request | No implementation authority |
-| Cortana | Captain | Navigation, health, recovery, General relay, context, or retirement coordination | No Crew direction unless relaying an exact General instruction |
-| Cortana | Crew | No free-form implementation route | Cortana must communicate through the owning Captain and cannot steer, interrupt, or retire Crew |
+| Cortana | Captain | Navigation, health, recovery, General relay, context, or retirement coordination | No agent direction unless relaying an exact General instruction |
+| Cortana | Agent session | No free-form implementation route | Cortana must communicate through the owning Captain and cannot steer, interrupt, or retire an agent |
 | Captain | General | Status, blocker, decision request, completion, risk, or authorization request | General may decide or delegate explicitly |
-| Captain | Own Crew | Assignment delivery, follow-up instruction, review finding, decision, recovery, stop, or coordination | Bounded by the Captain's Assignment, card, ship, and delegated authority |
-| Captain | Peer Captain | Coordination, dependency, conflict, technical request, or status | No authority transfer or foreign Crew control |
-| Captain | Foreign Crew | Denied | Route through the owning Captain |
-| Crew | Owning Captain | Status requiring attention, blocker, decision request, permission request, review response, completion, or emergency | No authority expansion |
-| Crew | General | Emergency or explicit General-requested dialogue, copied to the owning Captain when safe | No silent scope or ownership change |
-| Crew | Same-ship Crew | Dependency coordination or status linked to shared work | No instruction, claim, completion, or control authority over the peer |
-| Crew | Foreign Crew or peer Captain | Denied by default | Route through the owning Captain unless the General authorizes a specific coordination route |
+| Captain | Own agent sessions | Assignment delivery, follow-up instruction, review finding, decision, recovery, stop, or coordination | Bounded by the Captain's Assignment, ship, and delegated authority |
+| Captain | Peer Captain | Coordination, dependency, conflict, technical request, or status | No authority transfer or foreign agent control |
+| Captain | Foreign agent | Denied | Route through the owning Captain |
+| Agent | Owning Captain | Status requiring attention, blocker, decision request, permission request, review response, completion, or emergency | No authority expansion |
+| Agent | General | Emergency or explicit General-requested dialogue, copied to the owning Captain when safe | No silent scope or ownership change |
+| Agent | Same-Assignment agent | Dependency coordination or status linked to shared work | No instruction or control authority over the peer |
+| Agent | Foreign agent or peer Captain | Denied by default | Route through the owning Captain unless the General authorizes a specific coordination route |
 | T-Hub lifecycle service | Authorized owning identities | Needs-answer, needs-permission, failure, recovery, completion, context, or resource-risk notice | Attention only, never approval or implementation authority |
 
-Every authorization decision uses durable sender and recipient identity, Project, Assignment, ship, card, and run bindings rather than terminal location or prose claims.
+Every authorization decision uses durable sender and recipient identity, Project,
+Assignment, ship, and agent-session bindings rather than terminal location or
+prose claims.
 A denied route must not fall back to raw terminal injection.
 
 ### Lifecycle events and attention
@@ -261,7 +290,7 @@ Silence and terminal output activity remain non-authoritative for semantic work 
 
 Git and verification artifacts prove what changed and whether it passed the required gate.
 A completion report must identify exact commits, changed-file scope, tests, failed checks, residual risk, and proof artifacts.
-A Captain must inspect this evidence before accepting a card as complete.
+A Captain must inspect this evidence before advancing an agent work stage.
 Security-sensitive, destructive, control-plane, release, or broad shared-state changes require independent review.
 
 ### Terminal steering
@@ -278,62 +307,79 @@ Terminal text must never be the only record of an Assignment, decision, blocker,
 
 | Message class | Primary channel | Required behavior |
 | --- | --- | --- |
-| Assignment | Typed inbox assignment created by dispatch plus Powder card | Crew acknowledges receipt and exact ownership before mutation |
-| Follow-up instruction | Inbox linked to card and run | Crew acknowledges the instruction, and the card changes too when scope or acceptance changes |
-| Scope or ownership change | Powder card update or transfer plus inbox | Captain revalidates dependencies, authority, worktree ownership, and acceptance before affected work continues |
-| Routine progress | Powder work log | No direct message unless attention or coordination is required |
-| Blocker | Inbox plus Powder input request or blocked evidence | Captain acknowledges and answers or escalates |
-| Product or security decision | Inbox linked to card and run | Crew pauses only the affected path and continues safe unblocked work |
+| Assignment | Typed inbox assignment plus durable agent-session record | Agent acknowledges receipt and exact ownership before mutation |
+| Follow-up instruction | Inbox linked to the agent session | Agent acknowledges the instruction, and the Assignment changes too when scope changes |
+| Scope or ownership change | Assignment change plus inbox | Captain revalidates dependencies, authority, worktree ownership, and acceptance before affected work continues |
+| Routine progress | Agent checkpoint | No direct message unless attention or coordination is required |
+| Blocker | Inbox plus agent checkpoint or lifecycle attention | Captain acknowledges and answers or escalates |
+| Product or security decision | Inbox linked to the Assignment and agent session | Agent pauses only the affected path and continues safe unblocked work |
 | Permission request | Lifecycle attention plus typed approval request | An authorized approval operation binds one decision to one exact pending operation |
-| Review finding | Inbox linked to commit and card | Crew acknowledges, remediates, disputes with evidence, or requests a decision |
-| Completion report | Powder final evidence plus inbox notification | Captain verifies Git and tests before Powder completion |
+| Review finding | Inbox linked to commit and agent session | Agent acknowledges, remediates, disputes with evidence, or requests a decision |
+| Completion report | Agent checkpoint plus inbox notification | Captain verifies Git and tests before advancing the work stage |
 | Peer-Captain coordination | Inbox linked to both Assignments and shared dependency | No authority transfer occurs without an explicit ownership operation |
 | Runtime failure or recovery | Lifecycle event plus durable recovery state | Recover the identity rather than inferring retirement |
 
-When a Powder input request pauses an authoritative run, the authoritative answer must be recorded through Powder.
-An inbox response may explain or notify, but it does not silently resume the Powder run.
+When an agent checkpoint or lifecycle event pauses an authoritative work path,
+the authoritative answer must be recorded through the durable inbox or the
+typed control operation.
+An inbox response may explain or notify, but it does not silently change an
+agent's Assignment or work stage.
 
 ## Assignment Delivery and Acknowledgement
 
-`dispatch_crew` must create a typed assignment message inside the same durable, recoverable dispatch transaction that validates the Project and card, creates the Crew terminal, claims the Powder card, and persists the exact card/run/Crew binding.
-The assignment message records the Crew identity, owning Captain, card, run, worktree, branch, Harness, scope digest, acceptance digest, and dispatch request ID.
+`start_agent` must create a typed assignment message inside the same durable,
+recoverable launch transaction that validates the Project and Assignment,
+creates the agent terminal, and persists the exact agent-session binding.
+The assignment message records the agent identity, owning Captain, Project,
+worktree, branch, Harness, scope digest, and request ID.
 The launch prompt may transport the assignment into the Harness, but the durable inbox message remains the acknowledgement authority.
 
-Before repository mutation, the Crew acknowledges the exact assignment message and records the start work log against the same run.
-An acknowledgement with mismatched card, run, Crew, worktree, branch, or scope digest is rejected and creates Captain attention.
+Before repository mutation, the agent acknowledges the exact assignment
+message and records a start checkpoint against the same session.
+An acknowledgement with mismatched agent, worktree, branch, or scope digest is
+rejected and creates Captain attention.
 
-If failure occurs before the claim and binding persist, dispatch rolls back the uncommitted terminal and assignment message.
-If failure occurs after the binding persists but before acknowledgement, the Crew remains visibly `starting` or `awaiting-assignment-ack`, and T-Hub recovers or rolls back from the same dispatch request ID rather than creating a second claim or message.
-A declined or expired assignment stops affected work and enters the normal claim-release and resource-preservation path.
+If failure occurs before the session binding persists, start rolls back the
+uncommitted terminal and assignment message.
+If failure occurs after the binding persists but before acknowledgement, the
+agent remains visibly `starting` or `awaiting-assignment-ack`, and T-Hub recovers
+or rolls back from the same request ID rather than creating a second session.
+A declined or expired Assignment stops affected work and preserves the session
+record for recovery.
 After restart, T-Hub reconstructs the pending acknowledgement from the durable binding and message state before accepting new work.
 
 ## Typed Permission Decisions
 
 An inbox body alone cannot approve a Harness permission, T-Hub control mutation, destructive action, external effect, installation, publication, release, or spending decision.
-A typed approval request identifies one stable approval ID, authority domain, requesting identity, owning identity, exact operation, target, arguments digest, requested scope, expiry, and associated card and run.
+A typed approval request identifies one stable approval ID, authority domain,
+requesting identity, owning identity, exact operation, target, arguments digest,
+requested scope, expiry, and associated Assignment and agent session.
 Only an actor authorized for that domain may call the approval decision operation.
 
 Approval state distinguishes pending, approved, denied, expired, cancelled, and consumed.
 The exact pending operation consumes an approval at most once and rejects changed arguments or targets.
-A Captain may approve routine local development actions for its own Crew only when repository policy or the General has delegated that class.
-A Captain cannot use an approval to elevate a Crew's T-Hub capability, control foreign resources, or authorize an external action reserved to the General.
-Crew cannot approve their own request.
+A Captain may approve routine local development actions for its own agent
+sessions only when repository policy or the General has delegated that class.
+A Captain cannot use an approval to elevate an agent's T-Hub capability,
+control foreign resources, or authorize an external action reserved to the
+General.
+Agents cannot approve their own request.
 
-## Captain Responsibilities Over Crew
+## Captain Responsibilities Over Agent Sessions
 
 Before dispatch, the Captain must:
 
-1. Confirm the Assignment, Project, Powder binding, card, dependencies, and authorization are unambiguous.
+1. Confirm the Assignment, Project, dependencies, and authorization are unambiguous.
 2. Define bounded scope, explicit file ownership, expected branch and worktree, required tests, commit policy, escalation rules, and exit gate.
 3. Choose the Harness and effective local execution permission deliberately.
 4. Preserve least-privilege T-Hub control authority while allowing the repository's configured local development permission.
-5. Dispatch through the sanctioned transaction and verify the card, run, terminal, Harness, worktree, branch, and prompt.
+5. Start through the sanctioned transaction and verify the agent session, terminal, Harness, worktree, branch, and prompt.
 
 During work, the Captain must:
 
-1. Monitor Powder work evidence, inbox attention, lifecycle status, runtime health, claims, and owned resources as distinct signals.
+1. Monitor agent checkpoints, inbox attention, lifecycle status, runtime health, and owned resources as distinct signals.
 2. Respond to blockers and decisions promptly through durable messages.
-3. Coordinate dependencies and overlapping interfaces without taking over the Crew's implementation loop.
+3. Coordinate dependencies and overlapping interfaces without taking over the agent's implementation loop.
 4. Renew or recover work only from authoritative liveness and binding evidence.
 5. Continue supervising other unblocked lanes while one lane awaits a decision.
 6. Keep a durable checkpoint current when the roster, blocker, decision, or next ordered action materially changes.
@@ -342,68 +388,68 @@ Before completion, the Captain must:
 
 1. Verify the exact branch, worktree, commit, changed-file scope, test results, review findings, and residual risk.
 2. Require remediation or an explicit General decision for unresolved findings at the applicable severity.
-3. Record or verify final Powder evidence against the exact Crew run.
-4. Complete the card only after the acceptance criteria pass.
-5. Close the Crew and release owned resources only after landed-work and recovery checks pass.
+3. Record or verify final Git and test evidence against the exact agent session.
+4. Advance the work stage only after the acceptance criteria pass.
+5. Close the agent session and release owned resources only after landed-work and recovery checks pass.
 6. Update the checkpoint and handoff before context replacement or retirement.
 
-## Crew Responsibilities
+## Agent Responsibilities
 
-Crew must:
+Agents must:
 
-1. Work only inside the assigned card, run, worktree, branch, files, and authorization boundary.
-2. Verify the dispatch identity and report a mismatch before mutation.
-3. Record start and meaningful progress in the exact Powder run.
+1. Work only inside the assigned Assignment, worktree, branch, files, and authorization boundary.
+2. Verify the start identity and report a mismatch before mutation.
+3. Record start and meaningful progress in bounded checkpoints.
 4. Send blockers, decisions, and permission needs through the durable inbox when a response is required.
 5. Continue safe unblocked work while an escalation is pending.
 6. Commit each verified logical change clearly without merging, pushing, installing, publishing, or expanding scope unless authorized.
 7. Report exact tests, failed checks, residual risk, and final commit hashes honestly.
-8. Request review and completion rather than treating model-turn completion as card completion.
+8. Request review and stage advancement rather than treating model-turn completion as work completion.
 9. Preserve protected files, unrelated changes, credentials, and other Captains' resources.
 10. Stop the affected path and escalate when scope, credentials, authority, product intent, security posture, destructive impact, or outward-facing impact is ambiguous.
 
 ## Permission and Authority Separation
 
 Local execution permission and T-Hub control-plane capability are separate.
-A Crew may run its coding Harness with unrestricted local repository execution while retaining a read-capability T-Hub token that cannot spawn, type into, close, or control foreign terminals.
+A session may run its coding Harness with unrestricted local repository execution while retaining a read-capability T-Hub token that cannot spawn, type into, close, or control foreign terminals.
 A Captain may hold T-Hub control capability for its own ship without gaining authority over peer Captains.
 
-`BypassPermissions` is the explicitly authorized default local execution mode for dispatched Codex and Claude Crew in this Captain fleet.
-This default is intentional and grants the Harness full local execution authority inside the Crew's assigned worktree without provider approval prompts.
-It does not expand the Crew's card, file, worktree, branch, or product scope.
-Crew remain responsible for testing, exact-run work logging through sanctioned surfaces, separate verified commits, and honest reporting of commits, checks, failures, and residual risks.
-Crew must not merge, push, install, deploy, publish, release, alter Powder authority, or make product, security, destructive, spending, or outward-facing decisions unless the applicable Captain or General authority explicitly authorizes that exact action.
+`BypassPermissions` is the explicitly authorized default local execution mode for started Codex and Claude agent sessions in this Captain fleet.
+This default is intentional and grants the Harness full local execution authority inside the agent's assigned worktree without provider approval prompts.
+It does not expand the agent's file, worktree, branch, or product scope.
+Agents remain responsible for testing, bounded checkpoints, separate verified commits, and honest reporting of commits, checks, failures, and residual risks.
+Agents must not merge, push, install, deploy, publish, release, or make product, security, destructive, spending, or outward-facing decisions unless the applicable Captain or General authority explicitly authorizes that exact action.
 
-Every dispatched Crew launch must use the selected provider's native bypass flag, attest the authoritative foreground provider process after launch, and persist and return the verified effective Harness permission mode.
-T-Hub must fail closed and transactionally roll back the terminal, Crew binding, and exact Powder claim when permission evidence is missing, stale, conflicting, wrong-provider, wrapper-obscured, unreadable, or changes before durable launch acceptance.
-When structured provider telemetry is unavailable or the permission posture cannot remain observed, T-Hub must expose a degraded or unknown state rather than implying that the Crew is safely working.
+Every agent launch must use the selected provider's native bypass flag, attest the authoritative foreground provider process after launch, and persist and return the verified effective Harness permission mode.
+T-Hub must fail closed and transactionally roll back the terminal and agent binding when permission evidence is missing, stale, conflicting, wrong-provider, wrapper-obscured, unreadable, or changes before durable launch acceptance.
+When structured provider telemetry is unavailable or the permission posture cannot remain observed, T-Hub must expose a degraded or unknown state rather than implying that the agent is safely working.
 An observed permission posture change after launch must fail closed or degrade visibly until authoritative provider-native evidence re-establishes the expected posture.
 
 A local Codex or Claude approval prompt does not by itself indicate a missing T-Hub role permission.
 T-Hub must display both the effective Harness permission mode and the T-Hub control capability clearly.
-No message, Powder card, work log, terminal location, or inherited environment variable may silently elevate either authority.
-Harness bypass, T-Hub control capability, Powder claims, and General authority are independent authority axes.
-Harness bypass is not Powder authorization and cannot claim, complete, release, or otherwise mutate a Powder run.
+No message, checkpoint, terminal location, or inherited environment variable may silently elevate either authority.
+Harness bypass, T-Hub control capability, Assignment scope, and General authority are independent authority axes.
+Harness bypass is not T-Hub control authority and cannot mutate another session's durable record.
 
 ## End-to-End Work Lifecycle
 
-1. The phased plan or an authorized product decision establishes the work and dependencies.
-2. Powder receives one or more executable cards with acceptance criteria and proof plans.
-3. A Captain assigns separate cards to isolated Crew worktrees and records the dispatch bindings.
-4. Each Crew acknowledges the typed assignment message and records a start work log against the same run.
-5. Crew record meaningful milestones in Powder without generating conversational noise.
-6. Blockers and decisions travel through the durable inbox and remain linked to the card and run.
+1. The active plan or an authorized product decision establishes the work and dependencies.
+2. A Captain starts one or more agent sessions with explicit assignments and proof plans.
+3. Each agent receives an isolated worktree when needed and records the start binding.
+4. Each agent acknowledges the typed assignment message and records a start checkpoint.
+5. Agents record meaningful milestones in bounded session checkpoints without generating conversational noise.
+6. Blockers and decisions travel through the durable inbox and remain linked to the Assignment and agent session.
 7. Lifecycle events wake the Captain when attention is required.
-8. Crew submit final evidence with commits, tests, failed checks, and residual risk.
+8. Agents submit final evidence with commits, tests, failed checks, and residual risk.
 9. The Captain reviews the actual artifacts and requests corrections through the inbox when necessary.
-10. The Captain completes the Powder card with proof only after acceptance passes.
-11. The Captain lands or preserves the work under the applicable authorization, then closes Crew and releases resources safely.
+10. The Captain advances the agent work stage only after acceptance passes.
+11. The Captain lands or preserves the work under the applicable authorization, then closes the agent session and releases resources safely.
 12. Material roadmap changes update the phased plan, and the current runtime state updates the handoff.
 
 ## Multiple Captains and Integration Ownership
 
 Multiple Captains may hold distinct Assignments in the same Project.
-Each Assignment must have explicit scope and Powder ownership.
+Each Assignment must have explicit scope and agent-session ownership.
 Shared interfaces require a declared integration order and one integration owner.
 Two Captains must not edit the same registry schema, migration, lifecycle core, or version files concurrently without an agreed boundary.
 
@@ -413,31 +459,32 @@ If agreement would materially change either Assignment, the General decides or a
 
 ## Failure and Recovery Rules
 
-Messages, Powder events, dispatch transactions, approvals, and retryable mutations must carry stable idempotency identities.
+Messages, agent-session events, start transactions, approvals, and retryable mutations must carry stable idempotency identities.
 After an ambiguous timeout, reread authoritative state before retrying.
-Never blind-repost a non-idempotent Powder work log or completion mutation.
-Automated Powder completion requires a server-enforced expected-current-run precondition so a delayed operation from run A cannot complete run B after release, expiry, or reclaim.
-Work-log and criterion mutations require current-run attribution and retry recovery before T-Hub may treat them as authoritative current-run evidence.
-When Powder does not provide those generic guarantees, T-Hub must keep the dependent mutation disabled and fail closed rather than approximate it locally.
+Never blindly repost a non-idempotent checkpoint or session mutation.
+Agent-session mutations require the expected current session and request identity
+so a delayed operation cannot update a replacement session.
 
 After T-Hub, WSL, terminal, or Harness restart, recover durable identity and bindings before sending or accepting new work.
 Queued messages must survive terminal replacement.
-An unknown resume identity blocks terminal steering but does not erase the inbox message, Powder work, or durable Captain or Crew identity.
+An unknown resume identity blocks terminal steering but does not erase the inbox message, session history, or durable Captain or agent identity.
 
 A runtime failure triggers recovery rather than retirement.
 A failed message delivery remains visible and retryable.
-A Powder outage blocks new Powder-backed dispatch and completion but does not authorize local emulation of claims or card/run execution state.
+An unavailable external service does not block ordinary agent-session supervision
+and never authorizes a local emulation of another subsystem's authority.
 
 ## Security, Privacy, and Retention
 
-Message bodies, work logs, proof fields, and audit records must be bounded and scrubbed for known credential shapes.
-Machine surfaces must never expose protected Powder endpoints, profiles, tokens, credential commands, or arbitrary card and run substitution fields when durable bindings already supply authority.
+Message bodies, checkpoints, proof fields, and audit records must be bounded and scrubbed for known credential shapes.
+Machine surfaces must never expose protected credentials, unrestricted endpoints, or arbitrary identity substitution fields when durable bindings already supply authority.
 Audit records should preserve actor, operation, target, outcome, and safe hashes or summaries rather than sensitive message bodies or proof URLs.
 
 Use thirty days as the provisional recommended default for local inbox message bodies until the General resolves the retention setting.
 Keep non-secret delivery metadata longer for recovery and audit.
 Keep user-pinned messages until explicitly removed.
-Powder retention remains governed by Powder rather than duplicated inside T-Hub.
+Historical provider data remains governed by its original retention policy and is
+not duplicated into the active T-Hub agent-session model.
 
 ## CLI, MCP, and UI Contract
 
@@ -445,7 +492,10 @@ The compact JSON `th` CLI is the canonical agent and automation interface.
 MCP is a role-filtered thin adapter over the same backend operations and schemas.
 The graphical UI consumes the same authoritative state and must not define separate communication semantics.
 
-CLI and MCP must provide equivalent authorized operations for send, list, read, reply, acknowledge, accept, decline, complete, retry, cancel, supersede, Powder evidence, lifecycle attention, typed approval request, approval decision, approval cancellation, and approval status.
+CLI and MCP must provide equivalent authorized operations for send, list, read,
+reply, acknowledge, accept, decline, checkpoint, retry, cancel, lifecycle
+attention, typed approval request, approval decision, approval cancellation, and
+approval status.
 JSON output must remain bounded, deterministic, parseable, and free of diagnostics on stdout.
 Unknown inputs and forbidden identity substitutions must fail before side effects.
 
@@ -454,20 +504,22 @@ Unknown inputs and forbidden identity substitutions must fail before side effect
 Before this contract is considered implemented, packaged tests must prove:
 
 - Assignment dispatch and acknowledgement survive application and terminal restarts.
-- Powder work logs remain tied to the exact card, run, and Crew binding.
+- Agent checkpoints remain tied to the exact durable session binding.
 - Routine progress does not require terminal polling or direct messages.
 - Blocker, decision, permission, review, completion, and peer-coordination messages reach only authorized durable recipients.
 - Message retries are idempotent across timeout, crash, reconnect, and duplicate event delivery.
-- `send_text` cannot be mistaken for message acknowledgement or card completion.
-- Work state, runtime health, Powder status, and technical proof remain separate when they conflict.
-- A Captain cannot mutate a peer Captain or foreign Crew through messaging.
+- `send_text` cannot be mistaken for message acknowledgement or work-stage advancement.
+- Work stage, runtime health, and technical proof remain separate when they conflict.
+- A Captain cannot mutate a peer Captain or foreign agent through messaging.
 - Local unrestricted Harness execution does not grant T-Hub control-plane capability.
-- Completion cannot release, renew, or delete stale Crew state after the completion operation begins.
-- A delayed run A operation cannot append evidence to, approve criteria for, complete, renew, release, or clean up run B.
-- The General can inspect message content, delivery lifecycle, Powder evidence, technical proof, and cleanup outcome without relying on terminal scrollback.
+- Completion cannot release, renew, or delete stale agent state after the completion operation begins.
+- A delayed session A operation cannot append evidence to or clean up replacement session B.
+- The General can inspect message content, delivery lifecycle, session checkpoints, technical proof, and cleanup outcome without relying on terminal scrollback.
 - CLI, MCP, and UI return equivalent results for the same authorized operation.
 
-The contract exits only when one real installed Codex Crew and one real installed Claude Crew each complete the full lifecycle through Powder evidence, durable dialogue, Captain review, completion proof, and safe resource cleanup.
+The contract exits only when one real installed Codex agent session and one real
+installed Claude agent session each complete the full lifecycle through durable
+dialogue, Captain review, completion proof, and safe resource cleanup.
 
 ## Current Implementation Boundary
 
@@ -477,5 +529,7 @@ Implementation remains incomplete until the phased plan exit gates pass.
 The durable inbox substrate exists, but generic send, receive, acknowledgement, message history, and frontend visibility remain open.
 Interactive Codex lifecycle parity remains incomplete.
 Terminal steering remains a compatibility path and has demonstrated cases where accepted text remained unsubmitted in the interactive composer.
-Powder work-log and bounded evidence reads are active T-Hub implementation work for the next packaged version.
-Automated completion remains blocked on the generic Powder run-bound, current-run evidence, reviewer-attribution, and idempotent recovery dependencies recorded in the phased plan.
+Agent-session listing, checkpoint, event, and recovery reads are the active T-Hub
+implementation boundary.
+Historical Powder data remains readable only through compatibility migration and
+is not part of active authorization, health, or completion workflows.

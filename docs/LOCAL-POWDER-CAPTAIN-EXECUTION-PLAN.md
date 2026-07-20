@@ -1,5 +1,10 @@
 # Local Powder Captain Execution Plan
 
+> Historical compatibility plan: this document describes the retired Powder
+> integration workflow.
+> Do not use it to commission Captains, register Projects, dispatch agents, or
+> perform runtime health checks in the post-Powder model.
+
 ## Purpose
 
 This document is the zero-context execution plan for the existing T-Hub Captain to finish T-Hub's local Powder integration safely.

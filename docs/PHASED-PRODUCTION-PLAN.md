@@ -1,5 +1,10 @@
 # T-Hub Phased Production Plan
 
+> Compatibility note: Powder-specific roadmap sections are historical planning
+> context and do not describe current T-Hub runtime requirements.
+> The active post-Powder model is defined by
+> [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
+
 **Updated:** 2026-07-17.
 **Plan source:** `9d7c9f9` on `fix/captain-control-runtime` plus the General-directed scoped-autonomy integration recorded by this change.
 **Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.

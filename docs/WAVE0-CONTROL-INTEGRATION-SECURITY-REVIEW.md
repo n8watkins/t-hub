@@ -1,5 +1,9 @@
 # Wave 0 Control Integration Security Review Packet
 
+> Historical security review: Powder and Crew references below describe the
+> retired integration and are preserved as evidence, not active workflow
+> requirements.
+
 Date: 2026-07-17
 
 Powder card: `thub-wave0-control-integration`

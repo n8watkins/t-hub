@@ -13,10 +13,10 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 
 ## Canonical Current Documents
 
-1. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is the authoritative forward roadmap, dependency map, testing doctrine, and exit-gate definition.
-2. [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) is the current runtime evidence and zero-context resume handoff.
-3. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and Crew operating model.
-4. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, Powder evidence, durable dialogue, escalation, review, and completion across the agent organization.
+1. [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md) defines the active post-Powder agent-session model and compatibility boundary.
+2. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is supporting roadmap context; Powder-specific sections are historical.
+3. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and agent-session operating model.
+4. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, agent-session evidence, durable dialogue, escalation, review, and completion across the agent organization.
 5. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
 6. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
 7. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
@@ -26,7 +26,7 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 - [CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is the General-directed integration specification for scoped Captain grants, existing-repository self-bootstrap, and bounded routine delivery; the phased plan remains authoritative for ownership, order, and activation.
 - [PRODUCTION-READINESS.md](./PRODUCTION-READINESS.md) supplies release-quality gates that remain applicable where the phased plan has not superseded their sequencing.
 - [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the packaged runtime measurement procedure.
-- [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) describes the Powder integration boundary and protected profiles.
+- [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) is a historical compatibility reference for retired Powder data and profiles.
 - [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md) defines provider-neutral conversation identity, catalog, resume, recovery, archive, cache, and compatibility behavior.
 - [MCP.md](./MCP.md) documents the existing MCP and control-channel implementation, while the CLI-first roadmap governs its future surface.
 - [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md) remains the interaction and path-convention design, while the unified worktree contract governs status and safety.
@@ -45,7 +45,7 @@ These documents preserve rationale and prior findings but are not active backlog
 - [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) preserves the server-split design and earlier multi-client decisions.
 - [PERF-AUDIT.md](./PERF-AUDIT.md) is explicitly superseded for the original freeze diagnosis.
 - [PERF-AND-DRAG-WORKLOG.md](./PERF-AND-DRAG-WORKLOG.md) is the historical master worklog for the earlier drag and freeze investigation.
-- [HANDOFF.md](./HANDOFF.md) is an older handoff and must not replace the Captain and Powder handoff.
+- [HANDOFF.md](./HANDOFF.md) is an older historical handoff and must not replace the active agent-session contracts.
 - [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) and [CAPTAIN-SIDEBAR-PRD.md](./CAPTAIN-SIDEBAR-PRD.md) preserve earlier Captain UI slices that now feed the broader phased plan.
 
 ## Archived or Abandoned Experiments

@@ -74,8 +74,10 @@ Normal output must never contain a stack trace, while an explicit future debug m
 
 T-Hub currently exposes the numeric process exit status as `error.code` and a stable symbolic category as `error.kind`.
 That established shape should be extended compatibly with an optional `suggestion` and optional bounded `details` object rather than rewritten in place.
-Powder mutation failures use `powder_mutation_<state>` as the stable `error.kind`, where state is `pending`, `rejected`, `stale`, `conflict`, `expired`, `unsupported`, `malformed`, or `timeout`.
-Successful Powder mutation results expose `mutationState` as `committed` or `recovered` in the command data.
+Retired Powder mutation failures use `powder_mutation_<state>` as a historical
+compatibility shape, where state is `pending`, `rejected`, `stale`, `conflict`,
+`expired`, `unsupported`, `malformed`, or `timeout`.
+New agent-session operations do not expose Powder mutation state.
 
 ```json
 {
@@ -116,7 +118,8 @@ An idempotent mutation that has already reached the requested state must exit ze
 - Existing `--yes` behavior may remain temporarily as a documented compatibility alias while `--confirm` becomes canonical.
 - Destructive or wide-reaching commands should support `--dry-run` when practical.
 - Confirmation must be validated before endpoint discovery, dependency calls, or local mutation.
-- `th powder complete` must require the canonical `--confirm` flag before endpoint discovery or mutation.
+- Retired `th powder` commands must return the structured `powder_retired` error
+  before endpoint discovery or mutation.
 - `--force` may alter a safety policy only where documented and must not substitute for confirmation.
 - Unknown or misspelled flags must never be ignored.
 - Dry runs must report the proposed effects using the same stable vocabulary as execution results.

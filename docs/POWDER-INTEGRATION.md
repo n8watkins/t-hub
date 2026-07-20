@@ -1,5 +1,10 @@
 # Powder Integration
 
+> Historical compatibility reference: Powder is retired from active T-Hub
+> workflows.
+> The definitions and API notes below are retained for migration, legacy-data
+> interpretation, and compatibility tombstones only.
+
 T-Hub integrates with Powder through Powder's versioned HTTP API and does not modify or duplicate Powder state.
 Powder remains authoritative for cards, claims, runs, work logs, input requests, and completion evidence.
 T-Hub remains authoritative for projects, ships, terminal identity, Crew liveness, harness selection, checkout paths, and card/run-to-terminal bindings.

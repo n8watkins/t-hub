@@ -1,5 +1,10 @@
 # Captain, Crew, Powder, and Performance Handoff
 
+> Historical compatibility record: this handoff describes the pre-retirement
+> Powder workflow and verified runtime evidence.
+> It is preserved for migration and recovery history, not as current Captain,
+> Project, MCP, health, or agent-session procedure.
+
 ## Canonical Planning Note
 
 The runtime evidence in this handoff is current through the installed `0.3.103` build.

@@ -1,5 +1,8 @@
 # Codex Permission Observability Independent Review Packet
 
+> Historical review packet: Powder identifiers below are preserved as evidence
+> from the retired integration and are not active workflow requirements.
+
 Date: 2026-07-17
 
 Powder card: `thub-codex-permission-observability`

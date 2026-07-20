@@ -1,5 +1,9 @@
 # T-Hub Captain Active Assignment
 
+> Historical compatibility assignment: this record targets the pre-retirement
+> Powder acceptance run and is preserved for audit history only.
+> It is not current authorization to mutate Powder or dispatch a Crew.
+
 ## Purpose
 
 This document is the active instruction for Captain terminal `c2940be4` on ship `t-hub-app`.

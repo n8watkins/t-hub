@@ -1,5 +1,11 @@
 # Appturnity Project Link Cortana Runbook
 
+> Historical compatibility runbook: this Appturnity procedure depends on the
+> retired Powder binding and is no longer a normal Project-registration or
+> Captain-commissioning workflow.
+> Preserve it as an evidence record; use the active agent-session contracts for
+> current work.
+
 ## Status and intended reader
 
 This is an operational handoff for the active T-Hub Cortana.

@@ -1,5 +1,8 @@
 # T1 Dispatch Recovery Assessment and Proposed Solution
 
+> Historical incident record: Powder and Crew references below describe the
+> retired dispatch implementation and are preserved for compatibility history.
+
 ## Purpose
 
 This document gives an independent reviewer enough context to evaluate the failed T1 dispatch, the resulting lifecycle inconsistencies, and the proposed recovery sequence without relying on prior conversation history.

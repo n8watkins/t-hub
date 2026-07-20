@@ -1,5 +1,9 @@
 # T1 Dispatch Recovery Execution Directive
 
+> Historical recovery directive: Powder and Crew references below describe the
+> retired dispatch implementation and are retained for compatibility history.
+> Current work uses the durable agent-session model.
+
 ## Purpose
 
 This directive converts the T1 dispatch incident review into an authorized development sequence that can make progress without using the unreliable installed T-Hub dispatch path to repair itself.
