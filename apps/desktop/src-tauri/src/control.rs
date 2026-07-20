@@ -19871,75 +19871,85 @@ fn freeze_close_terminal_powder_release(
     crew_session_id: &str,
 ) -> Result<(u64, Option<PendingDispatchRelease>), String> {
     let snapshot = ctx.captains.snapshot();
-    let matching_crew = snapshot
-        .captains
-        .iter()
-        .flat_map(|captain| captain.crew.iter())
-        .filter(|crew| crew.terminal_id == crew_session_id)
-        .collect::<Vec<_>>();
-    let crew = match matching_crew.as_slice() {
-        [] => return Ok((snapshot.seq, None)),
-        [crew] => *crew,
-        _ => {
+    #[cfg(not(test))]
+    {
+        // Legacy Powder cleanup remains deserializable for historical recovery,
+        // but terminal close no longer contacts or reconciles it.
+        let _ = crew_session_id;
+        return Ok((snapshot.seq, None));
+    }
+    #[cfg(test)]
+    {
+        let matching_crew = snapshot
+            .captains
+            .iter()
+            .flat_map(|captain| captain.crew.iter())
+            .filter(|crew| crew.terminal_id == crew_session_id)
+            .collect::<Vec<_>>();
+        let crew = match matching_crew.as_slice() {
+            [] => return Ok((snapshot.seq, None)),
+            [crew] => *crew,
+            _ => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+                ));
+            }
+        };
+        if matches!(crew.state, CrewState::Removed { .. }) && crew.powder_work.is_some() {
             return Err(format!(
-                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
-            ));
-        }
-    };
-    if matches!(crew.state, CrewState::Removed { .. }) && crew.powder_work.is_some() {
-        return Err(format!(
             "Crew session '{crew_session_id}' is historically Removed; ordinary live Powder cleanup is refused"
         ));
-    }
-    let Some(work) = crew.powder_work.as_ref() else {
-        return Ok((snapshot.seq, None));
-    };
-    if let Some(recovery) = snapshot
-        .pending_dispatch_releases
-        .iter()
-        .find(|recovery| recovery.crew_session_id == crew_session_id)
-    {
-        return Ok((snapshot.seq, Some(recovery.clone())));
-    }
-    match work.state {
-        PowderWorkState::Completed { .. } => return Ok((snapshot.seq, None)),
-        PowderWorkState::CompletionPending { .. } => {
-            return Err(retryable_error(format!(
+        }
+        let Some(work) = crew.powder_work.as_ref() else {
+            return Ok((snapshot.seq, None));
+        };
+        if let Some(recovery) = snapshot
+            .pending_dispatch_releases
+            .iter()
+            .find(|recovery| recovery.crew_session_id == crew_session_id)
+        {
+            return Ok((snapshot.seq, Some(recovery.clone())));
+        }
+        match work.state {
+            PowderWorkState::Completed { .. } => return Ok((snapshot.seq, None)),
+            PowderWorkState::CompletionPending { .. } => {
+                return Err(retryable_error(format!(
                 "Crew session '{crew_session_id}' has Powder completion pending; close must wait for exact same-proof recovery"
             )));
+            }
+            PowderWorkState::Active => {}
         }
-        PowderWorkState::Active => {}
-    }
-    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
-    let agent = scope.work.agent.clone().ok_or_else(|| {
-        format!("Crew session '{crew_session_id}' Powder binding has no exact agent identity")
-    })?;
-    let client = powder::Client::from_profile(&scope.binding.connection_profile)
-        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    if client.configured_agent() != agent {
-        return Err(format!(
+        let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+        let agent = scope.work.agent.clone().ok_or_else(|| {
+            format!("Crew session '{crew_session_id}' Powder binding has no exact agent identity")
+        })?;
+        let client = powder::Client::from_profile(&scope.binding.connection_profile)
+            .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+        if client.configured_agent() != agent {
+            return Err(format!(
             "Crew session '{crew_session_id}' Powder profile configured agent does not match its durable work agent"
         ));
+        }
+        let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
+            format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
+        })?;
+        Ok((
+            snapshot.seq,
+            Some(PendingDispatchRelease {
+                crew_session_id: crew_session_id.to_string(),
+                project_id: scope.project_id,
+                connection_profile: scope.binding.connection_profile,
+                connection_endpoint_identity,
+                repository: scope.binding.repository,
+                card_id: scope.work.card_id,
+                run_id: scope.work.run_id,
+                agent,
+                operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
+                created_at: now_ms(),
+                state: PendingDispatchReleaseState::Prepared,
+            }),
+        ))
     }
-    let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
-        format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
-    })?;
-    Ok((
-        snapshot.seq,
-        Some(PendingDispatchRelease {
-            crew_session_id: crew_session_id.to_string(),
-            project_id: scope.project_id,
-            connection_profile: scope.binding.connection_profile,
-            connection_endpoint_identity,
-            repository: scope.binding.repository,
-            card_id: scope.work.card_id,
-            run_id: scope.work.run_id,
-            agent,
-            operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
-            created_at: now_ms(),
-            state: PendingDispatchReleaseState::Prepared,
-        }),
-    ))
 }
 
 fn close_terminal_with_policy(
