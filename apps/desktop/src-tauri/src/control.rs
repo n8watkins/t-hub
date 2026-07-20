@@ -16905,14 +16905,42 @@ fn observe_dispatch_baseline(
         match observer(target) {
             Ok(evidence) => match observer(target) {
                 Ok(confirm) => return confirm_stable_launch_baseline(&evidence, &confirm),
-                Err(LaunchAttestationError::UnreadableEvidence) => continue,
+                Err(LaunchAttestationError::UnreadableEvidence) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 Err(error) => return Err(error),
             },
-            Err(LaunchAttestationError::UnreadableEvidence) => continue,
+            Err(LaunchAttestationError::UnreadableEvidence) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
     Err(LaunchAttestationError::UnreadableEvidence)
+}
+
+/// Process scans can be briefly unreadable after tmux completes a pane respawn,
+/// especially while the system is compiling or running a large test suite.
+/// Retry only that transport-level observation failure for a bounded window.
+/// Semantic attestation failures are returned immediately.
+fn observe_dispatch_process(
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+    target: &str,
+    retry_unreadable: bool,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match observer(target) {
+            Err(LaunchAttestationError::UnreadableEvidence)
+                if retry_unreadable && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 fn rollback_crew_launch_failure(
@@ -17479,7 +17507,7 @@ fn dispatch_crew_with_observer_inner(
             rollback_launch_failure!(format!("dispatch_crew: harness startup failed: {error}"));
         }
     }
-    let after_launch = match observer(&tmux_target) {
+    let after_launch = match observe_dispatch_process(observer, &tmux_target, stabilize_baseline) {
         Ok(evidence) => evidence,
         Err(error) => {
             rollback_launch_failure!(format!(
@@ -17514,7 +17542,7 @@ fn dispatch_crew_with_observer_inner(
     let (attestation, final_evidence) = match attest_final_launch_permissions(
         harness.adapter(),
         &after_launch,
-        observer(&tmux_target),
+        observe_dispatch_process(observer, &tmux_target, stabilize_baseline),
         CREW_DEFAULT_PERMISSION,
     ) {
         Ok(accepted) => accepted,
