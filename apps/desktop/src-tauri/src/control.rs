@@ -10895,8 +10895,7 @@ fn get_agent(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .into_iter()
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
-    Ok(serde_json::to_value(agent)
-        .map_err(|error| format!("get_agent serialization failed: {error}"))?)
+    serde_json::to_value(agent).map_err(|error| format!("get_agent serialization failed: {error}"))
 }
 
 fn agent_checkpoint(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
@@ -19844,7 +19843,7 @@ fn freeze_close_terminal_powder_release(
         // Legacy Powder cleanup remains deserializable for historical recovery,
         // but terminal close no longer contacts or reconciles it.
         let _ = crew_session_id;
-        return Ok((snapshot.seq, None));
+        Ok((snapshot.seq, None))
     }
     #[cfg(test)]
     {
