@@ -83,9 +83,10 @@ pub struct ControlRequest {
     /// carried ALONGSIDE the tier `token` so the app can resolve WHICH session (in what
     /// role, on what ship) is calling and enforce the enqueue/access ACLs against an
     /// unforgeable-across-sessions identity (`identity.rs` mint/bind/resolve). Absent for
-    /// the trusted control-token HOST (the app's own webview / MCP / fleet wake), which
-    /// never minted a session token; those callers resolve to no identity and the
-    /// cross-ship ACL FAILS OPEN for them (the NORM-now / LAW-target staging, §2.6).
+    /// a request carrying the exact in-process host proof (the app's own webview,
+    /// MCP, or fleet wake), which never minted a session token.
+    /// A shared control token without that host proof does not substitute for an
+    /// identity on Organization or ProcessChanging requests.
     /// `#[serde(default)]` so every pre-Phase-3 client keeps working unchanged.
     #[serde(default)]
     pub session: String,
@@ -10058,8 +10059,46 @@ fn caller_is_apex(caller: Option<&ResolvedIdentity>, trusted_internal: bool) -> 
         || caller.mint_role == crate::identity::Role::General
 }
 
+fn agent_session_has_privileged_admin_intent(agent: &AgentSessionRecord) -> bool {
+    matches!(
+        agent.admission_purpose,
+        crate::governor::AdmissionPurpose::FleetAdmin
+            | crate::governor::AdmissionPurpose::ShipAdmin
+            | crate::governor::AdmissionPurpose::Recovery
+    )
+}
+
+/// Administrative intent is permanent authority-boundary history.
+///
+/// The durable AgentSession record establishes this history while it is still in
+/// Starting, before a role is appointed, and keeps it after runtime and work-stage
+/// transitions.
+/// Grant records contribute the same history whether active, revoked, or invalidated.
 fn has_delegated_admin_history(ctx: &ControlContext, identity_id: &str) -> bool {
-    !ctx.delegated_admin.grants_for_actor(identity_id).is_empty()
+    if !ctx.delegated_admin.grants_for_actor(identity_id).is_empty() {
+        return true;
+    }
+    let Some(tile) = ctx
+        .identity
+        .get(identity_id)
+        .and_then(|identity| identity.session_tile)
+    else {
+        return false;
+    };
+    ctx.captains.snapshot().agent_sessions.iter().any(|agent| {
+        agent.agent_session_id == tile && agent_session_has_privileged_admin_intent(agent)
+    })
+}
+
+fn target_has_delegated_admin_history(ctx: &ControlContext, terminal_id: &str) -> bool {
+    let privileged_intent = ctx.captains.snapshot().agent_sessions.iter().any(|agent| {
+        agent.agent_session_id == terminal_id && agent_session_has_privileged_admin_intent(agent)
+    });
+    privileged_intent
+        || ctx
+            .identity
+            .for_tile(terminal_id)
+            .is_some_and(|identity| has_delegated_admin_history(ctx, &identity.id))
 }
 
 fn enforce_ship_authority(
@@ -10088,6 +10127,12 @@ fn enforce_attach_authority(
     target_terminal: &str,
     role: FleetRole,
 ) -> Result<(), String> {
+    if target_has_delegated_admin_history(ctx, target_terminal) {
+        return Err(
+            "acl: an administrative Crew identity cannot acquire Captain or Cortana authority"
+                .into(),
+        );
+    }
     if caller_is_apex(caller, trusted_internal) {
         return Ok(());
     }
@@ -10570,13 +10615,15 @@ fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
     format!("{base}/{CREW_GH_CONFIG_SUBDIR}")
 }
 
-/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
-/// spawn - the second, independent wall behind the PreToolUse gate ("hook OR missing
+/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a Crew spawn - the
+/// second, independent wall behind the PreToolUse gate ("hook OR missing
 /// credential"). Points `gh` at an empty config dir (so it finds no `hosts.yml`
 /// credential) AND blanks the common ambient token env vars at the SESSION level (a
 /// tmux `-e KEY=` overrides any inherited value), so a crew that evades the gate still
-/// fails at the remote for lack of a credential. Control-class spawns (captains) are
-/// NOT withheld - orchestrating IS their job.
+/// fails at the remote for lack of a credential.
+/// Capability and organizational role are independent: an administrative Crew may
+/// receive the control capability for its exact operations while still receiving no
+/// ambient publishing credentials.
 fn crew_credential_withholding_env() -> Vec<(String, String)> {
     let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
@@ -10630,10 +10677,10 @@ fn audit_control_spawn(ctx: &ControlContext, command: &str, args: &Value) {
 /// Comms-plane Phase 2 (§2.3, D9): build the spawn env AND mint the session's
 /// per-session identity, injecting the per-session token (`T_HUB_SESSION_TOKEN`)
 /// ALONGSIDE the tier token that [`elevation_env`] already sets. Returns the env plus
-/// the minted identity so the caller binds it to the tile id once the spawn returns
-/// (the tile id is only known after `spawn_tmux_terminal`). When no capability env is
-/// injected (headless / addr unknown) no identity is minted and the session behaves
-/// exactly as before - the identity slice is additive.
+/// the minted identity. A known requested session id is bound durably before the
+/// child starts; a generic terminal id is bound once `spawn_tmux_terminal` returns.
+/// When no capability env is injected (headless / addr unknown) no identity is minted
+/// and the session behaves exactly as before - the identity slice is additive.
 ///
 /// Role at mint is best-effort `Crew`: `spawn_terminal` / `create_worktree` are the
 /// crew-spawn paths (a captain is created via `claim_captain`, not here).
@@ -10648,6 +10695,7 @@ fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
     command: &str,
+    requested_session_id: Option<&str>,
 ) -> Result<
     (
         Vec<(String, String)>,
@@ -10666,19 +10714,29 @@ fn spawn_env_with_identity(
     let capability = spawn_capability(args);
     if capability == Capability::Full {
         audit_control_spawn(ctx, command, args);
-    } else {
-        // item-3 §2.3.5: a read-class (crew) spawn also gets credential-withholding -
-        // gh pointed at an empty config dir + ambient tokens blanked - so a crew that
-        // evades the PreToolUse gate still fails at the remote. Control-class spawns
-        // (captains) keep their credentials (orchestrating is their job).
-        env.extend(crew_credential_withholding_env());
     }
+    // Every identity minted by this helper is Crew, including an administrator with
+    // the control capability. Role, not capability, decides ambient credential access.
+    env.extend(crew_credential_withholding_env());
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
         .or_else(|| arg_str(args, "spawned_by"))
         .and_then(|spawner| ctx.captains.ship_of(&spawner))
         .map(|m| m.ship_slug().to_string());
-    let identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship)?;
+    let mut identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship)?;
+    if let Some(session_id) = requested_session_id {
+        if let Err(error) = ctx.identity.bind_tile(&identity.id, session_id) {
+            let rollback = ctx.identity.retire(&identity.id);
+            return Err(format!(
+                "spawn_terminal: identity pre-binding persistence failed: {error}{}",
+                rollback
+                    .err()
+                    .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                    .unwrap_or_default()
+            ));
+        }
+        identity.session_tile = Some(session_id.to_string());
+    }
     env.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
@@ -11045,6 +11103,29 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     && identity.fleet_role.is_none()
                     && identity.tile.as_deref() == Some(agent.as_str())
             });
+
+    // A shared Full capability permits use of the mutation surface, but it does not
+    // identify who is exercising it.
+    // Every untrusted Organization or ProcessChanging request must also present a
+    // currently valid per-session identity.
+    // Only the exact in-process host provenance may omit that identity.
+    if cap == Capability::Full && tier != CommandTier::Read && !trusted_internal && caller.is_none()
+    {
+        let message = format!(
+            "unauthorized: '{}' requires a valid T_HUB_SESSION_TOKEN with the control capability",
+            req.command
+        );
+        audit_command(ctx, &req, tier, cap, "refused-identity", Some(&message));
+        ctx.fanout.emit_event(
+            "control://governor",
+            &json!({
+                "command": req.command.as_str(),
+                "decision": "refused-identity",
+                "error": message.as_str(),
+            }),
+        );
+        return ControlResponse::err(message);
+    }
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
@@ -11543,9 +11624,8 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
     }))
 }
 
-/// The 3-arg dispatcher used by the in-file unit tests (a control-token HOST with no
-/// per-session caller: `None` identity + `Full` capability - the fail-open path the ACL
-/// treats as the trusted host). The authenticated production path calls
+/// The 3-arg dispatcher used by in-file unit tests as the exact trusted in-process
+/// host (`None` identity plus trusted host provenance). The authenticated production path calls
 /// [`dispatch_with_caller`] directly with the resolved caller. Kept so the ~90 existing
 /// dispatch tests read unchanged; the Phase-3 ACL tests call `dispatch_with_caller`.
 #[cfg(test)]
@@ -11557,9 +11637,8 @@ fn dispatch_with_caller(
     ctx: &ControlContext,
     command: &str,
     args: &Value,
-    // Comms-plane Phase 3: the resolved per-session caller (`None` = a control-token
-    // host that presented no session token), and its resolved tier capability. The ACL
-    // wiring for the enqueue/access/ack cells consumes both.
+    // Comms-plane Phase 3: the resolved per-session caller and exact trusted-host
+    // provenance are separate inputs. The ACL wiring consumes both.
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
@@ -16521,6 +16600,15 @@ fn attach_captain(
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("attach_captain requires a 'captainSessionId' argument")?;
+    // Target eligibility is an authority predicate, so evaluate it before runtime,
+    // provider, or Project probes can reveal information about a forbidden target.
+    enforce_attach_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        &terminal_id,
+        FleetRole::Captain,
+    )?;
     if !caller_is_apex(caller, trusted_internal)
         && caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str())
     {
@@ -16591,13 +16679,6 @@ fn attach_captain(
         .map(|value| slugify_ship(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
-    enforce_attach_authority(
-        ctx,
-        caller,
-        trusted_internal,
-        &terminal_id,
-        FleetRole::Captain,
-    )?;
     let _provision = ctx.captains.provision_guard();
     if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
@@ -21458,12 +21539,12 @@ fn supervisor_authority_for_caller(
     match caller.fleet_role {
         Some(FleetRole::Cortana) => {
             let durable = ctx.captains.cortana_identity();
-            let active = ctx.captains.snapshot().captains.iter().any(|captain| {
-                captain.role == FleetRole::Cortana
-                    && captain.state == ClaimState::Active
-                    && captain.terminal_id.as_deref() == caller.tile.as_deref()
-            });
-            if durable.identity_id.as_deref() != Some(caller.session_id.as_str()) {
+            let authoritative = ctx
+                .identity
+                .get(&caller.session_id)
+                .is_some_and(|identity| authoritative_cortana_identity(ctx, &identity));
+            if !authoritative || durable.identity_id.as_deref() != Some(caller.session_id.as_str())
+            {
                 return Err("delegated admin: caller is not the durable Cortana identity".into());
             }
             Ok(crate::delegated_admin::SupervisorAuthority {
@@ -21471,7 +21552,7 @@ fn supervisor_authority_for_caller(
                 role: crate::delegated_admin::DelegatingSupervisorRole::Cortana,
                 ship_slug: None,
                 authority_generation: durable.generation,
-                active,
+                active: true,
             })
         }
         Some(FleetRole::Captain) => {
@@ -21506,17 +21587,11 @@ fn current_delegating_supervisor(
     match grant.delegator.role {
         crate::delegated_admin::DelegatingSupervisorRole::Cortana => {
             let durable = ctx.captains.cortana_identity();
-            let active = durable.identity_id.as_deref().is_some_and(|identity_id| {
-                ctx.captains.snapshot().captains.iter().any(|captain| {
-                    captain.role == FleetRole::Cortana
-                        && captain.state == ClaimState::Active
-                        && captain.terminal_id.as_deref().is_some_and(|terminal_id| {
-                            ctx.identity
-                                .for_tile(terminal_id)
-                                .is_some_and(|identity| identity.id == identity_id)
-                        })
-                })
-            });
+            let active = durable
+                .identity_id
+                .as_deref()
+                .and_then(|identity_id| ctx.identity.get(identity_id))
+                .is_some_and(|identity| authoritative_cortana_identity(ctx, &identity));
             crate::delegated_admin::SupervisorAuthority {
                 identity_id: durable
                     .identity_id
@@ -22894,7 +22969,7 @@ fn create_worktree_authorized(
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
         let (elevation, minted_identity) =
-            match spawn_env_with_identity(ctx, args, "create_worktree") {
+            match spawn_env_with_identity(ctx, args, "create_worktree", None) {
                 Ok(value) => value,
                 Err(error) => {
                     let rollback = rollback_created_worktree_state(
@@ -25248,7 +25323,6 @@ fn spawn_terminal_with_private_pane_command_and_id(
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
-    let (mut elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
     let provider_harness = arg_str(args, "_providerHarness").or_else(|| {
         requested_session_id.and_then(|session_id| {
             ctx.captains
@@ -25263,6 +25337,19 @@ fn spawn_terminal_with_private_pane_command_and_id(
         if !matches!(provider_harness.as_str(), "codex" | "claude") {
             return Err("spawn_terminal: internal provider Harness marker is invalid".into());
         }
+    }
+    let (mut elevation, minted_identity) =
+        spawn_env_with_identity(ctx, args, "spawn_terminal", requested_session_id)?;
+    if let Some(provider_harness) = arg_str(args, "_providerHarness").or_else(|| {
+        requested_session_id.and_then(|session_id| {
+            ctx.captains
+                .snapshot()
+                .agent_sessions
+                .into_iter()
+                .find(|agent| agent.agent_session_id == session_id)
+                .map(|agent| agent.provider)
+        })
+    }) {
         elevation.push((PROVIDER_SESSION_ENV.into(), provider_harness));
     }
     let spawn_result = match requested_session_id {
@@ -25285,9 +25372,13 @@ fn spawn_terminal_with_private_pane_command_and_id(
             return Err(e);
         }
     };
-    // Bind the minted identity to the tile id now it is known (the tile is a mutable
-    // pointer; the durable key is the minted identity id - item-2 re-key flagged).
-    if let Some(identity) = &minted_identity {
+    // A requested id is pre-bound before tmux starts so a privileged child can never
+    // observe a usable identity that is not yet tied to its durable AgentSession.
+    // Generic terminal ids remain unknown until tmux returns and bind here.
+    if let Some(identity) = minted_identity
+        .as_ref()
+        .filter(|_| requested_session_id.is_none())
+    {
         if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
             let _ = tmux::kill_session_tree(&tmux_session);
             let rollback = ctx.identity.retire(&identity.id);
@@ -26555,6 +26646,18 @@ mod tests {
     }
 
     fn seed_starting_agent(ctx: &ControlContext, agent_session_id: &str) {
+        seed_starting_agent_with_purpose(
+            ctx,
+            agent_session_id,
+            crate::governor::AdmissionPurpose::Ordinary,
+        );
+    }
+
+    fn seed_starting_agent_with_purpose(
+        ctx: &ControlContext,
+        agent_session_id: &str,
+        admission_purpose: crate::governor::AdmissionPurpose,
+    ) {
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "capacity-project".into(),
@@ -26603,7 +26706,7 @@ mod tests {
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(dispatch_capacity),
-                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+                admission_purpose,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -31647,7 +31750,7 @@ mod tests {
             assert!(response
                 .error
                 .unwrap_or_default()
-                .contains("terminal-bound"));
+                .contains("requires a valid T_HUB_SESSION_TOKEN"));
         }
         assert_eq!(captains.snapshot().seq, before_captains.seq);
         assert_eq!(captains.snapshot().captains, before_captains.captains);
@@ -35231,6 +35334,16 @@ mod tests {
             Some("start-fleet-admin"),
             "an authorized administrative lane must receive control capability"
         );
+        assert!(
+            tmux::session_environment(&tmux_target(agent_session_id), "GH_CONFIG_DIR")
+                .unwrap()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            tmux::session_environment(&tmux_target(agent_session_id), "NPM_TOKEN").unwrap(),
+            Some(String::new()),
+            "administrative control capability must not restore ambient credentials"
+        );
         let agent = ctx
             .captains
             .snapshot()
@@ -35299,6 +35412,51 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    fn fleet_admin_grant_fixture(
+        tag: &str,
+    ) -> (
+        ControlContext,
+        crate::identity::SessionIdentity,
+        crate::identity::SessionIdentity,
+        String,
+        String,
+    ) {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let cortana_tile = format!("co{}", &nonce[..6]);
+        let captain_tile = format!("ca{}", &nonce[..6]);
+        let admin_tile = format!("fa{}", &nonce[..6]);
+        let ctx = test_ctx(&format!("fleet-grant-{tag}-{}", &nonce[..6]));
+        ctx.captains
+            .claim_test(&captain_tile, Some(&format!("ship-{tag}")), vec![])
+            .unwrap();
+        ctx.captains
+            .record_crew(&captain_tile, &admin_tile)
+            .unwrap();
+        create_test_tmux_session(&tmux_target(&admin_tile)).unwrap();
+
+        let cortana_secret =
+            mint_current_cortana_session(&ctx.identity, &ctx.captains, &cortana_tile);
+        let cortana_identity = ctx.identity.resolve(&cortana_secret).unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, &admin_tile)
+            .unwrap();
+        let cortana = resolve_identity(&ctx, &cortana_secret).unwrap();
+        let appointed = appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": admin_tile,
+                "role": "fleetAdmin",
+                "permittedOperations": ["maintainFleetResource"]
+            }),
+            Some(&cortana),
+            false,
+        )
+        .unwrap();
+        let grant_id = appointed["grant"]["grantId"].as_str().unwrap().to_string();
+        (ctx, cortana_identity, admin_identity, grant_id, admin_tile)
     }
 
     #[test]
@@ -35691,6 +35849,71 @@ mod tests {
     }
 
     #[test]
+    fn fleet_admin_grants_invalidate_with_every_non_authoritative_cortana_state() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        for state in ["recovering", "degraded", "duplicate", "released"] {
+            let (ctx, cortana_identity, admin_identity, grant_id, admin_tile) =
+                fleet_admin_grant_fixture(state);
+            match state {
+                "recovering" => {
+                    ctx.captains
+                        .begin_cortana_recovery("test-recovering")
+                        .unwrap();
+                }
+                "degraded" => {
+                    ctx.captains
+                        .mark_cortana_degraded("test-degraded", "injected uncertainty")
+                        .unwrap();
+                }
+                "duplicate" => {
+                    let mut duplicate = ctx
+                        .captains
+                        .snapshot()
+                        .captains
+                        .into_iter()
+                        .find(|captain| captain.role == FleetRole::Cortana)
+                        .unwrap();
+                    duplicate.ship_slug = "cortana-duplicate".into();
+                    duplicate.assignment_id = "cortana-duplicate-assignment".into();
+                    duplicate.terminal_id = Some("duplicate".into());
+                    ctx.captains.lock().captains.push(duplicate);
+                }
+                "released" => {
+                    let cortana = resolve_identity(&ctx, &cortana_identity.secret).unwrap();
+                    release_captain(
+                        &ctx,
+                        &json!({"captainSessionId": cortana.tile.clone()}),
+                        Some(&cortana),
+                        false,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+            let denied = authorize_delegated_admin(
+                &ctx,
+                &admin,
+                crate::delegated_admin::AdminOperation::MaintainFleetResource,
+                crate::delegated_admin::AdminTarget::Fleet,
+                crate::delegated_admin::AdminSafeguards::default(),
+            )
+            .unwrap_err();
+            assert!(
+                denied.contains("supervisorInactive")
+                    || denied.contains("no active administrative grant"),
+                "unexpected {state} denial: {denied}"
+            );
+            assert!(matches!(
+                ctx.delegated_admin.get(&grant_id).unwrap().state,
+                crate::delegated_admin::GrantState::Invalidated { .. }
+            ));
+            reap_test_tmux_session(&tmux_target(&admin_tile)).unwrap();
+        }
+    }
+
+    #[test]
     fn dispatch_capacity_counts_one_live_harness_backed_ship_admin_per_ship() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("admin-capacity");
@@ -35926,7 +36149,6 @@ mod tests {
 
         let tabs_before = ctx.tabs.snapshot_full();
         let identities_before = ctx.identity.len();
-        let sessions_before = tmux::list_sessions().unwrap();
         let maintained = dispatch_authenticated(
             &ctx,
             req_session(
@@ -35955,7 +36177,12 @@ mod tests {
             serde_json::to_value(tabs_before.tabs).unwrap()
         );
         assert_eq!(ctx.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        // The tmux namespace is shared by concurrent tests, so verify this
+        // fixture's exact runtime instead of comparing the global session list.
+        assert_eq!(
+            tmux::session_liveness(&admin_target),
+            tmux::SessionLiveness::Alive
+        );
         assert!(sink.calls.lock().unwrap().is_empty());
         assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
         assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
@@ -35980,7 +36207,10 @@ mod tests {
         assert!(!elevated_target.exists());
         assert_eq!(ctx.tabs.snapshot_full().seq, tabs_before.seq);
         assert_eq!(ctx.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        assert_eq!(
+            tmux::session_liveness(&admin_target),
+            tmux::SessionLiveness::Alive
+        );
         assert!(sink.calls.lock().unwrap().is_empty());
         assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
         assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
@@ -36286,6 +36516,134 @@ mod tests {
         );
         assert!(grants.ok, "self grant listing failed: {:?}", grants.error);
         reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
+    fn privileged_agent_intent_is_permanent_admin_history_before_appointment_and_reload() {
+        for (label, purpose) in [
+            ("fleet", crate::governor::AdmissionPurpose::FleetAdmin),
+            ("ship", crate::governor::AdmissionPurpose::ShipAdmin),
+            ("recovery", crate::governor::AdmissionPurpose::Recovery),
+        ] {
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let captains_path = captains_tmp(&format!("intent-history-{label}-{nonce}"));
+            let identities_path = std::env::temp_dir().join(format!(
+                "t-hub-intent-history-identities-{label}-{nonce}.json"
+            ));
+            let agent_id = format!("{}{}", &label[..2], &nonce[..6]);
+            let admin_secret;
+            let general_secret;
+
+            {
+                let captains = Arc::new(CaptainsRegistry::load(captains_path.clone()));
+                let identities = Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                ));
+                let ctx = test_ctx(&format!("intent-history-{label}"))
+                    .with_captains_registry(captains)
+                    .with_identity_store(identities);
+                seed_starting_agent_with_purpose(&ctx, &agent_id, purpose);
+                admin_secret = mint_session(
+                    &ctx.identity,
+                    crate::identity::Role::Crew,
+                    "capacity-ship",
+                    &agent_id,
+                );
+                general_secret = mint_session(
+                    &ctx.identity,
+                    crate::identity::Role::General,
+                    "fleet",
+                    "general-intent",
+                );
+                let admin = resolve_identity(&ctx, &admin_secret).unwrap();
+                assert!(has_delegated_admin_history(&ctx, &admin.session_id));
+
+                let mutation = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        &format!("intent-history-{label}"),
+                        &admin_secret,
+                        "new_tab",
+                        json!({"name": "forbidden-before-appointment"}),
+                    ),
+                );
+                assert!(!mutation.ok);
+                assert!(mutation
+                    .error
+                    .unwrap_or_default()
+                    .contains("outside their exact administrative operation grants"));
+
+                let general = resolve_identity(&ctx, &general_secret).unwrap();
+                for role in [FleetRole::Captain, FleetRole::Cortana] {
+                    assert!(
+                        enforce_attach_authority(&ctx, Some(&general), false, &agent_id, role,)
+                            .unwrap_err()
+                            .contains("administrative Crew identity")
+                    );
+                }
+                for (command, args) in [
+                    (
+                        "claim_captain",
+                        json!({"captainSessionId": &agent_id, "shipSlug": "forbidden"}),
+                    ),
+                    (
+                        "attach_captain",
+                        json!({
+                            "captainSessionId": &agent_id,
+                            "projectId": "capacity-project",
+                            "assignment": "forbidden"
+                        }),
+                    ),
+                ] {
+                    let response = dispatch_authenticated(
+                        &ctx,
+                        req_session(
+                            &format!("intent-history-{label}"),
+                            &general_secret,
+                            command,
+                            args,
+                        ),
+                    );
+                    assert!(!response.ok, "{command} promoted {label} intent");
+                    assert!(response
+                        .error
+                        .unwrap_or_default()
+                        .contains("administrative Crew identity"));
+                }
+            }
+
+            {
+                let ctx = test_ctx(&format!("intent-history-{label}"))
+                    .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                    .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                        identities_path.clone(),
+                    )));
+                let admin = resolve_identity(&ctx, &admin_secret).unwrap();
+                assert!(has_delegated_admin_history(&ctx, &admin.session_id));
+                let mutation = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        &format!("intent-history-{label}"),
+                        &admin_secret,
+                        "new_tab",
+                        json!({"name": "forbidden-after-reload"}),
+                    ),
+                );
+                assert!(!mutation.ok);
+                assert!(mutation
+                    .error
+                    .unwrap_or_default()
+                    .contains("outside their exact administrative operation grants"));
+            }
+
+            for path in [
+                captains_path.with_extension("json.bak"),
+                captains_path,
+                identities_path,
+            ] {
+                std::fs::remove_file(path).ok();
+            }
+        }
     }
 
     #[test]
@@ -40882,7 +41240,7 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
 
         // Default (untagged => READ) spawn: NO control-spawn audit record.
-        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal");
+        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal", None);
         let recs = read_audit(&dir);
         assert!(
             recs.iter().all(|r| r["decision"] != "control-spawn"),
@@ -40894,6 +41252,7 @@ mod tests {
             &ctx,
             &json!({"cwd": "/tmp", "capability": "control"}),
             "spawn_terminal",
+            None,
         );
         let recs = read_audit(&dir);
         let ctl: Vec<_> = recs
@@ -41321,7 +41680,8 @@ mod tests {
     fn spawn_env_mints_and_injects_a_per_session_identity_token() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env, minted) =
+            spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         // The tier token is injected; the item-3 default is the READ token ...
         assert!(env
             .iter()
@@ -41347,9 +41707,83 @@ mod tests {
 
         // Headless (no addr): no identity minted, env empty, spawns behave as before.
         ctx.addr = String::new();
-        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env2, minted2) =
+            spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn requested_session_identity_is_bound_before_launch_and_prebind_failure_rolls_back() {
+        let mut ctx = test_ctx("identity-prebind");
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let (_, minted) = spawn_env_with_identity(
+            &ctx,
+            &json!({"capability": "control"}),
+            "spawn_terminal",
+            Some("fa123456"),
+        )
+        .unwrap();
+        let minted = minted.unwrap();
+        assert_eq!(minted.session_tile.as_deref(), Some("fa123456"));
+        assert_eq!(
+            ctx.identity
+                .resolve(&minted.secret)
+                .and_then(|identity| identity.session_tile),
+            Some("fa123456".into())
+        );
+
+        let path = captains_tmp("identity-prebind-rollback");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        store.fail_persist_after(1);
+        let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
+        failing.addr = "127.0.0.1:4242".to_string();
+        let error = spawn_env_with_identity(
+            &failing,
+            &json!({"capability": "control"}),
+            "spawn_terminal",
+            Some("fa654321"),
+        )
+        .unwrap_err();
+        assert!(error.contains("identity pre-binding persistence failed"));
+        assert!(store.is_empty());
+        assert!(crate::identity::IdentityStore::load(path.clone()).is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn failed_requested_session_spawn_retires_the_prebound_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "failed_requested_session_spawn_retires_the_prebound_identity: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let mut ctx =
+            test_ctx("identity-prebound-spawn-rollback").with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let target = tmux_target(&session_id);
+        create_test_tmux_session(&target).unwrap();
+        let result = spawn_terminal_with_private_pane_command_and_id(
+            &ctx,
+            &json!({"cwd": "/tmp", "capability": "control"}),
+            None,
+            false,
+            false,
+            false,
+            Some(&session_id),
+        );
+        assert!(result.is_err());
+        assert!(ctx.identity.is_empty());
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        reap_test_tmux_session(&target).unwrap();
     }
 
     #[test]
@@ -41465,15 +41899,15 @@ mod tests {
     }
 
     #[test]
-    fn crew_spawn_is_credential_withheld_but_control_spawn_is_not() {
-        // item-3 §2.3.5: a read-class (crew) spawn gets gh withholding (GH_CONFIG_DIR at
-        // an empty dir) + blanked ambient tokens - the second wall behind the gate. A
-        // control-class spawn (captain) keeps its credentials. BYPASS-WOULD-FAIL: drop
-        // the crew_credential_withholding_env call and the GH_CONFIG_DIR assert goes RED.
+    fn every_crew_spawn_is_credential_withheld_regardless_of_capability() {
+        // item-3 §2.3.5: every Crew spawn gets gh withholding (GH_CONFIG_DIR at an
+        // empty dir) plus blanked ambient tokens.
+        // A delegated administrative Crew may receive a control token for exact
+        // operations, but that capability must not restore publishing credentials.
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
 
-        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         let gh_dir = env
             .iter()
             .find(|(k, _)| k == "GH_CONFIG_DIR")
@@ -41498,13 +41932,36 @@ mod tests {
             "a crew spawn must blank the ambient GH_TOKEN"
         );
 
-        let (env2, _) =
-            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal")
-                .unwrap();
-        assert!(
-            !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
-            "a control-class spawn must keep its gh credentials"
-        );
+        for purpose in ["fleet-admin", "ship-admin", "recovery"] {
+            let (admin_env, _) = spawn_env_with_identity(
+                &ctx,
+                &json!({
+                    "capability": "control",
+                    "admissionPurpose": purpose
+                }),
+                "spawn_terminal",
+                None,
+            )
+            .unwrap();
+            assert!(
+                admin_env.iter().any(|(key, _)| key == "GH_CONFIG_DIR"),
+                "a {purpose} Crew spawn must still withhold gh credentials"
+            );
+            for token in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "NPM_TOKEN",
+                "NODE_AUTH_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+            ] {
+                assert!(
+                    admin_env
+                        .iter()
+                        .any(|(key, value)| key == token && value.is_empty()),
+                    "a {purpose} Crew spawn must blank ambient {token}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -41846,6 +42303,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn untrusted_full_mutations_require_identity_and_audit_omitted_or_invalid_tokens() {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let audit_dir = std::env::temp_dir().join(format!("t-hub-identity-gate-{nonce}"));
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let general_secret = mint_session(
+            &store,
+            crate::identity::Role::General,
+            "fleet",
+            "general-gate",
+        );
+        let ctx = test_ctx("identity-gate")
+            .with_identity_store(store)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+
+        for (command, args) in [
+            ("new_tab", json!({"name": "must-not-exist"})),
+            (
+                "spawn_terminal",
+                json!({"cwd": "/tmp", "requestId": "must-not-spawn"}),
+            ),
+        ] {
+            for session in ["", "invalid-nonempty-session-token"] {
+                let response = dispatch_authenticated(
+                    &ctx,
+                    req_untrusted("identity-gate", session, command, args.clone()),
+                );
+                assert!(
+                    !response.ok,
+                    "{command} accepted an unidentified Full bearer"
+                );
+                assert!(response
+                    .error
+                    .unwrap_or_default()
+                    .contains("requires a valid T_HUB_SESSION_TOKEN"));
+            }
+        }
+        assert!(ctx.tabs.id_for_name("must-not-exist").is_none());
+        let records = read_audit(&audit_dir);
+        assert_eq!(records.len(), 4);
+        assert!(records
+            .iter()
+            .all(|record| record["decision"] == "refused-identity"));
+        assert!(records
+            .iter()
+            .all(|record| record["tokenTier"] == "control"));
+
+        let identified = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "identity-gate",
+                &general_secret,
+                "new_tab",
+                json!({"name": "identified"}),
+            ),
+        );
+        assert!(
+            identified.ok,
+            "identified Full mutation failed: {:?}",
+            identified.error
+        );
+
+        let trusted = dispatch_authenticated(
+            &ctx,
+            req("identity-gate", "new_tab", json!({"name": "trusted-host"})),
+        );
+        assert!(
+            trusted.ok,
+            "trusted host mutation failed: {:?}",
+            trusted.error
+        );
+        std::fs::remove_dir_all(audit_dir).ok();
     }
 
     #[test]
