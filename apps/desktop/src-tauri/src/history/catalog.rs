@@ -292,6 +292,24 @@ impl HistoryService {
         Ok(self.state.lock().pending_resumes.get(request_id).cloned())
     }
 
+    /// Snapshot every durable provider-resume intent for capacity accounting.
+    /// The returned records are clones so the History lock is never held while
+    /// the caller inspects tmux or provider liveness.
+    pub fn pending_resumes(&self) -> Result<Vec<HistoryPendingResume>, String> {
+        if let Some(error) = &self.state_error {
+            return Err(format!(
+                "history_recovery_required: durable History state is unavailable: {error}"
+            ));
+        }
+        Ok(self
+            .state
+            .lock()
+            .pending_resumes
+            .values()
+            .cloned()
+            .collect())
+    }
+
     pub fn reserve_resume(&self, pending: HistoryPendingResume) -> Result<(), String> {
         if let Some(error) = &self.state_error {
             return Err(format!(

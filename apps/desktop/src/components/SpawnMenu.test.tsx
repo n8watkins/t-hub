@@ -23,7 +23,10 @@ describe("SpawnMenu presets", () => {
     const resume = byKey("resume");
     expect(resume).toBeDefined();
     expect(resume?.label).toBe("Resume Claude…");
-    expect(resume?.options).toEqual({ startupCommand: "claude --resume" });
+    expect(resume?.options).toEqual({
+      startupCommand: "claude --resume",
+      providerIntent: "claude",
+    });
   });
 
   it("keeps the plain Shell preset with no startup command", () => {
@@ -37,7 +40,10 @@ describe("SpawnMenu presets", () => {
     const codex = byKey("codex");
     expect(codex).toBeDefined();
     expect(codex?.label).toBe("Codex");
-    expect(codex?.options).toEqual({ startupCommand: "codex" });
+    expect(codex?.options).toEqual({
+      startupCommand: "codex",
+      providerIntent: "codex",
+    });
   });
 
   it("adds a Resume Codex picker preset symmetric with Claude", () => {
@@ -45,7 +51,10 @@ describe("SpawnMenu presets", () => {
     const resumeCodex = byKey("resume-codex");
     expect(resumeCodex).toBeDefined();
     expect(resumeCodex?.label).toBe("Resume Codex…");
-    expect(resumeCodex?.options).toEqual({ startupCommand: "codex resume" });
+    expect(resumeCodex?.options).toEqual({
+      startupCommand: "codex resume",
+      providerIntent: "codex",
+    });
   });
 
   it("keeps ordinary Codex read-only and routes Captain through commissioning", () => {
@@ -69,7 +78,9 @@ describe("SpawnMenu Captain commissioning", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Codex New terminal/i }));
 
     expect(onSpawn).toHaveBeenCalledWith(
-      expect.objectContaining({ options: { startupCommand: "codex" } }),
+      expect.objectContaining({
+        options: { startupCommand: "codex", providerIntent: "codex" },
+      }),
     );
     expect(onClose).toHaveBeenCalledOnce();
   });

@@ -14,9 +14,10 @@
 //!      spawn (never a free-running counter that drifts when a session dies
 //!      without a `close_terminal`). Default 64, env `T_HUB_MAX_SESSIONS`.
 //!   2. **Spawn rate** - a token-bucket: sustained 20/min, burst 8 (env
-//!      `T_HUB_SPAWN_RATE` / `T_HUB_SPAWN_BURST`). Burst 8 covers a captain
-//!      fanning out 6 crew plus slack; the sustained rate lets multi-level
-//!      near-simultaneous fan-out through while starving a runaway loop.
+//!      `T_HUB_SPAWN_RATE` / `T_HUB_SPAWN_BURST`). The burst covers short
+//!      adaptive fan-out plus supervisor recovery slack; the sustained rate
+//!      lets independent near-simultaneous lanes through while starving a
+//!      runaway loop.
 //!   3. **Hard ceiling** - an absolute concurrent stop (128) that no env
 //!      override can exceed (defense against a mis-set `T_HUB_MAX_SESSIONS`).
 //!   4. **Destructive rate** - a separate token-bucket throttling `close_terminal`
@@ -34,7 +35,7 @@
 //! It also rejects ambiguous ownership, dependencies, and mutable-resource
 //! collisions before callers allocate worktrees or start provider sessions.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -138,6 +139,7 @@ pub struct ReservationPolicy {
 pub enum AdmissionPurpose {
     #[default]
     Ordinary,
+    Cortana,
     FleetAdmin,
     ShipAdmin,
     Recovery,
@@ -198,9 +200,17 @@ pub struct RuntimeCapacity {
     pub provider_capacity_status: ProviderCapacityStatus,
     pub available_worktrees: usize,
     pub active_captains: usize,
+    /// Exact active ship scopes used to reserve one Ship Admin per ship.
+    /// Empty means the caller supplied only the legacy aggregate count.
+    #[serde(default)]
+    pub active_captain_ships: BTreeSet<String>,
     pub live_cortana: usize,
     pub live_fleet_admins: usize,
     pub live_ship_admins: usize,
+    /// Live Ship Admins by exact ship scope.
+    /// Empty means the caller supplied only the legacy aggregate count.
+    #[serde(default)]
+    pub live_ship_admin_scopes: BTreeMap<String, usize>,
     pub live_recovery_sessions: usize,
 }
 
@@ -262,6 +272,16 @@ pub struct IntegrationContract {
 #[serde(rename_all = "camelCase")]
 pub struct DispatchPreflight {
     pub requested_lanes: Vec<LaneClaim>,
+    /// Number of requested lanes that will consume a provider Harness slot.
+    /// Generic shells and plain worktrees explicitly request zero.
+    #[serde(default)]
+    pub requested_provider_lanes: usize,
+    /// Reservation class requested by a single runtime admission.
+    #[serde(default)]
+    pub admission_purpose: AdmissionPurpose,
+    /// Required only for a Ship Admin reservation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_admin_scope: Option<String>,
     #[serde(default)]
     pub active_lanes: Vec<LaneClaim>,
     #[serde(default)]
@@ -272,10 +292,11 @@ pub struct DispatchPreflight {
 }
 
 /// Machine-readable capacity and reservation evidence for an admission result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapacityReport {
     pub requested_lanes: usize,
+    pub requested_provider_lanes: usize,
     pub configured_session_limit: usize,
     pub hard_session_limit: usize,
     pub machine_session_limit: usize,
@@ -288,12 +309,81 @@ pub struct CapacityReport {
     #[serde(default)]
     pub provider_live_sessions: usize,
     pub provider_headroom: usize,
+    /// Provider headroom left after protecting all unfilled role reservations.
+    pub provider_headroom_after_reservations: usize,
     #[serde(default)]
     pub provider_capacity_status: ProviderCapacityStatus,
     pub worktree_headroom: usize,
     pub effective_lane_headroom: usize,
     pub reservations: ReservationReport,
     pub limiting_factors: Vec<DispatchReasonCode>,
+}
+
+/// Compatibility wire shape for reports persisted before provider reservations
+/// and explicit provider-lane requests were introduced.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapacityReportWire {
+    requested_lanes: usize,
+    #[serde(default)]
+    requested_provider_lanes: Option<usize>,
+    configured_session_limit: usize,
+    hard_session_limit: usize,
+    machine_session_limit: usize,
+    effective_session_limit: usize,
+    live_sessions: usize,
+    session_headroom_before_reservations: usize,
+    session_headroom_after_reservations: usize,
+    #[serde(default)]
+    provider_session_limit: usize,
+    #[serde(default)]
+    provider_live_sessions: usize,
+    provider_headroom: usize,
+    #[serde(default)]
+    provider_headroom_after_reservations: Option<usize>,
+    #[serde(default)]
+    provider_capacity_status: ProviderCapacityStatus,
+    worktree_headroom: usize,
+    effective_lane_headroom: usize,
+    reservations: ReservationReport,
+    limiting_factors: Vec<DispatchReasonCode>,
+}
+
+impl<'de> Deserialize<'de> for CapacityReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CapacityReportWire::deserialize(deserializer)?;
+        let provider_headroom_after_reservations = wire
+            .provider_headroom_after_reservations
+            .unwrap_or_else(|| {
+                wire.provider_headroom
+                    .saturating_sub(wire.reservations.total_deficit)
+            });
+        Ok(Self {
+            requested_lanes: wire.requested_lanes,
+            requested_provider_lanes: wire
+                .requested_provider_lanes
+                .unwrap_or(wire.requested_lanes),
+            configured_session_limit: wire.configured_session_limit,
+            hard_session_limit: wire.hard_session_limit,
+            machine_session_limit: wire.machine_session_limit,
+            effective_session_limit: wire.effective_session_limit,
+            live_sessions: wire.live_sessions,
+            session_headroom_before_reservations: wire.session_headroom_before_reservations,
+            session_headroom_after_reservations: wire.session_headroom_after_reservations,
+            provider_session_limit: wire.provider_session_limit,
+            provider_live_sessions: wire.provider_live_sessions,
+            provider_headroom: wire.provider_headroom,
+            provider_headroom_after_reservations,
+            provider_capacity_status: wire.provider_capacity_status,
+            worktree_headroom: wire.worktree_headroom,
+            effective_lane_headroom: wire.effective_lane_headroom,
+            reservations: wire.reservations,
+            limiting_factors: wire.limiting_factors,
+        })
+    }
 }
 
 /// A rejected dispatch with a stable reason, relevant lane/resource evidence,
@@ -425,14 +515,25 @@ impl SpawnGovernor {
     /// when no dispatch is being attempted.
     pub fn capacity_report(&self, request: &DispatchPreflight) -> CapacityReport {
         let runtime = &request.capacity;
-        let ship_admins_required = runtime
-            .active_captains
-            .saturating_mul(self.reservations.ship_admins_per_active_captain);
+        let ship_admins_required = if runtime.active_captain_ships.is_empty() {
+            runtime
+                .active_captains
+                .saturating_mul(self.reservations.ship_admins_per_active_captain)
+        } else {
+            runtime
+                .active_captain_ships
+                .len()
+                .saturating_mul(self.reservations.ship_admins_per_active_captain)
+        };
+        let live_ship_admins = if runtime.live_ship_admin_scopes.is_empty() {
+            runtime.live_ship_admins
+        } else {
+            runtime.live_ship_admin_scopes.values().copied().sum()
+        };
         let cortana = ReservationClassReport::new(self.reservations.cortana, runtime.live_cortana);
         let fleet_admins =
             ReservationClassReport::new(self.reservations.fleet_admins, runtime.live_fleet_admins);
-        let ship_admins =
-            ReservationClassReport::new(ship_admins_required, runtime.live_ship_admins);
+        let ship_admins = ReservationClassReport::new(ship_admins_required, live_ship_admins);
         let recovery =
             ReservationClassReport::new(self.reservations.recovery, runtime.live_recovery_sessions);
         let total_deficit = cortana
@@ -459,9 +560,19 @@ impl SpawnGovernor {
         let provider_headroom = runtime
             .provider_session_capacity
             .saturating_sub(runtime.provider_live_sessions);
+        let provider_headroom_after_reservations = provider_headroom.saturating_sub(total_deficit);
+        let protected_for_request = self.reservation_deficit_protected_from(request, &reservations);
+        let session_headroom_for_request =
+            session_headroom_before_reservations.saturating_sub(protected_for_request);
+        let provider_headroom_for_request = provider_headroom.saturating_sub(protected_for_request);
+        let provider_lane_headroom = if request.requested_provider_lanes == 0 {
+            usize::MAX
+        } else {
+            provider_headroom_for_request
+        };
         let effective_lane_headroom = if runtime.machine_healthy {
-            session_headroom_after_reservations
-                .min(provider_headroom)
+            session_headroom_for_request
+                .min(provider_lane_headroom)
                 .min(runtime.available_worktrees)
         } else {
             0
@@ -475,36 +586,38 @@ impl SpawnGovernor {
             limiting_factors.insert(DispatchReasonCode::HardCeiling);
         }
         if self.max_sessions <= runtime.machine_session_capacity
-            && session_headroom_before_reservations <= provider_headroom
+            && session_headroom_before_reservations <= provider_lane_headroom
             && session_headroom_before_reservations <= runtime.available_worktrees
         {
             limiting_factors.insert(DispatchReasonCode::ConfiguredCapacity);
         }
         if runtime.machine_session_capacity <= self.max_sessions
-            && session_headroom_before_reservations <= provider_headroom
+            && session_headroom_before_reservations <= provider_lane_headroom
             && session_headroom_before_reservations <= runtime.available_worktrees
         {
             limiting_factors.insert(DispatchReasonCode::MachineCapacity);
         }
-        if total_deficit > 0
-            && session_headroom_after_reservations <= provider_headroom
-            && session_headroom_after_reservations <= runtime.available_worktrees
+        if request.requested_lanes.len() > session_headroom_for_request
+            || (request.requested_provider_lanes > 0
+                && request.requested_provider_lanes > provider_headroom_for_request
+                && request.requested_provider_lanes <= provider_headroom)
         {
             limiting_factors.insert(DispatchReasonCode::ReservedCapacity);
         }
-        if provider_headroom <= session_headroom_after_reservations
-            && provider_headroom <= runtime.available_worktrees
+        if request.requested_provider_lanes > 0
+            && request.requested_provider_lanes > provider_headroom
         {
             limiting_factors.insert(DispatchReasonCode::ProviderCapacity);
         }
-        if runtime.available_worktrees <= session_headroom_after_reservations
-            && runtime.available_worktrees <= provider_headroom
+        if runtime.available_worktrees <= session_headroom_for_request
+            && runtime.available_worktrees <= provider_lane_headroom
         {
             limiting_factors.insert(DispatchReasonCode::WorktreeCapacity);
         }
 
         CapacityReport {
             requested_lanes: request.requested_lanes.len(),
+            requested_provider_lanes: request.requested_provider_lanes,
             configured_session_limit: self.max_sessions,
             hard_session_limit: HARD_SESSION_CEILING,
             machine_session_limit: runtime.machine_session_capacity,
@@ -515,11 +628,87 @@ impl SpawnGovernor {
             provider_session_limit: runtime.provider_session_capacity,
             provider_live_sessions: runtime.provider_live_sessions,
             provider_headroom,
+            provider_headroom_after_reservations,
             provider_capacity_status: runtime.provider_capacity_status.clone(),
             worktree_headroom: runtime.available_worktrees,
             effective_lane_headroom,
             reservations,
             limiting_factors: limiting_factors.into_iter().collect(),
+        }
+    }
+
+    /// Return the reservation deficit that must remain protected ahead of this
+    /// request. A request that fills its own missing role slot may consume that
+    /// slot, but it can never consume a higher-priority deficit.
+    ///
+    /// Priority is stable and fail-closed: Cortana, Recovery, Fleet Admin, then
+    /// Ship Admin. Missing Ship Admin scopes are ordered lexically so concurrent
+    /// requests cannot choose whichever ship happens to win a race.
+    fn reservation_deficit_protected_from(
+        &self,
+        request: &DispatchPreflight,
+        report: &ReservationReport,
+    ) -> usize {
+        let ordinary = || report.total_deficit;
+        match request.admission_purpose {
+            AdmissionPurpose::Ordinary => ordinary(),
+            AdmissionPurpose::Cortana if report.cortana.deficit > 0 => 0,
+            AdmissionPurpose::Recovery if report.recovery.deficit > 0 => report.cortana.deficit,
+            AdmissionPurpose::FleetAdmin if report.fleet_admins.deficit > 0 => report
+                .cortana
+                .deficit
+                .saturating_add(report.recovery.deficit),
+            AdmissionPurpose::ShipAdmin => {
+                let Some(scope) = request.ship_admin_scope.as_deref() else {
+                    return ordinary();
+                };
+                let runtime = &request.capacity;
+                if runtime.active_captain_ships.is_empty() {
+                    return if report.ship_admins.deficit > 0 {
+                        report
+                            .cortana
+                            .deficit
+                            .saturating_add(report.recovery.deficit)
+                            .saturating_add(report.fleet_admins.deficit)
+                    } else {
+                        ordinary()
+                    };
+                }
+                if !runtime.active_captain_ships.contains(scope) {
+                    return ordinary();
+                }
+                let live_for_scope = runtime
+                    .live_ship_admin_scopes
+                    .get(scope)
+                    .copied()
+                    .unwrap_or(0);
+                if live_for_scope >= self.reservations.ship_admins_per_active_captain {
+                    return ordinary();
+                }
+                let preceding_ship_deficits = runtime
+                    .active_captain_ships
+                    .iter()
+                    .take_while(|candidate| candidate.as_str() < scope)
+                    .map(|candidate| {
+                        self.reservations
+                            .ship_admins_per_active_captain
+                            .saturating_sub(
+                                runtime
+                                    .live_ship_admin_scopes
+                                    .get(candidate)
+                                    .copied()
+                                    .unwrap_or(0),
+                            )
+                    })
+                    .sum::<usize>();
+                report
+                    .cortana
+                    .deficit
+                    .saturating_add(report.recovery.deficit)
+                    .saturating_add(report.fleet_admins.deficit)
+                    .saturating_add(preceding_ship_deficits)
+            }
+            _ => ordinary(),
         }
     }
 
@@ -529,9 +718,26 @@ impl SpawnGovernor {
         report: &CapacityReport,
     ) -> Result<(), DispatchRefusal> {
         let requested = request.requested_lanes.len();
+        let requested_provider = request.requested_provider_lanes;
         let runtime = &request.capacity;
         if requested == 0 {
             return Ok(());
+        }
+        if requested_provider > requested {
+            return Err(dispatch_refusal(
+                DispatchReasonCode::ProviderCapacity,
+                format!(
+                    "dispatch refused: requested provider lanes {requested_provider} exceed total requested lanes {requested}"
+                ),
+                report,
+            ));
+        }
+        if request.admission_purpose != AdmissionPurpose::Ordinary && requested != 1 {
+            return Err(dispatch_refusal(
+                DispatchReasonCode::ReservedCapacity,
+                "dispatch refused: a privileged reservation admission must name exactly one lane",
+                report,
+            ));
         }
         if !runtime.machine_healthy {
             return Err(dispatch_refusal(
@@ -571,22 +777,38 @@ impl SpawnGovernor {
                 report,
             ));
         }
-        if requested > report.session_headroom_after_reservations {
+        if requested_provider > report.provider_headroom {
             return Err(dispatch_refusal(
-                DispatchReasonCode::ReservedCapacity,
+                DispatchReasonCode::ProviderCapacity,
                 format!(
-                    "dispatch refused: {requested} lanes would consume {} reserved supervisor, administrator, or recovery slots",
-                    report.reservations.total_deficit
+                    "dispatch refused: {requested_provider} provider lanes exceed raw provider headroom {}",
+                    report.provider_headroom
                 ),
                 report,
             ));
         }
-        if requested > report.provider_headroom {
+        let protected_for_request =
+            self.reservation_deficit_protected_from(request, &report.reservations);
+        let session_headroom_for_request = report
+            .session_headroom_before_reservations
+            .saturating_sub(protected_for_request);
+        if requested > session_headroom_for_request {
             return Err(dispatch_refusal(
-                DispatchReasonCode::ProviderCapacity,
+                DispatchReasonCode::ReservedCapacity,
                 format!(
-                    "dispatch refused: {requested} lanes exceed provider headroom {}",
-                    report.provider_headroom
+                    "dispatch refused: {requested} lanes would consume {protected_for_request} higher-priority or unclaimed supervisor, administrator, or recovery slots"
+                ),
+                report,
+            ));
+        }
+        let provider_headroom_for_request = report
+            .provider_headroom
+            .saturating_sub(protected_for_request);
+        if requested_provider > provider_headroom_for_request {
+            return Err(dispatch_refusal(
+                DispatchReasonCode::ReservedCapacity,
+                format!(
+                    "dispatch refused: {requested_provider} provider lanes would consume {protected_for_request} higher-priority or unclaimed provider reservations"
                 ),
                 report,
             ));
@@ -1155,16 +1377,27 @@ mod tests {
             },
             available_worktrees: 16,
             active_captains: 2,
+            active_captain_ships: strings(&["ship-a", "ship-b"]),
             live_cortana: 1,
             live_fleet_admins: 1,
             live_ship_admins: 2,
+            live_ship_admin_scopes: [
+                ("ship-a".to_string(), 1usize),
+                ("ship-b".to_string(), 1usize),
+            ]
+            .into_iter()
+            .collect(),
             live_recovery_sessions: 0,
         }
     }
 
     fn preflight(lanes: Vec<LaneClaim>) -> DispatchPreflight {
+        let requested_provider_lanes = lanes.len();
         DispatchPreflight {
             requested_lanes: lanes,
+            requested_provider_lanes,
+            admission_purpose: AdmissionPurpose::Ordinary,
+            ship_admin_scope: None,
             active_lanes: Vec::new(),
             satisfied_dependencies: BTreeSet::new(),
             integration_contracts: Vec::new(),
@@ -1198,13 +1431,192 @@ mod tests {
         object.remove("providerSessionLimit");
         object.remove("providerLiveSessions");
         object.remove("providerCapacityStatus");
+        object.remove("requestedProviderLanes");
+        object.remove("providerHeadroomAfterReservations");
 
         let legacy: CapacityReport = serde_json::from_value(value).unwrap();
 
         assert_eq!(legacy.provider_session_limit, 0);
         assert_eq!(legacy.provider_live_sessions, 0);
+        assert_eq!(legacy.requested_provider_lanes, legacy.requested_lanes);
+        assert_eq!(
+            legacy.provider_headroom_after_reservations,
+            legacy
+                .provider_headroom
+                .saturating_sub(legacy.reservations.total_deficit)
+        );
         assert_eq!(legacy.provider_capacity_status.source, "legacy-unspecified");
         assert!(legacy.provider_capacity_status.degraded);
+    }
+
+    #[test]
+    fn provider_reservations_and_raw_quota_have_distinct_refusal_codes() {
+        let governor = SpawnGovernor::new(16, 20.0, 8.0);
+        let mut reserved = preflight(vec![lane("lane-1"), lane("lane-2")]);
+        reserved.capacity.live_sessions = 3;
+        reserved.capacity.machine_session_capacity = 16;
+        reserved.capacity.provider_session_capacity = 2;
+        reserved.capacity.provider_live_sessions = 0;
+        reserved.capacity.active_captains = 0;
+        reserved.capacity.active_captain_ships.clear();
+        reserved.capacity.live_cortana = 0;
+        reserved.capacity.live_fleet_admins = 1;
+        reserved.capacity.live_recovery_sessions = 1;
+        reserved.capacity.live_ship_admins = 0;
+        reserved.capacity.live_ship_admin_scopes.clear();
+
+        let reserved_refusal = governor.preflight_dispatch(&reserved).unwrap_err();
+        assert_eq!(reserved_refusal.code, DispatchReasonCode::ReservedCapacity);
+        assert_eq!(reserved_refusal.capacity.provider_headroom, 2);
+        assert_eq!(
+            reserved_refusal
+                .capacity
+                .provider_headroom_after_reservations,
+            1
+        );
+        assert!(reserved_refusal
+            .capacity
+            .limiting_factors
+            .contains(&DispatchReasonCode::ReservedCapacity));
+        assert!(!reserved_refusal
+            .capacity
+            .limiting_factors
+            .contains(&DispatchReasonCode::ProviderCapacity));
+
+        let mut raw = reserved;
+        raw.capacity.provider_session_capacity = 1;
+        let raw_refusal = governor.preflight_dispatch(&raw).unwrap_err();
+        assert_eq!(raw_refusal.code, DispatchReasonCode::ProviderCapacity);
+        assert!(raw_refusal
+            .capacity
+            .limiting_factors
+            .contains(&DispatchReasonCode::ProviderCapacity));
+    }
+
+    #[test]
+    fn generic_lane_ignores_full_provider_quota_but_still_consumes_session_capacity() {
+        let governor = SpawnGovernor::new(8, 20.0, 8.0);
+        let mut generic = preflight(vec![lane("shell")]);
+        generic.requested_provider_lanes = 0;
+        generic.capacity.live_sessions = 4;
+        generic.capacity.provider_session_capacity = 1;
+        generic.capacity.provider_live_sessions = 1;
+        generic.capacity.live_cortana = 1;
+        generic.capacity.live_fleet_admins = 1;
+        generic.capacity.live_recovery_sessions = 1;
+
+        assert!(governor.preflight_dispatch(&generic).is_ok());
+
+        generic.capacity.live_sessions = 8;
+        assert_eq!(
+            governor.preflight_dispatch(&generic).unwrap_err().code,
+            DispatchReasonCode::ConfiguredCapacity
+        );
+    }
+
+    #[test]
+    fn privileged_reservations_follow_stable_purpose_priority() {
+        let case = |limit: usize,
+                    live_sessions: usize,
+                    live_cortana: usize,
+                    live_recovery_sessions: usize,
+                    live_fleet_admins: usize,
+                    purpose: AdmissionPurpose| {
+            let governor = SpawnGovernor::new(limit, 20.0, 8.0);
+            let mut request = preflight(vec![lane("privileged")]);
+            request.admission_purpose = purpose;
+            request.capacity.live_sessions = live_sessions;
+            request.capacity.machine_session_capacity = limit;
+            request.capacity.provider_session_capacity = limit;
+            request.capacity.provider_live_sessions = live_sessions;
+            request.capacity.active_captains = 0;
+            request.capacity.active_captain_ships.clear();
+            request.capacity.live_cortana = live_cortana;
+            request.capacity.live_recovery_sessions = live_recovery_sessions;
+            request.capacity.live_fleet_admins = live_fleet_admins;
+            request.capacity.live_ship_admins = 0;
+            request.capacity.live_ship_admin_scopes.clear();
+            governor.preflight_dispatch(&request)
+        };
+
+        assert!(case(1, 0, 0, 0, 0, AdmissionPurpose::Cortana).is_ok());
+        assert_eq!(
+            case(1, 0, 0, 0, 0, AdmissionPurpose::Recovery)
+                .unwrap_err()
+                .code,
+            DispatchReasonCode::ReservedCapacity
+        );
+        assert!(case(2, 1, 1, 0, 0, AdmissionPurpose::Recovery).is_ok());
+        assert!(case(3, 2, 1, 1, 0, AdmissionPurpose::FleetAdmin).is_ok());
+
+        let mut ship = preflight(vec![lane("ship-admin")]);
+        ship.admission_purpose = AdmissionPurpose::ShipAdmin;
+        ship.ship_admin_scope = Some("ship-a".into());
+        ship.capacity.live_sessions = 3;
+        ship.capacity.machine_session_capacity = 4;
+        ship.capacity.provider_session_capacity = 4;
+        ship.capacity.provider_live_sessions = 3;
+        ship.capacity.active_captains = 1;
+        ship.capacity.active_captain_ships = strings(&["ship-a"]);
+        ship.capacity.live_cortana = 1;
+        ship.capacity.live_recovery_sessions = 1;
+        ship.capacity.live_fleet_admins = 1;
+        ship.capacity.live_ship_admins = 0;
+        ship.capacity.live_ship_admin_scopes.clear();
+        assert!(SpawnGovernor::new(4, 20.0, 8.0)
+            .preflight_dispatch(&ship)
+            .is_ok());
+
+        ship.admission_purpose = AdmissionPurpose::FleetAdmin;
+        ship.ship_admin_scope = None;
+        ship.capacity.live_fleet_admins = 1;
+        assert_eq!(
+            SpawnGovernor::new(4, 20.0, 8.0)
+                .preflight_dispatch(&ship)
+                .unwrap_err()
+                .code,
+            DispatchReasonCode::ReservedCapacity,
+            "an extra Fleet Admin uses ordinary headroom and cannot consume the missing Ship Admin slot"
+        );
+    }
+
+    #[test]
+    fn ship_admin_reservation_is_scope_aware_and_lexically_stable() {
+        let governor = SpawnGovernor::new(5, 20.0, 8.0);
+        let mut request = preflight(vec![lane("ship-admin")]);
+        request.admission_purpose = AdmissionPurpose::ShipAdmin;
+        request.capacity.live_sessions = 4;
+        request.capacity.machine_session_capacity = 5;
+        request.capacity.provider_session_capacity = 5;
+        request.capacity.provider_live_sessions = 4;
+        request.capacity.active_captains = 2;
+        request.capacity.active_captain_ships = strings(&["ship-a", "ship-b"]);
+        request.capacity.live_cortana = 1;
+        request.capacity.live_recovery_sessions = 1;
+        request.capacity.live_fleet_admins = 1;
+        request.capacity.live_ship_admins = 1;
+        request.capacity.live_ship_admin_scopes =
+            [("ship-a".to_string(), 1usize)].into_iter().collect();
+
+        request.ship_admin_scope = Some("ship-a".into());
+        assert_eq!(
+            governor.preflight_dispatch(&request).unwrap_err().code,
+            DispatchReasonCode::ReservedCapacity
+        );
+
+        request.ship_admin_scope = Some("ship-b".into());
+        assert!(governor.preflight_dispatch(&request).is_ok());
+
+        request.capacity.live_ship_admin_scopes.clear();
+        request.capacity.live_ship_admins = 0;
+        request.ship_admin_scope = Some("ship-b".into());
+        assert_eq!(
+            governor.preflight_dispatch(&request).unwrap_err().code,
+            DispatchReasonCode::ReservedCapacity,
+            "ship-b cannot consume ship-a's lexically earlier missing reservation"
+        );
+        request.ship_admin_scope = Some("ship-a".into());
+        assert!(governor.preflight_dispatch(&request).is_ok());
     }
 
     #[test]
@@ -1228,9 +1640,11 @@ mod tests {
             },
             available_worktrees: 10,
             active_captains: 2,
+            active_captain_ships: strings(&["ship-a", "ship-b"]),
             live_cortana: 0,
             live_fleet_admins: 0,
             live_ship_admins: 0,
+            live_ship_admin_scopes: BTreeMap::new(),
             live_recovery_sessions: 0,
         };
 

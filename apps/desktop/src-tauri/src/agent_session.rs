@@ -1016,6 +1016,9 @@ mod tests {
         };
         let request = crate::governor::DispatchPreflight {
             requested_lanes: vec![lane.clone()],
+            requested_provider_lanes: 1,
+            admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+            ship_admin_scope: None,
             active_lanes: Vec::new(),
             satisfied_dependencies: std::collections::BTreeSet::new(),
             integration_contracts: Vec::new(),
@@ -1032,9 +1035,11 @@ mod tests {
                 },
                 available_worktrees: 8,
                 active_captains: 0,
+                active_captain_ships: std::collections::BTreeSet::new(),
                 live_cortana: 1,
                 live_fleet_admins: 1,
                 live_ship_admins: 0,
+                live_ship_admin_scopes: std::collections::BTreeMap::new(),
                 live_recovery_sessions: 1,
             },
         };

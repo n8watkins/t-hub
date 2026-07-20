@@ -30,6 +30,8 @@ export interface SpawnOptions {
    * shell (the "Shell" preset = today's behavior, no regression).
    */
   startupCommand?: string;
+  /** Provider slot intent for built-in Codex and Claude presets. */
+  providerIntent?: "codex" | "claude";
   /**
    * T-Hub control-plane authority inherited by the spawned terminal.
    * Omitted/read is least privilege; control is an explicit audited elevation.

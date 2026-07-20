@@ -45,6 +45,9 @@ pub struct SpawnOptions {
     /// a live shell instead of closing the tile. `None`/empty => plain login
     /// shell, byte-for-byte today's "Shell" behavior (no regression).
     pub startup_command: Option<String>,
+    /// Explicit provider capacity intent for built-in UI agent presets.
+    /// Generic shells omit it and therefore consume no provider slot.
+    pub provider_intent: Option<String>,
     /// item-3 §2.1.1 piece 3: the capability the UI-spawned session is granted.
     /// INVERTED least-privilege - `None`/`"read"` (the default) injects the READ
     /// token, so a UI-spawned terminal is a pure-work session that can observe but
@@ -361,8 +364,16 @@ pub fn spawn_terminal(
     admission_context: tauri::State<'_, std::sync::Arc<crate::control::ControlContext>>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
+    let provider_intent = opts
+        .provider_intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if provider_intent.is_some_and(|value| !matches!(value, "codex" | "claude")) {
+        return Err("providerIntent must be 'codex' or 'claude'".into());
+    }
     let _admission = admission_context
-        .admit_ui_spawn()
+        .admit_ui_spawn(usize::from(provider_intent.is_some()))
         .map_err(|refusal| refusal.message)?;
     // The terminal id IS the tmux session's own suffix, so the id is stable and
     // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
@@ -389,7 +400,13 @@ pub fn spawn_terminal(
     // inherited `T_HUB_CONTROL_TOKEN`/`_ADDR` the polluted app env would otherwise
     // leak - env-inheritance must never decide a session's capability. Default READ;
     // an explicit `capability:"control"` is a deliberate, audited elevation.
-    let (elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
+    let (mut elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
+    if let Some(provider) = provider_intent {
+        elevation.push((
+            "T_HUB_PROVIDER_SESSION".to_string(),
+            format!("pending:{provider}"),
+        ));
+    }
     if is_control {
         audit_ui_control_spawn(&app, &opts);
     }
