@@ -44010,6 +44010,49 @@ mod tests {
     }
 
     #[test]
+    fn captain_control_lease_capacity_evicts_oldest_identity_binding() {
+        let leases = CaptainControlLeases::default();
+        let base = Instant::now() + Duration::from_secs(3_600);
+        let mut oldest_secret = String::new();
+
+        for index in 0..MAX_CAPTAIN_CONTROL_LEASES {
+            let (secret, _) = leases.issue(CaptainControlLease {
+                identity_id: format!("identity-{index}"),
+                terminal_id: format!("terminal-{index}"),
+                authority: LeaseAuthority::Cortana {
+                    generation: index as u64,
+                },
+                expires_at: base + Duration::from_millis(index as u64),
+                expires_at_epoch_ms: 10_000 + index as u64,
+            });
+            if index == 0 {
+                oldest_secret = secret;
+            }
+        }
+
+        let (newest_secret, _) = leases.issue(CaptainControlLease {
+            identity_id: "identity-newest".into(),
+            terminal_id: "terminal-newest".into(),
+            authority: LeaseAuthority::Cortana {
+                generation: MAX_CAPTAIN_CONTROL_LEASES as u64,
+            },
+            expires_at: base + Duration::from_secs(1),
+            expires_at_epoch_ms: 20_000,
+        });
+
+        assert!(leases.get(&oldest_secret).is_none());
+        assert!(leases.get(&newest_secret).is_some());
+        let state = leases.state.lock().unwrap();
+        assert_eq!(state.by_secret.len(), MAX_CAPTAIN_CONTROL_LEASES);
+        assert_eq!(state.by_identity.len(), MAX_CAPTAIN_CONTROL_LEASES);
+        assert!(!state.by_identity.contains_key("identity-0"));
+        assert_eq!(
+            state.by_identity.get("identity-newest"),
+            Some(&newest_secret)
+        );
+    }
+
+    #[test]
     fn authoritative_cortana_renews_a_fleet_scoped_lease_and_mutates() {
         let terminal_id = "lease-cortana";
         let live_target = tmux_target(terminal_id);
