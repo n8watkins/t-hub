@@ -660,6 +660,15 @@ impl DelegatedAdminStore {
             .collect()
     }
 
+    pub fn active_grants(&self) -> Vec<DelegatedAdminGrant> {
+        self.lock()
+            .grants
+            .values()
+            .filter(|grant| grant.state.is_active())
+            .cloned()
+            .collect()
+    }
+
     /// Resolve and authorize an effective delegated grant.
     ///
     /// This method intentionally accepts no control token or capability tier.

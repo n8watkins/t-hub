@@ -78,6 +78,7 @@ pub enum DispatchReasonCode {
     MissingLaneIdentity,
     MissingOwnership,
     MissingDependencies,
+    UnmetDependency,
     DuplicateLane,
     DuplicateOwner,
     UnknownDependency,
@@ -90,7 +91,6 @@ pub enum DispatchReasonCode {
 }
 
 impl DispatchReasonCode {
-    #[allow(dead_code)] // stable control/CLI seam; wiring lands after the governor foundation
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MachineUnhealthy => "machine-unhealthy",
@@ -103,6 +103,7 @@ impl DispatchReasonCode {
             Self::MissingLaneIdentity => "missing-lane-identity",
             Self::MissingOwnership => "missing-ownership",
             Self::MissingDependencies => "missing-dependencies",
+            Self::UnmetDependency => "unmet-dependency",
             Self::DuplicateLane => "duplicate-lane",
             Self::DuplicateOwner => "duplicate-owner",
             Self::UnknownDependency => "unknown-dependency",
@@ -342,7 +343,6 @@ impl SpawnGovernor {
     }
 
     /// The effective concurrent-session cap after clamping (diagnostics / tests).
-    #[allow(dead_code)] // diagnostics accessor; exercised by the unit tests
     pub fn max_sessions(&self) -> usize {
         self.max_sessions
     }
@@ -363,7 +363,6 @@ impl SpawnGovernor {
     /// Callers should run this before allocating worktrees or provider sessions,
     /// then retain the report as dispatch evidence. Actual process creation must
     /// still pass [`Self::check_spawn`] immediately before each spawn.
-    #[allow(dead_code)] // stable control/CLI seam; wiring lands after the governor foundation
     pub fn preflight_dispatch(
         &self,
         request: &DispatchPreflight,
@@ -377,7 +376,6 @@ impl SpawnGovernor {
     /// Produce the capacity evidence used by [`Self::preflight_dispatch`].
     /// This is exposed separately so status surfaces can report headroom even
     /// when no dispatch is being attempted.
-    #[allow(dead_code)] // status seam; wiring lands after the governor foundation
     pub fn capacity_report(&self, request: &DispatchPreflight) -> CapacityReport {
         let runtime = &request.capacity;
         let ship_admins_required = runtime
@@ -751,6 +749,22 @@ fn validate_dependencies(
     lanes_by_id: &BTreeMap<String, &LaneClaim>,
     report: &CapacityReport,
 ) -> Result<(), DispatchRefusal> {
+    if let Some(lane) = request
+        .requested_lanes
+        .iter()
+        .find(|lane| request.satisfied_dependencies.contains(&lane.lane_id))
+    {
+        return Err(dispatch_refusal_with_lanes(
+            DispatchReasonCode::DuplicateLane,
+            format!(
+                "dispatch refused: lane '{}' already has complete delivery evidence",
+                lane.lane_id
+            ),
+            vec![lane.lane_id.clone()],
+            None,
+            report,
+        ));
+    }
     let mut indegree: BTreeMap<String, usize> = lanes_by_id
         .keys()
         .map(|lane_id| (lane_id.clone(), 0))
@@ -813,6 +827,24 @@ fn validate_dependencies(
             None,
             report,
         ));
+    }
+    for lane in &request.requested_lanes {
+        if let Some(dependency) = lane.dependencies.as_ref().and_then(|dependencies| {
+            dependencies
+                .iter()
+                .find(|dependency| !request.satisfied_dependencies.contains(*dependency))
+        }) {
+            return Err(dispatch_refusal_with_lanes(
+                DispatchReasonCode::UnmetDependency,
+                format!(
+                    "dispatch refused: lane '{}' is waiting for dependency '{dependency}'",
+                    lane.lane_id
+                ),
+                vec![lane.lane_id.clone()],
+                Some(dependency.clone()),
+                report,
+            ));
+        }
     }
     Ok(())
 }
@@ -1228,6 +1260,33 @@ mod tests {
                 .code,
             DispatchReasonCode::DependencyCycle
         );
+    }
+
+    #[test]
+    fn known_but_incomplete_dependencies_are_not_dispatched_early() {
+        let governor = SpawnGovernor::new(32, 20.0, 8.0);
+        let dependency = lane("lane-1");
+        let mut dependent = lane("lane-2");
+        dependent.dependencies = Some(strings(&["lane-1"]));
+        let request = preflight(vec![dependency, dependent]);
+
+        let refusal = governor.preflight_dispatch(&request).unwrap_err();
+
+        assert_eq!(refusal.code, DispatchReasonCode::UnmetDependency);
+        assert_eq!(refusal.lane_ids, vec!["lane-2"]);
+        assert_eq!(refusal.resource.as_deref(), Some("lane-1"));
+    }
+
+    #[test]
+    fn completed_lane_identities_cannot_be_reused() {
+        let governor = SpawnGovernor::new(32, 20.0, 8.0);
+        let mut request = preflight(vec![lane("lane-1")]);
+        request.satisfied_dependencies.insert("lane-1".into());
+
+        let refusal = governor.preflight_dispatch(&request).unwrap_err();
+
+        assert_eq!(refusal.code, DispatchReasonCode::DuplicateLane);
+        assert_eq!(refusal.lane_ids, vec!["lane-1"]);
     }
 
     #[test]

@@ -78,6 +78,12 @@ export function StartAgentDialog({
         harness,
         sourceCommit: checkout.headCommit,
         visibleProductBug,
+        laneId: `agent:${requestId}`,
+        dependencies: [],
+        mutableFiles: [directory],
+        mutableSchemas: [],
+        mutableInterfaces: [],
+        integrationContracts: [],
       });
       setAssignment("");
       setRequestId(crypto.randomUUID());

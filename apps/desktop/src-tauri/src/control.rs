@@ -40,7 +40,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -11061,6 +11061,7 @@ fn dispatch_with_caller(
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
         "list_agents" => list_agents(ctx, args, caller, trusted_internal),
+        "dispatch_preflight" => dispatch_preflight(ctx, args, caller, trusted_internal),
         "get_agent" => get_agent(ctx, args, caller, trusted_internal),
         "agent_events" => agent_events(ctx, args, caller, trusted_internal),
         "list_powder_boards" => list_powder_boards(args),
@@ -11511,6 +11512,70 @@ fn list_agents(
         "digest": digest,
         "eventCursor": event_cursor,
     }))
+}
+
+fn dispatch_preflight(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "dispatch_preflight",
+        &["projectId", "requestedLanes", "integrationContracts"],
+    )?;
+    let project_id = arg_str(args, "projectId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("dispatch_preflight requires a non-empty 'projectId'")?;
+    authorize_agent_filter(
+        ctx,
+        None,
+        Some(&project_id),
+        caller,
+        trusted_internal,
+        "dispatch_preflight",
+    )?;
+    let requested_lanes = serde_json::from_value::<Vec<crate::governor::LaneClaim>>(
+        args.get("requestedLanes")
+            .cloned()
+            .ok_or("dispatch_preflight requires a 'requestedLanes' array")?,
+    )
+    .map_err(|error| format!("dispatch_preflight requestedLanes are invalid: {error}"))?;
+    let integration_contracts = parse_integration_contracts(args, "dispatch_preflight")?;
+    let snapshot = ctx.captains.snapshot();
+    let satisfied_dependencies = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent.project_id == project_id)
+        .filter(|agent| {
+            agent
+                .delivery_states()
+                .is_some_and(|states| states.complete)
+        })
+        .filter_map(|agent| agent.lane_claim.as_ref().map(|lane| lane.lane_id.clone()))
+        .collect();
+    let request = crate::governor::DispatchPreflight {
+        requested_lanes,
+        active_lanes: active_dispatch_lanes(&snapshot, &project_id),
+        satisfied_dependencies,
+        integration_contracts,
+        capacity: dispatch_runtime_capacity(ctx, &snapshot, &project_id)?,
+    };
+    Ok(match ctx.governor.preflight_dispatch(&request) {
+        Ok(capacity) => json!({
+            "admitted": true,
+            "capacity": capacity,
+        }),
+        Err(refusal) => {
+            let capacity = refusal.capacity.clone();
+            json!({
+                "admitted": false,
+                "capacity": capacity,
+                "refusal": refusal,
+            })
+        }
+    })
 }
 
 fn get_agent(
@@ -20699,6 +20764,187 @@ fn move_tile(
 /// existing confirmation-gate tier — same audit, same remote-peer cwd allowlist,
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
+fn string_set_arg(args: &Value, key: &str, command: &str) -> Result<BTreeSet<String>, String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{command} requires a '{key}' array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{command} '{key}' entries must be strings"))
+        })
+        .collect()
+}
+
+fn active_dispatch_lanes(
+    snapshot: &CaptainsSnapshot,
+    project_id: &str,
+) -> Vec<crate::governor::LaneClaim> {
+    snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent.project_id == project_id)
+        .filter(|agent| {
+            !matches!(
+                agent.work_stage,
+                crate::agent_session::WorkStage::Complete
+                    | crate::agent_session::WorkStage::Stopped
+            )
+        })
+        .map(|agent| {
+            let mut lane = agent
+                .lane_claim
+                .clone()
+                .unwrap_or_else(|| crate::governor::LaneClaim {
+                    lane_id: format!("legacy:{}", agent.agent_session_id),
+                    owner_id: agent.agent_session_id.clone(),
+                    dependencies: Some(BTreeSet::new()),
+                    mutable_files: [agent.directory.clone()].into_iter().collect(),
+                    mutable_schemas: BTreeSet::new(),
+                    mutable_interfaces: BTreeSet::new(),
+                });
+            // The lane was admitted only after its dispatch dependencies were
+            // satisfied. They are provenance now, not unresolved dependencies
+            // for a later preflight.
+            lane.dependencies = Some(BTreeSet::new());
+            lane
+        })
+        .collect()
+}
+
+fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (bool, usize) {
+    let metrics = ctx.metrics.as_ref().and_then(|fetch| fetch().ok());
+    let Some(metrics) = metrics else {
+        return (true, ctx.governor.max_sessions());
+    };
+    let cpu_count = usize::try_from(metrics.cpu_count).unwrap_or(1).max(1);
+    let load_healthy = metrics.load_avg[0].is_finite()
+        && metrics.load_avg[0] <= (cpu_count.saturating_mul(2)) as f32;
+    let memory_known = metrics.mem_total_kib > 0;
+    let memory_healthy = !memory_known || metrics.mem_available_kib >= 512 * 1024;
+    let memory_slots = if memory_known {
+        usize::try_from(metrics.mem_available_kib / (512 * 1024)).unwrap_or(0)
+    } else {
+        ctx.governor.max_sessions()
+    };
+    let cpu_slots = cpu_count.saturating_mul(8);
+    let additional_slots = memory_slots.min(cpu_slots).max(1);
+    (
+        load_healthy && memory_healthy,
+        live_sessions
+            .saturating_add(additional_slots)
+            .min(crate::governor::HARD_SESSION_CEILING),
+    )
+}
+
+fn live_admin_counts(ctx: &ControlContext) -> (usize, usize) {
+    let mut fleet_admins = 0;
+    let mut ship_admins = 0;
+    for grant in ctx.delegated_admin.active_grants() {
+        let live = ctx
+            .identity
+            .get(&grant.actor_identity_id)
+            .and_then(|identity| identity.session_tile)
+            .is_some_and(|tile| {
+                tmux::session_liveness(&tmux_target(&tile)) == tmux::SessionLiveness::Alive
+            });
+        if !live {
+            continue;
+        }
+        match grant.role {
+            crate::delegated_admin::DelegatedAdminRole::FleetAdmin => fleet_admins += 1,
+            crate::delegated_admin::DelegatedAdminRole::ShipAdmin => ship_admins += 1,
+        }
+    }
+    (fleet_admins, ship_admins)
+}
+
+fn dispatch_runtime_capacity(
+    ctx: &ControlContext,
+    snapshot: &CaptainsSnapshot,
+    project_id: &str,
+) -> Result<crate::governor::RuntimeCapacity, String> {
+    let live_sessions = live_session_count();
+    let (machine_healthy, machine_session_capacity) = dispatch_machine_evidence(ctx, live_sessions);
+    let provider_session_capacity = std::env::var("T_HUB_PROVIDER_SESSION_CAPACITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| ctx.governor.max_sessions())
+        .min(crate::governor::HARD_SESSION_CEILING);
+    let active_directories = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| {
+            !matches!(
+                agent.work_stage,
+                crate::agent_session::WorkStage::Complete
+                    | crate::agent_session::WorkStage::Stopped
+            )
+        })
+        .map(|agent| files::posix_form(&agent.directory))
+        .collect::<BTreeSet<_>>();
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
+    let available_worktrees = git::worktree_list(&files::posix_form(&project.repo_root))
+        .map_err(|error| format!("dispatch preflight: could not inspect worktrees: {error}"))?
+        .into_iter()
+        .map(|worktree| files::posix_form(&worktree.path))
+        .filter(|path| !active_directories.contains(path))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let active_captains = snapshot
+        .captains
+        .iter()
+        .filter(|captain| captain.role == FleetRole::Captain && captain.state == ClaimState::Active)
+        .count();
+    let live_cortana = snapshot
+        .cortana
+        .terminal_id
+        .as_deref()
+        .is_some_and(|terminal_id| {
+            matches!(
+                &snapshot.cortana.recovery,
+                crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+            ) && tmux::session_liveness(&tmux_target(terminal_id)) == tmux::SessionLiveness::Alive
+        }) as usize;
+    let live_recovery_sessions = matches!(
+        &snapshot.cortana.recovery,
+        crate::cortana_reconcile::CortanaRecoveryState::Recovering { .. }
+    ) as usize;
+    let (live_fleet_admins, live_ship_admins) = live_admin_counts(ctx);
+    Ok(crate::governor::RuntimeCapacity {
+        live_sessions,
+        machine_healthy,
+        machine_session_capacity,
+        provider_session_capacity,
+        provider_live_sessions: live_sessions,
+        available_worktrees,
+        active_captains,
+        live_cortana,
+        live_fleet_admins,
+        live_ship_admins,
+        live_recovery_sessions,
+    })
+}
+
+fn parse_integration_contracts(
+    args: &Value,
+    command: &str,
+) -> Result<Vec<crate::governor::IntegrationContract>, String> {
+    serde_json::from_value(
+        args.get("integrationContracts")
+            .cloned()
+            .ok_or_else(|| format!("{command} requires an 'integrationContracts' array"))?,
+    )
+    .map_err(|error| format!("{command} integrationContracts are invalid: {error}"))
+}
+
 fn start_agent(
     ctx: &ControlContext,
     args: &Value,
@@ -20719,6 +20965,12 @@ fn start_agent(
             "workspaceTabId",
             "sourceCommit",
             "visibleProductBug",
+            "laneId",
+            "dependencies",
+            "mutableFiles",
+            "mutableSchemas",
+            "mutableInterfaces",
+            "integrationContracts",
         ],
     )?;
     arg_str(args, "requestId")
@@ -20740,6 +20992,14 @@ fn start_agent(
         .get("visibleProductBug")
         .and_then(Value::as_bool)
         .ok_or("start_agent requires a boolean 'visibleProductBug'")?;
+    let lane_id = arg_str(args, "laneId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'laneId'")?;
+    let dependencies = string_set_arg(args, "dependencies", "start_agent")?;
+    let mutable_files = string_set_arg(args, "mutableFiles", "start_agent")?;
+    let mutable_schemas = string_set_arg(args, "mutableSchemas", "start_agent")?;
+    let mutable_interfaces = string_set_arg(args, "mutableInterfaces", "start_agent")?;
+    let integration_contracts = parse_integration_contracts(args, "start_agent")?;
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -20761,8 +21021,9 @@ fn start_agent(
         .ok_or("start_agent: Captain is not bound to a registered Project")?;
     let project = snapshot
         .projects
-        .into_iter()
+        .iter()
         .find(|project| project.project_id == project_id)
+        .cloned()
         .ok_or_else(|| format!("start_agent: unknown projectId '{project_id}'"))?;
     let checkout = validate_crew_checkout(&project, Some(directory))
         .map_err(|error| error.replacen("dispatch_crew", "start_agent", 1))?;
@@ -20772,6 +21033,16 @@ fn start_agent(
         .find(|worktree| files::posix_form(&worktree.path) == checkout);
     git::require_clean_exact_baseline(&checkout, &source_commit)
         .map_err(|error| format!("start_agent: baseline rejected: {error}"))?;
+    if snapshot.agent_sessions.iter().any(|agent| {
+        !matches!(
+            agent.work_stage,
+            crate::agent_session::WorkStage::Complete | crate::agent_session::WorkStage::Stopped
+        ) && files::posix_form(&agent.directory) == checkout
+    }) {
+        return Err(format!(
+            "start_agent: checkout '{checkout}' is already owned by an active implementation lane"
+        ));
+    }
     let harness_name = arg_str(args, "harness")
         .unwrap_or_else(|| captain.harness.clone().unwrap_or_else(|| "codex".into()));
     let harness_name = harness_name.trim().to_ascii_lowercase();
@@ -20790,6 +21061,42 @@ fn start_agent(
             break candidate;
         }
     };
+    let lane_claim = crate::governor::LaneClaim {
+        lane_id,
+        owner_id: agent_session_id.clone(),
+        dependencies: Some(dependencies),
+        mutable_files,
+        mutable_schemas,
+        mutable_interfaces,
+    };
+    let satisfied_dependencies = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent.project_id == project.project_id)
+        .filter(|agent| {
+            agent
+                .delivery_states()
+                .is_some_and(|states| states.complete)
+        })
+        .filter_map(|agent| agent.lane_claim.as_ref().map(|lane| lane.lane_id.clone()))
+        .collect();
+    let preflight = crate::governor::DispatchPreflight {
+        requested_lanes: vec![lane_claim.clone()],
+        active_lanes: active_dispatch_lanes(&snapshot, &project.project_id),
+        satisfied_dependencies,
+        integration_contracts: integration_contracts.clone(),
+        capacity: dispatch_runtime_capacity(ctx, &snapshot, &project.project_id)?,
+    };
+    let dispatch_capacity = ctx
+        .governor
+        .preflight_dispatch(&preflight)
+        .map_err(|refusal| {
+            format!(
+                "start_agent: {}: {}",
+                refusal.code.as_str(),
+                refusal.message
+            )
+        })?;
     let now = now_ms();
     let record = AgentSessionRecord {
         agent_session_id: agent_session_id.clone(),
@@ -20812,6 +21119,9 @@ fn start_agent(
             source_commit,
             visible_product_bug,
         )),
+        lane_claim: Some(lane_claim),
+        integration_contracts,
+        dispatch_capacity: Some(dispatch_capacity.clone()),
         created_at: now,
         updated_at: now,
     };
@@ -20876,6 +21186,9 @@ fn start_agent(
         "provider": started.provider,
         "runtimeState": started.runtime_state,
         "workStage": started.work_stage,
+        "deliveryStates": started.delivery_states(),
+        "laneClaim": started.lane_claim,
+        "dispatchCapacity": dispatch_capacity,
         "assignmentDelivered": true,
     }))
 }
@@ -23055,6 +23368,43 @@ mod tests {
         .expect("git rev-parse spawns");
         assert!(ok, "git rev-parse failed: {stderr}");
         stdout.trim().to_string()
+    }
+
+    fn test_dispatch_evidence(
+        lane_id: &str,
+        owner_id: &str,
+    ) -> (crate::governor::LaneClaim, crate::governor::CapacityReport) {
+        let lane = crate::governor::LaneClaim {
+            lane_id: lane_id.into(),
+            owner_id: owner_id.into(),
+            dependencies: Some(BTreeSet::new()),
+            mutable_files: BTreeSet::new(),
+            mutable_schemas: BTreeSet::new(),
+            mutable_interfaces: BTreeSet::new(),
+        };
+        let request = crate::governor::DispatchPreflight {
+            requested_lanes: vec![lane.clone()],
+            active_lanes: Vec::new(),
+            satisfied_dependencies: BTreeSet::new(),
+            integration_contracts: Vec::new(),
+            capacity: crate::governor::RuntimeCapacity {
+                live_sessions: 3,
+                machine_healthy: true,
+                machine_session_capacity: 64,
+                provider_session_capacity: 64,
+                provider_live_sessions: 3,
+                available_worktrees: 8,
+                active_captains: 0,
+                live_cortana: 1,
+                live_fleet_admins: 1,
+                live_ship_admins: 0,
+                live_recovery_sessions: 1,
+            },
+        };
+        let capacity = SpawnGovernor::default()
+            .preflight_dispatch(&request)
+            .unwrap();
+        (lane, capacity)
     }
 
     #[cfg(not(windows))]
@@ -28708,6 +29058,7 @@ mod tests {
         ctx.captains
             .bind_ship_context("captain", "project-1", "Assignment", "codex")
             .unwrap();
+        let (lane_claim, dispatch_capacity) = test_dispatch_evidence("lane-checkpoint", "agent-1");
         ctx.captains
             .insert_agent_session(AgentSessionRecord {
                 agent_session_id: "agent-1".into(),
@@ -28728,6 +29079,9 @@ mod tests {
                     "1111111111111111111111111111111111111111",
                     false,
                 )),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
                 created_at: 2,
                 updated_at: 2,
             })
@@ -28800,6 +29154,8 @@ mod tests {
         ctx.captains
             .record_crew("captain-delivery", "agent-delivery")
             .unwrap();
+        let (lane_claim, dispatch_capacity) =
+            test_dispatch_evidence("lane-delivery", "agent-delivery");
         ctx.captains
             .insert_agent_session(AgentSessionRecord {
                 agent_session_id: "agent-delivery".into(),
@@ -28819,6 +29175,9 @@ mod tests {
                 delivery: Some(crate::agent_session::DeliveryProvenance::new(
                     BASELINE, false,
                 )),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
                 created_at: 2,
                 updated_at: 2,
             })
@@ -28945,6 +29304,76 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_preflight_admits_six_independent_lanes_with_available_capacity() {
+        let ctx =
+            test_ctx("dispatch-six").with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)));
+        let (base, repo_root, _worktree) = scratch_repo_with_worktree();
+        for index in 2..=5 {
+            let branch = format!("lane-{index}");
+            let path = base.join(format!("wt-{index}"));
+            let output = std::process::Command::new("git")
+                .current_dir(&repo_root)
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    path.to_str().unwrap(),
+                ])
+                .output()
+                .expect("git worktree add spawns");
+            assert!(
+                output.status.success(),
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-six".into(),
+                name: "Six Lane Project".into(),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let requested_lanes = (1..=6)
+            .map(|index| {
+                json!({
+                    "laneId": format!("lane-{index}"),
+                    "ownerId": format!("owner-{index}"),
+                    "dependencies": [],
+                    "mutableFiles": [format!("scope-{index}")],
+                    "mutableSchemas": [],
+                    "mutableInterfaces": []
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let response = dispatch(
+            &ctx,
+            "dispatch_preflight",
+            &json!({
+                "projectId": "project-six",
+                "requestedLanes": requested_lanes,
+                "integrationContracts": []
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response["admitted"], true);
+        assert_eq!(response["capacity"]["requestedLanes"], 6);
+        assert!(response["capacity"]["effectiveLaneHeadroom"]
+            .as_u64()
+            .is_some_and(|headroom| headroom >= 6));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn start_agent_persists_before_a_launch_failure_and_records_unavailable() {
         let ctx = test_ctx("secret");
         let (base, repo_root, worktree) = scratch_repo_with_worktree();
@@ -28976,9 +29405,15 @@ mod tests {
                 "requestId": "start-agent-test",
                 "captainSessionId": "captain-start",
                 "assignment": "Do one bounded change",
-                "directory": repo,
+                "directory": repo.clone(),
                 "sourceCommit": source_commit,
-                "visibleProductBug": false
+                "visibleProductBug": false,
+                "laneId": "lane-start-failure",
+                "dependencies": [],
+                "mutableFiles": [repo],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": []
             }),
         )
         .unwrap_err();
@@ -29045,10 +29480,16 @@ mod tests {
                 "requestId": "start-agent-success",
                 "captainSessionId": "captain-start-success",
                 "assignment": "Do one bounded change",
-                "directory": repo,
+                "directory": repo.clone(),
                 "harness": "codex",
                 "sourceCommit": source_commit,
-                "visibleProductBug": false
+                "visibleProductBug": false,
+                "laneId": "lane-start-success",
+                "dependencies": [],
+                "mutableFiles": [repo],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": []
             }),
         )
         .unwrap();

@@ -407,6 +407,76 @@ fn schema_list_agents() -> Value {
     })
 }
 
+fn schema_lane_claim() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "laneId": { "type": "string", "minLength": 1 },
+            "ownerId": { "type": "string", "minLength": 1 },
+            "dependencies": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableFiles": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableSchemas": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            },
+            "mutableInterfaces": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true
+            }
+        },
+        "required": ["laneId", "ownerId", "dependencies"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_integration_contract() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "contractId": { "type": "string", "minLength": 1 },
+            "integrationOwner": { "type": "string", "minLength": 1 },
+            "orderedLaneIds": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 2,
+                "uniqueItems": true
+            }
+        },
+        "required": ["contractId", "integrationOwner", "orderedLaneIds"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_dispatch_preflight() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "minLength": 1 },
+            "requestedLanes": {
+                "type": "array",
+                "items": schema_lane_claim(),
+                "minItems": 1
+            },
+            "integrationContracts": {
+                "type": "array",
+                "items": schema_integration_contract()
+            }
+        },
+        "required": ["projectId", "requestedLanes", "integrationContracts"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_get_agent() -> Value {
     json!({
         "type": "object",
@@ -597,9 +667,15 @@ fn schema_start_agent() -> Value {
             "name": { "type": "string" },
             "workspaceTabId": { "type": "string" },
             "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$", "description": "Exact commit checked out in the clean dispatch worktree." },
-            "visibleProductBug": { "type": "boolean", "description": "True when acceptance requires packaged GUI E2E evidence." }
+            "visibleProductBug": { "type": "boolean", "description": "True when acceptance requires packaged GUI E2E evidence." },
+            "laneId": { "type": "string", "minLength": 1, "description": "Stable identity for this independent implementation lane." },
+            "dependencies": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableFiles": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableSchemas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "mutableInterfaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "integrationContracts": { "type": "array", "items": schema_integration_contract() }
         },
-        "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug"],
+        "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug", "laneId", "dependencies", "mutableFiles", "mutableSchemas", "mutableInterfaces", "integrationContracts"],
         "additionalProperties": false
     })
 }
@@ -813,6 +889,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Read,
             summary: "List bounded durable agent-session summaries for one Captain or Project.",
             input_schema: schema_list_agents,
+        },
+        ToolDef {
+            name: "dispatch_preflight",
+            tier: Tier::Read,
+            summary: "Evaluate independent lane ownership, dependencies, mutable-resource collisions, live capacity, and reserved supervisor or recovery headroom without imposing a fixed lane-count cap.",
+            input_schema: schema_dispatch_preflight,
         },
         ToolDef {
             name: "get_agent",
@@ -1502,6 +1584,43 @@ mod tests {
             assert!(
                 schema["properties"]["spawnedBy"].is_object(),
                 "{name} must accept spawnedBy"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_dispatch_tools_require_explicit_lane_and_collision_evidence() {
+        let preflight = find("dispatch_preflight").unwrap();
+        let preflight_mcp = preflight.to_mcp();
+        assert_eq!(preflight_mcp["annotations"]["t-hubTier"], "read");
+        let preflight_schema = (preflight.input_schema)();
+        assert_eq!(
+            preflight_schema["required"],
+            json!(["projectId", "requestedLanes", "integrationContracts"])
+        );
+        let lane = &preflight_schema["properties"]["requestedLanes"]["items"];
+        assert_eq!(
+            lane["required"],
+            json!(["laneId", "ownerId", "dependencies"])
+        );
+
+        let start = (find("start_agent").unwrap().input_schema)();
+        for required in [
+            "sourceCommit",
+            "laneId",
+            "dependencies",
+            "mutableFiles",
+            "mutableSchemas",
+            "mutableInterfaces",
+            "integrationContracts",
+        ] {
+            assert!(
+                start["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == required),
+                "start_agent must require {required}"
             );
         }
     }
