@@ -1,0 +1,4 @@
+{"method":"turn/started","params":{"threadId":"00000000-0000-7000-8000-000000000144","turn":{"id":"00000000-0000-7000-8000-000000000145","items":[],"status":"inProgress"}}}
+{"method":"item/commandExecution/requestApproval","id":"approval-sanitized-1","params":{"command":"credential-bearing-command","cwd":"/sanitized/worktree","itemId":"item-sanitized-1","reason":"sanitized reason","startedAtMs":1784183000000,"threadId":"00000000-0000-7000-8000-000000000144","turnId":"00000000-0000-7000-8000-000000000145"}}
+{"method":"serverRequest/resolved","params":{"requestId":"approval-sanitized-1","threadId":"00000000-0000-7000-8000-000000000144"}}
+{"method":"turn/completed","params":{"threadId":"00000000-0000-7000-8000-000000000144","turn":{"id":"00000000-0000-7000-8000-000000000145","items":[],"status":"completed"}}}

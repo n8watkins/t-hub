@@ -56,7 +56,11 @@ fn git_ok(dir: &str, args: &[&str]) -> Result<String, String> {
     if code == Some(0) {
         Ok(stdout.trim_end().to_string())
     } else {
-        let detail = if stderr.trim().is_empty() { stdout } else { stderr };
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
         Err(format!("git {} failed: {}", args.join(" "), detail.trim()))
     }
 }
@@ -116,7 +120,12 @@ pub fn parse_worktree_porcelain(text: &str) -> Vec<WtEntry> {
             }
             "branch" => {
                 if let Some(e) = cur.as_mut() {
-                    e.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).to_string());
+                    e.branch = Some(
+                        value
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(value)
+                            .to_string(),
+                    );
                 }
             }
             "locked" => {
@@ -217,7 +226,11 @@ fn owned_by(s: &SessionPane, path: &str, worktree_paths: &[String]) -> bool {
 
 /// The LIVE session leasing `path`, if any: attributed by deepest-worktree
 /// ownership, smallest id shown when several sessions share the worktree.
-pub fn lease_for(path: &str, worktree_paths: &[String], sessions: &[SessionPane]) -> Option<String> {
+pub fn lease_for(
+    path: &str,
+    worktree_paths: &[String],
+    sessions: &[SessionPane],
+) -> Option<String> {
     sessions
         .iter()
         .filter(|s| s.live && owned_by(s, path, worktree_paths))
@@ -227,7 +240,11 @@ pub fn lease_for(path: &str, worktree_paths: &[String], sessions: &[SessionPane]
 
 /// Sessions attributed to `path` that the app reports as NOT live - prune
 /// closes these over the socket before removing the worktree.
-pub fn dead_sessions_for(path: &str, worktree_paths: &[String], sessions: &[SessionPane]) -> Vec<String> {
+pub fn dead_sessions_for(
+    path: &str,
+    worktree_paths: &[String],
+    sessions: &[SessionPane],
+) -> Vec<String> {
     let mut ids: Vec<String> = sessions
         .iter()
         .filter(|s| !s.live && owned_by(s, path, worktree_paths))
@@ -271,7 +288,14 @@ fn tmux_panes() -> Result<Vec<(String, String)>, String> {
 #[cfg(not(windows))]
 fn tmux_command(sock: &str) -> Command {
     let mut c = Command::new("tmux");
-    c.args(["-L", sock, "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}"]);
+    c.args([
+        "-L",
+        sock,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{pane_current_path}",
+    ]);
     c
 }
 
@@ -280,7 +304,18 @@ fn tmux_command(sock: &str) -> Command {
 #[cfg(windows)]
 fn tmux_command(sock: &str) -> Command {
     let mut c = Command::new("wsl.exe");
-    c.args(["--cd", "~", "-e", "tmux", "-L", sock, "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}"]);
+    c.args([
+        "--cd",
+        "~",
+        "-e",
+        "tmux",
+        "-L",
+        sock,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{pane_current_path}",
+    ]);
     c
 }
 
@@ -304,7 +339,9 @@ pub fn gather_leases() -> Leases {
                 .map(|arr| {
                     arr.iter()
                         .map(|t| {
-                            let sfield = |k: &str| t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let sfield = |k: &str| {
+                                t.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                            };
                             let state = sfield("state");
                             SessionPane {
                                 id: sfield("id"),
@@ -320,7 +357,13 @@ pub fn gather_leases() -> Leases {
             // by the session's tmux name (`th_<id>`), the same key the app uses.
             let needs_fill = sessions.iter().any(|s| s.cwd.is_empty());
             if !needs_fill {
-                return Leases { sessions, source: LeaseSource::Control, complete: true, note: None, endpoint };
+                return Leases {
+                    sessions,
+                    source: LeaseSource::Control,
+                    complete: true,
+                    note: None,
+                    endpoint,
+                };
             }
             match tmux_panes() {
                 Ok(panes) => {
@@ -331,7 +374,10 @@ pub fn gather_leases() -> Leases {
                     for s in sessions.iter_mut() {
                         if s.cwd.is_empty() {
                             let tmux_name = format!("th_{}", s.id);
-                            if let Some(p) = by_session.get(tmux_name.as_str()).or_else(|| by_session.get(s.id.as_str())) {
+                            if let Some(p) = by_session
+                                .get(tmux_name.as_str())
+                                .or_else(|| by_session.get(s.id.as_str()))
+                            {
                                 s.cwd = p.to_string();
                             }
                         }
@@ -345,20 +391,36 @@ pub fn gather_leases() -> Leases {
                             continue;
                         }
                         if sessions.iter().any(|s| s.id == id) {
-                            extra.push(SessionPane { id: id.to_string(), cwd: path.clone(), live: true });
+                            extra.push(SessionPane {
+                                id: id.to_string(),
+                                cwd: path.clone(),
+                                live: true,
+                            });
                         }
                     }
                     sessions.extend(extra);
                     let complete = sessions.iter().all(|s| !s.live || !s.cwd.is_empty());
                     let note = (!complete)
                         .then(|| "some live sessions have no known cwd; they cannot be correlated to worktrees".to_string());
-                    Leases { sessions, source: LeaseSource::ControlTmux, complete, note, endpoint }
+                    Leases {
+                        sessions,
+                        source: LeaseSource::ControlTmux,
+                        complete,
+                        note,
+                        endpoint,
+                    }
                 }
                 Err(e) => {
                     let note = format!(
                         "the app reported sessions without cwds and the tmux fallback failed ({e}); lease state is incomplete"
                     );
-                    Leases { sessions, source: LeaseSource::ControlTmux, complete: false, note: Some(note), endpoint }
+                    Leases {
+                        sessions,
+                        source: LeaseSource::ControlTmux,
+                        complete: false,
+                        note: Some(note),
+                        endpoint,
+                    }
                 }
             }
         }
@@ -380,7 +442,10 @@ pub fn gather_leases() -> Leases {
                         sessions,
                         source: LeaseSource::TmuxOnly,
                         complete: true,
-                        note: Some("app down - leases read straight from the t-hub tmux socket".to_string()),
+                        note: Some(
+                            "app down - leases read straight from the t-hub tmux socket"
+                                .to_string(),
+                        ),
                         endpoint: None,
                     }
                 }
@@ -388,7 +453,9 @@ pub fn gather_leases() -> Leases {
                     sessions: Vec::new(),
                     source: LeaseSource::Unavailable,
                     complete: false,
-                    note: Some(format!("neither the control socket nor tmux is reachable ({e})")),
+                    note: Some(format!(
+                        "neither the control socket nor tmux is reachable ({e})"
+                    )),
                     endpoint: None,
                 },
             }
@@ -450,7 +517,15 @@ pub fn resolve_repo_root(dir: Option<&String>) -> Result<String, String> {
 /// The repo's default branch: `origin/HEAD` if set, else `main`/`master` if
 /// they exist locally, else whatever the main worktree has checked out.
 fn default_branch(root: &str, main_branch: Option<&str>) -> String {
-    if let Ok(sym) = git_ok(root, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Ok(sym) = git_ok(
+        root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) {
         if let Some((_, b)) = sym.split_once('/') {
             if !b.is_empty() {
                 return b.to_string();
@@ -458,7 +533,15 @@ fn default_branch(root: &str, main_branch: Option<&str>) -> String {
         }
     }
     for cand in ["main", "master"] {
-        if let Ok((Some(0), _, _)) = run_git(root, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{cand}")]) {
+        if let Ok((Some(0), _, _)) = run_git(
+            root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{cand}"),
+            ],
+        ) {
             return cand.to_string();
         }
     }
@@ -525,7 +608,11 @@ pub fn scan(dir: Option<&String>) -> Result<RepoScan, String> {
                 is_main,
                 locked: e.locked,
                 stale: e.prunable,
-                dirty: if e.prunable { None } else { dirty_count(&e.path) },
+                dirty: if e.prunable {
+                    None
+                } else {
+                    dirty_count(&e.path)
+                },
                 merged,
                 lease: lease_for(&e.path, &paths, &leases.sessions),
             }
@@ -551,8 +638,12 @@ pub fn scan(dir: Option<&String>) -> Result<RepoScan, String> {
 pub enum Decision {
     /// Safe to reap. `forced` marks an unmerged/unknown branch taken only
     /// because `--force` was passed (the plan prints what would be lost).
-    Reap { forced: bool },
-    Skip { reason: String },
+    Reap {
+        forced: bool,
+    },
+    Skip {
+        reason: String,
+    },
 }
 
 /// The decision table. Ordering is the safety doctrine: main/locked/stale are
@@ -560,10 +651,14 @@ pub enum Decision {
 /// and only then does `force` get a say about unmerged branches.
 pub fn prune_decision(w: &WorktreeStatus, default_branch: &str, force: bool) -> Decision {
     if w.is_main {
-        return Decision::Skip { reason: "main worktree - never pruned".to_string() };
+        return Decision::Skip {
+            reason: "main worktree - never pruned".to_string(),
+        };
     }
     if w.locked {
-        return Decision::Skip { reason: "locked (git worktree lock) - unlock it first".to_string() };
+        return Decision::Skip {
+            reason: "locked (git worktree lock) - unlock it first".to_string(),
+        };
     }
     if w.stale {
         return Decision::Skip {
@@ -571,15 +666,22 @@ pub fn prune_decision(w: &WorktreeStatus, default_branch: &str, force: bool) -> 
         };
     }
     if let Some(id) = &w.lease {
-        return Decision::Skip { reason: format!("leased by live session {id} - hands off") };
+        return Decision::Skip {
+            reason: format!("leased by live session {id} - hands off"),
+        };
     }
     match w.dirty {
         None => {
-            return Decision::Skip { reason: "dirty state unknown (git status failed) - refusing".to_string() };
+            return Decision::Skip {
+                reason: "dirty state unknown (git status failed) - refusing".to_string(),
+            };
         }
         Some(n) if n > 0 => {
             return Decision::Skip {
-                reason: format!("dirty ({n} uncommitted change{}) - never reaped", if n == 1 { "" } else { "s" }),
+                reason: format!(
+                    "dirty ({n} uncommitted change{}) - never reaped",
+                    if n == 1 { "" } else { "s" }
+                ),
             };
         }
         Some(_) => {}
@@ -670,19 +772,29 @@ pub fn execute_reap(scan: &RepoScan, w: &WorktreeStatus, forced: bool) -> ReapRe
 /// (this repo's own convention, matching `th worktree new`'s default).
 pub fn pool_path(repo_root: &str, branch: &str) -> String {
     let leaf = branch.rsplit('/').next().unwrap_or(branch);
-    format!("{}/.claude/worktrees/{}", repo_root.trim_end_matches('/'), leaf)
+    format!(
+        "{}/.claude/worktrees/{}",
+        repo_root.trim_end_matches('/'),
+        leaf
+    )
 }
 
 /// Is `path` inside the repo's worktree pool directory?
 fn in_pool(repo_root: &str, path: &str) -> bool {
-    path_within(path, &format!("{}/.claude/worktrees", repo_root.trim_end_matches('/')))
+    path_within(
+        path,
+        &format!("{}/.claude/worktrees", repo_root.trim_end_matches('/')),
+    )
 }
 
 /// A worktree qualifies for reuse under exactly the reap conditions: linked,
 /// unlocked, clean, unleased, and its branch fully merged. Same doctrine -
 /// if it would be safe to prune, it is safe to recycle.
 fn reusable(w: &WorktreeStatus, default_branch: &str) -> bool {
-    matches!(prune_decision(w, default_branch, false), Decision::Reap { .. }) && w.branch.is_some()
+    matches!(
+        prune_decision(w, default_branch, false),
+        Decision::Reap { .. }
+    ) && w.branch.is_some()
 }
 
 /// What `worktree new` should do about the pool.
@@ -707,7 +819,9 @@ pub fn plan_reuse(
 ) -> ReusePlan {
     let find_at = |p: &str| {
         let p = p.trim_end_matches('/');
-        scan.worktrees.iter().find(|w| w.path.trim_end_matches('/') == p)
+        scan.worktrees
+            .iter()
+            .find(|w| w.path.trim_end_matches('/') == p)
     };
     let conflict = |w: &WorktreeStatus| {
         let reason = match prune_decision(w, &scan.default_branch, false) {
@@ -782,7 +896,9 @@ pub fn execute_reuse(
     let mut path = w.path.clone();
     if path.trim_end_matches('/') != desired_path.trim_end_matches('/') {
         if std::path::Path::new(desired_path).exists() {
-            notes.push(format!("kept path {path} (target {desired_path} already exists)"));
+            notes.push(format!(
+                "kept path {path} (target {desired_path} already exists)"
+            ));
         } else {
             match git_ok(&scan.repo_root, &["worktree", "move", &path, desired_path]) {
                 Ok(_) => path = desired_path.to_string(),
@@ -797,7 +913,10 @@ pub fn execute_reuse(
     let base = git_ok(&scan.repo_root, &["rev-parse", "HEAD"])?;
     let branch_ref = format!("refs/heads/{new_branch}");
     let exists = matches!(
-        run_git(&scan.repo_root, &["show-ref", "--verify", "--quiet", &branch_ref]),
+        run_git(
+            &scan.repo_root,
+            &["show-ref", "--verify", "--quiet", &branch_ref]
+        ),
         Ok((Some(0), _, _))
     );
     if exists {
@@ -938,7 +1057,11 @@ prunable gitdir file points to non-existent location
     // -- lease correlation --
 
     fn pane(id: &str, cwd: &str, live: bool) -> SessionPane {
-        SessionPane { id: id.to_string(), cwd: cwd.to_string(), live }
+        SessionPane {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            live,
+        }
     }
 
     fn paths(list: &[&str]) -> Vec<String> {
@@ -947,15 +1070,28 @@ prunable gitdir file points to non-existent location
 
     #[test]
     fn lease_matches_exact_and_nested_paths() {
-        let wts = paths(&["/repo", "/repo/.claude/worktrees/feat", "/repo/.claude/worktrees/other"]);
+        let wts = paths(&[
+            "/repo",
+            "/repo/.claude/worktrees/feat",
+            "/repo/.claude/worktrees/other",
+        ]);
         let sessions = vec![
             pane("aaa", "/repo/.claude/worktrees/feat", true),
             pane("bbb", "/repo/.claude/worktrees/other/apps/native", true),
         ];
-        assert_eq!(lease_for("/repo/.claude/worktrees/feat", &wts, &sessions), Some("aaa".into()));
+        assert_eq!(
+            lease_for("/repo/.claude/worktrees/feat", &wts, &sessions),
+            Some("aaa".into())
+        );
         // A pane deep inside the worktree still leases it (th_t8demo-style).
-        assert_eq!(lease_for("/repo/.claude/worktrees/other", &wts, &sessions), Some("bbb".into()));
-        assert_eq!(lease_for("/repo/.claude/worktrees/none", &wts, &sessions), None);
+        assert_eq!(
+            lease_for("/repo/.claude/worktrees/other", &wts, &sessions),
+            Some("bbb".into())
+        );
+        assert_eq!(
+            lease_for("/repo/.claude/worktrees/none", &wts, &sessions),
+            None
+        );
     }
 
     #[test]
@@ -973,7 +1109,10 @@ prunable gitdir file points to non-existent location
     #[test]
     fn lease_picks_smallest_session_id_when_several_share_a_worktree() {
         let wts = paths(&["/repo", "/repo/wt"]);
-        let sessions = vec![pane("zzz", "/repo/wt", true), pane("aaa", "/repo/wt/sub", true)];
+        let sessions = vec![
+            pane("zzz", "/repo/wt", true),
+            pane("aaa", "/repo/wt/sub", true),
+        ];
         assert_eq!(lease_for("/repo/wt", &wts, &sessions), Some("aaa".into()));
     }
 
@@ -989,7 +1128,10 @@ prunable gitdir file points to non-existent location
             pane("bbb", "/repo/.claude/worktrees/feat", false),      // dead session
             pane("ccc", "", true),                                   // unknown cwd
         ];
-        assert_eq!(lease_for("/repo/.claude/worktrees/feat", &wts, &sessions), None);
+        assert_eq!(
+            lease_for("/repo/.claude/worktrees/feat", &wts, &sessions),
+            None
+        );
         assert_eq!(
             dead_sessions_for("/repo/.claude/worktrees/feat", &wts, &sessions),
             vec!["bbb".to_string()]
@@ -1007,7 +1149,10 @@ prunable gitdir file points to non-existent location
 
     #[test]
     fn merged_clean_unleased_is_reaped() {
-        assert_eq!(prune_decision(&wt("/r/w", Some("feat")), "main", false), Decision::Reap { forced: false });
+        assert_eq!(
+            prune_decision(&wt("/r/w", Some("feat")), "main", false),
+            Decision::Reap { forced: false }
+        );
     }
 
     #[test]
@@ -1045,7 +1190,10 @@ prunable gitdir file points to non-existent location
         let mut w = wt("/r/w", Some("feat"));
         w.dirty = Some(3);
         let reason = skip_reason(prune_decision(&w, "main", true));
-        assert!(reason.contains("dirty (3 uncommitted changes)"), "reason: {reason}");
+        assert!(
+            reason.contains("dirty (3 uncommitted changes)"),
+            "reason: {reason}"
+        );
     }
 
     #[test]
@@ -1060,7 +1208,10 @@ prunable gitdir file points to non-existent location
         let mut w = wt("/r/w", Some("feat"));
         w.merged = Some(false);
         assert!(skip_reason(prune_decision(&w, "main", false)).contains("not merged"));
-        assert_eq!(prune_decision(&w, "main", true), Decision::Reap { forced: true });
+        assert_eq!(
+            prune_decision(&w, "main", true),
+            Decision::Reap { forced: true }
+        );
     }
 
     #[test]
@@ -1068,7 +1219,10 @@ prunable gitdir file points to non-existent location
         let mut w = wt("/r/w", Some("feat"));
         w.merged = None;
         assert!(skip_reason(prune_decision(&w, "main", false)).contains("unknown"));
-        assert_eq!(prune_decision(&w, "main", true), Decision::Reap { forced: true });
+        assert_eq!(
+            prune_decision(&w, "main", true),
+            Decision::Reap { forced: true }
+        );
     }
 
     #[test]
@@ -1076,7 +1230,10 @@ prunable gitdir file points to non-existent location
         let mut w = wt("/r/w", None);
         w.merged = None;
         assert!(skip_reason(prune_decision(&w, "main", false)).contains("detached"));
-        assert_eq!(prune_decision(&w, "main", true), Decision::Reap { forced: true });
+        assert_eq!(
+            prune_decision(&w, "main", true),
+            Decision::Reap { forced: true }
+        );
     }
 
     #[test]
@@ -1148,13 +1305,19 @@ prunable gitdir file points to non-existent location
         let mut unmerged = wt("/repo/.claude/worktrees/c", Some("c"));
         unmerged.merged = Some(false);
         let scan = scan_with(vec![dirty, leased, unmerged]);
-        assert_eq!(plan_reuse(&scan, None, "/repo/.claude/worktrees/new"), ReusePlan::Fresh);
+        assert_eq!(
+            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
+            ReusePlan::Fresh
+        );
     }
 
     #[test]
     fn reuse_ignores_clean_worktrees_outside_the_pool() {
         let scan = scan_with(vec![wt("/somewhere/else", Some("done"))]);
-        assert_eq!(plan_reuse(&scan, None, "/repo/.claude/worktrees/new"), ReusePlan::Fresh);
+        assert_eq!(
+            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
+            ReusePlan::Fresh
+        );
     }
 
     #[test]
@@ -1173,9 +1336,15 @@ prunable gitdir file points to non-existent location
         let a = wt("/repo/.claude/worktrees/aaa", Some("aaa"));
         let scan = scan_with(vec![a]);
         let p = "/repo/.claude/worktrees/aaa".to_string();
-        assert_eq!(plan_reuse(&scan, Some(&p), "/repo/.claude/worktrees/derived"), ReusePlan::Reuse(p.clone()));
+        assert_eq!(
+            plan_reuse(&scan, Some(&p), "/repo/.claude/worktrees/derived"),
+            ReusePlan::Reuse(p.clone())
+        );
         let missing = "/repo/elsewhere".to_string();
-        assert_eq!(plan_reuse(&scan, Some(&missing), "/repo/.claude/worktrees/derived"), ReusePlan::Fresh);
+        assert_eq!(
+            plan_reuse(&scan, Some(&missing), "/repo/.claude/worktrees/derived"),
+            ReusePlan::Fresh
+        );
     }
 
     #[test]
@@ -1197,14 +1366,23 @@ prunable gitdir file points to non-existent location
         let mut w = wt("/repo/.claude/worktrees/det", None);
         w.merged = None;
         let scan = scan_with(vec![w]);
-        assert_eq!(plan_reuse(&scan, None, "/repo/.claude/worktrees/new"), ReusePlan::Fresh);
+        assert_eq!(
+            plan_reuse(&scan, None, "/repo/.claude/worktrees/new"),
+            ReusePlan::Fresh
+        );
     }
 
     // -- pool path derivation --
 
     #[test]
     fn pool_path_uses_branch_leaf_and_trims_root_slash() {
-        assert_eq!(pool_path("/repo/", "crew/feat-x"), "/repo/.claude/worktrees/feat-x");
-        assert_eq!(pool_path("/repo", "feat-y"), "/repo/.claude/worktrees/feat-y");
+        assert_eq!(
+            pool_path("/repo/", "crew/feat-x"),
+            "/repo/.claude/worktrees/feat-x"
+        );
+        assert_eq!(
+            pool_path("/repo", "feat-y"),
+            "/repo/.claude/worktrees/feat-y"
+        );
     }
 }

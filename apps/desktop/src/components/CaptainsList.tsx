@@ -50,6 +50,7 @@ import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
 import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
 import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
+import { StartAgentDialog } from "./StartAgentDialog";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
  *  terminal tile - the sidebar-row click behavior now that agents live as
@@ -173,8 +174,8 @@ function AgentRow({
   // for the orchestrator - its name is the fixed brand label.
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [startAgentOpen, setStartAgentOpen] = useState(false);
 
-  const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
   // The tab the captain's tile lives in; undefined = popped out / gone, the
   // same liveness lookup the dropdown rows use (shared hook, cannot drift).
@@ -186,15 +187,14 @@ function AgentRow({
   // sharing one tab stay distinct. Shared with the overlay. The orchestrator
   // shows its fixed brand name ("Cortana") instead of the derived basename
   // (which would read the bland "orchestrator").
+  const claim = useCaptain((s) => s.claims[terminalId]);
   const identity = orchestrator
     ? ORCHESTRATOR_DISPLAY_NAME
-    : stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
+    : stableCaptainIdentity(claim?.displayName, claim?.shipSlug, terminalId);
   const branch = cwd ? cwdBranch(cwd) : "";
   const roleLabel = orchestrator ? "orchestrator" : "captain";
 
   // Phase 2: the captain's server-registry claim - the workspaces it controls.
-  const claim = useCaptain((s) => s.claims[terminalId]);
-
   // Resolve the captain's bound agent session via the statusline's tmux index,
   // then the supervision tree / status / snapshot for that session. All
   // best-effort: a captain with no session yet renders identity + location only.
@@ -232,10 +232,17 @@ function AgentRow({
   const tasks = tree?.outstandingTasks ?? 0;
 
   const commitRename = () => {
-    // Store semantics: trim + empty clears the override (identity falls back
-    // to the repo folder); no-op when unchanged.
-    useWorkspace.getState().setTerminalLabel(terminalId, draft);
     setEditing(false);
+    const displayName = draft.trim();
+    if (!displayName || displayName === identity || !claim) return;
+    void import("../ipc/controlClient")
+      .then((client) =>
+        client.controlRequest("rename_captain", {
+          captainSessionId: terminalId,
+          displayName,
+        }),
+      )
+      .catch(() => {});
   };
 
   return (
@@ -321,7 +328,7 @@ function AgentRow({
             onClick={() => revealAgent(terminalId)}
             title={
               hasTile
-                ? `Open in Captains - ${identity}${orchestrator ? " (orchestrator)" : ""}`
+                ? `Open in Captain Workspace - ${identity}${orchestrator ? " (orchestrator)" : ""}`
                 : `${identity} - terminal not available (tab popped out?)`
             }
             className="relative flex min-w-0 flex-1 items-center gap-2 py-2 pr-1 text-left"
@@ -416,13 +423,28 @@ function AgentRow({
             onClick={() => {
               // Seed with the CURRENT override (not the derived identity) so
               // committing an untouched empty draft clears back to derived.
-              setDraft(userLabel ?? "");
+              setDraft(identity);
               setEditing(true);
             }}
             className="relative flex h-6 w-5 shrink-0 items-center justify-center rounded opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
             style={{ color: "var(--th-fg-muted)" }}
           >
             <Pencil size={11} className="pointer-events-none" aria-hidden />
+          </button>
+        )}
+        {!editing && !orchestrator && claim?.projectId && cwd && (
+          <button
+            type="button"
+            aria-label={`Start agent for ${identity}`}
+            title="Start agent"
+            onClick={(event) => {
+              event.stopPropagation();
+              setStartAgentOpen(true);
+            }}
+            className="relative flex h-6 shrink-0 items-center rounded px-1 text-[10px] opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            + agent
           </button>
         )}
       </div>
@@ -442,6 +464,13 @@ function AgentRow({
           <SupervisionTreeView sessionId={sessionId ?? ""} label={identity} />
         </div>
       )}
+      <StartAgentDialog
+        open={startAgentOpen}
+        captainSessionId={terminalId}
+        directory={cwd ?? ""}
+        onClose={() => setStartAgentOpen(false)}
+        onStarted={() => setExpanded(true)}
+      />
     </div>
   );
 }
@@ -454,7 +483,13 @@ function CrewRow({ terminalId }: { terminalId: string }) {
   const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
-  const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
+  const folder = cwd
+    ?.replace(/[/\\]+$/, "")
+    .split(/[/\\]+/)
+    .filter(Boolean)
+    .at(-1);
+  const identity =
+    userLabel?.trim() || folder || workspaceName?.trim() || terminalId.slice(0, 8);
   return (
     <div
       className="flex items-center gap-2 py-0.5"

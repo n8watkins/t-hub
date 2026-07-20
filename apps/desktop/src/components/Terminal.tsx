@@ -1,43 +1,29 @@
 // xterm.js terminal tile for the 0.1 terminal nucleus.
 //
-// RENDERER: we load the **CANVAS addon** (GPU-accelerated 2D), with the **DOM
-// renderer as the automatic fallback**, and **deliberately avoid the WebGL
-// addon**. Rationale (the full version lives next to `term.open()` below):
-//   - The DOM renderer couldn't keep up with a busy Claude TUI's full-screen
-//     repaints (symptom D — the last thing still freezing a terminal after the
-//     rest of the app went smooth), so we moved to a GPU path.
-//   - We do NOT use WebGL: each xterm WebGL addon opens its OWN WebGL context,
-//     and WebView2 (Chromium) caps simultaneously-live WebGL contexts (~16) and
-//     HARD-EVICTS the least-recently-used under GPU/memory pressure. With 6+
-//     terminals plus a relayout/repaint, WebView2 evicted contexts across the
-//     grid; xterm's WebGL addon then preventDefault()s `webglcontextlost` and
-//     waits a HARD-CODED 3000ms before its fallback — during which every evicted
-//     canvas is blank. That is the "all terminals go blank / uniform muted gray,
-//     then a tab switch resets them" symptom (the "mutedbug" this build fixed).
-//   - The 2D CANVAS context has no such hard ceiling/evict (Chromium falls back
-//     to software for overflow instead of blanking), so it gives most of the GPU
-//     speedup without reintroducing the blank-grid failure. If the canvas addon
-//     can't load, we fall back to the DOM renderer (still correct, just slower on
-//     a busy TUI) rather than break the terminal.
+// RENDERER: xterm 6's built-in DOM renderer is the maintained multi-terminal
+// path. The Canvas addon is not supported by xterm 6, and its delayed render
+// path appears in the installed lifecycle crash. We also deliberately avoid
+// the WebGL addon because each terminal owns a WebGL context and WebView2
+// evicts contexts under a dense grid, temporarily blanking terminal tiles.
 //
 // Responsibilities (PRD §9.1, FR-004/FR-005, §12.1):
 //   - Create an xterm.js Terminal with Fit + Search + Unicode11 addons.
-//   - On mount/visible: attachTerminal(id, cols, rows), write the base64 scrollback,
-//     subscribe onOutput -> xterm.write(decodeBase64(...)).
+//   - On mount/visible: attachTerminal(id, cols, rows), then render the attached
+//     tmux client's authoritative redraw through onOutput.
 //   - xterm.onData -> writeTerminal(id, data); ResizeObserver/FitAddon -> resizeTerminal.
 //   - Dispose cleanly on unmount. The persistent pool keeps terminals mounted
 //     across tab switches; `foreground` only changes output flush cadence.
 //
-// Lifecycle is keyed on [terminalId, visible]. Hidden/parked terminals stay
-// attached so switching tabs does not reload, but background output is flushed on
-// a slower bounded timer instead of the foreground rAF path.
+// Lifecycle is keyed on [terminalId, visible]. Warm parked terminals stay
+// attached for fast switching and flush output on a slower bounded timer. The
+// pool eventually unmounts cold terminals, which runs the complete teardown
+// below; a later hot mount subscribes before attach and replays tmux capture.
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { CanvasAddon } from "@xterm/addon-canvas";
 import { saneFitProposal } from "./terminalFit";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -48,12 +34,12 @@ import {
   listTerminals,
   onExit,
   onOutput,
+  isMissingLiveTerminalError,
   resizeTerminal,
   writeTerminal,
 } from "../ipc/client";
 import { tmuxScroll, tmuxExitScroll, clipboardImageToTemp } from "../ipc/client05";
 import type { TerminalId } from "../ipc/types";
-import { stripAnsi } from "../lib/ansi";
 import { installFileDropOnce, formatPathsForInsert } from "../lib/dropPaste";
 import { usePanels } from "../store/panels";
 import { useFileOpen } from "../store/fileOpen";
@@ -66,6 +52,12 @@ import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTai
 import type { ITheme, ILink } from "@xterm/xterm";
 import { clipboardRead, clipboardWrite } from "../lib/clipboard";
 import { TerminalCursorBlinkController } from "../lib/terminalCursorBlink";
+import { updateTerminalResources } from "../lib/terminalResources";
+import { TerminalWriteLifecycle } from "../lib/terminalWriteLifecycle";
+import {
+  beginTerminalDetach,
+  waitForTerminalDetach,
+} from "../lib/terminalLifecycle";
 import "./Terminal.css";
 
 // Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
@@ -113,20 +105,6 @@ async function openExternal(url: string): Promise<void> {
     }
   }
 }
-
-// Matches a localhost-style URL printed in terminal output so we can surface it
-// as a one-click Preview chip for the tile (Claude/Vite/Next/etc. announce the
-// dev server this way). Intentionally narrow — only loopback hosts, with an
-// optional :port and path — so we never offer to preview an arbitrary internet
-// link the user didn't start. `g` so one chunk can yield several matches.
-const LOCALHOST_URL_RE =
-  /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/[^\s"'<>]*)?/gi;
-
-// How many trailing chars of one output chunk we prepend to the next before
-// scanning, so a URL split across two PTY writes is still matched whole. A URL
-// here is well under this; the tail just has to outspan the longest plausible
-// split point. Kept small — it runs on every output chunk.
-const URL_SCAN_TAIL = 256;
 
 // Output scheduling. Foreground terminals flush on rAF for low-latency typing.
 // Parked/inactive terminals keep their xterm buffers current, but flush less
@@ -316,6 +294,11 @@ export function TerminalView({
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
+  // ResizeObserver and zoom effects can run before the async remote PTY attach
+  // finishes. Keep their resize commands local until the backend connection is
+  // confirmed, otherwise the rejected `resize_terminal` promise becomes a noisy
+  // global "no live terminal" error during every restored-tile startup.
+  const ptyAttachedRef = useRef(false);
   // Skips the zoom effect's first (mount) run so it doesn't double-fit on open.
   const zoomMountRef = useRef(true);
   // Global zoom: every tile reads the same font size so they scale together.
@@ -344,6 +327,10 @@ export function TerminalView({
   // trigger here once it exists; before that (or after teardown) it is null and
   // the sweep is a no-op (the initial attach flow owns recovery until then).
   const reattachRef = useRef<(() => void) | null>(null);
+  // Buffer resize mutates xterm's line storage and must run behind its async
+  // write parser. The zoom effect lives outside the init closure, so it calls
+  // through this serialized bridge instead of fitting xterm directly.
+  const resizeRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     foregroundRef.current = foreground;
@@ -371,18 +358,15 @@ export function TerminalView({
     let resizeObserver: ResizeObserver | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
-    let promptTimer: ReturnType<typeof setTimeout> | null = null;
     let rafId = 0;
     // Coalesced-write rAF (perf): a flood of small terminal://output events is
     // batched into one frame of decode+write work instead of one synchronous
     // write per event on the single WebView2 JS thread. 0 == none scheduled;
     // torn down in cleanup like `rafId` so it can't fire into a disposed term.
     let flushRaf = 0;
-    // Drains any queued bytes synchronously. Set inside the async attach block
-    // (which owns the pending queue); cleanup calls it ONCE before disposing the
-    // term so a partial frame of output isn't dropped on unmount, matching the
-    // old synchronous path's completeness. Stays null if teardown beats setup.
-    let drainPending: (() => void) | null = null;
+    // Drops bytes that T-Hub has not submitted to xterm yet. A cold unmount can
+    // safely discard them because the next tmux attach redraws authoritative state.
+    let discardPending: (() => void) | null = null;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     // The reattach loop's pending backoff timer, held at effect scope so cleanup
     // can cancel it — a cleared timer never resolves its sleep, which (with the
@@ -406,6 +390,35 @@ export function TerminalView({
         ),
       ),
     });
+    const writes = new TerminalWriteLifecycle(term);
+    const recoverTerminalIpc = (
+      operation: "write" | "resize",
+      error: unknown,
+    ) => {
+      if (disposed) return;
+      if (!isMissingLiveTerminalError(error, terminalId)) {
+        console.error(`[t-hub] terminal ${operation} failed`, error);
+        return;
+      }
+      // A fast tab switch can detach the backend connection after the local
+      // attached flag was checked but before the IPC command acquires the
+      // connection map. Treat that narrow rejection as an attach-loss signal,
+      // not a global unhandled promise rejection. The existing reattach loop
+      // verifies tmux liveness and parks itself while this tile is backgrounded.
+      ptyAttachedRef.current = false;
+      tlog(
+        "attach",
+        `${operation} raced terminal detach for ${terminalId}; reattaching`,
+      );
+      reattachRef.current?.();
+    };
+    const writeAttachedTerminal = (data: string): void => {
+      if (disposed || !ptyAttachedRef.current) return;
+      void writeTerminal(terminalId, data).catch((error: unknown) => {
+        recoverTerminalIpc("write", error);
+      });
+    };
+    updateTerminalResources(terminalId, { xterm: true });
     termRef.current = term;
     // Register this xterm so the captains-deck orchestrator output strip can read
     // its latest visible line on demand (no per-chunk work; the strip polls).
@@ -548,23 +561,6 @@ export function TerminalView({
       );
     }
 
-    // RENDERER: the CANVAS addon (GPU-accelerated 2D), NOT WebGL. The DOM renderer
-    // can't keep up with a busy Claude TUI's full-screen repaints — that was the
-    // last thing freezing the terminal even after the rest of the app went smooth.
-    // We deliberately do NOT use the WebGL addon: each WebGL terminal opens its own
-    // WebGL context, WebView2 caps those (~16) and HARD-EVICTS the least-recent one
-    // under pressure → the whole grid blanks (the "mutedbug" this build originally
-    // fixed by dropping WebGL). A 2D canvas context has no such hard ceiling/evict
-    // (Chromium falls back to software for overflow instead of blanking), so canvas
-    // gives most of the GPU speedup without reintroducing the blank-grid failure.
-    // Loaded AFTER open(); a failure falls back to the DOM renderer rather than
-    // breaking the terminal.
-    try {
-      term.loadAddon(new CanvasAddon());
-    } catch {
-      // Canvas unavailable in this webview — fall back to the DOM renderer.
-    }
-
     // COPY-ON-SELECT (WS-1): mirror Claude Code / iTerm — selecting text in the
     // terminal auto-copies it to the clipboard, no Ctrl+C needed. onSelectionChange
     // fires rapidly during a drag, so we DEBOUNCE (~120ms) and only write once the
@@ -583,7 +579,7 @@ export function TerminalView({
 
     // Forward keystrokes/paste to the PTY.
     const dataSub = term.onData((d) => {
-      void writeTerminal(terminalId, d);
+      writeAttachedTerminal(d);
     });
 
     // Match the user's Windows Terminal bindings: Ctrl+C copies the selection
@@ -591,8 +587,8 @@ export function TerminalView({
     // SIGINT; Ctrl+V pastes (bracketed-paste aware via term.paste). Ctrl +/-/0
     // zoom is handled here too because a focused xterm otherwise swallows those
     // before they reach the window-level handler. Returning false stops xterm
-    // from sending the key to the PTY; stopPropagation prevents the Canvas
-    // window handler from double-firing.
+    // from sending the key to the PTY; stopPropagation prevents the window
+    // handler from double-firing.
     // Tracks whether THIS pane is in tmux copy-mode after a Page Up (set below).
     // A closure flag living for the terminal's lifetime; only ever true after a
     // scroll, so ordinary typing is unaffected while it's false.
@@ -640,7 +636,7 @@ export function TerminalView({
                   ? e.key
                   : null;
         void tmuxExitScroll(sessionName).then(() => {
-          if (ch !== null) void writeTerminal(terminalId, ch);
+          if (ch !== null) writeAttachedTerminal(ch);
         });
         e.preventDefault();
         e.stopPropagation();
@@ -688,14 +684,8 @@ export function TerminalView({
       return true;
     });
 
-    // Tracks the column count we last reported to the PTY. A width change is the
-    // only thing that makes xterm REFLOW (re-wrap) its buffer, so we use a
-    // before/after column comparison in the settle handler to decide whether the
-    // garbled reflowed scrollback needs clearing (see settleResize).
-    let lastCols = 0;
-
-    const pushResize = () => {
-      if (disposed) return;
+    const performResize = () => {
+      if (disposed || !ptyAttachedRef.current) return;
       // NEVER push a degenerate resize. A parked/hidden/not-yet-laid-out tile
       // measures ~0px wide and FitAddon would propose ~2 cols; pushing that to
       // the PTY wedges the whole tmux window to 2 columns (the 2x24-client bug).
@@ -704,7 +694,11 @@ export function TerminalView({
       if (!saneFitProposal(term, fit)) return;
       try {
         fit.fit();
-        void resizeTerminal(terminalId, term.cols, term.rows);
+        void resizeTerminal(terminalId, term.cols, term.rows).catch(
+          (error: unknown) => {
+            recoverTerminalIpc("resize", error);
+          },
+        );
       } catch {
         // Container may be detached mid-resize; ignore.
       }
@@ -714,61 +708,28 @@ export function TerminalView({
     // drag fires the ResizeObserver many times; we only get here after motion
     // stops, so the PTY sees a single resize/SIGWINCH instead of a stream.
     //
-    // The corruption fix: the terminals draw inline (not alt-screen), so the
-    // TUI's prior frames live in xterm's scrollback. On a WIDTH change xterm
-    // reflows that whole buffer and those frames re-wrap into a duplicated,
-    // scrambled mess. After the settle-fit, tmux gets the SIGWINCH and redraws
-    // the CURRENT screen cleanly at the new width -- so the old reflowed history
-    // is pure garbage we can safely drop. term.clear() discards the entire
-    // scrollback while KEEPING the cursor's line as the new first line, i.e. it
-    // leaves the live screen the user is reading intact and only kills the
-    // duplicated history above it. We only clear when the column count actually
-    // changed (height-only changes / re-shows at the same width don't reflow),
-    // so a pure vertical resize never throws away readable scrollback.
-    const settleResize = () => {
-      if (disposed) return;
-      pushResize();
-      // A width change is the only thing that reflows xterm's wrapped scrollback;
-      // compare against the LAST settled width (not the pre-fit value) so an
-      // unchanged width during a resize burst is a true no-op.
-      const widthChanged = term.cols !== lastCols;
-      const firstSettle = lastCols === 0;
-      lastCols = term.cols;
-      // THE BLANK-GRID FIX: term.clear() wipes the ACTIVE buffer. For a
-      // full-screen app (Claude Code, vim, less, ...) the active buffer is the
-      // ALTERNATE screen, so clearing it erases the app's visible frame — and
-      // during a spawn/relayout resize burst it gets erased faster than the app
-      // can redraw, so the pane (and, because a spawn reflows every tile, the
-      // WHOLE grid) reads blank/muted until something else redraws it. We
-      // therefore NEVER clear while the alt buffer is active: full-screen apps
-      // repaint themselves on the SIGWINCH from pushResize(), so there is no
-      // duplicated scrollback for us to clean up. We also only clear on a REAL
-      // width change of an inline (normal-buffer) terminal, and skip the very
-      // first settle (nothing to dedupe yet). This collapses the boot/spawn
-      // "422 clears" storm to near-zero and removes the blanking entirely.
-      const onAltScreen = term.buffer.active.type === "alternate";
+    // Fit once after resize settles, send one SIGWINCH, and let the attached TUI
+    // redraw itself. Never clear xterm here: term.clear() can erase inline chat
+    // transcript before the asynchronous backend resize/redraw reaches the page,
+    // which makes a live Codex session look as if it forgot its conversation.
+    const performSettledResize = () => {
+      if (disposed || !ptyAttachedRef.current) return;
+      if (!saneFitProposal(term, fit)) return;
+      performResize();
       tlog(
         "resize",
-        `${terminalId} settle cols->${term.cols} rows=${term.rows} widthChanged=${widthChanged} alt=${onAltScreen}`,
+        `${terminalId} settle cols->${term.cols} rows=${term.rows}`,
       );
-      if (widthChanged && !firstSettle && !onAltScreen) {
-        // Defer clear + repaint to the next frame so the post-SIGWINCH redraw of
-        // the inline shell lands first; clear only removes scrollback above the
-        // live line, then the forced repaint shows a clean, single frame.
-        requestAnimationFrame(() => {
-          if (disposed) return;
-          try {
-            term.clear();
-          } catch {
-            // Renderer/buffer detached mid-call; ignore.
-          }
-          tlog("resize", `${terminalId} cleared scrollback + repaint (rows=${term.rows})`);
-          forceFullRedraw();
-        });
-      } else {
-        forceFullRedraw();
-      }
+      forceFullRedraw();
     };
+    const settleResize = () => {
+      // xterm parses write() input asynchronously. Resizing its buffer while a
+      // line-feed parser action is in flight can leave the next row absent and
+      // throw from InputHandler.isWrapped. Keep one latest resize queued behind
+      // all accepted writes; repeated observer/zoom events coalesce in place.
+      writes.afterWritesCoalesced("resize", performSettledResize);
+    };
+    resizeRef.current = settleResize;
 
     // Defer the first fit until the browser has completed the constrained-flex
     // layout pass. A synchronous fit here reads a
@@ -819,43 +780,7 @@ export function TerminalView({
             let seeded = false;
             const liveBuffer: Uint8Array[] = [];
 
-            // LOCALHOST-URL DETECTION: scan the LIVE PTY stream for dev-server
-            // URLs and publish each NEW one to the panels store, where the tile's
-            // Preview tab renders them as one-click chips. Decoupled from xterm's
-            // write path so it can't perturb rendering. A streaming TextDecoder
-            // carries multi-byte UTF-8 across chunk boundaries; a rolling tail of
-            // the previous chunk is prepended so a URL split across two writes is
-            // still matched whole. We dedupe against the last few URLs we pushed
-            // so a server logging its URL on every request doesn't spam the store
-            // (addDetectedUrl also dedupes, but this avoids the regex+set churn).
-            const urlDecoder = new TextDecoder("utf-8");
-            let scanTail = "";
-            const recentUrls: string[] = [];
-            const scanForUrls = (bytes: Uint8Array): void => {
-              // `stream: true` keeps a trailing partial code point for next time.
-              const raw = scanTail + urlDecoder.decode(bytes, { stream: true });
-              // Strip ANSI/VT escapes BEFORE matching: the raw pty stream
-              // interleaves color/cursor/erase codes with the text, and without
-              // this they get captured into the URL (e.g. ".../preview\x1b[K\x1b[m
-              // \x1b[28;1H"). Match on the cleaned text; carry the RAW tail so an
-              // escape — or a URL — split across two writes still resolves on the
-              // next chunk.
-              const text = stripAnsi(raw);
-              LOCALHOST_URL_RE.lastIndex = 0;
-              for (const m of text.matchAll(LOCALHOST_URL_RE)) {
-                const url = m[0];
-                if (recentUrls.includes(url)) continue;
-                recentUrls.push(url);
-                if (recentUrls.length > 16) recentUrls.shift();
-                usePanels.getState().addDetectedUrl(terminalId, url);
-              }
-              // Carry the tail so a URL spanning this chunk and the next is caught.
-              scanTail =
-                raw.length > URL_SCAN_TAIL ? raw.slice(-URL_SCAN_TAIL) : raw;
-            };
-
-            // PER-TERMINAL COALESCED WRITE (perf): the old path decoded, scanned
-            // for URLs (stripAnsi + regex over a rolling buffer), and wrote to
+            // PER-TERMINAL COALESCED WRITE (perf): the old path decoded and wrote to
             // xterm SYNCHRONOUSLY for every single output event, on the one
             // WebView2 JS thread, for every live terminal. A burst from a few
             // busy terminals turned into a decode/ANSI/regex storm that froze the
@@ -863,33 +788,20 @@ export function TerminalView({
             // rAF flush per terminal does the writing + (bounded) URL scan once
             // per frame, collapsing a burst of small events into one frame of
             // work. Byte ORDER is preserved because the queue is FIFO and a flush
-            // drains it in arrival order; COMPLETENESS is preserved because every
-            // decoded chunk lands in the queue and the queue is fully drained on
-            // every flush (and one final flush runs before teardown disposes the
-            // term — see cleanup).
+            // drains it in arrival order. T-Hub's not-yet-submitted queue is
+            // discarded on cold teardown because tmux replays authoritative
+            // output on the next attach.
             const pending: Uint8Array[] = [];
             let pendingBytes = 0;
 
-            // Drain the queued bytes: URL-scan + activity-bump + write, ONCE for
-            // the whole frame's worth of chunks. Shared by the rAF flush and the
-            // teardown drain; the only difference is the rAF path's `disposed`
-            // guard (it must not write into an about-to-be-disposed term on a
-            // late frame), whereas the teardown path runs deliberately while the
-            // term is still alive (cleanup disposes it only afterward).
+            // Drain the queued bytes: activity-bump + write, once for the whole
+            // frame's worth of chunks.
             const drainQueue = (): void => {
               if (pending.length === 0) return;
               // Snapshot + clear up front so anything that arrives DURING this
               // drain queues cleanly for the next frame (FIFO order intact).
               const chunks = pending.splice(0, pending.length);
               pendingBytes = 0;
-
-              // URL detection runs at most ONCE per flush over the frame's bytes
-              // (in arrival order), not once per chunk — same stripAnsi/regex
-              // work, far fewer invocations. The dedup ring + tail carry-over
-              // make this identical in effect to the old per-chunk scan: a URL
-              // split across chunks within or across frames still resolves via
-              // `scanTail`, and `recentUrls` still suppresses repeats.
-              for (const bytes of chunks) scanForUrls(bytes);
 
               // RUNNING signal (#11): bump ONCE per flush rather than per chunk.
               // The sidebar pulse is a coarse "output is flowing" indicator, so a
@@ -901,7 +813,7 @@ export function TerminalView({
               // seed has landed we still route into `liveBuffer` (flushed after
               // the seed) so history/live ordering is preserved exactly as before.
               if (seeded) {
-                for (const bytes of chunks) term.write(bytes);
+                for (const bytes of chunks) writes.write(bytes);
               } else {
                 for (const bytes of chunks) liveBuffer.push(bytes);
               }
@@ -1020,7 +932,7 @@ export function TerminalView({
               // Flush queued output first so the process's final bytes land
               // before the banner (same ordering the old exit handler kept).
               drainQueue();
-              term.writeln("\r\n[process exited]");
+              writes.write("\r\n[process exited]\r\n");
               useWorkspace.getState().updateState(terminalId, "exited");
             };
 
@@ -1033,7 +945,7 @@ export function TerminalView({
               if (disposed || reconnecting || !initialAttachSettled) return;
               reconnecting = true;
               needsReattach = false;
-              term.writeln("\r\n[session detached - reconnecting...]");
+              writes.write("\r\n[session detached - reconnecting...]\r\n");
               let delay = RECONNECT_INITIAL_MS;
               for (;;) {
                 await reconnectSleep(delay);
@@ -1062,7 +974,9 @@ export function TerminalView({
                   // would see "already streaming" and return an empty seed
                   // without opening a new socket. close_terminal detaches +
                   // removes it (a no-op when absent); the tmux session survives.
+                  ptyAttachedRef.current = false;
                   await closeTerminal(terminalId);
+                  updateTerminalResources(terminalId, { pty: false });
                   if (disposed) return;
                   // Buffer live output while we await the fresh seed, exactly
                   // like the mount path: bytes from the new conn replay AFTER
@@ -1072,29 +986,28 @@ export function TerminalView({
                   pending.length = 0;
                   pendingBytes = 0;
                   liveBuffer.length = 0;
-                  const scrollback = await attachTerminal(
+                  await attachTerminal(
                     terminalId,
                     term.cols,
                     term.rows,
                   );
                   if (disposed) return;
+                  ptyAttachedRef.current = true;
+                  updateTerminalResources(terminalId, { pty: true });
                   // Repopulate: reset the grid so the stale pre-drop frame (and
                   // the reconnecting banner) never duplicates under the seed.
+                  await writes.waitForWrites();
+                  if (disposed) return;
                   term.reset();
-                  const seed = decodeBase64(scrollback);
-                  if (seed.length > 0) term.write(seed);
                   seeded = true;
                   if (liveBuffer.length > 0) {
-                    for (const chunk of liveBuffer) term.write(chunk);
+                    for (const chunk of liveBuffer) writes.write(chunk);
                     liveBuffer.length = 0;
                   }
-                  // An empty capture renders nothing — nudge the shell to
-                  // repaint its prompt, exactly like the fresh-spawn path.
-                  if (seed.length === 0) void writeTerminal(terminalId, "\x0c");
                   reconnecting = false;
                   tlog(
                     "attach",
-                    `reattached ${terminalId} after attach loss (seed ${seed.length}B)`,
+                    `reattached ${terminalId} after attach loss`,
                   );
                   return;
                 } catch (err) {
@@ -1159,10 +1072,11 @@ export function TerminalView({
             window.addEventListener(TERMINAL_FOREGROUND_EVENT, onForegroundChanged);
             document.addEventListener("visibilitychange", onVisibilityChanged);
 
-            // Expose a synchronous drain to the outer cleanup so a partial frame
-            // of output queued at unmount isn't lost (the old write path was
-            // synchronous, so nothing received was ever pending at teardown).
-            drainPending = drainQueue;
+            discardPending = () => {
+              pending.length = 0;
+              pendingBytes = 0;
+              liveBuffer.length = 0;
+            };
 
             const offOutput = await onOutput(terminalId, (e) => {
               if (disposed) return;
@@ -1219,45 +1133,33 @@ export function TerminalView({
               `subscribed ${terminalId} (listeners live BEFORE attach); requesting attach ${term.cols}x${term.rows}`,
             );
 
-            const scrollback = await attachTerminal(
+            await waitForTerminalDetach(terminalId);
+            if (disposed) return;
+            await attachTerminal(
               terminalId,
               term.cols,
               term.rows,
             );
             if (disposed) return;
-            // Empty seed => fresh spawn (backend skips capture); non-empty =>
-            // reattach history to restore. Only write a real seed; a fresh
-            // prompt is drawn by the forced redraw below.
-            const seed = decodeBase64(scrollback);
-            const freshSpawn = seed.length === 0;
-            if (!freshSpawn) term.write(seed);
-
-            // Seed is on screen; switch to live writes and flush anything that
-            // arrived on the listener while we were awaiting attach/seed.
+            ptyAttachedRef.current = true;
+            updateTerminalResources(terminalId, { pty: true });
+            // The tmux attach stream is the only screen renderer. Switch to live
+            // writes and flush the authoritative redraw buffered during attach.
             seeded = true;
             if (liveBuffer.length > 0) {
-              for (const chunk of liveBuffer) term.write(chunk);
+              for (const chunk of liveBuffer) writes.write(chunk);
               tlog(
                 "attach",
-                `attached ${terminalId}: seed ${seed.length}B, flushed ${liveBuffer.length} buffered live chunk(s)`,
+                `attached ${terminalId}: flushed ${liveBuffer.length} buffered live chunk(s)`,
               );
               liveBuffer.length = 0;
             } else {
               tlog(
                 "attach",
-                `attached ${terminalId}: seed ${seed.length}B, no buffered live chunks`,
+                `attached ${terminalId}: no buffered live chunks`,
               );
             }
 
-            // On a fresh spawn we seeded nothing, so draw one clean prompt: send
-            // Ctrl-L (\x0c) once subscribed. If zsh is still loading it buffers
-            // the keystroke and redraws when ready, so the prompt always appears
-            // -- with no seed reflow cascade. Reattach already restored history.
-            if (freshSpawn) {
-              promptTimer = setTimeout(() => {
-                if (!disposed) void writeTerminal(terminalId, "\x0c");
-              }, 250);
-            }
             initialAttachSettled = true;
           } catch (err) {
             // Initial attach failed. Previously this left the tile rendered but
@@ -1426,7 +1328,7 @@ export function TerminalView({
       const eid = (e as CustomEvent<{ id?: string }>).detail?.id;
       if (eid && eid !== terminalId) return;
       // A no-id BROADCAST (repaintMount's window-resize/maximize settle) would
-      // otherwise pushResize() EVERY pooled terminal — ~16 synchronous fit.fit()
+      // otherwise resize EVERY pooled terminal - ~16 synchronous fit.fit()
       // calls = the observed ~327ms main-thread stall. Background tiles re-fit on
       // un-park via the IntersectionObserver, so for a broadcast only fit+heal the
       // FOREGROUND tile. A TARGETED refresh (eid set — the ⟳ reload button on this
@@ -1437,9 +1339,9 @@ export function TerminalView({
       // buffer) mangles the formatting. Deep scroll-up is handled by Page Up (tmux
       // copy-mode), which reads the real tmux history (up to history-limit).
       // forceFullRedraw (not refresh) is why the ⟳ button now actually clears a
-      // stale frame: when cols/rows are unchanged, pushResize()'s fit is a no-op,
+      // stale frame: when cols/rows are unchanged, the fit is a no-op,
       // so only the atlas-clear re-composite heals it.
-      pushResize();
+      settleResize();
       requestAnimationFrame(forceFullRedraw);
     };
     window.addEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
@@ -1471,11 +1373,8 @@ export function TerminalView({
       initializedRef.current = false;
 
       cancelAnimationFrame(rafId);
-      // Cancel any scheduled coalesced-write flush, then drain its queue ONCE
-      // synchronously below (before term.dispose) so the final partial frame of
-      // output isn't lost. The cancel stops a late rAF from firing into the
-      // disposed term; flushPending also re-checks `disposed`, so even a frame
-      // that slips through the cancel is a no-op.
+      // Cancel any scheduled coalesced-write flush. The unsubmitted queue is
+      // discarded below; tmux replays it from authoritative capture on attach.
       if (flushRaf !== 0) {
         cancelAnimationFrame(flushRaf);
         flushRaf = 0;
@@ -1484,12 +1383,12 @@ export function TerminalView({
         clearTimeout(flushTimer);
         flushTimer = null;
       }
-      if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
       if (copyTimer) clearTimeout(copyTimer);
       // Abandon any in-flight reattach: the cleared timer never resolves its
       // sleep, and the loop's `disposed` checks bail on every other await.
       reattachRef.current = null;
+      if (resizeRef.current === settleResize) resizeRef.current = null;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1523,19 +1422,24 @@ export function TerminalView({
       });
       unlisteners.length = 0;
 
-      // Final synchronous drain of any output that was queued for the next rAF
-      // frame but never flushed (the cancel above stopped that frame). The term
-      // is still alive here — it's disposed on the next line — so this writes the
-      // last partial frame's bytes in order, preserving completeness the same way
-      // the old per-event synchronous write did. No-op if setup never reached the
-      // point of assigning `drainPending` (teardown beat the async attach).
-      drainPending?.();
+      discardPending?.();
+      ptyAttachedRef.current = false;
 
       cursorBlinkRef.current?.dispose();
       cursorBlinkRef.current = null;
 
       unregisterTerminalTail(terminalId, term);
-      term.dispose();
+      // xterm parses accepted writes asynchronously. Retire immediately so no
+      // later write is accepted, then dispose only after parser callbacks settle.
+      writes.disposeWhenIdle();
+      void beginTerminalDetach(terminalId, () => closeTerminal(terminalId)).catch(
+        () => undefined,
+      );
+      updateTerminalResources(terminalId, {
+        xterm: false,
+        canvas: false,
+        pty: false,
+      });
       termRef.current = null;
       fitRef.current = null;
     };
@@ -1565,18 +1469,7 @@ export function TerminalView({
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = fontSize;
-    const fit = fitRef.current;
-    if (!fit) return;
-    try {
-      // Same degenerate-measurement guard as pushResize: a zoom change on a
-      // parked/hidden tile must not fit-and-push ~2 cols to the PTY. When it
-      // un-parks, the pool-move / ResizeObserver re-fits at the new font size.
-      if (!saneFitProposal(term, fit)) return;
-      fit.fit();
-      void resizeTerminal(terminalId, term.cols, term.rows);
-    } catch {
-      /* container detached mid-zoom; ignore */
-    }
+    resizeRef.current?.();
   }, [fontSize, terminalId]);
 
   // Live-apply terminal palette changes — global (theme editor / MCP set_theme)

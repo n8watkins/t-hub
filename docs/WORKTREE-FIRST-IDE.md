@@ -21,13 +21,14 @@ Worktrees solve the disk-isolation problem cleanly. What's been missing is a coc
 
 ## 3. What T-Hub Already Does (shipped)
 
-The worktree primitive is in place end-to-end. Concretely:
+The worktree create, list, and reopen primitives are in place end-to-end.
+Removal is temporarily suspended in source `0.3.88` pending the unified safety verdict.
 
 **Core git surface (`git.rs`, registered in `lib.rs:474`).** Five Tauri async commands shell out via `run_git` (on Windows, through `wsl.exe -d <distro> --cd <cwd> -- git …` with `CREATE_NO_WINDOW`), each argument as its own argv entry so branch names with slashes and shell metacharacters are safe:
 
 - **LIST** — `git_worktree_list` parses `git worktree list --porcelain` into `WorktreeInfo[] {path, branch, isLinked}`; the main worktree is returned first (`isLinked:false`), linked worktrees after; detached/bare entries carry `branch:null`.
 - **CREATE with smart branch handling (WS-9)** — `git_worktree_add` runs `git show-ref --verify --quiet refs/heads/<b>` to decide the argv (`worktree_add_args`): existing local branch → bare checkout; non-existing branch → create-and-checkout (`-b`); no branch → git's path-derived default.
-- **REMOVE** — `git_worktree_remove` runs `git worktree remove [--force] <path>`; git refuses a dirty worktree without force. After any mutation the per-cwd `git_info` TTL cache is invalidated for both the source repo and the new/removed path.
+- **REMOVE** - `git_worktree_remove` synchronously refuses before Git while the unified worktree status service is unavailable.
 
 **Anchor-to-main resolution (`worktreeTarget.ts`).** `resolveWorktreeTarget(cwd, branch)` calls `gitWorktreeList`, picks the single `isLinked===false` entry as the main root, and builds a **sibling** path `<parent-of-root>/<root-name>-worktrees/<sanitized-branch>`. Worktrees never nest — invoked from inside a linked worktree, it still anchors to the main checkout. No main entry → `{kind:'no-repo'}`, which pops the repo picker rather than guessing.
 
@@ -35,11 +36,17 @@ The worktree primitive is in place end-to-end. Concretely:
 
 **The keybind / discovery workflow (`keybindings.ts`, `commands.ts`).** Rebindable, tmux-style prefix (default `Ctrl+B`): `Ctrl+B w` = new worktree workspace, `Ctrl+B c` = plain tab, `Ctrl+B l` = worktrees list, `Ctrl+T` = plain terminal in the current tile (deliberately *not* a worktree). All discoverable in the `Ctrl+K` palette.
 
-**Multiple entry points, one code path.** Beyond the keybind: `FilePanel` "New worktree…" (WS-4) offers a raw worktree-path field + optional branch; the `WorktreesList` modal re-opens existing worktrees (`alreadyCreated` skips the git add) and removes them with a confirm. The MCP/control channel exposes `create_worktree` / `remove_worktree` tools (Organization/process tier; remote peers path-scoped to the operator allowlist), which run git then forward the tab+spawn to the UI with `alreadyCreated:true` — so **`store.addWorktreeWorkspace` is the single path** whether the request came from a keybind, the FilePanel, or an MCP agent.
+**Multiple entry points, one creation path.** Beyond the keybind, `FilePanel` "New worktree…" offers a raw worktree-path field and optional branch, while the `WorktreesList` modal reopens existing worktrees.
+The MCP and control channel exposes `create_worktree`, which runs Git and forwards the tab and spawn to the UI with `alreadyCreated:true`, so `store.addWorktreeWorkspace` remains the single creation path.
+The `remove_worktree` tool remains discoverable but synchronously returns the temporary safety refusal.
+
+**Current removal override.** Source `0.3.88` suspends every public worktree-removal entry point before UI detachment or Git mutation until the unified status service exists.
+The creation and reopen paths remain available.
 
 **Error handling is concrete.** "branch already checked out elsewhere" is detected (`already_checked_out_branch`) and surfaced with the branch named; a pre-existing target directory yields an actionable "remove that leftover directory or pick a different branch name."
 
-**Safe lifecycle.** Removal is **detach-then-remove**: `store.removeWorktreeWorkspace` finds every live tile whose cwd is the worktree dir (or inside it, on a path-segment boundary), `detachTile`s each (the tmux session survives — no orphaned process), *then* calls `gitWorktreeRemove`. Closing a worktree tab detaches its tiles; the branch/work persists on disk and is re-openable from the worktrees list.
+**Safe lifecycle.** Source `0.3.88` runs an authoritative preflight before any detach and currently fails closed while the unified service is unavailable.
+Closing a worktree tab still detaches its tiles, and the branch and work remain on disk for reopening.
 
 **How it plugs into the cockpit.** Worktrees map cleanly onto T-Hub's model: one git worktree → one workspace **tab** containing a **tile** (terminal) whose cwd is the worktree dir, on its own branch. Each tile can run its own agent, so N feature branches = N concurrent agents, each isolated in its own checkout, all in one window. The per-tile git chip (`Tile.tsx`) and FilePanel badge show branch / linked-worktree tag / dirty count, making the cockpit a fleet view. The layer split is the core UX principle: `Ctrl+T` adds *more hands on the same task* (another terminal in the same worktree); `Ctrl+B w` starts a *new task* (a new worktree).
 
@@ -68,7 +75,7 @@ What is **not** there yet:
 - **The agent protocol is asymmetric.** `AgentRequest::GitWorktrees` is **list-only**; add/remove are reachable only via the control channel — functional but inconsistent.
 - **The `<repo>-worktrees/` base path is hardcoded** in `resolveWorktreeTarget` (design notes "configurable later").
 - **Naming-convention mismatch.** `RecentList.tsx` expects a `wt-<branch>` directory convention, but the workflow creates `<repo>-worktrees/<branch-sanitized>` — so RecentList won't recognize this workflow's worktrees by the `wt-*` segment and falls back to the parent folder.
-- **Headless removal is refused by design.** `remove_worktree` over control/MCP refuses to run with no UI sink (to avoid orphaning processes), so programmatic worktree removal requires the desktop app to be running.
+- **Worktree removal is temporarily unavailable.** Graphical, Tauri, control, MCP, and CLI callers receive the same fail-closed refusal while the unified status service is incomplete.
 
 ## 6. Roadmap to Fully Worktree-First
 
@@ -77,7 +84,8 @@ Prioritized, each step composing already-shipped primitives.
 1. **Make "one task = one worktree = one agent" the default new-work gesture.** Today new work splits across `Ctrl+T` (shell here), `Ctrl+B c` (plain tab), and `Ctrl+B w` (worktree tab). Promote "new worktree + agent" to the primary "start something new" action and the empty-workspace call-to-action, so the UI *nudges* toward the worktree-first model (`commands.ts`, `keymapExecutor.ts`, `WorktreePrompt.tsx`).
 2. **Build the worktree fleet launcher** (`ROADMAP-PLAN.md:146`). One action that spins K worktrees + K agents from a list of branches/task prompts — paste N branch names → N sibling worktrees → N tiles, each agent started in its own checkout. This is the headline gesture, and it composes the shipped `git_worktree_add` + tile-spawn primitives.
 3. **Add per-worktree ahead/behind status.** `GitInfo` already carries branch + worktree_root + is_linked_worktree + dirty_count; extend it with ahead/behind vs upstream/base and surface a compact per-worktree badge (dirty / ahead / behind / clean) on every tile and in the worktrees list.
-4. **Ship branch lifecycle / merge / cleanup UX.** Close the loop on the existing remove + re-open: "merge this worktree's branch back to main" and "task done → merge (or open PR) + remove the worktree + reap the agent" as one safe gesture (detach-of-live-tiles already enforced). Resolve the parked WS-9 nits while here — `sanitizeBranchToDir` collisions and remote-only branch DWIM-tracking.
+4. **Ship branch lifecycle, merge, and cleanup UX.** Implement the unified removal verdict first, then close the loop on reopen with "merge this worktree's branch back to main" and "task done, merge or open PR, remove the worktree, and reap the agent" as one safe gesture.
+   Resolve the parked WS-9 `sanitizeBranchToDir` collision and remote-only branch tracking issues in the same tranche.
 5. **Add aggregate cost rollup + a budget governor** (`ROADMAP-PLAN.md:146` and `:145`). Sum cost/context per worktree-agent into a fleet total, and pause/throttle/route work on spend or context budgets — turning the existing per-session economics (`usage.rs` / `codex.rs`) into fleet-level orchestration unique to a worktree-first cockpit.
 6. **Make the supervision tree worktree-aware.** Group/filter the supervision view and status indicators by worktree/branch (`supervision.rs`, `StatusIndicator.tsx`), and expose the parked MCP supervision **event stream** so an orchestrator agent can block on "worktree X's agent is blocked/done" and drive the fleet programmatically (building on the shipped `wait_for_status`).
 7. **Carry worktree-first over the server split** (`SERVER-SPLIT-AND-ROADMAP.md`, M1–M3 shipped, M4 next). Once the headless server-in-WSL owns the fleet, the worktree fleet plus its per-worktree git/cost/supervision state is reachable from any device, and named-session namespacing lets a whole fleet be addressed as one instance — "my whole worktree fleet, from my phone."

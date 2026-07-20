@@ -107,19 +107,12 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
 
-      # The mcp_e2e integration test spawns the REAL t-hub-mcp binary and locates
-      # it at target/debug/t-hub-mcp. `cargo test --workspace` compiles the crate's
-      # test targets but does NOT place that binary there, so build it explicitly
-      # FIRST (mirrors apps/desktop/scripts/mcp_proof.sh). Without this the e2e
-      # test fails with "t-hub-mcp binary not found".
-      - name: Build t-hub-mcp binary (mcp_e2e dependency)
-        run: cargo build -p t-hub-mcp
-
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      # This committed gate builds the real MCP binary before workspace tests.
+      - name: cargo workspace gate
+        run: ../scripts/workspace_gate.sh
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -156,6 +149,9 @@ jobs:
       # This catches Vite import, asset, and bundling failures that jsdom does not.
       - name: Production frontend build
         run: pnpm build
+
+      - name: Desktop version contract
+        run: bash apps/desktop/scripts/check-version.sh --history
 
       - name: Packaged runtime benchmark contract
         run: bash scripts/perf/perf-benchmark.test.sh

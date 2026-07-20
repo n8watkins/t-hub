@@ -14,6 +14,7 @@ mod tmux;
 
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
+pub mod agent_session; // Powder-independent durable agent-session contract
 mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
@@ -28,6 +29,7 @@ mod fleet;
 mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
+mod history; // provider-neutral conversation identity and transcript adapter foundation
 mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere) // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
                  // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
@@ -185,20 +187,17 @@ struct AppHandleApplySink {
 
 impl control::ApplySink for AppHandleApplySink {
     fn apply(&self, command: &str, args: &serde_json::Value) -> Result<(), String> {
-        use tauri::{Emitter, Manager};
+        use tauri::Emitter;
         // Headless-org: control-spawned sessions are created SERVER-side (the id
         // rides the forward), bypassing `commands::spawn_terminal`'s bookkeeping.
-        // Recreate it here so the adopted tile behaves exactly like a "+" spawn:
-        // mark the id FRESH (first attach returns empty scrollback → one clean
-        // prompt) and emit Live so the tile skips the "starting" placeholder.
+        // Recreate its Live event here so the adopted tile behaves exactly like
+        // a "+" spawn and skips the "starting" placeholder.
         if matches!(command, "spawn_terminal" | "add_worktree_workspace") {
             let id = args
                 .get("id")
                 .or_else(|| args.get("terminalId"))
                 .and_then(|v| v.as_str());
             if let Some(id) = id {
-                let remote = self.app.state::<remote_pty::RemotePtyManager>();
-                remote.fresh.lock().insert(id.to_string());
                 let _ = self.app.emit(
                     events::STATE,
                     &events::StateEvent {
@@ -233,35 +232,30 @@ fn report_workspace_tabs(
     captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
-    match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted {
-            seq,
-            removed_tab_ids,
-        } => {
-            // Captain-chat phase 2: the webview's normal tab-close lands here (not
-            // the socket close_tab), so a closed tab must be pruned from every
-            // captain's workspaceTabIds here too - else it lingers as a phantom
-            // controlled-workspace in the persistent captains.json. Forward a
-            // captains snapshot (webview + socket clients) when anything changed.
-            let mut pruned = false;
-            for tab_id in &removed_tab_ids {
-                match captains.prune_tab(tab_id) {
-                    Ok(changed) => pruned |= changed,
-                    Err(error) => {
-                        eprintln!("t-hub: Captain tab pruning failed for '{tab_id}': {error}")
-                    }
-                }
-            }
-            if pruned {
+    match control::apply_workspace_report(&registry, &captains, tabs, active_tab_id, base_seq) {
+        Ok((control::ReportOutcome::Accepted { seq, .. }, captains_changed, reconciled)) => {
+            if captains_changed {
                 commands::forward_captains_sync(&app, &captains, &fanout);
             }
-            serde_json::json!({ "seq": seq })
+            let snapshot = registry.snapshot_full();
+            serde_json::json!({
+                "seq": seq,
+                "stale": reconciled,
+                "activeTabId": reconciled.then_some(snapshot.active_tab_id).flatten(),
+                "tabs": reconciled.then_some(snapshot.tabs),
+            })
         }
-        control::ReportOutcome::Stale(snap) => serde_json::json!({
+        Ok((control::ReportOutcome::Stale(snap), _, _)) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
             "activeTabId": snap.active_tab_id,
             "tabs": snap.tabs,
+        }),
+        Err(error) => serde_json::json!({
+            "stale": true,
+            "seq": registry.snapshot_full().seq,
+            "tabs": registry.snapshot_full().tabs,
+            "error": error,
         }),
     }
 }
@@ -355,7 +349,7 @@ fn start_control_listener(
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz);
-    control::start_powder_reconciler(ctx.clone());
+    control::recover_pending_fleet_operations(&ctx);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -427,7 +421,23 @@ pub fn run() {
     // first touched — i.e. before the Tauri builder spawns anything.
     apply_devbuild_isolation();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Register this before every other plugin. A second packaged launch must hand
+    // focus to the existing cockpit instead of starting another control server and
+    // attaching a second set of PTY clients to the same tmux sessions.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        use tauri::Manager;
+
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         // Shell plugin: lets the frontend open URLs/paths in the OS default
         // browser (web-preview "Open externally"). Without it the JS open() is a
         // no-op. Paired with the `shell:allow-open` capability.
@@ -448,6 +458,7 @@ pub fn run() {
         // calls into this; gated by the `notification:*` capabilities + the
         // `plugins.notification` block in tauri.conf.json.
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(TerminalManager::default())
         // Server-split M2a: live remote-PTY connections (terminal tiles streamed
         // over the control socket) live here instead of the in-process
@@ -574,13 +585,17 @@ pub fn run() {
             // between the control listener (which reads it for list_tabs and updates
             // it on new_tab/move_tile/named placement) and the managed state the
             // `report_workspace_tabs` command writes the frontend's up-sync into.
-            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
-            app.manage(tab_registry.clone());
             // Captain-chat phase 2: the captains registry, loaded from its
-            // persistence file so claims survive app restarts (unlike tabs, whose
-            // layout the frontend re-seeds on boot).
+            // persistence file so claims and Fleet Workspace authority survive
+            // app restarts.
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Fleet Workspace identity is durable in the same registry as its
+            // Captain/Assignment owner. TabRegistry is only the live projection
+            // cache and is seeded before the listener or UI can call list_tabs.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
+            tab_registry.replace(captains_registry.workspace_projection());
+            app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
             // via that command, not the control socket, so without this a killed
@@ -782,20 +797,25 @@ pub fn run() {
             files::list_dir,
             files::read_text_file,
             files::write_text_file,
+            files::wsl_folder_dialog_initial_path,
+            files::wsl_folder_dialog_selection,
             // --- feat/git-panel ---
             // Git awareness for the Files panel: branch/worktree info + commit.
             git::git_info,
             git::git_commit,
             // WS-4: git worktrees as a first-class primitive (list/add/remove).
             git::git_worktree_list,
+            git::git_worktree_removal_preflight,
             git::git_worktree_add,
             git::git_worktree_remove,
             // ----------------------
             // feat/dev-runner: managed per-project dev server (Dev tab). Self-
             // contained (its own process-global registry; no .manage() needed).
             // Streams output on `devserver://<terminal_id>`.
+            devserver::discover_run_targets,
             devserver::start_dev_server,
             devserver::stop_dev_server,
+            devserver::dev_server_snapshot,
             // feat/preview: WSL2 preview-reachability helpers. `preview_host`
             // returns the Windows-reachable host to substitute for a WSL
             // `localhost`; `probe_tcp` reports whether a host:port accepts a

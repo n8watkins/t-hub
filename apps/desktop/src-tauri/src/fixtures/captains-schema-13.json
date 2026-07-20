@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 13,
+  "seq": 41,
+  "captains": [
+    {
+      "shipSlug": "aurora",
+      "assignmentId": "assignment:project-aurora:aurora",
+      "displayName": "Aurora",
+      "role": "captain",
+      "provider": "codex",
+      "providerSessionId": "00000000-0000-7000-8000-000000000013",
+      "terminalId": "tile-aurora-captain",
+      "projectId": "project-aurora",
+      "assignment": "Keep the Aurora worktree ready for review",
+      "harness": "codex",
+      "conversationId": "conversation-aurora-13",
+      "resumePoint": "checkpoint-aurora-13",
+      "workspaceTabIds": [],
+      "crew": [
+        {
+          "terminalId": "tile-aurora-worker",
+          "provider": "codex",
+          "providerSessionId": "00000000-0000-7000-8000-000000000014",
+          "conversationId": "conversation-aurora-worker-13",
+          "resumePoint": "worker-checkpoint-13",
+          "task": "Verify the registry migration boundary",
+          "harness": "codex",
+          "worktreePath": "/sanitized/worktrees/aurora-worker",
+          "branch": "migration/registry-fixtures",
+          "state": { "kind": "active" }
+        }
+      ],
+      "state": { "kind": "active" }
+    }
+  ],
+  "agentSessions": [],
+  "agentCheckpoints": [],
+  "agentEvents": [],
+  "projects": [
+    {
+      "projectId": "project-aurora",
+      "name": "Aurora",
+      "repoRoot": "/sanitized/workspaces/aurora",
+      "remoteUrl": "https://example.invalid/aurora.git",
+      "defaultBranch": "main",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000001000
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "captains-reserved",
+      "name": "Captain Workspace",
+      "kind": "captain",
+      "tileIds": []
+    }
+  ],
+  "pendingFleetOperations": [],
+  "retiredFleetTileIds": [],
+  "pendingDispatchClaims": [],
+  "pendingDispatchReleases": []
+}

@@ -34,7 +34,7 @@ export function reportWorkspaceTabs(
   return invoke(Commands.reportWorkspaceTabs, { tabs, activeTabId, baseSeq });
 }
 
-/** (Re)attach to a terminal; resolves to base64 scrollback to seed xterm. */
+/** (Re)attach to a terminal; the live tmux stream redraws its current screen. */
 export function attachTerminal(
   id: TerminalId,
   cols: number,
@@ -73,6 +73,16 @@ export function resizeTerminal(
   return invoke(Commands.resizeTerminal, { id, cols, rows });
 }
 
+/** True only for the expected IPC rejection when a local terminal view loses a
+ *  race with backend detach. Keep the terminal id in the match so an unrelated
+ *  command failure cannot be mistaken for this recoverable lifecycle edge. */
+export function isMissingLiveTerminalError(
+  error: unknown,
+  id: TerminalId,
+): boolean {
+  return String(error).includes(`no live terminal ${id}`);
+}
+
 export function closeTerminal(id: TerminalId): Promise<void> {
   return invoke(Commands.closeTerminal, { id });
 }
@@ -81,8 +91,34 @@ export function killTerminal(id: TerminalId): Promise<void> {
   return invoke(Commands.killTerminal, { id });
 }
 
+let inflightListTerminals: Promise<TerminalInfo[]> | null = null;
+
+function isBoundedTmuxTimeout(error: unknown): boolean {
+  return String(error).includes("command exceeded 10s timeout");
+}
+
+/**
+ * List the tmux-backed terminals without multiplying cold-start WSL probes.
+ *
+ * Canvas intentionally has both a mount seed and a metadata refresh path, and
+ * other surfaces may mount at the same time. Concurrent callers share one
+ * request. A bounded tmux timeout receives one fresh attempt after the first
+ * handler has returned; other errors remain visible without retry.
+ */
 export function listTerminals(): Promise<TerminalInfo[]> {
-  return invoke(Commands.listTerminals);
+  if (inflightListTerminals) return inflightListTerminals;
+  const request = (async () => {
+    try {
+      return await invoke<TerminalInfo[]>(Commands.listTerminals);
+    } catch (error) {
+      if (!isBoundedTmuxTimeout(error)) throw error;
+      return invoke<TerminalInfo[]>(Commands.listTerminals);
+    }
+  })().finally(() => {
+    if (inflightListTerminals === request) inflightListTerminals = null;
+  });
+  inflightListTerminals = request;
+  return request;
 }
 
 // ---------------------------------------------------------------------------

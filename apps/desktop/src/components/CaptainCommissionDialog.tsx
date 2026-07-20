@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ShipWheel, X } from "lucide-react";
 import {
-  bindProjectPowder,
   commissionCaptain,
   listProjects,
   registerProject,
   type RegisteredProject,
 } from "../ipc/projects";
+import {
+  gitInfo,
+  gitWorktreeList,
+  type GitInfo,
+  type WorktreeInfo,
+} from "../ipc/git";
+import { WslFolderPicker } from "./WslFolderPicker";
 
 interface CaptainCommissionDialogProps {
   open: boolean;
@@ -14,20 +20,25 @@ interface CaptainCommissionDialogProps {
   onCommissioned: () => void;
 }
 
-type ProjectMode = "registered" | "register";
+type ProjectMode = "saved" | "existing" | "new";
 
 export function CaptainCommissionDialog({
   open,
   onClose,
   onCommissioned,
 }: CaptainCommissionDialogProps) {
-  const [mode, setMode] = useState<ProjectMode>("registered");
+  const [mode, setMode] = useState<ProjectMode>("saved");
   const [projects, setProjects] = useState<RegisteredProject[]>([]);
+  const [wslHome, setWslHome] = useState("");
+  const [wslHomeError, setWslHomeError] = useState<string | null>(null);
+  const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
+  const [folderWorktrees, setFolderWorktrees] = useState<WorktreeInfo[]>([]);
+  const [initializeGit, setInitializeGit] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
-  const [powderRepository, setPowderRepository] = useState("");
-  const [connectionProfile, setConnectionProfile] = useState("production");
+  const [newParent, setNewParent] = useState("");
+  const [newName, setNewName] = useState("");
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -41,9 +52,13 @@ export function CaptainCommissionDialog({
       .then((catalog) => {
         if (cancelled) return;
         setProjects(catalog.projects);
+        setWslHome(catalog.wslHome ?? "");
+        setWslHomeError(catalog.wslHomeError ?? null);
+        setNewParent((current) => current || catalog.wslHome || "/home");
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
-        if (catalog.projects.length === 0) setMode("register");
+        setRepoRoot((current) => current || catalog.wslHome || first?.repoRoot || "/home");
+        if (catalog.projects.length === 0) setMode("existing");
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
@@ -59,10 +74,25 @@ export function CaptainCommissionDialog({
   );
 
   useEffect(() => {
-    if (!selected) return;
-    setPowderRepository(selected.powder?.repository ?? "");
-    setConnectionProfile(selected.powder?.connectionProfile ?? "production");
-  }, [selected]);
+    if (mode !== "existing" || !repoRoot) return;
+    let cancelled = false;
+    setFolderGit(null);
+    setFolderWorktrees([]);
+    setInitializeGit(false);
+    void gitInfo(repoRoot)
+      .then((info) => {
+        if (!cancelled) setFolderGit(info);
+      })
+      .catch(() => undefined);
+    void gitWorktreeList(repoRoot)
+      .then((worktrees) => {
+        if (!cancelled) setFolderWorktrees(worktrees);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, repoRoot]);
 
   if (!open) return null;
 
@@ -71,36 +101,47 @@ export function CaptainCommissionDialog({
       setError("Assignment is required.");
       return;
     }
-    if (!powderRepository.trim()) {
-      setError("Powder repository is required.");
-      return;
+    if (mode === "existing") {
+      if (folderGit === null) {
+        setError("Wait for Git inspection to finish before creating the Captain.");
+        return;
+      }
+      if (!folderGit.isRepo && !initializeGit) {
+        setError("Initialize Git explicitly or choose a folder that is already a Git repository.");
+        return;
+      }
+    }
+    let newCodebaseDestination: string | null = null;
+    if (mode === "new") {
+      try {
+        newCodebaseDestination = validateNewCodebaseDestination(newParent, newName);
+      } catch (validationError) {
+        setError(validationError instanceof Error ? validationError.message : String(validationError));
+        return;
+      }
     }
     setBusy(true);
     setError(null);
     try {
       let project: RegisteredProject;
-      if (mode === "register") {
-        if (!repoRoot.trim()) throw new Error("Repository path is required.");
+      if (mode === "existing") {
+        if (!repoRoot.trim()) throw new Error("WSL folder is required.");
+        if (!folderGit) throw new Error("Git inspection is incomplete.");
         project = await registerProject({
           repoRoot: repoRoot.trim(),
           name: projectName.trim() || undefined,
-          powderRepository: powderRepository.trim(),
-          powderConnectionProfile: connectionProfile.trim() || "default",
+          ...(folderGit.isRepo ? {} : { initializeGit: true }),
+        });
+      } else if (mode === "new") {
+        project = await registerProject({
+          repoRoot: newCodebaseDestination!,
+          name: newName.trim(),
+          createDirectory: true,
+          initializeGit: true,
         });
       } else {
-        if (!selected) throw new Error("Select a registered project.");
+        if (!selected) throw new Error("Select a saved codebase.");
         project = selected;
-        if (
-          !selected.powder ||
-          selected.powder.repository !== powderRepository.trim() ||
-          selected.powder.connectionProfile !== connectionProfile.trim()
-        ) {
-          project = await bindProjectPowder({
-            projectId: selected.projectId,
-            repository: powderRepository.trim(),
-            connectionProfile: connectionProfile.trim() || "default",
-          });
-        }
       }
       await commissionCaptain({
         projectId: project.projectId,
@@ -128,7 +169,7 @@ export function CaptainCommissionDialog({
       <div
         role="dialog"
         aria-modal="true"
-        aria-labelledby="commission-captain-title"
+        aria-labelledby="create-captain-title"
         className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-lg border shadow-2xl"
         style={{ background: "var(--th-tile-bg)", borderColor: "var(--th-border)" }}
         onPointerDown={(event) => event.stopPropagation()}
@@ -138,8 +179,11 @@ export function CaptainCommissionDialog({
           style={{ borderColor: "var(--th-border)" }}
         >
           <ShipWheel size={18} aria-hidden="true" />
-          <h2 id="commission-captain-title" className="min-w-0 flex-1 text-sm font-semibold">
-            Commission Captain
+          <h2
+            id="create-captain-title"
+            className="min-w-0 flex-1 text-sm font-semibold"
+          >
+            Create Captain
           </h2>
           <button
             type="button"
@@ -154,13 +198,16 @@ export function CaptainCommissionDialog({
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
           <div
-            className="grid grid-cols-2 rounded border p-0.5"
+            role="group"
+            aria-label="Codebase source"
+            className="grid grid-cols-3 rounded border p-0.5"
             style={{ borderColor: "var(--th-border)" }}
           >
-            {(["registered", "register"] as const).map((value) => (
+            {(["saved", "existing", "new"] as const).map((value) => (
               <button
                 key={value}
                 type="button"
+                aria-pressed={mode === value}
                 className="h-8 rounded text-xs font-medium"
                 style={{
                   background: mode === value ? "var(--th-accent)" : "transparent",
@@ -174,21 +221,25 @@ export function CaptainCommissionDialog({
                   setError(null);
                 }}
               >
-                {value === "registered" ? "Registered project" : "Register repository"}
+                {value === "saved"
+                  ? "Use saved codebase"
+                  : value === "existing"
+                    ? "Choose existing WSL folder"
+                    : "Create new codebase"}
               </button>
             ))}
           </div>
 
-          {mode === "registered" ? (
-            <Field label="Project">
+          {mode === "saved" ? (
+            <Field label="Saved codebase">
               <select
-                aria-label="Project"
+                aria-label="Saved codebase"
                 value={projectId}
                 onChange={(event) => setProjectId(event.target.value)}
                 className={inputClass}
                 style={fieldStyle}
               >
-                <option value="">Select project</option>
+                <option value="">Select codebase</option>
                 {projects.map((project) => (
                   <option key={project.projectId} value={project.projectId}>
                     {project.name}
@@ -196,51 +247,93 @@ export function CaptainCommissionDialog({
                 ))}
               </select>
             </Field>
-          ) : (
+          ) : mode === "existing" ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Field label="Repository path" wide>
-                <input
-                  aria-label="Repository path"
-                  value={repoRoot}
-                  onChange={(event) => setRepoRoot(event.target.value)}
-                  className={inputClass}
-                  style={fieldStyle}
-                  placeholder="/home/user/project"
+              <Field label="WSL folder" wide>
+                <WslFolderPicker
+                  path={repoRoot}
+                  home={wslHome || undefined}
+                  recentPaths={[...projects]
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((project) => ({
+                      label: project.name,
+                      path: project.repoRoot,
+                    }))}
+                  onPathChange={setRepoRoot}
                 />
+                {wslHomeError && (
+                  <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
+                )}
               </Field>
-              <Field label="Project name">
+              <Field label="Codebase name">
                 <input
-                  aria-label="Project name"
+                  aria-label="Codebase name"
                   value={projectName}
                   onChange={(event) => setProjectName(event.target.value)}
                   className={inputClass}
                   style={fieldStyle}
-                  placeholder="Derived from repository"
+                  placeholder="Derived from folder"
                 />
               </Field>
             </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Parent WSL folder" wide>
+                <WslFolderPicker
+                  path={newParent}
+                  home={wslHome || undefined}
+                  recentPaths={[...projects]
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((project) => ({
+                      label: project.name,
+                      path: project.repoRoot,
+                    }))}
+                  onPathChange={setNewParent}
+                />
+              </Field>
+              <Field label="Codebase name">
+                <input
+                  aria-label="New codebase name"
+                  value={newName}
+                  onChange={(event) => setNewName(event.target.value)}
+                  className={inputClass}
+                  style={fieldStyle}
+                  placeholder="my-project"
+                />
+              </Field>
+              <Field label="Destination">
+                <output className="block min-h-9 break-all rounded border px-2 py-2 font-mono text-xs" style={fieldStyle}>
+                  {previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name"}
+                </output>
+              </Field>
+              <div className="rounded border border-blue-400/30 bg-blue-400/10 px-3 py-2 text-xs sm:col-span-2">
+                <span className="block font-medium">Starting point: Empty Git repository</span>
+                <span style={{ color: "var(--th-fg-muted)" }}>
+                  Template and clone starting points will be added later.
+                </span>
+              </div>
+            </div>
           )}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field label="Powder repository">
+          {mode === "existing" && folderGit && !folderGit.isRepo && (
+            <label
+              className="flex items-start gap-2 rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs"
+            >
               <input
-                aria-label="Powder repository"
-                value={powderRepository}
-                onChange={(event) => setPowderRepository(event.target.value)}
-                className={inputClass}
-                style={fieldStyle}
+                type="checkbox"
+                aria-label="Initialize Git repository"
+                checked={initializeGit}
+                onChange={(event) => setInitializeGit(event.target.checked)}
+                className="mt-0.5"
               />
-            </Field>
-            <Field label="Connection profile">
-              <input
-                aria-label="Connection profile"
-                value={connectionProfile}
-                onChange={(event) => setConnectionProfile(event.target.value)}
-                className={inputClass}
-                style={fieldStyle}
-              />
-            </Field>
-          </div>
+              <span>
+                <span className="block font-medium">Initialize Git repository</span>
+                <span style={{ color: "var(--th-fg-muted)" }}>
+                  Creates only a .git directory in this existing folder and uses main as the default branch.
+                </span>
+              </span>
+            </label>
+          )}
 
           <Field label="Assignment">
             <textarea
@@ -261,6 +354,7 @@ export function CaptainCommissionDialog({
                 <button
                   key={value}
                   type="button"
+                  aria-pressed={harness === value}
                   className="h-8 rounded text-xs font-medium capitalize"
                   style={{
                     background: harness === value ? "var(--th-accent)" : "transparent",
@@ -276,6 +370,19 @@ export function CaptainCommissionDialog({
               ))}
             </div>
           </Field>
+
+          <ReviewSummary
+            mode={mode}
+            selected={selected}
+            repoRoot={repoRoot}
+            assignment={assignment}
+            harness={harness}
+            folderGit={folderGit}
+            folderWorktrees={folderWorktrees}
+            initializeGit={initializeGit}
+            newParent={newParent}
+            newName={newName}
+          />
 
           {error && (
             <div role="alert" className="rounded border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-300">
@@ -301,11 +408,138 @@ export function CaptainCommissionDialog({
             onClick={() => void submit()}
             disabled={busy}
           >
-            {busy ? "Commissioning..." : "Commission Captain"}
+            {busy ? "Creating..." : "Create Captain"}
           </button>
         </footer>
       </div>
     </div>
+  );
+}
+
+function previewNewCodebaseDestination(parent: string, name: string): string {
+  const base = parent.trim().replace(/\/+$/, "");
+  const leaf = name.trim();
+  return base && leaf ? `${base}/${leaf}` : "";
+}
+
+function validateNewCodebaseDestination(parent: string, name: string): string {
+  const base = parent.trim().replace(/\/+$/, "");
+  const leaf = name.trim();
+  if (!base.startsWith("/") || base.startsWith("//") || base.includes("\\")) {
+    throw new Error("Parent must be an absolute WSL path.");
+  }
+  if (!leaf) throw new Error("Codebase name is required.");
+  if (leaf === "." || leaf === ".." || /[\\/\u0000-\u001f\u007f]/.test(leaf)) {
+    throw new Error("Codebase name must be one safe folder name.");
+  }
+  return `${base}/${leaf}`;
+}
+
+function ReviewSummary({
+  mode,
+  selected,
+  repoRoot,
+  assignment,
+  harness,
+  folderGit,
+  folderWorktrees,
+  initializeGit,
+  newParent,
+  newName,
+}: {
+  mode: ProjectMode;
+  selected?: RegisteredProject;
+  repoRoot: string;
+  assignment: string;
+  harness: "codex" | "claude";
+  folderGit: GitInfo | null;
+  folderWorktrees: WorktreeInfo[];
+  initializeGit: boolean;
+  newParent: string;
+  newName: string;
+}) {
+  const source =
+    mode === "saved"
+      ? "Saved codebase"
+      : mode === "existing"
+        ? "Existing WSL codebase"
+        : "New empty codebase";
+  const location =
+    mode === "saved"
+      ? selected
+        ? `${selected.name} · ${selected.repoRoot}`
+        : "Select a codebase"
+      : mode === "existing"
+        ? repoRoot.trim() || "Choose a WSL folder"
+        : previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name";
+
+  return (
+    <section
+      aria-labelledby="captain-preflight-title"
+      className="rounded border p-3"
+      style={{ borderColor: "var(--th-border)", background: "var(--th-app-bg)" }}
+    >
+      <h3 id="captain-preflight-title" className="text-xs font-semibold">
+        Review before creating
+      </h3>
+      <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        <ReviewRow label="Source" value={source} />
+        <ReviewRow label="Codebase" value={location} />
+        {mode === "existing" && folderGit && (
+          <>
+            <ReviewRow
+              label="Git"
+              value={
+                folderGit.isRepo
+                  ? `${folderGit.branch ?? "Detached HEAD"} · ${folderGit.dirtyCount ? `${folderGit.dirtyCount} changed` : "clean"} · ${folderGit.isLinkedWorktree ? "linked worktree" : "main worktree"}`
+                  : initializeGit
+                    ? "Initialize with main as the default branch"
+                    : "Not a Git repository - initialization not authorized"
+              }
+            />
+            {folderGit.isRepo && (
+              <>
+                <ReviewRow
+                  label="Remote"
+                  value={folderGit.remoteUrl || "No origin remote"}
+                />
+                <ReviewRow
+                  label="Default branch"
+                  value={folderGit.defaultBranch || "Not advertised by origin"}
+                />
+                <ReviewRow
+                  label="HEAD"
+                  value={folderGit.headCommit?.slice(0, 12) || "Unknown"}
+                />
+                <ReviewRow
+                  label="Worktrees"
+                  value={`${folderWorktrees.length || 1} detected`}
+                />
+              </>
+            )}
+          </>
+        )}
+        {mode === "new" && (
+          <>
+            <ReviewRow label="Git" value="Initialize with main as the default branch" />
+            <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
+            <ReviewRow label="External effects" value="No remote service calls" />
+          </>
+        )}
+        <ReviewRow label="Assignment" value={assignment.trim() || "Required"} />
+        <ReviewRow label="Harness" value={harness === "codex" ? "Codex" : "Claude"} />
+        <ReviewRow label="Permissions" value="Unrestricted" />
+      </dl>
+    </section>
+  );
+}
+
+function ReviewRow({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt style={{ color: "var(--th-fg-muted)" }}>{label}</dt>
+      <dd className="min-w-0 break-words">{value}</dd>
+    </>
   );
 }
 

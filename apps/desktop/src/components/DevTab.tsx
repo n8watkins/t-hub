@@ -1,387 +1,463 @@
-// DevTab — the per-project "Dev" view: a managed `npm run dev` runner.
+// Managed-runner portion of the per-project Run and Preview surface.
 //
-// OWNED by the Dev-runner agent (feat/dev-runner). The per-tile panel mounts
-// <DevTab terminalId cwd/> and must not edit this file; keep these props stable.
-//
-// What it does:
-//   - Runs the project's dev server, scoped to `cwd`, as a managed child process
-//     in the backend (WSL on Windows, directly on unix). The command is editable
-//     and defaults to the detected package manager (`pnpm dev` when a
-//     pnpm-lock.yaml exists in cwd, else `npm run dev`).
-//   - Streams the server's combined stdout+stderr into a scrolling output pane.
-//   - Sniffs each line for the localhost URL the server prints
-//     (`http://localhost:PORT` / `http://127.0.0.1:PORT`) and publishes it via
-//     `usePanels.getState().setDevUrl(terminalId, url)` so the Preview tab loads
-//     it automatically.
-//   - Run/Stop button + a status row (idle / running / exited + detected URL).
-//
-// State is kept PER terminalId in a module-level store (below) so switching tabs
-// or remounting the tile doesn't lose the log / running state, and so the backend
-// process (which outlives a remount) stays in sync with what we render.
+// The backend discovers and validates typed package-script or static-site
+// targets, constructs executable arguments or a confined loopback server, and
+// owns lifecycle state. This component never accepts or sends shell text.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePanels } from "../store/panels";
 import {
+  devServerSnapshot,
+  discoverRunTargets,
   onDevServerEvent,
   startDevServer,
   stopDevServer,
   type DevServerEvent,
+  type DevServerSnapshot,
+  type RunTarget,
+  type RunTargetDiscovery,
+  type RunnerState,
 } from "../ipc/devserver";
-import { listDir } from "../ipc/files";
 import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
 
 export interface DevTabProps {
-  /** The project/terminal this dev runner belongs to. */
   terminalId: TerminalId;
-  /** The project's working directory (where the dev server runs). */
   cwd: string;
 }
 
-/** Lifecycle status of the managed dev server for a tile. */
-type RunStatus = "idle" | "running" | "exited";
-
-/** How many output lines we retain per tile (a rolling window so a chatty dev
- *  server can't grow the log unbounded). */
 const MAX_LINES = 2000;
+const BUTTON_STYLE = {
+  borderRadius: "var(--th-radius)",
+  border: "1px solid var(--th-border)",
+  background: "var(--th-tile-bg)",
+  color: "var(--th-fg)",
+} as const;
+const ACCENT_BUTTON_STYLE = {
+  ...BUTTON_STYLE,
+  background: "var(--th-accent, var(--th-tile-bg))",
+  color: "var(--th-accent-fg, var(--th-fg))",
+} as const;
 
-/**
- * Detect the localhost URL a dev server prints. Matches `http://localhost:PORT`
- * and `http://127.0.0.1:PORT` (the two forms the task calls out), with an
- * optional path. Vite/Next/CRA all print one of these in their startup banner.
- * Returns the first match in `line`, or null.
- */
 function detectUrl(line: string): string | null {
-  // Strip ANSI first — dev servers colorize their startup banner, so the raw
-  // line carries escape codes that would otherwise be captured into the URL.
-  const m = stripAnsi(line).match(
+  const match = stripAnsi(line).match(
     /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/[^\s)]*)?/i,
   );
-  return m ? m[0] : null;
+  return match ? match[0] : null;
 }
 
-// ---------------------------------------------------------------------------
-// Per-terminal state store.
-//
-// The backend dev-server process is keyed by terminalId and survives a DevTab
-// unmount (e.g. switching to the Terminal tab and back). So the UI state that
-// must track it — the log buffer, the run status, the editable command, the
-// detected URL — also lives OUTSIDE the component, in this module-level map. The
-// component subscribes to its slice and re-renders on change. This mirrors the
-// "process outlives the view" model the rest of T-Hub uses (tmux sessions).
-// ---------------------------------------------------------------------------
+type DiscoveryState = "loading" | RunTargetDiscovery["state"];
 
 interface DevState {
-  status: RunStatus;
-  /** Rolling output log (newest appended; capped at MAX_LINES). */
+  snapshot: DevServerSnapshot;
   lines: string[];
-  /** The detected dev-server URL, mirrored into usePanels for the Preview tab. */
   url: string | null;
-  /** The editable command. `undefined` until we've resolved the default. */
-  command: string | undefined;
-  /** Whether we're currently subscribed to this terminal's backend channel. */
+  targets: RunTarget[];
+  discoveryState: DiscoveryState;
+  discoveryMessage: string | null;
+  selectedTargetId: string | null;
   subscribed: boolean;
 }
 
-function freshState(): DevState {
+function idleSnapshot(terminalId: TerminalId): DevServerSnapshot {
   return {
-    status: "idle",
+    terminalId,
+    runId: null,
+    revision: 0,
+    state: "idle",
+    target: null,
+    exitCode: null,
+    reason: null,
+    previewUrl: null,
+    observedAt: 0,
+  };
+}
+
+function freshState(terminalId: TerminalId): DevState {
+  return {
+    snapshot: idleSnapshot(terminalId),
     lines: [],
     url: null,
-    command: undefined,
+    targets: [],
+    discoveryState: "loading",
+    discoveryMessage: null,
+    selectedTargetId: null,
     subscribed: false,
   };
 }
 
 const states = new Map<TerminalId, DevState>();
-/** Per-terminal subscriber callbacks (the mounted DevTab's re-render trigger). */
 const listeners = new Map<TerminalId, Set<() => void>>();
-/** Per-terminal backend dev-server unlisten handle. The subscription is attached
- *  once per terminal (see the effect below) and deliberately NOT torn down on a
- *  DevTab unmount (the process outlives the view). Stored here so the real
- *  teardown — `forgetDevState`, called when the tile is gone for good — can
- *  detach it and stop the channel leaking for the app's lifetime. */
 const unlisteners = new Map<TerminalId, () => void>();
 
 function getState(id: TerminalId): DevState {
-  let s = states.get(id);
-  if (!s) {
-    s = freshState();
-    states.set(id, s);
+  let state = states.get(id);
+  if (!state) {
+    state = freshState(id);
+    states.set(id, state);
   }
-  return s;
+  return state;
 }
 
-/** Mutate a terminal's state and notify its subscribers to re-render. */
 function update(id: TerminalId, patch: Partial<DevState>): void {
-  const next = { ...getState(id), ...patch };
-  states.set(id, next);
-  const subs = listeners.get(id);
-  if (subs) for (const cb of [...subs]) cb();
+  states.set(id, { ...getState(id), ...patch });
+  const subscribers = listeners.get(id);
+  if (subscribers) {
+    for (const callback of [...subscribers]) callback();
+  }
 }
 
 function appendLine(id: TerminalId, line: string): void {
-  const s = getState(id);
-  const lines = s.lines.length >= MAX_LINES ? s.lines.slice(-(MAX_LINES - 1)) : s.lines.slice();
+  const current = getState(id).lines;
+  const lines =
+    current.length >= MAX_LINES
+      ? current.slice(-(MAX_LINES - 1))
+      : current.slice();
   lines.push(line);
   update(id, { lines });
 }
 
-function subscribe(id: TerminalId, cb: () => void): () => void {
-  let subs = listeners.get(id);
-  if (!subs) {
-    subs = new Set();
-    listeners.set(id, subs);
+function subscribe(id: TerminalId, callback: () => void): () => void {
+  let subscribers = listeners.get(id);
+  if (!subscribers) {
+    subscribers = new Set();
+    listeners.set(id, subscribers);
   }
-  subs.add(cb);
-  return () => {
-    subs?.delete(cb);
-  };
+  subscribers.add(callback);
+  return () => subscribers?.delete(callback);
 }
 
-/**
- * Real teardown for a terminal's dev-server bookkeeping, called when its tile is
- * gone for good (close / detach / close-tab — via workspace.ts
- * `cleanupTileSideState`). The backend process is stopped separately on that same
- * path (`stopDevServer`); here we drop the FRONTEND state that the
- * "process outlives the view" model otherwise keeps forever:
- *   - detach this terminal's live backend event listener (the subscription is
- *     attached once and intentionally NOT removed on unmount), and
- *   - delete its `states` / `listeners` / `unlisteners` map entries so none of
- *     these module-level maps grow once per spawned terminal.
- * Idempotent and safe to call for a terminal that never opened its Dev tab.
- */
 export function forgetDevState(id: TerminalId): void {
-  const un = unlisteners.get(id);
-  if (un) {
+  const unlisten = unlisteners.get(id);
+  if (unlisten) {
     try {
-      un();
+      unlisten();
     } catch {
-      /* listener already gone / no Tauri runtime — nothing to detach */
+      // The runtime may already have removed the listener.
     }
-    unlisteners.delete(id);
   }
+  unlisteners.delete(id);
   states.delete(id);
   listeners.delete(id);
 }
 
-// ---------------------------------------------------------------------------
-// Default-command detection: prefer pnpm when a pnpm-lock.yaml is present in the
-// project's cwd, else fall back to npm. Resolved once per terminal (cached on the
-// state's `command` field, which the user can then freely edit).
-// ---------------------------------------------------------------------------
+function chooseTarget(
+  targets: RunTarget[],
+  snapshot: DevServerSnapshot,
+  previous: string | null,
+): string | null {
+  const candidates = [
+    snapshot.target?.id,
+    previous,
+    targets.find((target) => target.recommended)?.id,
+    targets[0]?.id,
+  ];
+  return (
+    candidates.find(
+      (candidate): candidate is string =>
+        Boolean(candidate) && targets.some((target) => target.id === candidate),
+    ) ?? null
+  );
+}
 
-async function resolveDefaultCommand(cwd: string): Promise<string> {
-  if (!cwd) return "npm run dev";
-  try {
-    const entries = await listDir(cwd);
-    const hasPnpm = entries.some((e) => e.name === "pnpm-lock.yaml");
-    return hasPnpm ? "pnpm dev" : "npm run dev";
-  } catch {
-    // Listing failed (e.g. cwd not yet reachable) — a safe default the user can
-    // edit. We don't block the UI on this.
-    return "npm run dev";
+function applySnapshot(id: TerminalId, snapshot: DevServerSnapshot): void {
+  const current = getState(id).snapshot;
+  if (snapshot.revision < current.revision) return;
+  const url = snapshot.state === "running" ? snapshot.previewUrl : null;
+  update(id, {
+    snapshot,
+    ...(url ? { url } : snapshot.state !== "running" ? { url: null } : {}),
+  });
+  if (url) {
+    usePanels.getState().setDevUrl(id, url);
+  } else if (snapshot.state !== "running") {
+    usePanels.getState().setDevUrl(id, null);
   }
 }
 
-// ---------------------------------------------------------------------------
-// The component.
-// ---------------------------------------------------------------------------
+function handleEvent(id: TerminalId, event: DevServerEvent): void {
+  const current = getState(id);
+  if (
+    event.kind === "started" &&
+    current.snapshot.state === "starting" &&
+    current.snapshot.runId === null &&
+    event.revision > current.snapshot.revision
+  ) {
+    update(id, {
+      snapshot: {
+        ...current.snapshot,
+        runId: event.runId,
+        revision: event.revision,
+        state: "running",
+      },
+    });
+    return;
+  }
+  if (event.runId !== current.snapshot.runId) return;
+  if (event.revision <= current.snapshot.revision) return;
+
+  if (event.kind === "line") {
+    update(id, {
+      snapshot: { ...current.snapshot, revision: event.revision },
+    });
+    appendLine(id, event.line);
+    const found = detectUrl(event.line);
+    if (found && found !== getState(id).url) {
+      update(id, { url: found });
+      usePanels.getState().setDevUrl(id, found);
+    }
+    return;
+  }
+
+  if (event.kind === "exited") {
+    if (event.line) appendLine(id, `[t-hub] ${event.line}`);
+    void devServerSnapshot(id).then((snapshot) => applySnapshot(id, snapshot));
+  }
+}
 
 export function DevTab({ terminalId, cwd }: DevTabProps) {
-  // Force re-render when this terminal's slice changes.
-  const [, force] = useState(0);
+  const [, forceRender] = useState(0);
+  const [discoveryNonce, setDiscoveryNonce] = useState(0);
+  const logRef = useRef<HTMLDivElement>(null);
+
   useEffect(
-    () => subscribe(terminalId, () => force((n) => n + 1)),
+    () => subscribe(terminalId, () => forceRender((value) => value + 1)),
     [terminalId],
   );
 
   const state = getState(terminalId);
-  const { status, lines, url, command } = state;
+  const { snapshot, lines, url } = state;
 
-  // The editable command field. Mirrors `state.command` but is a controlled
-  // input; we seed it from the resolved default the first time.
-  const [draft, setDraft] = useState<string>(command ?? "");
-  const logRef = useRef<HTMLDivElement>(null);
-
-  // Resolve the default command once per terminal (when not yet set). We don't
-  // overwrite a command the user already edited.
   useEffect(() => {
-    if (state.command !== undefined) {
-      // Keep the local draft in sync if the stored command changed elsewhere.
-      setDraft(state.command);
-      return;
-    }
-    let cancelled = false;
-    void resolveDefaultCommand(cwd).then((def) => {
-      if (cancelled) return;
-      // Don't clobber a value the user typed while we were resolving.
-      if (getState(terminalId).command === undefined) {
-        update(terminalId, { command: def });
-        setDraft(def);
-      }
+    if (getState(terminalId).subscribed) return;
+    update(terminalId, { subscribed: true });
+    let disposed = false;
+    void onDevServerEvent(terminalId, (event) =>
+      handleEvent(terminalId, event),
+    ).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        update(terminalId, { subscribed: false });
+      } else unlisteners.set(terminalId, unlisten);
     });
+    return () => {
+      disposed = true;
+    };
+  }, [terminalId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    update(terminalId, {
+      discoveryState: "loading",
+      discoveryMessage: null,
+    });
+    void Promise.all([
+      discoverRunTargets(cwd),
+      devServerSnapshot(terminalId),
+    ])
+      .then(([discovery, authoritative]) => {
+        if (cancelled) return;
+        const current = getState(terminalId);
+        const authoritativeUrl =
+          authoritative.state === "running" ? authoritative.previewUrl : null;
+        update(terminalId, {
+          snapshot: authoritative,
+          ...(authoritativeUrl
+            ? { url: authoritativeUrl }
+            : authoritative.state !== "running"
+              ? { url: null }
+              : {}),
+          targets: discovery.targets,
+          discoveryState: discovery.state,
+          discoveryMessage: discovery.message,
+          selectedTargetId: chooseTarget(
+            discovery.targets,
+            authoritative,
+            current.selectedTargetId,
+          ),
+        });
+        if (authoritativeUrl) {
+          usePanels.getState().setDevUrl(terminalId, authoritativeUrl);
+        } else if (authoritative.state !== "running") {
+          usePanels.getState().setDevUrl(terminalId, null);
+        }
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        update(terminalId, {
+          discoveryState: "unreadable",
+          discoveryMessage: String(error),
+          targets: [],
+          selectedTargetId: null,
+        });
+      });
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId, cwd]);
+  }, [terminalId, cwd, discoveryNonce]);
 
-  // Subscribe to the backend dev-server channel for this terminal. We attach the
-  // listener ONCE per terminal id (tracked on the state's `subscribed` flag) so a
-  // remount doesn't double-subscribe; the listener lives for the app session,
-  // which is fine since there's exactly one Dev tab per terminal.
   useEffect(() => {
-    if (state.subscribed) return;
-    update(terminalId, { subscribed: true });
-    let disposed = false;
-    void onDevServerEvent(terminalId, (e: DevServerEvent) => {
-      handleEvent(terminalId, e);
-    }).then((un) => {
-      if (disposed) {
-        un();
-      } else {
-        // Stash the live unlisten at module level so the real teardown
-        // (forgetDevState, on tile close) can detach it — the component unmount
-        // below deliberately keeps it attached.
-        unlisteners.set(terminalId, un);
-      }
-    });
-    return () => {
-      // We intentionally do NOT unsubscribe on unmount: the process outlives the
-      // view, and re-subscribing on every tab switch would risk missing lines in
-      // the gap. The listener is torn down only if the tile is truly gone, which
-      // the workspace close path handles via forgetDevState; here we just stop the
-      // pending attach if it hasn't resolved yet.
-      disposed = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId]);
-
-  // Auto-scroll the log to the bottom as lines arrive (only if already near the
-  // bottom, so a user scrolled up to read history isn't yanked back down).
-  useEffect(() => {
-    const el = logRef.current;
-    if (!el) return;
+    const element = logRef.current;
+    if (!element) return;
     const nearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+      element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    if (nearBottom) element.scrollTop = element.scrollHeight;
   }, [lines]);
 
-  const onRun = useCallback(() => {
-    const cmd = (draft || command || "npm run dev").trim();
-    if (!cmd) return;
-    // Persist the command + reset the log for a fresh run; flip to running
-    // optimistically (the backend also emits a "started" event).
+  const selectedTarget = state.targets.find(
+    (target) => target.id === state.selectedTargetId,
+  );
+  const busy = ["starting", "running", "stopping"].includes(snapshot.state);
+
+  const onRun = () => {
+    const current = getState(terminalId);
+    const target = current.targets.find(
+      (candidate) => candidate.id === current.selectedTargetId,
+    );
+    if (!target) return;
     update(terminalId, {
-      command: cmd,
-      status: "running",
+      snapshot: {
+        ...current.snapshot,
+        runId: null,
+        state: "starting",
+        target,
+        reason: null,
+        exitCode: null,
+      },
       lines: [],
       url: null,
     });
-    // Clear any stale detected URL for the Preview tab until the new run prints one.
     usePanels.getState().setDevUrl(terminalId, null);
-    void startDevServer(terminalId, cwd, cmd).catch((err) => {
-      appendLine(terminalId, `[t-hub] failed to start: ${String(err)}`);
-      update(terminalId, { status: "exited" });
-    });
-  }, [draft, command, terminalId, cwd]);
+    const targetRef =
+      target.kind === "packageScript"
+        ? { kind: target.kind, script: target.script }
+        : { kind: target.kind, id: target.id };
+    void startDevServer(terminalId, cwd, targetRef)
+      .then((authoritative) => applySnapshot(terminalId, authoritative))
+      .catch((error) => {
+        appendLine(terminalId, `[t-hub] failed to start: ${String(error)}`);
+        void devServerSnapshot(terminalId)
+          .then((authoritative) => applySnapshot(terminalId, authoritative))
+          .catch(() => {
+            const failed = getState(terminalId).snapshot;
+            update(terminalId, {
+              snapshot: {
+                ...failed,
+                state: "failed",
+                reason: String(error),
+              },
+            });
+          });
+      });
+  };
 
-  const onStop = useCallback(() => {
-    void stopDevServer(terminalId).catch(() => {
-      /* idempotent on the backend; nothing to surface */
+  const onStop = () => {
+    const current = getState(terminalId).snapshot;
+    if (!current.runId) return;
+    update(terminalId, {
+      snapshot: { ...current, state: "stopping" },
     });
-    update(terminalId, { status: "idle" });
-    // Clear the published URL: the server is gone, so Preview must stop loading
-    // it and the tile's busy-gate (devUrl present => "looks busy") must release.
-    usePanels.getState().setDevUrl(terminalId, null);
-  }, [terminalId]);
-
-  const running = status === "running";
+    void stopDevServer(terminalId, current.runId)
+      .then((authoritative) => applySnapshot(terminalId, authoritative))
+      .catch((error) => {
+        appendLine(terminalId, `[t-hub] failed to stop: ${String(error)}`);
+        void devServerSnapshot(terminalId).then((authoritative) =>
+          applySnapshot(terminalId, authoritative),
+        );
+      });
+  };
 
   return (
     <div
       className="flex h-full min-h-0 flex-col"
       style={{ color: "var(--th-fg)" }}
     >
-      {/* Control row: command field + Run/Stop. */}
       <div
         className="flex shrink-0 items-center gap-2 border-b px-3 py-2"
         style={{ borderColor: "var(--th-border)" }}
       >
-        <input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !running) onRun();
-          }}
-          placeholder="npm run dev"
-          spellCheck={false}
-          autoCorrect="off"
-          autoCapitalize="off"
-          autoComplete="off"
-          disabled={running}
-          className="min-w-0 flex-1 px-2.5 py-1.5 font-mono text-sm focus:outline-none disabled:opacity-60"
+        <select
+          aria-label="Run target"
+          value={state.selectedTargetId ?? ""}
+          onChange={(event) =>
+            update(terminalId, { selectedTargetId: event.target.value || null })
+          }
+          disabled={state.discoveryState !== "ready" || busy || state.targets.length === 0}
+          className="min-w-0 flex-1 px-2.5 py-1.5 font-mono text-sm disabled:opacity-60"
           style={{
             borderRadius: "var(--th-radius)",
             border: "1px solid var(--th-border)",
             background: "var(--th-tile-bg)",
             color: "var(--th-fg)",
           }}
-          onFocus={(e) => {
-            e.currentTarget.style.borderColor = "var(--th-focus-ring)";
-          }}
-          onBlur={(e) => {
-            e.currentTarget.style.borderColor = "var(--th-border)";
-          }}
-          title="The dev-server command to run in this project"
-        />
-        {running ? (
+        >
+          {state.discoveryState === "loading" ? (
+            <option value="">Loading run targets...</option>
+          ) : state.targets.length === 0 ? (
+            <option value="">No run targets found</option>
+          ) : (
+            state.targets.map((target) => (
+              <option key={target.id} value={target.id}>
+                {target.label} - {target.commandDisplay}
+              </option>
+            ))
+          )}
+        </select>
+        {busy ? (
           <button
             type="button"
             onClick={onStop}
-            className="shrink-0 px-3 py-1.5 text-sm font-medium"
-            style={{
-              borderRadius: "var(--th-radius)",
-              border: "1px solid var(--th-border)",
-              background: "var(--th-tile-bg)",
-              color: "var(--th-fg)",
-            }}
-            title="Stop the dev server"
+            disabled={!snapshot.runId || snapshot.state === "stopping"}
+            className="shrink-0 px-3 py-1.5 text-sm font-medium disabled:opacity-60"
+            style={BUTTON_STYLE}
+            title="Stop the active run"
           >
-            Stop
+            {snapshot.state === "stopping" ? "Stopping..." : "Stop"}
           </button>
         ) : (
           <button
             type="button"
             onClick={onRun}
-            className="shrink-0 px-3 py-1.5 text-sm font-medium"
-            style={{
-              borderRadius: "var(--th-radius)",
-              border: "1px solid var(--th-border)",
-              background: "var(--th-accent, var(--th-tile-bg))",
-              color: "var(--th-accent-fg, var(--th-fg))",
-            }}
-            title="Run the dev server"
+            disabled={!selectedTarget}
+            className="shrink-0 px-3 py-1.5 text-sm font-medium disabled:opacity-60"
+            style={ACCENT_BUTTON_STYLE}
+            title="Run the selected target"
           >
             Run
           </button>
         )}
       </div>
 
-      {/* Status row: lifecycle + the detected URL (click to force-feed Preview). */}
+      {state.discoveryState !== "loading" &&
+      state.discoveryState !== "ready" ? (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center justify-between gap-3 border-b px-3 py-2 text-xs"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-error)" }}
+        >
+          <span>{state.discoveryMessage ?? "Run targets are unavailable."}</span>
+          <button
+            type="button"
+            onClick={() => setDiscoveryNonce((value) => value + 1)}
+            className="shrink-0 underline"
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+
       <div
         className="flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
         style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
       >
-        <StatusDot status={status} />
-        <span>
-          {status === "running"
-            ? "running"
-            : status === "exited"
-              ? "exited"
-              : "idle"}
-        </span>
+        <StatusDot status={snapshot.state} />
+        <span>{snapshot.state}</span>
+        {selectedTarget ? (
+          <>
+            <span aria-hidden>·</span>
+            <code>{selectedTarget.commandDisplay}</code>
+          </>
+        ) : null}
         {url ? (
           <>
             <span aria-hidden>·</span>
@@ -390,20 +466,24 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
               onClick={() => usePanels.getState().setDevUrl(terminalId, url)}
               className="min-w-0 truncate font-mono hover:underline"
               style={{ color: "var(--th-fg)" }}
-              title={`Detected ${url} — feeding it to Preview`}
+              title={`Detected ${url}`}
             >
               {url}
             </button>
           </>
-        ) : running ? (
+        ) : snapshot.state === "running" ? (
           <>
             <span aria-hidden>·</span>
-            <span>waiting for a localhost URL…</span>
+            <span>waiting for a localhost URL...</span>
           </>
+        ) : null}
+        {snapshot.reason ? (
+          <span role="status" className="min-w-0 truncate" title={snapshot.reason}>
+            {snapshot.reason}
+          </span>
         ) : null}
       </div>
 
-      {/* Output pane: the streamed dev-server log. */}
       <div
         ref={logRef}
         className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
@@ -411,13 +491,15 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       >
         {lines.length === 0 ? (
           <div style={{ color: "var(--th-fg-muted)" }}>
-            {status === "running"
-              ? "Starting…"
-              : `Press Run to start the dev server in ${cwd || "this project"}.`}
+            {snapshot.state === "starting"
+              ? "Starting..."
+              : state.discoveryState === "ready" && state.targets.length === 0
+                ? "No run targets are available."
+                : `Select a run target in ${cwd || "this project"}.`}
           </div>
         ) : (
-          lines.map((line, i) => (
-            <div key={i} className="whitespace-pre-wrap break-words">
+          lines.map((line, index) => (
+            <div key={index} className="whitespace-pre-wrap break-words">
               {line || " "}
             </div>
           ))
@@ -427,12 +509,11 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
   );
 }
 
-/** A small colored status dot mirroring the terminal status convention. */
-function StatusDot({ status }: { status: RunStatus }) {
+function StatusDot({ status }: { status: RunnerState }) {
   const color =
     status === "running"
       ? "var(--th-ok, #3fb950)"
-      : status === "exited"
+      : status === "failed" || status === "exited"
         ? "var(--th-error, #f85149)"
         : "var(--th-fg-muted)";
   return (
@@ -442,36 +523,4 @@ function StatusDot({ status }: { status: RunStatus }) {
       style={{ background: color }}
     />
   );
-}
-
-// ---------------------------------------------------------------------------
-// Event handling (module-level so it runs regardless of which DevTab instance is
-// mounted, and so URL detection updates usePanels even mid-remount).
-// ---------------------------------------------------------------------------
-
-function handleEvent(id: TerminalId, e: DevServerEvent): void {
-  switch (e.kind) {
-    case "started":
-      update(id, { status: "running" });
-      break;
-    case "exited":
-      if (e.line) appendLine(id, `[t-hub] ${e.line}`);
-      update(id, { status: "exited" });
-      // The server died, so drop its URL: Preview stops loading a dead address
-      // and the tile's busy-gate (devUrl present) releases.
-      usePanels.getState().setDevUrl(id, null);
-      break;
-    case "line":
-    default: {
-      appendLine(id, e.line);
-      // Sniff for the localhost URL and feed Preview the first time we see one
-      // (or whenever it changes — a server can re-bind to a new port).
-      const found = detectUrl(e.line);
-      if (found && found !== getState(id).url) {
-        update(id, { url: found });
-        usePanels.getState().setDevUrl(id, found);
-      }
-      break;
-    }
-  }
 }

@@ -7,6 +7,7 @@ type Listener = (event: { payload: EventPayload }) => void;
 const tauri = vi.hoisted(() => ({
   listeners: new Map<string, Listener>(),
   listen: vi.fn(),
+  invoke: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -14,7 +15,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(),
+  invoke: tauri.invoke,
 }));
 
 async function loadClient() {
@@ -31,12 +32,68 @@ beforeEach(() => {
   vi.resetModules();
   tauri.listeners.clear();
   tauri.listen.mockReset();
+  tauri.invoke.mockReset();
   tauri.listen.mockImplementation(
     async (event: string, callback: Listener): Promise<() => void> => {
       tauri.listeners.set(event, callback);
       return () => tauri.listeners.delete(event);
     },
   );
+});
+
+describe("terminal enumeration", () => {
+  it("deduplicates concurrent cold-start requests", async () => {
+    let resolve: (value: unknown) => void = () => {};
+    tauri.invoke.mockReturnValueOnce(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const { listTerminals } = await loadClient();
+
+    const first = listTerminals();
+    const second = listTerminals();
+    resolve([]);
+
+    await expect(first).resolves.toEqual([]);
+    await expect(second).resolves.toEqual([]);
+    expect(tauri.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries one bounded tmux timeout and then clears the in-flight request", async () => {
+    tauri.invoke
+      .mockRejectedValueOnce(
+        "failed to list tmux sessions: command exceeded 10s timeout",
+      )
+      .mockResolvedValueOnce([{ id: "A" }])
+      .mockResolvedValueOnce([]);
+    const { listTerminals } = await loadClient();
+
+    await expect(listTerminals()).resolves.toEqual([{ id: "A" }]);
+    await expect(listTerminals()).resolves.toEqual([]);
+    expect(tauri.invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a non-timeout failure", async () => {
+    tauri.invoke.mockRejectedValueOnce("permission denied");
+    const { listTerminals } = await loadClient();
+
+    await expect(listTerminals()).rejects.toBe("permission denied");
+    expect(tauri.invoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("terminal lifecycle errors", () => {
+  it("recognizes only the matching missing-connection rejection", async () => {
+    const { isMissingLiveTerminalError } = await loadClient();
+
+    expect(isMissingLiveTerminalError("no live terminal A", "A")).toBe(true);
+    expect(isMissingLiveTerminalError(new Error("no live terminal A"), "A")).toBe(
+      true,
+    );
+    expect(isMissingLiveTerminalError("no live terminal B", "A")).toBe(false);
+    expect(isMissingLiveTerminalError("resize failed", "A")).toBe(false);
+  });
 });
 
 describe("terminal event fanout", () => {

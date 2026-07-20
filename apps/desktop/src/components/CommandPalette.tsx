@@ -130,8 +130,7 @@ export function CommandPalette() {
   // workspace tab name -> cwd basename, NEVER the volatile Claude title),
   // exactly like the overlay / deck / sidebar.
   const captainIds = useCaptain((s) => s.captainIds);
-  const terminals = useWorkspace((s) => s.terminals);
-  const userLabels = useWorkspace((s) => s.userLabels);
+  const claims = useCaptain((s) => s.claims);
   const tabs = useWorkspace((s) => s.tabs);
   const captainEntries = useMemo<PaletteEntry[]>(
     () =>
@@ -145,9 +144,8 @@ export function CommandPalette() {
         return {
           key: `summonCaptain:${id}`,
           label: `Summon captain: ${stableCaptainIdentity(
-            userLabels[id],
-            owningTab?.name,
-            terminals[id]?.cwd,
+            claims[id]?.displayName,
+            claims[id]?.shipSlug,
             id,
           )}`,
           description: hasTile
@@ -158,7 +156,7 @@ export function CommandPalette() {
           dimmed: !hasTile,
         };
       }),
-    [captainIds, terminals, userLabels, tabs],
+    [captainIds, claims, tabs],
   );
 
   // Ranked, filtered command list.

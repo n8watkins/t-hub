@@ -58,7 +58,7 @@ export interface TerminalInfo {
 /** Tauri command names (used with `invoke`). */
 export const Commands = {
   spawnTerminal: "spawn_terminal",
-  /** (Re)attach a PTY client to a tmux session; returns base64 scrollback to seed xterm. */
+  /** (Re)attach a PTY client to a tmux session and start its live redraw stream. */
   attachTerminal: "attach_terminal",
   /** Human-origin + local terminal-management (non-automation-message) input
    *  (comms-plane Phase 1). Automation-message input must use `deliverAgentInput`
@@ -82,8 +82,10 @@ export const Commands = {
 /** One workspace tab as the core's tab registry sees it (TASK C / #22). Mirrors
  *  the Rust `control::TabRecord` (`{id, name, tileIds}`). */
 export interface TabReport {
+  schemaVersion?: 1;
   id: string;
   name: string;
+  kind?: "work" | "captain";
   tileIds: TerminalId[];
 }
 
@@ -96,6 +98,8 @@ export interface TabReport {
 export interface TabReportResult {
   seq: number;
   stale?: boolean;
+  /** Native Tauri commands serialize apply errors as data instead of rejecting. */
+  error?: string;
   activeTabId?: string | null;
   tabs?: TabReport[];
 }
@@ -235,6 +239,8 @@ export interface DirEntry {
   /** Absolute path to this entry. */
   path: string;
   isDir: boolean;
+  /** True when this directory is itself a Git worktree or repository root. */
+  isGitRepo: boolean;
   /** File size in bytes (0 for directories). */
   size: number;
 }

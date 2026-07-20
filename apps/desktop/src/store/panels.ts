@@ -1,7 +1,7 @@
 // Per-project panel state — the per-tile "workbench".
 //
-// Each project tile shows ONE of several views — Terminal / Files / Preview /
-// Dev / Board — plus a fullscreen toggle. This store holds that purely-presentational,
+// Each project tile shows one of Terminal / Files / Run + Preview, plus
+// a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
 // the parallel panel work doesn't contend on workspace.ts.
 // In-memory only for v1 (not persisted): a fresh launch starts every tile on its
@@ -10,25 +10,16 @@
 // CROSS-FEATURE CONTRACT (scaffolded for the parallel build — multiple
 // components import this; don't reshape it lightly):
 //   - The per-tile panel (Tile/TilePanel) reads/sets `tab` + `fullscreenId`.
-//   - The Dev tab (DevTab) runs the project's dev server and publishes its
-//     URL via `setDevUrl`; the Preview tab reads `devUrl[id]` (falling back to
-//     the user-typed `previewUrl[id]`), so a freshly-started dev server loads
-//     automatically.
+//   - RunPreviewPanel runs the project's managed dev server and previews only
+//     the URL reported by that owned process or explicitly entered by the user.
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
-/** The selectable views inside a project tile. "board" embeds an external URL
- *  (the powder board by default — see settings.powderBoardUrl) in the shared
- *  WebPreview surface. */
-export type PanelTab = "terminal" | "files" | "preview" | "dev" | "board";
+/** The selectable views inside a project tile. */
+export type PanelTab = "terminal" | "files" | "preview";
 
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";
-
-/** Max localhost URLs kept per terminal in `detectedUrls`. Newest-first; older
- *  ones fall off the end. Small on purpose — these are quick "jump to it" chips,
- *  not a history, and the list re-renders the Preview URL bar. */
-export const MAX_DETECTED_URLS = 8;
 
 /**
  * Split-ratio bounds for the draggable terminal|panel divider (SPLIT mode). The
@@ -85,20 +76,11 @@ interface PanelState {
   tab: Record<TerminalId, PanelTab>;
   /** The one tile expanded to fill the window, or null for the normal grid. */
   fullscreenId: TerminalId | null;
-  /** Dev-server URL detected for a terminal (null/absent => none yet). Read by
-   *  the Preview tab; fed from terminal-output URL detection. */
+  /** Dev-server URL reported by the managed runner for this terminal. */
   devUrl: Record<TerminalId, string | null>;
-  /** Last URL the user committed in a terminal's Preview tab, so it survives a
-   *  tab switch. The Preview tab prefers a live `devUrl` over this. */
+  /** Last URL the user committed in Run and Preview, so it survives a tab switch.
+   *  The managed runner's live `devUrl` takes precedence. */
   previewUrl: Record<TerminalId, string | null>;
-  /** Last URL committed in a terminal's Board tab, so navigating away from the
-   *  powder-board default survives a tab switch. Absent => fall back to the
-   *  configured settings.powderBoardUrl. */
-  boardUrl: Record<TerminalId, string | null>;
-  /** localhost-ish URLs scraped from a terminal's LIVE output (newest-first,
-   *  deduped, capped). Written by Terminal.tsx as Claude/dev servers print their
-   *  URLs; surfaced as one-click chips in that tile's Preview tab. Absent => []. */
-  detectedUrls: Record<TerminalId, string[]>;
   /** Per-tile: when a non-terminal tab is active the tile SPLITS (terminal +
    *  panel). `panelExpanded[id]` true means the panel is EXPANDED to fill the
    *  whole tile (terminal hidden); false/absent => the split. */
@@ -127,14 +109,8 @@ interface PanelState {
   setFullscreen: (id: TerminalId | null) => void;
   /** Record the dev-server URL detected for a terminal (null clears it). */
   setDevUrl: (id: TerminalId, url: string | null) => void;
-  /** Add a localhost URL scraped from a terminal's output. Prepended (newest
-   *  first), deduped, and capped at MAX_DETECTED_URLS so a server logging its
-   *  URL on every request can't grow the list unbounded. */
-  addDetectedUrl: (id: TerminalId, url: string) => void;
   /** Remember the user-typed Preview URL for a terminal. */
   setPreviewUrl: (id: TerminalId, url: string | null) => void;
-  /** Remember the URL committed in a terminal's Board tab. */
-  setBoardUrl: (id: TerminalId, url: string | null) => void;
   /** Drop all panel state for a terminal (call when its tile is deleted). */
   forget: (id: TerminalId) => void;
 }
@@ -144,8 +120,6 @@ export const usePanels = create<PanelState>((set, get) => ({
   fullscreenId: null,
   devUrl: {},
   previewUrl: {},
-  boardUrl: {},
-  detectedUrls: {},
   panelExpanded: {},
   splitRatio: loadSplitRatios(),
 
@@ -178,37 +152,18 @@ export const usePanels = create<PanelState>((set, get) => ({
     set((s) => ({ fullscreenId: s.fullscreenId === id ? null : id })),
   setFullscreen: (id) => set({ fullscreenId: id }),
   setDevUrl: (id, url) => set((s) => ({ devUrl: { ...s.devUrl, [id]: url } })),
-  addDetectedUrl: (id, url) =>
-    set((s) => {
-      const prev = s.detectedUrls[id] ?? [];
-      // No-op if it's already the newest entry — the common case is a server
-      // re-logging the same URL, and skipping the set() avoids needless renders.
-      if (prev[0] === url) return s;
-      // Newest-first, drop any earlier occurrence (move-to-front), then cap.
-      const next = [url, ...prev.filter((u) => u !== url)].slice(
-        0,
-        MAX_DETECTED_URLS,
-      );
-      return { detectedUrls: { ...s.detectedUrls, [id]: next } };
-    }),
   setPreviewUrl: (id, url) =>
     set((s) => ({ previewUrl: { ...s.previewUrl, [id]: url } })),
-  setBoardUrl: (id, url) =>
-    set((s) => ({ boardUrl: { ...s.boardUrl, [id]: url } })),
   forget: (id) =>
     set((s) => {
       const tab = { ...s.tab };
       const devUrl = { ...s.devUrl };
       const previewUrl = { ...s.previewUrl };
-      const boardUrl = { ...s.boardUrl };
-      const detectedUrls = { ...s.detectedUrls };
       const panelExpanded = { ...s.panelExpanded };
       const splitRatio = { ...s.splitRatio };
       delete tab[id];
       delete devUrl[id];
       delete previewUrl[id];
-      delete boardUrl[id];
-      delete detectedUrls[id];
       delete panelExpanded[id];
       const hadRatio = id in splitRatio;
       delete splitRatio[id];
@@ -218,8 +173,6 @@ export const usePanels = create<PanelState>((set, get) => ({
         tab,
         devUrl,
         previewUrl,
-        boardUrl,
-        detectedUrls,
         panelExpanded,
         splitRatio,
         fullscreenId: s.fullscreenId === id ? null : s.fullscreenId,

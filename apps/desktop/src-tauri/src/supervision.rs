@@ -33,7 +33,64 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::model::{SessionStatus, SubagentNode, SubagentState, SupervisionTree};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use t_hub_protocol::JournalEventType;
+
+/// Provider-neutral permission need retained until its exact lifecycle clears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequest {
+    #[serde(alias = "schema_version")]
+    pub schema_version: String,
+    pub id: String,
+    pub kind: String,
+    pub provider: String,
+    #[serde(alias = "provider_request_id")]
+    pub provider_request_id: String,
+    #[serde(alias = "session_id")]
+    pub session_id: String,
+    #[serde(alias = "turn_id")]
+    pub turn_id: Option<String>,
+    #[serde(alias = "item_id")]
+    pub item_id: Option<String>,
+    #[serde(alias = "tool_name")]
+    pub tool_name: String,
+    #[serde(alias = "requested_at_ms")]
+    pub requested_at_ms: u64,
+}
+
+/// Runtime availability is separate from the Crew work state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeHealth {
+    Ready,
+    Degraded,
+    Disconnected,
+    Unknown,
+}
+
+/// Confidence in the observation that produced runtime health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ObservationQuality {
+    Authoritative,
+    Derived,
+    Stale,
+    Unknown,
+}
+
+/// Explicit health of a provider lifecycle transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeHealthObservation {
+    pub health: RuntimeHealth,
+    pub quality: ObservationQuality,
+    pub source: String,
+    #[serde(alias = "observed_at_ms")]
+    pub observed_at_ms: u64,
+    pub detail: Option<String>,
+}
 
 /// Cap on the bounded transition log. Big enough that a poller sleeping 500ms
 /// between checks cannot realistically miss an edge (each `ingest` pushes at
@@ -82,6 +139,10 @@ struct SessionEntry {
     /// True once a `Stop` has fired on the main agent (so a later child finish
     /// can transition WaitingOnSubagents → Completed).
     main_stopped: bool,
+    /// Exact structured permission need for this turn, if one is pending.
+    pending_permission: Option<PermissionRequest>,
+    /// Provider telemetry health, intentionally independent of work status.
+    runtime_health: Option<RuntimeHealthObservation>,
     /// Monotonic "last touched" stamp (the `Supervisor.touch_seq` value at the
     /// last ingest for this session). Used purely as an LRU key for the
     /// [`SESSION_MAP_CAP`] backstop — NOT wall-clock, so it is immune to clock
@@ -226,6 +287,28 @@ impl Supervisor {
         event: JournalEventType,
         timestamp_ms: u64,
     ) -> Option<String> {
+        self.ingest_with_payload(
+            session_id,
+            agent_id,
+            agent_type,
+            notification_type,
+            event,
+            timestamp_ms,
+            None,
+        )
+    }
+
+    /// Feed one event together with its credential-safe normalized payload.
+    pub fn ingest_with_payload(
+        &mut self,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        agent_type: Option<&str>,
+        notification_type: Option<&str>,
+        event: JournalEventType,
+        timestamp_ms: u64,
+        payload: Option<&Value>,
+    ) -> Option<String> {
         let session_id = session_id?;
         // Bump the monotonic touch counter and stamp it onto the entry below so the
         // session-map cap can evict by LRU. Done up front (any ingest counts as a
@@ -250,13 +333,44 @@ impl Supervisor {
         // against the reaped truth (Completed, not WaitingOnSubagents).
         let timed_out = entry.reap_timed_out_children(timestamp_ms);
 
+        if let Some(telemetry) = payload.and_then(|value| value.get("telemetry")) {
+            let health = match telemetry.get("runtime_health").and_then(Value::as_str) {
+                Some("ready") => RuntimeHealth::Ready,
+                Some("degraded") => RuntimeHealth::Degraded,
+                Some("disconnected") => RuntimeHealth::Disconnected,
+                _ => RuntimeHealth::Unknown,
+            };
+            let quality = match telemetry.get("quality").and_then(Value::as_str) {
+                Some("authoritative") => ObservationQuality::Authoritative,
+                Some("derived") => ObservationQuality::Derived,
+                Some("stale") => ObservationQuality::Stale,
+                _ => ObservationQuality::Unknown,
+            };
+            entry.runtime_health = Some(RuntimeHealthObservation {
+                health,
+                quality,
+                source: telemetry
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                observed_at_ms: timestamp_ms,
+                detail: telemetry
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+
         match event {
             JournalEventType::SessionStart => {
+                entry.pending_permission = None;
                 entry.status = SessionStatus::Working;
                 entry.main_stopped = false;
             }
 
             JournalEventType::UserPromptSubmit => {
+                entry.pending_permission = None;
                 // A new turn began — back to Working regardless of prior state.
                 //
                 // TURN BOUNDARY for the subagent tree: drop ALL children.
@@ -348,6 +462,7 @@ impl Supervisor {
             }
 
             JournalEventType::Stop => {
+                entry.pending_permission = None;
                 // The headline classification: a main-agent Stop with outstanding
                 // children/tasks is WaitingOnSubagents, not Completed (FR-012).
                 entry.main_stopped = true;
@@ -359,11 +474,45 @@ impl Supervisor {
             }
 
             JournalEventType::Elicitation => {
+                entry.pending_permission = None;
                 entry.status = SessionStatus::NeedsQuestion;
             }
 
             JournalEventType::PermissionRequest => {
+                entry.pending_permission = payload
+                    .and_then(|value| value.get("permission_request"))
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                if entry.pending_permission.is_none() && payload.is_some() {
+                    entry.runtime_health = Some(RuntimeHealthObservation {
+                        health: RuntimeHealth::Degraded,
+                        quality: ObservationQuality::Derived,
+                        source: "structured".to_string(),
+                        observed_at_ms: timestamp_ms,
+                        detail: Some("invalid_permission_request".to_string()),
+                    });
+                }
                 entry.status = SessionStatus::NeedsPermission;
+            }
+
+            JournalEventType::CoreAction
+                if payload
+                    .and_then(|value| value.get("lifecycle"))
+                    .and_then(Value::as_str)
+                    == Some("permission_resolved") =>
+            {
+                let resolved_id = payload
+                    .and_then(|value| value.get("permission_request_id"))
+                    .and_then(Value::as_str);
+                if entry
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|request| Some(request.id.as_str()) == resolved_id)
+                {
+                    entry.pending_permission = None;
+                    if !entry.main_stopped {
+                        entry.status = SessionStatus::Working;
+                    }
+                }
             }
 
             JournalEventType::Notification => match notification_type {
@@ -405,6 +554,7 @@ impl Supervisor {
             },
 
             JournalEventType::StopFailure => {
+                entry.pending_permission = None;
                 entry.status = SessionStatus::Failed;
                 // Terminal status: nothing can still be running - reap any
                 // orphans so the tree never shows phantom Running children on
@@ -414,6 +564,7 @@ impl Supervisor {
             }
 
             JournalEventType::SessionEnd => {
+                entry.pending_permission = None;
                 // Abnormal end → failed; a clean end after Completed stays
                 // Completed. We can't always distinguish, so only downgrade to
                 // Failed if we weren't already Completed.
@@ -568,6 +719,20 @@ impl Supervisor {
             .get(session_id)
             .map(|e| e.status)
             .unwrap_or(SessionStatus::Unknown)
+    }
+
+    /// Structured permission request currently awaiting a decision.
+    pub fn permission_request(&self, session_id: &str) -> Option<PermissionRequest> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.pending_permission.clone())
+    }
+
+    /// Latest provider runtime-health observation for this session.
+    pub fn runtime_health(&self, session_id: &str) -> Option<RuntimeHealthObservation> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.runtime_health.clone())
     }
 
     /// Build the read-only tree snapshot for a session (PLAN.md §C tree view).
@@ -1635,6 +1800,177 @@ mod tests {
             s.status("s99999"),
             SessionStatus::Working,
             "the new session is present"
+        );
+    }
+
+    fn permission_payload(request_id: &str, health: &str) -> Value {
+        serde_json::json!({
+            "provider": "codex",
+            "lifecycle": "permission_requested",
+            "permission_request_id": request_id,
+            "permission_request": {
+                "schema_version": "t-hub.permission-request.v1",
+                "id": request_id,
+                "kind": "command_execution",
+                "provider": "codex",
+                "provider_request_id": request_id,
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "item_id": "item-1",
+                "tool_name": "Bash",
+                "requested_at_ms": 10
+            },
+            "telemetry": {
+                "transport": "structured",
+                "quality": if health == "ready" { "authoritative" } else { "stale" },
+                "runtime_health": health
+            }
+        })
+    }
+
+    #[test]
+    fn structured_permission_is_typed_deduplicated_and_exactly_resolved() {
+        let mut s = sup();
+        let request = permission_payload("request-1", "ready");
+        s.ingest_with_payload(
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            JournalEventType::PermissionRequest,
+            10,
+            Some(&request),
+        );
+        assert_eq!(s.status("thread-1"), SessionStatus::NeedsPermission);
+        assert_eq!(
+            s.permission_request("thread-1")
+                .unwrap()
+                .provider_request_id,
+            "request-1"
+        );
+        assert_eq!(
+            s.runtime_health("thread-1").unwrap().health,
+            RuntimeHealth::Ready
+        );
+
+        let seq = s.current_seq();
+        s.ingest_with_payload(
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            JournalEventType::PermissionRequest,
+            11,
+            Some(&request),
+        );
+        assert!(s.transitions_since(seq).is_empty());
+
+        let wrong = serde_json::json!({
+            "lifecycle": "permission_resolved",
+            "permission_request_id": "request-other"
+        });
+        s.ingest_with_payload(
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            JournalEventType::CoreAction,
+            12,
+            Some(&wrong),
+        );
+        assert_eq!(s.status("thread-1"), SessionStatus::NeedsPermission);
+
+        let resolved = serde_json::json!({
+            "lifecycle": "permission_resolved",
+            "permission_request_id": "request-1"
+        });
+        s.ingest_with_payload(
+            Some("thread-1"),
+            None,
+            None,
+            None,
+            JournalEventType::CoreAction,
+            13,
+            Some(&resolved),
+        );
+        assert_eq!(s.status("thread-1"), SessionStatus::Working);
+        assert!(s.permission_request("thread-1").is_none());
+    }
+
+    #[test]
+    fn permission_clears_at_turn_failure_completion_and_restart_boundaries() {
+        for terminal in [
+            JournalEventType::Stop,
+            JournalEventType::StopFailure,
+            JournalEventType::SessionEnd,
+            JournalEventType::UserPromptSubmit,
+            JournalEventType::SessionStart,
+        ] {
+            let mut s = sup();
+            let request = permission_payload("request-1", "ready");
+            s.ingest_with_payload(
+                Some("thread-1"),
+                None,
+                None,
+                None,
+                JournalEventType::PermissionRequest,
+                10,
+                Some(&request),
+            );
+            s.ingest(Some("thread-1"), None, None, None, terminal, 20);
+            assert!(
+                s.permission_request("thread-1").is_none(),
+                "pending request survived {terminal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_restores_permission_and_disconnected_health_without_false_working() {
+        let request = permission_payload("request-1", "ready");
+        let disconnected = serde_json::json!({
+            "lifecycle": "telemetry_health",
+            "telemetry": {
+                "transport": "structured",
+                "quality": "stale",
+                "runtime_health": "disconnected",
+                "detail": "structured_stream_ended_mid_turn"
+            }
+        });
+        let replay = |supervisor: &mut Supervisor| {
+            supervisor.ingest_with_payload(
+                Some("thread-1"),
+                None,
+                None,
+                None,
+                JournalEventType::PermissionRequest,
+                10,
+                Some(&request),
+            );
+            supervisor.ingest_with_payload(
+                Some("thread-1"),
+                None,
+                None,
+                None,
+                JournalEventType::CoreAction,
+                11,
+                Some(&disconnected),
+            );
+        };
+        let mut live = sup();
+        replay(&mut live);
+        let mut restarted = sup();
+        replay(&mut restarted);
+
+        assert_eq!(live.status("thread-1"), SessionStatus::NeedsPermission);
+        assert_eq!(restarted.status("thread-1"), live.status("thread-1"));
+        assert_eq!(
+            restarted.permission_request("thread-1"),
+            live.permission_request("thread-1")
+        );
+        assert_eq!(
+            restarted.runtime_health("thread-1").unwrap().health,
+            RuntimeHealth::Disconnected
         );
     }
 }

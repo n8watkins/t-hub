@@ -5,7 +5,6 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../ipc/projects", () => ({
   listProjects: vi.fn().mockResolvedValue({ projects: [], count: 0, seq: 0 }),
   registerProject: vi.fn(),
-  bindProjectPowder: vi.fn(),
   commissionCaptain: vi.fn(),
 }));
 import {
@@ -75,14 +74,14 @@ describe("SpawnMenu Captain commissioning", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("opens project-aware commissioning instead of emitting a generic spawn", async () => {
+  it("opens codebase-aware creation instead of emitting a generic spawn", async () => {
     const onSpawn = vi.fn();
     const onClose = vi.fn();
     render(<SpawnMenu onSpawn={onSpawn} onClose={onClose} />);
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Captain Project-aware/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Captain Create a Codex/i }));
     expect(onSpawn).not.toHaveBeenCalled();
-    expect(await screen.findByRole("dialog", { name: "Commission Captain" })).toBeTruthy();
+    expect(await screen.findByRole("dialog", { name: "Create Captain" })).toBeTruthy();
     expect(onClose).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,16 @@
 // overlay do NOT pulse the row - rate-limit reads amber on the meter instead),
 // and the crewmate sub-rows + inline SupervisionTree expansion.
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+
+const controlRequests: Array<{ command: string; args: Record<string, unknown> }> = [];
+vi.mock("../ipc/controlClient", () => ({
+  onControlEvent: () => () => {},
+  controlRequest: async (command: string, args: Record<string, unknown>) => {
+    controlRequests.push({ command, args });
+    return {};
+  },
+}));
 
 // CaptainsList -> CaptainOverlay (status dot + display label) -> TerminalPool
 // -> xterm, whose import-time color math needs a real <canvas>. Nothing here
@@ -40,6 +49,8 @@ function claim(
   return {
     terminalId: id,
     shipSlug: `ship-${id}`,
+    assignmentId: `assignment:project:${id}`,
+    displayName: id === "cap00001" ? "monorepo-app" : `ship-${id}`,
     workspaceTabIds,
     crew: crew.map((c) => ({ terminalId: c })),
   };
@@ -49,6 +60,7 @@ function claim(
  *  two crew - one mid-turn, one done) controlling Workspace 1; bbb00001 (no
  *  session, no claim yet) whose tile lives in Workspace 2. */
 beforeEach(() => {
+  controlRequests.length = 0;
   const tabs: WorkspaceTab[] = [
     { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0", "crewdon0"] },
     { id: "t2", name: "Workspace 2", order: ["bbb00001"] },
@@ -178,18 +190,20 @@ describe("CaptainsList rename", () => {
     return within(row(terminalId)).getByRole("textbox") as HTMLInputElement;
   }
 
-  it("pencil -> type -> Enter commits through setTerminalLabel (persisted rename)", () => {
+  it("pencil -> type -> Enter requests a durable registry rename", async () => {
     render(<CaptainsList />);
     const input = startRename("cap00001");
     // Draft seeds from the CURRENT override (none yet), placeholder shows the
     // derived STABLE identity (the cwd basename, no rename set).
-    expect(input.value).toBe("");
+    expect(input.value).toBe("monorepo-app");
     expect(input.placeholder).toBe("monorepo-app");
     fireEvent.change(input, { target: { value: "Flagship" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    // Round-trip: the store carries the rename and the row leads with it.
-    expect(useWorkspace.getState().userLabels["cap00001"]).toBe("Flagship");
-    expect(row("cap00001").textContent).toContain("Flagship");
+    await waitFor(() => expect(controlRequests).toHaveLength(1));
+    expect(controlRequests[0]).toEqual({
+      command: "rename_captain",
+      args: { captainSessionId: "cap00001", displayName: "Flagship" },
+    });
     expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
   });
 
@@ -203,28 +217,23 @@ describe("CaptainsList rename", () => {
     expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
   });
 
-  it("blur commits the draft (click-away does not lose the rename)", () => {
+  it("blur requests the durable rename", async () => {
     render(<CaptainsList />);
     const input = startRename("cap00001");
     fireEvent.change(input, { target: { value: "Blurred" } });
     fireEvent.blur(input);
-    expect(useWorkspace.getState().userLabels["cap00001"]).toBe("Blurred");
+    await waitFor(() => expect(controlRequests[0]?.args.displayName).toBe("Blurred"));
     expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
   });
 
-  it("committing an emptied draft clears the override back to the derived identity", () => {
-    act(() => {
-      useWorkspace.getState().setTerminalLabel("cap00001", "Flagship");
-    });
+  it("refuses an empty durable display name", () => {
     render(<CaptainsList />);
-    expect(row("cap00001").textContent).toContain("Flagship");
     const input = startRename("cap00001");
-    expect(input.value).toBe("Flagship"); // seeded with the current override
+    expect(input.value).toBe("monorepo-app");
     fireEvent.change(input, { target: { value: "" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    expect(useWorkspace.getState().userLabels["cap00001"]).toBeUndefined();
-    // Cleared rename reverts to the stable identity (the workspace tab name).
-    expect(row("cap00001").textContent).toContain("Workspace 1");
+    expect(controlRequests).toEqual([]);
+    expect(row("cap00001").textContent).toContain("monorepo-app");
   });
 });
 
@@ -264,7 +273,9 @@ describe("CaptainsList workspace-relevant ordering", () => {
 describe("CaptainsList click-to-focus wiring", () => {
   it("clicking a row navigates to the Captains tab and focuses that agent's tile", () => {
     render(<CaptainsList />);
-    fireEvent.click(within(row("bbb00001")).getByTitle(/Open in Captains/));
+    fireEvent.click(
+      within(row("bbb00001")).getByTitle(/Open in Captain Workspace/),
+    );
     const ws = useWorkspace.getState();
     // The reserved Captains tab is now active and the agent's tile is focused.
     expect(ws.activeTabId).toBe(CAPTAINS_TAB_ID);

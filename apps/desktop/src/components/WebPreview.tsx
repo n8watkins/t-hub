@@ -75,19 +75,15 @@ export interface WebPreviewProps {
    *  Preview URL). Absent/empty => no auto-load; we show the empty state with
    *  the URL bar still available rather than loading a dead default address. */
   initialUrl?: string;
-  /** localhost URLs scraped from the tile's terminal output (newest-first).
-   *  Rendered as one-click chips under the URL bar; clicking one navigates. */
-  detectedUrls?: string[];
   /** Called with the normalized URL each time the user commits a navigation (URL
-   *  bar submit or a detected-URL chip). Lets a host tile persist the last-viewed
+   *  bar submit or managed runner update). Lets a host tile persist the last-viewed
    *  address so it survives a tab switch (e.g. usePanels.setPreviewUrl /
-   *  setBoardUrl). Optional — the standalone preview doesn't need it. */
+   *  setPreviewUrl). Optional because standalone previews do not persist it. */
   onNavigate?: (url: string) => void;
 }
 
 export function WebPreview({
   initialUrl = "",
-  detectedUrls = [],
   onNavigate,
 }: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
@@ -131,9 +127,9 @@ export function WebPreview({
     [normalize, onNavigate],
   );
 
-  // Follow a LIVE `initialUrl`. The per-tile Preview tab passes the project's
-  // detected dev-server URL (usePanels.devUrl) as `initialUrl`; when terminal
-  // output detection updates it, the prop changes and we should navigate there —
+  // Follow a LIVE `initialUrl`. RunPreviewPanel passes the managed runner's
+  // detected dev-server URL as `initialUrl`; when owned runner output updates it,
+  // the prop changes and we should navigate there -
   // but ONLY when it's a genuinely new server URL, never clobbering an address
   // the user typed into the bar. We remember the last `initialUrl` we adopted
   // and re-navigate only when the incoming prop differs from BOTH that adopted
@@ -150,24 +146,6 @@ export function WebPreview({
     // `navigate` is stable (useCallback); `url` is read to avoid a redundant
     // reload when we're already on the incoming URL.
   }, [initialUrl, navigate, url]);
-
-  // Seed the preview from the newest DETECTED URL, but only as a last resort:
-  // when no real dev-server URL was ever passed in (so the committed `url` is
-  // still the untouched empty initial) and the user hasn't navigated. This makes
-  // the first localhost URL a terminal prints auto-load, without ever clobbering
-  // a URL the user typed/is viewing — once `url` diverges from the adopted
-  // initial value the guard below is false forever, and this is one-shot anyway.
-  const detectedSeededRef = useRef(false);
-  const newestDetected = detectedUrls[0];
-  useEffect(() => {
-    if (detectedSeededRef.current) return; // only auto-seed once
-    if (!newestDetected) return; // nothing detected yet
-    // Don't seed if a real dev URL was supplied, or if the user has navigated:
-    // in both cases the committed `url` no longer equals the adopted initial.
-    if (url !== adoptedInitialRef.current) return;
-    detectedSeededRef.current = true;
-    navigate(newestDetected);
-  }, [newestDetected, navigate, url]);
 
   // Resolve the reachable load URL whenever the committed `url` (or a manual
   // retry via `nav`) changes. On Windows this swaps a WSL `localhost` for the
@@ -332,41 +310,6 @@ export function WebPreview({
         </button>
       </form>
 
-      {/* Detected-URL chips: localhost URLs the tile's terminal printed (e.g. a
-          dev server announcing itself). Click to navigate the preview there.
-          Newest-first; only shown when there are any. */}
-      {detectedUrls.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
-          <span
-            className="text-[11px]"
-            style={{ color: "var(--th-fg-muted)" }}
-          >
-            Detected:
-          </span>
-          {detectedUrls.map((u) => {
-            const active = u === url;
-            return (
-              <button
-                key={u}
-                type="button"
-                onClick={() => navigate(u)}
-                title={`Preview ${u}`}
-                className="max-w-[16rem] truncate px-2 py-0.5 text-[11px]"
-                style={{
-                  borderRadius: "var(--th-radius)",
-                  border: "1px solid var(--th-border)",
-                  // The currently-shown URL reads as selected; the rest are
-                  // muted "jump to it" affordances.
-                  background: active ? "var(--th-tile-bg)" : "transparent",
-                  color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
-                }}
-              >
-                {u}
-              </button>
-            );
-          })}
-        </div>
-      )}
       </div>
 
       {/* Body: the framed page, with overlays for the blocked/error cases. The
@@ -390,10 +333,9 @@ export function WebPreview({
             onError={() => setLoad({ status: "error" })}
           />
         ) : (
-          // Empty state: no URL detected / typed / fed from the Dev runner yet.
+          // Empty state: no URL entered or reported by the managed runner yet.
           // We deliberately do NOT load a dead default address (which would flash
-          // a connection error) — instead point the user at the Dev tab or the
-          // URL bar above, both of which set a real URL when ready.
+          // a connection error) - instead point the user at the runner or URL bar.
           <div
             className="flex h-full flex-col items-center justify-center gap-1.5 px-8 text-center"
             style={{ color: "var(--th-fg-muted)" }}
@@ -402,8 +344,7 @@ export function WebPreview({
               Nothing to preview yet
             </div>
             <div className="max-w-xs text-xs leading-relaxed">
-              Start a dev server (the <span className="font-medium">Dev</span>{" "}
-              tab) or enter a URL above to preview it here.
+              Start the managed runner above or enter a URL to preview it here.
             </div>
           </div>
         )}

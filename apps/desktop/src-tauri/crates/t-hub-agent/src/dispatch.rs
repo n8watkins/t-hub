@@ -25,6 +25,11 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
             Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
         },
 
+        AgentRequest::TerminalSnapshot => match registry::terminal_snapshot() {
+            Ok(snapshot) => AgentResponse::TerminalSnapshot(snapshot),
+            Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
+        },
+
         AgentRequest::NewSession { name, cwd, command } => {
             let res = registry::new_session(&name, &cwd, command.as_deref());
             record_command(journal, &name, "new_session", res.as_ref().err());
@@ -56,6 +61,11 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
 
         AgentRequest::GitWorktrees { cwd } => match host::git_worktrees(&cwd) {
             Ok(worktrees) => AgentResponse::GitWorktrees { worktrees },
+            Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
+        },
+
+        AgentRequest::GitInfo { cwd } => match host::git_info(&cwd) {
+            Ok(info) => AgentResponse::GitInfo(info),
             Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
         },
 
@@ -121,6 +131,14 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_request_returns_snapshot() {
+        let (j, dir) = temp_journal("terminal-snapshot");
+        let resp = handle(&j, AgentRequest::TerminalSnapshot);
+        assert!(matches!(resp, AgentResponse::TerminalSnapshot(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn unknown_request_is_unsupported() {
         let (j, dir) = temp_journal("unknown");
         let resp = handle(&j, AgentRequest::Unknown);
@@ -129,6 +147,24 @@ mod tests {
                 assert_eq!(kind, ResponseErrorKind::Unsupported)
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_info_request_returns_non_repo_snapshot() {
+        let (j, dir) = temp_journal("git-info");
+        let cwd = dir.join("not-a-repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resp = handle(
+            &j,
+            AgentRequest::GitInfo {
+                cwd: cwd.to_string_lossy().into_owned(),
+            },
+        );
+        match resp {
+            AgentResponse::GitInfo(info) => assert!(!info.is_repo),
+            other => panic!("expected GitInfo, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }

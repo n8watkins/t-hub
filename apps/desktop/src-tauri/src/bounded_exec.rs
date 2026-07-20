@@ -153,7 +153,7 @@ fn join_or_detach(handle: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

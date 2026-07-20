@@ -10,7 +10,9 @@
 //! stable machine envelope, output is bounded + sorted, and the shell exit code
 //! is a stable taxonomy agents can branch on (see [`exit`]).
 
+mod agents;
 mod control;
+mod powder;
 mod render;
 mod worktree;
 
@@ -48,13 +50,37 @@ struct CliError {
 
 impl CliError {
     fn usage(message: impl Into<String>) -> Self {
-        CliError { code: exit::USAGE, kind: "usage", message: message.into() }
+        CliError {
+            code: exit::USAGE,
+            kind: "usage",
+            message: message.into(),
+        }
+    }
+
+    fn gated(message: impl Into<String>) -> Self {
+        CliError {
+            code: exit::GATED,
+            kind: "gated",
+            message: message.into(),
+        }
+    }
+
+    fn powder_retired(message: impl Into<String>) -> Self {
+        CliError {
+            code: exit::SERVER_ERROR,
+            kind: "powder_retired",
+            message: message.into(),
+        }
     }
 
     /// A local git interrogation/mutation failed. Same exit tier as a server
     /// `ok:false` (4 = "the operation failed"), distinguished by `kind`.
     fn git(message: impl Into<String>) -> Self {
-        CliError { code: exit::SERVER_ERROR, kind: "git_error", message: message.into() }
+        CliError {
+            code: exit::SERVER_ERROR,
+            kind: "git_error",
+            message: message.into(),
+        }
     }
 }
 
@@ -64,24 +90,76 @@ impl CliError {
 impl From<ControlError> for CliError {
     fn from(e: ControlError) -> Self {
         match e {
-            ControlError::AppDown(m) => CliError { code: exit::APP_DOWN, kind: "app_down", message: m },
-            ControlError::Protocol(m) => CliError { code: exit::PROTOCOL, kind: "protocol", message: m },
+            ControlError::AppDown(m) => CliError {
+                code: exit::APP_DOWN,
+                kind: "app_down",
+                message: m,
+            },
+            ControlError::Protocol(m) => CliError {
+                code: exit::PROTOCOL,
+                kind: "protocol",
+                message: m,
+            },
             ControlError::Server(m) => {
-                if is_gated(&m) {
-                    CliError { code: exit::GATED, kind: "gated", message: m }
+                if let Some(message) = m.strip_prefix("powder_retired:") {
+                    CliError::powder_retired(message)
+                } else if let Some(kind) = powder_mutation_error_kind(&m) {
+                    CliError {
+                        code: exit::SERVER_ERROR,
+                        kind,
+                        message: m,
+                    }
+                } else if is_gated(&m) {
+                    CliError {
+                        code: exit::GATED,
+                        kind: "gated",
+                        message: m,
+                    }
                 } else {
-                    CliError { code: exit::SERVER_ERROR, kind: "server_error", message: m }
+                    CliError {
+                        code: exit::SERVER_ERROR,
+                        kind: "server_error",
+                        message: m,
+                    }
                 }
             }
         }
     }
 }
 
+fn powder_mutation_error_kind(message: &str) -> Option<&'static str> {
+    [
+        ("committed", "powder_mutation_committed"),
+        ("pending", "powder_mutation_pending"),
+        ("recovered", "powder_mutation_recovered"),
+        ("rejected", "powder_mutation_rejected"),
+        ("stale", "powder_mutation_stale"),
+        ("conflict", "powder_mutation_conflict"),
+        ("expired", "powder_mutation_expired"),
+        ("unsupported", "powder_mutation_unsupported"),
+        ("malformed", "powder_mutation_malformed"),
+        ("timeout", "powder_mutation_timeout"),
+    ]
+    .into_iter()
+    .find_map(|(state, kind)| {
+        message
+            .contains(&format!("Powder mutation state '{state}'"))
+            .then_some(kind)
+    })
+}
+
 /// Does a server error read as a permission/confirmation gate rather than a
 /// generic failure? Keyed off the app's own gating language (PRD §11.2).
 fn is_gated(message: &str) -> bool {
     let m = message.to_lowercase();
-    m.contains("gated") || m.contains("confirmation") || m.contains("process-changing")
+    m.contains("gated")
+        || m.contains("confirmation")
+        || m.contains("process-changing")
+        || m.contains("permission denied")
+        || m.contains("not authorized")
+        || m.contains("unauthorized")
+        || m.contains("forbidden")
+        || m.starts_with("acl:")
 }
 
 /// Restore the OS-default SIGPIPE handling so a downstream `head`/`grep` that
@@ -141,6 +219,8 @@ fn command_label(args: &[String]) -> String {
             Some(sub) if !sub.starts_with('-') => format!("worktree {sub}"),
             _ => "worktree".to_string(),
         },
+        Some("powder") => powder::command_label(&args[1..]),
+        Some("agents") => agents::command_label(&args[1..]),
         Some(c) => c.to_string(),
     }
 }
@@ -160,6 +240,8 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "tabs" => cmd_tabs(rest),
         "health" => cmd_health(rest),
         "events" | "watch" => cmd_events(rest),
+        "powder" => powder::run(rest),
+        "agents" => agents::run(rest),
         other => Err(CliError::usage(format!(
             "unknown command '{other}'. Run `th --help` for the command list."
         ))),
@@ -207,11 +289,17 @@ fn cmd_read(args: &[String]) -> Result<(), CliError> {
     let ui = f.ui();
     let session = f.positional(0, "read", "<session>")?;
     let history: i64 = match f.opts.get("--history") {
-        Some(v) => v.parse().map_err(|_| CliError::usage(format!("--history expects an integer, got '{v}'")))?,
+        Some(v) => v
+            .parse()
+            .map_err(|_| CliError::usage(format!("--history expects an integer, got '{v}'")))?,
         None => 0,
     };
     let ep = endpoint()?;
-    let result = control::call(&ep, "read_terminal", json!({ "sessionId": session, "historyLines": history }))?;
+    let result = control::call(
+        &ep,
+        "read_terminal",
+        json!({ "sessionId": session, "historyLines": history }),
+    )?;
     if f.json {
         emit_json_ok("read", result);
     } else {
@@ -230,7 +318,10 @@ fn cmd_status(args: &[String]) -> Result<(), CliError> {
         let status = control::call(&ep, "get_status", json!({ "sessionId": session }))?;
         let tree = control::call(&ep, "supervision_tree", json!({ "sessionId": session }))?;
         if f.json {
-            emit_json_ok("status", json!({ "status": status, "supervisionTree": tree }));
+            emit_json_ok(
+                "status",
+                json!({ "status": status, "supervisionTree": tree }),
+            );
         } else {
             render::status_one(session, &status, &tree, &ui);
         }
@@ -248,14 +339,22 @@ fn cmd_status(args: &[String]) -> Result<(), CliError> {
     let mut raw = Vec::new();
     for id in &ids {
         let status = control::call(&ep, "get_status", json!({ "sessionId": id }))?;
-        let st = status.get("status").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+        let st = status
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
         let ctx = status
             .get("snapshot")
             .and_then(|s| s.get("contextUsedPct"))
             .and_then(|p| p.as_f64())
             .map(|p| format!("{p:.0}%"))
             .unwrap_or_else(|| "-".to_string());
-        rows.push(render::StatusRow { session: id.clone(), status: st, ctx });
+        rows.push(render::StatusRow {
+            session: id.clone(),
+            status: st,
+            ctx,
+        });
         raw.push(status);
     }
 
@@ -288,19 +387,37 @@ fn cmd_send(args: &[String]) -> Result<(), CliError> {
         }
     }
     if positionals.len() < 2 {
-        return Err(CliError::usage("usage: th send <session> <text...>  [--no-enter] [--json]"));
+        return Err(CliError::usage(
+            "usage: th send <session> <text...>  [--no-enter] [--json]",
+        ));
     }
     let session = &positionals[0];
     let text = positionals[1..].join(" ");
 
     let ep = endpoint()?;
-    let result = control::call(&ep, "send_text", json!({ "sessionId": session, "text": text, "enter": enter }))?;
+    let result = control::call(
+        &ep,
+        "send_text",
+        json!({ "sessionId": session, "text": text, "enter": enter }),
+    )?;
     if json_mode {
-        emit_json_ok("send", json!({ "sessionId": session, "text": text, "enter": enter, "result": result }));
+        emit_json_ok(
+            "send",
+            json!({ "sessionId": session, "text": text, "enter": enter, "result": result }),
+        );
     } else {
-        let ui = Ui { tty: std::io::stdout().is_terminal(), all: false };
-        println!("sent to {session}: {text:?}{}", if enter { "  ⏎" } else { "" });
-        render::next(&ui, &[(format!("th read {session}"), "see the session's response")]);
+        let ui = Ui {
+            tty: std::io::stdout().is_terminal(),
+            all: false,
+        };
+        println!(
+            "sent to {session}: {text:?}{}",
+            if enter { "  ⏎" } else { "" }
+        );
+        render::next(
+            &ui,
+            &[(format!("th read {session}"), "see the session's response")],
+        );
     }
     Ok(())
 }
@@ -388,7 +505,9 @@ fn cmd_worktree_ls(args: &[String]) -> Result<(), CliError> {
                 (_, Some(true)) => "yes".to_string(),
                 (_, Some(false)) => "no".to_string(),
                 (_, None) if w.branch.is_none() => "n/a".to_string(),
-                (_, None) if w.branch.as_deref() == Some(scan.default_branch.as_str()) => "n/a".to_string(),
+                (_, None) if w.branch.as_deref() == Some(scan.default_branch.as_str()) => {
+                    "n/a".to_string()
+                }
                 (_, None) => "?".to_string(),
             },
             leased: match (&w.lease, scan.leases_complete) {
@@ -398,7 +517,13 @@ fn cmd_worktree_ls(args: &[String]) -> Result<(), CliError> {
             },
         })
         .collect();
-    render::worktrees(&scan.repo_root, &scan.default_branch, scan.lease_note.as_deref(), &rows, &ui);
+    render::worktrees(
+        &scan.repo_root,
+        &scan.default_branch,
+        scan.lease_note.as_deref(),
+        &rows,
+        &ui,
+    );
     Ok(())
 }
 
@@ -421,7 +546,9 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
             kind: "lease_unknown",
             message: format!(
                 "cannot verify session leases - refusing to prune. {}",
-                scan.lease_note.as_deref().unwrap_or("lease source unavailable")
+                scan.lease_note
+                    .as_deref()
+                    .unwrap_or("lease source unavailable")
             ),
         });
     }
@@ -537,9 +664,19 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                         d = "FORCED past an unmerged branch".to_string();
                     }
                     if !item.dead_sessions.is_empty() {
-                        d.push_str(&format!("; would close dead session(s) {}", item.dead_sessions.join(", ")));
+                        d.push_str(&format!(
+                            "; would close dead session(s) {}",
+                            item.dead_sessions.join(", ")
+                        ));
                     }
-                    (if *forced { "REAP*".to_string() } else { "REAP".to_string() }, d)
+                    (
+                        if *forced {
+                            "REAP*".to_string()
+                        } else {
+                            "REAP".to_string()
+                        },
+                        d,
+                    )
                 }
                 (worktree::Decision::Reap { forced }, Some(r)) => {
                     let d = match &r.error {
@@ -550,18 +687,32 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                                 d.push_str(", branch deleted");
                             }
                             if !r.closed_sessions.is_empty() {
-                                d.push_str(&format!(", closed dead session(s) {}", r.closed_sessions.join(", ")));
+                                d.push_str(&format!(
+                                    ", closed dead session(s) {}",
+                                    r.closed_sessions.join(", ")
+                                ));
                             }
                             d
                         }
                     };
-                    (if *forced { "REAP*".to_string() } else { "REAP".to_string() }, d)
+                    (
+                        if *forced {
+                            "REAP*".to_string()
+                        } else {
+                            "REAP".to_string()
+                        },
+                        d,
+                    )
                 }
             };
             render::PruneRow {
                 action,
                 path: rel_path(&item.w.path, &scan.repo_root),
-                branch: item.w.branch.clone().unwrap_or_else(|| "(detached)".to_string()),
+                branch: item
+                    .w
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "(detached)".to_string()),
                 detail,
                 would_lose: item.would_lose.clone(),
             }
@@ -570,7 +721,9 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
     render::prune_plan(&scan.repo_root, &scan.default_branch, !yes, &rows, &ui);
 
     if failures > 0 {
-        return Err(CliError::git(format!("{failures} reap(s) failed - see the report above")));
+        return Err(CliError::git(format!(
+            "{failures} reap(s) failed - see the report above"
+        )));
     }
     Ok(())
 }
@@ -619,7 +772,8 @@ fn cmd_worktree_new(args: &[String]) -> Result<(), CliError> {
         }
     }
 
-    let mut wt_args = json!({ "repoRoot": repo_root, "worktreePath": worktree_path, "branch": branch });
+    let mut wt_args =
+        json!({ "repoRoot": repo_root, "worktreePath": worktree_path, "branch": branch });
     if let Some(tab) = f.opts.get("--tab") {
         wt_args["tabName"] = json!(tab);
     }
@@ -634,8 +788,14 @@ fn cmd_worktree_new(args: &[String]) -> Result<(), CliError> {
         render::next(
             &ui,
             &[
-                ("th".to_string(), "fleet home view (find the new tab's terminal)"),
-                (format!("th worktree rm {repo_root} {worktree_path}"), "remove it when done"),
+                (
+                    "th".to_string(),
+                    "fleet home view (find the new tab's terminal)",
+                ),
+                (
+                    format!("th worktree rm {repo_root} {worktree_path}"),
+                    "remove it when done",
+                ),
             ],
         );
     }
@@ -652,7 +812,8 @@ fn reuse_worktree(
     branch: &str,
     desired_path: &str,
 ) -> Result<(), CliError> {
-    let out = worktree::execute_reuse(scan, candidate, branch, desired_path).map_err(CliError::git)?;
+    let out =
+        worktree::execute_reuse(scan, candidate, branch, desired_path).map_err(CliError::git)?;
     let data = json!({
         "reused": true,
         "repoRoot": scan.repo_root,
@@ -667,12 +828,21 @@ fn reuse_worktree(
         emit_json_ok("worktree new", data);
     } else {
         let ui = f.ui();
-        println!("worktree reused (pool recycle, no fresh checkout): {}", compact(&data));
+        println!(
+            "worktree reused (pool recycle, no fresh checkout): {}",
+            compact(&data)
+        );
         render::next(
             &ui,
             &[
-                (format!("th worktree ls {}", scan.repo_root), "the lifecycle table"),
-                (format!("th spawn {}", out.path), "open a terminal there (gated in this build)"),
+                (
+                    format!("th worktree ls {}", scan.repo_root),
+                    "the lifecycle table",
+                ),
+                (
+                    format!("th spawn {}", out.path),
+                    "open a terminal there (gated in this build)",
+                ),
             ],
         );
     }
@@ -684,7 +854,9 @@ fn cmd_worktree_rm(args: &[String]) -> Result<(), CliError> {
     let repo_root = f.positional(0, "worktree rm", "<repoRoot>")?;
     let worktree_path = f.positional(1, "worktree rm", "<path>")?;
     if f.opts.contains_key("--branch") {
-        eprintln!("th: note — remove_worktree keys off the path, not a branch; --branch is ignored.");
+        eprintln!(
+            "th: note — remove_worktree keys off the path, not a branch; --branch is ignored."
+        );
     }
     let force = f.bools.contains("--force");
 
@@ -811,7 +983,9 @@ impl Flags {
                     all = true;
                 } else if value_set.contains(a.as_str()) {
                     // `--flag value` form.
-                    let val = args.get(i + 1).ok_or_else(|| CliError::usage(format!("{a} expects a value")))?;
+                    let val = args
+                        .get(i + 1)
+                        .ok_or_else(|| CliError::usage(format!("{a} expects a value")))?;
                     opts.insert(a.clone(), val.clone());
                     i += 1;
                 } else {
@@ -823,7 +997,13 @@ impl Flags {
             i += 1;
         }
 
-        Ok(Flags { pos, opts, bools, json, all })
+        Ok(Flags {
+            pos,
+            opts,
+            bools,
+            json,
+            all,
+        })
     }
 
     fn positional(&self, idx: usize, cmd: &str, name: &str) -> Result<String, CliError> {
@@ -835,7 +1015,10 @@ impl Flags {
 
     /// The render context: TTY-detected stdout + the `--all` cap override.
     fn ui(&self) -> Ui {
-        Ui { tty: std::io::stdout().is_terminal(), all: self.all }
+        Ui {
+            tty: std::io::stdout().is_terminal(),
+            all: self.all,
+        }
     }
 }
 
@@ -856,12 +1039,13 @@ commands:\n\
   worktree new <repoRoot> <branch>   create a git worktree + tab  [--path P] [--tab T]\n\
                             (recycles a merged+clean+unleased pool worktree\n\
                              in place when one exists; --fresh opts out)\n\
-  worktree rm  <repoRoot> <path>     remove a git worktree        [--force]\n\
+  worktree rm  <repoRoot> <path>     temporarily unavailable pending safety service\n\
   worktree prune [repoRoot] reap merged+clean+unleased worktrees; dry-run by\n\
                             default  [--yes execute] [--force include unmerged]\n\
   tabs                      list workspace tabs                [--json]\n\
   health                    WSL host snapshot                  [--json]\n\
   events                    stream the control event bus (Ctrl-C to stop)\n\
+  agents                    start and supervise durable agent sessions\n\
 \n\
 flags:\n\
   --json        stable machine envelope: {{ok, command, data, error}} (read cmds)\n\
@@ -892,4 +1076,39 @@ examples:\n\
   th send 052ccbb2 'ls -la'\n\
   th health --json"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powder_mutation_errors_have_stable_machine_kinds() {
+        for state in [
+            "committed",
+            "pending",
+            "recovered",
+            "rejected",
+            "stale",
+            "conflict",
+            "expired",
+            "unsupported",
+            "malformed",
+            "timeout",
+        ] {
+            let error: CliError = ControlError::Server(format!(
+                "Powder completion: Powder mutation state '{state}': bounded detail"
+            ))
+            .into();
+            assert_eq!(error.code, exit::SERVER_ERROR);
+            assert_eq!(error.kind, format!("powder_mutation_{state}"));
+        }
+    }
+
+    #[test]
+    fn unrelated_server_errors_keep_the_existing_kind() {
+        let error: CliError = ControlError::Server("ordinary failure".into()).into();
+        assert_eq!(error.code, exit::SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

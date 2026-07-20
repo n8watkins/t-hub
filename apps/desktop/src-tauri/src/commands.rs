@@ -14,6 +14,7 @@ use crate::events::{self, StateEvent};
 use crate::pty::PtySession;
 use crate::remote_pty::{RemotePty, RemotePtyManager};
 use crate::tmux;
+use crate::{agent, agent::TerminalSnapshotBridgeError};
 
 // Wire-contract enum mirroring the frontend `TerminalState` (ipc/types.ts). The
 // backend doesn't emit every variant yet — `Starting`/`Error` are part of the
@@ -65,7 +66,7 @@ pub struct TerminalInfo {
     /// REPLACED by the pane's *live* current path (`#{pane_current_path}` from
     /// `tmux::pane_info`), so it tracks the user `cd`-ing around. There is a
     /// single `cwd` field — the spawn value is just its initial seed, and the
-    /// ~5s `list_terminals` poll keeps it current. This is the enabling primitive
+    /// ~15s `list_terminals` poll keeps it current. This is the enabling primitive
     /// for the worktree "anchor to the focused tile's repo" flow (WS-9) and the
     /// relative-file-open TODO (WS-1).
     pub cwd: String,
@@ -357,7 +358,6 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
 #[tauri::command]
 pub async fn spawn_terminal(
     app: tauri::AppHandle,
-    remote: tauri::State<'_, RemotePtyManager>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
     // The terminal id IS the tmux session's own suffix, so the id is stable and
@@ -422,12 +422,6 @@ pub async fn spawn_terminal(
             ));
         }
     }
-
-    // Mark this id FRESH so its first `attach_terminal` returns empty scrollback
-    // (the frontend then draws one clean prompt via Ctrl-L instead of replaying the
-    // reflow-prone capture). A later reattach-after-close is NOT fresh → real
-    // scrollback. Preserves the in-process path's `has_live` fresh-vs-reattach signal.
-    remote.fresh.lock().insert(id.clone());
 
     // Server-split M2a: spawn NO local PTY here. The detached tmux session is now
     // ready; the frontend's mount flow calls `attach_terminal`, which opens a
@@ -517,11 +511,9 @@ pub async fn attach_terminal(
 
     // First attach (or re-attach after `close_terminal` detached it): open a new
     // RemotePty over the control socket. `connect` performs the attach_pty
-    // handshake and returns the server's base64 scrollback (its opening frame),
-    // which we hand straight back to the frontend — the same wire shape the old
-    // path returned (a base64 string of the pane scrollback).
+    // handshake and returns the empty compatibility seed from its opening frame.
     let endpoint = control_endpoint(&app)?;
-    let (conn, scrollback_b64) =
+    let (conn, _compatibility_seed) =
         match RemotePty::connect(&app, &endpoint.addr(), endpoint.token(), &id, cols, rows) {
             Ok(x) => x,
             // A local rebind may have rotated the listener port (relay-wedge
@@ -533,12 +525,6 @@ pub async fn attach_terminal(
             },
         };
     remote.conns.lock().insert(id.clone(), conn);
-
-    // Fresh spawn (spawn_terminal marked it) → return EMPTY scrollback so the
-    // frontend draws a clean prompt via Ctrl-L instead of replaying the capture's
-    // reflow cascade. A reattach (not in `fresh`) → the real scrollback, to restore
-    // history. Mirrors the old `has_live` ? empty : capture_pane branch.
-    let was_fresh = remote.fresh.lock().remove(&id);
 
     // A successful attach binds a remote PTY to this session, so the terminal is
     // unambiguously Live. After a reload the frontend may have seeded this terminal
@@ -553,11 +539,7 @@ pub async fn attach_terminal(
         },
     );
 
-    Ok(if was_fresh {
-        String::new()
-    } else {
-        scrollback_b64
-    })
+    Ok(String::new())
 }
 
 /// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
@@ -693,10 +675,6 @@ pub async fn kill_terminal(
     // its process tree). Remove the conn (releasing the lock) before any blocking
     // socket op so the Mutex is never held across I/O.
     let conn = remote.conns.lock().remove(&id);
-    // Drop any lingering "fresh" mark for this id (spawned but never attached) so
-    // it can't accumulate — the id is gone for good after a kill.
-    remote.fresh.lock().remove(&id);
-
     // Captain-chat phase 2: a killed tile leaves the captains registry too - its
     // captaincy is released, and it drops out of every crew list. The UI kills
     // via this command (the × and the closeWorkspace reap), so this is the UI's
@@ -771,28 +749,19 @@ pub async fn list_terminals(
         .map(|(tmux_session, id)| (id.clone(), tmux_session.clone()))
         .collect();
 
-    // The two `wsl.exe` spawns (`list_sessions` + `pane_info`) each wait on a
-    // child, which would pin a Tokio worker; run the whole reconcile off the
-    // executor so a saturated worker pool can't stall the UI's IPC. The blocking
-    // walk returns both the rendered `infos` AND the live tmux session set, so
-    // the caller (which still holds `state`) can evict dead map entries without
-    // the `'static` closure needing to borrow `&State`.
+    // The persistent WSL agent owns the normal terminal snapshot path, avoiding
+    // two recurring Windows host-bridge process trees every 15 seconds. Older or
+    // disconnected agents use the bounded local compatibility scan. Either path
+    // is blocking, so run the reconcile off the async executor.
     let (infos, live_sessions): (Vec<TerminalInfo>, std::collections::HashSet<String>) =
         tauri::async_runtime::spawn_blocking(move || {
-            // Source of truth for liveness is the tmux server on the `t-hub` socket;
-            // the in-memory map only tells us which terminals this UI currently has a
-            // PTY client for (Live) vs. ones running detached (Detached).
-            let live_sessions =
-                tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
-
-            // Per-session foreground command + live cwd (best-effort), so each tile is
-            // labeled by what's actually running (`claude`, `zsh`, ...) and where, rather
-            // than a raw id. A failure here just leaves the old id-based label.
-            let pane_map: std::collections::HashMap<String, (String, String)> = tmux::pane_info()
-                .unwrap_or_default()
+            let snapshot = terminal_snapshot()?;
+            let pane_map: std::collections::HashMap<String, (String, String)> = snapshot
+                .panes
                 .into_iter()
                 .map(|p| (p.session, (p.command, p.cwd)))
                 .collect();
+            let live_sessions = snapshot.sessions;
 
             // Reconcile: every tmux session named `th_*` is a T-Hub terminal. Reverse
             // any leftover in-memory entries whose tmux session vanished by NOT
@@ -849,7 +818,7 @@ pub async fn list_terminals(
     // already emitted `exit` + `state=Exited`, and the connection dropped — yet the
     // dead `RemotePty` (joined reader handle) still lingers in the map until the UI
     // happens to call `close_terminal`/`kill_terminal`. Evict it here, piggybacking
-    // on this existing 5s reconcile.
+    // on this existing 15s reconcile.
     //
     // SAFETY — a DETACHED-but-running terminal is NEVER reaped: `close_terminal`
     // already removed it from the map (nothing to evict) and intentionally kept
@@ -900,9 +869,159 @@ pub async fn list_terminals(
     Ok(infos)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSnapshotSource {
+    Agent,
+    FallbackDisconnected,
+    FallbackUnsupported,
+}
+
+static TERMINAL_SNAPSHOT_AGENT_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static TERMINAL_SNAPSHOT_LAST_DIAGNOSTIC: std::sync::LazyLock<Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+static TERMINAL_SNAPSHOT_FALLBACK_POLICY: std::sync::LazyLock<
+    Mutex<TerminalSnapshotFallbackPolicy>,
+> = std::sync::LazyLock::new(|| Mutex::new(TerminalSnapshotFallbackPolicy::default()));
+
+#[derive(Debug, Default)]
+struct TerminalSnapshotFallbackPolicy {
+    agent_succeeded: bool,
+    bootstrap_fallback_used: bool,
+}
+
+impl TerminalSnapshotFallbackPolicy {
+    fn record_agent_success(&mut self) {
+        self.agent_succeeded = true;
+    }
+
+    fn claim_bootstrap_fallback(&mut self) -> bool {
+        if self.agent_succeeded || self.bootstrap_fallback_used {
+            return false;
+        }
+        self.bootstrap_fallback_used = true;
+        true
+    }
+}
+
+fn terminal_snapshot() -> Result<t_hub_protocol::TerminalSnapshot, String> {
+    let result = select_terminal_snapshot(
+        &TERMINAL_SNAPSHOT_FALLBACK_POLICY,
+        agent::terminal_snapshot,
+        || {
+            let sessions =
+                tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
+            let panes = tmux::pane_info()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|pane| t_hub_protocol::TerminalPane {
+                    session: pane.session,
+                    command: pane.command,
+                    cwd: pane.cwd,
+                })
+                .collect();
+            Ok(t_hub_protocol::TerminalSnapshot { sessions, panes })
+        },
+    );
+
+    let (snapshot, source, reason) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            log_terminal_snapshot_diagnostic(format!(
+                "t-hub: terminal_snapshot source=agent_error reason={error}"
+            ));
+            return Err(error);
+        }
+    };
+
+    let should_log = match source {
+        TerminalSnapshotSource::Agent => {
+            !TERMINAL_SNAPSHOT_AGENT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
+        TerminalSnapshotSource::FallbackDisconnected
+        | TerminalSnapshotSource::FallbackUnsupported => true,
+    };
+    if should_log {
+        let source_name = match source {
+            TerminalSnapshotSource::Agent => "agent",
+            TerminalSnapshotSource::FallbackDisconnected => "fallback_disconnected",
+            TerminalSnapshotSource::FallbackUnsupported => "fallback_unsupported",
+        };
+        let diagnostic = reason.map_or_else(
+            || format!("t-hub: terminal_snapshot source={source_name}"),
+            |reason| format!("t-hub: terminal_snapshot source={source_name} reason={reason}"),
+        );
+        log_terminal_snapshot_diagnostic(diagnostic);
+    }
+    Ok(snapshot)
+}
+
+fn log_terminal_snapshot_diagnostic(diagnostic: String) {
+    let mut previous = TERMINAL_SNAPSHOT_LAST_DIAGNOSTIC.lock();
+    if previous.as_deref() != Some(&diagnostic) {
+        eprintln!("{diagnostic}");
+        *previous = Some(diagnostic);
+    }
+}
+
+fn select_terminal_snapshot(
+    policy: &Mutex<TerminalSnapshotFallbackPolicy>,
+    bridge: impl FnOnce() -> Result<t_hub_protocol::TerminalSnapshot, TerminalSnapshotBridgeError>,
+    fallback: impl FnOnce() -> Result<t_hub_protocol::TerminalSnapshot, String>,
+) -> Result<
+    (
+        t_hub_protocol::TerminalSnapshot,
+        TerminalSnapshotSource,
+        Option<String>,
+    ),
+    String,
+> {
+    match bridge() {
+        Ok(snapshot) => {
+            policy.lock().record_agent_success();
+            Ok((snapshot, TerminalSnapshotSource::Agent, None))
+        }
+        Err(TerminalSnapshotBridgeError::Disconnected(reason)) => {
+            if !policy.lock().claim_bootstrap_fallback() {
+                return Err(format!("agent disconnected: {reason}"));
+            }
+            fallback()
+                .map(|snapshot| {
+                    (
+                        snapshot,
+                        TerminalSnapshotSource::FallbackDisconnected,
+                        Some(reason),
+                    )
+                })
+                .map_err(|error| format!("bootstrap fallback failed: {error}"))
+        }
+        Err(TerminalSnapshotBridgeError::Unsupported(reason)) => {
+            if !policy.lock().claim_bootstrap_fallback() {
+                return Err(format!("agent unsupported: {reason}"));
+            }
+            fallback()
+                .map(|snapshot| {
+                    (
+                        snapshot,
+                        TerminalSnapshotSource::FallbackUnsupported,
+                        Some(reason),
+                    )
+                })
+                .map_err(|error| format!("bootstrap fallback failed: {error}"))
+        }
+        Err(TerminalSnapshotBridgeError::TimedOut(reason)) => {
+            Err(format!("agent timeout: {reason}"))
+        }
+        Err(TerminalSnapshotBridgeError::CommandFailed(reason)) => {
+            Err(format!("agent command failed: {reason}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     fn live(names: &[&str]) -> HashSet<String> {
@@ -911,6 +1030,124 @@ mod tests {
 
     fn candidate(id: &str, session: &str) -> (String, String) {
         (id.to_string(), session.to_string())
+    }
+
+    fn sample_terminal_snapshot() -> t_hub_protocol::TerminalSnapshot {
+        t_hub_protocol::TerminalSnapshot {
+            sessions: vec!["th_abc12345".into()],
+            panes: vec![t_hub_protocol::TerminalPane {
+                session: "th_abc12345".into(),
+                command: "codex".into(),
+                cwd: "/repo".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_agent_success_never_invokes_fallback() {
+        let expected = sample_terminal_snapshot();
+        let fallback_called = Cell::new(false);
+        let policy = Mutex::new(TerminalSnapshotFallbackPolicy::default());
+        let (actual, source, reason) = select_terminal_snapshot(
+            &policy,
+            || Ok(expected.clone()),
+            || {
+                fallback_called.set(true);
+                Err("fallback must not run".into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(source, TerminalSnapshotSource::Agent);
+        assert_eq!(reason, None);
+        assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn terminal_snapshot_uses_categorized_compatibility_fallbacks() {
+        let cases = [
+            (
+                TerminalSnapshotBridgeError::Disconnected("offline".into()),
+                TerminalSnapshotSource::FallbackDisconnected,
+            ),
+            (
+                TerminalSnapshotBridgeError::Unsupported("old agent".into()),
+                TerminalSnapshotSource::FallbackUnsupported,
+            ),
+        ];
+
+        for (error, expected_source) in cases {
+            let expected = sample_terminal_snapshot();
+            let policy = Mutex::new(TerminalSnapshotFallbackPolicy::default());
+            let (actual, source, reason) =
+                select_terminal_snapshot(&policy, || Err(error), || Ok(expected.clone())).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(source, expected_source);
+            assert!(reason.is_some());
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_agent_failures_never_invoke_local_fallback() {
+        for error in [
+            TerminalSnapshotBridgeError::TimedOut("slow tmux".into()),
+            TerminalSnapshotBridgeError::CommandFailed("tmux failed".into()),
+        ] {
+            let fallback_called = Cell::new(false);
+            let policy = Mutex::new(TerminalSnapshotFallbackPolicy::default());
+            let result = select_terminal_snapshot(
+                &policy,
+                || Err(error),
+                || {
+                    fallback_called.set(true);
+                    Ok(sample_terminal_snapshot())
+                },
+            );
+            assert!(result.is_err());
+            assert!(!fallback_called.get());
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_compatibility_fallback_is_bounded_to_one_attempt() {
+        let policy = Mutex::new(TerminalSnapshotFallbackPolicy::default());
+        let fallback_count = Cell::new(0);
+        for _ in 0..3 {
+            let _ = select_terminal_snapshot(
+                &policy,
+                || Err(TerminalSnapshotBridgeError::Unsupported("old agent".into())),
+                || {
+                    fallback_count.set(fallback_count.get() + 1);
+                    Ok(sample_terminal_snapshot())
+                },
+            );
+        }
+        assert_eq!(fallback_count.get(), 1);
+    }
+
+    #[test]
+    fn terminal_snapshot_never_falls_back_after_agent_success() {
+        let policy = Mutex::new(TerminalSnapshotFallbackPolicy::default());
+        select_terminal_snapshot(
+            &policy,
+            || Ok(sample_terminal_snapshot()),
+            || Err("fallback must not run".into()),
+        )
+        .unwrap();
+
+        let fallback_count = Cell::new(0);
+        for _ in 0..3 {
+            let _ = select_terminal_snapshot(
+                &policy,
+                || Err(TerminalSnapshotBridgeError::Disconnected("offline".into())),
+                || {
+                    fallback_count.set(fallback_count.get() + 1);
+                    Ok(sample_terminal_snapshot())
+                },
+            );
+        }
+        assert_eq!(fallback_count.get(), 0);
     }
 
     /// An EXITED terminal — in the map but its tmux session has vanished from the

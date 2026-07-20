@@ -1,25 +1,647 @@
 # Captain, Crew, Powder, and Performance Handoff
 
-**Updated:** 2026-07-14.
+> Historical compatibility record: this handoff describes the pre-retirement
+> Powder workflow and verified runtime evidence.
+> It is preserved for migration and recovery history, not as current Captain,
+> Project, MCP, health, or agent-session procedure.
+
+## Canonical Planning Note
+
+The runtime evidence in this handoff is current through the installed `0.3.103` build.
+The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
+That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
+The CLI-first phase is governed by [cli-contract.md](./cli-contract.md), which preserves the existing Rust client architecture and stable JSON contract while scheduling strict parsing, safety, bounded output, help, and contract tests for later implementation.
+Agent status is governed by [STATUS-MODEL.md](./STATUS-MODEL.md), and shared worktree state is governed by [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
+Where the narrower ordered list in this handoff differs from the phased plan, follow the phased plan.
+
+**Updated:** 2026-07-18.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
-**Branch:** `main`.
-**Source head before this handoff update:** `7f395fb`.
-**Installed Windows build:** T-Hub `0.3.64` produced by production release workflow `29308870690` from `7f395fb`.
+**Branch:** `fix/captain-control-runtime`.
+**Source head before this handoff update:** `20c14a3`.
+**Last verified installed Windows build:** locally built T-Hub `0.3.104` from exact detached source `e2ab7e3`; current installed identity after the later token rotation is unknown.
+
+## Active Resume Boundary
+
+This section is the reset-safe starting point for the next session.
+The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
+
+### Replacement Captain Resume Point, 2026-07-18
+
+This subsection supersedes every older resume point below for current orchestration state.
+It was written because Captain terminal `0c7b7560` retained a pinned control token after the T-Hub application rotated its token.
+The terminal remains alive, but `my_capability` and `captain_bootstrap` now fail with `unauthorized: bad control token`.
+The client correctly refuses to adopt the read-only token from `control.json`.
+The old Captain therefore cannot checkpoint, dispatch, steer, reap, release its registry claim, or communicate through T-Hub.
+The General must close or replace that terminal through the T-Hub UI, create a new control-capability Captain for the existing `t-hub-app` Project, and give it the kickoff prompt at the end of this subsection.
+
+#### Assignment and authority
+
+Recover ship `t-hub-app` for Project `t-hub-app` at `/home/natkins/projects/tools/t-hub/t-hub-app`.
+Continue improving T-Hub through the existing phased chain rather than starting a replacement roadmap.
+Powder profile name `n8desktop-wsl` and Powder repository `t-hub` are authoritative for work and claims.
+Never read the protected profile file, resolve its credential command, expose a token, or emulate a Powder claim locally.
+Read `AGENTS.md`, this handoff, and the canonical documents listed in `docs/REVIEW-INDEX.md` before changing work.
+Treat `docs/PHASED-PRODUCTION-PLAN.md` as the canonical implementation order.
+Treat `docs/CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md` as integrated General-directed input rather than a competing roadmap.
+Preserve cross-Project isolation, Crew read-capability defaults, protected credentials, production and protected-branch gates, idempotency, rollback guarantees, and installed-runtime verification.
+Commit every verified logical change separately with no agent co-author.
+Do not push, merge, install, restart, deploy, publish, or release unless the General explicitly authorizes that action.
+Preserve `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md`.
+Do not touch either Appturnity checkout or dispatch Appturnity Crew until its Project link is authoritative.
+
+#### Coordinator landing point
+
+The coordinator branch is `fix/captain-control-runtime` at `20c14a3e0b0cc6de9cee0f32826b18de85fdd8d9`.
+Commit `034b520` merged the independently approved Fleet Workspace Identity lane.
+Commit `20c14a3` serialized the request-status tmux fixture after landing.
+The coordinator has no tracked modification.
+Its only observed untracked paths are protected `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md`.
+No push, new install, restart, deploy, publication, or release followed this landing.
+
+Fleet Workspace Identity was independently approved at immutable head `f77ffae478d1239ed9720a99a3141859df21811b` before merge.
+Recorded exact-head evidence includes Rust formatting, warnings-denied Clippy, a clean Rust rerun with 932 passed and 2 ignored, frontend verification with 57 files and 477 tests, TypeScript, the production Vite build, real MCP E2E with 2 passed and 1 helper ignored, restart-convergence and foreign or duplicate rejection with 2 passed, and durable pre-report seed coverage with 1 passed.
+The separate Fleet worktree is clean except protected untracked `CLAUDE.md`.
+
+#### Active Cortana lane
+
+The Cortana worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/cortana-startup-recovery` on branch `feat/cortana-startup-recovery`.
+Its observed head is `fbed6e8`, `harden Cortana provider receipt observation`.
+Earlier reviewed foundations include authenticated journal migration at `c16bd10` and provider-session authentication at `6721fa4`.
+Independent review rejected `6721fa4` because provider validation used the canonical `.js` basename of an installed Codex symlink and because tmux environment observation could resolve a unique-prefix collision after the expected session died.
+Commit `fbed6e8` changes `control.rs`, `harness/mod.rs`, and `tmux.rs` and appears scoped to those two receipt-observation blockers.
+No post-rotation T-Hub report or independent approval for `fbed6e8` was available to the old Captain.
+The replacement Captain must not infer approval from the commit title.
+It must collect the Crew report and Powder evidence, inspect the exact diff, rerun proportionate gates, and obtain fresh independent exact-head review.
+
+The Cortana worktree currently also has uncommitted changes in `apps/desktop/src-tauri/src/control.rs` and `apps/desktop/src-tauri/src/identity.rs` totaling approximately 645 insertions and 28 deletions, plus protected untracked `CLAUDE.md`.
+Before token rotation, this was described as separate operation-bound Cortana identity and orphan-recovery work that had been restored after the receipt fix.
+That attribution is not freshly verified.
+Preserve the changes, inspect them before sending any instruction, and keep them separate from receipt review and remediation commits.
+
+Before token rotation, the authoritative Crew binding was Captain Crew terminal `ef9925f8`, Powder card `thub-cortana-startup-recovery`, and run `run-EE-3gLkCnBnn`.
+The replacement Captain must reread the manifest, terminal, claim, run, and work log before treating that binding as live.
+
+#### Active Codex capacity fallback lane
+
+The capacity worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-capacity-fallback` on branch `feat/codex-capacity-fallback`.
+Its observed head is `b45fd468e583dd9f40ad17ff091981effdcb37a2`, `fix(codex): close picker proof replay gaps`.
+The durable recovery policy and bounded journal through `7d3c9d0` were independently approved before token rotation.
+The official Codex 0.144.5 picker adapter at `b45fd46` was independently approved before token rotation with 20 focused tests, formatting, warnings-denied Clippy, exact capture freshness and predecessor binding, bounded row movement, strict Quick and All Models grammar, and official fixture coverage.
+That approval may not yet be appended to the authoritative Powder work log because the token rotated immediately afterward.
+The replacement Captain must reconcile the work log and append only through the sanctioned Crew binding if evidence is missing and the operation is unambiguous.
+
+The capacity worktree contains uncommitted integration work across the Harness, desktop library, Captain list, theme editor, tile header, IPC client, auto-continue watcher, and settings store.
+It also contains untracked implementation files `apps/desktop/src-tauri/src/codex_capacity.rs` and `apps/desktop/src/store/codexCapacity.ts`, plus protected untracked `CLAUDE.md`.
+Preserve all of that work.
+Do not ask the General to log in to Codex merely to continue this lane.
+Official source, exact snapshots, and disposable credential-free fixtures are sufficient for current development, while a real authenticated installed E2E may remain a final acceptance gate.
+
+Before token rotation, the authoritative Crew binding was Captain Crew terminal `100e3851`, Powder card `thub-codex-capacity-fallback`, and run `run-vZQTh0E9o5fe`.
+The replacement Captain must reread the manifest, terminal, claim, run, and work log before treating that binding as live.
+
+#### Newly requested chain workspace and terminal-header plan
+
+The General requested that a GPT-5.6-solo extra-high Crew create the plan and that the Captain not author the product implementation plan itself.
+The request strengthens card `thub-captain-workspace-integration` with durable chain-based Work Workspace ownership.
+Related tasks should share one named chain workspace instead of receiving duplicate worktree-named workspaces.
+Captains must remain in Captain Workspace, and Crew terminals must be created in the owning chain workspace.
+An eligible Work Workspace should be closed and destroyed only after its chain has landed and its terminals and worktrees are safely retired.
+Terminal headers should show the project or product first, the chain or workspace second, and branch or worktree detail as secondary information without repeating equivalent names.
+Responsive layouts should truncate deliberately, rename `Run + Preview` to `Preview`, and collapse Terminal, Files, Preview, and Board controls to accessible icons at narrow widths.
+
+A clean planning worktree already exists at `/home/natkins/projects/tools/t-hub/t-hub-worktrees/workspace-chain-lifecycle` on branch `plan/workspace-chain-lifecycle` at coordinator base `20c14a3`.
+It has no changes and no protected artifact.
+Two sanctioned `dispatch_crew` attempts against `thub-captain-workspace-integration` returned Powder HTTP 409.
+Each attempt rolled back cleanly with no Crew terminal, Powder claim, run binding, or partial local terminal retained.
+The card was last observed as `ready` and unclaimed, and protected Powder health was good.
+The sanitized error did not establish whether the conflict was a dependency, WIP limit, or another authoritative claim rule.
+Do not retry the dispatch blindly and do not create an unclaimed terminal as a substitute.
+First reread the board and reconcile any retained T-Hub operation intent.
+If the conflict persists, route this exact evidence to the Powder Captain through a sanctioned cross-Project communication surface.
+Once the card is authoritatively staffable, dispatch exactly one planning-only Crew into the shared chain workspace, verify the prompt, and select GPT-5.6-solo extra-high through the supported Codex UI because `dispatch_crew` does not currently accept model or reasoning parameters.
+Require an independent plan review before scheduling implementation with fresh context.
+
+#### Powder and control-plane state
+
+Immediately before token rotation, the T-Hub Project was authoritatively bound to protected profile `n8desktop-wsl` and repository `t-hub`.
+The Cortana and capacity claims above were healthy and auto-renewing.
+Fleet watches were armed for both active Crew on completed, needs-question, needs-permission, and failed transitions.
+The old Captain observed a Captain-only tab `captains-reserved`, a shared Crew tab `tab-mrqu9mvx-1`, and another generic tab `tab-mrl21zhy-1`.
+Those observations directly support the General's workspace naming and placement concern, but they are not current after token rotation.
+
+The only observed sentinel after token rotation was the older `powder-control-remediation.done`.
+No active Cortana, capacity, or planning sentinel was present.
+The old Captain could not update `captain_checkpoint` or append a Powder work log after rotation.
+The durable manifest is therefore expected to omit `fbed6e8`, the approval status of `b45fd46`, the two failed planning dispatches, and the token-rotation blocker.
+
+#### Ordered recovery and continuation
+
+1. Run the Captain skill environment check and confirm the new terminal has T-Hub `control` capability.
+2. Run full `captain_bootstrap`, then reconcile `list_captains`, `list_terminals`, tabs, live terminal reads, Git worktrees, provider conversation identifiers, the Project binding, Powder health, the board, active claims, runs, criteria, work logs, blockers, awaiting-input records, pending operation intents, and sentinels.
+3. Resolve the stale registry ownership left by terminal `0c7b7560` only through sanctioned T-Hub operations and observed liveness.
+4. Persist a new `captain_checkpoint` containing the exact reconciled facts and the next ordered action.
+5. Preserve and supervise the two active lanes before staffing new work.
+6. Review and land the Cortana receipt fix first if `fbed6e8` passes fresh independent review, then continue the separate identity and orphan-recovery slice.
+7. Reconcile the missing Powder approval log for `b45fd46`, then continue capacity integration and its real fallback flow.
+8. Reconcile the planning card's two HTTP 409 outcomes and staff the planning Crew only when Powder authoritatively allows one claim without overlap.
+9. Continue the remaining chain in canonical order: provider-neutral History, terminal and agent status prerequisites, sidebar status, final Captain Workspace integration including new-board Captain flow and obsolete-board cleanup, then installed-runtime completion audit.
+10. Use parallel Crew only when dependencies unlock and file ownership does not overlap, with independent review along the way.
+11. Reap terminals, worktrees, and Work Workspaces only after landed-work, evidence, follow-up, and clean-state gates all pass.
+
+The last user-facing progress estimate was approximately 45 percent of the full chain when weighted by exit gates.
+That estimate reflects Fleet Workspace Identity landed, substantial Cortana and capacity foundations complete, and significant integration, History, status, workspace UX, cleanup, and installed-runtime work still open.
+
+#### Captain creation purpose prompt
+
+Use the following as the assignment or purpose in the T-Hub Captain creation flow:
+
+```text
+Recover and continue ship t-hub-app for the existing T-Hub Project t-hub-app at /home/natkins/projects/tools/t-hub/t-hub-app.
+Use Powder profile n8desktop-wsl and repository t-hub as authoritative.
+First read AGENTS.md, docs/CAPTAIN-POWDER-HANDOFF.md, and every canonical document listed in docs/REVIEW-INDEX.md.
+Run full Captain durable recovery before acting, reconcile the stale prior Captain claim, all live Crew, Git worktrees, Powder claims and runs, pending operation intents, sentinels, and the two cleanly rolled-back HTTP 409 planning dispatches.
+Preserve every active lane and uncommitted change.
+Continue supervising Cortana startup recovery and Codex capacity fallback, require fresh independent review at each landing boundary, and staff the GPT-5.6-solo extra-high workspace-chain planning Crew only after Powder authoritatively permits the claim.
+Keep the Captain at orchestration altitude, use sanctioned T-Hub and Powder surfaces only, keep the durable checkpoint current, commit every verified logical change separately without a co-author, and do not push, merge, install, restart, deploy, publish, or release without explicit General authorization.
+```
+
+### Verified 2026-07-17 Wave 0 Installed Activation Boundary
+
+The General authorized the protected Wave 0 integration, local installation, application restart, and installed-runtime verification needed to unblock the active T-Hub chain.
+The canonical branch `fix/captain-control-runtime` now contains merge commit `e2ab7e3781a95db37269c4f61916f2ba8c0a498e` with coordinator parent `1956424801c8cc1bd065bef9cf27bbd7d2adbe11` and exact reviewed Wave 0 parent `d10de00ca6a4c02e0ec5a2d4b721f58cfc090842`.
+An independent read-only landing audit approved that merge after verifying a common base at `a3b136a4005afea05b2d72f21f5742d4ad0f08fe`, no changed-path overlap, exact parent order, exact tree overlay, no conflict resolution, clean diff checks, and untouched protected artifacts.
+
+The source and frontend gates passed formatting, strict workspace Clippy, 480 frontend tests, TypeScript checking, and the production frontend build.
+The required real-agent integration gate passed its exact ignored workspace case separately.
+The one permitted fresh serial Rust workspace probe reported 887 passed, 2 intentional ignores, and 1 known last-session tmux teardown residual in `get_request_status_command_resolves_a_completed_spawn` with `server exited unexpectedly`.
+That fixture residual was not retried, and production `tmux.rs` was not changed.
+The exact reviewed Wave 0 source at `d10de00` retains its separately recorded green aggregate evidence.
+
+The Windows production artifacts were built from a clean detached worktree at exact commit `e2ab7e3`.
+The local build produced NSIS installer SHA-256 `E32281BA16BE817914EE2517436629EB90B3F7BA425602E59AE863F93873CEFF` and MSI SHA-256 `396D71CA0D135EE6DF6B0B55C8AEC8E7C251A261112261371E60A5C87C11BCAF`.
+The build command returned nonzero only after producing both bundles because the repository contains a public updater key but the local environment has no private signing key.
+No signing credential was accessed or bypassed.
+The exact NSIS installer completed silently with exit code zero, and the application restarted once from PID `3872` to PID `24052`.
+The installed executable is version `0.3.104` at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` with SHA-256 `4E90AC9B36ABD9AC0DD57F744E16D634B371137C70AD64B807E74FE608B246C9`.
+The prior installed executable remains available for rollback with SHA-256 `1ADBC5D0F9D9A4F386FC36173ABADC4772EDC87A9521CCC4506F4B3B9132F814`.
+
+The WSL runtime was updated from the same source boundary.
+Installed `t-hub-agent` SHA-256 is `F188BEC319E899F90E2C6255E7341A8E8235D947D2EDEE99275A086EAF23AA11`.
+Installed `t-hub-mcp` SHA-256 is `F13F0765223BC63AAD8F45AE1F0B54FEB9260EAFC0D19F4E06F2DE264B753555`.
+Installed `th` SHA-256 is `DAE508A985F5FF8333BBF07D659B10559B3254B5BF2FFD322DAA78F2A35F6F58`.
+Rollback copies of the previous WSL agent and CLI were retained.
+
+All nine pre-install tmux terminal identities and pane PIDs survived the restart.
+All four Captain ships, the active Wave 0 and T2 Crew bindings, their exact Powder cards and runs, the control capability, the fleet roster, and the registered Project survived the restart.
+The authoritative Project remains bound to Powder profile `n8desktop-wsl` and repository `t-hub`.
+Protected Powder health and repository authorization pass, and the board remains readable and ready.
+
+The installed Wave 0 runtime now reaches the exact fail-closed Powder capability boundary, but the authoritative Powder deployment does not advertise the complete schema-18 run-bound mutation contract.
+The first exact Wave 0 criterion review therefore returned `Powder mutation state 'unsupported': deployed run-bound capability verification failed` without recording a mutation.
+The first post-install dispatch of ready card `thub-codex-permission-observability` failed before claim or terminal creation because the protected profile has no stable `operationIdentity` for replay-safe initial claims.
+The card remains ready and unclaimed, and no duplicate Crew, run, terminal, or binding was created.
+
+Cross-Project isolation correctly prevents the T-Hub Captain from operating or reading the Powder Captain session directly.
+The T-Hub Captain sent a durable standard-priority status request through Cortana for the authoritative Powder Captain to verify the live schema and route catalog against Powder main `8217c29c47b6d55a7ce9e788be2ba69a0b252fe8`, reconcile any stale Powder deployment, and restore a stable protected profile operation identity without exposing credentials.
+Wave 0 Crew `f1717de9` and T2 Crew `84ec361c` remain preserved with their exact active claims until that Powder-owned gate is resolved.
+The previously completed T1 Crew `1e7eef7d` and launch-attestation Crew `e0b697e9` were safely closed only after their authoritative cards and runs were confirmed complete, their reviewed heads were confirmed landed in `e2ab7e3`, and their worktrees were confirmed clean except protected `CLAUDE.md`.
+
+The next ordered action is to receive the Powder-owned deployment and profile reconciliation evidence through Cortana, repeat the exact Wave 0 criterion review, complete Wave 0 and T2 with run-bound proof, and dispatch `thub-codex-permission-observability` from its clean `e2ab7e3` worktree.
+No push, protected-branch merge, public deployment, publication, or product release occurred.
+
+### Verified 2026-07-16 Combined Codex Permission Integration Boundary
+
+The General authorized an isolated combined-tree integration and real-agent verification, with an explicit stop before merge or installation.
+The integration worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-integration` on branch `integrate/codex-permission-failsafe` from canonical base `4d5e900`.
+The ten reviewed observability commits were cherry-picked first as `cc85d07` through `25a87e2`.
+The ten reviewed launch-attestation commits were then cherry-picked as `7a0dfd0` through `ea78d31`.
+`git range-diff` reports every commit in both series as an exact match after hash translation.
+
+Commit `87d9470` adds the missing combined proof through the real `dispatch_crew` path.
+It builds and invokes the agent from the integration worktree, records exactly one degraded marker for the spawned Crew tmux session, then executes and attests the Codex provider with bypass permissions.
+The proof observed one Powder claim and no release on success.
+Commit `83dde88` makes the existing timed-out descendant test wait for bounded kernel reaping after a process-group kill.
+That correction passed the 56-test agent suite and 3 agent process E2E tests twenty consecutive times with default parallelism.
+Commit `0d42ce8` removes an inappropriate test-server lifetime deadline that began before the serialized Powder profile lock was acquired and recovers the restored test environment lock after a prior panic.
+The full workspace passed three consecutive parallel runs after that correction.
+
+Commit `8601f2a` adds the named repository gate `scripts/captain/verify-codex-permission-integration.sh` and makes the real-agent test explicitly ignored in ordinary workspace runs instead of silently reporting success.
+Commit `5f38a89` records the gate as mode `100755`, requires tmux and Node, asserts those prerequisites in the ignored test, and pins one worktree-local Cargo target directory for both the agent build and the exact test.
+The executable gate passed even with a conflicting external `CARGO_TARGET_DIR`, proving that it built and used this worktree's agent.
+The final built agent reports `t-hub-agent 0.5.2` and SHA-256 `9ac6813f5f84436c2b708c687063c5ad2fe184fdaa9a50055ec163a9ebe34071`.
+
+Focused verification passed 33 Harness tests, 8 dispatch tests, the exact marker process test, 23 agent-bridge tests, 30 supervision tests, 18 fleet tests, and 18 Powder control tests.
+Final workspace verification passed 724 desktop tests with 2 explicit ignores, 2 MCP process E2E tests with 1 helper ignored, 56 agent tests, 3 agent Codex process E2E tests, 16 MCP library tests, 51 MCP binary tests, and 8 protocol tests.
+The named combined gate passed separately and is not counted as one of the ignored workspace results.
+Strict `t-hub-agent` and desktop library-test Clippy, formatting, full-range diff checks, shell syntax, executable mode, and tracked-worktree cleanliness all passed.
+
+Independent control-plane review found no high or medium production issue.
+The reviewer requested hardening the combined gate against silent skip, missing executable mode, Cargo target-directory drift, and missing tmux or Node prerequisites.
+Commits `8601f2a` and `5f38a89` addressed every finding, and final focused rereview reported no remaining finding.
+
+The integration branch is accepted as locally implementation-complete and independently reviewed.
+It has not been merged, pushed, installed, deployed, published, released, or used to complete or release any Powder card or claim.
+The installed agent remains stale, so production dispatch must not use these commits until a separately authorized coordinated merge and installation places the combined agent on the Crew PATH.
+A stale agent fails closed with transactional rollback but causes dispatch unavailability.
+Exact-run final Powder work-log backfill also remains pending the sanctioned operation in the installed runtime.
+
+### Verified 2026-07-16 Permission Monitor and Powder Profile Boundary
+
+This boundary was verified on `2026-07-16` after the General moved the Codex Crew into the normal Crew workspace and asked the Captain to continue permission monitoring.
+Direct tmux inspection found T30 terminal `2bef9b61`, launch-attestation terminal `10d1093e`, and permission-observability terminal `8026ea1a` alive, detached, and idle at their Codex prompts with no permission dialogue open.
+Their pane activity and commit tips are unchanged from the accepted review boundary.
+The T30 worktree remains tracked-clean at `96aacb2`, the launch-attestation worktree remains tracked-clean at `03e7aa8`, and the permission-observability worktree remains tracked-clean at `0c23665`.
+Each worktree contains only the protected untracked `CLAUDE.md` artifact.
+The three independent reviewers remain complete.
+T30 remains fully accepted, permission observability remains review-clean pending combined launch integration, and launch attestation remains conditionally unaccepted until observability lands first and the real agent from the combined tree passes its exact launch proof.
+
+The installed `0.3.103` automatic fleet wake initially could not be armed because the Captain liveness probe timed out even though tmux proved the Captain session attached and the Crew sessions alive.
+A later reconciled registry read proved no watch existed, and one idempotent retry successfully armed Captain `c2940be4` for terminals `2bef9b61`, `10d1093e`, and `8026ea1a` on `needsPermission`, `needsQuestion`, `failed`, and `completed` transitions.
+Direct pane inspection remains the verification fallback, while the durable wake now provides automatic attention routing whenever a watched Crew changes into an actionable state.
+The installed runtime still lacks the reviewed unrestricted launch and structured permission failsafe changes.
+
+Authoritative Powder reconciliation now reports the registered binding `n8desktop-wsl` and repository `t-hub` as misconfigured because the protected profile is unavailable or invalid.
+The dedicated protected health check identified the immediate failure as `Powder apiKeyCommand failed: command exceeded 10s timeout`.
+The Captain did not bypass the protected profile, inspect credentials, retry any ambiguous mutation, modify Powder, or change the binding.
+One later credential-safe health check succeeded without configuration changes and confirmed `n8desktop-wsl` healthy against repository `t-hub`.
+An authoritative board reread returned status ready with 16 cards and confirmed `thub-control-client-deadline`, `thub-codex-permission-launch-attestation`, and `thub-codex-permission-observability` still claimed by `t-hub`.
+No card was lost, completed, or released during the transient profile failure.
+Exact-run final work-log backfill remains unavailable because installed `0.3.103` exposes no sanctioned append operation, not because the protected Powder service remains unhealthy.
+
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+The next ordered implementation action still requires separate General authorization to integrate observability before launch attestation, run the real combined-tree agent launch proof, and only then consider merge or installation.
+After more than three consecutive monitoring turns, the exact-run final work-log gap remains unchanged because the installed sanctioned T-Hub surface exposes no append operation.
+The Captain goal is blocked at that evidence gate and the separately authorized combined-tree integration gate, while the verified fleet wake remains armed and all three Crew remain preserved for recovery.
+
+### Verified 2026-07-15 Permission Crew Progress Boundary
+
+This boundary was verified at `2026-07-15T23:38:08-07:00` while the Captain actively monitored the three authorized Codex Crew for permission prompts.
+The General moved both permission Crew into the normal Crew workspace, and the Captain preserved their terminal identities, Powder runs, branches, worktrees, and file ownership without moving them again.
+T30 terminal `2bef9b61` committed the bounded control-client recovery change as `e7922ac` on branch `fix/control-client-deadline`.
+The Crew reports that the exact stale-endpoint fixture improved from 15.074 seconds to 2.053 seconds with exit code 0 and clean JSON stdout.
+Verification passed 37 CLI unit tests, 7 CLI JSON contract tests, 11 focused desktop tests, 54 MCP unit tests, 2 MCP process tests, formatting checks, CLI and MCP clippy, and Git diff checks.
+Desktop full-library clippy remains blocked by a pre-existing warning in unowned `apps/desktop/src-tauri/src/control.rs`.
+The Captain approved one exact final Powder work-log append containing that commit and evidence, but the sanctioned CLI returned `ok: false`.
+The result is not being retried until its failure is reconciled, and T30 still requires independent review.
+Independent review of `e7922ac` found that the two-second attempt slice also truncates healthy ordinary desktop and MCP responses that are entitled to a longer command budget.
+The review also found that the new CLI transport behavior lacks a committed process-level regression for stale recovery, stable JSON error fields, clean stderr, and exit status.
+T30 addressed both findings in separate commit `b032841`, including healthy slow-response coverage and a CLI process contract regression.
+Independent rereview then found that the MCP unchanged-endpoint read can consume the full deadline before idempotent ambiguity resolution or relay self-heal receives any budget.
+The rereview also reproduced a partial-frame trickle that kept the source CLI alive beyond its ten-second absolute deadline, and the same loop shape exists in all three clients.
+The rereview additionally found that desktop endpoint adoption can overwrite a newer rotation with a stale captured address.
+The Captain has returned these new blockers for explicit downstream recovery reserves, hard deadline enforcement during partial reads, concurrency-safe endpoint adoption, and deterministic coverage in all three clients.
+T30 corrected those three issues as `58b6ec5`, and independent rereview verified the absolute trickle deadline, MCP recovery reserves, idle polling, and concurrency-safe endpoint adoption.
+That rereview found one remaining blocker because all three clients still accumulate and repeatedly rescan an unbounded response frame, and the CLI can echo the raw malformed frame.
+The Captain returned a shared safe frame limit, incremental scanning, bounded credential-safe protocol errors, and exact-limit, over-limit, malformed, unterminated, output-bound, and non-leak coverage.
+T30 corrected framing as `570c0c6`, and independent rereview verified the one-mebibyte limit, linear chunk scanning, bounded safe errors, output bounds, and trickle deadline.
+That rereview found a new high-severity MCP ambiguity regression because partial response EOF after an idempotent mutation returns Protocol before `get_request_status` reconciliation.
+The Captain returned partial-EOF ambiguity routing with completed, failed, unknown, unavailable-status, no-duplicate-mutation, process, and credential-safety coverage.
+T30 corrected primary partial-EOF reconciliation as `73ed99f`, but rereview found that a partial EOF on the single same-request-ID reissue after Unknown still skips the final status query.
+The Captain returned an explicit reissued state that permits at most one mutation reissue while continuing authoritative status polling after any ambiguous reissue response.
+T30 corrected the final reconciliation state machine as `96aacb2`.
+Independent rereview found no defects and verified exact same-request-ID spawn, status, spawn, status sequences for completed, failed, still-unknown, and unavailable outcomes with one mutation retry maximum and one total deadline.
+It also verified fail-closed non-idempotent and pre-write cases, bounded clean output, credential safety, 16 MCP library tests, 75 MCP binary tests, 2 MCP process E2E tests with 1 helper ignored, strict Clippy, formatting, and diff checks.
+T30 is accepted as implementation-complete and independently reviewed, with only live PowerShell relay timing remaining as an environment-dependent integration risk.
+
+Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
+Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
+The Crew committed the control integration and cleanup as `35d6c61`, `1283b10`, and `a213d35`, with 28 Harness tests, 238 control tests, formatting, warnings-denied Clippy, and diff checks passing.
+Independent control-plane review requested changes because concurrent same-card dispatches can share one idempotent Powder run and a failed contender can release the sibling claim.
+The review also found that malformed or repeated permission flags can bypass fail-closed parsing and that the rollback tests do not exercise attestation failure through the real dispatch path.
+The Captain has returned these findings for per-card and profile serialization or reservation, strict duplicate and malformed flag rejection, and deterministic end-to-end dispatch success, failure, rollback, and concurrency coverage.
+The Crew corrected the first review as `c39ff4b`, `10cfb4d`, and `90b3026`.
+Independent rereview confirmed the real dispatch rollback tests but found that the mutex still permits a sequential duplicate binding to the same idempotent run after the winner succeeds, and its key omits repository.
+The rereview also found that native Codex short permission aliases and flag-only inline forms such as `--dangerously-skip-permissions=false` can bypass conflict detection.
+The Captain returned these blockers for durable active-binding rejection with restart recovery, a profile, repository, and card key, success-then-contender-failure proof, and full native alias normalization.
+The same correction turn is authorized to integrate automatic `t-hub-agent --codex-unobserved` invocation before plain interactive Codex TUI execution without editing observability-owned files.
+The Crew corrected durable winner protection, native alias normalization, and the degraded marker prelude as `05a5679`, `5527ea2`, and `03e7aa8`.
+Independent rereview found no defect in those three commits and verified 716 library tests with one ignore, 33 Harness tests, restart contention, exact marker identity, rollback, formatting, strict Clippy, diff checks, quoting safety, and credential-safe errors.
+The rereview found one combined integration gate because `--codex-unobserved` exists only on the separate observability branch and the currently installed agent rejects that mode.
+Observability must land before launch attestation, and the real built agent from the combined tree must pass the exact launch process proof before any installation.
+The launch-attestation commits must not be merged or installed alone.
+The launch-attestation lane is implementation-complete but remains conditionally unaccepted until combined-tree verification is separately authorized.
+
+Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
+The Crew committed structured producer, reducer, runtime-health, owning-Captain routing, fixture coverage, and lint cleanup as `7cc10f0`, `a55c411`, `7f895ab`, `d06a75f`, and `3d496ce`.
+Independent review requested changes because duplicate or out-of-order journal entries can still reduce after the cursor and let a late `SessionStart` erase a real permission request with false Working.
+The review also found that current Codex `thread/started` events using `params.thread.id` are silently dropped and that missing identifiers fall back to an unsalted fingerprint of raw credential-bearing input.
+The parser is not yet wired to plain interactive Codex TUI dispatch through hooks or an app-server mirror, so the implementation must either add an in-scope producer or expose explicit unsupported and degraded runtime health that prevents false Working.
+The Captain has returned all findings for separate correction commits, focused and workspace verification, and independent rereview.
+The Crew corrected replay rejection, current thread identity parsing, opaque fallback identifiers, explicit unobserved-TUI degraded health, and its isolated process proof as `119f672`, `4c707ef`, `6c1c24f`, `3715943`, and `0c23665`.
+Independent rereview found no defects in those correction commits.
+It verified replay safety before all side effects, current Codex thread identity, content-independent opaque identifiers, exact tmux correlation, status Unknown, degraded health, unavailable transport, 30 repeated unobserved-tmux process executions, focused tests, strict agent Clippy, workspace tests, formatting, and diff checks.
+Plain interactive Codex launch still invokes neither structured telemetry nor the degraded marker because that integration belongs to the launch and Harness ownership lane.
+The Captain selected automatic degraded-marker invocation as the immediate fail-safe integration while retaining a native hook or app-server mirror as the required path to structured automatic permission detection.
+The observability lane remains unaccepted until launch integration lands and the combined behavior is independently verified.
+
+Installed `0.3.103` still launches these Codex Crew without the unrestricted source flag.
+Until the launch and observability changes are reviewed and later authorized for installation, the Captain is monitoring all three live panes and approving only exact routine local read, build, test, and evidence operations already authorized by the General.
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+
+### Verified 2026-07-15 Codex Permission Work Boundary
+
+This boundary was verified at `2026-07-15T23:23:50-07:00` after the General authorized immediate Crew implementation of Codex permission launch and monitoring reliability.
+The Captain created and reread two P0 review cards on authoritative repository `t-hub`, each with six acceptance criteria and three proof gates.
+`thub-codex-permission-launch-attestation` is claimed under run `run-YrFBMtKYHGPM` by Crew terminal `10d1093e` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-launch-attestation` on branch `fix/codex-permission-launch-attestation`.
+That Crew exclusively owns the provider-neutral Harness adapters, `apps/desktop/src-tauri/src/control.rs`, and directly colocated launch, attestation, rollback, and capability-separation tests.
+Its tracked worktree is clean with only the protected untracked `CLAUDE.md` artifact.
+The Crew reproduced that installed `0.3.103` launched its live Codex process without `--dangerously-bypass-approvals-and-sandbox` and is implementing fail-closed post-launch permission attestation without modifying the installed runtime.
+
+`thub-codex-permission-observability` is claimed under run `run-yZF7-C7sz47t` by Crew terminal `8026ea1a` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-observability` on branch `feat/codex-permission-observability`.
+That Crew exclusively owns `t-hub-agent`, the agent bridge, supervision, fleet notification, sanitized Codex lifecycle fixtures, and directly colocated tests.
+Its tracked worktree is clean with only the protected untracked `CLAUDE.md` artifact.
+The required result is structured exact-Crew `needsPermission`, explicit degraded telemetry health, and owning-Captain wake routing without relying on terminal dialogue text as the sole production signal.
+
+The Captain appended and reread exactly one attributed start work log for each exact run through protected profile `n8desktop-wsl`.
+Installed `0.3.103` still launches both new Codex Crew without the source-fixed unrestricted flag, so the Captain is temporarily clearing only exact authorized local prompts while these lanes remove that bootstrap defect.
+T30 terminal `2bef9b61` remains the third and final active Crew lane under run `run-Q7QP9N_mqTJF` and is completing MCP process-contract verification.
+No fourth Crew may be dispatched while these three lanes are active.
+All three implementation lanes require focused tests, exact-run evidence, clean logical commits, and independent review before acceptance.
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+
+### Verified 2026-07-15 Active Implementation Boundary
+
+This boundary was verified at `2026-07-15T22:43:08-07:00`.
+T30 Crew terminal `2bef9b61` remains live under run `run-Q7QP9N_mqTJF` with no completion sentinel and no commit yet.
+Its isolated worktree contains tracked changes only in the owned CLI and desktop control clients, plus the protected untracked `CLAUDE.md` artifact.
+The CLI and desktop implementations now share a bounded recovery-deadline shape with deterministic loopback coverage for refused connections, connected-but-silent inherited endpoints, response loss, healthy current endpoints, exhausted discovery budget, structured timeout classification, and credential-safe errors.
+The focused desktop control-client suite passed all 11 tests on three executions after the Captain approved the exact local formatting and loopback-test command.
+The Crew is now implementing the owned MCP control client, so all three authorized client files contain active changes before final T30 verification and commits.
+
+Powder card `powder-mutation-idempotency` remains the sole active Powder dependency lane under run `run-9RWhdmpyPzXE`.
+Its Crew has produced five logical commits: `07bd797` for the transactional operation substrate, `c9c7cd7` for stable authenticated authority, `695c0a8` for schema migration coverage, `44da772` for HTTP, CLI, and MCP adapter exposure, and `e18e6e9` for the mutation recovery contract.
+The mutation-idempotency worktree is tracked-clean.
+Exact verification passed `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `git diff --check` across all workspace targets.
+The next Powder gate is independent review and exact-run evidence reconciliation before any dependency transition.
+The other three Powder cards remain dependency-blocked.
+
+The installed `0.3.103` T-Hub control RPC still times out on capability and board-read calls.
+The Captain therefore used the documented read-only tmux and Git fallbacks and did not mutate claims, lifecycle state, or the installed runtime.
+T2 remains accepted, independently reviewed, and exact-run evidence-complete while its claim is deliberately preserved until run-bound Powder completion is safe.
+No merge, push, install, deploy, publication, release, card completion, run release, or resource reap is authorized or claimed.
+
+### Verified 2026-07-15 T2 Completion and T30 Reproduction Boundary
+
+This boundary was verified at `2026-07-15T22:33:42-07:00` while the General's authorization to implement T30 and T2 remained active.
+T-Hub Crew terminal `0006cfb5` completed T2 `thub-powder-lifecycle-serialization` under authoritative run `run-trPe9u6_KuU0` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/powder-lifecycle-serialization` on branch `fix/powder-lifecycle-serialization`.
+Implementation commit `eb75f5ea769144ac6875ab17ccd5851976acd944` revalidates active Crew lifecycle state inside the per-Crew guard so a queued heartbeat cannot renew a Crew after cleanup begins.
+Test commit `425435d33e57fec26c619de6820a21f272f043fc` expands deterministic lifecycle race, rollback, recovery, unrelated-Crew, deadlock, and reconciler coverage.
+The Crew reports 23 focused tests passed with zero failures, `rustfmt --check` passed, and `git diff --check` passed.
+The T2 worktree is tracked-clean and contains only the protected untracked `CLAUDE.md` artifact.
+The expected completion sentinel exists at `/tmp/t-hub-crew-done/t-hub-app/powder-lifecycle-serialization.done`.
+Independent read-only review completed with no findings.
+The reviewer reran the 23-test focused suite ten times for 230 passing test executions with zero failures, and independently confirmed `cargo fmt --check`, `git diff --check`, and tracked worktree cleanliness.
+The reviewer confirmed that renewal revalidates active lifecycle state inside the serialized per-Crew guard before any remote renew, cleanup holds the same guard through disposition and final mutation, unrelated Crew can still progress, and the deterministic regression prevents a queued heartbeat from renewing a cleanup-pending Crew.
+The residual review risk is limited to live Powder integration, which was outside the read-only review scope.
+The Captain appended exactly one `T2_FINAL_VERIFIED` work-log entry through the protected `n8desktop-wsl` profile for exact run `run-trPe9u6_KuU0` and reread exactly one matching entry.
+The entry records both commits, the Crew's 23 passing tests, the independent review's 230 passing repeated executions, formatting and diff checks, tracked cleanliness, and the remaining live-integration risk.
+The Captain accepts the T2 implementation and review result.
+The card remains claimed, and the run, Crew, and worktree remain unreaped and unmerged because card-only completion remains unsafe until Powder's run-bound mutation contract stabilizes.
+T17 `thub-captain-crew-terminal-state` remains blocked on that safe lifecycle transition and must not be dispatched from a blocked card.
+
+T-Hub Crew terminal `2bef9b61` remains active on T30 `thub-control-client-deadline` under authoritative run `run-Q7QP9N_mqTJF` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on branch `fix/control-client-deadline`.
+The Crew reproduced the defect through the source CLI with a stale inherited endpoint that accepted a request but stayed silent while the handshake pointed to a live replacement.
+The failing bounded case took 15.221 seconds and returned structured exit code 6, while recovery succeeded after 15.074 seconds with clean JSON stdout.
+The current implementation stacks independent stale and replacement timeouts across the CLI, desktop, and MCP clients rather than enforcing one bounded recovery deadline.
+T30 is now implementing the owned three-client fix and has not created a source commit yet.
+The T30 worktree is tracked-clean and contains only the protected untracked `CLAUDE.md` artifact.
+
+The installed `0.3.103` control surface still hangs on some terminal and messaging operations, which directly corroborates T30's defect.
+The Captain used bounded cancellation and owned tmux inspection to recover without changing the installed runtime.
+Required source-runtime Powder work-log append remains unavailable in the installed build, while the Captain's exact-run start entries remain verified on the board.
+No merge, push, install, deploy, publication, release, card completion, run release, or resource reap is authorized or claimed.
+
+### Verified 2026-07-15 Cross-Repository Work Boundary
+
+This boundary was verified at `2026-07-15T22:04:11-07:00` after the General authorized both Captains to create their required Powder cards through Powder's sanctioned native card-creation surface.
+The authoritative roadmap and complete card register remain in [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+The exact Powder P1 through P4 implementation contracts remain in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/captain-safety-handoff/docs/POWDER-CAPTAIN-RUN-BOUND-HANDOFF.md` at local commit `c4ab73e98339d651f8f00cacc252db6c4c90c6db`.
+
+The canonical T-Hub checkout is on `fix/captain-control-runtime` at `b058b1b` before this handoff update.
+Source declares version `0.3.104`.
+The only canonical-checkout entries are the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They remain untouched.
+
+Installed T-Hub remains PID `10036`, version `0.3.103`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 remains `B76F8B54691754AAB7CC8509AE2ED6E14B565DBC7FAA7543D73DEE500CD8A3B3`.
+The installed package remains related to exact detached source `8654986`, which declares version `0.3.103`.
+Source after `8654986` includes the staged `0.3.104` Powder lifecycle and evidence implementation plus later planning documentation.
+No `0.3.104` merge, push, install, deployment, publication, or release is authorized or claimed by this handoff.
+
+Powder Captain `aae93881` created and reread all four authoritative P0 review cards on repository `powder`.
+`powder-mutation-idempotency` is active under run `run-9RWhdmpyPzXE` with Crew terminal `4e50931c`, branch `feat/mutation-idempotency`, and isolated worktree `/home/natkins/projects/powder-worktrees/mutation-idempotency`.
+The Powder Captain checkpoint records Crew `4e50931c` as the sole integration owner for the shared operation identity, digest, lifecycle, retention, recovery, migration, API, and transactional substrate.
+`powder-run-bound-work-logs` and `powder-run-scoped-criteria` remain blocked by `powder-mutation-idempotency`.
+`powder-run-bound-conditional-completion` remains blocked by `powder-mutation-idempotency` and `powder-run-scoped-criteria`.
+The next Powder action is to supervise P2 reproduction, sanctioned work-log evidence, focused and workspace tests, verified commits, and independent review before dispatching P3 or P4.
+
+T-Hub Captain `c2940be4` created and reread all five authorized P0 review cards on repository `t-hub`.
+`thub-control-client-deadline` and `thub-powder-lifecycle-serialization` are ready.
+`thub-captain-crew-terminal-state` is blocked until lifecycle serialization is stable.
+`thub-powder-run-bound-mutations` and `thub-powder-evidence-recovery` remain blocked on their recorded Powder and T-Hub dependencies.
+The Captain created clean isolated worktrees `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on `fix/control-client-deadline` and `/home/natkins/projects/tools/t-hub/t-hub-worktrees/powder-lifecycle-serialization` on `fix/powder-lifecycle-serialization`, both from `b058b1b`.
+Dispatch of T30 `thub-control-client-deadline` was accepted for Crew terminal `2bef9b61` under run `run-Q7QP9N_mqTJF` in the control-client worktree with ownership limited to the three control-client implementations and their focused tests.
+Dispatch of T2 `thub-powder-lifecycle-serialization` was accepted for Crew terminal `0006cfb5` under run `run-trPe9u6_KuU0` in the lifecycle worktree with exclusive ownership of `apps/desktop/src-tauri/src/control.rs` and its focused tests.
+The Captain inspected both terminals and verified that both Crew were live in their exact worktrees and had accepted their complete briefs without permission prompts.
+One bounded native API work-log append for each exact run returned successfully without retry, although the legacy response exposed no entry identity.
+The Captain reread both cards and verified exactly one matching start entry for each exact run and Crew terminal.
+The next T-Hub action is to checkpoint the roster and supervise both independent lanes through reproduction, focused tests, verified commits, and independent review.
+T17 must follow T2 rather than overlap it, while T1 and T3 must remain blocked until the required Powder contracts stabilize.
+
+The Powder Captain has a current durable T-Hub checkpoint, and the T-Hub cards, claims, runs, bindings, terminals, and worktrees are already durable while its Captain finishes the corresponding checkpoint update.
+An orchestrator conversation reset must not recreate cards, claims, runs, worktrees, or Crew from chat memory.
+After reset, read this boundary, recover both Captain manifests and Powder boards, inspect the live terminals, and continue from authoritative checkpoint evidence.
+
+### Verified 0.3.103 Resume Boundary
+
+The canonical checkout is on `fix/captain-control-runtime` at `cb1032c` before this documentation change.
+The only working-tree entries are the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They remain untouched.
+
+Installed T-Hub is version `0.3.103`, PID `10036`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 is `B76F8B54691754AAB7CC8509AE2ED6E14B565DBC7FAA7543D73DEE500CD8A3B3`.
+The installed package was built from exact detached source `8654986` in `/mnt/c/Users/natha/projects/Tools/t-hub/t-hub-build-8654986`.
+Source head and installed source both declare desktop version `0.3.103`; the commits after `8654986` are documentation-only.
+
+Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` is bound to Powder profile `n8desktop-wsl` and canonical repository `t-hub`.
+Captain terminal `c2940be4` runs Codex `0.144.4` with control capability in `/home/natkins/projects/tools/t-hub/t-hub-app`.
+The Captain checkpoint records Codex thread `019f67df-ef69-7bb2-9bc2-f790cf53b949` and the exact Project and Powder binding.
+
+The single authorized Stage 1 retry dispatched Crew terminal `0c9f07ff` into `/home/natkins/projects/tools/t-hub/t-hub-worktrees/local-acceptance` on branch `test/local-acceptance`.
+T-Hub durably bound Powder card `thub-local-acceptance` and run `run-nO9Ih6F-Dt-E` before starting the interactive Codex Harness.
+The exact protected checkout baseline remained `?? CLAUDE.md`, and that path remained symlink inode `3807587` targeting `AGENTS.md` with no additional tracked, staged, untracked, or ignored delta.
+The Captain used the sanctioned heartbeat operation once, and Powder recorded the same attributed run and renewed expiry.
+
+Stage 1 is blocked only because T-Hub `0.3.103` exposes no sanctioned Crew operation for Powder work-log append, bounded work-log evidence read, or completion with proof.
+The Crew correctly withheld `/tmp/t-hub-crew-done/t-hub-app/local-acceptance.done`.
+The Captain collected the blocked report, closed only Crew `0c9f07ff`, released `run-nO9Ih6F-Dt-E`, removed the active Crew binding, returned the card to `ready`, restored the six-terminal baseline, and wrote the final `DECISION-NEEDED: acceptance blocked` checkpoint.
+No claim, run, Crew record, terminal, or sentinel remains stale.
+
+Powder already provides agent-authorized `POST /api/v1/cards/{id}/work-log`, bounded card and run detail reads, and `POST /api/v1/cards/{id}/complete`.
+The next implementation belongs in T-Hub, not Powder.
+It must add a Crew-scoped work-log mutation, bounded evidence read, and Captain-controlled completion operation over the existing protected profile.
+It must also make normal terminal cleanup recognize a card already completed through the same Crew run rather than reporting the absent claim as a failed release.
+The next packaged code version is `0.3.104` under the every-change version policy.
+
+During implementation, follow the General's reduced cadence: run focused tests for the changed Powder client, control authorization, MCP or CLI contract, completion cleanup, formatting, version consistency, and diff checks.
+Reserve comprehensive local, PR, and CI gates for the pull request, install, or release boundary.
+Do not retry Stage 1 until exact committed and installed `0.3.104` exposes the missing evidence path and focused failure tests pass.
+Do not modify Powder source, push, publish, or clean unrelated worktrees or protected artifacts.
+
+The remaining content below preserves the older `0.3.100` evidence and rationale.
+Where it conflicts with this verified boundary, use this boundary.
+
+### Prior 0.3.100 Git and Runtime State
+
+The canonical checkout is on `main` at source head `cbe88a5`, 122 commits ahead of `origin/main` before this handoff-only commit.
+The only working-tree entries before this handoff edit were the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They were not modified.
+No source commit after exact detached build source `8635374` changes the installed runtime.
+
+Installed T-Hub is version `0.3.100`, PID `14868`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 is `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+The installed package was built from exact detached commit `8635374` in `/mnt/c/Users/natha/projects/Tools/t-hub/t-hub-build-8635374`.
+Keep that detached worktree until a replacement build has passed installed acceptance or the General authorizes cleanup.
+
+The five tmux sessions present before installation retained their exact names and pane PIDs.
+The commissioned Captain adds a sixth live session, `th_d24b63fa`, with pane PID `2808476`.
+A 50-second installed process sample spanning more than three Powder reconciliation intervals observed no T-Hub-owned PowerShell or cmd child.
+The repeated credential-shell regression is therefore closed in installed `0.3.100`.
+
+### Prior 0.3.100 Commissioned Captain Evidence
+
+The durable Project is `project-e28c0579-4e78-4de1-b225-d69aab93c143`, named `t-hub-app`.
+It is bound to Powder profile `n8desktop-wsl` and Powder repository `t-hub`.
+Its durable `repoRoot` is the Windows canonical path `\\?\UNC\wsl.localhost\Ubuntu-24.04\home\natkins\projects\tools\t-hub\t-hub-app`.
+
+Installed `0.3.100` successfully completed `spawn_terminal` at `2026-07-15T13:02:07.957419300-07:00` and `commission_captain` at `2026-07-15T13:02:11.075534-07:00`.
+The Captain registry record uses terminal `d24b63fa`, ship slug `t-hub-app`, role `captain`, Harness `codex`, assignment `continue improving thub as we are`, and the exact Project ID above.
+The live process chain is pane shell PID `2808476`, Codex node PID `2808549`, Codex native PID `2808556`, and T-Hub MCP PID `2808943`.
+The Captain runs Codex `0.144.4`, and its Powder health and repository probes succeeded.
+
+Captain creation now completes without the earlier Windows 10060 timeout or rollback failure.
+The Captain is registered and alive, but it is not yet functionally control-capable because packaged acceptance exposed the two blockers below.
+Do not dispatch canonical Crew until both blockers are repaired and installed acceptance proves the control boundary.
+
+### Resolved 0.3.100 Blocker 1: Codex MCP Drops Captain Capability Variables
+
+The Captain's `my_capability` call returns `read`, so the Captain skill correctly refuses claims, dispatch, and checkpoint mutation.
+The tmux and Codex parent processes contain `T_HUB_CONTROL_ADDR`, a nonpublished control token, and `T_HUB_SESSION_TOKEN`.
+The Codex-launched T-Hub MCP child contains only `HOME`, `LANG`, `LOGNAME`, `PATH`, `SHELL`, and `TERM`.
+It is missing `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` because Codex `0.144.4` filters stdio MCP server environment by default.
+
+The current `~/.codex/config.toml` T-Hub registration has an empty `transport.env_vars` list.
+The supported registration must name exactly `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` as pass-through variables while leaving `transport.env` absent or empty.
+Never persist the rotating values with `codex mcp add --env KEY=VALUE`, and never write a live address, control token, or session token into Codex configuration.
+
+Repair `scripts/captain/ensure-thub-codex.sh` and `scripts/captain/ensure-thub-codex.test.sh`.
+The fast path must require the exact command and exact three-name `transport.env_vars` list.
+Treat the current empty-variable registration as the legacy managed shape eligible for migration.
+Preserve customized user policy when the command and canonical variables already match.
+Because the Codex CLI cannot express inherited variable names, add the canonical `env_vars` entry inside the existing locked, backed-up, hash-checked transaction, verify it through `codex mcp get --json`, and restore the original bytes on any insertion or verification failure.
+
+The focused provisioner test must use sentinel values and prove that only the three variable names enter the registration, no sentinel value enters the config, unrelated hooks remain byte-preserved, a rerun with different values leaves the config byte-identical, the legacy empty registration converges, and a forced failure restores the original bytes.
+
+### Resolved 0.3.100 Blocker 2: Windows Canonical Project Root Is Not a WSL tmux Cwd
+
+The Captain pane reports cwd `/home/natkins`, and the Codex header reports `directory: ~`.
+Its bootstrap prompt contains the raw extended Windows UNC path.
+`commission_captain` forwards the durable Windows canonical Project root to the WSL tmux `-c` boundary, so tmux cannot use it and falls back to the WSL home directory.
+
+Repair the shared spawn boundary in `apps/desktop/src-tauri/src/files.rs` and `apps/desktop/src-tauri/src/control.rs` rather than adding a commission-only workaround.
+Factor or expose a crate-private, platform-neutral converter for standard `\\wsl.localhost`, legacy `\\wsl$`, and extended `\\?\UNC\wsl.localhost` paths.
+Convert only the cwd handed to WSL tmux.
+Keep the durable Project root and public response in their canonical Windows form so host identity is not rewritten.
+Use the POSIX root in the Captain bootstrap instructions so the prompt and actual working directory agree.
+
+Focused tests must cover bare POSIX paths, standard WSL UNC, legacy WSL UNC, extended WSL UNC, distro root, and a Windows drive path that must not be misclassified as WSL.
+A commission or spawn test must prove that an extended UNC Project retains its canonical registry and response value while tmux receives `/home/natkins/projects/tools/t-hub/t-hub-app`.
+
+### Superseded 0.3.100 Ordered Next Implementation
+
+1. Create a feature branch such as `fix/captain-control-runtime` before editing source.
+2. Reproduce both failures against installed `0.3.100` using the evidence above, and retain the existing Captain until the replacement is ready.
+3. Add failing focused tests for Codex MCP variable pass-through and WSL cwd conversion.
+4. Implement the transaction-safe Codex registration repair and the shared tmux cwd normalization.
+5. Bump the desktop version from `0.3.100` to `0.3.101` in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/Cargo.lock`, and `apps/desktop/src-tauri/tauri.conf.json`.
+6. Run the focused provisioner and Rust tests, formatting, version consistency, and `git diff --check`, then obtain an independent diff review.
+7. Commit each verified logical change separately without an agent co-author.
+8. Build exact committed `0.3.101` source in a new detached Windows worktree, install it, and preserve every pre-existing tmux session.
+9. Restart or recommission the Captain because Codex reads MCP registration at session start.
+10. Prove `my_capability=control`, the exact WSL repository cwd, a POSIX bootstrap path, and successful `captain_checkpoint` before dispatch.
+11. Commission and complete one real Powder-backed Crew card, including claim, work log, completion evidence, event delivery, and durable recovery.
+12. Continue the canonical sequence with Board and Preview acceptance, the Claude header check, and the packaged 1, 4, 8, and 16 terminal performance matrix.
+
+### Prior 0.3.100 Test Cadence and Exit Gate
+
+The General chose a reduced development test cadence.
+During implementation, run only the focused tests needed for changed behavior plus cheap formatting, version, and diff checks.
+Use the comprehensive local suite, no-mistakes review, GitHub CI, and full PR verification at the pull request, install, or release boundary rather than after every small edit.
+This is a cadence change, not permission to merge or install code with a known failure.
+
+The immediate exit gate is an exact committed and installed `0.3.101` package that preserves existing sessions, creates no repeating T-Hub-owned shell children, launches the Captain in `/home/natkins/projects/tools/t-hub/t-hub-app`, passes exactly the three capability variables by name without persisting their values, returns `control` from `my_capability`, writes a real Captain checkpoint, and completes one real Powder-backed Crew lifecycle.
+Do not call the Captain and Crew path functionally complete before this gate passes.
+
+This root session has no sanctioned control-capability token, and the commissioned Captain currently sees only read capability.
+No Captain checkpoint or Powder work log was written for this handoff.
+No branch was pushed.
 
 ## Executive Status
 
 The Captain, Crew, cross-harness provisioning, Handoff skill, authority hardening, and initial performance work are implemented and committed on `main`.
 The final independent authority review reports no remaining Critical, High, or Medium application-level finding under the documented same-user threat model.
-The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
+Source `1484750` passed 55 frontend files and 470 tests, TypeScript, the Rust workspace and MCP end-to-end suites, formatting, warning-free Clippy, and the production frontend build.
+The earlier exact `0.3.86` source then passed 621 Linux Rust library tests with one ignored, warning-free Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
 
-The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `ad5872e4bdf327c11035fb205c7d799a561f96d05a050e52d8a743c3f38e3e8c`.
-The exact release installer SHA-256 is `ff9b71a8b520ffff393d8d67d2e47150dd52df84ee1e79bc7d8b850da5b81a37`.
-It is running as PID `45508` with protocol version `2` and control address `127.0.0.1:60501`.
+The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+The installed executable SHA-256 is `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+It is running on the canonical profile as PID `14868`.
+The exact NSIS installer SHA-256 is `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`.
 
-The T-Hub repository is registered as a durable project but is not bound to Powder.
-The authoritative Powder endpoint remains unreachable from the current tailnet, and no approved agent-scoped credential command is configured.
-Real Powder-backed Captain commissioning and Crew dispatch remain externally blocked and must continue to fail closed.
+Source `0.3.95` at commit `8231b5e` preserves partial Codex usage snapshots, normalizes 5-hour and weekly windows by duration, and migrates the last-known cache.
+Source `0.3.96` at commit `c40d52a` adds a Windows Explorer folder chooser to the shared WSL picker used by existing-folder and new-codebase Captain flows.
+Source `0.3.97` at commit `4759df0` closes the independent review finding in the Codex usage merge by preserving an unknown-duration primary beside a recognized weekly window and advancing expired windows before later partial polls merge.
+Source `0.3.98` at commit `4e264f0` establishes the unexposed provider-neutral History identity and Claude/Codex parser foundation without changing the legacy Recent UI or exposing incomplete actions.
+Source `0.3.99` at commit `3afb521` repairs Codex Captain commissioning by removing the exec-only `--skip-git-repo-check` flag from interactive Codex and giving only Captain and Crew orchestration a bounded 120-second response window.
+Source `0.3.100` at commit `f8ef9aa` reuses Powder event clients for five minutes, refreshes after a Powder request failure, and suppresses the Windows credential-command console.
+Exact detached source `8635374` packages those source changes as installed `0.3.100`.
+
+The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
+The local `http://127.0.0.1:4017/healthz` endpoint returned HTTP 200 with the Powder health payload during the 2026-07-15 review.
+The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
+That profile currently has no repository-admin credential.
+The `t-hub` Powder board and `thub-local-acceptance` card exist.
+Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` now durably registers this repository and binds it to the `t-hub` board through `n8desktop-wsl`.
+The earlier installed `0.3.94` commissioning attempt spawned one control-capability terminal, but interactive Codex `0.144.4` rejected the exec-only `--skip-git-repo-check` flag and exited.
+The backend rolled that terminal back and left the Project intact without a commissioned Captain.
+The installed control client timed out first and surfaced Windows error 10060 instead of the authoritative rollback error.
+The same durable Project also activated the 15-second Powder event reconciler, which rebuilt its client and visibly launched the profile's PowerShell credential command about every 16.5 seconds.
+Installed `0.3.100` contains both repairs and passed the trusted graphical commissioning retry.
+That retry created a live registered Captain, then exposed the Codex MCP environment and WSL cwd blockers recorded in the Active Resume Boundary.
+Real control-capable Captain and Crew acceptance therefore remains incomplete.
+
+The requested automatic board creation for new codebases is not safe against Powder's current API.
+Powder exposes repository upsert, not create-if-absent, so a concurrent creator can appear between T-Hub's read and write and have its settings overwritten.
+The reviewed uncommitted Powder prototype was rejected and fully removed because it could not close that race without changing Powder.
+T-Hub must not modify Powder to accommodate this flow and must remain fail-closed until Powder independently provides a non-overwriting create precondition.
+The rejected prototype also exposed two recovery requirements that remain part of the Phase 7 gate: reuse one reviewed request identity across ambiguous retries, and make a preserved unbound Project directly resumable after Powder or binding failure.
+
+Provider-neutral History implementation is now governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
+The contract requires deterministic Harness-plus-conversation identity, distinct same-cwd conversations, backend-owned resume and focus actions, non-destructive per-conversation archive overlays, legacy Claude archive discovery, explicit cache disposal, and dual-Harness packaged acceptance.
+The current Claude-only Recent implementation remains unchanged and must not be extended with Codex rows before those identity and action boundaries exist.
+The `0.3.98` foundation now locks exact length-prefixed Harness identity, lowercase Codex rollout identity, filename-matching child metadata, real `model_provider`, UTC timestamp normalization, malformed-record degradation, per-conversation Claude archive identity, bounded Unicode text, and explicit unavailable actions.
+It is not connected to `history_list`, control, MCP, CLI, frontend IPC, or History UI yet.
+Its 16 focused tests, 659 passed desktop Rust tests with one ignored, Rust workspace and MCP end-to-end suites, strict all-feature Clippy, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
+
+The runtime was reverified before this handoff update.
+Installed T-Hub is PID `14868`, version `0.3.100`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+The installed WSL agent reports `0.5.2` and SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
+Six tmux sessions are currently visible on the canonical `t-hub` socket after Captain commissioning.
+All five pre-install session names and pane PIDs survived the upgrade unchanged.
+The exact detached build produced a standalone executable with SHA-256 `950F9C91124CAFBB817FF1A0B1EF496615E9B6222FBC1793D1CABC0D2EAEE8AC`, an NSIS installer with SHA-256 `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`, and an MSI with SHA-256 `9BBD43D3A951FFB6E845E7D828AB84AB42437C09B877FE6926CB3BEF9D5D9C6E`.
+The expected local updater-signing error occurred only after both installers were complete because the private release key is not present on this machine.
+A 50-second live process sample spanning more than three Powder event poll intervals observed zero PowerShell or cmd children owned by T-Hub PID `14868`.
 
 ## Integrated Commits
 
@@ -48,10 +670,49 @@ The main implementation sequence in this work is:
 - `e2a55c0 fix(identity): prefer durable harness metadata`
 - `212774a fix(tmux): allow healthy WSL command latency`
 - `7f395fb docs: hand off final runtime validation`
+- `21379d2 perf(terminal): expose live resource counters`
+- `d827882 perf(terminal): add hot warm cold lifecycle`
+- `6cd97f8 test(terminal): cover pool lifecycle rehydration`
+- `12c9e0b chore(release): bump desktop to 0.3.65`
+- `a4fd704 fix(windows): own supervisor job handle`
+- `a6230aa fix: bound retained diagnostic logs`
+- `67fd348 fix: close diagnostic backup before replacement`
+- `cfa4139 fix: serialize terminal resize behind writes`
+- `cbc558b fix: leave xterm parser before buffer mutation`
+- `1e005e6 fix: recover terminal IPC detach races`
+- `3576957 chore: bump desktop to 0.3.71`
+- `409675a fix: launch captains with unrestricted authority`
+- `5b4e9d2 chore: bump desktop to 0.3.72`
+- `0be8504 feat: select captains from Powder boards`
+- `4cddab2 chore: bump desktop to 0.3.73`
+- `61f56ba feat: discover typed Run targets`
+- `ee5eb66 chore: bump desktop to 0.3.77`
+- `776439a fix: prevent duplicate terminal redraws`
+- `b4a1c5d chore: bump desktop to 0.3.78`
+- `fbacc8f fix: expose Tauri Vite previews to Windows`
+- `987606a chore: bump desktop to 0.3.79`
+- `16480b7 fix: bind mirrored WSL previews on all interfaces`
+- `25585db chore: bump desktop to 0.3.80`
+- `19dc3c7 fix: preserve reachable mirrored preview URLs`
+- `8f5fffa chore: bump desktop to 0.3.81`
+- `9d95fa9 fix: own managed development process trees`
+- `ec55526 chore: bump desktop to 0.3.82`
+- `5011803 feat: serve typed static Preview targets`
+- `2cbdbb8 chore: bump desktop to 0.3.83`
+- `3177d81 fix: clear stopped managed Preview URLs`
+- `0cd5861 chore: bump desktop to 0.3.84`
+- `1484750 fix: harden managed Preview lifecycle`
+- `9005117 chore: bump desktop to 0.3.85`
+- `d05073d test: silence Windows-only Rust warnings`
+- `5ea945c chore: bump desktop to 0.3.86`
+- `1daf25f test: satisfy strict History lint`
+- `3afb521 fix: commission Codex captains reliably`
+- `f8ef9aa fix: bound Powder credential polling churn`
 
 ## Captain and Crew Model
 
 `skills/captain/SKILL.md` is the canonical Captain protocol.
+[AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) is the canonical authority, evidence, dialogue, escalation, review, and completion contract for General, Cortana, Captains, peer Captains, and Crew.
 `skills/shipmate/SKILL.md` is a compatibility alias and should not be used as the product name going forward.
 Codex uses `$captain`, while Claude uses `/captain`.
 Both harnesses receive managed Captain, Shipmate compatibility, and Handoff skills.
@@ -111,19 +772,13 @@ Commissioning requires a healthy protected Powder profile.
 Crew dispatch validates the project checkout and Powder card, claims work, persists the binding, starts the selected harness, verifies liveness, and rolls back failures.
 Ambiguous liveness causes no Powder mutation.
 
-The expected historical endpoint is `https://sanctum.tail5f5eb4.ts.net:10001`.
-The current machine is on the `tailae53f1` tailnet, where no `sanctum`, `powder`, or `bastion` peer is visible and the documented endpoint does not resolve.
-`~/.t-hub/powder-profiles.json` is absent.
-No approved password-manager command, environment source, or other agent-scoped key command is available.
-
-The external requirements are:
-
-1. Make the authoritative Powder deployment reachable from this machine or provide its replacement endpoint.
-2. Provide a command that prints an existing agent-scoped Powder API key.
-3. Provide the Powder agent name that matches that key.
-
-Do not put the raw key in this repository, this handoff, logs, or chat.
-Do not create a separate local Powder authority as a production substitute.
+The historical endpoint `https://sanctum.tail5f5eb4.ts.net:10001` belongs to the Powder author's environment and is not the authority for this installation.
+This installation intentionally uses its own local Powder authority for testing.
+Powder runs on WSL at `127.0.0.1:4017` and Tailscale Serve exposes it privately to this tailnet at `https://n8desktop-wsl.tailae53f1.ts.net`.
+The protected profile is named `n8desktop-wsl`, not `production`.
+Its credential command retrieves the agent key from WSL without storing the raw key in the T-Hub project registry.
+The T-Hub codebase registration and `t-hub` Powder binding through this profile are complete.
+The remaining integration work is to repair and install the two active Captain blockers, restore a control-capable Captain, and perform real Crew acceptance.
 
 The protected profile should use mode `0600` and this shape:
 
@@ -131,10 +786,10 @@ The protected profile should use mode `0600` and this shape:
 {
   "schemaVersion": 1,
   "profiles": {
-    "production": {
-      "baseUrl": "https://confirmed-powder-endpoint",
-      "agentName": "matching-agent-name",
-      "apiKeyCommand": "command that prints the existing agent-scoped key"
+    "n8desktop-wsl": {
+      "baseUrl": "https://n8desktop-wsl.tailae53f1.ts.net",
+      "agentName": "t-hub",
+      "apiKeyCommand": "protected command that retrieves the WSL agent key"
     }
   }
 }
@@ -216,44 +871,63 @@ Completed low-risk performance changes are:
 - Disabled voice and attention announcements perform no steady Scribe polling.
 - Voice settings hydration races no longer transiently arm polling.
 - PTY output, state, and exit events use keyed subscribers instead of per-terminal global fanout.
+- The UI exposes live terminal resource counters.
+- Parked terminals now move through hot, warm, and cold lifecycle states while tmux remains authoritative.
+- Lifecycle tests cover cold disposal and rehydration.
+
+The earlier installed `0.3.66` application logged xterm rendering failures involving `loadCell` and `isWrapped` after terminal parking and restoration.
+Source commit `6870444` serializes destructive xterm teardown after accepted writes, discards unreplayed pending output during cold teardown, upgrades xterm, and removes the unmaintained canvas renderer.
+The fix is installed in the package built from `35fbae2`.
+Three Captain terminals were parked past the 30-second cold threshold and rehydrated with readable live output.
+The packaged launch produced zero `loadCell`, `isWrapped`, or window errors.
+A repeated application launch initially reproduced competing processes and visibly corrupted canvases, so source commit `35fbae2` added the official Tauri single-instance guard as the first plugin.
+The rebuilt package kept one PID, preserved the control endpoint, and rendered cleanly when launched again.
+Source commit `3b83b9e` gates frontend resize delivery on confirmed remote PTY attachment.
+The rebuilt package restored eight live terminals with zero `no live terminal`, xterm, window, or terminal-list errors in the fresh startup diagnostic slice.
 
 The fresh general performance review ranked the next work as:
 
 1. Add packaged 1, 4, 8, and 16 terminal measurements plus in-app resource counters.
 2. Implement a hot, warm, and cold terminal lifecycle so parked terminals eventually dispose xterm, CanvasAddon, RemotePty, sockets, readers, and attach processes while tmux stays authoritative.
 3. Preserve the stable pool wrapper and rehydrate by subscribing before attach and replaying authoritative capture, avoiding the known canvas DOM-move blanking regression.
-4. Skip Powder event polling when no active Captain can receive events and cache profile clients, credentials, and HTTP connection pools with explicit refresh behavior.
+4. Preserve bounded Powder event polling for registered Projects without a live Captain so relevant events remain unread until delivery is possible, and cache profile clients, credentials, and HTTP connection pools with explicit refresh behavior.
+
+Source `0.3.100` completes the event-reconciler client cache and Windows console suppression portion of that work.
 5. Enable the existing binary PTY protocol and remove the live JSON/base64 encode and decode chain with a tested V1 fallback.
 6. Coalesce focus-driven terminal and Git scans, pause low-priority hidden polling, and reduce permanent watchdog cadence after measurement.
 7. Lazy-load and prune the non-Lucide icon resolver stack by selected theme.
 
-The hot, warm, and cold terminal lifecycle is the highest-value RAM and idle CPU change.
-It is also the highest-risk performance change because terminal visibility, scrollback recovery, input readiness, and canvas reattachment require packaged end-to-end testing.
+The hot, warm, and cold terminal lifecycle is now implemented and has passed packaged cold rehydration and application-restart testing.
+The full performance matrix and a control-capable input mutation check remain open.
 
 ## Remaining Production Work
 
+The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+
 The ordered continuation is:
 
-1. Confirm the Codex versus Claude terminal-header label interactively in the installed application.
-2. Make the authoritative Powder deployment reachable and configure the protected agent profile.
-3. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
-4. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-5. Add in-app lifecycle counters and run stable packaged 1, 4, 8, and 16 terminal acceptance measurements.
-6. Implement hot, warm, and cold terminal parking while preserving authoritative tmux rehydration.
-7. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+1. Keep worktree removal suspended until the Phase 2 unified status service consumes Phase 3 B1 ownership and passes its full activation matrix.
+2. In parallel against stable shared contracts, complete template and clone preparation plus the shared registration-and-commission resume or rollback transaction, while keeping automatic Powder board creation fail closed until Powder independently provides a non-overwriting create precondition.
+3. In parallel through the approved B3 and B4 lanes, implement the provider-neutral History adapter and catalog foundation without changing the Claude-only Recent UI or introducing a substitute durable identity schema.
+4. Repair installed Codex Captain control and cwd behavior, then commission accepted disposable Codex and Claude Captains against the already registered and Powder-bound T-Hub Project.
+5. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+6. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
+7. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
+8. Confirm the Claude terminal-header label interactively in the installed application.
+9. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
+10. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
 - Authenticode signing is absent.
 - Tauri CSP hardening is incomplete.
 - Security scanning and strict branch protection need completion.
-- GitHub Actions dependencies should be pinned to immutable revisions.
 - Packaged Windows, WSL, tmux, Codex, and Claude end-to-end CI is incomplete.
 - A 24-hour soak and resource acceptance matrix have not been completed.
 
 ## Fresh Context Procedure
 
-1. Read `AGENTS.md`, this file, `skills/captain/SKILL.md`, `docs/POWDER-INTEGRATION.md`, `docs/PERFORMANCE-BENCHMARK.md`, and `docs/PRODUCTION-READINESS.md`.
+1. Read `AGENTS.md`, this file, and the canonical phased plan, then read only the supporting contracts required by the active phase.
 2. Run `git status --short` and preserve the user's `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` artifacts.
 3. Run `git log --oneline -12` and inspect any commits after this handoff.
 4. Confirm the installed Windows executable and PID rather than assuming source is deployed.
@@ -267,8 +941,176 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The WSL skill migration, authority hardening, immutable CI action migration, provider identity fix, push, CI, production release, Windows installation, and four-terminal packaged measurement are complete through `7f395fb`.
-The live smoke reproduced a five-second tmux timeout against a healthy `4.3s` Windows-to-WSL command, widened the bounded default to ten seconds, and verified the final packaged request in `0.673s`.
-The immediate local action is an interactive terminal-header visual check, followed by the measured terminal lifecycle optimization tranche.
-Powder-backed acceptance remains externally blocked until the authoritative endpoint and agent-scoped credential source are available.
-Performance optimization has a reviewed, measured order, with inactive terminal lifecycle as the primary next implementation tranche.
+Before the `0.3.94` tranche, the installed Windows process was reverified at PID `23436` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the `0.3.93` packaged review.
+That earlier runtime's file and product version were `0.3.93`.
+That earlier runtime's installed executable SHA-256 was `4F82CCB76A60B8481FF69601CDB0E7BDCB459CE00B83B31CADA125E688BC5643`.
+That earlier installed build was produced from exact detached source `e95eb56` with final standalone executable SHA-256 `725EF0B74E0E2ABBC32064D68785E17F85978A2BE997E865B18E2DE4C21C635D`, NSIS installer SHA-256 `C4CDC28F278815DC2AE826B139A4F1605250B73E48C87D105DD84C06DF3B7F98`, and MSI SHA-256 `AC23DC2414CBC19E174C7EED063CADA3EDFDA85A05F7609AA2250BB8535C51DF`.
+That earlier installed executable differs from the final post-bundle standalone hash even though its version, byte length, and build timing align, so byte-for-byte provenance to that final patched standalone is not proven.
+The installed `th` CLI is version `0.2.0` from source `07e74f4`.
+Source commit `6870444` fixes the reproduced xterm teardown race.
+Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
+Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction.
+It never initializes without `initializeGit: true`, refuses a pre-existing `.git` entry, defaults the new repository to `main`, and rolls back only the `.git` directory it created if a later boundary fails.
+Source commit `e5948c8` collapses concurrent frontend terminal enumeration into one in-flight request and retries one bounded tmux timeout without retrying unrelated failures.
+The `e5948c8` source gate passed 447 frontend tests and TypeScript typechecking.
+The preceding runtime and log-retention tranche passed 585 Rust desktop tests with 1 ignored, the Rust workspace suites, MCP end-to-end tests, formatting, warnings-denied Clippy, the production frontend build, and the performance contract.
+The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
+Source commit `2b7d864` suspends worktree removal fail closed across graphical preflight and the shared backend mutation path until the unified worktree status service can prove canonical Git state, terminals, durable ownership, leases, and Powder claims.
+Installed `0.3.86` reproduced the safety failure before that change: direct Tauri removal deleted a disposable linked worktree while tmux session `th_wtrme2e` was rooted inside it, leaving the live pane at a `(deleted)` cwd.
+The disposable worktree and session were cleaned after reproduction, and the six canonical sessions were unchanged.
+The suspension preserves UI state and invokes no Git operation, and force cannot override it.
+Private rollback is limited to worktrees created by the current in-flight `create_worktree` transaction and never removes a worktree after unconfirmed terminal cleanup.
+Commit `cfc72b7` first bumped this source to `0.3.87`.
+The exact detached Windows build produced all three unsigned local artifacts, but its native removal suite exposed a path-separator-only test failure after proving that the directory remained intact.
+Commit `11ccb19` normalizes that cross-platform assertion, and `b8f7309` bumps that source to `0.3.88` under the every-change version policy.
+The exact detached `0.3.88` build from `807c271` produced standalone, NSIS, and MSI SHA-256 values `349F899E1938F4C615FC13822FE1DEAEACE47BFB002E90C0C6A108459F4301FE`, `CD4E30FF6A484EF64FAF2E38748C737522A2FED32413F68B65BD5EA6B8AFE973`, and `B135C2D3C8B52B870426B3EC3CB3C84A1737DC5660D4F05F078F1E0EE1C28003`.
+Packaging created both installers and then exited only because the updater public key was present without its private signing key, so the artifacts were eligible for local testing but not publication.
+The exact detached `0.3.88` native suite then passed the three public refusal cases but exposed that the transaction-rollback fixture registered its worktree with native Windows Git before exercising the production WSL Git path.
+Commit `f62f188` makes the fixture use the same WSL Git and host-path conversion boundary as production, and `2c6a429` bumps the corrected source to `0.3.89`.
+The exact detached `0.3.89` build from `ac1e2a6` produced standalone, NSIS, and MSI SHA-256 values `440E36512BD95AF56934FEB4B57BED3DF339E2EA64002E432D5FBBF82644967B`, `8144A5CDA2F8CD1378672AC4BE519DD016401D4B2E902BCBA8DAC6A26338545D`, and `B9AF6D760DC15DC0597D4F3FD889F0FA7B34214CCA9635FC833BFBE05C39A2B0`.
+Its native suite proved WSL Git fixture creation and the exact public refusal, then exposed a Windows UNC access denial in the host-side existence assertion for a mounted-drive fixture.
+Commit `3841c2e` keeps all product operations on WSL Git while checking the retained native fixture path directly, and `e26fe2e` bumps the corrected source to `0.3.90`.
+The exact detached `0.3.90` native suite passed all four focused removal tests.
+Installed `0.3.90` verified graphical and direct Tauri preflight, normal, and forced refusal against disposable worktrees with live UI and tmux tiles.
+Every installed path returned the exact temporary-unavailable error before UI detachment or Git mutation; the tiles, Git registrations, and live pane paths remained intact.
+Control, MCP, and CLI parity remains source-test evidence because the installed session retained its read-only capability and did not reuse raw tokens to invoke mutation channels.
+The upgrade first launched under debug acceptance as PID `30136`.
+The declared one-terminal performance retry ran as isolated PID `49712`, and Windows Explorer separately invalidated the first attempt by launching a normal application process.
+The normal installed application was finally restored as PID `20376` without changing the installed hash or any of the six canonical tmux names and pane PIDs.
+During the preceding `0.3.90` retry, its live bridge agent reported `t-hub-agent 0.5.0` and had SHA-256 `4BF61DA4DC7BFDBB9AEF8EF464B3AB6E7035D7EF14F715FC5BFE43A78857A706`.
+That older binary returned the stable `unsupported` response for `git_info` in a direct protocol 1 capability probe.
+The Windows package did not replace that older WSL agent, so packaging the desktop alone could not close the preceding performance blocker.
+The retry artifact `artifacts/perf/t-hub-0.3.90-1t-20260715T0044-r2.json` completed 55 samples over 61.05 seconds but observed eight host-bridge births and eight deaths across four incomplete CPU intervals, so `release_acceptance_eligible` is false.
+That artifact is diagnostic only, not an accepted baseline, and the 4, 8, and 16 terminal cells remain blocked until the recurring bridge churn is removed and the one-terminal scenario is eligible.
+The 29.94-second recurrence matched the visible tile's then-active 30-second full Git-header poll, whose Windows fallback created a fresh WSL process tree on every cache miss.
+Source commits `5ced6c2` and `bd0d8dd` implement bridge-first `GitInfo` collection with typed disconnected, unsupported, and command-failure outcomes, a nine-second agent collector bound below the ten-second desktop request bound, and a real matching-agent stdio acceptance test.
+The compatibility fallback runs only when the bridge is disconnected or the installed agent explicitly reports `GitInfo` unsupported; agent command failures do not start competing WSL work.
+Commit `f821957` bumps the agent and protocol to `0.5.1`, and `8dd94c9` makes successful agent routing one-shot diagnostic evidence while logging every fallback or agent failure.
+The full source gate exposed two existing test-isolation failures under load: a lingering attach-churn firehose that could reset the fresh client, and process-global agent environment that leaked across parallel tests.
+Commits `a9b7082` and `42de985` quiesce the churn workload, restore the agent test environment, and disconnect the fixture agent before deleting its home.
+Commit `d73f9cb` versions desktop `0.3.93` before exact source `e95eb56` was built and installed.
+The `0.3.93` source gate passed 56 frontend files and 471 tests, TypeScript, the production frontend build, 633 passed desktop Rust tests with one ignored, the real built-agent stdio round trip, all Rust workspace and MCP end-to-end suites, formatting, warning-denied Clippy, and the performance harness self-tests.
+During that `0.3.93` acceptance, the installed bridge agent was PID `1930912` at `/home/natkins/.local/bin/t-hub-agent`, reported `t-hub-agent 0.5.1`, and had SHA-256 `E96DCA57F831451FDA62BE25346B54FF9B495293F0F55095B7ECAC4A891EF04F`.
+Installed `0.3.93` passed the graphical same-cwd Git-header proof with one `git_info source=agent` marker and no fallback or agent-error marker.
+The isolated packaged retry at PID `20132` completed 55 samples over 60.96 seconds, but host-bridge triplets produced 12 births, 15 deaths, and seven incomplete intervals even though GitInfo stayed on the persistent agent.
+Artifact `artifacts/perf/t-hub-0.3.93-1t-20260715T0204-r2.json` is diagnostic and reports `release_acceptance_eligible: false`.
+The normal canonical profile was restored as PID `23436`, the disposable performance socket and profiles were removed, and the same six canonical tmux names and pane PIDs remained intact.
+Read-only descendant tracing attributed the residual periodic host-bridge lane to terminal reconciliation, which collected tmux sessions and pane metadata through recurring Windows-to-WSL subprocesses.
+Source commit `3816bf4` adds the additive `TerminalSnapshot` protocol operation, routes normal terminal reconciliation through the persistent WSL agent, and versions the uninstalled source as desktop `0.3.94` with agent and protocol `0.5.2`.
+The compatibility scan is limited to one bootstrap attempt for a disconnected or explicitly unsupported agent, never runs after agent success, and does not run after timeout or agent command failure.
+The agent collector bounds each sequential collection step to four seconds, drains output concurrently, and kills and reaps its process group on timeout.
+The `0.3.94` source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused timeout regressions, and the performance harness self-tests.
+The exact detached `3816bf4` Windows build produced a standalone `0.3.94` executable with SHA-256 `00AA4B113B19B41B2D476E88D9CD5600D42B76F588C294A5D3E06C3B6D59F922`, an NSIS installer with SHA-256 `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`, and an MSI with SHA-256 `FF467ECB84AF41C5893E60DBD54B71BF7848E4D89FEEB7829130893C1BAEF54D`.
+The build created both bundles and then exited only because the updater public key was present without the private signing key, so these artifacts are for local acceptance and not publication.
+The matching detached Linux agent reports `t-hub-agent 0.5.2`, has SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`, and passed a real bridge round trip on a disposable socket with exactly one declared session and one pane.
+The disposable socket was removed after the proof.
+The exact NSIS installed desktop is `0.3.94` with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`, and the matching installed agent reports `0.5.2` with SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
+The normal-profile graphical proof emitted one `terminal_snapshot source=agent` marker and one `git_info source=agent` marker with no fallback, timeout, or agent-error marker.
+Five polls spanning more than four terminal reconciliation periods kept all six terminal IDs, states, and current working directories stable.
+The first isolated 95.09-second artifact `artifacts/perf/t-hub-0.3.94-1t-20260715T1034.json` recorded zero host-bridge births or deaths and 86 complete host-bridge intervals, but a one-second WebView2 helper lifetime made two total intervals incomplete.
+The warm repeat `artifacts/perf/t-hub-0.3.94-1t-20260715T1043-r3.json` sampled 95.35 seconds with one declared idle shell, 86 complete total intervals, zero incomplete intervals, zero births or deaths in every category, a stable 17-process tree, and a stable 10-process host bridge.
+Its total CPU release statistic is eligible at `0.10637` logical cores over the run.
+The disposable tmux socket, database, control files, WebView profile, and shared-layout backup were removed after the proof.
+The normal canonical profile is restored as PID `46860` with agent PID `2118725`, and the six original tmux names and pane PIDs remain unchanged.
+The eligible one-terminal gate unblocks the serialized 4, 8, and 16 terminal Phase 11 measurements.
+The local Powder endpoint and protected agent credential path are operational.
+That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.
+The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
+After installing `e5948c8`, three consecutive application starts preserved all eight tmux sessions.
+Their combined fresh diagnostic slice contains zero `listTerminals failed`, premature-resize, xterm, or window errors, and `th ls` returns all eight sessions.
+Installed `0.3.71` completed one warm stress pass and two cold restart passes with zero `loadCell`, `isWrapped`, `replaceCells`, `no live terminal`, window, or unhandled errors in the targeted fresh slices.
+Installed `0.3.72` preserved all eight tmux sessions across upgrade and its packaged Captain review reports `Permissions` as `Unrestricted`.
+The Codex and Claude harness tests lock the exact unrestricted launch flags used by `commission_captain`.
+Installed `0.3.73` preserved all eight tmux sessions and listed all 25 visible canonical Powder boards through `n8desktop-wsl` without free-text entry.
+The packaged dialog selected `t-hub`, reported `t-hub via n8desktop-wsl` in preflight, and performed no Project, Powder, Captain, or filesystem mutation during verification.
+Source commit `2cf4a42` adds the reviewed empty-codebase transaction, and `00d9207` packages it as `0.3.74`.
+Its full gate passed 452 frontend tests, 593 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, the production frontend build, and the transactional installer test.
+Installed `0.3.74` preserved all eight tmux sessions, displayed the new empty-codebase choice with all 25 Powder boards, reviewed the exact absent destination and unrestricted authority, and left no directory after Cancel.
+Packaged Board reproduction on the T-Hub tile resolved the legacy global `http://localhost:4000` setting to `http://192.168.0.102:4000/` instead of using a Project Powder binding or showing the honest unbound state.
+Source commit `6c6e4ee` replaces that global iframe with a native Project-scoped read-only Board, and `15ab30f` packages it as `0.3.75`.
+The full source gate passed 453 frontend tests, 599 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
+The exact detached Windows build produced an executable SHA-256 of `4F43B4B22982B2E09493A7EF331F938675E43405ABE19450081DD6B4DE1153FA` and the installed upgrade preserved all eight tmux sessions.
+Packaged WebView verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input.
+The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.75-Board.png`.
+The native Board's registered and bound Project success state remains gated on real Phase 8 acceptance.
+The packaged graphical success matrix for new codebases remains open, so Phase 7 remains active on the current Captain-creation sequence.
+Installed `0.3.86` reproduced the new-codebase gap: the dialog exposes only an empty Git repository starting point and explicitly defers templates and clones.
+The graphical flow sequences separate `register_project` and `commission_captain` backend transactions, so cross-operation resume or rollback and graphical-to-Cortana transaction parity remain open.
+Source commit `96998fc` unifies Dev and Preview into one Run and Preview surface and removes all terminal-output URL detection and automatic navigation.
+Commit `7ced938` packages that change as `0.3.76`.
+The full source gate passed 459 frontend tests, 599 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
+The detached Windows build produced executable SHA-256 `2C6FF7C0003852AE95F8968FCC5EF5819744255C1F3F0401150786506D02AF31`, NSIS installer SHA-256 `3798914846CFAE64F3F7FFC79F9BA964E7AD31E2CD64C587D68310F91E6854E0`, and MSI SHA-256 `EEF628D1140DD7AF87D94E6A79450F5124CE440E41352F2B3BA16519DD3B71ED`.
+The upgrade preserved the exact same eight tmux session names and pane PIDs.
+Packaged WebView verification showed one **Run + Preview** tab, no separate Dev or Preview tab, one unified panel, an empty preview URL, zero iframes, and no detected-URL chips.
+The previously offending `http://127.0.0.1:9223/json/list` text remained in the tile's PTY scrollback during that verification.
+The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.76-Run-Preview.png`.
+Source commit `61f56ba` implements typed root-package target discovery and generation-safe backend lifecycle snapshots, and `ee5eb66` first packaged it as `0.3.77`.
+Source commit `776439a` fixes the reproduced duplicate Codex frame and header-Refresh transcript loss by making tmux attach the only current-screen renderer and removing resize-time transcript clearing.
+Commit `b4a1c5d` packages that repair as installed `0.3.78`.
+Its full source gate passed 463 frontend tests, 604 Rust desktop tests with 1 ignored, the Rust workspace and MCP end-to-end suites, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
+The exact detached Windows build produced executable SHA-256 `B5786376AA179B08B973940E9D6002D212C958CD470A0E6B43377C586750ED91`, NSIS installer SHA-256 `C174D09E7CAEA3546A57923B3A7CF109867CFD78095994886FC37CA7E607CC71`, and MSI SHA-256 `BB06C0F74B3A46DA1C9D5FD3E69F8AD408BAA41B4E8BEAB9B1CF19C1E5F270A2`.
+The upgrade, header Refresh, and full relaunch preserved the same eight tmux pane PIDs and the same T-Hub Codex process chain `1505037 -> 1505453 -> 1505460`.
+The active `Run /review on my current changes` draft appeared once after relaunch, and direct visible-pane capture also counted exactly one occurrence.
+Screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.78-thub-after-header-refresh.png` and `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.78-thub-after-full-relaunch-settled.png`.
+Packaged Run and Preview acceptance discovered only the four declared T-Hub scripts, started the real Vite `dev` target, detected `http://localhost:1420/`, and stopped the exact run without leaving its Vite descendant alive.
+Windows HTTP probing timed out against that WSL loopback-only listener and the preview stayed in its loading state, so reachable-interface ownership is the next Run and Preview implementation boundary.
+Source commits `fbacc8f`, `16480b7`, and `19dc3c7` repair that boundary, and `8f5fffa` packages the result as installed `0.3.81`.
+Packaged acceptance started the T-Hub root `dev` target, showed Vite `6.4.3`, kept the Preview iframe at `http://localhost:1420/`, returned Windows HTTP 200, and showed both the application and HMR listeners on `0.0.0.0`.
+Stop removed ports `1420` and `1421` and the exact managed Vite PID `547880`.
+Source commit `9d95fa9` adds a fixed argv-safe WSL supervisor, per-run process groups, stdin lifelines, retained Windows Job Objects, bounded TERM then KILL cleanup, and bounded output-reader joins.
+Commit `ec55526` packages that repair as installed `0.3.82`.
+The installed package launched the real root `pnpm run dev` as one process group containing pnpm, Vite, and esbuild, returned Windows HTTP 200, and loaded `http://localhost:1420/` in the Preview iframe.
+Normal Stop returned in 161 milliseconds, removed all six observed group processes and the run marker, released ports `1420` and `1421`, and a second run reused port `1420` successfully.
+Forcing PID `51332` to exit during the second run removed its complete process group, marker, and listeners without changing any of the seven unrelated tmux session names or pane PIDs.
+The application then relaunched as installed `0.3.82` PID `48160`.
+Installed `0.3.82` also passed representative Next.js acceptance against the real `apps/site` fixture.
+The application discovered npm `dev`, started Next `14.2.35`, returned Windows HTTP 200 with both expected page sentinels, loaded `http://localhost:3000/` in Preview, stopped in 161 milliseconds, and removed the full npm and Next process group.
+Source commit `5011803` adds a typed static-site target for a regular root `index.html`, an authoritative snapshot URL, and a Windows `127.0.0.1` server with bounded files and strict traversal, hidden-path, symlink, reparse-point, method, and MIME handling.
+Packaged `0.3.83` reproduced and exposed a remaining lifecycle defect after successful security acceptance: Stop closed the listener but retained the dead managed URL and iframe as if they were a user URL.
+Source commit `3177d81` separates managed and manual Preview URLs so Stop remounts the honest empty state, and `0cd5861` packages the repair as installed `0.3.84`.
+The `0.3.84` source gate passed all 469 frontend tests, TypeScript, 613 Rust desktop tests with 612 passed and one ignored, the Rust workspace and MCP end-to-end suites, formatting, and warning-denied Clippy.
+Packaged `0.3.84` discovered exactly one package-less static target, auto-loaded `http://127.0.0.1:63437/`, returned the expected HTML sentinel with correct CSS and JavaScript MIME types, and bound only Windows loopback under the T-Hub PID.
+Raw, encoded, and double-encoded traversal, backslash, hidden-file, and outside-symlink requests all returned 404, while POST returned 405 and GET and HEAD returned the required security headers.
+Stop returned in 406 milliseconds, removed the iframe and URL input, restored the empty Preview state, and closed the listener.
+A second run restored its authoritative URL across a Terminal to Run and Preview tab remount, and forced application exit closed that listener while preserving the disposable fixture session and all seven canonical sessions.
+The disposable session and files were then removed, and installed `0.3.84` relaunched as PID `17664` with the same seven canonical tmux session names and pane PIDs.
+Source commit `1484750` hardens managed Preview concurrency, rejected-start reconciliation, static request admission and deadlines, exact loopback Host validation, and path-race confinement through capability-relative no-follow handles.
+Commit `9005117` packaged that source as `0.3.85` and passed 23 focused native Windows Preview tests, including directory-junction rejection.
+Its standalone executable, NSIS, and MSI SHA-256 values are `870E71B240B13675F2F717EB786C97F91FDABBD5BFD89E0504E43B2D9E87624D`, `B227A48FDEEF8589E629CA286898FE42ECFCA336C860AE177AC17A6C02A5E121`, and `81A38DB62EE8A68F43DD3F5C3473BC16044F28BF6B4B225FD85630F7315DA454`.
+That artifact was not installed because its native test compilation exposed two platform-specific warnings.
+Source commit `d05073d` removes those warnings, and `5ea945c` packages the result as installed `0.3.86`.
+The exact `0.3.86` source passed 621 Linux Rust library tests with one ignored, warning-denied Clippy, the production frontend build, and the same 23 focused native Windows Preview tests without warnings.
+The detached `0.3.86` build produced standalone executable SHA-256 `EF2ED4C1D610F80555A84255F52CC798C1779F24FA9CA79436318D2A5E07B8E1`, NSIS installer SHA-256 `480AAD85F88C20D8105E776E2E84F811096835219F6D97E16999403A6D56714A`, and MSI SHA-256 `4CC8834E283F1639CDA2FD9DD86C34CD703590D7C4AFDC830AC967B95751AAE6`.
+Packaged acceptance discovered exactly one typed static target and passed HTML, CSS, JavaScript, nested-path, security-header, hidden-path, symlink, oversize, encoded-traversal, method, missing-Host, mismatched-Host, and duplicate-Host checks.
+A nonreading 16 MiB response stopped in 206 milliseconds while a second terminal independently reached `running` with its own run ID and URL.
+Restart produced a distinct run ID, stale-run Stop was refused without changing the active run, final Stop cleared the authoritative URL, and final relaunch left no Preview listener.
+The six tmux sessions present immediately before installation retained the same names and pane PIDs through installation, acceptance, and final relaunch.
+The previously recorded `th_a486c7fc` session was already absent before installation and is not claimed as preserved by this run.
+Installed `0.3.86` initially relaunched normally as PID `17712` and was later reverified as PID `53764`, with executable SHA-256 `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46` unchanged.
+The preceding `0.3.81` source review gate passed 55 frontend files and 466 tests, TypeScript, 604 Rust tests with 603 passed and one ignored, MCP end-to-end, and warning-denied Clippy.
+The fleet contained eight canonical tmux sessions when the preceding `0.3.81` packaged acceptance began.
+During that `0.3.81` review window, the unrelated Scribe session `th_118218d2` and its prior pane PID `3043188` exited, leaving seven live sessions; the managed Stop action owned only the Vite run and did not issue a tmux lifecycle command.
+Representative Vite, Next.js, and package-less static packaged acceptance is complete.
+The remaining Run and Preview hardening is generic non-Tauri Vite launch adapters and stale WSL-address recovery.
+Real Powder acceptance still requires a control-capable Captain session.
+The bound Board success state, remaining Run and Preview hardening, Claude header check, packaged performance matrix, and release hardening remain open.
+
+## Current Captain Reconciliation - 2026-07-16
+
+Powder P1-P4 are complete at local deployment commit `8217c29` with schema version 18 and independent QA verification.
+
+The T-Hub Captain preserved and then fast-forwarded the reviewed Stage 2 candidate `7ea4dc5` onto canonical `fix/captain-control-runtime`.
+
+Canonical descends from corrected Stage 1 commit `d8aa935`, which has the same patch identity as formatting repair `444131b`, and does not descend from the parallel `444131b` history.
+
+T30 translated commits through `171b83b` and T2 commits `59a2cb5` and `7ea4dc5` are present.
+
+The candidate was independently reviewed and passed formatting, diff, Powder race-matrix, MCP, workspace-test, and warnings-denied Clippy gates.
+
+Independent validation of the canonical fast-forward is the current review boundary.
+
+T1 and T3 remain separate later work, and no installation, restart, publication, claim completion or release, or worktree cleanup is authorized by this boundary.
+
+The T1 card `thub-powder-run-bound-mutations` is now ready and unclaimed after sanctioned dependency reconciliation, with Captain `c2940be4` designated as the sole shared-surface integration owner pending separate dispatch authorization.
+
+T3 remains undispatched.

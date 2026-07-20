@@ -9,18 +9,8 @@
 // ALREADY decided to fire a notification ask this for the subject to put in it,
 // so this stays clear of the voice-gate (Scribe) semantics entirely.
 import { useSupervision } from "../store/supervision";
-import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import { useCaptain } from "../store/captain";
 import { ORCHESTRATOR_DISPLAY_NAME } from "./ensureOrchestrator";
-
-/** Last path segment of a cwd (`/a/b/t-hub` -> `t-hub`); "" when empty. */
-function cwdBasename(cwd: string | undefined): string {
-  const parts = (cwd ?? "")
-    .replace(/[/\\]+$/, "")
-    .split(/[/\\]+/)
-    .filter(Boolean);
-  return parts[parts.length - 1] ?? "";
-}
 
 /** The tile (terminal) id backing a Claude session id, via the supervision
  *  reverse index (`sessionIdByTmux` maps `th_<id>` -> sessionId). Null when the
@@ -56,15 +46,11 @@ export function captainAttributionForSession(
     return { isOrchestrator: true, name: ORCHESTRATOR_DISPLAY_NAME };
   }
   if (!cap.captainIds.includes(terminalId)) return null;
-  const ws = useWorkspace.getState();
-  const rename = ws.userLabels[terminalId]?.trim();
-  const folder = cwdBasename(ws.terminals[terminalId]?.cwd);
-  const tabId = tabIdForTerminal(ws, terminalId);
-  const tabName = tabId
-    ? ws.tabs.find((t) => t.id === tabId)?.name?.trim()
-    : undefined;
-  const slug = cap.claims[terminalId]?.shipSlug?.trim();
-  const name = rename || folder || tabName || slug || terminalId.slice(0, 8);
+  const claim = cap.claims[terminalId];
+  const name =
+    claim?.displayName?.trim() ||
+    claim?.shipSlug?.trim() ||
+    terminalId.slice(0, 8);
   return { isOrchestrator: false, name };
 }
 

@@ -20,7 +20,7 @@ anyhow = "1"
 
 [package]
 name = "t-hub"
-version = "0.3.64"
+version = "0.3.106"
 description = "T-Hub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
@@ -77,16 +77,22 @@ tauri-plugin-process = "2"
 # tauri.conf.json. Without it the frontend degrades to sound-only (see
 # src/lib/notify.ts).
 tauri-plugin-notification = "2"
+# Native Windows folder selection for the Captain codebase picker. The selected
+# host path is validated and converted back to a WSL POSIX path before use.
+tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"
 anyhow = { workspace = true }
 parking_lot = "0.12"
+async-lock = "3"
 base64 = "0.22"
 # SHA-256 for the control-socket audit log's tamper-evident hash chain
 # (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
 # makes it a direct dependency (no lockfile resolution change).
 sha2 = "0.10"
+# Standard HMAC construction for non-persisted protected endpoint identities.
+hmac = "0.12"
 # RFC3339 timestamps for the control-socket audit log (audit.rs). Already in the
 # tree transitively; this only makes it a direct dependency.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -96,6 +102,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # server rejects browser-origin requests.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Backend-owned static Preview targets serve through capability-relative file
+# handles so a writable project cannot race path validation with a symlink or
+# reparse-point swap. The frontend selects only the typed root target and never
+# supplies a command, executable, port, or alternate serving directory.
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
+mime_guess = "2"
+percent-encoding = "2"
 # OS cache-dir resolution for the Scribe voice-gate status file (scribe.rs):
 # LOCALAPPDATA on Windows, ~/.cache on Linux, ~/Library/Caches on macOS - so the
 # reader points at Scribe's Tauri app_cache_dir on whatever OS T-Hub runs on.
@@ -125,8 +139,12 @@ t-hub-protocol = { path = "crates/t-hub-protocol" }
 # hwnd()` is the same type we pass to SetWindowSubclass. Only the features this
 # module uses are enabled; on non-Windows targets this dependency is absent.
 [target.'cfg(windows)'.dependencies]
+tauri-plugin-single-instance = "2"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # MoveFileExW with replace + write-through semantics for atomic diagnostic
+    # log rotation when a previous `.1` backup already exists.
+    "Win32_Storage_FileSystem",
     # OpenProcess/CloseHandle for the Scribe voice-gate pid-liveness check
     # (scribe.rs): T-Hub-on-Windows confirms Scribe's pid is alive so a long
     # continuous dictation holds regardless of the status file's mtime.
@@ -161,6 +179,7 @@ windows = { version = "0.61", features = [
 # (item-3 ledger #16). The shipped app binary does not link this.
 [dev-dependencies]
 t-hub-mcp = { path = "crates/t-hub-mcp" }
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1

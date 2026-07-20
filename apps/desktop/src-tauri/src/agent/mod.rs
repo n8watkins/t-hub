@@ -28,12 +28,13 @@ pub mod emit;
 pub use connection::ConnectionState;
 pub use emit::EventEmitter;
 
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, LazyLock, Weak};
 
 use parking_lot::Mutex;
 use t_hub_protocol::{
-    AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, Hello,
-    HostMetrics, Priority, WorktreeInfo, PROTOCOL_VERSION,
+    AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, GitInfo,
+    Hello, HostMetrics, Priority, ResponseErrorKind, TerminalSnapshot, WorktreeInfo,
+    PROTOCOL_VERSION,
 };
 
 use crate::supervision::Supervisor;
@@ -120,6 +121,37 @@ pub struct AgentBridge {
     inner: Arc<BridgeInner>,
 }
 
+static ACTIVE_BRIDGE: LazyLock<Mutex<Weak<BridgeInner>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));
+
+#[cfg(test)]
+static AGENT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct TestEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvVar {
+    fn drop(&mut self) {
+        match self.previous.as_ref() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 struct BridgeInner {
     /// The supervision reducer, fed by incoming journal events. Shared so the
     /// supervision Tauri commands can read snapshots without a round-trip.
@@ -158,6 +190,51 @@ struct BridgeInner {
 /// orchestrator wake, without coupling the `agent` module to fleet concepts.
 pub type StatusObserver = Arc<dyn Fn(&str, crate::model::SessionStatus) + Send + Sync>;
 
+/// Stable failure categories for the GitInfo capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitInfoBridgeError {
+    Disconnected(String),
+    Unsupported(String),
+    CommandFailed(String),
+}
+
+/// Stable failure categories for the terminal snapshot capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSnapshotBridgeError {
+    Disconnected(String),
+    TimedOut(String),
+    Unsupported(String),
+    CommandFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRequestError {
+    Disconnected(String),
+    WriteFailed(String),
+    TimedOut(String),
+}
+
+fn classify_request_receive_error(id: u64, error: mpsc::RecvTimeoutError) -> AgentRequestError {
+    match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            AgentRequestError::TimedOut(format!("request id={id} timed out after 10 seconds"))
+        }
+        mpsc::RecvTimeoutError::Disconnected => AgentRequestError::Disconnected(format!(
+            "agent bridge disconnected while awaiting request id={id}"
+        )),
+    }
+}
+
+impl std::fmt::Display for AgentRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected(message) | Self::WriteFailed(message) | Self::TimedOut(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
 impl BridgeInner {
     /// Emit a `Serialize` payload on `channel` if an emitter is installed; a
     /// no-op otherwise (pre-`setup()` and under unit tests). Best-effort: the
@@ -172,7 +249,7 @@ impl BridgeInner {
 
 impl Default for AgentBridge {
     fn default() -> Self {
-        Self {
+        let bridge = Self {
             inner: Arc::new(BridgeInner {
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
@@ -182,7 +259,9 @@ impl Default for AgentBridge {
                 status: Mutex::new(None),
                 status_observer: Mutex::new(None),
             }),
-        }
+        };
+        *ACTIVE_BRIDGE.lock() = Arc::downgrade(&bridge.inner);
+        bridge
     }
 }
 
@@ -457,14 +536,13 @@ impl AgentBridge {
     /// **Channel / Priority**: `Channel::Control` and `Priority::Normal` are
     /// used for all requests today. A future scheduler can inspect the request
     /// body to select the appropriate channel and priority before writing.
-    pub fn request(&self, req: AgentRequest) -> Result<AgentResponse, String> {
+    pub fn request(&self, req: AgentRequest) -> Result<AgentResponse, AgentRequestError> {
         // Grab the transport handles (returns an error if not connected).
         let handles = {
             let guard = self.inner.transport.lock();
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| "agent bridge not connected".to_string())?
+            guard.as_ref().cloned().ok_or_else(|| {
+                AgentRequestError::Disconnected("agent bridge not connected".to_string())
+            })?
         };
 
         // Allocate a unique request id.
@@ -496,25 +574,38 @@ impl AgentBridge {
             write_frame(&mut *stdin_guard, &frame).map_err(|e| {
                 // Remove the dangling correlation entry on write failure.
                 handles.pending.lock().remove(&id);
-                format!("failed to write request id={id}: {e}")
+                AgentRequestError::WriteFailed(format!("failed to write request id={id}: {e}"))
             })?;
         }
 
         // Block until the reader delivers the response or we time out.
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(response) => Ok(response),
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Clean up the correlation entry so the reader doesn't deliver
                 // a stale response after we've given up.
                 handles.pending.lock().remove(&id);
-                Err(format!("request id={id} timed out after 10 seconds"))
+                Err(classify_request_receive_error(
+                    id,
+                    mpsc::RecvTimeoutError::Timeout,
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                handles.pending.lock().remove(&id);
+                Err(classify_request_receive_error(
+                    id,
+                    mpsc::RecvTimeoutError::Disconnected,
+                ))
             }
         }
     }
 
     /// Convenience: fetch a host metrics snapshot.
     pub fn metrics(&self) -> Result<HostMetrics, String> {
-        match self.request(AgentRequest::Metrics)? {
+        match self
+            .request(AgentRequest::Metrics)
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::Metrics(m) => Ok(m),
             other => Err(format!("unexpected response to metrics: {other:?}")),
         }
@@ -522,9 +613,12 @@ impl AgentBridge {
 
     /// Convenience: derive the current git branch for `cwd` (statusline lacks it).
     pub fn git_branch(&self, cwd: &str) -> Result<Option<String>, String> {
-        match self.request(AgentRequest::GitBranch {
-            cwd: cwd.to_string(),
-        })? {
+        match self
+            .request(AgentRequest::GitBranch {
+                cwd: cwd.to_string(),
+            })
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::GitBranch { branch } => Ok(branch),
             other => Err(format!("unexpected response to git_branch: {other:?}")),
         }
@@ -532,12 +626,41 @@ impl AgentBridge {
 
     /// Convenience: list worktrees for the repo containing `cwd`.
     pub fn git_worktrees(&self, cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
-        match self.request(AgentRequest::GitWorktrees {
-            cwd: cwd.to_string(),
-        })? {
+        match self
+            .request(AgentRequest::GitWorktrees {
+                cwd: cwd.to_string(),
+            })
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::GitWorktrees { worktrees } => Ok(worktrees),
             other => Err(format!("unexpected response to git_worktrees: {other:?}")),
         }
+    }
+
+    /// Fetch the complete Files-panel git snapshot through the persistent agent.
+    pub fn git_info(&self, cwd: &str) -> Result<GitInfo, GitInfoBridgeError> {
+        let response = self
+            .request(AgentRequest::GitInfo {
+                cwd: cwd.to_string(),
+            })
+            .map_err(|error| GitInfoBridgeError::Disconnected(error.to_string()))?;
+        map_git_info_response(response)
+    }
+
+    /// Fetch terminal reconciliation metadata through the persistent agent.
+    pub fn terminal_snapshot(&self) -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+        let response =
+            self.request(AgentRequest::TerminalSnapshot)
+                .map_err(|error| match error {
+                    AgentRequestError::Disconnected(message)
+                    | AgentRequestError::WriteFailed(message) => {
+                        TerminalSnapshotBridgeError::Disconnected(message)
+                    }
+                    AgentRequestError::TimedOut(message) => {
+                        TerminalSnapshotBridgeError::TimedOut(message)
+                    }
+                })?;
+        map_terminal_snapshot_response(response)
     }
 
     /// Consume one journal entry: advance the cursor, feed supervision, emit the
@@ -557,6 +680,15 @@ impl AgentBridge {
     /// (so the unit tests that call this directly still pass). Returns the
     /// affected session id for callers/tests that want it.
     pub fn consume_journal_entry(&self, entry: &EventJournalEntry) -> Option<String> {
+        // The journal sequence is the replay idempotency boundary. Reject an
+        // already-consumed or out-of-order entry before every side effect,
+        // including status ingestion, UI emission, title derivation, provider
+        // binding, and supervision reduction. Otherwise a late SessionStart can
+        // erase a newer pending permission and falsely report Working.
+        if !self.advance_cursor(entry.seq) {
+            return None;
+        }
+
         // StatusSnapshot entries get a DEDICATED minimal path. The statusline
         // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
         // ticks). On that path the full fan-out below is pure waste and a sustained
@@ -572,7 +704,6 @@ impl AgentBridge {
             entry.event_type,
             t_hub_protocol::JournalEventType::StatusSnapshot
         ) {
-            self.advance_cursor(entry.seq);
             self.ingest_status_from_journal(entry);
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
@@ -585,16 +716,12 @@ impl AgentBridge {
             });
         }
 
-        let cursor_advanced = self.advance_cursor(entry.seq);
-
         // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
         //    the protocol type). Serialize once and reuse the value.
         self.inner.emit(EVT_JOURNAL, &JournalEventPayload { entry });
 
-        // 2. If the replay cursor moved, the health area's journalCursor changed.
-        if cursor_advanced {
-            self.emit_agent_state();
-        }
+        // 2. The replay cursor moved, so the health area's journalCursor changed.
+        self.emit_agent_state();
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
         // at the top of this method onto a dedicated minimal path (status bridge +
@@ -626,14 +753,25 @@ impl AgentBridge {
             .get("notification_type")
             .and_then(|v| v.as_str());
 
+        // Structured provider lifecycle events carry the exact tmux binding.
+        // Feed that binding into the existing session-to-terminal authority so
+        // fleet attention can resolve this provider session to its Crew tile.
+        if entry.payload.get("provider").and_then(|v| v.as_str()) == Some("codex") {
+            if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
+            {
+                status_bridge.ingest(sid, &entry.payload, entry.timestamp_ms);
+            }
+        }
+
         let affected = self.with_supervisor(|s| {
-            s.ingest(
+            s.ingest_with_payload(
                 session_id,
                 agent_id,
                 agent_type,
                 notification_type,
                 entry.event_type,
                 entry.timestamp_ms,
+                Some(&entry.payload),
             )
         });
 
@@ -650,7 +788,14 @@ impl AgentBridge {
     /// current reducer state. Public-in-crate so the status bridge / commands can
     /// re-emit a session after an out-of-band status change.
     pub(crate) fn emit_session(&self, session_id: &str) {
-        let (tree, status) = self.with_supervisor(|s| (s.tree(session_id), s.status(session_id)));
+        let (tree, status, runtime_health, permission_request) = self.with_supervisor(|s| {
+            (
+                s.tree(session_id),
+                s.status(session_id),
+                s.runtime_health(session_id),
+                s.permission_request(session_id),
+            )
+        });
         if let Some(tree) = tree {
             self.inner.emit(EVT_SUPERVISION, &tree);
         }
@@ -659,6 +804,8 @@ impl AgentBridge {
             &SessionStatusPayload {
                 session_id: session_id.to_string(),
                 status,
+                runtime_health,
+                permission_request,
             },
         );
         // Notify the fleet observer (if wired) so a supervised session's transition
@@ -725,6 +872,57 @@ impl AgentBridge {
         if prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
             self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
         }
+    }
+}
+
+/// Fetch git facts through the current application bridge.
+pub fn git_info(cwd: &str) -> Result<GitInfo, GitInfoBridgeError> {
+    let inner = ACTIVE_BRIDGE
+        .lock()
+        .upgrade()
+        .ok_or_else(|| GitInfoBridgeError::Disconnected("agent bridge unavailable".to_string()))?;
+    AgentBridge { inner }.git_info(cwd)
+}
+
+/// Fetch terminal reconciliation metadata through the current application bridge.
+pub fn terminal_snapshot() -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+    let inner = ACTIVE_BRIDGE.lock().upgrade().ok_or_else(|| {
+        TerminalSnapshotBridgeError::Disconnected("agent bridge unavailable".to_string())
+    })?;
+    AgentBridge { inner }.terminal_snapshot()
+}
+
+fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, GitInfoBridgeError> {
+    match response {
+        AgentResponse::GitInfo(info) => Ok(info),
+        AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message,
+        } => Err(GitInfoBridgeError::Unsupported(message)),
+        AgentResponse::Error { kind, message } => Err(GitInfoBridgeError::CommandFailed(format!(
+            "{kind:?}: {message}"
+        ))),
+        other => Err(GitInfoBridgeError::CommandFailed(format!(
+            "unexpected response: {other:?}"
+        ))),
+    }
+}
+
+fn map_terminal_snapshot_response(
+    response: AgentResponse,
+) -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+    match response {
+        AgentResponse::TerminalSnapshot(snapshot) => Ok(snapshot),
+        AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message,
+        } => Err(TerminalSnapshotBridgeError::Unsupported(message)),
+        AgentResponse::Error { kind, message } => Err(TerminalSnapshotBridgeError::CommandFailed(
+            format!("{kind:?}: {message}"),
+        )),
+        other => Err(TerminalSnapshotBridgeError::CommandFailed(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -868,6 +1066,134 @@ mod tests {
     }
 
     #[test]
+    fn request_receive_errors_preserve_timeout_and_disconnect_categories() {
+        assert!(matches!(
+            classify_request_receive_error(7, mpsc::RecvTimeoutError::Timeout),
+            AgentRequestError::TimedOut(message) if message.contains("id=7")
+        ));
+        assert!(matches!(
+            classify_request_receive_error(9, mpsc::RecvTimeoutError::Disconnected),
+            AgentRequestError::Disconnected(message) if message.contains("id=9")
+        ));
+    }
+
+    #[test]
+    fn git_info_response_reports_unsupported_agent_capability() {
+        let error = super::map_git_info_response(AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message: "unsupported request op".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GitInfoBridgeError::Unsupported("unsupported request op".to_string())
+        );
+    }
+
+    #[test]
+    fn git_info_response_reports_agent_command_failure() {
+        let error = super::map_git_info_response(AgentResponse::Error {
+            kind: ResponseErrorKind::CommandFailed,
+            message: "git timed out".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GitInfoBridgeError::CommandFailed("CommandFailed: git timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_response_reports_unsupported_agent_capability() {
+        let error = super::map_terminal_snapshot_response(AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message: "unsupported request op".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            TerminalSnapshotBridgeError::Unsupported("unsupported request op".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_response_reports_agent_command_failure() {
+        let error = super::map_terminal_snapshot_response(AgentResponse::Error {
+            kind: ResponseErrorKind::CommandFailed,
+            message: "tmux timed out".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            TerminalSnapshotBridgeError::CommandFailed("CommandFailed: tmux timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn live_stdio_git_info_round_trip_with_real_agent() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agent_bin = manifest.join("target/debug/t-hub-agent");
+        if !agent_bin.exists() {
+            eprintln!(
+                "live_stdio_git_info_round_trip_with_real_agent: binary missing; run cargo build -p t-hub-agent"
+            );
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("t-hub-bridge-git-info-{unique}"));
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "T-Hub Test"],
+            vec!["config", "user.email", "t-hub@example.test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &agent_bin);
+        let bridge = AgentBridge::new();
+        bridge.connect("ignored").expect("real agent must connect");
+        drop(agent_bin_env);
+        drop(env_lock);
+        let info = bridge
+            .git_info(repo.to_str().unwrap())
+            .expect("real stdio GitInfo request must succeed");
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.worktree_root.as_deref(), repo.to_str());
+        assert_eq!(info.dirty_count, 1);
+        assert!(info.head_commit.is_some());
+        bridge.disconnect();
+        std::fs::remove_dir_all(repo).ok();
+    }
+
+    #[test]
     fn consume_journal_advances_cursor_and_feeds_supervision() {
         let bridge = AgentBridge::new();
         assert_eq!(bridge.journal_cursor(), 0);
@@ -890,8 +1216,84 @@ mod tests {
         bridge.consume_journal_entry(&entry(5, "o1", None, JournalEventType::SessionStart));
         assert_eq!(bridge.journal_cursor(), 5);
         // A late/duplicate lower seq must not move the cursor backwards.
-        bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit));
+        assert!(bridge
+            .consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit))
+            .is_none());
         assert_eq!(bridge.journal_cursor(), 5);
+    }
+
+    #[test]
+    fn replay_restart_and_late_session_start_cannot_clear_a_permission_need() {
+        fn permission(seq: u64) -> EventJournalEntry {
+            EventJournalEntry {
+                seq,
+                timestamp_ms: seq,
+                source: JournalSource::Agent,
+                entity_id: Some("thread-1".to_string()),
+                event_type: JournalEventType::PermissionRequest,
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "lifecycle": "permission_requested",
+                    "permission_request_id": "request-1",
+                    "permission_request": {
+                        "schema_version": "t-hub.permission-request.v1",
+                        "id": "request-1",
+                        "kind": "command_execution",
+                        "provider": "codex",
+                        "provider_request_id": "request-1",
+                        "session_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "item_id": "item-1",
+                        "tool_name": "Bash",
+                        "requested_at_ms": 2
+                    },
+                    "telemetry": {
+                        "transport": "structured",
+                        "quality": "authoritative",
+                        "runtime_health": "ready"
+                    }
+                }),
+                result: None,
+            }
+        }
+
+        let replay = [
+            entry(1, "thread-1", None, JournalEventType::SessionStart),
+            permission(2),
+        ];
+        for restarted in [false, true] {
+            let bridge = AgentBridge::new();
+            let rec = RecordingEmitter::default();
+            bridge.set_emitter(Arc::new(rec.clone()));
+            rec.events.lock().clear();
+            for journal_entry in &replay {
+                bridge.consume_journal_entry(journal_entry);
+            }
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission,
+                "replay must restore the permission need (restarted={restarted})"
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+
+            let emitted_before_late = rec.events.lock().len();
+            let late_start = entry(1, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&late_start).is_none());
+            let duplicate_start = entry(2, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&duplicate_start).is_none());
+            assert_eq!(rec.events.lock().len(), emitted_before_late);
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+        }
     }
 
     /// A recording emitter for the live-emit tests: captures (channel, payload).
@@ -964,6 +1366,292 @@ mod tests {
             .unwrap();
         assert_eq!(tree_ev.1["sessionId"], "o1");
         assert_eq!(tree_ev.1["status"], "working");
+    }
+
+    #[test]
+    fn codex_permission_lifecycle_emits_typed_need_health_and_tile_binding() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        let make_entry = |seq, event_type, payload| EventJournalEntry {
+            seq,
+            timestamp_ms: seq * 10,
+            source: JournalSource::Agent,
+            entity_id: Some("thread-1".to_string()),
+            event_type,
+            payload,
+            result: None,
+        };
+        let request = make_entry(
+            1,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "permission_request_id": "request-1",
+                "permission_request": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "id": "request-1",
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "provider_request_id": "request-1",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "tool_name": "Bash",
+                    "requested_at_ms": 10
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&request);
+
+        let permission_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(permission_status.1["status"], "needsPermission");
+        assert_eq!(
+            permission_status.1["permissionRequest"]["providerRequestId"],
+            "request-1"
+        );
+        assert_eq!(permission_status.1["runtimeHealth"]["health"], "ready");
+        assert_eq!(
+            status_bridge.terminal_for_session("thread-1").as_deref(),
+            Some("crew0001")
+        );
+
+        let disconnected = make_entry(
+            2,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "telemetry_health",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "disconnected",
+                    "detail": "structured_stream_ended_mid_turn"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&disconnected);
+        let degraded_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(degraded_status.1["status"], "needsPermission");
+        assert_eq!(degraded_status.1["runtimeHealth"]["health"], "disconnected");
+
+        let resolved = make_entry(
+            3,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "permission_resolved",
+                "permission_request_id": "request-1",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&resolved);
+        let resolved_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(resolved_status.1["status"], "working");
+        assert!(resolved_status.1.get("permissionRequest").is_none());
+    }
+
+    #[test]
+    fn malformed_codex_permission_cannot_cross_clear_a_valid_request() {
+        let bridge = AgentBridge::new();
+        let request_id = "p".repeat(512);
+        let entry = |seq, event_type, payload| EventJournalEntry {
+            seq,
+            timestamp_ms: seq * 10,
+            source: JournalSource::Agent,
+            entity_id: Some("thread-1".to_string()),
+            event_type,
+            payload,
+            result: None,
+        };
+        bridge.consume_journal_entry(&entry(
+            1,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "permission_request_id": request_id,
+                "permission_request": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "id": request_id,
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "provider_request_id": request_id,
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "tool_name": "Bash",
+                    "requested_at_ms": 10
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        ));
+        bridge.consume_journal_entry(&entry(
+            2,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "permission_observation": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "valid": false
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "invalid_permission_request_identity"
+                }
+            }),
+        ));
+        bridge.consume_journal_entry(&entry(
+            3,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "telemetry_health",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "invalid_permission_resolution_identity"
+                }
+            }),
+        ));
+
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::NeedsPermission
+        );
+        assert!(bridge
+            .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+            .is_none());
+        assert_eq!(
+            bridge
+                .with_supervisor(|supervisor| supervisor.runtime_health("thread-1"))
+                .unwrap()
+                .health,
+            crate::supervision::RuntimeHealth::Degraded
+        );
+
+        let replayed = entry(3, JournalEventType::SessionStart, serde_json::json!({}));
+        assert!(bridge.consume_journal_entry(&replayed).is_none());
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::NeedsPermission
+        );
+
+        bridge.consume_journal_entry(&entry(
+            4,
+            JournalEventType::UserPromptSubmit,
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+            crate::model::SessionStatus::Working
+        );
+    }
+
+    #[test]
+    fn unobserved_interactive_codex_is_degraded_never_false_working() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        bridge.consume_journal_entry(&EventJournalEntry {
+            seq: 1,
+            timestamp_ms: 10,
+            source: JournalSource::Agent,
+            entity_id: Some("codex-unobserved:th_crew0001".to_string()),
+            event_type: JournalEventType::AgentCommand,
+            payload: serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "codex-unobserved:th_crew0001",
+                "lifecycle": "telemetry_health",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "telemetry": {
+                    "transport": "unavailable",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "interactive_tui_lifecycle_unsupported"
+                }
+            }),
+            result: None,
+        });
+
+        let status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(status.1["status"], "unknown");
+        assert_ne!(status.1["status"], "working");
+        assert_eq!(status.1["runtimeHealth"]["health"], "degraded");
+        assert_eq!(status.1["runtimeHealth"]["source"], "unavailable");
+        assert_eq!(
+            status_bridge
+                .terminal_for_session("codex-unobserved:th_crew0001")
+                .as_deref(),
+            Some("crew0001")
+        );
     }
 
     /// The fleet status observer fires on the REAL journal-consume path (the

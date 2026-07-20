@@ -355,16 +355,91 @@ function fmtReset(epoch: number | null | undefined): string | null {
 
 const CODEX_CACHE_KEY = "t-hub.codexUsage.v1";
 
-function loadCachedCodexUsage(): CodexUsage | null {
+export function loadCachedCodexUsage(): CodexUsage | null {
   if (typeof localStorage === "undefined") return null;
   try {
     const raw = localStorage.getItem(CODEX_CACHE_KEY);
     if (!raw) return null;
     const u = JSON.parse(raw) as CodexUsage;
-    return u && u.ok ? u : null;
+    return u && u.ok ? normalizeCodexWindows(u) : null;
   } catch {
     return null;
   }
+}
+
+function mergeCodexWindow(
+  previous: CodexRateWindow | null,
+  incoming: CodexRateWindow | null,
+): CodexRateWindow | null {
+  if (!incoming) return previous;
+  if (!previous) return incoming;
+  return {
+    usedPercent: incoming.usedPercent ?? previous.usedPercent,
+    windowMinutes: incoming.windowMinutes ?? previous.windowMinutes,
+    resetsAt: incoming.resetsAt ?? previous.resetsAt,
+  };
+}
+
+function normalizeCodexWindows(usage: CodexUsage): CodexUsage {
+  const slots = [usage.primary, usage.secondary] as const;
+  let fiveHour = slots.find((window) => window?.windowMinutes === 300) ?? null;
+  let weekly = slots.find((window) => window?.windowMinutes === 10_080) ?? null;
+  if (!fiveHour && !weekly) return usage;
+
+  // A partial provider window can omit its duration while still carrying a fresh
+  // percentage. Preserve it in its original provider slot when that semantic
+  // slot is not already occupied, then use the remaining slot as a fallback.
+  // This keeps a partial primary reading beside a recognized weekly secondary.
+  for (const [index, window] of slots.entries()) {
+    if (
+      !window ||
+      window.windowMinutes === 300 ||
+      window.windowMinutes === 10_080
+    ) {
+      continue;
+    }
+    if (index === 0 && !fiveHour) fiveHour = window;
+    else if (index === 1 && !weekly) weekly = window;
+    else if (!fiveHour) fiveHour = window;
+    else if (!weekly) weekly = window;
+  }
+  return {
+    ...usage,
+    primary: fiveHour,
+    secondary: weekly,
+  };
+}
+
+/** Merge a successful but partial provider snapshot into the last-known reading.
+ * Codex can emit one rate-limit window without the other, so replacing the whole
+ * cache would make the omitted weekly or session value disappear until a later
+ * rollout happens to include it again. */
+export function mergeCodexUsage(
+  previous: CodexUsage | null,
+  incoming: CodexUsage,
+): CodexUsage | null {
+  if (!incoming.ok) return previous;
+  const normalizedIncoming = normalizeCodexWindows(incoming);
+  if (!normalizedIncoming.primary && !normalizedIncoming.secondary) return previous;
+  if (!previous?.ok) return normalizedIncoming;
+  const normalizedPrevious = normalizeCodexWindows(previous);
+  return {
+    primary: mergeCodexWindow(normalizedPrevious.primary, normalizedIncoming.primary),
+    secondary: mergeCodexWindow(
+      normalizedPrevious.secondary,
+      normalizedIncoming.secondary,
+    ),
+    planType: normalizedIncoming.planType ?? normalizedPrevious.planType,
+    contextTokens:
+      normalizedIncoming.contextTokens ?? normalizedPrevious.contextTokens,
+    contextWindow:
+      normalizedIncoming.contextWindow ?? normalizedPrevious.contextWindow,
+    ok: true,
+  };
+}
+
+export function isUsableCodexUsage(usage: CodexUsage): boolean {
+  return mergeCodexUsage(null, usage) != null;
 }
 
 /** Locally roll a window past its reset boundary. Each window carries an absolute
@@ -388,7 +463,7 @@ function advanceWindow(
 
 /** Apply {@link advanceWindow} to both Codex windows for display, so a stale
  *  last-known reading still shows correct "available" windows between polls. */
-function advanceCodexUsage(
+export function advanceCodexUsage(
   u: CodexUsage | null,
   nowMs: number,
 ): CodexUsage | null {
@@ -413,10 +488,13 @@ function advanceCodexUsage(
  *  the cached, time-advanced last-known value so the strip persists what it had. */
 export function useCodexUsage(enabled = true): CodexUsage | null {
   const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
+  const usageRef = useRef(usage);
   const lastRunRef = useRef(0);
   const lastGoodRef = useRef(0);
+  const inFlightRef = useRef(false);
 
   const refresh = useCallback((force = false) => {
+    if (inFlightRef.current) return;
     const now = Date.now();
     if (!force) {
       const fresh = now - lastGoodRef.current < USAGE_FRESH_MS;
@@ -424,13 +502,19 @@ export function useCodexUsage(enabled = true): CodexUsage | null {
       if (fresh || ranRecently) return;
     }
     lastRunRef.current = now;
+    inFlightRef.current = true;
     void codexUsage()
       .then((u) => {
-        if (u && u.ok) {
+        if (u && isUsableCodexUsage(u)) {
+          const current = advanceCodexUsage(usageRef.current, Date.now());
+          usageRef.current = current;
+          const merged = mergeCodexUsage(current, u);
+          if (!merged) return;
+          usageRef.current = merged;
           lastGoodRef.current = Date.now();
-          setUsage(u);
+          setUsage(merged);
           try {
-            localStorage.setItem(CODEX_CACHE_KEY, JSON.stringify(u));
+            localStorage.setItem(CODEX_CACHE_KEY, JSON.stringify(merged));
           } catch {
             /* ignore quota */
           }
@@ -438,6 +522,9 @@ export function useCodexUsage(enabled = true): CodexUsage | null {
       })
       .catch(() => {
         /* transient — keep the last-known values */
+      })
+      .finally(() => {
+        inFlightRef.current = false;
       });
   }, []);
 

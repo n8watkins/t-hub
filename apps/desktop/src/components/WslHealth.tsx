@@ -4,6 +4,7 @@
 // metrics come from the agent via client05.hostMetrics() (polled by a parent).
 import type { HostMetrics } from "../ipc/protocol";
 import type { ConnectionState } from "../ipc/protocol";
+import { useTerminalResourceSnapshot } from "../lib/terminalResources";
 
 /** KiB → human GiB string. Exported so the sidebar's collapsed WSL summary
  *  (Sidebar.tsx BottomStatus) formats memory identically to the expanded view. */
@@ -26,6 +27,7 @@ export interface WslHealthProps {
 }
 
 export function WslHealth({ metrics, connection }: WslHealthProps) {
+  const terminals = useTerminalResourceSnapshot();
   if (!metrics) {
     const offline = connection && connection !== "live";
     return (
@@ -81,6 +83,15 @@ export function WslHealth({ metrics, connection }: WslHealthProps) {
       <div className="flex items-center justify-between gap-2">
         <span>Procs</span>
         <span>{metrics.process_count}</span>
+      </div>
+      <div
+        className="flex items-center justify-between gap-2"
+        title={`${terminals.xterms} xterm, ${terminals.canvases} canvas, ${terminals.ptys} PTY`}
+      >
+        <span>Terms</span>
+        <span>
+          {terminals.hot} hot · {terminals.warm} warm · {terminals.cold} cold
+        </span>
       </div>
     </div>
   );

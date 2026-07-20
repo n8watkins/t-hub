@@ -24,11 +24,14 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use t_hub_protocol::GitInfo as AgentGitInfo;
 
+use crate::agent::GitInfoBridgeError;
 use crate::bounded_exec::output_with_timeout;
 
 /// Default per-command timeout for a `git`/`wsl.exe` subprocess (the symmetric half
@@ -82,24 +85,46 @@ pub struct GitInfo {
     pub is_linked_worktree: bool,
     /// Number of changed entries (`git status --porcelain` line count). 0 = clean.
     pub dirty_count: u32,
+    /// Current HEAD commit, or unknown for an unborn or unreadable repository.
+    pub head_commit: Option<String>,
+    /// The origin fetch URL when configured.
+    pub remote_url: Option<String>,
+    /// The branch named by origin/HEAD when configured.
+    pub default_branch: Option<String>,
 }
 
-/// How long a `git_info` answer stays fresh per cwd. The Files panel re-polls
-/// `git_info` PER TILE every 5s (plus a burst on window focus), so without a
-/// cache M tiles on the same cwd each spawned their own `wsl.exe` every poll —
-/// the storm that pinned the Tokio workers and froze the UI. A TTL just under
-/// the 5s poll collapses every tile sharing a cwd (and the focus re-poll burst)
-/// onto ONE `wsl.exe` invocation per cwd per poll cycle. A few seconds of
-/// staleness on a branch/dirty-count is invisible in the panel header.
+impl From<AgentGitInfo> for GitInfo {
+    fn from(info: AgentGitInfo) -> Self {
+        Self {
+            is_repo: info.is_repo,
+            branch: info.branch,
+            worktree_root: info.worktree_root,
+            is_linked_worktree: info.is_linked_worktree,
+            dirty_count: info.dirty_count,
+            head_commit: info.head_commit,
+            remote_url: info.remote_url,
+            default_branch: info.default_branch,
+        }
+    }
+}
+
+/// How long a `git_info` answer stays fresh per cwd. The Tile polls every 30
+/// seconds and also refreshes on window focus. This short cache coalesces
+/// sibling tiles and focus bursts without making branch or dirty state visibly
+/// stale. Cache misses use the persistent agent whenever it is available.
 const GIT_INFO_TTL: Duration = Duration::from_millis(3500);
 
 /// Per-cwd cache of the last `git_info` answer + when it was computed, shared
-/// across all tiles/windows so rapid same-cwd re-polls collapse onto one real
-/// `wsl.exe` invocation per [`GIT_INFO_TTL`] (mirrors `recent.rs`'s TTL cache).
+/// across all tiles/windows so rapid same-cwd re-polls collapse onto one
+/// collection per [`GIT_INFO_TTL`] (mirrors `recent.rs`'s TTL cache).
 /// Keyed by the raw `cwd` string the frontend passes (tiles for the same project
 /// pass an identical cwd, so they share an entry). `Instant`, never wall-clock.
 static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Successful agent routing is expected and only needs one acceptance marker.
+/// Exceptional sources remain visible on every occurrence.
+static GIT_INFO_AGENT_SOURCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Drop any cached `git_info` for `cwd` so the next poll re-runs git. Called after
 /// a mutation (commit / worktree add+remove) that changes what `git_info` reports —
@@ -108,6 +133,78 @@ static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
 fn invalidate_git_info_cache(cwd: &str) {
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         cache_invalidate(&mut guard, cwd);
+    }
+}
+
+/// Initialize a new repository in an existing directory after the caller has
+/// obtained explicit user authorization. Refuses to touch an existing `.git`
+/// entry, including a malformed one, so this operation never rewrites version
+/// control state that T-Hub did not create.
+pub(crate) fn initialize_repository(cwd: &str) -> Result<(), String> {
+    let host_root = crate::files::to_host_path(cwd);
+    let metadata = std::fs::metadata(&host_root)
+        .map_err(|error| format!("could not inspect selected folder: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("selected path is not a directory".to_string());
+    }
+    let git_dir = host_root.join(".git");
+    if git_dir
+        .try_exists()
+        .map_err(|error| format!("could not inspect .git: {error}"))?
+    {
+        return Err("selected folder already contains a .git entry".to_string());
+    }
+    std::fs::create_dir(&git_dir)
+        .map_err(|error| format!("could not reserve a new .git directory: {error}"))?;
+
+    let (ok, stdout, stderr) = match run_git(cwd, &["init", "-b", "main"]) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(initialization_error_with_rollback(cwd, error));
+        }
+    };
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        return Err(initialization_error_with_rollback(
+            cwd,
+            format!("git init failed: {}", detail.trim()),
+        ));
+    }
+    invalidate_git_info_cache(cwd);
+    Ok(())
+}
+
+/// Roll back only the `.git` directory created by [`initialize_repository`].
+/// The selected directory and every pre-existing file remain untouched.
+pub(crate) fn rollback_initialized_repository(cwd: &str) -> Result<(), String> {
+    let git_dir = crate::files::to_host_path(cwd).join(".git");
+    if !git_dir
+        .try_exists()
+        .map_err(|error| format!("could not inspect initialized .git: {error}"))?
+    {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(&git_dir)
+        .map_err(|error| format!("could not inspect initialized .git: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("refusing to remove an initialized .git entry that is not a directory".into());
+    }
+    std::fs::remove_dir_all(&git_dir)
+        .map_err(|error| format!("could not remove initialized .git directory: {error}"))?;
+    invalidate_git_info_cache(cwd);
+    Ok(())
+}
+
+fn initialization_error_with_rollback(cwd: &str, error: String) -> String {
+    match rollback_initialized_repository(cwd) {
+        Ok(()) => format!("{error}; removed the reserved .git directory"),
+        Err(rollback_error) => {
+            format!("{error}; could not remove the reserved .git directory: {rollback_error}")
+        }
     }
 }
 
@@ -158,6 +255,9 @@ impl GitInfo {
             worktree_root: None,
             is_linked_worktree: false,
             dirty_count: 0,
+            head_commit: None,
+            remote_url: None,
+            default_branch: None,
         }
     }
 }
@@ -203,6 +303,11 @@ fn run_git(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
     Ok((output.status.success(), stdout, stderr))
 }
 
+#[cfg(test)]
+pub(crate) fn run_git_for_test(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    run_git(cwd, args)
+}
+
 /// Build the `git` command for the current platform (see [`run_git`]).
 #[cfg(not(windows))]
 fn build_git_command(cwd: &str, args: &[&str]) -> Command {
@@ -239,14 +344,11 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 // ---------------------------------------------------------------------------
 // One-shot `git_info` collection: ONE shell invocation computes everything.
 //
-// The Files panel polls `git_info` per tile every 5s (+ a focus burst). The old
-// path made SIX sequential `run_git` calls, and on Windows each one spawned its
-// own blocking `wsl.exe` on the Tokio executor — 6×M `wsl.exe` spawns every 5s,
-// pinning worker threads. We collapse those six into a SINGLE `bash -lc` script
-// (one `wsl.exe` on Windows; one direct `bash` on unix) that runs every git
-// query in one shell and prints `key<TAB>value` lines we parse back into a
-// `GitInfo`. The exact per-field semantics of the old six-call path are
-// preserved by [`parse_git_info_output`].
+// This is the disconnected/unsupported fallback for the persistent agent path.
+// The old collector made six sequential `run_git` calls, each spawning its own
+// blocking `wsl.exe` on Windows. The fallback collapses those calls into one
+// `bash -lc` script and prints `key<TAB>value` lines parsed into `GitInfo`.
+// The exact per-field semantics are preserved by [`parse_git_info_output`].
 // ---------------------------------------------------------------------------
 
 /// The shell script run ONCE per `git_info`. It emits tab-delimited `key\tvalue`
@@ -258,6 +360,9 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 ///   - `gitdir\t<path>`        — `rev-parse --git-dir`;
 ///   - `commondir\t<path>`     — `rev-parse --git-common-dir`;
 ///   - `dirty\t<n>`            — `git status --porcelain | wc -l` (dirty count).
+///   - `head\t<commit>`         — `rev-parse HEAD`;
+///   - `remote\t<url>`          — the origin fetch URL;
+///   - `default\t<branch>`      — the branch named by origin/HEAD.
 /// We short-circuit to ONLY the `inside` line when not in a work tree, so a
 /// non-repo collapses to `is_repo:false` exactly like the old cheap gate did.
 /// Every git invocation is silenced (`2>/dev/null`) so stderr never pollutes the
@@ -272,6 +377,9 @@ printf 'toplevel\\t%s\\n' \"$(git rev-parse --show-toplevel 2>/dev/null)\"; \
 printf 'gitdir\\t%s\\n' \"$(git rev-parse --git-dir 2>/dev/null)\"; \
 printf 'commondir\\t%s\\n' \"$(git rev-parse --git-common-dir 2>/dev/null)\"; \
 printf 'dirty\\t%s\\n' \"$(git status --porcelain 2>/dev/null | wc -l)\"; \
+printf 'head\\t%s\\n' \"$(git rev-parse HEAD 2>/dev/null)\"; \
+printf 'remote\\t%s\\n' \"$(git remote get-url origin 2>/dev/null)\"; \
+printf 'default\\t%s\\n' \"$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')\"; \
 fi";
 
 /// Run [`GIT_INFO_SCRIPT`] in ONE shell against `cwd`, returning its stdout.
@@ -369,6 +477,9 @@ fn parse_git_info_output(stdout: &str) -> GitInfo {
         .get("dirty")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(0);
+    let head_commit = fields.get("head").and_then(|v| first_line_opt(v));
+    let remote_url = fields.get("remote").and_then(|v| first_line_opt(v));
+    let default_branch = fields.get("default").and_then(|v| first_line_opt(v));
 
     GitInfo {
         is_repo: true,
@@ -376,6 +487,9 @@ fn parse_git_info_output(stdout: &str) -> GitInfo {
         worktree_root,
         is_linked_worktree,
         dirty_count,
+        head_commit,
+        remote_url,
+        default_branch,
     }
 }
 
@@ -538,12 +652,12 @@ fn worktree_add_args<'a>(
 ///
 /// PERF (the freeze fix): this used to make SIX sequential blocking `run_git`
 /// calls — on Windows six separate `wsl.exe` spawns — directly on the async
-/// executor, per tile, every 5s poll (+ a focus burst). It now does ONE of three
-/// cheap things: (1) returns a fresh cached answer for this cwd, OR (2) runs a
-/// SINGLE one-shot shell script ([`GIT_INFO_SCRIPT`]) — one `wsl.exe` total —
-/// inside `spawn_blocking` so the blocking IO never pins a Tokio worker, then
-/// caches it. Many tiles polling the same cwd (and the focus re-poll burst) thus
-/// collapse onto one `wsl.exe` per cwd per [`GIT_INFO_TTL`].
+/// executor on every poll. The Tile now polls every 30 seconds, and this command
+/// returns a fresh cached answer or asks the persistent WSL agent.
+/// A disconnected or older unsupported agent falls back to the bounded one-shot
+/// script inside `spawn_blocking`.
+/// Many tiles polling the same cwd still collapse onto one collection per cwd
+/// per [`GIT_INFO_TTL`].
 #[tauri::command]
 pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     // (1) Serve a fresh-enough cached answer for this cwd. The lock is held only
@@ -557,10 +671,9 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
         return Ok(cached);
     }
 
-    // (2) Cache miss / stale: run the single one-shot script off the async
-    // runtime. The blocking work (the `wsl.exe`/`bash` spawn + parse) lives in a
-    // closure that captures only OWNED data (the cloned `cwd`) — no `&State` is
-    // held across the await — so it can't pin a worker thread.
+    // (2) Cache miss / stale: use the persistent bridge, with the one-shot
+    // script retained only for a disconnected or older unsupported agent.
+    // The blocking request and possible subprocess live off the async runtime.
     let cwd_for_blocking = cwd.clone();
     let info = tauri::async_runtime::spawn_blocking(move || compute_git_info(&cwd_for_blocking))
         .await
@@ -573,14 +686,67 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     Ok(info)
 }
 
-/// Run the one-shot [`GIT_INFO_SCRIPT`] for `cwd` and parse it into a [`GitInfo`] —
-/// the "scan" half shared by the async [`git_info`] command (inside its
-/// `spawn_blocking`) and the sync [`git_info_cached`] control core. A spawn failure
-/// (no git / no wsl.exe / unreadable dir) degrades to the "not a repo" answer,
-/// best-effort exactly like the old per-call path. Pure blocking IO; no cache.
+/// Fetch `cwd` through the persistent agent, falling back to the one-shot
+/// [`GIT_INFO_SCRIPT`] only when the bridge is disconnected or too old to
+/// support GitInfo. Agent command failures do not start competing fallback work.
+/// A fallback spawn failure degrades to the "not a repo" answer, exactly like
+/// the previous best-effort path. Pure blocking IO; no cache.
 fn compute_git_info(cwd: &str) -> GitInfo {
-    let stdout = run_git_info_script(cwd).unwrap_or_default();
-    parse_git_info_output(&stdout)
+    let (info, source) = compute_git_info_with(cwd, crate::agent::git_info, |cwd| {
+        let stdout = run_git_info_script(cwd).unwrap_or_default();
+        parse_git_info_output(&stdout)
+    });
+    if should_log_git_info_source(source, &GIT_INFO_AGENT_SOURCE_LOGGED) {
+        eprintln!("t-hub: git_info source={} cwd={cwd}", source.as_str());
+    }
+    info
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitInfoSource {
+    Agent,
+    FallbackDisconnected,
+    FallbackUnsupported,
+    AgentError,
+}
+
+impl GitInfoSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::FallbackDisconnected => "fallback_disconnected",
+            Self::FallbackUnsupported => "fallback_unsupported",
+            Self::AgentError => "agent_error",
+        }
+    }
+}
+
+fn should_log_git_info_source(source: GitInfoSource, agent_logged: &AtomicBool) -> bool {
+    match source {
+        GitInfoSource::Agent => !agent_logged.swap(true, Ordering::Relaxed),
+        GitInfoSource::FallbackDisconnected
+        | GitInfoSource::FallbackUnsupported
+        | GitInfoSource::AgentError => true,
+    }
+}
+
+fn compute_git_info_with(
+    cwd: &str,
+    bridge: impl FnOnce(&str) -> Result<AgentGitInfo, GitInfoBridgeError>,
+    fallback: impl FnOnce(&str) -> GitInfo,
+) -> (GitInfo, GitInfoSource) {
+    match bridge(cwd) {
+        Ok(info) => (info.into(), GitInfoSource::Agent),
+        Err(GitInfoBridgeError::Disconnected(_)) => {
+            (fallback(cwd), GitInfoSource::FallbackDisconnected)
+        }
+        Err(GitInfoBridgeError::Unsupported(_)) => {
+            (fallback(cwd), GitInfoSource::FallbackUnsupported)
+        }
+        Err(GitInfoBridgeError::CommandFailed(_)) => {
+            (GitInfo::not_repo(), GitInfoSource::AgentError)
+        }
+    }
 }
 
 /// SYNC `git_info` for `cwd` — the core of [`git_info`] minus the async/`spawn_blocking`
@@ -588,9 +754,8 @@ fn compute_git_info(cwd: &str) -> GitInfo {
 /// awareness over the socket, so a thin client gets a project's branch / worktree root /
 /// linked flag / dirty count remotely. Reuses [`GIT_INFO_CACHE`] (the freeze-fix
 /// per-cwd TTL cache) via the same [`cache_lookup`]/[`cache_store`] seams as the async
-/// command, so local + remote per-tile polls collapse onto one `wsl.exe`/`git` spawn
-/// per cwd per [`GIT_INFO_TTL`]. Safe on a (blocking) control connection thread — the
-/// script spawn is blocking IO.
+/// command, so local + remote per-tile polls collapse onto one collection per
+/// cwd per [`GIT_INFO_TTL`]. Safe on a blocking control connection thread.
 pub fn git_info_cached(cwd: &str) -> GitInfo {
     // (1) Fresh cached answer for this cwd (same fast-path as the async command).
     if let Some(cached) = GIT_INFO_CACHE
@@ -600,7 +765,7 @@ pub fn git_info_cached(cwd: &str) -> GitInfo {
     {
         return cached;
     }
-    // (2) Cache miss / stale: run the one-shot script synchronously, then cache it.
+    // (2) Cache miss / stale: use the bridge-first collector, then cache it.
     let info = compute_git_info(cwd);
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         cache_store(&mut guard, cwd.to_string(), Instant::now(), info.clone());
@@ -808,6 +973,28 @@ pub async fn git_worktree_remove(
         .map_err(|e| format!("git_worktree_remove task failed: {e}"))?
 }
 
+/// Fail closed until the unified worktree status service can prove the complete
+/// removal decision required by `docs/WORKTREE-STATUS-CONTRACT.md`.
+///
+/// A tmux-only check is insufficient: canonical path identity, dirty and locked
+/// Git state, durable ownership, leases, and spawn/removal
+/// serialization must agree in one backend decision. Keeping this gate central
+/// makes Tauri, control, MCP, and CLI callers receive the same refusal without
+/// detaching UI state or invoking Git.
+pub(crate) const WORKTREE_REMOVAL_UNAVAILABLE: &str = "worktree removal is temporarily unavailable until T-Hub can verify canonical Git state, live terminals, durable ownership, leases, and spawn/removal serialization through the unified worktree status service";
+
+pub(crate) fn require_worktree_removal_safety_service() -> Result<(), String> {
+    Err(WORKTREE_REMOVAL_UNAVAILABLE.to_string())
+}
+
+#[tauri::command]
+pub async fn git_worktree_removal_preflight(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+    require_worktree_removal_safety_service()
+}
+
 /// Synchronous core of [`git_worktree_remove`], shared with the MCP control
 /// channel (`control::remove_worktree`).
 pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), String> {
@@ -815,6 +1002,24 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
     if path.is_empty() {
         return Err("worktree path is empty".to_string());
     }
+    require_worktree_removal_safety_service()?;
+    worktree_remove_git(cwd, path, force)
+}
+
+/// Roll back a worktree created by the current `create_worktree` transaction.
+///
+/// This is intentionally narrower than user-requested removal: the caller has
+/// just created the path and invokes this only while unwinding that uncommitted
+/// operation. It must not be exposed through Tauri, control, MCP, or CLI.
+pub(crate) fn rollback_created_worktree(cwd: &str, path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+    worktree_remove_git(cwd, path, true)
+}
+
+fn worktree_remove_git(cwd: &str, path: &str, force: bool) -> Result<(), String> {
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -843,6 +1048,14 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_removal_fails_closed_until_unified_status_is_available() {
+        assert_eq!(
+            require_worktree_removal_safety_service().unwrap_err(),
+            WORKTREE_REMOVAL_UNAVAILABLE
+        );
+    }
 
     /// F1 invariant: the git bound is NEVER unbounded. A positive int widens it;
     /// unset / 0 / negative / junk all fall back to the [`GIT_CMD_TIMEOUT_DEFAULT`]
@@ -933,6 +1146,9 @@ toplevel\t/home/u/repo
 gitdir\t/home/u/repo/.git
 commondir\t/home/u/repo/.git
 dirty\t3
+head\t0123456789abcdef
+remote\thttps://example.test/repo.git
+default\tmain
 ";
         let info = parse_git_info_output(out);
         assert!(info.is_repo);
@@ -940,6 +1156,12 @@ dirty\t3
         assert_eq!(info.worktree_root.as_deref(), Some("/home/u/repo"));
         assert!(!info.is_linked_worktree);
         assert_eq!(info.dirty_count, 3);
+        assert_eq!(info.head_commit.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            info.remote_url.as_deref(),
+            Some("https://example.test/repo.git")
+        );
+        assert_eq!(info.default_branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -991,6 +1213,9 @@ dirty\t0
         assert_eq!(info.worktree_root, None);
         assert!(!info.is_linked_worktree); // both gitdir/commondir absent
         assert_eq!(info.dirty_count, 0); // "nope" -> 0
+        assert_eq!(info.head_commit, None);
+        assert_eq!(info.remote_url, None);
+        assert_eq!(info.default_branch, None);
     }
 
     #[test]
@@ -1001,6 +1226,9 @@ dirty\t0
         assert_eq!(info.worktree_root, None);
         assert!(!info.is_linked_worktree);
         assert_eq!(info.dirty_count, 0);
+        assert_eq!(info.head_commit, None);
+        assert_eq!(info.remote_url, None);
+        assert_eq!(info.default_branch, None);
     }
 
     #[test]
@@ -1076,6 +1304,106 @@ detached
             worktree_root: Some("/home/u/repo".to_string()),
             is_linked_worktree: false,
             dirty_count: 2,
+            head_commit: Some("0123456789abcdef".to_string()),
+            remote_url: Some("https://example.test/repo.git".to_string()),
+            default_branch: Some("main".to_string()),
+        }
+    }
+
+    fn sample_agent_info() -> AgentGitInfo {
+        AgentGitInfo {
+            is_repo: true,
+            branch: Some("agent-main".to_string()),
+            worktree_root: Some("/agent/repo".to_string()),
+            is_linked_worktree: true,
+            dirty_count: 7,
+            head_commit: Some("agent-head".to_string()),
+            remote_url: Some("https://example.test/agent.git".to_string()),
+            default_branch: Some("agent-main".to_string()),
+        }
+    }
+
+    #[test]
+    fn compute_git_info_uses_bridge_without_fallback() {
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| Ok(sample_agent_info()),
+            |_| panic!("fallback must not run after a successful bridge response"),
+        );
+        assert_eq!(source, GitInfoSource::Agent);
+        assert_eq!(info.branch.as_deref(), Some("agent-main"));
+        assert_eq!(info.dirty_count, 7);
+        assert!(info.is_linked_worktree);
+    }
+
+    #[test]
+    fn compute_git_info_falls_back_when_bridge_is_disconnected() {
+        let expected = sample_info();
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| {
+                Err(GitInfoBridgeError::Disconnected(
+                    "agent bridge not connected".to_string(),
+                ))
+            },
+            |cwd| {
+                assert_eq!(cwd, "/repo");
+                expected.clone()
+            },
+        );
+        assert_eq!(source, GitInfoSource::FallbackDisconnected);
+        assert_eq!(info, expected);
+    }
+
+    #[test]
+    fn compute_git_info_falls_back_for_old_unsupported_agent() {
+        let expected = sample_info();
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| {
+                Err(GitInfoBridgeError::Unsupported(
+                    "unsupported request op".to_string(),
+                ))
+            },
+            |_| expected.clone(),
+        );
+        assert_eq!(source, GitInfoSource::FallbackUnsupported);
+        assert_eq!(info, expected);
+    }
+
+    #[test]
+    fn compute_git_info_does_not_fallback_on_agent_command_failure() {
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| {
+                Err(GitInfoBridgeError::CommandFailed(
+                    "git timed out".to_string(),
+                ))
+            },
+            |_| panic!("command failures must not start a competing fallback"),
+        );
+        assert_eq!(source, GitInfoSource::AgentError);
+        assert_eq!(info, GitInfo::not_repo());
+    }
+
+    #[test]
+    fn git_info_source_logging_is_one_shot_only_for_agent_success() {
+        let agent_logged = AtomicBool::new(false);
+        assert!(should_log_git_info_source(
+            GitInfoSource::Agent,
+            &agent_logged
+        ));
+        assert!(!should_log_git_info_source(
+            GitInfoSource::Agent,
+            &agent_logged
+        ));
+        for source in [
+            GitInfoSource::FallbackDisconnected,
+            GitInfoSource::FallbackUnsupported,
+            GitInfoSource::AgentError,
+        ] {
+            assert!(should_log_git_info_source(source, &agent_logged));
+            assert!(should_log_git_info_source(source, &agent_logged));
         }
     }
 

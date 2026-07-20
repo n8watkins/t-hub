@@ -172,8 +172,58 @@ pub struct DirEntry {
     /// Absolute path to this entry (so the UI can drill in / open directly).
     pub path: String,
     pub is_dir: bool,
+    /// True when this directory is itself a Git worktree or repository root.
+    pub is_git_repo: bool,
     /// File size in bytes (0 for directories).
     pub size: u64,
+}
+
+/// Resolve the user's native WSL home for folder browsing.
+///
+/// The packaged Windows app must ask the configured distro because its process
+/// HOME points at Windows. Native Linux and WSL builds can use HOME directly.
+pub fn user_home_path() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let distro = host_distro();
+        let mut command = std::process::Command::new("wsl.exe");
+        command
+            .arg("-d")
+            .arg(&distro)
+            .arg("-e")
+            .arg("bash")
+            .arg("-lc")
+            .arg("printf %s \"$HOME\"")
+            .creation_flags(0x0800_0000);
+        let output = crate::bounded_exec::output_with_timeout(
+            command,
+            crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        )
+        .map_err(|error| format!("could not resolve WSL home for {distro}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not resolve WSL home for {distro}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        normalize_home_output(&output.stdout)
+    }
+    #[cfg(unix)]
+    {
+        std::env::var("HOME")
+            .map_err(|_| "HOME is unavailable".to_string())
+            .and_then(|home| normalize_home_output(home.as_bytes()))
+    }
+}
+
+fn normalize_home_output(output: &[u8]) -> Result<String, String> {
+    let home = String::from_utf8_lossy(output).trim().to_string();
+    if home.starts_with('/') && home.len() > 1 {
+        Ok(home.trim_end_matches('/').to_string())
+    } else {
+        Err("WSL home is not an absolute POSIX path".to_string())
+    }
 }
 
 /// The capped result of reading a text file for the reader.
@@ -246,9 +296,13 @@ fn normalize(path: &str) -> PathBuf {
 /// Canonical definition for the crate: `git.rs`, `recent.rs`, and `devserver.rs`
 /// all call `crate::files::host_distro()` rather than re-declaring this (one
 /// source of truth for the distro default + `T_HUB_DISTRO` override).
+fn configured_wsl_distro() -> String {
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
 #[cfg(windows)]
 pub(crate) fn host_distro() -> String {
-    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    configured_wsl_distro()
 }
 
 /// Translate a path so the *Windows-side* file commands can reach a project that
@@ -265,7 +319,7 @@ pub(crate) fn host_distro() -> String {
 ///
 /// On unix this is the identity function: a native path already *is* the Linux
 /// path, so the project is indexed directly (see the module-level scope note).
-fn to_host_path(path: &str) -> PathBuf {
+pub(crate) fn to_host_path(path: &str) -> PathBuf {
     #[cfg(windows)]
     {
         // Already a Windows/UNC path (drive-letter, `\\server\...`, or a
@@ -290,6 +344,71 @@ fn to_host_path(path: &str) -> PathBuf {
     }
 }
 
+fn posix_to_wsl_unc(path: &str, distro: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if !trimmed.starts_with('/') || trimmed.starts_with("//") || trimmed.contains('\0') {
+        return Err("Choose an absolute WSL folder path.".into());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    let tail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\\{}", parts.join("\\"))
+    };
+    Ok(format!("\\\\wsl.localhost\\{distro}{tail}"))
+}
+
+fn wsl_unc_to_posix_for_distro(path: &str, distro: &str) -> Result<String, String> {
+    let replaced = path.trim().replace('/', "\\");
+    let normalized = if let Some(rest) = replaced.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else {
+        replaced
+    };
+    let without_leading = normalized
+        .strip_prefix("\\\\")
+        .ok_or("Choose a folder inside the configured WSL distribution.")?;
+    let mut parts = without_leading.split('\\');
+    let server = parts.next().unwrap_or_default();
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return Err("Choose a folder inside the configured WSL distribution.".into());
+    }
+    let selected_distro = parts.next().unwrap_or_default();
+    if !selected_distro.eq_ignore_ascii_case(distro) {
+        return Err(format!(
+            "Choose a folder inside the configured WSL distribution '{distro}'."
+        ));
+    }
+    let mut posix_parts = Vec::new();
+    for part in parts {
+        match part {
+            "" | "." => {}
+            ".." => return Err("The selected WSL folder path is not safe.".into()),
+            value => posix_parts.push(value),
+        }
+    }
+    Ok(format!("/{}", posix_parts.join("/")))
+}
+
+#[tauri::command]
+pub fn wsl_folder_dialog_initial_path(path: String) -> Result<String, String> {
+    posix_to_wsl_unc(&path, &configured_wsl_distro())
+}
+
+#[tauri::command]
+pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, String> {
+    wsl_unc_to_posix_for_distro(&selected_path, &configured_wsl_distro())
+}
+
 // ---------------------------------------------------------------------------
 // Windows: native-in-WSL fast paths (avoid the slow `\\wsl.localhost\` UNC/9P
 // bridge for directory listing + indexing by shelling into the distro itself).
@@ -303,37 +422,38 @@ fn to_host_path(path: &str) -> PathBuf {
 /// e.g. `\\wsl.localhost\Ubuntu-24.04\home\natkins\proj` → `/home/natkins/proj`.
 #[cfg(windows)]
 fn unc_to_posix(path: &Path) -> Option<String> {
-    let s = path.to_string_lossy();
-    // Already a bare POSIX path (shouldn't usually reach here post-normalize,
-    // but be lenient): pass through.
-    if s.starts_with('/') {
-        return Some(s.into_owned());
+    wsl_path_to_posix(&path.to_string_lossy())
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .and_then(|_| value.get(prefix.len()..))
+}
+
+/// Convert a bare POSIX path or any supported WSL UNC spelling to the path tmux
+/// sees inside WSL. Genuine Windows paths are not WSL paths and return `None`.
+fn wsl_path_to_posix(path: &str) -> Option<String> {
+    if path.starts_with('/') && !path.starts_with("//") {
+        return Some(path.to_string());
     }
-    // Peel a verbatim extended-length prefix first (`std::fs::canonicalize`
-    // emits these): `\\?\UNC\wsl.localhost\...` -> `\\wsl.localhost\...`, and a
-    // plain `\\?\C:\...` -> `C:\...` (which then won't match the WSL prefixes
-    // below and correctly returns None for a real drive path).
-    let s: std::borrow::Cow<str> = if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
-        std::borrow::Cow::Owned(format!("\\\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
-        std::borrow::Cow::Owned(rest.to_string())
-    } else {
-        s
-    };
-    // Strip a `\\wsl.localhost\<distro>` or `\\wsl$\<distro>` prefix.
-    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            // `rest` is `<distro>\home\natkins\...`; drop the distro segment.
-            let tail = match rest.split_once('\\') {
-                Some((_distro, tail)) => tail,
-                // `\\wsl.localhost\<distro>` with no trailing path → distro root.
-                None => "",
-            };
-            let posix = format!("/{}", tail.replace('\\', "/"));
-            return Some(posix);
-        }
+
+    let slashes = path.replace('/', "\\");
+    let normalized = strip_ascii_case_prefix(&slashes, "\\\\?\\UNC\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .unwrap_or(slashes);
+    let without_leading = normalized.strip_prefix("\\\\")?;
+    let mut parts = without_leading.split('\\');
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
     }
-    None
+    let distro = parts.next()?;
+    if distro.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", parts.collect::<Vec<_>>().join("/")))
 }
 
 /// Build a `wsl.exe -d <distro> --cd <cwd> -- bash -lc '<script>'` command with
@@ -396,20 +516,27 @@ fn wsl_list_dir(dir: &str, show_ignored: bool) -> Result<Vec<DirEntry>, String> 
     // matches, so `|| true` keeps the pipeline alive. Already in `dir` via wsl.exe
     // --cd, so we operate on `.` (no `cd "$1"`).
     const SCRIPT_FILTER: &str = r#"
-emit() { find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null; }
+emit() {
+  find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
+    while IFS=$'\t' read -r f y; do
+      g=0
+      [ "$y" = d ] && [ -e "$f/.git" ] && g=1
+      printf '%s\t%s\t%s\n' "$f" "$y" "$g"
+    done
+}
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  ign=$(emit | while IFS=$'\t' read -r f y; do
+  ign=$(emit | while IFS=$'\t' read -r f y g; do
           [ "$y" = d ] && printf '%s/\n' "$f"
         done | git check-ignore --stdin 2>/dev/null | sed 's#/$##' || true)
-  emit | while IFS=$'\t' read -r f y; do
+  emit | while IFS=$'\t' read -r f y g; do
     if [ "$y" = d ]; then
       skip=
       while IFS= read -r ig; do [ "$f" = "$ig" ] && skip=1 && break; done <<EOF
 $ign
 EOF
-      [ -z "$skip" ] && printf '%s\t%s\n' "$f" "$y"
+      [ -z "$skip" ] && printf '%s\t%s\t%s\n' "$f" "$y" "$g"
     else
-      printf '%s\t%s\n' "$f" "$y"
+      printf '%s\t%s\t%s\n' "$f" "$y" "$g"
     fi
   done
 else
@@ -417,7 +544,14 @@ else
 fi
 "#;
     // "Show ignored": no filtering — list every child (ignored dirs included).
-    const SCRIPT_ALL: &str = r#"find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null"#;
+    const SCRIPT_ALL: &str = r#"
+find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
+  while IFS=$'\t' read -r f y; do
+    g=0
+    [ "$y" = d ] && [ -e "$f/.git" ] && g=1
+    printf '%s\t%s\t%s\n' "$f" "$y" "$g"
+  done
+"#;
     let script = if show_ignored {
         SCRIPT_ALL
     } else {
@@ -442,9 +576,10 @@ fi
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut out = Vec::new();
     for line in stdout.lines() {
-        let (name, ty) = match line.split_once('\t') {
-            Some(parts) => parts,
-            None => continue,
+        let mut fields = line.splitn(3, '\t');
+        let (name, ty, git) = match (fields.next(), fields.next(), fields.next()) {
+            (Some(name), Some(ty), Some(git)) => (name, ty, git),
+            _ => continue,
         };
         if name.is_empty() || name == "." || name == ".." {
             continue;
@@ -460,6 +595,7 @@ fi
             name: name.to_string(),
             path: format!("{base}/{name}"),
             is_dir,
+            is_git_repo: is_dir && git == "1",
             // Size is not surfaced in the tree UI; computing it would cost an
             // extra stat per entry. Report 0 (dirs already report 0 on the fs
             // path too); the reader stats the real size on open.
@@ -975,6 +1111,7 @@ fn read_dir_shallow_fs(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, 
             name,
             path: path.to_string_lossy().into_owned(),
             is_dir,
+            is_git_repo: is_dir && path.join(".git").exists(),
             size,
         });
     }
@@ -1032,6 +1169,7 @@ fn read_dir_raw(dir: &Path, keep: impl Fn(&str, bool) -> bool) -> Result<Vec<Dir
             name,
             path: path.to_string_lossy().into_owned(),
             is_dir,
+            is_git_repo: is_dir && path.join(".git").exists(),
             size,
         });
     }
@@ -1226,17 +1364,11 @@ fn host_of_resolved(real_posix: &Path) -> PathBuf {
     to_host_path(&real_posix.to_string_lossy())
 }
 
-/// The POSIX form of a control-channel path for the ancestor walk: identity on unix
-/// (already POSIX), the WSL-UNC→POSIX mapping on Windows.
-fn posix_form(path: &str) -> String {
-    #[cfg(not(windows))]
-    {
-        path.to_string()
-    }
-    #[cfg(windows)]
-    {
-        unc_to_posix(&PathBuf::from(path)).unwrap_or_else(|| path.to_string())
-    }
+/// Return the WSL runtime form of a control-channel path when it has one.
+/// This is platform-neutral because Windows Project roots cross into WSL tmux
+/// even when focused tests exercise that boundary on Linux.
+pub(crate) fn posix_form(path: &str) -> String {
+    wsl_path_to_posix(path).unwrap_or_else(|| path.to_string())
 }
 
 fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
@@ -1793,6 +1925,7 @@ mod tests {
     #[test]
     fn list_dir_is_shallow_dirs_first_and_prunes() {
         let root = make_fixture();
+        std::fs::create_dir_all(root.join("nested-repo/.git")).unwrap();
         let entries = read_dir_shallow(&root, false).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
 
@@ -1842,7 +1975,10 @@ mod tests {
         // src must be a directory with size 0.
         let src = entries.iter().find(|e| e.name == "src").unwrap();
         assert!(src.is_dir);
+        assert!(!src.is_git_repo);
         assert_eq!(src.size, 0);
+        let nested_repo = entries.iter().find(|e| e.name == "nested-repo").unwrap();
+        assert!(nested_repo.is_git_repo);
         // The .env we added back via the raw pass must report a real (non-dir)
         // size, not 0 — i.e. it's classified as a file.
         let env = entries.iter().find(|e| e.name == ".env").unwrap();
@@ -1850,6 +1986,17 @@ mod tests {
         assert!(env.size > 0, "added-back .env should carry its byte size");
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn home_output_requires_an_absolute_posix_path() {
+        assert_eq!(
+            normalize_home_output(b" /home/natkins/\n").unwrap(),
+            "/home/natkins"
+        );
+        assert!(normalize_home_output(b"C:\\Users\\natha").is_err());
+        assert!(normalize_home_output(b"/").is_err());
+        assert!(normalize_home_output(b"").is_err());
     }
 
     #[test]
@@ -1976,6 +2123,67 @@ mod tests {
             PathBuf::from("/home/natkins/proj")
         );
         assert_eq!(to_host_path("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[test]
+    fn explorer_paths_round_trip_only_inside_the_configured_wsl_distro() {
+        let distro = "Ubuntu-24.04";
+        let unc = posix_to_wsl_unc("/home/natkins/My Project", distro).unwrap();
+        assert_eq!(
+            unc,
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\My Project"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro(&unc, distro).unwrap(),
+            "/home/natkins/My Project"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro("\\\\wsl$\\ubuntu-24.04\\home\\natkins\\日本語", distro,)
+                .unwrap(),
+            "/home/natkins/日本語"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro("\\\\wsl.localhost\\Ubuntu-24.04", distro).unwrap(),
+            "/"
+        );
+    }
+
+    #[test]
+    fn explorer_paths_reject_windows_other_distros_and_parent_segments() {
+        let distro = "Ubuntu-24.04";
+        assert!(wsl_unc_to_posix_for_distro("C:\\Users\\natha", distro).is_err());
+        assert!(
+            wsl_unc_to_posix_for_distro("\\\\wsl.localhost\\Debian\\home\\natkins", distro,)
+                .is_err()
+        );
+        assert!(wsl_unc_to_posix_for_distro(
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\..\\root",
+            distro,
+        )
+        .is_err());
+        assert!(posix_to_wsl_unc("C:\\Users\\natha", distro).is_err());
+    }
+
+    #[test]
+    fn control_paths_convert_every_wsl_unc_form_without_touching_windows_paths() {
+        assert_eq!(posix_form("/home/natkins/project"), "/home/natkins/project");
+        assert_eq!(
+            posix_form("\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(
+            posix_form("\\\\wsl$\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(
+            posix_form("\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\project"),
+            "/home/natkins/project"
+        );
+        assert_eq!(posix_form("\\\\wsl.localhost\\Ubuntu-24.04"), "/");
+        assert_eq!(
+            posix_form("C:\\Users\\natha\\project"),
+            "C:\\Users\\natha\\project"
+        );
     }
 
     #[cfg(windows)]

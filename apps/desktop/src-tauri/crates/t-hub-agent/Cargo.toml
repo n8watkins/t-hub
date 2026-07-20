@@ -1,6 +1,6 @@
 [package]
 name = "t-hub-agent"
-version = "0.5.0"
+version = "0.5.2"
 description = "T-Hub WSL-side control agent: NDJSON-over-stdio bridge, append-only event journal, tmux/git/metrics RPCs."
 edition = "2021"
 rust-version = "1.89"
@@ -17,3 +17,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 base64 = "0.22"
+libc = "0.2"
