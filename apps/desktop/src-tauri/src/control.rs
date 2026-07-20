@@ -11881,16 +11881,18 @@ fn is_retired_powder_command(command: &str) -> bool {
 /// commands from the field incidents (a create-then-register that can leave a
 /// ghost, or a spawn that can duplicate on retry). Read/organization commands are
 /// naturally re-runnable and need no dedup.
+const IDEMPOTENT_COMMANDS: &[&str] = &[
+    "spawn_terminal",
+    "create_worktree",
+    "history_resume",
+    "reconcile_cortana",
+    "commission_captain",
+    "dispatch_crew",
+    "start_agent",
+];
+
 fn is_idempotent_command(command: &str) -> bool {
-    matches!(
-        command,
-        "spawn_terminal"
-            | "create_worktree"
-            | "reconcile_cortana"
-            | "commission_captain"
-            | "dispatch_crew"
-            | "start_agent"
-    )
+    IDEMPOTENT_COMMANDS.contains(&command)
 }
 
 fn request_signature(command: &str, args: &Value) -> String {
@@ -45188,9 +45190,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn history_resume_uses_its_durable_ledger_instead_of_the_generic_cache() {
-        assert!(!is_idempotent_command("history_resume"));
-        assert!(is_idempotent_command("spawn_terminal"));
+    fn server_idempotent_command_contract_is_complete() {
+        assert_eq!(
+            IDEMPOTENT_COMMANDS,
+            [
+                "spawn_terminal",
+                "create_worktree",
+                "history_resume",
+                "reconcile_cortana",
+                "commission_captain",
+                "dispatch_crew",
+                "start_agent",
+            ]
+        );
+        assert!(!is_idempotent_command("list_tabs"));
     }
 
     #[test]

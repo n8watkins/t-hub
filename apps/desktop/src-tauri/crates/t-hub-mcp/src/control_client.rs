@@ -47,15 +47,18 @@ const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Spawn-class commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
+const IDEMPOTENT_COMMANDS: &[&str] = &[
+    "spawn_terminal",
+    "create_worktree",
+    "history_resume",
+    "reconcile_cortana",
+    "commission_captain",
+    "dispatch_crew",
+    "start_agent",
+];
+
 fn is_idempotent_command(command: &str) -> bool {
-    matches!(
-        command,
-        "spawn_terminal"
-            | "create_worktree"
-            | "commission_captain"
-            | "dispatch_crew"
-            | "history_resume"
-    )
+    IDEMPOTENT_COMMANDS.contains(&command)
 }
 
 /// Mint a process-unique idempotency key without pulling in a uuid/rng dependency
@@ -2273,6 +2276,26 @@ mod tests {
             "a spawn-class call must carry a requestId: {:?}",
             reqs[0]
         );
+    }
+
+    #[test]
+    fn client_idempotent_command_contract_matches_the_server_contract() {
+        assert_eq!(
+            IDEMPOTENT_COMMANDS,
+            [
+                "spawn_terminal",
+                "create_worktree",
+                "history_resume",
+                "reconcile_cortana",
+                "commission_captain",
+                "dispatch_crew",
+                "start_agent",
+            ]
+        );
+        for command in IDEMPOTENT_COMMANDS {
+            let (_, request_id) = ensure_request_id(command, &Value::Null);
+            assert!(request_id.is_some(), "{command} did not receive a requestId");
+        }
     }
 
     #[test]
