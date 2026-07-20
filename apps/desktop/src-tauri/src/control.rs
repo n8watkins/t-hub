@@ -8269,6 +8269,7 @@ struct CaptainControlLease {
     terminal_id: String,
     authority: LeaseAuthority,
     expires_at: Instant,
+    expires_at_epoch_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8291,40 +8292,98 @@ enum LeaseAuthority {
 
 #[derive(Default)]
 struct CaptainControlLeases {
-    by_secret: Mutex<HashMap<String, CaptainControlLease>>,
+    state: Mutex<CaptainControlLeaseState>,
+}
+
+#[derive(Default)]
+struct CaptainControlLeaseState {
+    by_secret: HashMap<String, CaptainControlLease>,
+    by_identity: HashMap<String, String>,
 }
 
 const CAPTAIN_CONTROL_LEASE_TTL: Duration = Duration::from_secs(90);
+const MAX_CAPTAIN_CONTROL_LEASES: usize = 1024;
 
 impl CaptainControlLeases {
-    fn issue(&self, lease: CaptainControlLease) -> String {
+    fn retain_live(state: &mut CaptainControlLeaseState) {
+        let now = Instant::now();
+        state.by_secret.retain(|_, lease| lease.expires_at > now);
+        state.by_identity.retain(|identity_id, secret| {
+            state
+                .by_secret
+                .get(secret)
+                .is_some_and(|lease| lease.identity_id == *identity_id)
+        });
+    }
+
+    fn issue(&self, lease: CaptainControlLease) -> (String, u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::retain_live(&mut state);
+        if let Some(secret) = state.by_identity.get(&lease.identity_id).cloned() {
+            if let Some(existing) = state.by_secret.get(&secret) {
+                if existing.terminal_id == lease.terminal_id
+                    && existing.authority == lease.authority
+                {
+                    return (secret, existing.expires_at_epoch_ms);
+                }
+            }
+            state.by_secret.remove(&secret);
+            state.by_identity.remove(&lease.identity_id);
+        }
+        if state.by_secret.len() >= MAX_CAPTAIN_CONTROL_LEASES {
+            if let Some(oldest) = state
+                .by_secret
+                .iter()
+                .min_by_key(|(_, existing)| existing.expires_at)
+                .map(|(secret, _)| secret.clone())
+            {
+                if let Some(evicted) = state.by_secret.remove(&oldest) {
+                    state.by_identity.remove(&evicted.identity_id);
+                }
+            }
+        }
         let secret = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let mut leases = self
-            .by_secret
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        leases.retain(|_, existing| existing.expires_at > Instant::now());
-        leases.insert(secret.clone(), lease);
-        secret
+        let expires_at_epoch_ms = lease.expires_at_epoch_ms;
+        state
+            .by_identity
+            .insert(lease.identity_id.clone(), secret.clone());
+        state.by_secret.insert(secret.clone(), lease);
+        (secret, expires_at_epoch_ms)
     }
 
     fn get(&self, secret: &str) -> Option<CaptainControlLease> {
         if secret.is_empty() {
             return None;
         }
-        let mut leases = self
-            .by_secret
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        leases.retain(|_, existing| existing.expires_at > Instant::now());
-        leases
+        Self::retain_live(&mut state);
+        state
+            .by_secret
             .iter()
             .find(|(candidate, _)| ct_token_eq(candidate, secret))
             .map(|(_, lease)| lease.clone())
+    }
+
+    #[cfg(test)]
+    fn insert_test(&self, secret: &str, lease: CaptainControlLease) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .by_identity
+            .insert(lease.identity_id.clone(), secret.to_string());
+        state.by_secret.insert(secret.to_string(), lease);
     }
 }
 
@@ -10255,15 +10314,17 @@ fn renew_captain_control_lease(
             "scope": scope,
         }),
     };
-    let secret = ctx.control_leases.issue(CaptainControlLease {
+    let expires_at_epoch_ms = now_ms().saturating_add(CAPTAIN_CONTROL_LEASE_TTL.as_millis() as u64);
+    let (secret, expires_at_epoch_ms) = ctx.control_leases.issue(CaptainControlLease {
         identity_id: authority.identity_id,
         terminal_id: authority.terminal_id.clone(),
         authority: authority.authority,
         expires_at,
+        expires_at_epoch_ms,
     });
     Ok(json!({
         "lease": secret,
-        "expiresAt": now_ms().saturating_add(CAPTAIN_CONTROL_LEASE_TTL.as_millis() as u64),
+        "expiresAt": expires_at_epoch_ms,
         "terminalId": authority.terminal_id,
         "scope": response_scope,
         "capability": "control",
@@ -43549,6 +43610,22 @@ mod tests {
         assert_eq!(captains.snapshot().captains, before.captains);
         assert_eq!(captains.snapshot().projects, before.projects);
 
+        let repeated = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "read-global-control",
+                &identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(repeated.ok, "{:?}", repeated.error);
+        assert_eq!(repeated.result.unwrap()["lease"], lease);
+        let lease_state = ctx.control_leases.state.lock().unwrap();
+        assert_eq!(lease_state.by_secret.len(), 1);
+        assert_eq!(lease_state.by_identity.len(), 1);
+        drop(lease_state);
+
         let capability = dispatch_authenticated(
             &ctx,
             req_session(lease, &identity.secret, "my_capability", json!({})),
@@ -43706,8 +43783,8 @@ mod tests {
         }));
 
         let (expired_ctx, _, _, expired_identity) = captain_lease_fixture(true);
-        expired_ctx.control_leases.by_secret.lock().unwrap().insert(
-            "expired-lease".into(),
+        expired_ctx.control_leases.insert_test(
+            "expired-lease",
             CaptainControlLease {
                 identity_id: expired_identity.id.clone(),
                 terminal_id: "lease-captain".into(),
@@ -43721,6 +43798,7 @@ mod tests {
                     ),
                 },
                 expires_at: Instant::now() - Duration::from_secs(1),
+                expires_at_epoch_ms: now_ms().saturating_sub(1),
             },
         );
         let expired = dispatch_authenticated(

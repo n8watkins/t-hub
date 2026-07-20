@@ -1318,12 +1318,8 @@ thread_local! {
 /// self-recovers: the stale env addr is now dead and control.json names the new port,
 /// which the existing file-re-read path already handles.
 ///
-/// The rebind_control request itself is authenticated with `stale.token` (the env
-/// token, control-tier under an env pin - correct, the app requires control for a
-/// rebind). The endpoint to RESUME on then KEEPS that env token via
-/// [`healed_endpoint_after_rebind`] rather than adopting control.json's (read-only,
-/// under item-3 harden) token - closing the same silent read-only downgrade the
-/// primary path fixes (P71-1).
+/// The rebind request carries both the scoped lease and its bound durable session
+/// identity. The endpoint used after the port-only rebind keeps that same lease.
 fn try_bridge_rebind(
     discovery: &Discovery,
     stale: &ControlEndpoint,
@@ -1336,24 +1332,24 @@ fn try_bridge_rebind(
     if !wsl_powershell_available() {
         return None;
     }
-    if !send_rebind_via_powershell(stale, deadline) {
+    if !send_rebind_via_powershell(stale, discovery.session_token(), deadline) {
         return None;
     }
     healed_endpoint_after_rebind(discovery, stale)
 }
 
 /// Given a successful rebind, the endpoint to resume on: the fresh ADDR the app just
-/// published, KEEPING the env token when an env pin is in force (a rebind rotates the
-/// port, not the token - the same invariant [`Discovery::refreshed_endpoint`] holds on
-/// the primary stale-pin path). Returns `Some` only when the addr actually moved (the
-/// rebind took effect). Split out of the powershell-spawning [`try_bridge_rebind`] so
-/// this token-preservation is unit-testable without a live bridge.
+/// published, keeping the scoped credential that authenticated the rebind. Returns
+/// `Some` only when the address actually moved.
 fn healed_endpoint_after_rebind(
     discovery: &Discovery,
     stale: &ControlEndpoint,
 ) -> Option<ControlEndpoint> {
-    let fresh = discovery.refreshed_endpoint().ok()?;
-    (fresh.addr != stale.addr).then_some(fresh)
+    let fresh = discovery.resolve_from_file().ok()?;
+    (fresh.addr != stale.addr).then_some(ControlEndpoint {
+        addr: fresh.addr,
+        token: stale.token.clone(),
+    })
 }
 
 /// Send a single `rebind_control` to the app via `powershell.exe` (a Windows-native
@@ -1364,7 +1360,14 @@ fn healed_endpoint_after_rebind(
 /// the one-line JSON request from them. Bounded by powershell's own 8s socket
 /// timeouts so a hung bridge can't park the MCP server. Returns true iff the app
 /// answered with a rebind (`"rebound"`), i.e. the port actually moved.
-fn send_rebind_via_powershell(stale: &ControlEndpoint, deadline: Instant) -> bool {
+fn send_rebind_via_powershell(
+    stale: &ControlEndpoint,
+    session_token: &str,
+    deadline: Instant,
+) -> bool {
+    let Some(request) = bridge_rebind_request(stale, session_token) else {
+        return false;
+    };
     // control.json addr is always loopback `host:port`; split from the right so a
     // stray host colon (there is none for 127.0.0.1) can't misparse the port.
     let (host, port) = match stale.addr.rsplit_once(':') {
@@ -1378,7 +1381,7 @@ fn send_rebind_via_powershell(stale: &ControlEndpoint, deadline: Instant) -> boo
     const SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
 try {
-  $req = '{"token":"' + $env:THUB_REBIND_TOKEN + '","command":"rebind_control","args":{},"v":1}' + "`n"
+  $req = $env:THUB_REBIND_REQUEST + "`n"
   $c = New-Object System.Net.Sockets.TcpClient
   $c.ReceiveTimeout = 8000; $c.SendTimeout = 8000
   $c.Connect($env:THUB_REBIND_HOST, [int]$env:THUB_REBIND_PORT)
@@ -1398,7 +1401,7 @@ try {
     // child at the deadline instead of waiting on `.output()` forever.
     let child = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-        .env("THUB_REBIND_TOKEN", &stale.token)
+        .env("THUB_REBIND_REQUEST", request)
         .env("THUB_REBIND_HOST", host)
         .env("THUB_REBIND_PORT", port)
         .stdin(std::process::Stdio::null())
@@ -1418,6 +1421,20 @@ try {
         Some(out) => out.contains("\"rebound\""),
         None => false, // timed out (child killed) or read failed
     }
+}
+
+fn bridge_rebind_request(stale: &ControlEndpoint, session_token: &str) -> Option<String> {
+    if stale.token.is_empty() || session_token.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "token": stale.token,
+        "session": session_token,
+        "command": "rebind_control",
+        "args": {},
+        "v": 1,
+    }))
+    .ok()
 }
 
 /// Total wall-clock bound for the powershell bridge subprocess (F3). Comfortably
@@ -2183,6 +2200,7 @@ mod tests {
                 addr: "no-colon-here".to_string(),
                 token: "t".to_string(),
             },
+            "session",
             Instant::now() + Duration::from_millis(50),
         ));
         assert!(!send_rebind_via_powershell(
@@ -2190,8 +2208,43 @@ mod tests {
                 addr: "127.0.0.1:not-a-port".to_string(),
                 token: "t".to_string(),
             },
+            "session",
             Instant::now() + Duration::from_millis(50),
         ));
+        assert!(!send_rebind_via_powershell(
+            &ControlEndpoint {
+                addr: "127.0.0.1:1234".to_string(),
+                token: "lease".to_string(),
+            },
+            "",
+            Instant::now() + Duration::from_millis(50),
+        ));
+    }
+
+    #[test]
+    fn powershell_bridge_request_binds_scoped_lease_to_session_identity() {
+        let request = bridge_rebind_request(
+            &ControlEndpoint {
+                addr: "127.0.0.1:1234".into(),
+                token: "scoped-lease".into(),
+            },
+            "durable-session",
+        )
+        .unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["token"], "scoped-lease");
+        assert_eq!(request["session"], "durable-session");
+        assert_eq!(request["command"], "rebind_control");
+        assert_eq!(request["args"], serde_json::json!({}));
+        assert_eq!(request["v"], 1);
+        assert!(bridge_rebind_request(
+            &ControlEndpoint {
+                addr: "127.0.0.1:1234".into(),
+                token: "scoped-lease".into(),
+            },
+            "",
+        )
+        .is_none());
     }
 
     fn discovery_for(addr: String) -> Discovery {
@@ -3092,11 +3145,9 @@ mod tests {
     }
 
     #[test]
-    fn healed_endpoint_after_rebind_keeps_env_token_not_control_json_token() {
-        // P71-1: the relay-wedge self-heal must resume on the fresh addr the rebind
-        // published but KEEP the env token - never adopt control.json's (read-only,
-        // under item-3 harden) token. Guards the exact silent read-only downgrade the
-        // bridge-heal path used to have.
+    fn healed_endpoint_after_rebind_keeps_scoped_lease_with_stable_file_discovery() {
+        // The relay-wedge self-heal resumes on the fresh address but keeps the
+        // identity-bound scoped lease used to authenticate the bridge request.
         //
         // BYPASS-WOULD-FAIL: revert `healed_endpoint_after_rebind` to
         // `discovery.resolve_from_file()` and it returns "READ-tok" - the token
@@ -3111,23 +3162,21 @@ mod tests {
         )
         .unwrap();
 
-        // The control-tier session's env pin (FULL token) at the now-wedged old port.
         let discovery = Discovery {
-            addr: Some("127.0.0.1:1".into()),
-            token: Some("FULL-tok".into()),
             file: Some(file.clone()),
+            session: Some("BOUND-session".into()),
             ..Default::default()
         };
         let stale = ControlEndpoint {
             addr: "127.0.0.1:1".into(),
-            token: "FULL-tok".into(),
+            token: "SCOPED-lease".into(),
         };
 
         let healed = healed_endpoint_after_rebind(&discovery, &stale).expect("addr moved -> Some");
         assert_eq!(healed.addr, "127.0.0.1:7777", "resumes on the rebound port");
         assert_eq!(
-            healed.token, "FULL-tok",
-            "the healed endpoint must keep the env token, not control.json's read-only token"
+            healed.token, "SCOPED-lease",
+            "the healed endpoint must keep the scoped lease, not the ambient read token"
         );
 
         // No addr movement (control.json still names the stale addr) -> None (nothing
