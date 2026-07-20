@@ -105,4 +105,22 @@ The installed executable launched successfully and remained responsive.
 
 The Dev control file and diagnostic log were created under the isolated `.t-hub-dev` state directory.
 
-The production application was not replaced or modified.
+The production application was not replaced or modified by the Dev install.
+
+The production Windows installer was then built from the same committed HEAD.
+
+The production NSIS artifact was `T-Hub_0.3.105_x64-setup.exe`.
+
+The unsigned production installer artifact size was 6,167,952 bytes.
+
+The unsigned production installer SHA-256 was `903A7AE08CD3D9AF8AB2B7771C9286F96048200583128328BDC3DE6BD923004B`.
+
+The production installer was installed successfully with exit code 0.
+
+Windows reports `T-Hub` version `0.3.105` installed at `C:\Users\natha\AppData\Local\T-Hub`.
+
+The installed production executable launched successfully and remained responsive.
+
+The production control file and diagnostic log were present after relaunch.
+
+The production install replaced the prior `0.3.104` executable as authorized by the user.
