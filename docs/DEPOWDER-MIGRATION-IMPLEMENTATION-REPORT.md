@@ -81,4 +81,28 @@ The final full Rust library run passed with 914 tests and 2 ignored tests.
 
 The final formatting and diff checks passed.
 
-The branch ancestry mismatch against `efd3271` still requires an explicit integration decision before release.
+The branch ancestry mismatch against `efd3271` is documented as an intentional baseline decision in commit `f073690`.
+
+## Local release-candidate installation
+
+The Windows Dev installer was built from the committed HEAD in a Windows-local temporary checkout.
+
+The NSIS artifact was `T-Hub Dev_0.3.105_x64-setup.exe`.
+
+The unsigned installer artifact size was 6,166,734 bytes.
+
+The unsigned installer SHA-256 was `728DF1ED15F7F9C4BE773F351BF8B711ADA0C33C2D676BA008BF260892341211`.
+
+The build produced both MSI and NSIS bundles.
+
+The local build returned a signing warning because `TAURI_SIGNING_PRIVATE_KEY` was not available.
+
+The unsigned NSIS installer was installed successfully with exit code 0.
+
+Windows reports `T-Hub Dev` version `0.3.105` installed at `C:\Users\natha\AppData\Local\T-Hub Dev`.
+
+The installed executable launched successfully and remained responsive.
+
+The Dev control file and diagnostic log were created under the isolated `.t-hub-dev` state directory.
+
+The production application was not replaced or modified.
