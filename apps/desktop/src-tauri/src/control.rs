@@ -68,6 +68,11 @@ use crate::{
     files, git, plane, powder, pty, tmux,
 };
 
+#[doc(hidden)]
+pub use crate::cortana_reconcile::{CortanaDurableIdentity, CortanaRecoveryState};
+#[doc(hidden)]
+pub use crate::identity::{IdentityStore, Role as SessionIdentityRole};
+
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by an ambient tier token or identity-bound scoped lease.
 #[derive(Debug, Deserialize)]
@@ -8304,6 +8309,14 @@ struct CaptainControlLeaseState {
 const CAPTAIN_CONTROL_LEASE_TTL: Duration = Duration::from_secs(90);
 const MAX_CAPTAIN_CONTROL_LEASES: usize = 1024;
 
+fn captain_control_lease_ttl() -> Duration {
+    std::env::var("T_HUB_CONTROL_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, 90)))
+        .unwrap_or(CAPTAIN_CONTROL_LEASE_TTL)
+}
+
 impl CaptainControlLeases {
     fn retain_live(state: &mut CaptainControlLeaseState) {
         let now = Instant::now();
@@ -10296,7 +10309,8 @@ fn renew_captain_control_lease(
         "control_reauthentication_required: durable session identity could not be verified",
     )?;
     let authority = control_lease_authority(ctx, caller)?;
-    let expires_at = Instant::now() + CAPTAIN_CONTROL_LEASE_TTL;
+    let lease_ttl = captain_control_lease_ttl();
+    let expires_at = Instant::now() + lease_ttl;
     let response_scope = match &authority.authority {
         LeaseAuthority::Captain {
             ship_slug,
@@ -10314,7 +10328,7 @@ fn renew_captain_control_lease(
             "scope": scope,
         }),
     };
-    let expires_at_epoch_ms = now_ms().saturating_add(CAPTAIN_CONTROL_LEASE_TTL.as_millis() as u64);
+    let expires_at_epoch_ms = now_ms().saturating_add(lease_ttl.as_millis() as u64);
     let (secret, expires_at_epoch_ms) = ctx.control_leases.issue(CaptainControlLease {
         identity_id: authority.identity_id,
         terminal_id: authority.terminal_id.clone(),

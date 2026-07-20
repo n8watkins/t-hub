@@ -30,6 +30,16 @@ const HELPER_LIFETIME: Duration = Duration::from_secs(60);
 const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
+const CONTINUITY_CAPTAIN: &str = "ctcap001";
+const CONTINUITY_FOREIGN_CAPTAIN: &str = "frcap001";
+const CONTINUITY_CREW: &str = "ctcrew01";
+const CONTINUITY_FOREIGN_CREW: &str = "frcrew01";
+const CONTINUITY_CORTANA: &str = "cort0001";
+const CONTINUITY_SHIP_ADMIN: &str = "shadm001";
+const CONTINUITY_FLEET_ADMIN: &str = "fladm001";
+const CONTINUITY_DEAD_CAPTAIN: &str = "dead0001";
+const CONTINUITY_DUPLICATE_CAPTAIN: &str = "dupe0001";
+
 const RETIRED_POWDER_TOOLS: [&str; 4] = [
     "append_crew_powder_work_log",
     "read_crew_powder_evidence",
@@ -129,6 +139,24 @@ impl McpProc {
         endpoint: Option<(&str, &str)>,
         session_token: Option<&str>,
     ) -> Self {
+        Self::spawn_with_home(
+            bin,
+            handshake_file,
+            tmux_socket,
+            endpoint,
+            session_token,
+            None,
+        )
+    }
+
+    fn spawn_with_home(
+        bin: &Path,
+        handshake_file: &Path,
+        tmux_socket: &str,
+        endpoint: Option<(&str, &str)>,
+        session_token: Option<&str>,
+        home: Option<&Path>,
+    ) -> Self {
         let mut command = Command::new(bin);
         command
             .env("T_HUB_CONTROL_FILE", handshake_file)
@@ -146,6 +174,9 @@ impl McpProc {
         }
         if let Some(session_token) = session_token {
             command.env("T_HUB_SESSION_TOKEN", session_token);
+        }
+        if let Some(home) = home {
+            command.env("HOME", home);
         }
         let mut child = command.spawn().expect("spawn t-hub-mcp");
         let mut stdin = child.stdin.take().expect("MCP stdin");
@@ -287,8 +318,9 @@ struct ControlProc {
     seed_ready_file: PathBuf,
     powder_state_file: PathBuf,
     addr: String,
-    control_token: String,
     read_token: String,
+    tmux_socket: String,
+    continuity_fixture: bool,
 }
 
 struct TempDirGuard(Option<PathBuf>);
@@ -309,6 +341,14 @@ impl Drop for TempDirGuard {
 
 impl ControlProc {
     fn spawn(tmux_socket: &str) -> Self {
+        Self::spawn_with_fixture(tmux_socket, false)
+    }
+
+    fn spawn_continuity(tmux_socket: &str) -> Self {
+        Self::spawn_with_fixture(tmux_socket, true)
+    }
+
+    fn spawn_with_fixture(tmux_socket: &str, continuity_fixture: bool) -> Self {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let temp_dir =
             std::env::temp_dir().join(format!("th-mcp-e2e-control-{}-{id}", std::process::id()));
@@ -321,27 +361,17 @@ impl ControlProc {
         let seed_file = temp_dir.join("seed.json");
         let seed_ready_file = temp_dir.join("seed-ready");
         let powder_state_file = temp_dir.join("powder-state.json");
-        let child = Command::new(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "mcp_control_helper",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("T_HUB_MCP_CONTROL_HELPER", "1")
-            .env("T_HUB_CONTROL_FILE", &handshake_file)
-            .env("T_HUB_MCP_CONTROL_STOP_FILE", &stop_file)
-            .env("T_HUB_MCP_CONTROL_AUTH_FILE", &auth_file)
-            .env("T_HUB_MCP_CONTROL_SEED_FILE", &seed_file)
-            .env("T_HUB_MCP_CONTROL_SEED_READY_FILE", &seed_ready_file)
-            .env("T_HUB_MCP_POWDER_STATE_FILE", &powder_state_file)
-            .env("T_HUB_TMUX_SOCKET", tmux_socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn control helper process");
+        let child = Self::launch_helper(
+            tmux_socket,
+            continuity_fixture,
+            &handshake_file,
+            &stop_file,
+            &auth_file,
+            &seed_file,
+            &seed_ready_file,
+            &powder_state_file,
+            temp_dir,
+        );
         let temp_dir = temp_guard.disarm();
         let mut process = Self {
             child: Some(child),
@@ -353,11 +383,53 @@ impl ControlProc {
             seed_ready_file,
             powder_state_file,
             addr: String::new(),
-            control_token: String::new(),
             read_token: String::new(),
+            tmux_socket: tmux_socket.to_string(),
+            continuity_fixture,
         };
         process.wait_until_ready();
         process
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_helper(
+        tmux_socket: &str,
+        continuity_fixture: bool,
+        handshake_file: &Path,
+        stop_file: &Path,
+        auth_file: &Path,
+        seed_file: &Path,
+        seed_ready_file: &Path,
+        powder_state_file: &Path,
+        temp_dir: &Path,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args([
+                "--exact",
+                "mcp_control_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("T_HUB_MCP_CONTROL_HELPER", "1")
+            .env("T_HUB_CONTROL_FILE", handshake_file)
+            .env("T_HUB_MCP_CONTROL_STOP_FILE", stop_file)
+            .env("T_HUB_MCP_CONTROL_AUTH_FILE", auth_file)
+            .env("T_HUB_MCP_CONTROL_SEED_FILE", seed_file)
+            .env("T_HUB_MCP_CONTROL_SEED_READY_FILE", seed_ready_file)
+            .env("T_HUB_MCP_POWDER_STATE_FILE", powder_state_file)
+            .env("T_HUB_TMUX_SOCKET", tmux_socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        if continuity_fixture {
+            command
+                .env("T_HUB_MCP_CONTINUITY_FIXTURE", "1")
+                .env("T_HUB_MCP_CONTINUITY_DIR", temp_dir)
+                .env("T_HUB_CONTROL_LEASE_TTL_SECS", "1");
+        }
+        command.spawn().expect("spawn control helper process")
     }
 
     fn wait_until_ready(&mut self) {
@@ -368,10 +440,6 @@ impl ControlProc {
                 .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
             {
                 self.addr = auth["addr"].as_str().expect("helper addr").to_string();
-                self.control_token = auth["controlToken"]
-                    .as_str()
-                    .expect("helper control token")
-                    .to_string();
                 self.read_token = auth["readToken"]
                     .as_str()
                     .expect("helper read token")
@@ -416,6 +484,45 @@ impl ControlProc {
             return Err("control helper temp directory remained after removal".into());
         }
         Ok(())
+    }
+
+    fn restart(&mut self) -> Result<(), String> {
+        fs::write(&self.stop_file, b"stop\n")
+            .map_err(|error| format!("signal control helper restart: {error}"))?;
+        if let Some(child) = self.child.as_mut() {
+            stop_child(child)?;
+        }
+        self.child.take();
+        let old_addr = self.addr.parse::<SocketAddr>().map_err(|error| {
+            format!("parse control helper address before restart: {error}")
+        })?;
+        if TcpStream::connect_timeout(&old_addr, Duration::from_millis(100)).is_ok() {
+            return Err("old control listener remained reachable across restart".into());
+        }
+        for path in [&self.stop_file, &self.auth_file] {
+            if path.exists() {
+                fs::remove_file(path)
+                    .map_err(|error| format!("remove restart marker '{}': {error}", path.display()))?;
+            }
+        }
+        self.child = Some(Self::launch_helper(
+            &self.tmux_socket,
+            self.continuity_fixture,
+            &self.handshake_file,
+            &self.stop_file,
+            &self.auth_file,
+            &self.seed_file,
+            &self.seed_ready_file,
+            &self.powder_state_file,
+            &self.temp_dir,
+        ));
+        self.wait_until_ready();
+        Ok(())
+    }
+
+    fn fixture_auth(&self) -> Value {
+        serde_json::from_slice(&fs::read(&self.auth_file).expect("read helper auth fixture"))
+            .expect("parse helper auth fixture")
     }
 }
 
@@ -946,7 +1053,17 @@ fn mcp_control_helper() {
     );
     let token = format!("e2e-token-{}", std::process::id());
     let read_token = format!("e2e-read-token-{}", std::process::id());
-    let registry = Arc::new(control::CaptainsRegistry::new());
+    let continuity_fixture = std::env::var("T_HUB_MCP_CONTINUITY_FIXTURE").as_deref() == Ok("1");
+    let (registry, identities, delegated_admin, fixture_sessions) = if continuity_fixture {
+        continuity_control_fixture()
+    } else {
+        (
+            Arc::new(control::CaptainsRegistry::new()),
+            Arc::new(control::IdentityStore::ephemeral()),
+            Arc::new(t_hub_lib::delegated_admin::DelegatedAdminStore::ephemeral()),
+            Value::Null,
+        )
+    };
     let powder_state_file =
         PathBuf::from(std::env::var_os("T_HUB_MCP_POWDER_STATE_FILE").expect("Powder state file"));
     let mut powder_server = PowderFixtureServer::start(powder_state_file);
@@ -956,6 +1073,8 @@ fn mcp_control_helper() {
         control::ControlContext::with_shared_supervisor(status, supervisor, token.clone())
             .with_read_token(read_token.clone())
             .with_captains_registry(registry.clone())
+            .with_identity_store(identities)
+            .with_delegated_admin(delegated_admin)
             .with_apply_sink(Arc::new(NoopApplySink));
     let handshake = control::start(context).expect("control listener starts");
     assert_eq!(handshake.local_control_token, token);
@@ -963,12 +1082,15 @@ fn mcp_control_helper() {
         std::env::var_os("T_HUB_MCP_CONTROL_AUTH_FILE").expect("control helper auth file"),
         serde_json::to_vec(&json!({
             "addr": handshake.addr,
-            "controlToken": handshake.local_control_token,
             "readToken": handshake.read_token,
+            "sessions": fixture_sessions,
         }))
         .expect("serialize control helper auth"),
     )
     .expect("write control helper auth");
+    protect_fixture_file(&PathBuf::from(
+        std::env::var_os("T_HUB_MCP_CONTROL_AUTH_FILE").expect("control helper auth file"),
+    ));
     let stop_file = PathBuf::from(
         std::env::var_os("T_HUB_MCP_CONTROL_STOP_FILE").expect("control helper stop file"),
     );
@@ -994,6 +1116,259 @@ fn mcp_control_helper() {
     }
     powder_server.shutdown().expect("stop Powder fixture");
     let _ = fs::remove_file(profile_file);
+}
+
+fn protect_fixture_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("protect credential-bearing test fixture");
+    }
+}
+
+fn continuity_control_fixture() -> (
+    Arc<control::CaptainsRegistry>,
+    Arc<control::IdentityStore>,
+    Arc<t_hub_lib::delegated_admin::DelegatedAdminStore>,
+    Value,
+) {
+    let root = PathBuf::from(
+        std::env::var_os("T_HUB_MCP_CONTINUITY_DIR").expect("continuity fixture directory"),
+    );
+    let captains_path = root.join("captains.json");
+    let identities_path = root.join("identities.json");
+    let grants_path = root.join("delegated-admin.json");
+    let credentials_path = root.join("continuity-credentials.json");
+    if credentials_path.exists() {
+        return (
+            Arc::new(control::CaptainsRegistry::load(captains_path)),
+            Arc::new(control::IdentityStore::load(identities_path)),
+            Arc::new(
+                t_hub_lib::delegated_admin::DelegatedAdminStore::load(grants_path)
+                    .expect("reload delegated admin fixture"),
+            ),
+            serde_json::from_slice(&fs::read(credentials_path).expect("read continuity credentials"))
+                .expect("parse continuity credentials"),
+        );
+    }
+
+    let registry = control::CaptainsRegistry::load(captains_path.clone());
+    for (project_id, root_path) in [
+        ("continuity-project", "/tmp/continuity-project"),
+        ("continuity-foreign-project", "/tmp/continuity-foreign-project"),
+        ("continuity-dead-project", "/tmp/continuity-dead-project"),
+        ("continuity-duplicate-project", "/tmp/continuity-duplicate-project"),
+    ] {
+        registry
+            .upsert_project(control::ProjectRecord {
+                project_id: project_id.into(),
+                name: project_id.into(),
+                repo_root: root_path.into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed continuity project");
+    }
+    for (terminal, ship, project) in [
+        (CONTINUITY_CAPTAIN, "continuity-ship", "continuity-project"),
+        (
+            CONTINUITY_FOREIGN_CAPTAIN,
+            "continuity-foreign-ship",
+            "continuity-foreign-project",
+        ),
+        (
+            CONTINUITY_DEAD_CAPTAIN,
+            "continuity-dead-ship",
+            "continuity-dead-project",
+        ),
+        (
+            CONTINUITY_DUPLICATE_CAPTAIN,
+            "continuity-duplicate-ship",
+            "continuity-duplicate-project",
+        ),
+    ] {
+        registry
+            .claim_provider(
+                terminal,
+                Some(ship),
+                control::FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| panic!("fresh fixture claim does not inspect Crew"),
+            )
+            .expect("seed continuity Captain");
+        registry
+            .bind_ship_context(ship, project, "Continuity E2E", "codex")
+            .expect("bind continuity Project");
+    }
+    for crew in [
+        CONTINUITY_CREW,
+        CONTINUITY_SHIP_ADMIN,
+        CONTINUITY_FLEET_ADMIN,
+    ] {
+        registry
+            .record_crew(CONTINUITY_CAPTAIN, crew)
+            .expect("seed owned continuity Crew");
+    }
+    registry
+        .record_crew(CONTINUITY_FOREIGN_CAPTAIN, CONTINUITY_FOREIGN_CREW)
+        .expect("seed foreign continuity Crew");
+    registry
+        .claim_provider(
+            CONTINUITY_CORTANA,
+            None,
+            control::FleetRole::Cortana,
+            Some("codex"),
+            None,
+            vec![],
+            &|_| false,
+            &|_| panic!("fresh Cortana claim does not inspect Crew"),
+        )
+        .expect("seed continuity Cortana");
+
+    let identities = control::IdentityStore::load(identities_path.clone());
+    let captain = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-ship".into()),
+            CONTINUITY_CAPTAIN,
+        )
+        .expect("mint continuity Captain");
+    let foreign = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-foreign-ship".into()),
+            CONTINUITY_FOREIGN_CAPTAIN,
+        )
+        .expect("mint foreign Captain");
+    let crew = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Crew,
+            Some("continuity-ship".into()),
+            CONTINUITY_CREW,
+        )
+        .expect("mint continuity Crew");
+    let foreign_crew = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Crew,
+            Some("continuity-foreign-ship".into()),
+            CONTINUITY_FOREIGN_CREW,
+        )
+        .expect("mint foreign Crew");
+    let cortana = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Cortana,
+            None,
+            CONTINUITY_CORTANA,
+        )
+        .expect("mint continuity Cortana");
+    let ship_admin = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Crew,
+            Some("continuity-ship".into()),
+            CONTINUITY_SHIP_ADMIN,
+        )
+        .expect("mint Ship Admin Crew");
+    let fleet_admin = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Crew,
+            Some("continuity-ship".into()),
+            CONTINUITY_FLEET_ADMIN,
+        )
+        .expect("mint Fleet Admin Crew");
+    let dead = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-dead-ship".into()),
+            CONTINUITY_DEAD_CAPTAIN,
+        )
+        .expect("mint dead Captain fixture");
+    let duplicate = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-duplicate-ship".into()),
+            CONTINUITY_DUPLICATE_CAPTAIN,
+        )
+        .expect("mint duplicate Captain fixture");
+    identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-duplicate-ship".into()),
+            CONTINUITY_DUPLICATE_CAPTAIN,
+        )
+        .expect("mint second duplicate identity");
+    let revoked = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-ship".into()),
+            "continuity-revoked",
+        )
+        .expect("mint revoked fixture");
+    identities.revoke(&revoked.id).expect("revoke fixture identity");
+    let removed = identities
+        .mint_and_bind(
+            control::SessionIdentityRole::Captain,
+            Some("continuity-ship".into()),
+            "continuity-removed",
+        )
+        .expect("mint removed fixture");
+    identities.retire(&removed.id).expect("retire fixture identity");
+
+    let mut snapshot = registry.snapshot();
+    snapshot.cortana = control::CortanaDurableIdentity {
+        identity_id: Some(cortana.id.clone()),
+        generation: 1,
+        terminal_id: Some(CONTINUITY_CORTANA.into()),
+        harness: Some("codex".into()),
+        provider_session_id: None,
+        conversation_id: None,
+        checkpoint: None,
+        recovery: control::CortanaRecoveryState::Healthy {
+            operation_id: "continuity-e2e".into(),
+            verified_at: 1,
+        },
+    };
+    fs::write(
+        &captains_path,
+        serde_json::to_vec_pretty(&snapshot).expect("serialize continuity Fleet"),
+    )
+    .expect("persist authoritative Cortana fixture");
+
+    let sessions = json!({
+        "captain": captain.secret,
+        "foreignCaptain": foreign.secret,
+        "crew": crew.secret,
+        "foreignCrew": foreign_crew.secret,
+        "cortana": cortana.secret,
+        "shipAdmin": ship_admin.secret,
+        "fleetAdmin": fleet_admin.secret,
+        "deadCaptain": dead.secret,
+        "duplicateCaptain": duplicate.secret,
+        "revoked": revoked.secret,
+        "removed": removed.secret,
+    });
+    fs::write(
+        &credentials_path,
+        serde_json::to_vec(&sessions).expect("serialize continuity credentials"),
+    )
+    .expect("persist isolated continuity test credentials");
+    protect_fixture_file(&credentials_path);
+
+    (
+        Arc::new(control::CaptainsRegistry::load(captains_path)),
+        Arc::new(control::IdentityStore::load(identities_path)),
+        Arc::new(
+            t_hub_lib::delegated_admin::DelegatedAdminStore::load(grants_path)
+                .expect("load continuity delegated admin store"),
+        ),
+        sessions,
+    )
 }
 
 fn powder_server_profile_file(addr: SocketAddr) -> PathBuf {
@@ -1134,6 +1509,46 @@ fn tool_error_text(response: &Value) -> &str {
     response["result"]["content"][0]["text"]
         .as_str()
         .expect("tool error text")
+}
+
+fn raw_control_call(
+    addr: &str,
+    token: &str,
+    session: &str,
+    command: &str,
+    args: Value,
+) -> Value {
+    let mut stream = TcpStream::connect(addr).expect("connect raw control fixture");
+    stream
+        .set_read_timeout(Some(FIXTURE_IO_TIMEOUT))
+        .expect("set raw control read timeout");
+    let request = json!({
+        "token": token,
+        "session": session,
+        "command": command,
+        "args": args,
+    });
+    stream
+        .write_all(&serde_json::to_vec(&request).expect("serialize raw control request"))
+        .and_then(|_| stream.write_all(b"\n"))
+        .expect("write raw control request");
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .expect("read raw control response");
+    serde_json::from_str(response.trim()).expect("parse raw control response")
+}
+
+fn current_handshake(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).expect("read current control handshake"))
+        .expect("parse current control handshake")
+}
+
+fn add_tmux_fixture_session(socket: &str, terminal_id: &str) {
+    let target = format!("th_{terminal_id}");
+    let output = bounded_tmux_output(socket, &["new-session", "-d", "-s", &target, "sleep 300"])
+        .expect("start continuity tmux session");
+    assert!(output.status.success(), "failed to start {target}: {}", command_failure(&output));
 }
 
 fn spawn_fixture_terminal(mcp: &McpProc, id: u64, capability: &str) -> String {
@@ -1544,6 +1959,314 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
 
     tmux_guard.shutdown().expect("stop Powder tmux fixtures");
     control.shutdown().expect("stop Powder control helper");
+}
+
+#[test]
+fn captain_control_continuity_process_merge_gate() {
+    let bin = locate_mcp_binary();
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let tmux_socket = format!("t-hub-continuity-{}-{test_id}", std::process::id());
+    let mut tmux_guard = TmuxServerGuard::start(
+        tmux_socket.clone(),
+        format!("th_{CONTINUITY_CAPTAIN}"),
+    )
+    .expect("start continuity tmux server");
+    for terminal in [
+        CONTINUITY_FOREIGN_CAPTAIN,
+        CONTINUITY_CREW,
+        CONTINUITY_FOREIGN_CREW,
+        CONTINUITY_CORTANA,
+        CONTINUITY_SHIP_ADMIN,
+        CONTINUITY_FLEET_ADMIN,
+        CONTINUITY_DUPLICATE_CAPTAIN,
+    ] {
+        add_tmux_fixture_session(&tmux_socket, terminal);
+    }
+    let mut control = ControlProc::spawn_continuity(&tmux_socket);
+    let first_auth = control.fixture_auth();
+    let sessions = &first_auth["sessions"];
+
+    let shadow_home = control.temp_dir.join("wsl-home");
+    let shadow_dir = shadow_home.join(".t-hub");
+    fs::create_dir_all(&shadow_dir).expect("create stale WSL shadow directory");
+    fs::write(
+        shadow_dir.join("control.json"),
+        serde_json::to_vec(&json!({
+            "addr": "127.0.0.1:9",
+            "token": "stale-shadow-token",
+            "readToken": "stale-shadow-token",
+        }))
+        .unwrap(),
+    )
+    .expect("write stale WSL shadow handshake");
+
+    let mut captain = McpProc::spawn_with_home(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["captain"].as_str(),
+        Some(&shadow_home),
+    );
+    initialize_mcp(&captain, 200);
+    let initial_mutation = call_tool(&captain, 201, "new_tab", json!({"name": "Stable discovery"}));
+    assert_eq!(initial_mutation["result"]["isError"], false, "{initial_mutation}");
+
+    let before_rebind = current_handshake(&control.handshake_file);
+    let lease_response = raw_control_call(
+        before_rebind["addr"].as_str().unwrap(),
+        before_rebind["token"].as_str().unwrap(),
+        sessions["captain"].as_str().unwrap(),
+        "renew_captain_control_lease",
+        Value::Null,
+    );
+    assert_eq!(lease_response["ok"], true, "lease acquisition failed");
+    let scoped_lease = lease_response["result"]["lease"]
+        .as_str()
+        .expect("scoped lease in memory")
+        .to_string();
+    let bridge_rebind = raw_control_call(
+        before_rebind["addr"].as_str().unwrap(),
+        &scoped_lease,
+        sessions["captain"].as_str().unwrap(),
+        "rebind_control",
+        Value::Null,
+    );
+    assert_eq!(bridge_rebind["ok"], true, "scoped bridge-shaped rebind failed");
+    let after_rebind = current_handshake(&control.handshake_file);
+    assert_ne!(after_rebind["addr"], before_rebind["addr"]);
+    assert_eq!(after_rebind["token"], before_rebind["token"]);
+    let rebound_mutation = call_tool(&captain, 202, "new_tab", json!({"name": "Port rebound"}));
+    assert_eq!(rebound_mutation["result"]["isError"], false, "{rebound_mutation}");
+
+    thread::sleep(Duration::from_millis(1_100));
+    let expired = raw_control_call(
+        after_rebind["addr"].as_str().unwrap(),
+        &scoped_lease,
+        sessions["captain"].as_str().unwrap(),
+        "new_tab",
+        json!({"name": "Expired lease must fail"}),
+    );
+    assert_eq!(expired["ok"], false, "expired scoped lease remained usable");
+    let renewed_after_expiry = call_tool(
+        &captain,
+        203,
+        "new_tab",
+        json!({"name": "Renewed after expiry"}),
+    );
+    assert_eq!(renewed_after_expiry["result"]["isError"], false, "{renewed_after_expiry}");
+
+    let ship_appointment = call_tool(
+        &captain,
+        204,
+        "appoint_admin",
+        json!({
+            "actorSessionId": CONTINUITY_SHIP_ADMIN,
+            "role": "shipAdmin",
+            "permittedOperations": ["maintainSession"]
+        }),
+    );
+    assert_eq!(ship_appointment["result"]["isError"], false, "{ship_appointment}");
+
+    let mut cortana = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["cortana"].as_str(),
+    );
+    initialize_mcp(&cortana, 210);
+    let cortana_mutation = call_tool(&cortana, 211, "new_tab", json!({"name": "Cortana scoped"}));
+    assert_eq!(cortana_mutation["result"]["isError"], false, "{cortana_mutation}");
+    let fleet_appointment = call_tool(
+        &cortana,
+        212,
+        "appoint_admin",
+        json!({
+            "actorSessionId": CONTINUITY_FLEET_ADMIN,
+            "role": "fleetAdmin",
+            "permittedOperations": ["maintainFleetResource"]
+        }),
+    );
+    assert_eq!(fleet_appointment["result"]["isError"], false, "{fleet_appointment}");
+
+    let mut ship_admin = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["shipAdmin"].as_str(),
+    );
+    initialize_mcp(&ship_admin, 220);
+    let ship_allowed = call_tool(
+        &ship_admin,
+        221,
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainSession",
+            "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
+        }),
+    );
+    assert_eq!(ship_allowed["result"]["isError"], false, "{ship_allowed}");
+    let ship_foreign = call_tool(
+        &ship_admin,
+        222,
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainSession",
+            "target": {"kind": "session", "sessionId": CONTINUITY_FOREIGN_CREW}
+        }),
+    );
+    assert!(tool_error_text(&ship_foreign).contains("scope"));
+
+    let mut fleet_admin = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["fleetAdmin"].as_str(),
+    );
+    initialize_mcp(&fleet_admin, 230);
+    let fleet_allowed = call_tool(
+        &fleet_admin,
+        231,
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainFleetResource",
+            "target": {"kind": "fleet"}
+        }),
+    );
+    assert_eq!(fleet_allowed["result"]["isError"], false, "{fleet_allowed}");
+    let fleet_wrong_operation = call_tool(
+        &fleet_admin,
+        232,
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainSession",
+            "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
+        }),
+    );
+    assert!(tool_error_text(&fleet_wrong_operation).contains("operationNotGranted"));
+
+    let mut crew = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["crew"].as_str(),
+    );
+    initialize_mcp(&crew, 240);
+    let crew_control_request = call_tool(
+        &crew,
+        241,
+        "spawn_terminal",
+        json!({"cwd": "/tmp", "capability": "control"}),
+    );
+    assert!(tool_error_text(&crew_control_request).contains("control_reauthentication_required"));
+    let crew_mutation = call_tool(&crew, 242, "new_tab", json!({"name": "Crew escape"}));
+    assert!(tool_error_text(&crew_mutation).contains("control_reauthentication_required"));
+
+    let mut foreign = McpProc::spawn(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        sessions["foreignCaptain"].as_str(),
+    );
+    initialize_mcp(&foreign, 250);
+    let foreign_watch = call_tool(
+        &foreign,
+        251,
+        "watch_fleet",
+        json!({"orchestratorSessionId": CONTINUITY_CAPTAIN, "scope": "all"}),
+    );
+    assert!(tool_error_text(&foreign_watch).contains("own or same-ship watch"));
+
+    let old_read_token = first_auth["readToken"].as_str().unwrap().to_string();
+    let pre_restart_handshake = current_handshake(&control.handshake_file);
+    control.restart().expect("restart continuity control app");
+    let restarted_auth = control.fixture_auth();
+    assert!(
+        restarted_auth["readToken"] != old_read_token,
+        "rotating read credential did not change across app restart"
+    );
+    let post_restart_handshake = current_handshake(&control.handshake_file);
+    assert!(
+        post_restart_handshake["instance_id"] != pre_restart_handshake["instance_id"],
+        "listener instance identity did not change across app restart"
+    );
+    let post_restart = call_tool(
+        &captain,
+        260,
+        "new_tab",
+        json!({"name": "Same MCP after app restart"}),
+    );
+    assert_eq!(post_restart["result"]["isError"], false, "{post_restart}");
+    let admin_post_restart = call_tool(
+        &ship_admin,
+        261,
+        "execute_admin_operation",
+        json!({
+            "operation": "maintainSession",
+            "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
+        }),
+    );
+    assert_eq!(admin_post_restart["result"]["isError"], false, "{admin_post_restart}");
+
+    for (id, label, secret_key, expected) in [
+        (270, "dead", "deadCaptain", "not alive"),
+        (271, "duplicate", "duplicateCaptain", "ambiguous"),
+        (272, "revoked", "revoked", "could not be verified"),
+        (273, "removed", "removed", "could not be verified"),
+    ] {
+        let mut denied = McpProc::spawn(
+            &bin,
+            &control.handshake_file,
+            &tmux_socket,
+            None,
+            restarted_auth["sessions"][secret_key].as_str(),
+        );
+        initialize_mcp(&denied, id);
+        let response = call_tool(
+            &denied,
+            id + 100,
+            "new_tab",
+            json!({"name": format!("{label} must not mutate")}),
+        );
+        assert!(
+            tool_error_text(&response).contains(expected),
+            "{label} refusal was unexpected: {response}"
+        );
+        denied.shutdown().expect("stop denied identity MCP");
+    }
+
+    let release = call_tool(
+        &captain,
+        280,
+        "release_captain",
+        json!({"captainSessionId": CONTINUITY_CAPTAIN}),
+    );
+    assert_eq!(release["result"]["isError"], false, "{release}");
+    let released_mutation = call_tool(
+        &captain,
+        281,
+        "new_tab",
+        json!({"name": "Released Captain must not mutate"}),
+    );
+    assert!(tool_error_text(&released_mutation).contains("no active scoped mutation authority"));
+
+    for process in [
+        &mut fleet_admin,
+        &mut ship_admin,
+        &mut cortana,
+        &mut foreign,
+        &mut crew,
+        &mut captain,
+    ] {
+        process.shutdown().expect("stop continuity MCP process");
+    }
+    control.shutdown().expect("stop continuity control helper");
+    tmux_guard.shutdown().expect("stop continuity tmux fixtures");
 }
 
 #[test]
