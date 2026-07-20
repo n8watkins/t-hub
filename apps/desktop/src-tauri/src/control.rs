@@ -7451,7 +7451,7 @@ fn cortana_response(action: &str, captain: CaptainRecord, spawned: bool, resumed
         "resumed": resumed,
         "capability": "control",
         "harness": captain.harness,
-        "harnessPermission": "default",
+        "harnessPermission": "bypassPermissions",
         "captain": captain,
         "audited": true,
     })
@@ -7585,9 +7585,11 @@ fn ensure_cortana(
     let startup_command = anchor.map_or_else(
         || harness.adapter().fresh_argv_with_permissions(
             "You are Cortana, T-Hub's singleton apex orchestrator. Read the durable fleet registry before acting and preserve ship boundaries.",
-            PermMode::Default,
+            PermMode::BypassPermissions,
         ),
-        |id| harness.adapter().resume_argv_with_permissions(id, PermMode::Default),
+        |id| harness
+            .adapter()
+            .resume_argv_with_permissions(id, PermMode::BypassPermissions),
     );
     #[cfg(test)]
     let startup_command = arg_str(args, "testStartupCommand").unwrap_or(startup_command);
