@@ -15578,6 +15578,9 @@ fn commission_captain(
         );
     }
     let suffix = uuid::Uuid::new_v4().simple().to_string();
+    #[cfg(test)]
+    let terminal_id = arg_str(args, "testTerminalId").unwrap_or_else(|| suffix[..8].to_string());
+    #[cfg(not(test))]
     let terminal_id = suffix[..8].to_string();
     let operation = ctx.captains.prepare_commission_operation(
         &terminal_id,
@@ -31709,7 +31712,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-failure",
                 "dependencies": [],
-                "mutableFiles": [repo],
+                "mutableFiles": ["src"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
@@ -31785,7 +31788,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-success",
                 "dependencies": [],
-                "mutableFiles": [repo],
+                "mutableFiles": ["src"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
@@ -32920,7 +32923,8 @@ mod tests {
             .with_tab_registry(Arc::clone(&tabs))
             .with_apply_sink(sink.clone());
         let (harness_bin_dir, harness_command) = test_harness_command("codex");
-        let sessions_before = tmux::list_sessions().unwrap_or_default();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let terminal_id = suffix[..8].to_string();
         let identities_before = context.identity.len();
 
         let error = dispatch(
@@ -32934,15 +32938,22 @@ mod tests {
                 "workspaceTabIds": ["commission-work"],
                 "testStartupCommand": harness_command,
                 "testSkipPowderHealth": true,
-                "testFailCommitPersist": true
+                "testFailCommitPersist": true,
+                "testTerminalId": terminal_id
             }),
         )
         .unwrap_err();
-        assert!(error.contains("commission binding persistence failure"));
+        assert!(
+            error.contains("commission binding persistence failure"),
+            "got: {error}"
+        );
         assert!(captains.snapshot().captains.is_empty());
         assert!(captains.snapshot().pending_fleet_operations.is_empty());
         assert_eq!(context.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap_or_default(), sessions_before);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&terminal_id)),
+            tmux::SessionLiveness::Gone
+        );
         assert!(tabs
             .snapshot()
             .iter()
