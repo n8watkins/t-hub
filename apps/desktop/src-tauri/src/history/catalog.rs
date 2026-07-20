@@ -412,7 +412,7 @@ fn collect_transcripts(
             entries.truncate(MAX_DIRECTORY_ENTRIES);
             truncated = true;
         }
-        entries.sort_by(|left, right| left.path().cmp(&right.path()));
+        entries.sort_by_key(|left| left.path());
         for entry in entries {
             let Ok(file_type) = entry.file_type() else {
                 truncated = true;
