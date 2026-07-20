@@ -9,9 +9,11 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -157,6 +159,27 @@ impl McpProc {
         session_token: Option<&str>,
         home: Option<&Path>,
     ) -> Self {
+        Self::spawn_with_environment(
+            bin,
+            handshake_file,
+            tmux_socket,
+            endpoint,
+            session_token,
+            home,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_environment(
+        bin: &Path,
+        handshake_file: &Path,
+        tmux_socket: &str,
+        endpoint: Option<(&str, &str)>,
+        session_token: Option<&str>,
+        home: Option<&Path>,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(bin);
         command
             .env("T_HUB_CONTROL_FILE", handshake_file)
@@ -178,6 +201,7 @@ impl McpProc {
         if let Some(home) = home {
             command.env("HOME", home);
         }
+        command.envs(environment.iter().copied());
         let mut child = command.spawn().expect("spawn t-hub-mcp");
         let mut stdin = child.stdin.take().expect("MCP stdin");
         let stdout = child.stdout.take().expect("MCP stdout");
@@ -321,6 +345,7 @@ struct ControlProc {
     read_token: String,
     tmux_socket: String,
     continuity_fixture: bool,
+    lease_ttl_secs: Option<String>,
 }
 
 struct TempDirGuard(Option<PathBuf>);
@@ -341,14 +366,22 @@ impl Drop for TempDirGuard {
 
 impl ControlProc {
     fn spawn(tmux_socket: &str) -> Self {
-        Self::spawn_with_fixture(tmux_socket, false)
+        Self::spawn_with_fixture(tmux_socket, false, None)
     }
 
     fn spawn_continuity(tmux_socket: &str) -> Self {
-        Self::spawn_with_fixture(tmux_socket, true)
+        Self::spawn_with_fixture(tmux_socket, true, Some("1"))
     }
 
-    fn spawn_with_fixture(tmux_socket: &str, continuity_fixture: bool) -> Self {
+    fn spawn_bridge_continuity(tmux_socket: &str) -> Self {
+        Self::spawn_with_fixture(tmux_socket, true, Some("90"))
+    }
+
+    fn spawn_with_fixture(
+        tmux_socket: &str,
+        continuity_fixture: bool,
+        lease_ttl_secs: Option<&str>,
+    ) -> Self {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let temp_dir =
             std::env::temp_dir().join(format!("th-mcp-e2e-control-{}-{id}", std::process::id()));
@@ -371,6 +404,7 @@ impl ControlProc {
             &seed_ready_file,
             &powder_state_file,
             temp_dir,
+            lease_ttl_secs,
         );
         let temp_dir = temp_guard.disarm();
         let mut process = Self {
@@ -386,6 +420,7 @@ impl ControlProc {
             read_token: String::new(),
             tmux_socket: tmux_socket.to_string(),
             continuity_fixture,
+            lease_ttl_secs: lease_ttl_secs.map(str::to_string),
         };
         process.wait_until_ready();
         process
@@ -402,6 +437,7 @@ impl ControlProc {
         seed_ready_file: &Path,
         powder_state_file: &Path,
         temp_dir: &Path,
+        lease_ttl_secs: Option<&str>,
     ) -> Child {
         let mut command = Command::new(std::env::current_exe().expect("current test executable"));
         command
@@ -426,8 +462,10 @@ impl ControlProc {
         if continuity_fixture {
             command
                 .env("T_HUB_MCP_CONTINUITY_FIXTURE", "1")
-                .env("T_HUB_MCP_CONTINUITY_DIR", temp_dir)
-                .env("T_HUB_CONTROL_LEASE_TTL_SECS", "1");
+                .env("T_HUB_MCP_CONTINUITY_DIR", temp_dir);
+        }
+        if let Some(lease_ttl_secs) = lease_ttl_secs {
+            command.env("T_HUB_CONTROL_LEASE_TTL_SECS", lease_ttl_secs);
         }
         command.spawn().expect("spawn control helper process")
     }
@@ -517,6 +555,7 @@ impl ControlProc {
             &self.seed_ready_file,
             &self.powder_state_file,
             &self.temp_dir,
+            self.lease_ttl_secs.as_deref(),
         ));
         self.wait_until_ready();
         Ok(())
@@ -532,6 +571,94 @@ impl Drop for ControlProc {
     fn drop(&mut self) {
         if self.shutdown().is_err() {
             std::process::abort();
+        }
+    }
+}
+
+struct BridgeWedgeProxy {
+    addr: SocketAddr,
+    wedged: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl BridgeWedgeProxy {
+    fn start(target: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bridge wedge proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make bridge wedge proxy nonblocking");
+        let addr = listener.local_addr().expect("bridge wedge proxy address");
+        let wedged = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_wedged = Arc::clone(&wedged);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut client, _)) if thread_wedged.load(Ordering::Acquire) => {
+                        let _ = client.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
+                        let mut request = Vec::new();
+                        let _ = BufReader::new(&mut client).read_until(b'\n', &mut request);
+                        while !thread_stop.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Ok((client, _)) => forward_control_connection(client, target),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            wedged,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn wedge(&self) {
+        self.wedged.store(true, Ordering::Release);
+    }
+}
+
+fn forward_control_connection(mut client: TcpStream, target: SocketAddr) {
+    let _ = client.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
+    let _ = client.set_write_timeout(Some(FIXTURE_IO_TIMEOUT));
+    let Ok(mut backend) = TcpStream::connect_timeout(&target, FIXTURE_IO_TIMEOUT) else {
+        return;
+    };
+    let _ = backend.set_read_timeout(Some(FIXTURE_IO_TIMEOUT));
+    let _ = backend.set_write_timeout(Some(FIXTURE_IO_TIMEOUT));
+    let mut request = Vec::new();
+    if BufReader::new(&mut client)
+        .read_until(b'\n', &mut request)
+        .is_err()
+    {
+        return;
+    }
+    if backend.write_all(&request).is_err() {
+        return;
+    }
+    let mut response = Vec::new();
+    if BufReader::new(&mut backend)
+        .read_until(b'\n', &mut response)
+        .is_ok()
+    {
+        let _ = client.write_all(&response);
+        let _ = client.flush();
+    }
+}
+
+impl Drop for BridgeWedgeProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(100));
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("join bridge wedge proxy");
         }
     }
 }
@@ -1552,6 +1679,72 @@ fn current_handshake(path: &Path) -> Value {
         .expect("parse current control handshake")
 }
 
+#[cfg(unix)]
+fn install_test_powershell_bridge(directory: &Path) -> (PathBuf, PathBuf) {
+    let bin_dir = directory.join("bridge-bin");
+    let capture_file = directory.join("bridge-capture.json");
+    fs::create_dir_all(&bin_dir).expect("create test PowerShell bridge directory");
+    let bridge = bin_dir.join("powershell.exe");
+    fs::write(
+        &bridge,
+        "#!/bin/sh\nexec \"$T_HUB_TEST_BRIDGE_HELPER_EXE\" --exact \
+         mcp_powershell_bridge_helper --ignored --nocapture\n",
+    )
+    .expect("write test PowerShell bridge");
+    let mut permissions = fs::metadata(&bridge)
+        .expect("stat test PowerShell bridge")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&bridge, permissions).expect("make test PowerShell bridge executable");
+    (bin_dir, capture_file)
+}
+
+#[test]
+#[ignore = "PowerShell-shaped bridge subprocess helper"]
+fn mcp_powershell_bridge_helper() {
+    if std::env::var("T_HUB_TEST_POWERSHELL_BRIDGE").as_deref() != Ok("1") {
+        return;
+    }
+    let wire = std::env::var("THUB_REBIND_REQUEST").expect("bridge request");
+    let request: Value = serde_json::from_str(&wire).expect("parse bridge request");
+    let target = std::env::var("T_HUB_TEST_BRIDGE_TARGET")
+        .expect("bridge target")
+        .parse::<SocketAddr>()
+        .expect("parse bridge target");
+    let mut stream =
+        TcpStream::connect_timeout(&target, FIXTURE_IO_TIMEOUT).expect("connect bridge target");
+    stream
+        .set_read_timeout(Some(FIXTURE_IO_TIMEOUT))
+        .expect("set bridge read timeout");
+    stream
+        .write_all(wire.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .expect("write bridge request");
+    let mut response_line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response_line)
+        .expect("read bridge response");
+    let response: Value =
+        serde_json::from_str(response_line.trim_end()).expect("parse bridge response");
+    let token = request["token"].as_str().unwrap_or_default();
+    let session = request["session"].as_str().unwrap_or_default();
+    let capture = json!({
+        "command": request["command"],
+        "hasToken": !token.is_empty(),
+        "hasSession": !session.is_empty(),
+        "tokenDigest": format!("{:x}", Sha256::digest(token.as_bytes())),
+        "sessionDigest": format!("{:x}", Sha256::digest(session.as_bytes())),
+        "responseOk": response["ok"],
+        "responseResult": response["result"],
+    });
+    fs::write(
+        std::env::var_os("T_HUB_TEST_BRIDGE_CAPTURE").expect("bridge capture path"),
+        serde_json::to_vec(&capture).expect("serialize bridge capture"),
+    )
+    .expect("write bridge capture");
+    println!("{}", response_line.trim_end());
+}
+
 fn add_tmux_fixture_session(socket: &str, terminal_id: &str) {
     let target = format!("th_{terminal_id}");
     let output = bounded_tmux_output(socket, &["new-session", "-d", "-s", &target, "sleep 300"])
@@ -1971,6 +2164,108 @@ fn powder_tools_reach_real_authenticated_dispatcher() {
 
     tmux_guard.shutdown().expect("stop Powder tmux fixtures");
     control.shutdown().expect("stop Powder control helper");
+}
+
+#[cfg(unix)]
+#[test]
+fn captain_bridge_wedge_recovers_through_production_mcp_process_path() {
+    let bin = locate_mcp_binary();
+    let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let tmux_socket = format!("t-hub-bridge-{}-{test_id}", std::process::id());
+    let mut tmux_guard =
+        TmuxServerGuard::start(tmux_socket.clone(), format!("th_{CONTINUITY_CAPTAIN}"))
+            .expect("start bridge tmux server");
+    let mut control = ControlProc::spawn_bridge_continuity(&tmux_socket);
+    let session = control.fixture_auth()["sessions"]["captain"]
+        .as_str()
+        .expect("bridge Captain session")
+        .to_string();
+    let backend_addr = control
+        .addr
+        .parse::<SocketAddr>()
+        .expect("bridge backend address");
+    let proxy = BridgeWedgeProxy::start(backend_addr);
+
+    let mut handshake = current_handshake(&control.handshake_file);
+    handshake["addr"] = Value::String(proxy.addr.to_string());
+    fs::write(
+        &control.handshake_file,
+        serde_json::to_vec(&handshake).expect("serialize proxied control handshake"),
+    )
+    .expect("publish proxied control handshake");
+
+    let (bridge_bin, capture_file) = install_test_powershell_bridge(&control.temp_dir);
+    let path = format!(
+        "{}:{}",
+        bridge_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let backend = backend_addr.to_string();
+    let capture = capture_file.to_string_lossy().into_owned();
+    let bridge_helper_exe = std::env::current_exe()
+        .expect("bridge helper executable")
+        .to_string_lossy()
+        .into_owned();
+    let environment = [
+        ("PATH", path.as_str()),
+        ("WSL_DISTRO_NAME", "T-Hub-Bridge-E2E"),
+        ("T_HUB_TEST_POWERSHELL_BRIDGE", "1"),
+        ("T_HUB_TEST_BRIDGE_HELPER_EXE", bridge_helper_exe.as_str()),
+        ("T_HUB_TEST_BRIDGE_TARGET", backend.as_str()),
+        ("T_HUB_TEST_BRIDGE_CAPTURE", capture.as_str()),
+    ];
+    let mut captain = McpProc::spawn_with_environment(
+        &bin,
+        &control.handshake_file,
+        &tmux_socket,
+        None,
+        Some(&session),
+        None,
+        &environment,
+    );
+    initialize_mcp(&captain, 300);
+
+    let before_wedge = call_tool(&captain, 301, "my_capability", Value::Null);
+    assert_eq!(before_wedge["result"]["isError"], false, "{before_wedge}");
+    assert_eq!(
+        before_wedge["result"]["structuredContent"]["capability"],
+        "control"
+    );
+
+    proxy.wedge();
+    let recovered = call_tool(
+        &captain,
+        302,
+        "new_tab",
+        json!({"name": "Mutate after bridge recovery"}),
+    );
+
+    wait_for_path(&capture_file, "PowerShell bridge capture");
+    let capture_body = fs::read_to_string(&capture_file).expect("read PowerShell bridge capture");
+    let bridge_capture: Value =
+        serde_json::from_str(&capture_body).expect("parse PowerShell bridge capture");
+    let session_digest = format!("{:x}", Sha256::digest(session.as_bytes()));
+    let read_token_digest = format!("{:x}", Sha256::digest(control.read_token.as_bytes()));
+    assert_eq!(bridge_capture["command"], "rebind_control");
+    assert_eq!(bridge_capture["hasToken"], true);
+    assert_eq!(bridge_capture["hasSession"], true);
+    assert_eq!(bridge_capture["sessionDigest"], session_digest);
+    assert_ne!(bridge_capture["tokenDigest"], read_token_digest);
+    assert_eq!(bridge_capture["responseOk"], true, "{bridge_capture}");
+    assert_eq!(bridge_capture["responseResult"]["rebound"], true);
+    assert_eq!(bridge_capture["responseResult"]["tokensRotated"], false);
+    assert!(!capture_body.contains(&session));
+    assert!(!capture_body.contains(&control.read_token));
+    assert_eq!(recovered["result"]["isError"], false, "{recovered}");
+
+    let healed = current_handshake(&control.handshake_file);
+    assert_ne!(healed["addr"], proxy.addr.to_string());
+    assert_ne!(healed["addr"], backend_addr.to_string());
+
+    captain.shutdown().expect("stop bridge MCP process");
+    drop(proxy);
+    tmux_guard.shutdown().expect("stop bridge tmux server");
+    control.shutdown().expect("stop bridge control helper");
 }
 
 #[test]
