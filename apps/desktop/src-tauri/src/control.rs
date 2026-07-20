@@ -13564,8 +13564,14 @@ fn discover_cortana_runtimes(
         let terminal_id = pane
             .session
             .strip_prefix("th_")
-            .unwrap_or(&pane.session)
+            .ok_or_else(|| {
+                format!(
+                    "reconcile_cortana: reserved-scope runtime session '{}' is not an exact T-Hub terminal target",
+                    pane.session
+                )
+            })?
             .to_string();
+        exact_cortana_tmux_target(&terminal_id)?;
         if by_terminal.contains_key(&terminal_id) {
             continue;
         }
@@ -13656,11 +13662,226 @@ fn claim_cortana_runtime(
         .map_err(|error| format!("reconcile_cortana: invalid Fleet claim result: {error}"))
 }
 
+fn exact_cortana_tmux_target(terminal_id: &str) -> Result<String, String> {
+    if terminal_id.len() != 8
+        || !terminal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "reconcile_cortana: discovered terminal id '{terminal_id}' is outside the exact T-Hub target contract"
+        ));
+    }
+    Ok(format!("th_{terminal_id}"))
+}
+
+fn audit_cortana_runtime_mutation(
+    ctx: &ControlContext,
+    decision: &str,
+    operation_id: &str,
+    requested_terminal_ids: &[String],
+    affected_terminal_ids: &[String],
+    error: Option<&str>,
+) {
+    let quarantined_terminal_ids = if decision.starts_with("quarantine") {
+        affected_terminal_ids
+    } else {
+        &[]
+    };
+    let migrated_terminal_ids = if decision.starts_with("generation-migrat") {
+        affected_terminal_ids
+    } else {
+        &[]
+    };
+    let args = json!({
+        "operationId": operation_id,
+        "requestedTerminalIds": requested_terminal_ids,
+        "affectedTerminalIds": affected_terminal_ids,
+        "quarantinedTerminalIds": quarantined_terminal_ids,
+        "migratedTerminalIds": migrated_terminal_ids,
+        "authorityClaimed": false,
+    });
+    ctx.audit.record(
+        "reconcile_cortana_runtime_mutation",
+        CommandTier::ProcessChanging.label(),
+        decision,
+        &args,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: Capability::Full.tier_label(),
+            session: None,
+            spawned_by: None,
+            error,
+        },
+    );
+}
+
+fn quarantine_cortana_runtimes(
+    ctx: &ControlContext,
+    operation_id: &str,
+    requested_terminal_ids: &[String],
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<Vec<String>, String> {
+    let requested = requested_terminal_ids
+        .iter()
+        .map(|terminal_id| {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.terminal_id == *terminal_id)
+                .ok_or_else(|| {
+                    format!(
+                        "reconcile_cortana: quarantine target '{terminal_id}' was not present in the authoritative discovery snapshot"
+                    )
+                })?;
+            let target = exact_cortana_tmux_target(terminal_id)?;
+            Ok((candidate, target))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut quarantined = Vec::new();
+    let mut failures = Vec::new();
+    for (candidate, target) in &requested {
+        let kill = tmux::kill_session_tree(target);
+        match tmux::session_liveness(target) {
+            tmux::SessionLiveness::Gone => {
+                quarantined.push(candidate.terminal_id.clone());
+            }
+            tmux::SessionLiveness::Alive => failures.push(format!(
+                "runtime '{}' remained alive after exact quarantine: {kill:?}",
+                candidate.terminal_id
+            )),
+            tmux::SessionLiveness::Unknown => failures.push(retryable_error(format!(
+                "runtime '{}' has uncertain liveness after exact quarantine: {kill:?}",
+                candidate.terminal_id
+            ))),
+        }
+    }
+    quarantined.sort();
+    for terminal_id in &quarantined {
+        ctx.tabs.retire_tile_locked(terminal_id);
+        if let Err(error) = ctx.captains.remove_session(terminal_id) {
+            failures.push(format!(
+                "runtime '{terminal_id}' was stopped but its Fleet session state could not be retired: {error}"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        let identity_ids = requested
+            .iter()
+            .filter_map(|(candidate, _)| candidate.identity_id.as_deref())
+            .filter(|identity_id| durable.identity_id.as_deref() != Some(*identity_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        for identity_id in identity_ids {
+            if let Err(error) = ctx.identity.retire(identity_id) {
+                failures.push(format!(
+                    "quarantined Cortana identity '{identity_id}' could not be revoked: {error}"
+                ));
+            }
+        }
+    }
+    let error = (!failures.is_empty()).then(|| failures.join("; "));
+    audit_cortana_runtime_mutation(
+        ctx,
+        if error.is_some() {
+            "quarantine-failed"
+        } else {
+            "quarantined"
+        },
+        operation_id,
+        requested_terminal_ids,
+        &quarantined,
+        error.as_deref(),
+    );
+    if let Some(error) = error {
+        return Err(format!(
+            "reconcile_cortana: exact duplicate quarantine did not complete: {error}"
+        ));
+    }
+    Ok(quarantined)
+}
+
+fn migrate_generation_zero_runtime(
+    ctx: &ControlContext,
+    operation_id: &str,
+    authoritative: &crate::cortana_reconcile::CortanaRuntimeCandidate,
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+) -> Result<(), String> {
+    let Some(legacy) = candidates.iter().find(|candidate| {
+        candidate.terminal_id == authoritative.terminal_id && candidate.generation == 0
+    }) else {
+        return Ok(());
+    };
+    let target = exact_cortana_tmux_target(&legacy.terminal_id)?;
+    let requested = vec![legacy.terminal_id.clone()];
+    if let Err(error) = tmux::set_session_environment(&target, CORTANA_GENERATION_ENV, "1") {
+        let message = format!(
+            "generation-zero runtime '{}' could not be migrated before authority claim: {error}",
+            legacy.terminal_id
+        );
+        audit_cortana_runtime_mutation(
+            ctx,
+            "generation-migration-failed",
+            operation_id,
+            &requested,
+            &[],
+            Some(&message),
+        );
+        return Err(message);
+    }
+    let observed = match tmux::session_environment(&target, CORTANA_GENERATION_ENV) {
+        Ok(observed) => observed,
+        Err(error) => {
+            let message = format!(
+                "generation-zero runtime '{}' could not be verified after migration: {error}",
+                legacy.terminal_id
+            );
+            audit_cortana_runtime_mutation(
+                ctx,
+                "generation-migration-failed",
+                operation_id,
+                &requested,
+                &[],
+                Some(&message),
+            );
+            return Err(message);
+        }
+    };
+    if observed.as_deref() != Some("1") {
+        let message = format!(
+            "generation-zero runtime '{}' did not retain generation 1 before authority claim",
+            legacy.terminal_id
+        );
+        audit_cortana_runtime_mutation(
+            ctx,
+            "generation-migration-failed",
+            operation_id,
+            &requested,
+            &[],
+            Some(&message),
+        );
+        return Err(message);
+    }
+    audit_cortana_runtime_mutation(
+        ctx,
+        "generation-migrated",
+        operation_id,
+        &requested,
+        &requested,
+        None,
+    );
+    Ok(())
+}
+
 fn cortana_reconcile_response(
     operation_id: &str,
     action: crate::cortana_reconcile::CortanaReconcileAction,
     durable: crate::cortana_reconcile::CortanaDurableIdentity,
     retired: Vec<String>,
+    quarantined: Vec<String>,
     reason: Option<String>,
 ) -> Value {
     json!({
@@ -13675,6 +13896,7 @@ fn cortana_reconcile_response(
         "providerSessionId": durable.provider_session_id,
         "recovery": durable.recovery,
         "retiredTerminalIds": retired,
+        "quarantinedTerminalIds": quarantined,
         "degradedReason": reason,
         "audited": true,
     })
@@ -13758,6 +13980,17 @@ fn reconcile_cortana_inner(
     }
     let plan = crate::cortana_reconcile::plan_reconciliation(&durable, operation_id, &candidates);
     if plan.action == crate::cortana_reconcile::CortanaReconcileAction::Degraded {
+        let quarantined = if plan.quarantine_terminal_ids.is_empty() {
+            Vec::new()
+        } else {
+            quarantine_cortana_runtimes(
+                ctx,
+                operation_id,
+                &plan.quarantine_terminal_ids,
+                &candidates,
+                &durable,
+            )?
+        };
         let reason = plan
             .degraded_reason
             .clone()
@@ -13768,8 +14001,26 @@ fn reconcile_cortana_inner(
             plan.action,
             ctx.captains.cortana_identity(),
             Vec::new(),
+            quarantined,
             Some(reason),
         ));
+    }
+
+    if let Some(candidate) = plan.authoritative.as_ref() {
+        if let Err(error) =
+            migrate_generation_zero_runtime(ctx, operation_id, candidate, &candidates)
+        {
+            let reason = format!("reconcile_cortana: {error}");
+            ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
+            return Ok(cortana_reconcile_response(
+                operation_id,
+                crate::cortana_reconcile::CortanaReconcileAction::Degraded,
+                ctx.captains.cortana_identity(),
+                Vec::new(),
+                Vec::new(),
+                Some(reason),
+            ));
+        }
     }
 
     for terminal_id in &plan.retire_terminal_ids {
@@ -13802,6 +14053,7 @@ fn reconcile_cortana_inner(
             plan.action,
             durable,
             plan.retire_terminal_ids,
+            Vec::new(),
             None,
         ));
     }
@@ -13995,6 +14247,7 @@ fn reconcile_cortana_inner(
         operation_id,
         plan.action,
         durable,
+        Vec::new(),
         Vec::new(),
         None,
     ))
@@ -23213,10 +23466,15 @@ mod tests {
         reap_test_tmux_session(target).unwrap_or_else(|error| panic!("{error}"));
     }
 
-    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+    fn create_test_tmux_session_with_env(
+        target: &str,
+        cwd: &str,
+        command: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match tmux::new_session_with_env(target, "/tmp", None, &[]) {
+            match tmux::new_session_with_env(target, cwd, command, env) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.message == "server exited unexpectedly" => {
                     match tmux::session_liveness(target) {
@@ -23234,6 +23492,10 @@ mod tests {
                 Err(error) => return Err(error.to_string()),
             }
         }
+    }
+
+    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+        create_test_tmux_session_with_env(target, "/tmp", None, &[])
     }
 
     /// Serialize process-attestation fixtures and keep an anchor alive while a
@@ -31338,6 +31600,379 @@ mod tests {
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn duplicate_cortana_runtimes_are_quarantined_and_next_reconcile_recovers() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-quarantine-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut ctx = test_ctx("cortana-quarantine")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.addr = "127.0.0.1:4244".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-quarantine-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let mut terminal_ids = (0..2)
+            .map(|_| uuid::Uuid::new_v4().simple().to_string()[..8].to_string())
+            .collect::<Vec<_>>();
+        ctx.identity
+            .bind_tile(&identity.id, &terminal_ids[0])
+            .unwrap();
+        let environment = vec![
+            ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+            (
+                crate::identity::SESSION_TOKEN_ENV.into(),
+                identity.secret.clone(),
+            ),
+            (CORTANA_GENERATION_ENV.into(), "7".into()),
+        ];
+        for terminal_id in &terminal_ids {
+            let target = exact_cortana_tmux_target(terminal_id).unwrap();
+            create_test_tmux_session_with_env(
+                &target,
+                home.to_str().unwrap(),
+                Some(&harness_command),
+                &environment,
+            )
+            .unwrap();
+            wait_for_harness_started(terminal_id, "codex").unwrap();
+        }
+        terminal_ids.sort();
+
+        let degraded = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-quarantine-1",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(degraded["action"], "degraded");
+        assert_eq!(degraded["healthy"], false);
+        assert_eq!(
+            degraded["quarantinedTerminalIds"],
+            serde_json::to_value(&terminal_ids).unwrap()
+        );
+        assert!(terminal_ids
+            .iter()
+            .all(|terminal_id| tmux::session_liveness(
+                &exact_cortana_tmux_target(terminal_id).unwrap()
+            ) == tmux::SessionLiveness::Gone));
+        assert!(ctx.captains.cortana_identity().identity_id.is_none());
+        assert!(ctx.identity.resolve(&identity.secret).is_none());
+        let quarantine_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "quarantined")
+            .expect("duplicate quarantine must have a distinct audit record");
+        assert_eq!(
+            quarantine_audit["args"]["quarantinedTerminalIds"],
+            serde_json::to_value(&terminal_ids).unwrap()
+        );
+        assert_eq!(quarantine_audit["args"]["authorityClaimed"], false);
+
+        let recovered = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-quarantine-2",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "create");
+        assert_eq!(recovered["healthy"], true);
+        assert_eq!(recovered["generation"], 1);
+        assert!(recovered["identityId"].as_str().is_some());
+        assert_ne!(recovered["identityId"], identity.id);
+        let recovered_terminal = recovered["terminalId"].as_str().unwrap();
+        dispatch(
+            &ctx,
+            "close_terminal",
+            &json!({ "sessionId": recovered_terminal }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn quarantine_revokes_candidate_identities_except_the_durable_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-identity-quarantine-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-identity-quarantine")
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        let durable_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let foreign_identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let durable_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let foreign_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity
+            .bind_tile(&durable_identity.id, &durable_terminal)
+            .unwrap();
+        ctx.identity
+            .bind_tile(&foreign_identity.id, &foreign_terminal)
+            .unwrap();
+        for terminal_id in [&durable_terminal, &foreign_terminal] {
+            create_test_tmux_session(&exact_cortana_tmux_target(terminal_id).unwrap()).unwrap();
+        }
+        let candidates = vec![
+            crate::cortana_reconcile::CortanaRuntimeCandidate {
+                terminal_id: durable_terminal.clone(),
+                identity_id: Some(durable_identity.id.clone()),
+                generation: 4,
+                harness: "codex".into(),
+                provider_session_id: None,
+                terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                current_control_capability: true,
+                trusted_cortana_identity: true,
+            },
+            crate::cortana_reconcile::CortanaRuntimeCandidate {
+                terminal_id: foreign_terminal.clone(),
+                identity_id: Some(foreign_identity.id.clone()),
+                generation: 4,
+                harness: "codex".into(),
+                provider_session_id: None,
+                terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+                current_control_capability: true,
+                trusted_cortana_identity: true,
+            },
+        ];
+        let durable = crate::cortana_reconcile::CortanaDurableIdentity {
+            identity_id: Some(durable_identity.id.clone()),
+            generation: 4,
+            terminal_id: Some(durable_terminal.clone()),
+            harness: Some("codex".into()),
+            ..Default::default()
+        };
+        let requested = vec![durable_terminal, foreign_terminal];
+
+        let quarantined = quarantine_cortana_runtimes(
+            &ctx,
+            "cortana-identity-quarantine-1",
+            &requested,
+            &candidates,
+            &durable,
+        )
+        .unwrap();
+
+        let mut expected = requested;
+        expected.sort();
+        assert_eq!(quarantined, expected);
+        assert!(ctx.identity.resolve(&durable_identity.secret).is_some());
+        assert!(ctx.identity.resolve(&foreign_identity.secret).is_none());
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn generation_zero_cortana_is_migrated_in_tmux_before_adoption() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-generation")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        let target = exact_cortana_tmux_target(&terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    identity.secret.clone(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "0".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+
+        let adopted = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-1",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(adopted["action"], "adopt");
+        assert_eq!(adopted["healthy"], true);
+        assert_eq!(adopted["generation"], 1);
+        assert_eq!(adopted["identityId"], identity.id);
+        assert_eq!(adopted["terminalId"], terminal_id);
+        assert_eq!(
+            tmux::session_environment(&target, CORTANA_GENERATION_ENV).unwrap(),
+            Some("1".into())
+        );
+        let migration_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "generation-migrated")
+            .expect("generation migration must have a distinct audit record");
+        assert_eq!(
+            migration_audit["args"]["migratedTerminalIds"],
+            json!([terminal_id])
+        );
+        assert_eq!(migration_audit["args"]["authorityClaimed"], false);
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn generation_zero_update_failure_is_degraded_without_claiming_authority() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let audit_dir = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-failure-audit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let ctx = test_ctx("cortana-generation-failure")
+            .with_apply_sink(sink)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-generation-failure-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        let target = exact_cortana_tmux_target(&terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    identity.secret.clone(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "0".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+        tmux::fail_next_session_environment_set_for(&target);
+
+        let degraded = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-failure-1",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(degraded["action"], "degraded");
+        assert_eq!(degraded["healthy"], false);
+        assert!(degraded["degradedReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("could not be migrated before authority claim")));
+        assert_eq!(
+            tmux::session_environment(&target, CORTANA_GENERATION_ENV).unwrap(),
+            Some("0".into())
+        );
+        let durable = ctx.captains.cortana_identity();
+        assert!(durable.identity_id.is_none());
+        assert_eq!(durable.generation, 0);
+        assert!(matches!(
+            durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Degraded { .. }
+        ));
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        let failed_audit = read_audit(&audit_dir)
+            .into_iter()
+            .find(|record| record["decision"] == "generation-migration-failed")
+            .expect("failed generation migration must have a distinct audit record");
+        assert_eq!(failed_audit["args"]["authorityClaimed"], false);
+
+        let recovered = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-generation-failure-2",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "adopt");
+        assert_eq!(recovered["generation"], 1);
+        assert_eq!(recovered["identityId"], identity.id);
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(audit_dir);
     }
 
     #[test]

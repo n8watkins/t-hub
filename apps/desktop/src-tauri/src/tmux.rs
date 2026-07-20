@@ -48,6 +48,10 @@ static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
     std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| default_socket_name().into())
 });
 
+#[cfg(test)]
+static FAIL_NEXT_SESSION_ENVIRONMENT_TARGET: LazyLock<std::sync::Mutex<Option<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
 /// The compiled-in default socket name: `"t-hub"` in a normal build, but
 /// `"t-hub-test"` under `cfg(test)` so the test binary is isolated from the live
 /// app's socket (see [`SOCKET_NAME`]).
@@ -345,6 +349,61 @@ pub fn session_environment(name: &str, key: &str) -> Result<Option<String>, Tmux
         Err(error) if error.message.contains("unknown variable") => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Set one value in a live tmux session's private environment.
+///
+/// The command uses argv values rather than a shell and is bounded by the same
+/// timeout as every other tmux control operation. Environment names are
+/// validated here so callers cannot accidentally ask tmux to interpret an
+/// option or malformed assignment as the variable name.
+pub fn set_session_environment(name: &str, key: &str, value: &str) -> Result<(), TmuxError> {
+    let valid_key = !key.is_empty()
+        && key.len() <= 128
+        && key.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        });
+    if !valid_key {
+        return Err(TmuxError {
+            op: "set-environment",
+            code: None,
+            message: "environment name must be a valid identifier no longer than 128 bytes".into(),
+        });
+    }
+    if name.is_empty() || name.len() > 128 || value.len() > 4096 || value.contains('\0') {
+        return Err(TmuxError {
+            op: "set-environment",
+            code: None,
+            message: "session target or environment value is outside the bounded input contract"
+                .into(),
+        });
+    }
+    #[cfg(test)]
+    {
+        let mut failure = FAIL_NEXT_SESSION_ENVIRONMENT_TARGET
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failure.as_deref() == Some(name) {
+            *failure = None;
+            return Err(TmuxError {
+                op: "set-environment",
+                code: None,
+                message: "injected session environment update failure".into(),
+            });
+        }
+    }
+    run(
+        "set-environment",
+        &["set-environment", "-t", name, key, value],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_session_environment_set_for(name: &str) {
+    *FAIL_NEXT_SESSION_ENVIRONMENT_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.to_string());
 }
 
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
@@ -1180,6 +1239,38 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    #[test]
+    fn session_environment_setter_roundtrips_on_exact_session() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::session_environment_setter_roundtrips_on_exact_session: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", None, &[]).unwrap();
+
+        set_session_environment(&session.name, "T_HUB_TEST_GENERATION", "1").unwrap();
+
+        assert_eq!(
+            session_environment(&session.name, "T_HUB_TEST_GENERATION").unwrap(),
+            Some("1".into())
+        );
+    }
+
+    #[test]
+    fn session_environment_setter_rejects_unbounded_or_invalid_input() {
+        let invalid_name = set_session_environment("target", "-bad", "1").unwrap_err();
+        assert_eq!(invalid_name.op, "set-environment");
+        assert!(invalid_name.message.contains("valid identifier"));
+
+        let oversized_value = "x".repeat(4097);
+        let invalid_value =
+            set_session_environment("target", "VALID_NAME", &oversized_value).unwrap_err();
+        assert_eq!(invalid_value.op, "set-environment");
+        assert!(invalid_value.message.contains("bounded input contract"));
     }
 
     #[test]
