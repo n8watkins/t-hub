@@ -40,7 +40,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -3771,6 +3771,10 @@ impl CaptainsRegistry {
     }
 
     fn provision_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        // Lock order contract: callers that also need dispatch admission must
+        // acquire `ControlContext::dispatch_admission` first. Reconciliation may
+        // inspect under this lock alone, but it must release and retry in global
+        // order before creating a replacement runtime.
         self.provision.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -8147,13 +8151,38 @@ pub fn captains_path() -> PathBuf {
 /// tests/proofs. Returns the bridge's "not connected" error until the agent attaches.
 type MetricsFn = Arc<dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync>;
 
+/// Validated provider-capacity policy and its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderCapacityEvidence {
+    session_capacity: usize,
+    status: crate::governor::ProviderCapacityStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PackagedProviderCapacity {
+    schema_version: u32,
+    source: String,
+    session_capacity: usize,
+}
+
 /// Resolve the provider's authoritative concurrent-session ceiling.
 ///
-/// Production reads an explicit operator/provider value rather than treating the
-/// governor's unrelated machine-process limit as provider evidence. Tests replace
-/// this closure to exercise unavailable and exhausted provider states without
-/// mutating the process environment.
-type ProviderCapacityFn = Arc<dyn Fn() -> Result<usize, String> + Send + Sync>;
+/// A validated environment override is authoritative when present. A normal
+/// installed build otherwise uses the signed-in-binary conservative policy in
+/// `provider-capacity.json`. The packaged source is reported as degraded because
+/// it is a safety ceiling, not live account quota telemetry.
+type ProviderCapacityFn = Arc<dyn Fn() -> Result<ProviderCapacityEvidence, String> + Send + Sync>;
+
+/// Count sessions that actually host a provider Harness.
+///
+/// Generic tmux terminals still consume machine capacity but do not consume a
+/// provider-concurrency slot. Production attests each live T-Hub session;
+/// deterministic tests replace this seam with exact evidence.
+type ProviderLiveSessionsFn =
+    Arc<dyn Fn(&CaptainsSnapshot, &[String]) -> Result<usize, String> + Send + Sync>;
+
+const PROVIDER_SESSION_ENV: &str = "T_HUB_PROVIDER_SESSION";
 
 /// Enumerate the authoritative tmux session registry for admission.
 ///
@@ -8318,6 +8347,8 @@ pub struct ControlContext {
     /// Authoritative provider capacity evidence. Missing or invalid evidence
     /// refuses admission instead of defaulting to the governor's machine cap.
     provider_capacity: ProviderCapacityFn,
+    /// Authoritative count of live provider-consuming Harness sessions.
+    provider_live_sessions: ProviderLiveSessionsFn,
     /// Authoritative tmux enumeration, injectable only for deterministic tests.
     live_sessions: LiveSessionsFn,
     /// The CORE's addressable tab registry (TASK C / #22). Read by `list_tabs`,
@@ -8341,6 +8372,10 @@ pub struct ControlContext {
     /// durable insertion. This closes the check-then-insert race where two
     /// concurrent starts could otherwise observe the same free capacity and
     /// mutable resources before either record became visible.
+    /// Global dual-lock order: acquire this admission lock before
+    /// `CaptainsRegistry::provision` whenever an operation needs both. Cortana
+    /// first inspects under provision alone and retries in this order only when a
+    /// replacement spawn is necessary.
     dispatch_admission: Arc<Mutex<()>>,
     /// The orchestrator-wake watch registry. Armed by `watch_fleet` / cleared by
     /// `unwatch_fleet`; read by the [`crate::fleet::FleetNotifier`] wired in
@@ -10616,7 +10651,17 @@ fn spawn_env_with_identity(
 /// A failed tmux enumeration is propagated. Returning zero here would erase both
 /// the concurrent ceiling and reserved-slot policy during the exact outage in
 /// which the process source of truth cannot be checked.
-fn live_session_count(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> Result<usize, String> {
+#[derive(Debug)]
+struct LiveSessionEvidence {
+    tmux_sessions: Vec<String>,
+    total_live_sessions: usize,
+    pending_provider_sessions: usize,
+}
+
+fn live_session_evidence(
+    ctx: &ControlContext,
+    snapshot: &CaptainsSnapshot,
+) -> Result<LiveSessionEvidence, String> {
     let sessions = (ctx.live_sessions)()
         .map_err(|error| format!("tmux session evidence unavailable: {error}"))?;
     let live = sessions
@@ -10630,7 +10675,16 @@ fn live_session_count(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> Resu
         .filter(|agent| agent.runtime_state == RuntimeState::Starting)
         .filter(|agent| !live.contains(&tmux_target(&agent.agent_session_id)))
         .count();
-    Ok(live.len().saturating_add(durable_pending))
+    Ok(LiveSessionEvidence {
+        tmux_sessions: live.iter().cloned().collect(),
+        total_live_sessions: live.len().saturating_add(durable_pending),
+        pending_provider_sessions: durable_pending,
+    })
+}
+
+#[cfg(test)]
+fn live_session_count(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> Result<usize, String> {
+    Ok(live_session_evidence(ctx, snapshot)?.total_live_sessions)
 }
 
 /// Whether a `send_keys` payload carries a process-signal / kill-style key. The
@@ -13948,6 +14002,7 @@ fn history_resume(
     let mut spawn_args = json!({
         "cwd": entry.cwd.clone(),
         "startupCommand": history_resume_command(&entry),
+        "_providerHarness": entry.harness.canonical(),
     });
     if let Some(tab_id) = target_tab.as_deref() {
         spawn_args["tabId"] = json!(tab_id);
@@ -15665,27 +15720,55 @@ fn reconcile_cortana(
         .or_else(|| arg_str(args, "requestId"))
         .filter(|value| !value.trim().is_empty())
         .ok_or("reconcile_cortana requires a stable non-empty operationId")?;
-    let _provision = ctx.captains.provision_guard();
-    let existing = ctx.captains.cortana_identity();
-    let operation_id = match &existing.recovery {
-        crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. } => {
-            operation_id.clone()
+    let operation_id;
+    {
+        let _provision = ctx.captains.provision_guard();
+        let existing = ctx.captains.cortana_identity();
+        operation_id = match &existing.recovery {
+            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. } => {
+                operation_id.clone()
+            }
+            _ => requested_operation_id,
+        };
+        let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
+        let result = reconcile_cortana_inner(ctx, args, &operation_id, durable, false);
+        if !matches!(
+            result.as_ref().err().map(String::as_str),
+            Some(CORTANA_SPAWN_ADMISSION_REQUIRED)
+        ) {
+            if let Err(error) = &result {
+                let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
+            }
+            return result;
         }
-        _ => requested_operation_id,
-    };
+    }
+
+    // The inspection-only pass found that a replacement is required. Retry
+    // while holding the one global dual-lock order: dispatch admission, then
+    // provisioning. Capacity and rate are evaluated only if the second pass
+    // still reaches the exact spawn boundary.
+    let _admission_lock = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _provision = ctx.captains.provision_guard();
     let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
-    let result = reconcile_cortana_inner(ctx, args, &operation_id, durable);
+    let result = reconcile_cortana_inner(ctx, args, &operation_id, durable, true);
     if let Err(error) = &result {
         let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
     }
     result
 }
 
+const CORTANA_SPAWN_ADMISSION_REQUIRED: &str =
+    "internal: Cortana replacement requires ordered spawn admission";
+
 fn reconcile_cortana_inner(
     ctx: &ControlContext,
     args: &Value,
     operation_id: &str,
     durable: crate::cortana_reconcile::CortanaDurableIdentity,
+    dispatch_admission_held: bool,
 ) -> Result<Value, String> {
     let home = orchestrator_home(args)?;
     if home.is_empty() || !home.starts_with('/') {
@@ -15797,7 +15880,13 @@ fn reconcile_cortana_inner(
     if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
         return Err("reconcile_cortana: no UI is connected to adopt a recovered runtime".into());
     }
-    let _admission = admit_spawn(ctx, SpawnPurpose::Cortana)
+    if !dispatch_admission_held {
+        #[cfg(test)]
+        ctx.captains
+            .pause_dispatch("cortana_spawn_admission_required");
+        return Err(CORTANA_SPAWN_ADMISSION_REQUIRED.into());
+    }
+    let _capacity = evaluate_spawn_capacity(ctx, SpawnPurpose::Cortana)
         .map_err(|refusal| format!("reconcile_cortana: {}", refusal.message))?;
     let harness_name = arg_str(args, "harness")
         .or_else(|| durable.harness.clone())
@@ -15900,6 +15989,7 @@ fn reconcile_cortana_inner(
         CORTANA_GENERATION_ENV.to_string(),
         plan.next_generation.to_string(),
     ));
+    elevation.push((PROVIDER_SESSION_ENV.to_string(), harness_name.clone()));
     let pane = crate::commands::pane_command(None, Some(&startup_command));
     let tmux_cwd = files::posix_form(&home);
     let (_, tmux_session) =
@@ -16155,6 +16245,10 @@ fn commission_captain(
     elevation.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
+    ));
+    elevation.push((
+        PROVIDER_SESSION_ENV.to_string(),
+        harness.as_provider().to_string(),
     ));
     if let Err(error) = ctx
         .captains
@@ -17464,6 +17558,13 @@ fn dispatch_crew_with_observer_inner(
             ));
         }
     };
+    if let Err(error) =
+        tmux::set_session_environment(&tmux_target, PROVIDER_SESSION_ENV, harness.as_provider())
+    {
+        rollback_launch_failure!(format!(
+            "dispatch_crew: provider session marker could not be persisted: {error}"
+        ));
+    }
     #[cfg(test)]
     ctx.captains.pause_dispatch("after_respawn");
     revalidate_or_rollback!("immediately after provider respawn");
@@ -24094,12 +24195,156 @@ fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usiz
     (fleet_admin_actors.len(), ship_admin_scopes.len())
 }
 
-fn provider_capacity_evidence(ctx: &ControlContext) -> Result<usize, String> {
+fn packaged_provider_capacity_evidence() -> Result<ProviderCapacityEvidence, String> {
+    let policy: PackagedProviderCapacity =
+        serde_json::from_str(include_str!("../provider-capacity.json"))
+            .map_err(|error| format!("packaged provider capacity policy is invalid: {error}"))?;
+    if policy.schema_version != 1 {
+        return Err(format!(
+            "packaged provider capacity policy schema {} is unsupported",
+            policy.schema_version
+        ));
+    }
+    if policy.source.trim().is_empty() || policy.session_capacity == 0 {
+        return Err("packaged provider capacity policy is incomplete".into());
+    }
+    Ok(ProviderCapacityEvidence {
+        session_capacity: policy
+            .session_capacity
+            .min(crate::governor::HARD_SESSION_CEILING),
+        status: crate::governor::ProviderCapacityStatus {
+            source: policy.source,
+            degraded: true,
+            detail: Some(
+                "live provider quota telemetry is unavailable; enforcing the packaged conservative safety ceiling"
+                    .into(),
+            ),
+        },
+    })
+}
+
+fn provider_capacity_from_environment(
+    configured: Result<String, std::env::VarError>,
+) -> Result<ProviderCapacityEvidence, String> {
+    match configured {
+        Ok(raw) => {
+            let session_capacity = raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .map(|value| value.min(crate::governor::HARD_SESSION_CEILING))
+                .ok_or_else(|| {
+                    "configured provider capacity telemetry is invalid: T_HUB_PROVIDER_SESSION_CAPACITY must be a positive integer"
+                        .to_string()
+                })?;
+            Ok(ProviderCapacityEvidence {
+                session_capacity,
+                status: crate::governor::ProviderCapacityStatus {
+                    source: "environment-override:T_HUB_PROVIDER_SESSION_CAPACITY".into(),
+                    degraded: false,
+                    detail: None,
+                },
+            })
+        }
+        Err(std::env::VarError::NotPresent) => packaged_provider_capacity_evidence(),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "configured provider capacity telemetry is unavailable: T_HUB_PROVIDER_SESSION_CAPACITY is not valid Unicode"
+                .into(),
+        ),
+    }
+}
+
+fn recorded_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeMap<String, String> {
+    let mut harnesses = BTreeMap::new();
+    for agent in &snapshot.agent_sessions {
+        if !matches!(
+            agent.runtime_state,
+            RuntimeState::Exited | RuntimeState::Unavailable
+        ) {
+            harnesses.insert(tmux_target(&agent.agent_session_id), agent.provider.clone());
+        }
+    }
+    for captain in &snapshot.captains {
+        if let (Some(terminal_id), Some(harness)) = (
+            captain.terminal_id.as_deref(),
+            captain.harness.as_deref().or(captain.provider.as_deref()),
+        ) {
+            harnesses.insert(tmux_target(terminal_id), harness.to_string());
+        }
+        for crew in &captain.crew {
+            if let Some(harness) = crew.harness.as_deref().or(crew.provider.as_deref()) {
+                harnesses.insert(tmux_target(&crew.terminal_id), harness.to_string());
+            }
+        }
+    }
+    harnesses
+}
+
+fn inspect_provider_live_sessions(
+    snapshot: &CaptainsSnapshot,
+    sessions: &[String],
+) -> Result<usize, String> {
+    let recorded = recorded_provider_harnesses(snapshot);
+    let mut live = 0usize;
+    for tmux_session in sessions.iter().filter(|session| session.starts_with("th_")) {
+        let marker = tmux::session_environment(tmux_session, PROVIDER_SESSION_ENV)
+            .map_err(|error| {
+                format!(
+                    "provider session marker is unavailable for tmux session '{tmux_session}': {error}"
+                )
+            })?;
+        let harness = match marker.as_deref() {
+            Some("none") => None,
+            Some(harness @ ("codex" | "claude")) => Some(harness.to_string()),
+            Some(other) => {
+                return Err(format!(
+                    "provider session marker for tmux session '{tmux_session}' is invalid: '{other}'"
+                ));
+            }
+            None => match recorded.get(tmux_session).cloned() {
+                Some(harness) => Some(harness),
+                None => {
+                    let legacy_provider = ["codex", "claude"].into_iter().any(|harness| {
+                        tmux::harness_liveness(tmux_session, harness)
+                            == tmux::SessionLiveness::Alive
+                    });
+                    if legacy_provider {
+                        live = live.saturating_add(1);
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(harness) = harness else {
+            continue;
+        };
+        match tmux::harness_liveness(tmux_session, &harness) {
+            tmux::SessionLiveness::Alive => live = live.saturating_add(1),
+            tmux::SessionLiveness::Gone => {}
+            tmux::SessionLiveness::Unknown => {
+                return Err(format!(
+                    "provider Harness evidence is unavailable for tmux session '{tmux_session}'"
+                ));
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn provider_capacity_evidence(ctx: &ControlContext) -> Result<ProviderCapacityEvidence, String> {
     (ctx.provider_capacity)()
-        .and_then(|capacity| {
-            (capacity > 0)
-                .then_some(capacity.min(crate::governor::HARD_SESSION_CEILING))
-                .ok_or_else(|| "provider capacity evidence reported a zero ceiling".to_string())
+        .and_then(|mut evidence| {
+            if evidence.session_capacity == 0 {
+                return Err("provider capacity evidence reported a zero ceiling".into());
+            }
+            if evidence.status.source.trim().is_empty() {
+                return Err("provider capacity evidence omitted its source".into());
+            }
+            evidence.session_capacity = evidence
+                .session_capacity
+                .min(crate::governor::HARD_SESSION_CEILING);
+            Ok(evidence)
         })
         .map_err(|error| format!("provider capacity evidence unavailable: {error}"))
 }
@@ -24107,11 +24352,15 @@ fn provider_capacity_evidence(ctx: &ControlContext) -> Result<usize, String> {
 fn runtime_capacity_from_evidence(
     ctx: &ControlContext,
     snapshot: &CaptainsSnapshot,
-    live_sessions: usize,
+    live: &LiveSessionEvidence,
     available_worktrees: usize,
 ) -> Result<crate::governor::RuntimeCapacity, String> {
+    let live_sessions = live.total_live_sessions;
     let (machine_healthy, machine_session_capacity) = dispatch_machine_evidence(ctx, live_sessions);
-    let provider_session_capacity = provider_capacity_evidence(ctx)?;
+    let provider = provider_capacity_evidence(ctx)?;
+    let provider_live_sessions = (ctx.provider_live_sessions)(snapshot, &live.tmux_sessions)
+        .map_err(|error| format!("provider usage evidence unavailable: {error}"))?
+        .saturating_add(live.pending_provider_sessions);
     let active_captains = snapshot
         .captains
         .iter()
@@ -24142,8 +24391,9 @@ fn runtime_capacity_from_evidence(
         live_sessions,
         machine_healthy,
         machine_session_capacity,
-        provider_session_capacity,
-        provider_live_sessions: live_sessions,
+        provider_session_capacity: provider.session_capacity,
+        provider_live_sessions,
+        provider_capacity_status: provider.status,
         available_worktrees,
         active_captains,
         live_cortana,
@@ -24199,15 +24449,15 @@ fn evaluate_spawn_capacity(
     purpose: SpawnPurpose,
 ) -> Result<crate::governor::CapacityReport, crate::governor::Refusal> {
     let snapshot = ctx.captains.snapshot();
-    let live_sessions =
-        live_session_count(ctx, &snapshot).map_err(|message| crate::governor::Refusal {
+    let live =
+        live_session_evidence(ctx, &snapshot).map_err(|message| crate::governor::Refusal {
             code: "refused-evidence",
             message: format!("spawn refused: {message}"),
         })?;
     let capacity = runtime_capacity_from_evidence(
         ctx,
         &snapshot,
-        live_sessions,
+        &live,
         crate::governor::HARD_SESSION_CEILING,
     )
     .map_err(|message| crate::governor::Refusal {
@@ -24235,7 +24485,8 @@ fn evaluate_spawn_capacity(
             code: refusal.code.as_str(),
             message: refusal.message,
         })?;
-    ctx.governor.check_spawn(live_sessions, Instant::now())?;
+    ctx.governor
+        .check_spawn(live.total_live_sessions, Instant::now())?;
     Ok(capacity)
 }
 
@@ -24244,7 +24495,7 @@ fn dispatch_runtime_capacity(
     snapshot: &CaptainsSnapshot,
     project_id: &str,
 ) -> Result<crate::governor::RuntimeCapacity, String> {
-    let live_sessions = live_session_count(ctx, snapshot)?;
+    let live = live_session_evidence(ctx, snapshot)?;
     let active_directories = snapshot
         .agent_sessions
         .iter()
@@ -24269,7 +24520,7 @@ fn dispatch_runtime_capacity(
         .filter(|path| !active_directories.contains(path))
         .collect::<BTreeSet<_>>()
         .len();
-    runtime_capacity_from_evidence(ctx, snapshot, live_sessions, available_worktrees)
+    runtime_capacity_from_evidence(ctx, snapshot, &live, available_worktrees)
 }
 
 fn parse_integration_contracts(
@@ -24784,7 +25035,23 @@ fn spawn_terminal_with_private_pane_command_and_id(
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
-    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
+    let (mut elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
+    let provider_harness = arg_str(args, "_providerHarness").or_else(|| {
+        requested_session_id.and_then(|session_id| {
+            ctx.captains
+                .snapshot()
+                .agent_sessions
+                .into_iter()
+                .find(|agent| agent.agent_session_id == session_id)
+                .map(|agent| agent.provider)
+        })
+    });
+    if let Some(provider_harness) = provider_harness {
+        if !matches!(provider_harness.as_str(), "codex" | "claude") {
+            return Err("spawn_terminal: internal provider Harness marker is invalid".into());
+        }
+        elevation.push((PROVIDER_SESSION_ENV.into(), provider_harness));
+    }
     let spawn_result = match requested_session_id {
         Some(requested) => {
             spawn_tmux_terminal_with_id(requested, &tmux_cwd, pane.as_deref(), &elevation)
@@ -24931,10 +25198,17 @@ fn spawn_tmux_terminal_with_id(
     env: &[(String, String)],
 ) -> Result<(String, String), String> {
     let tmux_session = format!("th_{id}");
+    let mut session_env = env.to_vec();
+    if !session_env
+        .iter()
+        .any(|(key, _)| key == PROVIDER_SESSION_ENV)
+    {
+        session_env.push((PROVIDER_SESSION_ENV.into(), "none".into()));
+    }
     // Phase 2b: `env` carries the capability token (+ addr) for the new session, set
     // via tmux `-e` so it is present BEFORE the first pane execs and never lands in
     // argv. Empty ⇒ a plain session (headless tests / addr unknown).
-    tmux::new_session_with_env(&tmux_session, cwd, command, env)
+    tmux::new_session_with_env(&tmux_session, cwd, command, &session_env)
         .map_err(|e| format!("failed to create tmux session: {e}"))?;
     // Registry-vs-reality (Incident A/B, ask #3): never hand back an id whose tmux
     // session did not actually materialize. `new-session` returning success is not
@@ -25781,26 +26055,32 @@ impl ControlContext {
     ) -> Self {
         #[cfg(not(test))]
         let provider_capacity: ProviderCapacityFn = Arc::new(|| {
-            let raw = std::env::var("T_HUB_PROVIDER_SESSION_CAPACITY").map_err(|_| {
-                "provider capacity evidence unavailable: set T_HUB_PROVIDER_SESSION_CAPACITY"
-                    .to_string()
-            })?;
-            raw.trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|value| *value > 0)
-                .map(|value| value.min(crate::governor::HARD_SESSION_CEILING))
-                .ok_or_else(|| {
-                    "provider capacity evidence is invalid: T_HUB_PROVIDER_SESSION_CAPACITY must be a positive integer"
-                        .to_string()
-                })
+            provider_capacity_from_environment(std::env::var("T_HUB_PROVIDER_SESSION_CAPACITY"))
         });
+        #[cfg(not(test))]
+        let provider_live_sessions: ProviderLiveSessionsFn =
+            Arc::new(inspect_provider_live_sessions);
         // Most existing unit tests exercise unrelated control behavior. They get
         // explicit deterministic provider evidence, while dedicated regressions
         // replace this closure with unavailable and exhausted evidence.
         #[cfg(test)]
-        let provider_capacity: ProviderCapacityFn =
-            Arc::new(|| Ok(crate::governor::HARD_SESSION_CEILING));
+        let provider_capacity: ProviderCapacityFn = Arc::new(|| {
+            Ok(ProviderCapacityEvidence {
+                session_capacity: crate::governor::HARD_SESSION_CEILING,
+                status: crate::governor::ProviderCapacityStatus {
+                    source: "deterministic-test-evidence".into(),
+                    degraded: false,
+                    detail: None,
+                },
+            })
+        });
+        #[cfg(test)]
+        let provider_live_sessions: ProviderLiveSessionsFn = Arc::new(|_, sessions| {
+            Ok(sessions
+                .iter()
+                .filter(|session| session.starts_with("th_"))
+                .count())
+        });
         Self {
             status,
             history: crate::history::HistoryService::from_env(),
@@ -25810,6 +26090,7 @@ impl ControlContext {
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
             provider_capacity,
+            provider_live_sessions,
             live_sessions: Arc::new(|| tmux::list_sessions().map_err(|error| error.to_string())),
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
@@ -25861,7 +26142,34 @@ impl ControlContext {
         mut self,
         provider_capacity: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
     ) -> Self {
+        self.provider_capacity = Arc::new(move || {
+            provider_capacity().map(|session_capacity| ProviderCapacityEvidence {
+                session_capacity,
+                status: crate::governor::ProviderCapacityStatus {
+                    source: "injected-test-evidence".into(),
+                    degraded: false,
+                    detail: None,
+                },
+            })
+        });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_provider_capacity_evidence(
+        mut self,
+        provider_capacity: impl Fn() -> Result<ProviderCapacityEvidence, String> + Send + Sync + 'static,
+    ) -> Self {
         self.provider_capacity = Arc::new(provider_capacity);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_provider_live_sessions(
+        mut self,
+        provider_live_sessions: impl Fn(&[String]) -> Result<usize, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.provider_live_sessions = Arc::new(move |_, sessions| provider_live_sessions(sessions));
         self
     }
 
@@ -27175,6 +27483,11 @@ mod tests {
                 machine_session_capacity: 64,
                 provider_session_capacity: 64,
                 provider_live_sessions: 3,
+                provider_capacity_status: crate::governor::ProviderCapacityStatus {
+                    source: "test-telemetry".into(),
+                    degraded: false,
+                    detail: None,
+                },
                 available_worktrees: 8,
                 active_captains: 0,
                 live_cortana: 1,
@@ -33404,6 +33717,94 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_uses_reported_packaged_provider_policy() {
+        let evidence =
+            provider_capacity_from_environment(Err(std::env::VarError::NotPresent)).unwrap();
+        assert_eq!(evidence.session_capacity, 32);
+        assert_eq!(evidence.status.source, "packaged-conservative-policy-v1");
+        assert!(evidence.status.degraded);
+        assert!(evidence
+            .status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("live provider quota telemetry is unavailable")));
+
+        let ctx = test_ctx("packaged-provider-policy")
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_provider_capacity_evidence(|| {
+                provider_capacity_from_environment(Err(std::env::VarError::NotPresent))
+            })
+            .with_provider_live_sessions(|_| Ok(0));
+        let admission = admit_spawn(&ctx, SpawnPurpose::Cortana).unwrap();
+        assert_eq!(admission._capacity.provider_session_limit, 32);
+        assert_eq!(admission._capacity.provider_live_sessions, 0);
+        assert_eq!(
+            admission._capacity.provider_capacity_status.source,
+            "packaged-conservative-policy-v1"
+        );
+        assert!(admission._capacity.provider_capacity_status.degraded);
+    }
+
+    #[test]
+    fn explicit_provider_capacity_configuration_is_validated_fail_closed() {
+        for invalid in ["", "0", "unknown", "-1"] {
+            let error = provider_capacity_from_environment(Ok(invalid.into())).unwrap_err();
+            assert!(error.contains("must be a positive integer"), "got: {error}");
+        }
+        let configured = provider_capacity_from_environment(Ok("7".into())).unwrap();
+        assert_eq!(configured.session_capacity, 7);
+        assert_eq!(
+            configured.status.source,
+            "environment-override:T_HUB_PROVIDER_SESSION_CAPACITY"
+        );
+        assert!(!configured.status.degraded);
+        let unavailable = provider_capacity_from_environment(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("configured-unavailable"),
+        )))
+        .unwrap_err();
+        assert!(unavailable.contains("not valid Unicode"));
+    }
+
+    #[test]
+    fn provider_usage_attestation_excludes_generic_tmux_terminals() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "provider_usage_attestation_excludes_generic_tmux_terminals: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let generic_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let provider_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let generic_target = tmux_target(&generic_id);
+        let provider_target = tmux_target(&provider_id);
+        create_test_tmux_session(&generic_target).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        create_test_tmux_session_with_env(
+            &provider_target,
+            "/tmp",
+            Some(&harness_command),
+            &[(PROVIDER_SESSION_ENV.into(), "codex".into())],
+        )
+        .unwrap();
+        wait_for_harness_started(&provider_id, "codex").unwrap();
+
+        let snapshot = test_ctx("provider-usage-attestation").captains.snapshot();
+        assert_eq!(
+            inspect_provider_live_sessions(
+                &snapshot,
+                &[generic_target.clone(), provider_target.clone()]
+            )
+            .unwrap(),
+            1
+        );
+
+        reap_test_tmux_session(&generic_target).unwrap();
+        reap_test_tmux_session(&provider_target).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
+    }
+
+    #[test]
     fn spawn_admission_fails_closed_without_provider_evidence_and_at_provider_limit() {
         let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let evidence = available.clone();
@@ -35421,6 +35822,67 @@ mod tests {
     }
 
     #[test]
+    fn healthy_cortana_reconciliation_does_not_consume_spawn_rate() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("cortana-no-spawn-rate")
+            .with_apply_sink(sink)
+            .with_governor(Arc::new(SpawnGovernor::new(64, 20.0, 1.0)));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-no-spawn-rate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        let target = exact_cortana_tmux_target(&terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                ("T_HUB_CONTROL_TOKEN".into(), ctx.token.clone()),
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    identity.secret.clone(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "1".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+
+        let adopted = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-no-spawn-rate-1",
+                "testOrchestratorHome": home,
+            }),
+        )
+        .unwrap();
+        assert_eq!(adopted["action"], "adopt");
+        assert_eq!(adopted["terminalId"], terminal_id);
+
+        let admission = admit_spawn(&ctx, SpawnPurpose::Ordinary)
+            .expect("healthy no-spawn reconciliation must preserve the sole rate token");
+        drop(admission);
+        reap_test_tmux_session(&target).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn concurrent_cortana_startup_calls_produce_one_runtime() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
@@ -35853,6 +36315,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "concurrent_captain_commission_and_cortana_recovery_follow_one_lock_order: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = Arc::new(
+            test_ctx("ordered-provisioning")
+                .with_apply_sink(sink)
+                .with_governor(Arc::new(SpawnGovernor::new(64, 600.0, 8.0))),
+        );
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-ordered-provisioning".into(),
+                name: "Ordered Provisioning".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "ordered-provisioning".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-ordered-provisioning-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let (reconcile_reached_tx, reconcile_reached_rx) = mpsc::sync_channel(1);
+        let (reconcile_resume_tx, reconcile_resume_rx) = mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "cortana_spawn_admission_required",
+            reached: reconcile_reached_tx,
+            resume: reconcile_resume_rx,
+        }));
+
+        let reconcile_ctx = Arc::clone(&ctx);
+        let reconcile_command = harness_command.clone();
+        let reconcile_home = home.clone();
+        let (reconcile_done_tx, reconcile_done_rx) = mpsc::sync_channel(1);
+        let reconcile_thread = std::thread::spawn(move || {
+            let result = dispatch(
+                &reconcile_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": "ordered-cortana-recovery",
+                    "testOrchestratorHome": reconcile_home,
+                    "testStartupCommand": reconcile_command,
+                }),
+            );
+            reconcile_done_tx.send(result).unwrap();
+        });
+        assert_eq!(
+            reconcile_reached_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Cortana did not reach the ordered admission boundary"),
+            "cortana_spawn_admission_required"
+        );
+
+        let commission_ctx = Arc::clone(&ctx);
+        let commission_command = harness_command.clone();
+        let (commission_done_tx, commission_done_rx) = mpsc::sync_channel(1);
+        let commission_thread = std::thread::spawn(move || {
+            let response = dispatch_authenticated(
+                &commission_ctx,
+                ControlRequest {
+                    token: commission_ctx.token.clone(),
+                    command: "commission_captain".into(),
+                    args: json!({
+                        "projectId": "project-ordered-provisioning",
+                        "assignment": "Own the ordered project",
+                        "harness": "codex",
+                        "shipSlug": "ordered-provisioning",
+                        "testStartupCommand": commission_command,
+                        "testSkipPowderHealth": true,
+                    }),
+                    session: String::new(),
+                    host: commission_ctx.host_token.clone(),
+                    v: None,
+                },
+            );
+            commission_done_tx.send(response).unwrap();
+        });
+
+        let lock_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if ctx.dispatch_admission.try_lock().is_err() {
+                break;
+            }
+            assert!(
+                Instant::now() < lock_deadline,
+                "Captain commission never acquired dispatch admission"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reconcile_resume_tx.send(()).unwrap();
+
+        let commission = commission_done_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("Captain commission deadlocked with Cortana reconciliation");
+        assert!(commission.ok, "commission failed: {:?}", commission.error);
+        let reconciled = reconcile_done_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("Cortana reconciliation deadlocked with Captain commission")
+            .unwrap();
+        commission_thread.join().unwrap();
+        reconcile_thread.join().unwrap();
+
+        assert_eq!(reconciled["healthy"], true);
+        assert_eq!(reconciled["action"], "create");
+        let snapshot = ctx.captains.snapshot();
+        assert_eq!(
+            snapshot
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Captain)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot.cortana.terminal_id.as_deref(),
+            reconciled["terminalId"].as_str()
+        );
+
+        for terminal_id in snapshot
+            .captains
+            .iter()
+            .filter_map(|captain| captain.terminal_id.as_deref())
+        {
+            reap_test_tmux_session(&tmux_target(terminal_id)).unwrap();
+        }
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

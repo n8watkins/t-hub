@@ -231,6 +231,11 @@ Use governor-backed adaptive capacity instead:
 
 Capacity planning should be dynamic and visible.
 Dispatch preflight should explain admitted lanes, deferred lanes, reservations, and the constraint that determined the current limit.
+Provider capacity reports include the exact provider session ceiling, attested live provider-session count, source, degraded state, and explanatory detail.
+Generic T-Hub tmux terminals consume machine capacity but do not consume provider capacity unless a live Codex or Claude Harness is attested in that session.
+A validated `T_HUB_PROVIDER_SESSION_CAPACITY` override is authoritative when configured.
+An absent override uses the signed-in-binary conservative policy from `apps/desktop/src-tauri/provider-capacity.json`, reports that policy as degraded rather than live quota telemetry, and still permits normal installed startup and Cortana recovery.
+An explicitly configured malformed or unavailable override fails closed instead of falling back silently.
 
 ### 8. Cortana startup needs backend singleton reconciliation
 
@@ -246,6 +251,10 @@ Replace it with an idempotent backend reconciliation operation that:
 - Quarantines or safely retires non-authoritative duplicates.
 - Fails closed and displays a degraded recovery state when identity or generation authority is uncertain.
 - Reserves enough governor capacity for Cortana and administrative recovery even under high Crew load.
+
+Provisioning follows one lock order whenever both locks are required: dispatch admission first, then the Fleet provisioning lock.
+A no-spawn Cortana reconciliation first inspects under the provisioning lock alone, so keeping or adopting a healthy runtime does not consume spawn capacity or a rate token.
+When replacement is required, reconciliation releases the provisioning lock and retries under the global lock order before revalidating the runtime and charging admission at the exact spawn boundary.
 
 One Cortana means one durable supervisor identity with at most one authoritative active runtime.
 It does not limit the number of Cortana-owned Fleet Admins or other Crew.

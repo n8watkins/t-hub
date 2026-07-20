@@ -194,12 +194,38 @@ pub struct RuntimeCapacity {
     pub machine_session_capacity: usize,
     pub provider_session_capacity: usize,
     pub provider_live_sessions: usize,
+    #[serde(default)]
+    pub provider_capacity_status: ProviderCapacityStatus,
     pub available_worktrees: usize,
     pub active_captains: usize,
     pub live_cortana: usize,
     pub live_fleet_admins: usize,
     pub live_ship_admins: usize,
     pub live_recovery_sessions: usize,
+}
+
+/// Provenance and health of the provider-capacity ceiling used for admission.
+///
+/// A packaged policy is usable but degraded because it is a conservative local
+/// safety ceiling rather than live account telemetry. Explicit configured
+/// telemetry is healthy only after its value has been validated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapacityStatus {
+    pub source: String,
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl Default for ProviderCapacityStatus {
+    fn default() -> Self {
+        Self {
+            source: "legacy-unspecified".into(),
+            degraded: true,
+            detail: Some("provider capacity provenance was not recorded".into()),
+        }
+    }
 }
 
 /// An implementation lane's explicit ownership, dependency, and mutable
@@ -257,7 +283,13 @@ pub struct CapacityReport {
     pub live_sessions: usize,
     pub session_headroom_before_reservations: usize,
     pub session_headroom_after_reservations: usize,
+    #[serde(default)]
+    pub provider_session_limit: usize,
+    #[serde(default)]
+    pub provider_live_sessions: usize,
     pub provider_headroom: usize,
+    #[serde(default)]
+    pub provider_capacity_status: ProviderCapacityStatus,
     pub worktree_headroom: usize,
     pub effective_lane_headroom: usize,
     pub reservations: ReservationReport,
@@ -480,7 +512,10 @@ impl SpawnGovernor {
             live_sessions: runtime.live_sessions,
             session_headroom_before_reservations,
             session_headroom_after_reservations,
+            provider_session_limit: runtime.provider_session_capacity,
+            provider_live_sessions: runtime.provider_live_sessions,
             provider_headroom,
+            provider_capacity_status: runtime.provider_capacity_status.clone(),
             worktree_headroom: runtime.available_worktrees,
             effective_lane_headroom,
             reservations,
@@ -1113,6 +1148,11 @@ mod tests {
             machine_session_capacity: 32,
             provider_session_capacity: 32,
             provider_live_sessions: 4,
+            provider_capacity_status: ProviderCapacityStatus {
+                source: "test-telemetry".into(),
+                degraded: false,
+                detail: None,
+            },
             available_worktrees: 16,
             active_captains: 2,
             live_cortana: 1,
@@ -1149,6 +1189,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_capacity_report_without_provider_provenance_remains_readable() {
+        let report = SpawnGovernor::new(32, 20.0, 8.0)
+            .preflight_dispatch(&preflight(vec![lane("lane-legacy")]))
+            .unwrap();
+        let mut value = serde_json::to_value(report).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("providerSessionLimit");
+        object.remove("providerLiveSessions");
+        object.remove("providerCapacityStatus");
+
+        let legacy: CapacityReport = serde_json::from_value(value).unwrap();
+
+        assert_eq!(legacy.provider_session_limit, 0);
+        assert_eq!(legacy.provider_live_sessions, 0);
+        assert_eq!(legacy.provider_capacity_status.source, "legacy-unspecified");
+        assert!(legacy.provider_capacity_status.degraded);
+    }
+
+    #[test]
     fn preflight_preserves_supervisor_admin_and_recovery_reservations() {
         let governor = SpawnGovernor::new(10, 20.0, 8.0);
         let mut request = preflight(
@@ -1162,6 +1221,11 @@ mod tests {
             machine_session_capacity: 10,
             provider_session_capacity: 20,
             provider_live_sessions: 2,
+            provider_capacity_status: ProviderCapacityStatus {
+                source: "test-telemetry".into(),
+                degraded: false,
+                detail: None,
+            },
             available_worktrees: 10,
             active_captains: 2,
             live_cortana: 0,

@@ -22,6 +22,12 @@ Recovery preserves Cortana's identity and checkpoints while replacing a missing 
 When several candidates exist, reconciliation accepts only one deterministic authoritative generation and safely retires only older trusted duplicates.
 Equal highest generations, foreign identities, uncertain liveness, and untrusted live candidates fail closed into a visible degraded recovery state.
 The runtime governor reserves capacity for Cortana and recovery before admitting ordinary implementation lanes.
+The installed runtime obtains provider capacity from a validated `T_HUB_PROVIDER_SESSION_CAPACITY` override when present or from the conservative packaged policy when the override is absent.
+The packaged policy is reported as degraded because it is not live provider quota telemetry, while a malformed or unavailable configured override fails closed.
+Capacity evidence reports provider limit, provider-consuming live sessions, evidence source, degraded state, and detail separately from total tmux session pressure.
+Generic tmux terminals consume machine capacity but not provider capacity unless a Codex or Claude Harness is attested.
+Provisioning takes dispatch admission before the Fleet provisioning lock whenever both are required.
+Healthy no-spawn Cortana reconciliation inspects under provisioning alone and does not consume spawn admission or rate budget.
 
 ## Valid Codebase Entry Paths
 

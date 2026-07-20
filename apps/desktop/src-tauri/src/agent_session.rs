@@ -1025,6 +1025,11 @@ mod tests {
                 machine_session_capacity: 64,
                 provider_session_capacity: 64,
                 provider_live_sessions: 3,
+                provider_capacity_status: crate::governor::ProviderCapacityStatus {
+                    source: "test-telemetry".into(),
+                    degraded: false,
+                    detail: None,
+                },
                 available_worktrees: 8,
                 active_captains: 0,
                 live_cortana: 1,
