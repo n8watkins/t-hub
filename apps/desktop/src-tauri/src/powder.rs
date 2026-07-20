@@ -1,7 +1,10 @@
-//! Protected Powder connection profiles and the narrow API client T-Hub uses.
+//! Retired Powder compatibility types.
 //!
-//! Captain state stores only a profile name and Powder repository. Endpoint and
-//! credential material lives in `~/.t-hub/powder-profiles.json` or process env.
+//! Production access is fail-closed at [`Client::from_profile`].
+//! The remaining types stay available for legacy registry deserialization and
+//! test fixtures until the control-plane type graph is fully migrated.
+
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -613,6 +616,12 @@ fn configured_profile_names_from_path(path: &Path) -> Result<Vec<String>, String
 
 impl Client {
     pub fn from_profile(name: &str) -> Result<Self, String> {
+        #[cfg(not(test))]
+        {
+            let _ = name;
+            return Err("powder_retired: Powder runtime access is disabled".into());
+        }
+        #[cfg(test)]
         Self::from_profile_path(name, &profiles_path())
     }
 
