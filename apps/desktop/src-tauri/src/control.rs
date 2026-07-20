@@ -10979,9 +10979,8 @@ fn list_agents(
     )?;
     let cursor = agent_page_cursor(args, "list_agents")?;
     let limit = agent_page_limit(args, "list_agents")?;
-    let mut records: Vec<_> = ctx
-        .captains
-        .snapshot()
+    let snapshot = ctx.captains.snapshot();
+    let mut records: Vec<_> = snapshot
         .agent_sessions
         .into_iter()
         .filter(|agent| {
@@ -10998,6 +10997,17 @@ fn list_agents(
                 })
         })
         .collect();
+    let agent_ids: std::collections::HashSet<_> = records
+        .iter()
+        .map(|agent| agent.agent_session_id.as_str())
+        .collect();
+    let event_cursor = snapshot
+        .agent_events
+        .iter()
+        .filter(|event| agent_ids.contains(event.agent_session_id.as_str()))
+        .map(|event| event.cursor)
+        .max()
+        .unwrap_or(0);
     records.sort_by(|left, right| left.agent_session_id.cmp(&right.agent_session_id));
     let total = records.len();
     let digest = crate::agent_session::snapshot_digest(&records)?;
@@ -11022,7 +11032,7 @@ fn list_agents(
         "nextCursor": (next_cursor < total).then(|| next_cursor.to_string()),
         "hasMore": next_cursor < total,
         "digest": digest,
-        "eventCursor": 0,
+        "eventCursor": event_cursor,
     }))
 }
 
@@ -19950,8 +19960,56 @@ fn freeze_close_terminal_powder_release(
     ctx: &ControlContext,
     crew_session_id: &str,
 ) -> Result<(u64, Option<PendingDispatchRelease>), String> {
-    let _ = (ctx, crew_session_id);
-    Ok((ctx.captains.snapshot().seq, None))
+    let snapshot = ctx.captains.snapshot();
+    let matching_crew = snapshot
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .filter(|crew| crew.terminal_id == crew_session_id)
+        .collect::<Vec<_>>();
+    let crew = match matching_crew.as_slice() {
+        [] => return Ok((snapshot.seq, None)),
+        [crew] => *crew,
+        _ => {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+            ));
+        }
+    };
+    let Some(work) = crew.powder_work.as_ref() else {
+        return Ok((snapshot.seq, None));
+    };
+    let Some(expected_agent) = work.agent.as_deref() else {
+        return Ok((snapshot.seq, None));
+    };
+    let project_id = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|candidate| candidate.terminal_id == crew_session_id)
+        })
+        .and_then(|captain| captain.project_id.as_deref());
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project_id == Some(project.project_id.as_str()));
+    let Some(project) = project else {
+        return Ok((snapshot.seq, None));
+    };
+    let Some(binding) = project.powder.as_ref() else {
+        return Ok((snapshot.seq, None));
+    };
+    let client = powder::Client::from_profile(&binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    if client.configured_agent() != expected_agent {
+        return Err(format!(
+            "Crew session '{crew_session_id}' configured agent does not match its durable agent identity"
+        ));
+    }
+    Ok((snapshot.seq, None))
 }
 
 fn close_terminal_with_policy(
@@ -27052,6 +27110,13 @@ mod tests {
         assert!(response["eventCursor"]
             .as_u64()
             .is_some_and(|cursor| cursor > 0));
+        let listed = dispatch(
+            &ctx,
+            "list_agents",
+            &json!({"projectId": "project-1", "limit": 10}),
+        )
+        .unwrap();
+        assert_eq!(listed["eventCursor"], response["eventCursor"]);
         let events = dispatch(
             &ctx,
             "agent_events",
@@ -29131,7 +29196,6 @@ mod tests {
         assert_eq!(powder.release_posts, 0);
     }
 
-    #[cfg(any())]
     #[test]
     fn close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects() {
         if !tmux_process_tests_available() {
