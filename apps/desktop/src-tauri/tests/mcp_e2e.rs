@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! End-to-end proof of the real MCP binary, control listener, and tmux path.
 //!
 //! The control listener runs in a helper process. Closing that process is the
