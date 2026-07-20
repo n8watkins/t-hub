@@ -75,7 +75,7 @@ pub use crate::identity::{IdentityStore, Role as SessionIdentityRole};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by an ambient tier token or identity-bound scoped lease.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ControlRequest {
     /// Ambient read token, trusted host control token, or scoped Captain lease.
     #[serde(default)]
@@ -108,6 +108,20 @@ pub struct ControlRequest {
     /// version is rejected.
     #[serde(default)]
     pub v: Option<u32>,
+}
+
+impl std::fmt::Debug for ControlRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlRequest")
+            .field("token", &"<redacted>")
+            .field("command", &self.command)
+            .field("args", &"<redacted>")
+            .field("session", &"<redacted>")
+            .field("host", &"<redacted>")
+            .field("v", &self.v)
+            .finish()
+    }
 }
 
 /// A single control response. `ok` discriminates success (`result`) from failure
@@ -27691,6 +27705,34 @@ impl ControlContext {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex as StdMutex};
+
+    #[test]
+    fn control_request_debug_redacts_all_credential_and_argument_values() {
+        let request = ControlRequest {
+            token: "global-control-secret".into(),
+            command: "new_tab".into(),
+            args: serde_json::json!({"credential": "argument-secret"}),
+            session: "bound-session-secret".into(),
+            host: "host-proof-secret".into(),
+            v: Some(PROTOCOL_VERSION),
+        };
+
+        let diagnostic = format!("{request:?}");
+        assert!(diagnostic.contains("ControlRequest"));
+        assert!(diagnostic.contains("new_tab"));
+        assert!(diagnostic.contains("<redacted>"));
+        for secret in [
+            "global-control-secret",
+            "argument-secret",
+            "bound-session-secret",
+            "host-proof-secret",
+        ] {
+            assert!(
+                !diagnostic.contains(secret),
+                "ControlRequest Debug leaked {secret}"
+            );
+        }
+    }
 
     /// Build a ControlContext backed by a real (empty) Supervisor + StatusBridge,
     /// with a fixed token, for dispatch tests.
