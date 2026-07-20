@@ -9855,22 +9855,68 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
     let tile = ident.session_tile.clone();
     // Registry-authoritative ship/role, falling back to the mint-time ship copy when
     // the tile is not (yet) a registry member.
-    let (ship_slug, fleet_role) = match tile.as_deref().and_then(|t| ctx.captains.ship_of(t)) {
+    let (ship_slug, mut fleet_role) = match tile.as_deref().and_then(|t| ctx.captains.ship_of(t)) {
         Some(ShipMembership::Supervisor { ship_slug, role }) => (Some(ship_slug), Some(role)),
         Some(ShipMembership::Crew { ship_slug }) => (Some(ship_slug), None),
         None => (ident.ship_slug.clone(), None),
+    };
+    let authoritative_cortana = authoritative_cortana_identity(ctx, &ident);
+    if fleet_role == Some(FleetRole::Cortana) && !authoritative_cortana {
+        fleet_role = None;
+    }
+    let mint_role = if ident.role == crate::identity::Role::Cortana && !authoritative_cortana {
+        crate::identity::Role::Unknown
+    } else {
+        ident.role
     };
     let claude_uuid = tile
         .as_deref()
         .and_then(|t| ctx.status.session_for_terminal(t));
     Some(ResolvedIdentity {
         session_id: ident.id,
-        mint_role: ident.role,
+        mint_role,
         tile,
         ship_slug,
         fleet_role,
         claude_uuid,
     })
+}
+
+/// A Cortana bearer is apex only while all durable singleton facts agree on the
+/// exact identity, terminal, generation, healthy recovery state, and one active
+/// Fleet claim. Mint-time `Role::Cortana` is historical attribution, not authority.
+fn authoritative_cortana_identity(
+    ctx: &ControlContext,
+    identity: &crate::identity::SessionIdentity,
+) -> bool {
+    if identity.role != crate::identity::Role::Cortana {
+        return false;
+    }
+    let Some(tile) = identity.session_tile.as_deref() else {
+        return false;
+    };
+    let durable = ctx.captains.cortana_identity();
+    if durable.generation == 0
+        || durable.identity_id.as_deref() != Some(identity.id.as_str())
+        || durable.terminal_id.as_deref() != Some(tile)
+        || !matches!(
+            durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        )
+    {
+        return false;
+    }
+    let active_cortana_claims = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .filter(|captain| captain.role == FleetRole::Cortana && captain.state == ClaimState::Active)
+        .collect::<Vec<_>>();
+    matches!(
+        active_cortana_claims.as_slice(),
+        [captain] if captain.terminal_id.as_deref() == Some(tile)
+    )
 }
 
 /// Map a [`ResolvedIdentity`] into the [`crate::acl::AclActor`] the Phase-3 ACL keys on.
@@ -9883,7 +9929,9 @@ fn acl_actor(id: &ResolvedIdentity) -> crate::acl::AclActor {
         Some(FleetRole::Captain) => AclRole::Captain,
         None => match id.mint_role {
             crate::identity::Role::General => AclRole::General,
-            crate::identity::Role::Cortana => AclRole::Cortana,
+            // Cortana authority is registry-derived above. A bare mint-time role
+            // must never resurrect a released or superseded singleton bearer.
+            crate::identity::Role::Cortana => AclRole::Unknown,
             crate::identity::Role::Captain => AclRole::Captain,
             crate::identity::Role::Crew => AclRole::Crew,
             crate::identity::Role::Unknown => AclRole::Unknown,
@@ -9972,10 +10020,11 @@ fn caller_is_apex(caller: Option<&ResolvedIdentity>, trusted_internal: bool) -> 
     }
     let Some(caller) = caller else { return false };
     caller.fleet_role == Some(FleetRole::Cortana)
-        || matches!(
-            caller.mint_role,
-            crate::identity::Role::General | crate::identity::Role::Cortana
-        )
+        || caller.mint_role == crate::identity::Role::General
+}
+
+fn has_delegated_admin_history(ctx: &ControlContext, identity_id: &str) -> bool {
+    !ctx.delegated_admin.grants_for_actor(identity_id).is_empty()
 }
 
 fn enforce_ship_authority(
@@ -10011,12 +10060,7 @@ fn enforce_attach_authority(
         return Err("acl: only General/Cortana may assign the Cortana role or slug".into());
     }
     let caller = caller.expect("non-apex caller must be identified");
-    if ctx
-        .delegated_admin
-        .grants_for_actor(&caller.session_id)
-        .iter()
-        .any(|grant| grant.state.is_active())
-    {
+    if has_delegated_admin_history(ctx, &caller.session_id) {
         return Err(
             "acl: delegated administrators cannot acquire Captain or Cortana authority".into(),
         );
@@ -10297,11 +10341,8 @@ fn workspace_mutation_authority(
     }
     let caller = caller
         .ok_or_else(|| format!("acl: '{command}' requires a terminal-bound Fleet identity"))?;
-    if matches!(caller.fleet_role, Some(FleetRole::Cortana))
-        || matches!(
-            caller.mint_role,
-            crate::identity::Role::General | crate::identity::Role::Cortana
-        )
+    if caller.fleet_role == Some(FleetRole::Cortana)
+        || caller.mint_role == crate::identity::Role::General
     {
         return Ok(WorkspaceMutationAuthority::Apex);
     }
@@ -10668,6 +10709,17 @@ fn governor_gate<'a>(
         // direct test/internal calls cannot bypass the atomic check. Cortana only
         // reserves when reconciliation actually needs a replacement runtime.
         "start_agent" | "reconcile_cortana" => Ok(None),
+        // A durable delegated administrator reaches only the maintenance-only
+        // create_worktree handler, which cannot create a tab, identity, terminal,
+        // capability, or Crew record. Do not consume or require spawn evidence for
+        // a filesystem-only operation. The handler still requires one active exact
+        // Ship Admin grant, so revoked historical identities fail there.
+        "create_worktree"
+            if caller
+                .is_some_and(|identity| has_delegated_admin_history(ctx, &identity.session_id)) =>
+        {
+            Ok(None)
+        }
         "spawn_terminal"
         | "history_resume"
         | "commission_captain"
@@ -11594,12 +11646,7 @@ fn enforce_delegated_admin_command(
     let Some(caller) = caller else {
         return Ok(());
     };
-    let has_active_grant = ctx
-        .delegated_admin
-        .grants_for_actor(&caller.session_id)
-        .iter()
-        .any(|grant| grant.state.is_active());
-    if !has_active_grant {
+    if !has_delegated_admin_history(ctx, &caller.session_id) {
         return Ok(());
     }
     if matches!(
@@ -22518,6 +22565,7 @@ fn create_worktree(
         ctx,
         caller,
         trusted_internal,
+        args,
         &repo_root,
         &worktree_path,
         startup_command.as_deref(),
@@ -22573,6 +22621,26 @@ fn create_worktree_authorized(
     // Create the worktree on disk first (shares git_worktree_add's impl). A git
     // failure short-circuits here — no tab/terminal is spawned for a failed add.
     let git_output = git::worktree_add(&repo_root, &worktree_path, branch.as_deref())?;
+
+    // A delegated administrator owns filesystem maintenance, not runtime creation.
+    // Stop at the exact authorized artifact boundary: no tab, terminal, identity,
+    // capability, Crew membership, or UI orchestration is created or forwarded.
+    if delegated_audit.is_some() {
+        return Ok(json!({
+            "accepted": "create_worktree",
+            "worktreePath": worktree_path,
+            "branch": branch,
+            "tabId": Value::Null,
+            "terminalId": Value::Null,
+            "gitOutput": git_output,
+            "delegatedAdmin": delegated_audit,
+            "administrativeMaintenanceOnly": true,
+            "crewRecorded": false,
+            "audited": true,
+            "applied": false,
+            "note": "worktree filesystem maintenance completed within the delegated Ship Admin grant; no runtime, identity, tab, or UI state was created.",
+        }));
+    }
 
     // Resolve the TARGET TAB by NAME deterministically (TASK C / #22): the tile
     // must land in a tab identified by name, NOT in whatever tab is focused. Reuse
@@ -22751,21 +22819,32 @@ fn authorize_worktree_maintenance(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
+    args: &Value,
     repo_root: &str,
     worktree_path: &str,
     startup_command: Option<&str>,
     spawned_by: Option<&str>,
 ) -> Result<Option<crate::delegated_admin::AdminAuditContext>, String> {
-    let active_admin_grant = caller.and_then(|caller| {
-        ctx.delegated_admin
-            .grants_for_actor(&caller.session_id)
-            .into_iter()
-            .find(|grant| grant.state.is_active())
-    });
-    if active_admin_grant.is_none() && caller_is_apex(caller, trusted_internal) {
+    let admin_grants = caller
+        .map(|caller| ctx.delegated_admin.grants_for_actor(&caller.session_id))
+        .unwrap_or_default();
+    let active_admin_grant = admin_grants
+        .iter()
+        .find(|grant| grant.state.is_active())
+        .cloned();
+    let has_admin_history = !admin_grants.is_empty();
+    if trusted_internal && caller.is_none() {
         return Ok(None);
     }
     let caller = caller.ok_or("acl: create_worktree requires a session identity")?;
+    if has_admin_history && active_admin_grant.is_none() {
+        return Err(
+            "acl: create_worktree administrative identity has no active Ship Admin grant".into(),
+        );
+    }
+    if active_admin_grant.is_none() && caller_is_apex(Some(caller), false) {
+        return Ok(None);
+    }
     let repo_worktrees = git::worktree_list(&files::posix_form(repo_root))?;
     let snapshot = ctx.captains.snapshot();
     let project = snapshot
@@ -22797,10 +22876,24 @@ fn authorize_worktree_maintenance(
         return Ok(None);
     }
 
-    if startup_command.is_some() || spawned_by.is_some() {
+    let runtime_or_capability_requested = startup_command.is_some()
+        || spawned_by.is_some()
+        || [
+            "capability",
+            "admissionPurpose",
+            "admission_purpose",
+            "shell",
+            "preset",
+            "startupCommand",
+            "startup_command",
+            "spawnedBy",
+            "spawned_by",
+        ]
+        .iter()
+        .any(|field| args.get(field).is_some_and(|value| !value.is_null()));
+    if runtime_or_capability_requested {
         return Err(
-            "acl: delegated worktree maintenance cannot dispatch implementation or assign Crew"
-                .into(),
+            "acl: delegated worktree maintenance cannot create or elevate a runtime, dispatch implementation, or assign Crew".into(),
         );
     }
     let grant = active_admin_grant
@@ -24617,12 +24710,7 @@ fn spawn_terminal(
     if !caller_is_apex(caller, trusted_internal) {
         let caller = caller
             .ok_or("acl: spawn_terminal requires General/Cortana or an active owning Captain")?;
-        if ctx
-            .delegated_admin
-            .grants_for_actor(&caller.session_id)
-            .iter()
-            .any(|grant| grant.state.is_active())
-        {
+        if has_delegated_admin_history(ctx, &caller.session_id) {
             return Err(
                 "acl: delegated administrators cannot spawn implementation sessions".into(),
             );
@@ -34761,7 +34849,23 @@ mod tests {
     #[test]
     fn ship_admin_worktree_maintenance_is_scoped_and_cannot_dispatch_implementation() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
-        let ctx = test_ctx("ship-admin-worktree");
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let provider_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_probe_count = provider_probes.clone();
+        let tmux_probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tmux_probe_count = tmux_probes.clone();
+        let ctx = test_ctx("ship-admin-worktree")
+            .with_apply_sink(sink.clone())
+            .with_provider_capacity(move || {
+                provider_probe_count.fetch_add(1, Ordering::SeqCst);
+                Err("provider admission unavailable".into())
+            })
+            .with_live_sessions(move || {
+                tmux_probe_count.fetch_add(1, Ordering::SeqCst);
+                Err("tmux admission unavailable".into())
+            });
         let (base, repo_root, _existing_worktree) = scratch_repo_with_worktree();
         ctx.captains
             .upsert_project(ProjectRecord {
@@ -34813,6 +34917,7 @@ mod tests {
             &ctx,
             Some(&admin),
             false,
+            &json!({}),
             repo_root.to_str().unwrap(),
             &target,
             None,
@@ -34830,13 +34935,75 @@ mod tests {
             &ctx,
             Some(&admin),
             false,
+            &json!({"startupCommand": "codex exec implement"}),
             repo_root.to_str().unwrap(),
             &target,
             Some("codex exec implement"),
             None,
         )
         .unwrap_err();
-        assert!(denied.contains("cannot dispatch implementation"));
+        assert!(denied.contains("cannot create or elevate a runtime"));
+
+        let tabs_before = ctx.tabs.snapshot_full();
+        let identities_before = ctx.identity.len();
+        let sessions_before = tmux::list_sessions().unwrap();
+        let maintained = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "ship-admin-worktree",
+                &admin_identity.secret,
+                "create_worktree",
+                json!({
+                    "repoRoot": repo_root,
+                    "worktreePath": target,
+                }),
+            ),
+        );
+        assert!(
+            maintained.ok,
+            "maintenance-only create was governed as a spawn: {:?}",
+            maintained.error
+        );
+        let maintained = maintained.result.unwrap();
+        assert_eq!(maintained["administrativeMaintenanceOnly"], true);
+        assert!(maintained["tabId"].is_null());
+        assert!(maintained["terminalId"].is_null());
+        assert!(std::path::Path::new(&target).exists());
+        assert_eq!(ctx.tabs.snapshot_full().seq, tabs_before.seq);
+        assert_eq!(
+            serde_json::to_value(ctx.tabs.snapshot_full().tabs).unwrap(),
+            serde_json::to_value(tabs_before.tabs).unwrap()
+        );
+        assert_eq!(ctx.identity.len(), identities_before);
+        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
+
+        let elevated_target = base.join("elevated-worktree");
+        let elevated = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "ship-admin-worktree",
+                &admin_identity.secret,
+                "create_worktree",
+                json!({
+                    "repoRoot": repo_root,
+                    "worktreePath": elevated_target,
+                    "capability": "control",
+                }),
+            ),
+        );
+        assert!(!elevated.ok);
+        let elevated = elevated.error.unwrap();
+        assert!(elevated.contains("cannot create or elevate a runtime"));
+        assert!(!elevated_target.exists());
+        assert_eq!(ctx.tabs.snapshot_full().seq, tabs_before.seq);
+        assert_eq!(ctx.identity.len(), identities_before);
+        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
         reap_test_tmux_session(&admin_target).unwrap();
         std::fs::remove_dir_all(base).ok();
     }
@@ -35139,6 +35306,184 @@ mod tests {
         );
         assert!(grants.ok, "self grant listing failed: {:?}", grants.error);
         reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
+    fn revoked_and_invalidated_admin_tokens_stay_restricted_after_reload() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let captains_path = captains_tmp(&format!("admin-history-{nonce}"));
+        let identities_path =
+            std::env::temp_dir().join(format!("t-hub-admin-history-identities-{nonce}.json"));
+        let grants_path =
+            std::env::temp_dir().join(format!("t-hub-admin-history-grants-{nonce}.json"));
+        let captain_tile = format!("cp{}", &nonce[..6]);
+        let revoked_tile = format!("rv{}", &nonce[..6]);
+        let invalidated_tile = format!("iv{}", &nonce[..6]);
+        let captain_secret;
+        let admin_credentials;
+
+        {
+            let captains = Arc::new(CaptainsRegistry::load(captains_path.clone()));
+            captains
+                .claim_test(&captain_tile, Some("alpha"), vec![])
+                .unwrap();
+            captains.record_crew(&captain_tile, &revoked_tile).unwrap();
+            captains
+                .record_crew(&captain_tile, &invalidated_tile)
+                .unwrap();
+            let identities = Arc::new(crate::identity::IdentityStore::load(
+                identities_path.clone(),
+            ));
+            let grants = Arc::new(
+                crate::delegated_admin::DelegatedAdminStore::load(grants_path.clone()).unwrap(),
+            );
+            let captain_identity = identities.mint(crate::identity::Role::Captain).unwrap();
+            identities
+                .bind_tile(&captain_identity.id, &captain_tile)
+                .unwrap();
+            captain_secret = captain_identity.secret.clone();
+            let mut credentials = Vec::new();
+            for tile in [&revoked_tile, &invalidated_tile] {
+                create_test_tmux_session(&tmux_target(tile)).unwrap();
+                let identity = identities.mint(crate::identity::Role::Crew).unwrap();
+                identities.bind_tile(&identity.id, tile).unwrap();
+                credentials.push((tile.clone(), identity.id, identity.secret));
+            }
+            let ctx = test_ctx("persisted-admin-token")
+                .with_captains_registry(captains)
+                .with_identity_store(identities)
+                .with_delegated_admin(grants);
+            let captain = resolve_identity(&ctx, &captain_secret).unwrap();
+            for (tile, _, _) in &credentials {
+                appoint_admin(
+                    &ctx,
+                    &json!({
+                        "actorSessionId": tile,
+                        "role": "shipAdmin",
+                        "permittedOperations": ["maintainSession"]
+                    }),
+                    Some(&captain),
+                    false,
+                )
+                .unwrap();
+            }
+            admin_credentials = credentials;
+        }
+
+        // An active appointment and its exact operation survive a process reload.
+        {
+            let ctx = test_ctx("persisted-admin-token")
+                .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                )))
+                .with_delegated_admin(Arc::new(
+                    crate::delegated_admin::DelegatedAdminStore::load(grants_path.clone()).unwrap(),
+                ));
+            for (tile, _, secret) in &admin_credentials {
+                let maintained = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        "persisted-admin-token",
+                        secret,
+                        "execute_admin_operation",
+                        json!({
+                            "operation": "maintainSession",
+                            "target": { "kind": "session", "sessionId": tile }
+                        }),
+                    ),
+                );
+                assert!(
+                    maintained.ok,
+                    "active admin reload failed: {:?}",
+                    maintained.error
+                );
+            }
+            let captain = resolve_identity(&ctx, &captain_secret).unwrap();
+            let revoked_grant = ctx
+                .delegated_admin
+                .grants_for_actor(&admin_credentials[0].1)
+                .into_iter()
+                .find(|grant| grant.state.is_active())
+                .unwrap();
+            revoke_admin(
+                &ctx,
+                &json!({ "grantId": revoked_grant.grant_id, "reason": "rotation" }),
+                Some(&captain),
+                false,
+            )
+            .unwrap();
+            ctx.delegated_admin
+                .invalidate_actor(&admin_credentials[1].1, "Crew ownership changed")
+                .unwrap();
+        }
+
+        // Both durable tombstone forms continue to classify the old bearer as an
+        // administrator after another reload. Full control admission cannot turn
+        // either identity back into an ordinary mutator or a Captain claimant.
+        {
+            let ctx = test_ctx("persisted-admin-token")
+                .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                )))
+                .with_delegated_admin(Arc::new(
+                    crate::delegated_admin::DelegatedAdminStore::load(grants_path.clone()).unwrap(),
+                ));
+            for (tile, _, secret) in &admin_credentials {
+                for (command, args) in [
+                    ("new_tab", json!({"name": "escaped"})),
+                    (
+                        "claim_captain",
+                        json!({"captainSessionId": tile, "shipSlug": "escaped"}),
+                    ),
+                    (
+                        "attach_captain",
+                        json!({
+                            "captainSessionId": tile,
+                            "projectId": "escaped",
+                            "assignment": "escaped"
+                        }),
+                    ),
+                ] {
+                    let response = dispatch_authenticated(
+                        &ctx,
+                        req_session("persisted-admin-token", secret, command, args),
+                    );
+                    assert!(!response.ok, "historical admin called {command}");
+                    assert!(
+                        response
+                            .error
+                            .unwrap_or_default()
+                            .contains("outside their exact administrative operation grants"),
+                        "historical admin did not fail at durable boundary for {command}"
+                    );
+                }
+                let resolved = resolve_identity(&ctx, secret).unwrap();
+                assert!(enforce_attach_authority(
+                    &ctx,
+                    Some(&resolved),
+                    false,
+                    tile,
+                    FleetRole::Captain,
+                )
+                .unwrap_err()
+                .contains("cannot acquire Captain or Cortana authority"));
+            }
+        }
+
+        for (tile, _, _) in &admin_credentials {
+            reap_test_tmux_session(&tmux_target(tile)).unwrap();
+        }
+        for path in [
+            captains_path.with_extension("json.bak"),
+            captains_path,
+            identities_path,
+            grants_path,
+        ] {
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]
@@ -40084,6 +40429,133 @@ mod tests {
         id.secret
     }
 
+    fn mint_current_cortana_session(
+        store: &crate::identity::IdentityStore,
+        registry: &CaptainsRegistry,
+        tile: &str,
+    ) -> String {
+        registry
+            .claim_provider(
+                tile,
+                None,
+                FleetRole::Cortana,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let identity = store.mint(crate::identity::Role::Cortana).unwrap();
+        store.bind_tile(&identity.id, tile).unwrap();
+        let operation_id = format!("test-cortana-{tile}");
+        registry.begin_cortana_recovery(&operation_id).unwrap();
+        registry
+            .commit_cortana_runtime(&operation_id, &identity.id, 1, tile, "codex", None)
+            .unwrap();
+        identity.secret
+    }
+
+    #[test]
+    fn only_the_current_durable_cortana_identity_is_apex_across_reload_and_release() {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let captains_path = captains_tmp(&format!("cortana-apex-{nonce}"));
+        let identities_path =
+            std::env::temp_dir().join(format!("t-hub-cortana-apex-identities-{nonce}.json"));
+        let current_tile = format!("co{}", &nonce[..6]);
+        let stale_tile = format!("st{}", &nonce[..6]);
+        let current_secret;
+        let stale_secret;
+
+        {
+            let registry = CaptainsRegistry::load(captains_path.clone());
+            let identities = crate::identity::IdentityStore::load(identities_path.clone());
+            current_secret = mint_current_cortana_session(&identities, &registry, &current_tile);
+            let stale = identities.mint(crate::identity::Role::Cortana).unwrap();
+            identities.bind_tile(&stale.id, &stale_tile).unwrap();
+            stale_secret = stale.secret;
+        }
+
+        // A reconnect after process reload preserves the exact durable bearer,
+        // while a second mint-time Cortana identity is role-demoted and non-apex.
+        {
+            let ctx = test_ctx("cortana-apex-token")
+                .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                )));
+            let current = resolve_identity(&ctx, &current_secret).unwrap();
+            assert_eq!(current.fleet_role, Some(FleetRole::Cortana));
+            assert!(caller_is_apex(Some(&current), false));
+
+            let stale = resolve_identity(&ctx, &stale_secret).unwrap();
+            assert_eq!(stale.fleet_role, None);
+            assert_eq!(stale.mint_role, crate::identity::Role::Unknown);
+            assert!(!caller_is_apex(Some(&stale), false));
+            let denied = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "cortana-apex-token",
+                    &stale_secret,
+                    "commission_captain",
+                    json!({}),
+                ),
+            );
+            assert!(!denied.ok);
+            let error = denied.error.unwrap_or_default();
+            assert!(
+                error.contains("General/Cortana"),
+                "unexpected denial: {error}"
+            );
+
+            release_captain(
+                &ctx,
+                &json!({"captainSessionId": current_tile}),
+                Some(&current),
+                false,
+            )
+            .unwrap();
+            let released = resolve_identity(&ctx, &current_secret).unwrap();
+            assert_eq!(released.fleet_role, None);
+            assert_eq!(released.mint_role, crate::identity::Role::Unknown);
+            assert!(!caller_is_apex(Some(&released), false));
+        }
+
+        // The released token stays non-apex after the next durable-state reload.
+        {
+            let ctx = test_ctx("cortana-apex-token")
+                .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                )));
+            let released = resolve_identity(&ctx, &current_secret).unwrap();
+            assert!(!caller_is_apex(Some(&released), false));
+            let denied = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "cortana-apex-token",
+                    &current_secret,
+                    "commission_captain",
+                    json!({}),
+                ),
+            );
+            assert!(!denied.ok);
+            let error = denied.error.unwrap_or_default();
+            assert!(
+                error.contains("General/Cortana"),
+                "unexpected denial: {error}"
+            );
+        }
+
+        for path in [
+            captains_path.with_extension("json.bak"),
+            captains_path,
+            identities_path,
+        ] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
     #[test]
     fn cross_ship_isolation_refuses_a_foreign_read_through_the_gate() {
         // MANDATED cross-ship-isolation guard: a crew on ship-a may NOT read another
@@ -40422,7 +40894,7 @@ mod tests {
         assert!(reg.record_crew("cap-b", "crew-b").unwrap());
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
         let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
-        let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
+        let cortana = mint_current_cortana_session(&store, &reg, "cor");
         let ctx = test_ctx("ctrl")
             .with_read_token("read-t".to_string())
             .with_identity_store(store)
@@ -40768,7 +41240,7 @@ mod tests {
             .enqueue("crew-a", "x", crate::inbox::Priority::Standard, "m", true)
             .unwrap();
         let captain = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
-        let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
+        let cortana = mint_current_cortana_session(&store, &reg, "cor");
         let ctx = test_ctx("ctrl")
             .with_identity_store(store)
             .with_captains_registry(reg)
