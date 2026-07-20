@@ -23,7 +23,7 @@ describe("isOrchestratorCwd", () => {
   });
 });
 
-describe("resolveOrchestrator (adopt-only, never spawns)", () => {
+describe("resolveOrchestrator (pure frontend designation)", () => {
   const home = "/home/x/.t-hub/orchestrator";
 
   it("keeps the persisted orchestrator when it is still a live terminal", () => {

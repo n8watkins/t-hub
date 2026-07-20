@@ -1,6 +1,6 @@
-// The default-orchestrator startup logic (ADOPT-ONLY, per the general's
-// adversarial-audit hold on auto-spawn): on launch, ensure the deck's
-// orchestrator points at a live session, WITHOUT ever spawning one.
+// Pure frontend designation helpers for the default orchestrator.
+// Process creation and recovery are owned by the trusted backend
+// `ensure_cortana` command; this module only resolves the live tile to display.
 //
 // `~/.t-hub/orchestrator` is the canonical orchestrator home. We adopt by cwd
 // suffix so we never need to resolve the (WSL-vs-Windows) absolute home path in
@@ -40,11 +40,11 @@ export interface OrchestratorTerminal {
 }
 
 /**
- * Resolve which terminal id (if any) should be the orchestrator - ADOPT ONLY,
- * never spawn. Precedence:
+ * Resolve which terminal id (if any) should be the orchestrator after the
+ * backend recovery transaction has completed. Precedence:
  *   1. the persisted orchestrator, if it is still a live terminal - keep it;
  *   2. else a live terminal whose cwd is the orchestrator home - adopt it;
- *   3. else null - leave it (no spawn).
+ *   3. else null - leave it for the backend result to populate.
  * Returns the id to DESIGNATE, or null to make no change. Pure + idempotent:
  * a second call with the same inputs designates the same id.
  */
