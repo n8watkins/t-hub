@@ -549,10 +549,12 @@ pub fn profiles_path() -> PathBuf {
 }
 
 /// Return configured profile names without exposing endpoints or credentials.
+#[allow(dead_code)]
 pub fn configured_profile_names() -> Result<Vec<String>, String> {
     configured_profile_names_from_path(&profiles_path())
 }
 
+#[allow(dead_code)]
 fn configured_profile_names_from_path(path: &Path) -> Result<Vec<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(body) => {

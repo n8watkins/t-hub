@@ -11450,8 +11450,20 @@ fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
 /// MCP captain both read; ship files remain the captain-side roster only.
 fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
     let snap = ctx.captains.snapshot();
+    let mut captains = serde_json::to_value(&snap.captains).map_err(|e| e.to_string())?;
+    if let Some(items) = captains.as_array_mut() {
+        for captain in items {
+            if let Some(crew) = captain.get_mut("crew").and_then(Value::as_array_mut) {
+                for member in crew {
+                    if let Some(object) = member.as_object_mut() {
+                        object.remove("powderWork");
+                    }
+                }
+            }
+        }
+    }
     Ok(json!({
-        "captains": snap.captains,
+        "captains": captains,
         "count": snap.captains.len(),
         "seq": snap.seq,
     }))
@@ -11461,20 +11473,22 @@ fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
 /// which is activity-derived and may include unregistered scratch directories.
 fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
     let snap = ctx.captains.snapshot();
-    let (powder_profiles, powder_profiles_error) = match powder::configured_profile_names() {
-        Ok(names) => (names, None),
-        Err(error) => (Vec::new(), Some(error)),
-    };
+    let mut projects = serde_json::to_value(&snap.projects).map_err(|e| e.to_string())?;
+    if let Some(items) = projects.as_array_mut() {
+        for project in items {
+            if let Some(object) = project.as_object_mut() {
+                object.remove("powder");
+            }
+        }
+    }
     let (wsl_home, wsl_home_error) = match files::user_home_path() {
         Ok(home) => (Some(home), None),
         Err(error) => (None, Some(error)),
     };
     Ok(json!({
-        "projects": snap.projects,
+        "projects": projects,
         "count": snap.projects.len(),
         "seq": snap.seq,
-        "powderProfiles": powder_profiles,
-        "powderProfilesError": powder_profiles_error,
         "wslHome": wsl_home,
         "wslHomeError": wsl_home_error,
     }))
