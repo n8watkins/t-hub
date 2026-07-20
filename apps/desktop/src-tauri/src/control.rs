@@ -8684,7 +8684,14 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                     serve_pty_attach(ctx, &mut writer, &mut reader, &req.args)?;
                     break;
                 } else {
-                    write_response(&mut writer, &dispatch_authenticated(ctx, req))?;
+                    let response = if is_retired_powder_command(&req.command)
+                        && resolve_capability(ctx, &req.token).is_some()
+                    {
+                        ControlResponse::powder_retired(&req.command)
+                    } else {
+                        dispatch_authenticated(ctx, req)
+                    };
+                    write_response(&mut writer, &response)?;
                 }
             }
             Err(e) => write_response(
@@ -10112,12 +10119,6 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     let Some(cap) = resolve_capability(ctx, &req.token) else {
         return ControlResponse::err("unauthorized: bad control token");
     };
-
-    // The legacy unit suite still exercises the inert compatibility helpers
-    // directly; production protocol traffic gets the retirement boundary.
-    if !cfg!(test) && is_retired_powder_command(&req.command) {
-        return ControlResponse::powder_retired(&req.command);
-    }
 
     // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
     // token carried on the request (`req.session`), if any. IDENTIFICATION only
