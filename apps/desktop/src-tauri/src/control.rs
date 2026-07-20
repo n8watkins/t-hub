@@ -12243,16 +12243,6 @@ fn resolve_bootstrap_context(
 
 fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> String {
     let assignment = captain.assignment.as_deref().unwrap_or("Unassigned");
-    let powder = project
-        .powder
-        .as_ref()
-        .map(|binding| {
-            format!(
-                "Powder profile '{}' and repository '{}' are authoritative for work and claims.",
-                binding.connection_profile, binding.repository
-            )
-        })
-        .unwrap_or_else(|| "This project has no Powder binding.".to_string());
     let invocation = match captain.harness.as_deref() {
         Some(provider) => Harness::from_provider(provider).captain_invocation(),
         // Historical Captain records did not store a harness. Preserve the
@@ -12261,8 +12251,8 @@ fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> S
     };
     let runtime_root = files::posix_form(&project.repo_root);
     format!(
-        "Use {invocation}. Recover ship '{}' for project '{}' at '{}'. Assignment: {} {} Read the durable Captain and Crew records before acting, reconcile Powder state before dispatching work, and keep the registry resume point current.",
-        captain.ship_slug, project.name, runtime_root, assignment, powder
+        "Use {invocation}. Recover ship '{}' for project '{}' at '{}'. Assignment: {} Read the durable Captain and agent-session records before acting, then keep checkpoints and the registry resume point current.",
+        captain.ship_slug, project.name, runtime_root, assignment
     )
 }
 
@@ -12271,9 +12261,55 @@ fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> S
 fn captain_bootstrap(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let (captain, project) = resolve_bootstrap_context(ctx, args)?;
     let instructions = bootstrap_instructions(&captain, &project);
+    let snapshot = ctx.captains.snapshot();
+    let mut agents: Vec<Value> = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| {
+            agent.captain_session_id == captain.terminal_id.as_deref().unwrap_or_default()
+                && agent.project_id == project.project_id
+        })
+        .map(|agent| {
+            json!({
+                "agentSessionId": agent.agent_session_id,
+                "captainSessionId": agent.captain_session_id,
+                "projectId": agent.project_id,
+                "directory": agent.directory,
+                "worktreePath": agent.worktree_path,
+                "branch": agent.branch,
+                "workspaceTabId": agent.workspace_tab_id,
+                "harness": agent.harness,
+                "provider": agent.provider,
+                "runtimeState": agent.runtime_state,
+                "workStage": agent.work_stage,
+                "updatedAt": agent.updated_at,
+            })
+        })
+        .collect();
+    agents.sort_by(|left, right| {
+        left["agentSessionId"]
+            .as_str()
+            .cmp(&right["agentSessionId"].as_str())
+    });
+    let agent_digest = crate::agent_session::snapshot_digest(&agents)?;
+    let event_cursor = snapshot
+        .agent_events
+        .iter()
+        .filter(|event| {
+            agents.iter().any(|agent| {
+                agent["agentSessionId"].as_str() == Some(event.agent_session_id.as_str())
+            })
+        })
+        .map(|event| event.cursor)
+        .max()
+        .unwrap_or(0);
     Ok(json!({
         "captain": captain,
         "project": project,
+        "agents": agents,
+        "agentCount": agents.len(),
+        "agentDigest": agent_digest,
+        "agentEventCursor": event_cursor.to_string(),
         "instructions": instructions,
         "recoverySource": "captains-registry",
     }))

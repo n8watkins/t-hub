@@ -9,14 +9,14 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `list_projects`, `list_powder_boards`,
+//!     `list_captains`, `list_projects`,
 //!     `list_fleet_watches`, `read_terminal`,
 //!     `my_capability`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
-//!     `bind_project_powder`.
+//!     `captain_bootstrap` and the agent-session operations.
 //!   - **Powder Crew evidence**: append and completion are Organization tier;
 //!     evidence read is Read tier. The backend narrowly lets a bound Crew use a
 //!     read-capability token for its own work-log append, then rechecks the exact
@@ -371,14 +371,13 @@ fn schema_register_project() -> Value {
             "initializeGit": { "type": "boolean", "description": "Explicitly initialize Git with main as the default branch when repoRoot is not already a repository. Defaults to false and never replaces an existing .git entry." },
             "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
-            "powderRepository": { "type": "string", "description": "Optional canonical Powder repository name to bind during registration." },
-            "powderConnectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
         },
         "required": ["repoRoot"],
         "additionalProperties": false
     })
 }
 
+#[allow(dead_code)]
 fn schema_bind_project_powder() -> Value {
     json!({
         "type": "object",
@@ -392,6 +391,7 @@ fn schema_bind_project_powder() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_list_powder_boards() -> Value {
     json!({
         "type": "object",
@@ -404,6 +404,7 @@ fn schema_list_powder_boards() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_project_board_snapshot() -> Value {
     json!({
         "type": "object",
@@ -534,6 +535,7 @@ fn schema_attach_captain() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_powder_status() -> Value {
     json!({
         "type": "object",
@@ -545,6 +547,7 @@ fn schema_powder_status() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_dispatch_crew() -> Value {
     json!({
         "type": "object",
@@ -598,6 +601,7 @@ fn schema_captain_checkpoint() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_heartbeat_crew_powder() -> Value {
     json!({
         "type": "object",
@@ -609,6 +613,7 @@ fn schema_heartbeat_crew_powder() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_append_crew_powder_work_log() -> Value {
     json!({
         "type": "object",
@@ -632,6 +637,7 @@ fn schema_append_crew_powder_work_log() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_read_crew_powder_evidence() -> Value {
     json!({
         "type": "object",
@@ -653,6 +659,7 @@ fn schema_read_crew_powder_evidence() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_review_crew_powder_criterion() -> Value {
     json!({
         "type": "object",
@@ -693,6 +700,7 @@ fn schema_review_crew_powder_criterion() -> Value {
     })
 }
 
+#[allow(dead_code)]
 fn schema_complete_crew_powder() -> Value {
     json!({
         "type": "object",
@@ -877,7 +885,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "list_projects",
             tier: Tier::Read,
-            summary: "List durable registered projects and their Powder repository bindings.",
+            summary: "List durable registered projects and their Git repository metadata.",
             input_schema: schema_empty,
         },
         ToolDef {
@@ -901,7 +909,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "captain_bootstrap",
             tier: Tier::Read,
-            summary: "Recover a Captain's durable project, assignment, Crew roster, and Powder binding after a reset or new conversation.",
+            summary: "Recover a Captain's durable project, assignment, and agent-session roster after a reset or new conversation.",
             input_schema: schema_captain_bootstrap,
         },
         ToolDef {
@@ -992,7 +1000,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "register_project",
             tier: Tier::Organization,
-            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf, optionally with its Powder mapping.",
+            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf.",
             input_schema: schema_register_project,
         },
         ToolDef {
@@ -1024,13 +1032,13 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "commission_captain",
             tier: Tier::ProcessChanging,
-            summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable Powder-backed ship.",
+            summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable ship.",
             input_schema: schema_commission_captain,
         },
         ToolDef {
             name: "attach_captain",
             tier: Tier::ProcessChanging,
-            summary: "Attach an existing control-capability terminal as a Powder-backed project Captain without rewriting or elevating its bearer token.",
+            summary: "Attach an existing control-capability terminal as a project Captain without rewriting or elevating its bearer token.",
             input_schema: schema_attach_captain,
         },
         ToolDef {
