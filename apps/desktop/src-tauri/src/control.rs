@@ -20098,6 +20098,7 @@ fn start_agent(
         resume_point: None,
         runtime_state: RuntimeState::Starting,
         work_stage: crate::agent_session::WorkStage::Assigned,
+        delivery: None,
         created_at: now,
         updated_at: now,
     };
@@ -27991,6 +27992,7 @@ mod tests {
                 resume_point: None,
                 runtime_state: crate::agent_session::RuntimeState::Starting,
                 work_stage: crate::agent_session::WorkStage::Assigned,
+                delivery: None,
                 created_at: 2,
                 updated_at: 2,
             })
