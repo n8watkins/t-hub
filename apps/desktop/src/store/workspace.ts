@@ -533,7 +533,7 @@ interface WorkspaceState {
   ) => Promise<TerminalId | null>;
   /** Remove a git worktree only after the backend's unified safety service admits
    *  it. The current backend fails closed before this store detaches any tile;
-   *  activation waits for canonical Git, ownership, lease, and Powder decisions. */
+   *  activation waits for canonical Git, ownership, and lease decisions. */
   removeWorktreeWorkspace: (
     repoRoot: string,
     worktreePath: string,
