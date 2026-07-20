@@ -1,4 +1,4 @@
-// The sidebar - Captains supervision + Workspaces navigation + Recent recall.
+// The sidebar - Captains supervision + Workspaces navigation + History.
 //
 // In the product model the sidebar is three lists:
 //   1. Captains - one row per PINNED captain (docs/CAPTAIN-SIDEBAR-PRD.md,
@@ -9,8 +9,8 @@
 //      inside it (feat/workspaces-lifecycle). Clicking a row switches to that
 //      workspace; clicking a nested terminal switches to it AND focuses it. The
 //      active workspace is expanded + subtly highlighted.
-//   3. Recent  — past Claude sessions you can RECALL: clicking re-spawns a
-//      terminal in that session's directory and resumes it (`claude --resume`).
+//   3. History - active and resumable Claude and Codex conversations, keyed by
+//      exact backend-owned identity.
 //      Capped to ~3 rows (scrolls internally) so history can't crowd the
 //      supervision surface above.
 //
@@ -46,7 +46,7 @@ import { LayoutGrid } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
-import { RecentList } from "./RecentList";
+import { HistoryList } from "./HistoryList";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { ChevronIcon } from "./SidebarChrome";
@@ -63,7 +63,7 @@ import type { TerminalId } from "../ipc/types";
 
 /**
  * The sidebar's 3-state collapse mode (App owns + persists it; #1):
- *  - "full": the resizable full-width Projects + Recent surface.
+ *  - "full": the resizable full-width Workspaces + History surface.
  *  - "rail": a thin ~48px strip showing just iconic section markers + a compact
  *    workspace list, "barely showing" but still useful for switching tabs.
  *  - "hidden": not rendered at all (App skips <Sidebar> entirely).
@@ -74,14 +74,14 @@ export type SidebarMode = "full" | "rail" | "hidden";
 /** Pixel width of the rail strip (kept in sync with App's RAIL width). */
 export const SIDEBAR_RAIL_WIDTH = 48;
 
-/** Approximate height of ONE RecentList row. The rows are TWO-line
+/** Approximate height of ONE HistoryList row. The rows are TWO-line
  *  (ProjectRow: a 13px title line over an 11px subtitle, ~36px of text at the
  *  inherited 1.5 leading) plus py-1.5 (12px) - about 47px each. Exported so
  *  the layout test can tie the cap to the row height instead of a bare
  *  constant. */
 export const RECENT_ROW_APPROX_PX = 47;
 
-/** Max height of the RECENT section body: THREE full two-line rows plus the
+/** Max height of the History section body: THREE full two-line rows plus the
  *  list's own chrome (2 gap-0.5 seams between rows + the container's py-1),
  *  per the captain-sidebar PRD - a short scrollable tail instead of the old
  *  38vh wall, freeing the vertical space the Captains section moves into. */
@@ -153,7 +153,7 @@ interface FullProps {
   onToggleSidebar?: () => void;
 }
 
-function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
+function SidebarFull({ width, onToggleSidebar }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
 
   // The Workspaces section count must match what WorkspacesList renders, which
@@ -163,9 +163,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   const workspaceCount = useWorkspace(
     (s) => s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length,
   );
-  // The Recent section's count is owned by RecentList (it does the fetch +
-  // hidden-filter); it reports its filtered length up so the header shows it.
-  const [recentCount, setRecentCount] = useState(0);
+  const [historyCount, setHistoryCount] = useState(0);
   // Pinned captains drive the Captains section; zero pins = no section at all
   // (the titlebar anchor's tooltip explains how to pin).
   const captainCount = useCaptain((s) => s.captainIds.length);
@@ -191,9 +189,8 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           titlebar's LEFT cluster (see Titlebar.tsx LeftChrome), so the sidebar
           starts straight at its content and reclaims that vertical space. */}
 
-      {/* Body: two stacked sections — Workspaces (EVERY tab + its terminals; the
-          one navigation surface now) and Recent (recallable past Claude
-          sessions). Each grows and scrolls internally; the whole body scrolls as
+      {/* Body: two stacked sections - Workspaces (EVERY tab + its terminals; the
+          one navigation surface now) and provider-neutral History. Each grows and scrolls internally; the whole body scrolls as
           a safety net on a short window. The old separate "Projects" section is
           gone — a workspace's terminals live under it in Workspaces. */}
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
@@ -266,23 +263,19 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           <WorkspacesList />
         </Section>
 
-        {/* Recent — past Claude sessions to resume. Collapsible, and capped to
-            ~3 rows with its own scroll (PRD: a short scrollable tail, not a
-            wall); the list scrolls inside this region, not the page. The count
-            is reported up from RecentList (post hidden-filter). */}
+        {/* History keeps active and closed conversations visible as exact rows.
+            It is capped to about three rows with its own scroll so it remains a
+            compact continuity surface. */}
         <Section
-          title="Recent"
-          count={recentCount}
+          title="History"
+          count={historyCount}
           className="border-b"
           collapsible
           storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
           bodyStyle={{ maxHeight: RECENT_BODY_MAX_PX }}
         >
-          <RecentList
-            onRecall={(id, cwd) => onRecall?.(id, cwd)}
-            onCount={setRecentCount}
-          />
+          <HistoryList onCount={setHistoryCount} />
         </Section>
       </div>
 
@@ -563,7 +556,7 @@ function RailStats() {
  * Rail mode (#1): a thin ~48px iconic strip — "barely showing" but still useful.
  * It stacks one square per workspace tab (its initial + a tiny tile count) so the
  * user can still switch tabs, then a small column of section glyphs (Projects /
- * Recent) as a hint of what the full sidebar holds.
+ * History) as a hint of what the full sidebar holds.
  */
 function SidebarRail({
   width,
@@ -815,7 +808,7 @@ function SidebarToggleIcon() {
 }
 
 // ===========================================================================
-// Sections. Each of the sidebar's two lists (Projects, Recent) is a simple
+// Sections. Each of the sidebar's primary lists is a simple
 // titled block: an uppercase header (with an optional count chip) over its body.
 // Unlike the old supervision sidebar these are NOT collapsible accordions —
 // there are only two, and both are primary, so they're always shown.

@@ -1,14 +1,14 @@
 // Sidebar section-layout tests for the captain-sidebar PRD (slice A): the
 // CAPTAINS section appears above WORKSPACES only while captains are pinned,
-// and the RECENT body is capped to ~3 rows (RECENT_BODY_MAX_PX) instead of the
+// and the HISTORY body is capped to ~3 rows (RECENT_BODY_MAX_PX) instead of the
 // old 38vh wall. Heavy children (recent fetch, usage pollers, WSL telemetry,
 // the workspaces list, the terminal pool behind the captain rows) are stubbed
 // - this suite pins the SECTION layout, not their internals.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render } from "@testing-library/react";
 
-vi.mock("./RecentList", () => ({
-  RecentList: () => <div data-testid="recent-list" />,
+vi.mock("./HistoryList", () => ({
+  HistoryList: () => <div data-testid="history-list" />,
 }));
 vi.mock("./WorkspacesList", () => ({
   WorkspacesList: () => <div data-testid="workspaces-list" />,
@@ -90,25 +90,25 @@ describe("Sidebar captains section", () => {
   });
 });
 
-describe("Sidebar recent cap", () => {
+describe("Sidebar History cap", () => {
   it("fits about THREE two-line rows (not fewer, not four)", () => {
     // jsdom has no layout engine, so visible-row-count is asserted as
     // arithmetic against the exported per-row height the cap is derived
-    // from: three full rows fit, a fourth cannot. RecentList rows are
+    // from: three full rows fit, a fourth cannot. HistoryList rows are
     // TWO-line (13px title + 11px subtitle + py-1.5), which is what sank
     // the first 104px cap (it assumed one-line rows and showed ~2).
     expect(RECENT_BODY_MAX_PX).toBeGreaterThanOrEqual(3 * RECENT_ROW_APPROX_PX);
     expect(RECENT_BODY_MAX_PX).toBeLessThan(4 * RECENT_ROW_APPROX_PX);
   });
 
-  it(`caps the Recent body at ${RECENT_BODY_MAX_PX}px with internal scroll`, () => {
+  it(`caps the History body at ${RECENT_BODY_MAX_PX}px with internal scroll`, () => {
     const { container } = render(<Sidebar mode="full" />);
     const capped = [...container.querySelectorAll<HTMLElement>("div")].find(
       (d) => d.style.maxHeight === `${RECENT_BODY_MAX_PX}px`,
     );
     expect(capped).toBeTruthy();
     expect(capped!.className).toContain("overflow-y-auto");
-    // The capped wrapper is the one holding the Recent list body.
-    expect(capped!.querySelector('[data-testid="recent-list"]')).toBeTruthy();
+    // The capped wrapper is the one holding the History list body.
+    expect(capped!.querySelector('[data-testid="history-list"]')).toBeTruthy();
   });
 });

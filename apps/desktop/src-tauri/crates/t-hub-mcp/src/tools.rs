@@ -12,13 +12,14 @@
 //!     `list_captains`, `list_projects`,
 //!     `list_fleet_watches`, `read_terminal`,
 //!     `my_capability`.
-//!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
+//!   - **Organization** (allowed, audited): `focus_session`, `history_list`,
+//!     `history_focus`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
 //!     `captain_bootstrap` and the agent-session operations.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
-//!     `start_agent`,
+//!     `history_resume`, `start_agent`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
 //!
@@ -165,6 +166,43 @@ fn schema_focus_session() -> Value {
             "sessionId": { "type": "string", "description": "Session to focus (switches tab + focuses its tile)." }
         },
         "required": ["sessionId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_list() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Optional case-insensitive label, path, or preview filter." },
+            "harness": { "type": "string", "enum": ["claude", "codex"], "description": "Optional exact Harness filter." },
+            "includeArchived": { "type": "boolean", "description": "Include archived conversations (default true)." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum rows to return (default 100)." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_focus() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "historyId": { "type": "string", "minLength": 1, "description": "Opaque exact History identity returned by history_list." }
+        },
+        "required": ["historyId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_history_resume() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "historyId": { "type": "string", "minLength": 1, "description": "Opaque exact History identity returned by history_list." },
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_:-]+$", "description": "Stable idempotency key retained through ambiguous response recovery." },
+            "targetTabId": { "type": "string", "minLength": 1, "description": "Optional existing destination workspace tab." }
+        },
+        "required": ["historyId", "requestId"],
         "additionalProperties": false
     })
 }
@@ -711,6 +749,18 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         // ---- Organization tier -----------------------------------------
         ToolDef {
+            name: "history_list",
+            tier: Tier::Organization,
+            summary: "List the provider-neutral History catalog with exact continuity and action compatibility.",
+            input_schema: schema_history_list,
+        },
+        ToolDef {
+            name: "history_focus",
+            tier: Tier::Organization,
+            summary: "Focus the unique live terminal for one exact active History identity.",
+            input_schema: schema_history_focus,
+        },
+        ToolDef {
             name: "focus_session",
             tier: Tier::Organization,
             summary: "Focus a session: switch to its tab and focus its tile.",
@@ -801,6 +851,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
             input_schema: schema_spawn_terminal,
+        },
+        ToolDef {
+            name: "history_resume",
+            tier: Tier::ProcessChanging,
+            summary: "Resume one exact provider conversation using backend-owned Harness, identity, cwd, and command selection.",
+            input_schema: schema_history_resume,
         },
         ToolDef {
             name: "start_agent",
@@ -898,11 +954,14 @@ mod tests {
             "read_terminal",
             "scribe_status",
             "focus_session",
+            "history_list",
+            "history_focus",
             "move_tile",
             "rename_tab",
             "new_tab",
             "focus_tab",
             "spawn_terminal",
+            "history_resume",
             "send_text",
             "send_keys",
             "close_terminal",
@@ -980,6 +1039,38 @@ mod tests {
         assert!(desc.contains("CONFIRMATION REQUIRED"), "desc: {desc}");
         assert_eq!(mcp["annotations"]["confirmationRequired"], true);
         assert_eq!(mcp["annotations"]["t-hubTier"], "process-changing");
+    }
+
+    #[test]
+    fn history_tools_expose_exact_identity_schemas_and_tiers() {
+        let list = find("history_list").unwrap();
+        assert_eq!(list.to_mcp()["annotations"]["t-hubTier"], "organization");
+        assert_eq!((list.input_schema)()["properties"]["limit"]["maximum"], 500);
+
+        let focus = find("history_focus").unwrap();
+        assert_eq!(focus.to_mcp()["annotations"]["t-hubTier"], "organization");
+        assert_eq!((focus.input_schema)()["required"], json!(["historyId"]));
+        assert_eq!(
+            (focus.input_schema)()["properties"]["historyId"]["minLength"],
+            1
+        );
+
+        let resume = find("history_resume").unwrap();
+        let advertised = resume.to_mcp();
+        assert_eq!(advertised["annotations"]["t-hubTier"], "process-changing");
+        assert_eq!(advertised["annotations"]["confirmationRequired"], true);
+        assert_eq!(
+            (resume.input_schema)()["required"],
+            json!(["historyId", "requestId"])
+        );
+        assert_eq!(
+            (resume.input_schema)()["properties"]["historyId"]["minLength"],
+            1
+        );
+        assert_eq!(
+            (resume.input_schema)()["properties"]["targetTabId"]["minLength"],
+            1
+        );
     }
 
     #[test]

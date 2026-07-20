@@ -260,6 +260,12 @@ impl StatusBridge {
         let touch = self.touch_seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut latest = self.latest.write();
+            if let Some(tmux_session) = snap.tmux_session.as_deref() {
+                latest.retain(|existing_id, (_, existing)| {
+                    existing_id == session_id
+                        || existing.tmux_session.as_deref() != Some(tmux_session)
+                });
+            }
             latest.insert(session_id.to_string(), (touch, snap.clone()));
             // Backstop for the leak: the statusline carries no session-end signal,
             // so ended sessions are never removed organically. Hard-bound the map
@@ -293,10 +299,9 @@ impl StatusBridge {
 
     /// Drop a session's snapshot — the seam for an explicit session-end eviction.
     /// The statusline payloads that feed [`Self::ingest`] carry no lifecycle/end
-    /// signal, so today the bridge relies on the [`STATUS_MAP_CAP`] LRU backstop to
-    /// bound growth; if a `SessionEnd` signal is ever routed here (as the
-    /// supervision reducer already evicts on), call this for prompt cleanup. Kept
-    /// in-crate and harmless when the session is already gone.
+    /// signal, so the agent journal's `SessionEnd` path calls this after emitting
+    /// the terminal supervision status. The [`STATUS_MAP_CAP`] LRU remains a
+    /// backstop for providers or older agents that do not emit lifecycle events.
     pub fn evict(&self, session_id: &str) {
         self.latest.write().remove(session_id);
     }
@@ -668,6 +673,18 @@ mod tests {
         );
         assert_eq!(snap.session_id, "s1");
         assert!(bridge.get("s1").is_some());
+    }
+
+    #[test]
+    fn a_new_session_identity_replaces_stale_evidence_for_the_same_tmux_pane() {
+        let bridge = StatusBridge::new();
+        let pane = serde_json::json!({ "cwd": "/repo", "tmux_session": "th_tile1" });
+        bridge.ingest("old-session", &pane, 1);
+        bridge.ingest("new-session", &pane, 2);
+
+        assert!(bridge.get("old-session").is_none());
+        assert!(bridge.get("new-session").is_some());
+        assert_eq!(bridge.all().len(), 1);
     }
 
     // --- Memory-leak fix: bounded growth ------------------------------------

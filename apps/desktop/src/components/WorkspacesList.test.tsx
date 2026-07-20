@@ -14,6 +14,7 @@ import { fireEvent, render, waitFor, within } from "@testing-library/react";
 
 const killTerminal = vi.fn((_id: string) => Promise.resolve());
 const invalidateRecentCache = vi.fn(() => Promise.resolve());
+const invalidateHistoryCache = vi.fn(() => Promise.resolve());
 
 // WorkspacesList -> TerminalRow reads the supervision/activity/theme/clientType
 // stores but never mounts a terminal; nothing here needs xterm, but popOutTab
@@ -26,6 +27,9 @@ vi.mock("../ipc/client", () => ({
 }));
 vi.mock("../ipc/recent", () => ({
   invalidateRecentCache: () => invalidateRecentCache(),
+}));
+vi.mock("../ipc/history", () => ({
+  invalidateHistoryCache: () => invalidateHistoryCache(),
 }));
 
 import { WorkspacesList } from "./WorkspacesList";
