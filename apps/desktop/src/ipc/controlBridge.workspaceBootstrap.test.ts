@@ -111,4 +111,26 @@ describe("workspace registry bootstrap", () => {
       expect.objectContaining({ baseSeq: 7 }),
     );
   });
+
+  it("keeps the local work workspace when the native report returns an error", async () => {
+    seed([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] }]);
+    controlRequest.mockResolvedValue({
+      seq: 8,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    invoke.mockResolvedValue({
+      seq: 8,
+      stale: true,
+      error: "Workspace report rejected",
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+
+    await bootstrapWorkspaceTabs();
+
+    expect(useWorkspace.getState().tabs.some((tab) => tab.id !== CAPTAINS_TAB_ID)).toBe(true);
+    expect(useWorkspace.getState().tabs).not.toEqual([
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+  });
 });

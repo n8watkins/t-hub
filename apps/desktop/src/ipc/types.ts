@@ -98,6 +98,8 @@ export interface TabReport {
 export interface TabReportResult {
   seq: number;
   stale?: boolean;
+  /** Native Tauri commands serialize apply errors as data instead of rejecting. */
+  error?: string;
   activeTabId?: string | null;
   tabs?: TabReport[];
 }

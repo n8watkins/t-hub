@@ -94,13 +94,9 @@ function adoptSync(args: ControlApply["args"]): boolean {
   if (!sync || typeof sync !== "object") return false;
   const { seq, tabs } = sync as { seq?: unknown; tabs?: unknown };
   if (typeof seq !== "number" || !Array.isArray(tabs)) return false;
+  if (!hasWorkWorkspace(tabs as TabReport[])) return true;
   lastSeq = seq;
-  adoptingRegistry = true;
-  try {
-    useWorkspace.getState().adoptRegistry(tabs as TabReport[]);
-  } finally {
-    adoptingRegistry = false;
-  }
+  adoptAuthoritativeTabs(tabs as TabReport[]);
   return true;
 }
 
@@ -112,6 +108,27 @@ function tabReports(tabs: ReturnType<typeof useWorkspace.getState>["tabs"]): Tab
     kind: t.kind ?? (t.id === "captains-reserved" ? "captain" : "work"),
     tileIds: t.order,
   }));
+}
+
+function hasWorkWorkspace(tabs: TabReport[]): boolean {
+  return tabs.some(
+    (tab) => (tab.kind ?? (tab.id === "captains-reserved" ? "captain" : "work")) === "work",
+  );
+}
+
+/** Apply only a usable authoritative snapshot. The server's legacy projection
+ * can briefly contain Captain Workspace alone during startup recovery; adopting
+ * that snapshot would erase the local work tab and make all visible terminals
+ * disappear. Keep the local layout until a real Work Workspace is available. */
+function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
+  if (!hasWorkWorkspace(tabs)) return false;
+  adoptingRegistry = true;
+  try {
+    useWorkspace.getState().adoptRegistry(tabs);
+  } finally {
+    adoptingRegistry = false;
+  }
+  return true;
 }
 
 /**
@@ -171,24 +188,17 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         repairedLocal.activeTabId,
         res.seq,
       );
+      if (typeof (repaired as { error?: unknown }).error === "string") {
+        surfaceLayoutSyncFailure((repaired as { error: string }).error);
+      }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      if (repaired.stale && Array.isArray(repaired.tabs)) {
-        adoptingRegistry = true;
-        try {
-          useWorkspace.getState().adoptRegistry(repaired.tabs);
-        } finally {
-          adoptingRegistry = false;
-        }
+      if (!repaired.error && repaired.stale && Array.isArray(repaired.tabs)) {
+        adoptAuthoritativeTabs(repaired.tabs);
       }
       return;
     }
 
-    adoptingRegistry = true;
-    try {
-      useWorkspace.getState().adoptRegistry(serverTabs);
-    } finally {
-      adoptingRegistry = false;
-    }
+    adoptAuthoritativeTabs(serverTabs);
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     surfaceLayoutSyncFailure(error);
@@ -609,17 +619,15 @@ function startTabReporter(): void {
     void import("./client")
       .then((m) => m.reportWorkspaceTabs(payload, activeTabId, lastSeq))
       .then((res: TabReportResult | void) => {
+        if (res?.error) {
+          throw new Error(res.error);
+        }
         layoutSyncFailed = false;
         if (res && typeof res.seq === "number") {
           lastSeq = res.seq;
           if (res.stale && Array.isArray(res.tabs)) {
             // A server mutation raced this report: converge on the registry.
-            adoptingRegistry = true;
-            try {
-              useWorkspace.getState().adoptRegistry(res.tabs);
-            } finally {
-              adoptingRegistry = false;
-            }
+            adoptAuthoritativeTabs(res.tabs);
           }
         }
       })
