@@ -155,6 +155,9 @@ Reusing a request ID with a different action, entry, or target tab returns a str
 The frontend retains one request ID through ambiguous response recovery and request-status polling.
 After process restart or reservation reap, the backend re-probes the exact terminal or archive reality before applying the action again.
 In-flight and completed-request identity is never keyed by cwd or bare session ID.
+The backend authorizes and replays a matching completed or in-flight durable request before consulting spawn capacity or consuming a spawn-rate token.
+Only a request that reaches an actual new terminal creation acquires spawn admission, and it holds that admission through tmux creation.
+If a fresh request reserves a durable terminal identity but capacity is refused, the backend cancels that new reservation before returning the refusal.
 
 The backend exposes `history_focus` with `historyId` for an entry whose continuity state is active.
 It re-resolves the exact Harness and conversation identity to one authoritative live terminal and then uses the existing focus operation internally.

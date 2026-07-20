@@ -10669,7 +10669,6 @@ fn governor_gate<'a>(
         // reserves when reconciliation actually needs a replacement runtime.
         "start_agent" | "reconcile_cortana" => Ok(None),
         "spawn_terminal"
-        | "history_resume"
         | "commission_captain"
         | "dispatch_crew"
         | "create_worktree"
@@ -10683,6 +10682,59 @@ fn governor_gate<'a>(
         }
         _ => Ok(None),
     }
+}
+
+/// Keep the public terminal and worktree primitives from becoming a second,
+/// incomplete Crew dispatcher.
+///
+/// A trusted in-process host still uses these primitives for UI terminals and
+/// internal launch transactions.
+/// An identified supervisor may also open a plain shell or a plain worktree.
+/// Once a request links the terminal to a Captain, launches a command, or asks
+/// for reserved Crew capacity, however, it is an agent assignment and must flow
+/// through `start_agent` so the exact baseline, lane claims, collision preflight,
+/// durable Starting record, and dependency evidence are one transaction.
+fn enforce_public_spawn_contract(
+    command: &str,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<(), String> {
+    if trusted_internal {
+        return Ok(());
+    }
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    let is_supervisor = caller.fleet_role.is_some()
+        || matches!(
+            caller.mint_role,
+            crate::identity::Role::General
+                | crate::identity::Role::Cortana
+                | crate::identity::Role::Captain
+        );
+    if !is_supervisor {
+        return Ok(());
+    }
+    let spawned_by = arg_str(args, "spawnedBy")
+        .or_else(|| arg_str(args, "spawned_by"))
+        .is_some_and(|value| !value.trim().is_empty());
+    let startup_command = arg_str(args, "startupCommand")
+        .or_else(|| arg_str(args, "startup_command"))
+        .is_some_and(|value| !value.trim().is_empty());
+    let shell_command = command == "spawn_terminal"
+        && arg_str(args, "shell").is_some_and(|value| !value.trim().is_empty());
+    let reserved_capacity = arg_str(args, "admissionPurpose")
+        .or_else(|| arg_str(args, "admission_purpose"))
+        .is_some_and(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("ordinary"));
+    let control_capability = arg_str(args, "capability")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("control"));
+    if spawned_by || startup_command || shell_command || reserved_capacity || control_capability {
+        return Err(format!(
+            "{command}: supervisor Crew/provider assignments must use start_agent with an exact sourceCommit, durable lane and dependency claims, collision preflight, and a Starting record; no terminal or worktree was created"
+        ));
+    }
+    Ok(())
 }
 
 fn requested_spawn_purpose(
@@ -10941,6 +10993,26 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // above), no side effect, so it is answered here from `cap` directly.
     if req.command == "my_capability" {
         return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
+    }
+
+    if matches!(req.command.as_str(), "spawn_terminal" | "create_worktree") {
+        if let Err(error) = enforce_public_spawn_contract(
+            &req.command,
+            &req.args,
+            caller.as_ref(),
+            trusted_internal,
+        ) {
+            audit_command(ctx, &req, tier, cap, "refused-contract", Some(&error));
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": "refused-contract",
+                    "error": error.as_str(),
+                }),
+            );
+            return ControlResponse::err(error);
+        }
     }
 
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
@@ -13884,9 +13956,15 @@ fn history_resume(
                 };
             }
             crate::history::AssociationLiveness::Inactive => {
+                if !history_pending_runtime_proof_expired(&pending) {
+                    return Err(retryable_error(
+                        "history_resume_in_flight: the durable terminal reservation is awaiting runtime creation",
+                    ));
+                }
                 // A fallback shell, closed pane, or replaced conversation cannot
-                // satisfy this reservation. Reap it, then reuse the same durable
-                // request and exact terminal identity for one clean relaunch below.
+                // satisfy an expired reservation. Reap it, then reuse the same
+                // durable request and exact terminal identity for one clean
+                // recovery launch below.
                 reap_history_pending_terminal(ctx, &pending)?;
                 if tmux::session_liveness(&tmux_target(&pending.terminal_id))
                     != tmux::SessionLiveness::Gone
@@ -13907,7 +13985,7 @@ fn history_resume(
     {
         return Err("history_unavailable: conversation is not resumable".to_string());
     }
-    let pending = match ctx.history.pending_resume(&request_id)? {
+    let (pending, reserved_here) = match ctx.history.pending_resume(&request_id)? {
         Some(pending) => {
             if pending.history_id != entry.history_id
                 || pending.harness != entry.harness
@@ -13918,7 +13996,7 @@ fn history_resume(
                         .into(),
                 );
             }
-            pending
+            (pending, false)
         }
         None => {
             let (authorized_ship_slug, authorized_project_id, authorized_assignment_id) =
@@ -13942,7 +14020,21 @@ fn history_resume(
                     error
                 });
             }
-            pending
+            (pending, true)
+        }
+    };
+    let _admission = match admit_spawn(ctx, SpawnPurpose::Ordinary) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            if reserved_here {
+                if let Err(cleanup) = ctx.history.cancel_resume_reservation(&pending) {
+                    return Err(retryable_error(format!(
+                        "{}; durable reservation cleanup also failed: {cleanup}",
+                        refusal.message
+                    )));
+                }
+            }
+            return Err(refusal.message);
         }
     };
     let mut spawn_args = json!({
@@ -22497,6 +22589,7 @@ fn create_worktree(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    enforce_public_spawn_contract("create_worktree", args, caller, trusted_internal)?;
     let repo_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("create_worktree requires a 'repoRoot' argument")?;
@@ -24549,6 +24642,12 @@ fn start_agent(
         "startupCommand": launch,
         "spawnedBy": captain_session_id,
     });
+    if matches!(
+        spawn_purpose,
+        SpawnPurpose::FleetAdmin | SpawnPurpose::ShipAdmin | SpawnPurpose::Recovery
+    ) {
+        spawn_args["capability"] = json!("control");
+    }
     if let Some(tab_id) = arg_str(args, "workspaceTabId") {
         spawn_args["tabId"] = json!(tab_id);
     }
@@ -24614,6 +24713,7 @@ fn spawn_terminal(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    enforce_public_spawn_contract("spawn_terminal", args, caller, trusted_internal)?;
     if !caller_is_apex(caller, trusted_internal) {
         let caller = caller
             .ok_or("acl: spawn_terminal requires General/Cortana or an active owning Captain")?;
@@ -24631,7 +24731,7 @@ fn spawn_terminal(
             .tile
             .as_deref()
             .ok_or("acl: spawn_terminal Captain has no terminal binding")?;
-        let captain = ctx
+        let owns_active_captain = ctx
             .captains
             .captain_for_session(caller_tile)
             .filter(|captain| {
@@ -24640,12 +24740,9 @@ fn spawn_terminal(
                     && caller.fleet_role == Some(FleetRole::Captain)
                     && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
             })
-            .ok_or("acl: spawn_terminal requires an active owning Captain")?;
-        let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
-        if spawned_by.as_deref() != captain.terminal_id.as_deref() {
-            return Err(
-                "acl: spawn_terminal Captain must name its own terminal in spawnedBy".into(),
-            );
+            .is_some();
+        if !owns_active_captain {
+            return Err("acl: spawn_terminal requires an active owning Captain".into());
         }
     }
     spawn_terminal_with_private_pane_command(ctx, args, None, false, false, true)
@@ -26087,6 +26184,67 @@ mod tests {
                 updated_at: 2,
             })
             .unwrap();
+    }
+
+    fn history_service_at(root: &std::path::Path) -> Arc<crate::history::HistoryService> {
+        let claude_root = root.join("claude");
+        let codex_root = root.join("codex");
+        std::fs::create_dir_all(&claude_root).unwrap();
+        std::fs::create_dir_all(&codex_root).unwrap();
+        Arc::new(crate::history::HistoryService::new(
+            claude_root,
+            codex_root,
+            Duration::from_secs(60),
+        ))
+    }
+
+    fn seed_history_resume(
+        history: &crate::history::HistoryService,
+        request_id: &str,
+        terminal_id: &str,
+        complete: bool,
+    ) -> (String, String) {
+        let history_id = format!("history:v1:{request_id}");
+        let conversation_id = format!("conversation-{request_id}");
+        let pending = crate::history::HistoryPendingResume {
+            request_id: request_id.to_string(),
+            history_id: history_id.clone(),
+            harness: crate::history::Harness::Codex,
+            conversation_id: conversation_id.clone(),
+            terminal_id: terminal_id.to_string(),
+            target_tab_id: None,
+            authorized_ship_slug: None,
+            authorized_project_id: None,
+            authorized_assignment_id: None,
+            reserved_at_ms: now_ms(),
+        };
+        history.reserve_resume(pending).unwrap();
+        if complete {
+            history
+                .record_resume(
+                    crate::history::HistoryBinding {
+                        history_id: history_id.clone(),
+                        harness: crate::history::Harness::Codex,
+                        conversation_id: conversation_id.clone(),
+                        terminal_id: terminal_id.to_string(),
+                    },
+                    crate::history::HistoryResumeOperation {
+                        request_id: request_id.to_string(),
+                        history_id: history_id.clone(),
+                        harness: crate::history::Harness::Codex,
+                        conversation_id: conversation_id.clone(),
+                        terminal_id: terminal_id.to_string(),
+                        target_tab_id: None,
+                        actual_tab_id: None,
+                        authorized_ship_slug: None,
+                        authorized_project_id: None,
+                        authorized_assignment_id: None,
+                        recorded_at_ms: now_ms(),
+                    },
+                )
+                .unwrap();
+        }
+        (history_id, conversation_id)
     }
 
     fn test_harness_command(harness: &str) -> (std::path::PathBuf, String) {
@@ -33525,6 +33683,13 @@ mod tests {
             false,
         )
         .is_err());
+        assert!(requested_spawn_purpose(
+            "start_agent",
+            &json!({"captainSessionId": "captain-one", "admissionPurpose": "fleet-admin"}),
+            Some(&captain),
+            false,
+        )
+        .is_err());
 
         let cortana = ResolvedIdentity {
             session_id: "cortana-identity".into(),
@@ -33544,6 +33709,166 @@ mod tests {
             .unwrap(),
             SpawnPurpose::FleetAdmin
         );
+    }
+
+    #[test]
+    fn public_captain_spawn_assignment_is_refused_before_rate_or_process_side_effects() {
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("captain-one", Some("ship-one"), vec![])
+            .unwrap();
+        let captain = mint_session(
+            &store,
+            crate::identity::Role::Captain,
+            "ship-one",
+            "captain-one",
+        );
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("captain-spawn-contract")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_identity_store(store)
+            .with_captains_registry(registry)
+            .with_apply_sink(sink.clone());
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "captain-spawn-contract",
+                &captain,
+                "spawn_terminal",
+                json!({
+                    "cwd": "/tmp",
+                    "spawnedBy": "captain-one",
+                    "startupCommand": "codex"
+                }),
+            ),
+        );
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert!(error.contains("must use start_agent"), "got: {error}");
+        assert!(ctx.captains.snapshot().captains[0].crew.is_empty());
+        assert!(sink.calls.lock().unwrap().is_empty());
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            "a contract refusal must not consume the sole spawn-rate token"
+        );
+    }
+
+    #[test]
+    fn start_agent_caller_cannot_set_its_own_capability() {
+        let ctx = test_ctx("start-agent-capability-contract");
+        let error = start_agent(
+            &ctx,
+            &json!({
+                "requestId": "caller-capability",
+                "captainSessionId": "captain-one",
+                "assignment": "Attempt capability relabel",
+                "directory": "/tmp",
+                "sourceCommit": "1111111111111111111111111111111111111111",
+                "visibleProductBug": false,
+                "laneId": "caller-capability",
+                "dependencies": [],
+                "mutableFiles": [],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": [],
+                "capability": "control"
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("unexpected argument"), "got: {error}");
+        assert!(error.contains("capability"), "got: {error}");
+        assert!(ctx.captains.snapshot().agent_sessions.is_empty());
+    }
+
+    #[test]
+    fn public_captain_worktree_assignment_is_refused_before_filesystem_or_rate_side_effects() {
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("captain-one", Some("ship-one"), vec![])
+            .unwrap();
+        let captain = mint_session(
+            &store,
+            crate::identity::Role::Captain,
+            "ship-one",
+            "captain-one",
+        );
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-contract-no-worktree-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let worktree = root.join("worktree");
+        let ctx = test_ctx("captain-worktree-contract")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_identity_store(store)
+            .with_captains_registry(registry);
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "captain-worktree-contract",
+                &captain,
+                "create_worktree",
+                json!({
+                    "repoRoot": root,
+                    "worktreePath": worktree,
+                    "spawnedBy": "captain-one",
+                    "startupCommand": "claude"
+                }),
+            ),
+        );
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert!(error.contains("must use start_agent"), "got: {error}");
+        assert!(!worktree.exists());
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            "a contract refusal must not consume the sole spawn-rate token"
+        );
+    }
+
+    #[test]
+    fn plain_supervisor_shell_and_worktree_remain_generic_operations() {
+        let captain = ResolvedIdentity {
+            session_id: "captain-identity".into(),
+            mint_role: crate::identity::Role::Captain,
+            tile: Some("captain-one".into()),
+            ship_slug: Some("ship-one".into()),
+            fleet_role: Some(FleetRole::Captain),
+            claude_uuid: None,
+        };
+        assert!(enforce_public_spawn_contract(
+            "spawn_terminal",
+            &json!({"cwd": "/tmp"}),
+            Some(&captain),
+            false,
+        )
+        .is_ok());
+        assert!(enforce_public_spawn_contract(
+            "create_worktree",
+            &json!({"repoRoot": "/repo", "worktreePath": "/worktree"}),
+            Some(&captain),
+            false,
+        )
+        .is_ok());
+        for command in ["spawn_terminal", "create_worktree"] {
+            let error = enforce_public_spawn_contract(
+                command,
+                &json!({"capability": "control"}),
+                Some(&captain),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("must use start_agent"), "got: {error}");
+        }
     }
 
     #[test]
@@ -33607,7 +33932,27 @@ mod tests {
     }
 
     #[test]
-    fn history_resume_cannot_bypass_spawn_capacity() {
+    fn fresh_history_resume_acquires_capacity_and_cancels_its_new_reservation_on_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        let codex_root = temp.path().join("codex/2026/07/20");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        let conversation_id = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            codex_root.join(format!(
+                "rollout-2026-07-20T10-00-00-{conversation_id}.jsonl"
+            )),
+            format!(
+                "{}\n{}",
+                json!({"type":"session_meta","payload":{"id":conversation_id,"cwd":"/tmp","model_provider":"openai"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Resume me"}})
+            ),
+        )
+        .unwrap();
+        let history = Arc::new(crate::history::HistoryService::new(
+            temp.path().join("claude"),
+            temp.path().join("codex"),
+            Duration::from_secs(60),
+        ));
         let ctx = test_ctx("history-cap")
             .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
             .with_live_sessions(|| {
@@ -33617,21 +33962,139 @@ mod tests {
                     "th_live0003".into(),
                     "th_live0004".into(),
                 ])
-            });
+            })
+            .with_history_service(history.clone());
+        let listed = history_list(&ctx, &json!({"limit": 10}), None, true).unwrap();
+        let history_id = listed["entries"][0]["historyId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let response = dispatch_authenticated(
             &ctx,
             req(
                 "history-cap",
                 "history_resume",
-                json!({"entryId": "history-entry"}),
+                json!({"historyId": history_id, "requestId": "fresh-capacity"}),
             ),
         );
         assert!(!response.ok);
         let error = response.error.unwrap();
         assert!(error.contains("dispatch refused"), "got: {error}");
         assert!(
-            !error.contains("entryId"),
-            "handler ran before admission: {error}"
+            history.pending_resume("fresh-capacity").unwrap().is_none(),
+            "a pre-spawn capacity refusal must not strand a durable reservation"
+        );
+    }
+
+    #[test]
+    fn completed_history_replay_precedes_full_capacity_and_preserves_one_rate_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = history_service_at(temp.path());
+        let (full_history_id, _) =
+            seed_history_resume(&history, "completed-full", "cmpfull1", true);
+        let full = test_ctx("history-completed-full")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| {
+                Ok(vec![
+                    "th_live0001".into(),
+                    "th_live0002".into(),
+                    "th_live0003".into(),
+                    "th_live0004".into(),
+                ])
+            })
+            .with_history_service(history.clone());
+        let replay = dispatch_authenticated(
+            &full,
+            req(
+                "history-completed-full",
+                "history_resume",
+                json!({"historyId": full_history_id, "requestId": "completed-full"}),
+            ),
+        );
+        assert!(!replay.ok);
+        let error = replay.error.unwrap();
+        assert!(
+            error.contains("history_previous_resume_closed"),
+            "got: {error}"
+        );
+        assert!(!error.contains("spawn refused"), "got: {error}");
+
+        let (token_history_id, _) =
+            seed_history_resume(&history, "completed-token", "cmptoken", true);
+        let one_token = test_ctx("history-completed-token")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_history_service(history);
+        let replay = dispatch_authenticated(
+            &one_token,
+            req(
+                "history-completed-token",
+                "history_resume",
+                json!({"historyId": token_history_id, "requestId": "completed-token"}),
+            ),
+        );
+        assert!(!replay.ok);
+        assert!(replay
+            .error
+            .unwrap_or_default()
+            .contains("history_previous_resume_closed"));
+        assert!(
+            admit_spawn(&one_token, SpawnPurpose::Ordinary).is_ok(),
+            "completed replay must not consume the sole spawn-rate token"
+        );
+    }
+
+    #[test]
+    fn pending_history_replay_precedes_full_capacity_and_preserves_one_rate_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = history_service_at(temp.path());
+        let terminal_id = "pendrep1";
+        let (history_id, _) = seed_history_resume(&history, "pending-replay", terminal_id, false);
+
+        let full = test_ctx("history-pending-full")
+            .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
+            .with_live_sessions(|| {
+                Ok(vec![
+                    "th_live0001".into(),
+                    "th_live0002".into(),
+                    "th_live0003".into(),
+                    "th_live0004".into(),
+                ])
+            })
+            .with_history_service(history.clone());
+        let replay = dispatch_authenticated(
+            &full,
+            req(
+                "history-pending-full",
+                "history_resume",
+                json!({"historyId": history_id, "requestId": "pending-replay"}),
+            ),
+        );
+        assert!(!replay.ok);
+        let error = replay.error.unwrap();
+        assert!(error.contains("history_resume_in_flight"), "got: {error}");
+        assert!(!error.contains("spawn refused"), "got: {error}");
+
+        let one_token = test_ctx("history-pending-token")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 1.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_history_service(history);
+        let replay = dispatch_authenticated(
+            &one_token,
+            req(
+                "history-pending-token",
+                "history_resume",
+                json!({"historyId": "history:v1:pending-replay", "requestId": "pending-replay"}),
+            ),
+        );
+        assert!(!replay.ok);
+        assert!(replay
+            .error
+            .unwrap_or_default()
+            .contains("history_resume_in_flight"));
+        assert!(
+            admit_spawn(&one_token, SpawnPurpose::Ordinary).is_ok(),
+            "pending replay must not consume the sole spawn-rate token"
         );
     }
 
@@ -34100,7 +34563,8 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let ctx = test_ctx("start-agent-success").with_apply_sink(sink);
+        let mut ctx = test_ctx("start-agent-success").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:1".into();
         let (base, repo_root, worktree) = scratch_repo_with_worktree();
         let source_commit = exact_head(&worktree);
         let repo = worktree.to_string_lossy().to_string();
@@ -34165,6 +34629,13 @@ mod tests {
         assert!(agent.provider_conversation_id.is_none());
         assert_eq!(response["runtimeState"], "running");
         assert!(response.get("providerConversationId").is_none());
+        assert_eq!(
+            tmux::session_environment(&tmux_target(agent_session_id), "T_HUB_CONTROL_TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("read-start-agent-success"),
+            "ordinary implementation lanes must remain read-only"
+        );
         let event = ctx
             .captains
             .snapshot()
@@ -34174,6 +34645,86 @@ mod tests {
             .expect("started lifecycle event");
         assert_eq!(event.kind, "started");
         assert_eq!(event.runtime_state, Some(RuntimeState::Running));
+
+        reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn authorized_admin_start_agent_receives_control_capability() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("start-fleet-admin").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:1".into();
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let repo = worktree.to_string_lossy().to_string();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-fleet-admin".into(),
+                name: "Fleet Admin Project".into(),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-fleet-admin", Some("captain-fleet-admin"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-fleet-admin",
+                "project-fleet-admin",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+
+        let response = dispatch(
+            &ctx,
+            "start_agent",
+            &json!({
+                "requestId": "start-fleet-admin",
+                "captainSessionId": "captain-fleet-admin",
+                "assignment": "Perform delegated fleet administration",
+                "directory": repo,
+                "harness": "codex",
+                "sourceCommit": source_commit,
+                "visibleProductBug": false,
+                "laneId": "lane-fleet-admin",
+                "dependencies": [],
+                "mutableFiles": [],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": [],
+                "admissionPurpose": "fleet-admin"
+            }),
+        )
+        .unwrap();
+        let agent_session_id = response["agentSessionId"].as_str().unwrap();
+        assert_eq!(
+            tmux::session_environment(&tmux_target(agent_session_id), "T_HUB_CONTROL_TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("start-fleet-admin"),
+            "an authorized administrative lane must receive control capability"
+        );
+        let agent = ctx
+            .captains
+            .snapshot()
+            .agent_sessions
+            .into_iter()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .unwrap();
+        assert_eq!(
+            agent.admission_purpose,
+            crate::governor::AdmissionPurpose::FleetAdmin
+        );
 
         reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
         std::fs::remove_dir_all(base).ok();

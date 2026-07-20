@@ -450,9 +450,11 @@ fn cmd_spawn(args: &[String]) -> Result<(), CliError> {
         spawn_args["name"] = json!(name);
     }
     let ep = endpoint()?;
-    // spawn_terminal is gated off in the running build (PRD §11.2). We surface
-    // the server's message verbatim and map it to exit 5 (gated) via the From
-    // impl — do NOT try to bypass it — plus an operator fallback in text mode.
+    // `spawn_terminal` is only a generic user-shell primitive.
+    // The backend refuses supervisor Crew/provider assignments and directs them
+    // through `start_agent`, which owns the durable dispatch transaction.
+    // Keep surfacing any deployment-specific gate verbatim with the existing
+    // operator fallback.
     match control::call(&ep, "spawn_terminal", spawn_args) {
         Ok(result) => {
             if f.json {

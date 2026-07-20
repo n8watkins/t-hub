@@ -251,6 +251,67 @@ fn start_sends_the_exact_baseline_and_adaptive_lane_contract() {
         request["args"]["integrationContracts"],
         serde_json::json!([])
     );
+    assert!(request["args"].get("capability").is_none());
+    assert!(request["args"].get("admissionPurpose").is_none());
+}
+
+#[test]
+fn start_forwards_only_a_valid_durable_admission_purpose() {
+    let source_commit = "a".repeat(40);
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "start",
+        "--request-id",
+        "request-admin",
+        "--captain",
+        "captain-1",
+        "--directory",
+        "/tmp/worktree",
+        "--assignment",
+        "Perform delegated administration",
+        "--source-commit",
+        &source_commit,
+        "--lane-id",
+        "admin-lane",
+        "--integration-contracts-json",
+        "[]",
+        "--admission-purpose",
+        "fleet-admin",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "start_agent");
+    assert_eq!(request["args"]["admissionPurpose"], "fleet-admin");
+    assert!(request["args"].get("capability").is_none());
+}
+
+#[test]
+fn start_rejects_unknown_admission_purpose_before_control_call() {
+    let source_commit = "a".repeat(40);
+    assert_usage(
+        &[
+            "agents",
+            "start",
+            "--request-id",
+            "request-admin",
+            "--captain",
+            "captain-1",
+            "--directory",
+            "/tmp/worktree",
+            "--assignment",
+            "Perform delegated administration",
+            "--source-commit",
+            &source_commit,
+            "--lane-id",
+            "admin-lane",
+            "--integration-contracts-json",
+            "[]",
+            "--admission-purpose",
+            "captain",
+            "--json",
+        ],
+        "th agents start: --admission-purpose must be ordinary, fleet-admin, ship-admin, or recovery",
+    );
 }
 
 #[test]

@@ -147,9 +147,9 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `watch_fleet` | Organization | allowed, **audited** | arms a server-side push that re-invokes THIS orchestrator's loop (injects a prompt into its terminal) when a watched session (default: any captain) goes idle / needs-input / completes; idempotent (re-arming replaces the prior watch) |
 | `unwatch_fleet` | Organization | allowed, **audited** | disarms the orchestrator wake previously armed with `watch_fleet` |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
-| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; optional `spawnedBy` records the worktree terminal as a captain's crew |
+| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns a generic worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; supervisor agent assignments are refused and must use `start_agent` after creating the worktree |
 | `remove_worktree` | Organization | temporarily unavailable | source `0.3.88` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
-| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all; optional `spawnedBy` records the session as a captain's crew |
+| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns a generic user terminal, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; supervisor Crew/provider assignments are refused before admission and must use `start_agent` |
 | `commission_captain` | **Process-changing** | **confirmation required** | starts a new control-capability Codex or Claude Captain and binds it to a registered Project |
 | `attach_captain` | **Process-changing** | **confirmation required** | attaches an existing live harness only when it already holds the current control capability; read-only terminals are refused without changing their token |
 | `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
@@ -231,7 +231,10 @@ The contract mirrors the tab registry, with one difference (it is **persistent**
 - **Overlay pinning is visual only.** A pin changes the local summon overlay without claiming authority, changing capability, or moving the terminal.
 - **Commissioning and attachment create authority explicitly.** `commission_captain` starts a new control-capability harness, while `attach_captain` accepts only an existing harness that already holds the current control token. Both require a registered Project; neither requires Powder.
 - **Claims remain registry-first.** `claim_captain`, commissioning, attachment, and release mutate the registry before forwarding the authoritative claim snapshot under `args.sync` on a `sync_captains` `control://apply`. The UI keeps overlay MRU membership as independent view state.
-- **`spawnedBy` links crew.** `spawn_terminal` and `create_worktree` accept a `spawnedBy` captain session id and record the spawned session under that captain's `crew` (an unclaimed `spawnedBy` never fails the spawn - `crewRecorded: false` tells the caller to `claim_captain` first). This is what makes the sidebar's crew counts and per-crewmate rows real rather than a count of Task-tool subagents.
+- **`start_agent` links Crew.**
+  Public `spawn_terminal` and `create_worktree` no longer expose `spawnedBy` or reserved admission classes.
+  A supervisor request that tries to link Crew, launch a provider command, or consume reserved Crew capacity is refused before the governor or any filesystem/process side effect.
+  `start_agent` is the only public Crew assignment transaction and records the Captain relationship together with the exact baseline, lane claims, dependency evidence, collision preflight, and durable Starting state.
 - **Lifecycle cleanup is server-side.** `close_terminal` drops the dead session from the registry - a captain's death releases its claim, a crewmate's death leaves every crew list. `close_tab` prunes the closed tab from every captain's `workspaceTabIds` (the claim survives; a captain can control zero tabs). Each cleanup forwards a `sync_captains` snapshot.
 - **Survives restarts.** Unlike tabs (which the frontend re-seeds on boot), the captains registry is written through to `~/.t-hub/captains.json` (override `T_HUB_CAPTAINS_FILE`; the dev build isolates it under `~/.t-hub-dev`) on every mutation, including the revision, and reloaded on launch. localStorage keeps only view state (overlay geometry, MRU order). A missing or corrupt file starts empty and heals on the first write.
 
@@ -246,6 +249,9 @@ assignment, and selected harness.
 `start_agent` starts one durable agent session in an existing Project checkout.
 The session record contains the Captain relationship, assignment, directory,
 detected worktree and branch, harness, runtime state, and work stage.
+Ordinary implementation lanes receive read capability.
+Authorized `fleet-admin`, `ship-admin`, and `recovery` admissions receive control capability so a separately appointed durable role can execute its permitted administrative operations.
+Callers cannot pass a raw capability override, and the admission purpose never grants the administrative role by itself.
 `list_agents`, `get_agent`, `agent_events`, and `captain_bootstrap` provide
 bounded recovery reads, while `agent_checkpoint` records concise local progress
 or handoff evidence.

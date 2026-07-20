@@ -40,7 +40,7 @@ fn print_help() {
     println!(
         "usage: th agents <preflight|start|list|show|checkpoint|delivery|events> [flags]\n\n\
 preflight  --project ID --lanes-json JSON [--integration-contracts-json JSON] [--json]\n\
-start      --request-id ID --captain ID --directory PATH --assignment TEXT --source-commit COMMIT --lane-id ID [ownership flags]\n\
+start      --request-id ID --captain ID --directory PATH --assignment TEXT --source-commit COMMIT --lane-id ID [ownership flags] [--admission-purpose PURPOSE]\n\
 list       --captain ID or --project ID [--cursor N] [--limit N] [--state active|removed] [--json]\n\
 show       <agentSessionId> [--json]\n\
 checkpoint <agentSessionId> <summary> --author ID [--stage STAGE] [--json]\n\
@@ -97,6 +97,7 @@ fn start(args: &[String]) -> Result<(), CliError> {
             "--mutable-schemas",
             "--mutable-interfaces",
             "--integration-contracts-json",
+            "--admission-purpose",
         ],
         &["--visible-product-bug", "--json"],
     )?;
@@ -141,6 +142,17 @@ fn start(args: &[String]) -> Result<(), CliError> {
                 "th agents start: --harness must be codex or claude",
             ));
         }
+    }
+    if let Some(purpose) = flags.options.get("--admission-purpose") {
+        if !matches!(
+            purpose.as_str(),
+            "ordinary" | "fleet-admin" | "ship-admin" | "recovery"
+        ) {
+            return Err(CliError::usage(
+                "th agents start: --admission-purpose must be ordinary, fleet-admin, ship-admin, or recovery",
+            ));
+        }
+        args["admissionPurpose"] = json!(purpose);
     }
     call_and_render("agents start", "start_agent", args, &flags)
 }

@@ -105,15 +105,15 @@ name over the loopback channel:
 | `th read <session>` | `read_terminal` | `--history N` for scrollback |
 | `th status [<session>]` | `list_terminals`+`get_status`, or `get_status`+`supervision_tree` | fleet table, or one session + its tree |
 | `th send <session> <text…>` | `send_text` | `--no-enter` to skip the trailing Enter |
-| `th spawn <cwd>` | `spawn_terminal` | **gated off** in the running build (exit 5) |
+| `th spawn <cwd>` | `spawn_terminal` | opens a generic user shell; supervisor agent assignments must use `th agents start` |
 | `th worktree ls [repoRoot]` | local git + `list_terminals` | lifecycle table: BRANCH / DIRTY / MERGED / LEASED |
-| `th worktree new <repoRoot> <branch>` | `create_worktree` (or local git when recycling) | `--path P` (defaults under `.claude/worktrees/`), `--tab T`, `--fresh` to skip pool reuse |
+| `th worktree new <repoRoot> <branch>` | `create_worktree` (or local git when recycling) | opens a generic shell; use `th agents start` afterward for a supervised assignment; `--path P` (defaults under `.claude/worktrees/`), `--tab T`, `--fresh` to skip pool reuse |
 | `th worktree rm <repoRoot> <path>` | `remove_worktree` | `--force` |
 | `th worktree prune [repoRoot]` | local git + `list_terminals`/`close_terminal` | dry-run by default; `--yes` executes, `--force` includes unmerged |
 | `th tabs` | `list_tabs` | |
 | `th health` | `wsl_health` | |
 | `th events` | `__subscribe_events` | streams the event bus until Ctrl-C |
-| `th agents start` | `start_agent` | starts one durable Codex or Claude agent in an existing Project checkout |
+| `th agents start` | `start_agent` | starts one durable Codex or Claude agent in an existing Project checkout; `--admission-purpose ordinary\|fleet-admin\|ship-admin\|recovery` selects the authorized capacity/capability class without exposing a raw capability override |
 | `th agents list` | `list_agents` | bounded agent summaries by Captain or Project |
 | `th agents show` | `get_agent` | full durable agent record |
 | `th agents checkpoint` | `agent_checkpoint` | appends a bounded resume checkpoint |

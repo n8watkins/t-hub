@@ -323,12 +323,10 @@ fn schema_spawn_terminal() -> Value {
             "cwd":   { "type": "string", "description": "Working directory for the new terminal." },
             "shell": { "type": "string", "description": "Optional shell/command preset." },
             "name":  { "type": "string", "description": "Optional tile title." },
-            "startupCommand": { "type": "string", "description": "Optional command run inside an interactive login shell the pane execs back into (e.g. claude --resume <id>)." },
+            "startupCommand": { "type": "string", "description": "Optional user terminal command run inside an interactive login shell the pane execs back into. Supervisor agent assignments are refused here and must use start_agent." },
             "tabName": { "type": "string", "description": "Optional target workspace tab, by name: reused if it exists, created (hidden - the user's active tab is NOT switched) if not." },
             "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." },
-            "spawnedBy": { "type": "string", "description": "Optional captain session id: records the spawned session as that captain's CREW in the captains registry (requires the captain to have claim_captain'd; an unclaimed id records nothing - crewRecorded: false)." },
-            "capability": { "type": "string", "enum": ["read", "control"], "description": "Capability the new session is granted (item-3 least-privilege, default \"read\"): \"read\" spawns a pure-work crew that can observe but not spawn/type/kill; \"control\" is a deliberate, audited elevation for a session that must orchestrate (e.g. a captain/orchestrator). Omitted defaults to \"read\"." },
-            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "description": "Capacity class for this Crew spawn. Omitted defaults to ordinary. Fleet-admin and recovery require General/Cortana authority. Ship-admin requires the same owning Captain named in spawnedBy. This reserves capacity only; the supervisor must still appoint the durable role explicitly." }
+            "capability": { "type": "string", "enum": ["read", "control"], "description": "Capability the generic terminal is granted (item-3 least-privilege, default \"read\"). Agent assignments and reserved administrative sessions must use start_agent." }
         },
         "additionalProperties": false
     })
@@ -357,10 +355,8 @@ fn schema_create_worktree() -> Value {
             "worktreePath": { "type": "string", "description": "Absolute POSIX path for the new worktree's working-tree dir." },
             "branch":       { "type": "string", "description": "Optional branch to check out at the worktree (must not be checked out elsewhere). Omitted => git creates a new branch named after the path's final component." },
             "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." },
-            "startupCommand": { "type": "string", "description": "Optional command the worktree terminal runs inside an interactive login shell it execs back into (e.g. claude --resume <id>) - same contract and exec path as spawn_terminal's startupCommand. Omitted boots a bare shell in the worktree dir." },
-            "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." },
-            "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the worktree terminal is granted (item-3 least-privilege, default \"read\"): same contract as spawn_terminal's capability - \"control\" is a deliberate, audited elevation." },
-            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "description": "Capacity class for the spawned Crew terminal, with the same supervisor-authorization contract as spawn_terminal." }
+            "startupCommand": { "type": "string", "description": "Optional user terminal command run in the new worktree. Supervisor agent assignments are refused here and must use start_agent after the worktree is created." },
+            "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the generic worktree terminal is granted (item-3 least-privilege, default \"read\"). Agent assignments and reserved administrative sessions must use start_agent." }
         },
         "required": ["repoRoot", "worktreePath"],
         "additionalProperties": false
@@ -950,7 +946,7 @@ fn schema_start_agent() -> Value {
             "mutableSchemas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "mutableInterfaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "integrationContracts": { "type": "array", "items": schema_integration_contract() },
-            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "default": "ordinary", "description": "Durable capacity intent for this agent. Admin and recovery purposes consume only their matching reserved slot and require supervisor authority. The value is persisted on the AgentSession but does not grant the role without a separate appointment." }
+            "admissionPurpose": { "type": "string", "enum": ["ordinary", "fleet-admin", "ship-admin", "recovery"], "default": "ordinary", "description": "Durable capacity intent for this agent. Ordinary implementation lanes receive read capability. Authorized admin and recovery lanes receive control capability so a later durable role appointment can execute administration. The value is persisted on the AgentSession but does not itself grant a role." }
         },
         "required": ["requestId", "captainSessionId", "assignment", "directory", "sourceCommit", "visibleProductBug", "laneId", "dependencies", "mutableFiles", "mutableSchemas", "mutableInterfaces", "integrationContracts"],
         "additionalProperties": false
@@ -1347,7 +1343,7 @@ pub fn catalog() -> Vec<ToolDef> {
             // organization actions; it carries the confirmation contract.
             name: "spawn_terminal",
             tier: Tier::ProcessChanging,
-            summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
+            summary: "Spawn a generic user terminal in a directory (optionally into a named workspace tab, without switching the user's view). Supervisor agent assignments must use start_agent.",
             input_schema: schema_spawn_terminal,
         },
         ToolDef {
@@ -1401,7 +1397,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "create_worktree",
             tier: Tier::Organization,
-            summary: "Create a git worktree at a path (optionally a branch), open it as a new workspace tab, and spawn a terminal in the worktree dir.",
+            summary: "Create a git worktree at a path (optionally a branch), open it as a new workspace tab, and spawn a generic terminal in the worktree dir. Supervisor agent assignments must use start_agent.",
             input_schema: schema_create_worktree,
         },
         ToolDef {
@@ -1977,12 +1973,16 @@ mod tests {
     }
 
     #[test]
-    fn spawn_paths_expose_spawned_by_for_crew_linkage() {
+    fn generic_spawn_paths_do_not_expose_crew_assignment_fields() {
         for name in ["spawn_terminal", "create_worktree"] {
             let schema = (find(name).unwrap().input_schema)();
             assert!(
-                schema["properties"]["spawnedBy"].is_object(),
-                "{name} must accept spawnedBy"
+                schema["properties"].get("spawnedBy").is_none(),
+                "{name} must not expose the legacy Crew linkage bypass"
+            );
+            assert!(
+                schema["properties"].get("admissionPurpose").is_none(),
+                "{name} must not expose reserved Crew capacity outside start_agent"
             );
         }
     }
@@ -2024,11 +2024,6 @@ mod tests {
         }
         assert_eq!(
             start["properties"]["admissionPurpose"]["enum"],
-            json!(["ordinary", "fleet-admin", "ship-admin", "recovery"])
-        );
-        let spawn = (find("spawn_terminal").unwrap().input_schema)();
-        assert_eq!(
-            spawn["properties"]["admissionPurpose"]["enum"],
             json!(["ordinary", "fleet-admin", "ship-admin", "recovery"])
         );
     }
@@ -2107,9 +2102,9 @@ mod tests {
 
     #[test]
     fn spawn_paths_expose_startup_command() {
-        // audit MED: create_worktree must accept startupCommand just like
-        // spawn_terminal, so a worktree crew can boot into its command (e.g.
-        // `claude --resume <id>`) instead of a bare shell.
+        // Generic user terminals may still launch a command.
+        // The control service rejects this field for supervisor dispatch and
+        // requires agent assignments to use start_agent instead.
         for name in ["spawn_terminal", "create_worktree"] {
             let schema = (find(name).unwrap().input_schema)();
             assert!(

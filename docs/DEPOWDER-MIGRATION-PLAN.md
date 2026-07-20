@@ -161,6 +161,10 @@ T-Hub detects and records the worktree and branch instead of requiring the calle
 
 Provider permission posture comes from established repository and Captain policy.
 
+Ordinary implementation lanes receive read control-channel capability.
+Authorized `fleet-admin`, `ship-admin`, and `recovery` admissions receive control capability for later role-authorized administration.
+The caller cannot pass `capability` directly, and an administrative admission purpose does not appoint the durable role.
+
 The caller cannot pass raw credentials, Powder identity, unrestricted endpoints, or arbitrary provider permission overrides.
 
 The operation must persist the assignment and a `starting` agent record before launching the harness.
