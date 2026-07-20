@@ -1468,13 +1468,13 @@ mod tests {
             .unwrap()
             .contains(&json!("manifest")));
         assert_eq!(
-            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
-                ["inputs"]["maxItems"],
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]["inputs"]
+                ["maxItems"],
             256
         );
         assert_eq!(
-            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]
-                ["inputs"]["items"]["additionalProperties"],
+            integrated["properties"]["evidence"]["properties"]["manifest"]["properties"]["inputs"]
+                ["items"]["additionalProperties"],
             false
         );
         let packaged = schema["oneOf"]
@@ -1493,8 +1493,7 @@ mod tests {
             "^[0-9a-fA-F]{64}$"
         );
         assert_eq!(
-            packaged["properties"]["evidence"]["properties"]["manifest"]
-                ["additionalProperties"],
+            packaged["properties"]["evidence"]["properties"]["manifest"]["additionalProperties"],
             false
         );
     }
