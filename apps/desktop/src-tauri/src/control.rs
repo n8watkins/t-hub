@@ -83,9 +83,10 @@ pub struct ControlRequest {
     /// carried ALONGSIDE the tier `token` so the app can resolve WHICH session (in what
     /// role, on what ship) is calling and enforce the enqueue/access ACLs against an
     /// unforgeable-across-sessions identity (`identity.rs` mint/bind/resolve). Absent for
-    /// the trusted control-token HOST (the app's own webview / MCP / fleet wake), which
-    /// never minted a session token; those callers resolve to no identity and the
-    /// cross-ship ACL FAILS OPEN for them (the NORM-now / LAW-target staging, §2.6).
+    /// a request carrying the exact in-process host proof (the app's own webview,
+    /// MCP, or fleet wake), which never minted a session token.
+    /// A shared control token without that host proof does not substitute for an
+    /// identity on Organization or ProcessChanging requests.
     /// `#[serde(default)]` so every pre-Phase-3 client keeps working unchanged.
     #[serde(default)]
     pub session: String,
@@ -8204,12 +8205,12 @@ const PROVIDER_SESSION_ENV: &str = "T_HUB_PROVIDER_SESSION";
 /// unavailable capacity observation, never an observation of zero sessions.
 type LiveSessionsFn = Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnPurpose {
     Ordinary,
     Cortana,
     FleetAdmin,
-    ShipAdmin,
+    ShipAdmin { ship_slug: String },
     Recovery,
 }
 
@@ -8500,8 +8501,9 @@ impl ControlContext {
     /// provider, reservation, and rate gates as a control-socket spawn.
     pub(crate) fn admit_ui_spawn(
         &self,
+        provider_lanes: usize,
     ) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
-        admit_spawn(self, SpawnPurpose::Ordinary)
+        admit_spawn(self, SpawnPurpose::Ordinary, provider_lanes, None)
     }
 }
 
@@ -9944,7 +9946,10 @@ fn authoritative_cortana_identity(
     let Some(tile) = identity.session_tile.as_deref() else {
         return false;
     };
-    let durable = ctx.captains.cortana_identity();
+    // Read all durable singleton facts from one versioned snapshot.  Mixing a
+    // standalone Cortana read with a later registry read admits torn authority.
+    let snapshot = ctx.captains.snapshot();
+    let durable = snapshot.cortana;
     if durable.generation == 0
         || durable.identity_id.as_deref() != Some(identity.id.as_str())
         || durable.terminal_id.as_deref() != Some(tile)
@@ -9955,9 +9960,7 @@ fn authoritative_cortana_identity(
     {
         return false;
     }
-    let active_cortana_claims = ctx
-        .captains
-        .snapshot()
+    let active_cortana_claims = snapshot
         .captains
         .into_iter()
         .filter(|captain| captain.role == FleetRole::Cortana && captain.state == ClaimState::Active)
@@ -10072,8 +10075,46 @@ fn caller_is_apex(caller: Option<&ResolvedIdentity>, trusted_internal: bool) -> 
         || caller.mint_role == crate::identity::Role::General
 }
 
+fn agent_session_has_privileged_admin_intent(agent: &AgentSessionRecord) -> bool {
+    matches!(
+        agent.admission_purpose,
+        crate::governor::AdmissionPurpose::FleetAdmin
+            | crate::governor::AdmissionPurpose::ShipAdmin
+            | crate::governor::AdmissionPurpose::Recovery
+    )
+}
+
+/// Administrative intent is permanent authority-boundary history.
+///
+/// The durable AgentSession record establishes this history while it is still in
+/// Starting, before a role is appointed, and keeps it after runtime and work-stage
+/// transitions.
+/// Grant records contribute the same history whether active, revoked, or invalidated.
 fn has_delegated_admin_history(ctx: &ControlContext, identity_id: &str) -> bool {
-    !ctx.delegated_admin.grants_for_actor(identity_id).is_empty()
+    if !ctx.delegated_admin.grants_for_actor(identity_id).is_empty() {
+        return true;
+    }
+    let Some(tile) = ctx
+        .identity
+        .get(identity_id)
+        .and_then(|identity| identity.session_tile)
+    else {
+        return false;
+    };
+    ctx.captains.snapshot().agent_sessions.iter().any(|agent| {
+        agent.agent_session_id == tile && agent_session_has_privileged_admin_intent(agent)
+    })
+}
+
+fn target_has_delegated_admin_history(ctx: &ControlContext, terminal_id: &str) -> bool {
+    let privileged_intent = ctx.captains.snapshot().agent_sessions.iter().any(|agent| {
+        agent.agent_session_id == terminal_id && agent_session_has_privileged_admin_intent(agent)
+    });
+    privileged_intent
+        || ctx
+            .identity
+            .for_tile(terminal_id)
+            .is_some_and(|identity| has_delegated_admin_history(ctx, &identity.id))
 }
 
 fn enforce_ship_authority(
@@ -10102,6 +10143,12 @@ fn enforce_attach_authority(
     target_terminal: &str,
     role: FleetRole,
 ) -> Result<(), String> {
+    if target_has_delegated_admin_history(ctx, target_terminal) {
+        return Err(
+            "acl: an administrative Crew identity cannot acquire Captain or Cortana authority"
+                .into(),
+        );
+    }
     if caller_is_apex(caller, trusted_internal) {
         return Ok(());
     }
@@ -10584,14 +10631,16 @@ fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
     format!("{base}/{CREW_GH_CONFIG_SUBDIR}")
 }
 
-/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
-/// spawn - the second, independent wall behind the PreToolUse gate ("hook OR missing
+/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a Crew spawn - the
+/// second, independent wall behind the PreToolUse gate ("hook OR missing
 /// credential"). Points `gh` at an empty config dir (so it finds no `hosts.yml`
 /// credential) AND blanks the common ambient token env vars at the SESSION level (a
 /// tmux `-e KEY=` overrides any inherited value), so a crew that evades the gate still
-/// fails at the remote for lack of a credential. Control-class spawns (captains) are
-/// NOT withheld - orchestrating IS their job.
-fn crew_credential_withholding_env() -> Vec<(String, String)> {
+/// fails at the remote for lack of a credential.
+/// Capability and organizational role are independent: an administrative Crew may
+/// receive the control capability for its exact operations while still receiving no
+/// ambient publishing credentials.
+pub(crate) fn crew_credential_withholding_env() -> Vec<(String, String)> {
     let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
     // them empty at the session level scrubs any value inherited from the app env.
@@ -10644,10 +10693,10 @@ fn audit_control_spawn(ctx: &ControlContext, command: &str, args: &Value) {
 /// Comms-plane Phase 2 (§2.3, D9): build the spawn env AND mint the session's
 /// per-session identity, injecting the per-session token (`T_HUB_SESSION_TOKEN`)
 /// ALONGSIDE the tier token that [`elevation_env`] already sets. Returns the env plus
-/// the minted identity so the caller binds it to the tile id once the spawn returns
-/// (the tile id is only known after `spawn_tmux_terminal`). When no capability env is
-/// injected (headless / addr unknown) no identity is minted and the session behaves
-/// exactly as before - the identity slice is additive.
+/// the minted identity. A known requested session id is bound durably before the
+/// child starts; a generic terminal id is bound once `spawn_tmux_terminal` returns.
+/// When no capability env is injected (headless / addr unknown) no identity is minted
+/// and the session behaves exactly as before - the identity slice is additive.
 ///
 /// Role at mint is best-effort `Crew`: `spawn_terminal` / `create_worktree` are the
 /// crew-spawn paths (a captain is created via `claim_captain`, not here).
@@ -10662,6 +10711,7 @@ fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
     command: &str,
+    requested_session_id: Option<&str>,
 ) -> Result<
     (
         Vec<(String, String)>,
@@ -10680,19 +10730,24 @@ fn spawn_env_with_identity(
     let capability = spawn_capability(args);
     if capability == Capability::Full {
         audit_control_spawn(ctx, command, args);
-    } else {
-        // item-3 §2.3.5: a read-class (crew) spawn also gets credential-withholding -
-        // gh pointed at an empty config dir + ambient tokens blanked - so a crew that
-        // evades the PreToolUse gate still fails at the remote. Control-class spawns
-        // (captains) keep their credentials (orchestrating is their job).
-        env.extend(crew_credential_withholding_env());
     }
+    // Every identity minted by this helper is Crew, including an administrator with
+    // the control capability. Role, not capability, decides ambient credential access.
+    env.extend(crew_credential_withholding_env());
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
         .or_else(|| arg_str(args, "spawned_by"))
         .and_then(|spawner| ctx.captains.ship_of(&spawner))
         .map(|m| m.ship_slug().to_string());
-    let identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship)?;
+    let identity = match requested_session_id {
+        Some(session_id) => ctx
+            .identity
+            .mint_and_bind(crate::identity::Role::Crew, ship, session_id)
+            .map_err(|error| {
+                format!("spawn_terminal: identity pre-binding persistence failed: {error}")
+            })?,
+        None => ctx.identity.mint_for(crate::identity::Role::Crew, ship)?,
+    };
     env.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
@@ -10713,9 +10768,21 @@ struct LiveSessionEvidence {
     pending_provider_sessions: usize,
 }
 
+fn agent_has_durable_provider_intent(agent: &AgentSessionRecord) -> bool {
+    if agent.work_stage == crate::agent_session::WorkStage::Stopped {
+        return false;
+    }
+    !(agent.work_stage == crate::agent_session::WorkStage::Complete
+        && agent
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.states().integrated))
+}
+
 fn live_session_evidence(
     ctx: &ControlContext,
     snapshot: &CaptainsSnapshot,
+    excluded_history_terminal_id: Option<&str>,
 ) -> Result<LiveSessionEvidence, String> {
     let sessions = (ctx.live_sessions)()
         .map_err(|error| format!("tmux session evidence unavailable: {error}"))?;
@@ -10724,22 +10791,41 @@ fn live_session_evidence(
         .filter(|session| session.starts_with("th_"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let durable_pending = snapshot
+    let durable_pending_sessions = snapshot
         .agent_sessions
         .iter()
         .filter(|agent| agent.runtime_state == RuntimeState::Starting)
         .filter(|agent| !live.contains(&tmux_target(&agent.agent_session_id)))
         .count();
+    let pending_agent_providers = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent_has_durable_provider_intent(agent))
+        .filter(|agent| !live.contains(&tmux_target(&agent.agent_session_id)))
+        .count();
+    let pending_history = ctx
+        .history
+        .pending_resumes()
+        .map_err(|error| format!("durable History provider intent is unavailable: {error}"))?
+        .into_iter()
+        .filter(|pending| {
+            excluded_history_terminal_id != Some(pending.terminal_id.as_str())
+                && !live.contains(&tmux_target(&pending.terminal_id))
+        })
+        .count();
     Ok(LiveSessionEvidence {
         tmux_sessions: live.iter().cloned().collect(),
-        total_live_sessions: live.len().saturating_add(durable_pending),
-        pending_provider_sessions: durable_pending,
+        total_live_sessions: live
+            .len()
+            .saturating_add(durable_pending_sessions)
+            .saturating_add(pending_history),
+        pending_provider_sessions: pending_agent_providers.saturating_add(pending_history),
     })
 }
 
 #[cfg(test)]
 fn live_session_count(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> Result<usize, String> {
-    Ok(live_session_evidence(ctx, snapshot)?.total_live_sessions)
+    Ok(live_session_evidence(ctx, snapshot, None)?.total_live_sessions)
 }
 
 /// Whether a `send_keys` payload carries a process-signal / kill-style key. The
@@ -10788,13 +10874,14 @@ fn governor_gate<'a>(
         {
             Ok(None)
         }
-        "spawn_terminal"
-        | "commission_captain"
-        | "dispatch_crew"
-        | "create_worktree"
-        | "add_worktree_workspace" => {
+        "spawn_terminal" | "dispatch_crew" | "create_worktree" | "add_worktree_workspace" => {
             let purpose = requested_spawn_purpose(command, args, caller, trusted_internal)?;
-            admit_spawn(ctx, purpose).map(Some)
+            let requested_provider_lanes = usize::from(
+                command == "dispatch_crew"
+                    || arg_str(args, "_providerHarness").is_some()
+                    || arg_str(args, "providerIntent").is_some(),
+            );
+            admit_spawn(ctx, purpose, requested_provider_lanes, None).map(Some)
         }
         "close_terminal" => ctx.governor.check_destructive(now).map(|()| None),
         "send_keys" if keys_are_kill_style(args) => {
@@ -10913,7 +11000,9 @@ fn requested_spawn_purpose(
                 && caller.tile.as_deref() == spawned_by.as_deref()
                 && caller.ship_slug.is_some()
             {
-                Ok(SpawnPurpose::ShipAdmin)
+                Ok(SpawnPurpose::ShipAdmin {
+                    ship_slug: caller.ship_slug.clone().expect("checked above"),
+                })
             } else {
                 Err(deny(
                     "ship-admin reserved capacity requires the same owning Captain in spawnedBy",
@@ -10936,14 +11025,20 @@ fn requested_spawn_purpose(
     }
 }
 
-fn durable_admission_purpose(purpose: SpawnPurpose) -> crate::governor::AdmissionPurpose {
+fn durable_admission_purpose(purpose: &SpawnPurpose) -> crate::governor::AdmissionPurpose {
     match purpose {
-        SpawnPurpose::Ordinary | SpawnPurpose::Cortana => {
-            crate::governor::AdmissionPurpose::Ordinary
-        }
+        SpawnPurpose::Ordinary => crate::governor::AdmissionPurpose::Ordinary,
+        SpawnPurpose::Cortana => crate::governor::AdmissionPurpose::Cortana,
         SpawnPurpose::FleetAdmin => crate::governor::AdmissionPurpose::FleetAdmin,
-        SpawnPurpose::ShipAdmin => crate::governor::AdmissionPurpose::ShipAdmin,
+        SpawnPurpose::ShipAdmin { .. } => crate::governor::AdmissionPurpose::ShipAdmin,
         SpawnPurpose::Recovery => crate::governor::AdmissionPurpose::Recovery,
+    }
+}
+
+fn ship_admin_scope(purpose: &SpawnPurpose) -> Option<String> {
+    match purpose {
+        SpawnPurpose::ShipAdmin { ship_slug } => Some(ship_slug.clone()),
+        _ => None,
     }
 }
 
@@ -11059,6 +11154,34 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     && identity.fleet_role.is_none()
                     && identity.tile.as_deref() == Some(agent.as_str())
             });
+
+    // A shared Full capability permits use of the mutation surface, but it does not
+    // identify who is exercising it.
+    // Every untrusted Organization or ProcessChanging request must also present a
+    // currently valid per-session identity.
+    // Only the exact in-process host provenance may omit that identity.
+    if cap == Capability::Full
+        && tier != CommandTier::Read
+        && !trusted_internal
+        && caller
+            .as_ref()
+            .is_none_or(|identity| identity.tile.is_none())
+    {
+        let message = format!(
+            "unauthorized: '{}' requires a valid T_HUB_SESSION_TOKEN with the control capability",
+            req.command
+        );
+        audit_command(ctx, &req, tier, cap, "refused-identity", Some(&message));
+        ctx.fanout.emit_event(
+            "control://governor",
+            &json!({
+                "command": req.command.as_str(),
+                "decision": "refused-identity",
+                "error": message.as_str(),
+            }),
+        );
+        return ControlResponse::err(message);
+    }
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
@@ -11557,9 +11680,8 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
     }))
 }
 
-/// The 3-arg dispatcher used by the in-file unit tests (a control-token HOST with no
-/// per-session caller: `None` identity + `Full` capability - the fail-open path the ACL
-/// treats as the trusted host). The authenticated production path calls
+/// The 3-arg dispatcher used by in-file unit tests as the exact trusted in-process
+/// host (`None` identity plus trusted host provenance). The authenticated production path calls
 /// [`dispatch_with_caller`] directly with the resolved caller. Kept so the ~90 existing
 /// dispatch tests read unchanged; the Phase-3 ACL tests call `dispatch_with_caller`.
 #[cfg(test)]
@@ -11571,9 +11693,8 @@ fn dispatch_with_caller(
     ctx: &ControlContext,
     command: &str,
     args: &Value,
-    // Comms-plane Phase 3: the resolved per-session caller (`None` = a control-token
-    // host that presented no session token), and its resolved tier capability. The ACL
-    // wiring for the enqueue/access/ack cells consumes both.
+    // Comms-plane Phase 3: the resolved per-session caller and exact trusted-host
+    // provenance are separate inputs. The ACL wiring consumes both.
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
@@ -12243,7 +12364,10 @@ fn dispatch_preflight(
         &source_commit,
     )?;
     let request = crate::governor::DispatchPreflight {
+        requested_provider_lanes: requested_lanes.len(),
         requested_lanes,
+        admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+        ship_admin_scope: None,
         active_lanes: active_dispatch_lanes(&snapshot, &project_id),
         satisfied_dependencies,
         integration_contracts,
@@ -14250,6 +14374,8 @@ fn history_resume(
     {
         return Err("history_unavailable: conversation is not resumable".to_string());
     }
+    let mut fresh_admission_lock = None;
+    let mut fresh_capacity = None;
     let (pending, reserved_here) = match ctx.history.pending_resume(&request_id)? {
         Some(pending) => {
             if pending.history_id != entry.history_id
@@ -14264,6 +14390,13 @@ fn history_resume(
             (pending, false)
         }
         None => {
+            // Serialize creation of fresh durable intents with admission.  If
+            // two resumes race, the second cannot become invisible pending
+            // demand while the first is being admitted.
+            let admission_lock = ctx
+                .dispatch_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (authorized_ship_slug, authorized_project_id, authorized_assignment_id) =
                 history_resume_owner(&authority);
             let pending = crate::history::HistoryPendingResume {
@@ -14285,21 +14418,42 @@ fn history_resume(
                     error
                 });
             }
+            let capacity = match evaluate_spawn_capacity(
+                ctx,
+                &SpawnPurpose::Ordinary,
+                1,
+                Some(&pending.terminal_id),
+            ) {
+                Ok(capacity) => capacity,
+                Err(refusal) => {
+                    let _ = ctx.history.cancel_resume_reservation(&pending);
+                    return Err(refusal.message);
+                }
+            };
+            fresh_admission_lock = Some(admission_lock);
+            fresh_capacity = Some(capacity);
             (pending, true)
         }
     };
-    let _admission = match admit_spawn(ctx, SpawnPurpose::Ordinary) {
-        Ok(admission) => admission,
-        Err(refusal) => {
-            if reserved_here {
-                if let Err(cleanup) = ctx.history.cancel_resume_reservation(&pending) {
-                    return Err(retryable_error(format!(
-                        "{}; durable reservation cleanup also failed: {cleanup}",
-                        refusal.message
-                    )));
+    let _admission = if let Some(lock) = fresh_admission_lock {
+        SpawnAdmissionGuard {
+            _lock: lock,
+            _capacity: fresh_capacity.expect("fresh capacity accompanies its admission lock"),
+        }
+    } else {
+        match admit_spawn(ctx, SpawnPurpose::Ordinary, 1, Some(&pending.terminal_id)) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                if reserved_here {
+                    if let Err(cleanup) = ctx.history.cancel_resume_reservation(&pending) {
+                        return Err(retryable_error(format!(
+                            "{}; durable reservation cleanup also failed: {cleanup}",
+                            refusal.message
+                        )));
+                    }
                 }
+                return Err(refusal.message);
             }
-            return Err(refusal.message);
         }
     };
     let mut spawn_args = json!({
@@ -15582,6 +15736,28 @@ fn commissioned_response(
     })
 }
 
+fn inspect_commission_contract(
+    ctx: &ControlContext,
+    project: &ProjectRecord,
+    ship_slug: &str,
+    assignment: &str,
+    harness: Harness,
+) -> Result<Option<Value>, String> {
+    let Some(captain) = existing_project_captain(ctx, &project.project_id, ship_slug)? else {
+        return Ok(None);
+    };
+    let same_contract = captain.assignment.as_deref() == Some(assignment)
+        && captain.harness.as_deref() == Some(harness.as_provider())
+        && captain.ship_slug == ship_slug;
+    if !same_contract {
+        return Err(format!(
+            "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
+            project.name, captain.ship_slug
+        ));
+    }
+    Ok(Some(commissioned_response(captain, project.clone(), true)))
+}
+
 fn detected_harness(terminal_id: &str) -> Option<String> {
     for provider in ["codex", "claude"] {
         if tmux::harness_liveness(&tmux_target(terminal_id), provider)
@@ -15741,7 +15917,9 @@ fn claim_cortana_runtime(
     ctx: &ControlContext,
     candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
 ) -> Result<CaptainRecord, String> {
-    let result = claim_captain(
+    // reconcile_cortana already owns the shared identity transaction.  Use the
+    // internal claim path to avoid recursively taking the non-reentrant lock.
+    let result = claim_captain_locked(
         ctx,
         &json!({
             "captainSessionId": candidate.terminal_id,
@@ -15749,6 +15927,8 @@ fn claim_cortana_runtime(
             "provider": candidate.harness,
             "providerSessionId": candidate.provider_session_id,
         }),
+        None,
+        true,
         None,
         true,
     )?;
@@ -16025,6 +16205,7 @@ fn reconcile_cortana(
         .ok_or("reconcile_cortana requires a stable non-empty operationId")?;
     let operation_id;
     {
+        let _identity_transaction = ctx.tabs.identity_transaction();
         let _provision = ctx.captains.provision_guard();
         let existing = ctx.captains.cortana_identity();
         operation_id = match &existing.recovery {
@@ -16054,6 +16235,7 @@ fn reconcile_cortana(
         .dispatch_admission
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let _provision = ctx.captains.provision_guard();
     let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
     let result = reconcile_cortana_inner(ctx, args, &operation_id, durable, true);
@@ -16189,7 +16371,7 @@ fn reconcile_cortana_inner(
             .pause_dispatch("cortana_spawn_admission_required");
         return Err(CORTANA_SPAWN_ADMISSION_REQUIRED.into());
     }
-    let _capacity = evaluate_spawn_capacity(ctx, SpawnPurpose::Cortana)
+    let _capacity = evaluate_spawn_capacity(ctx, &SpawnPurpose::Cortana, 1, None)
         .map_err(|refusal| format!("reconcile_cortana: {}", refusal.message))?;
     let harness_name = arg_str(args, "harness")
         .or_else(|| durable.harness.clone())
@@ -16292,7 +16474,10 @@ fn reconcile_cortana_inner(
         CORTANA_GENERATION_ENV.to_string(),
         plan.next_generation.to_string(),
     ));
-    elevation.push((PROVIDER_SESSION_ENV.to_string(), harness_name.clone()));
+    elevation.push((
+        PROVIDER_SESSION_ENV.to_string(),
+        pending_provider_marker(&harness_name),
+    ));
     let pane = crate::commands::pane_command(None, Some(&startup_command));
     let tmux_cwd = files::posix_form(&home);
     let (_, tmux_session) =
@@ -16455,18 +16640,46 @@ fn commission_captain(
     if ship_slug.is_empty() {
         return Err("commission_captain: could not derive a non-empty shipSlug".into());
     }
-    let _provision = ctx.captains.provision_guard();
-    if let Some(captain) = existing_project_captain(ctx, &project.project_id, &ship_slug)? {
-        let same_contract = captain.assignment.as_deref() == Some(assignment.as_str())
-            && captain.harness.as_deref() == Some(harness.as_provider())
-            && captain.ship_slug == ship_slug;
-        if !same_contract {
-            return Err(format!(
-                "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
-                project.name, captain.ship_slug
-            ));
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("commission_initial_inspection");
+    {
+        let _provision = ctx.captains.provision_guard();
+        if let Some(response) =
+            inspect_commission_contract(ctx, &project, &ship_slug, &assignment, harness)?
+        {
+            return Ok(response);
         }
-        return Ok(commissioned_response(captain, project, true));
+    }
+
+    // The inspection-only pass found no exact live Captain. Retry under the
+    // global spawn lock order used by Cortana: dispatch admission, then fleet
+    // provisioning. Recheck before charging capacity because another caller may
+    // have completed the identical commission while this caller waited.
+    let _admission_lock = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _provision = ctx.captains.provision_guard();
+    if let Some(response) =
+        inspect_commission_contract(ctx, &project, &ship_slug, &assignment, harness)?
+    {
+        return Ok(response);
+    }
+    let capacity =
+        evaluate_spawn_capacity_for_new_ship(ctx, &ship_slug).map_err(|refusal| refusal.message)?;
+    // Commissioning consumes the Captain's provider slot, but the new ship
+    // must also have room for its standing Ship Admin.  Keep that slot
+    // prospective so a provider cap of one cannot admit a ship that can never
+    // satisfy its required administration invariant.
+    let standing_admin_needed = capacity.reservations.ship_admins.deficit;
+    if capacity.provider_headroom < 1usize.saturating_add(standing_admin_needed)
+        || capacity.session_headroom_before_reservations
+            < 1usize.saturating_add(standing_admin_needed)
+    {
+        return Err(format!(
+            "commission_captain: insufficient capacity for Captain and standing Ship Admin (provider headroom {}, session headroom {})",
+            capacity.provider_headroom, capacity.session_headroom_before_reservations
+        ));
     }
 
     let provisional = CaptainRecord {
@@ -16551,7 +16764,7 @@ fn commission_captain(
     ));
     elevation.push((
         PROVIDER_SESSION_ENV.to_string(),
-        harness.as_provider().to_string(),
+        pending_provider_marker(harness.as_provider()),
     ));
     if let Err(error) = ctx
         .captains
@@ -16685,6 +16898,15 @@ fn attach_captain(
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("attach_captain requires a 'captainSessionId' argument")?;
+    // Target eligibility is an authority predicate, so evaluate it before runtime,
+    // provider, or Project probes can reveal information about a forbidden target.
+    enforce_attach_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        &terminal_id,
+        FleetRole::Captain,
+    )?;
     if !caller_is_apex(caller, trusted_internal)
         && caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str())
     {
@@ -16755,13 +16977,6 @@ fn attach_captain(
         .map(|value| slugify_ship(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
-    enforce_attach_authority(
-        ctx,
-        caller,
-        trusted_internal,
-        &terminal_id,
-        FleetRole::Captain,
-    )?;
     let _provision = ctx.captains.provision_guard();
     if let Some(existing) = existing_project_captain(ctx, &project_id, &ship_slug)? {
         if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
@@ -17889,9 +18104,11 @@ fn dispatch_crew_with_observer_inner(
             ));
         }
     };
-    if let Err(error) =
-        tmux::set_session_environment(&tmux_target, PROVIDER_SESSION_ENV, harness.as_provider())
-    {
+    if let Err(error) = tmux::set_session_environment(
+        &tmux_target,
+        PROVIDER_SESSION_ENV,
+        &pending_provider_marker(harness.as_provider()),
+    ) {
         rollback_launch_failure!(format!(
             "dispatch_crew: provider session marker could not be persisted: {error}"
         ));
@@ -21622,12 +21839,12 @@ fn supervisor_authority_for_caller(
     match caller.fleet_role {
         Some(FleetRole::Cortana) => {
             let durable = ctx.captains.cortana_identity();
-            let active = ctx.captains.snapshot().captains.iter().any(|captain| {
-                captain.role == FleetRole::Cortana
-                    && captain.state == ClaimState::Active
-                    && captain.terminal_id.as_deref() == caller.tile.as_deref()
-            });
-            if durable.identity_id.as_deref() != Some(caller.session_id.as_str()) {
+            let authoritative = ctx
+                .identity
+                .get(&caller.session_id)
+                .is_some_and(|identity| authoritative_cortana_identity(ctx, &identity));
+            if !authoritative || durable.identity_id.as_deref() != Some(caller.session_id.as_str())
+            {
                 return Err("delegated admin: caller is not the durable Cortana identity".into());
             }
             Ok(crate::delegated_admin::SupervisorAuthority {
@@ -21635,7 +21852,7 @@ fn supervisor_authority_for_caller(
                 role: crate::delegated_admin::DelegatingSupervisorRole::Cortana,
                 ship_slug: None,
                 authority_generation: durable.generation,
-                active,
+                active: true,
             })
         }
         Some(FleetRole::Captain) => {
@@ -21670,17 +21887,11 @@ fn current_delegating_supervisor(
     match grant.delegator.role {
         crate::delegated_admin::DelegatingSupervisorRole::Cortana => {
             let durable = ctx.captains.cortana_identity();
-            let active = durable.identity_id.as_deref().is_some_and(|identity_id| {
-                ctx.captains.snapshot().captains.iter().any(|captain| {
-                    captain.role == FleetRole::Cortana
-                        && captain.state == ClaimState::Active
-                        && captain.terminal_id.as_deref().is_some_and(|terminal_id| {
-                            ctx.identity
-                                .for_tile(terminal_id)
-                                .is_some_and(|identity| identity.id == identity_id)
-                        })
-                })
-            });
+            let active = durable
+                .identity_id
+                .as_deref()
+                .and_then(|identity_id| ctx.identity.get(identity_id))
+                .is_some_and(|identity| authoritative_cortana_identity(ctx, &identity));
             crate::delegated_admin::SupervisorAuthority {
                 identity_id: durable
                     .identity_id
@@ -21816,6 +22027,10 @@ fn appoint_admin(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    // Hold the registry's common mutation transaction across authority
+    // validation and grant commit.  Captain/Cortana claim or promotion cannot
+    // interleave between these two steps and invalidate the decision.
+    let _authorization_transaction = ctx.tabs.identity_transaction();
     require_exact_args(
         args,
         "appoint_admin",
@@ -21834,6 +22049,14 @@ fn appoint_admin(
     let supervisor = supervisor_authority_for_caller(ctx, caller)?;
     if !supervisor.active {
         return Err("appoint_admin requires an active supervisor".into());
+    }
+    if supervisor.role == crate::delegated_admin::DelegatingSupervisorRole::Cortana
+        && !matches!(
+            ctx.captains.snapshot().cortana.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        )
+    {
+        return Err("appoint_admin requires Cortana recovery to be healthy".into());
     }
     let actor_session_id = arg_str(args, "actorSessionId")
         .or_else(|| arg_str(args, "actor_session_id"))
@@ -23058,7 +23281,7 @@ fn create_worktree_authorized(
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
         let (elevation, minted_identity) =
-            match spawn_env_with_identity(ctx, args, "create_worktree") {
+            match spawn_env_with_identity(ctx, args, "create_worktree", None) {
                 Ok(value) => value,
                 Err(error) => {
                     let rollback = rollback_created_worktree_state(
@@ -24528,7 +24751,10 @@ fn recorded_admin_harness(snapshot: &CaptainsSnapshot, terminal_id: &str) -> Opt
         })
 }
 
-fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usize, usize) {
+fn live_admin_counts(
+    ctx: &ControlContext,
+    snapshot: &CaptainsSnapshot,
+) -> (usize, BTreeMap<String, usize>) {
     let active_captain_ships = snapshot
         .captains
         .iter()
@@ -24536,7 +24762,7 @@ fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usiz
         .map(|captain| captain.ship_slug.clone())
         .collect::<BTreeSet<_>>();
     let mut fleet_admin_actors = BTreeSet::new();
-    let mut ship_admin_scopes = BTreeSet::new();
+    let mut ship_admin_actors_by_scope = BTreeMap::<String, BTreeSet<String>>::new();
     for grant in ctx.delegated_admin.active_grants() {
         let actor = current_admin_actor(ctx, &grant);
         let supervisor = current_delegating_supervisor(ctx, &grant);
@@ -24565,13 +24791,22 @@ fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usiz
             crate::delegated_admin::DelegatedAdminRole::ShipAdmin => {
                 if let crate::delegated_admin::AdminScope::Ship { ship_slug } = grant.scope {
                     if active_captain_ships.contains(&ship_slug) {
-                        ship_admin_scopes.insert(ship_slug);
+                        ship_admin_actors_by_scope
+                            .entry(ship_slug)
+                            .or_default()
+                            .insert(grant.actor_identity_id);
                     }
                 }
             }
         }
     }
-    (fleet_admin_actors.len(), ship_admin_scopes.len())
+    (
+        fleet_admin_actors.len(),
+        ship_admin_actors_by_scope
+            .into_iter()
+            .map(|(scope, actors)| (scope, actors.len()))
+            .collect(),
+    )
 }
 
 fn packaged_provider_capacity_evidence() -> Result<ProviderCapacityEvidence, String> {
@@ -24637,10 +24872,7 @@ fn provider_capacity_from_environment(
 fn recorded_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeMap<String, String> {
     let mut harnesses = BTreeMap::new();
     for agent in &snapshot.agent_sessions {
-        if !matches!(
-            agent.runtime_state,
-            RuntimeState::Exited | RuntimeState::Unavailable
-        ) {
+        if agent_has_durable_provider_intent(agent) {
             harnesses.insert(tmux_target(&agent.agent_session_id), agent.provider.clone());
         }
     }
@@ -24660,11 +24892,25 @@ fn recorded_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeMap<String, 
     harnesses
 }
 
+fn durable_agent_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeMap<String, String> {
+    snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| agent_has_durable_provider_intent(agent))
+        .map(|agent| (tmux_target(&agent.agent_session_id), agent.provider.clone()))
+        .collect()
+}
+
+fn pending_provider_marker(harness: &str) -> String {
+    format!("pending:{harness}")
+}
+
 fn inspect_provider_live_sessions(
     snapshot: &CaptainsSnapshot,
     sessions: &[String],
 ) -> Result<usize, String> {
     let recorded = recorded_provider_harnesses(snapshot);
+    let durable_agents = durable_agent_provider_harnesses(snapshot);
     let mut live = 0usize;
     for tmux_session in sessions.iter().filter(|session| session.starts_with("th_")) {
         let marker = tmux::session_environment(tmux_session, PROVIDER_SESSION_ENV)
@@ -24673,16 +24919,24 @@ fn inspect_provider_live_sessions(
                     "provider session marker is unavailable for tmux session '{tmux_session}': {error}"
                 )
             })?;
-        let harness = match marker.as_deref() {
-            Some("none") => None,
-            Some(harness @ ("codex" | "claude")) => Some(harness.to_string()),
+        if durable_agents.contains_key(tmux_session) {
+            live = live.saturating_add(1);
+            continue;
+        }
+        let (harness, pending, established) = match marker.as_deref() {
+            Some("none") => (None, false, false),
+            Some("pending:codex") => (Some("codex".to_string()), true, false),
+            Some("pending:claude") => (Some("claude".to_string()), true, false),
+            Some("alive:codex") => (Some("codex".to_string()), false, true),
+            Some("alive:claude") => (Some("claude".to_string()), false, true),
+            Some(harness @ ("codex" | "claude")) => (Some(harness.to_string()), false, false),
             Some(other) => {
                 return Err(format!(
                     "provider session marker for tmux session '{tmux_session}' is invalid: '{other}'"
                 ));
             }
             None => match recorded.get(tmux_session).cloned() {
-                Some(harness) => Some(harness),
+                Some(harness) => (Some(harness), false, false),
                 None => {
                     let legacy_provider = ["codex", "claude"].into_iter().any(|harness| {
                         tmux::harness_liveness(tmux_session, harness)
@@ -24699,12 +24953,44 @@ fn inspect_provider_live_sessions(
             continue;
         };
         match tmux::harness_liveness(tmux_session, &harness) {
-            tmux::SessionLiveness::Alive => live = live.saturating_add(1),
+            tmux::SessionLiveness::Alive => {
+                live = live.saturating_add(1);
+                if pending {
+                    tmux::set_session_environment(
+                        tmux_session,
+                        PROVIDER_SESSION_ENV,
+                        &format!("alive:{harness}"),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "provider readiness marker could not be persisted for tmux session '{tmux_session}': {error}"
+                        )
+                    })?;
+                }
+            }
+            tmux::SessionLiveness::Gone if pending => {
+                // A dead terminal cannot become the provider runtime it was
+                // reserving.  Clear the marker and release the quota instead
+                // of leaking one provider slot forever after Harness exit.
+                // Count this observation once so the in-flight transition is
+                // fail-closed, then the cleared marker prevents future leaks.
+                live = live.saturating_add(1);
+                tmux::set_session_environment(tmux_session, PROVIDER_SESSION_ENV, "none")
+                    .map_err(|error| {
+                        format!(
+                            "provider pending marker could not be cleared for tmux session '{tmux_session}': {error}"
+                        )
+                    })?;
+            }
             tmux::SessionLiveness::Gone => {}
             tmux::SessionLiveness::Unknown => {
-                return Err(format!(
-                    "provider Harness evidence is unavailable for tmux session '{tmux_session}'"
-                ));
+                if pending || established {
+                    live = live.saturating_add(1);
+                } else {
+                    return Err(format!(
+                        "provider Harness evidence is unavailable for tmux session '{tmux_session}'"
+                    ));
+                }
             }
         }
     }
@@ -24747,6 +25033,12 @@ fn runtime_capacity_from_evidence(
         .map(|captain| captain.ship_slug.as_str())
         .collect::<BTreeSet<_>>()
         .len();
+    let active_captain_ships = snapshot
+        .captains
+        .iter()
+        .filter(|captain| captain.role == FleetRole::Captain && captain.state == ClaimState::Active)
+        .map(|captain| captain.ship_slug.clone())
+        .collect::<BTreeSet<_>>();
     let live_cortana = snapshot
         .cortana
         .terminal_id
@@ -24761,11 +25053,16 @@ fn runtime_capacity_from_evidence(
                         == tmux::SessionLiveness::Alive
             })
         }) as usize;
-    let live_recovery_sessions = matches!(
-        &snapshot.cortana.recovery,
-        crate::cortana_reconcile::CortanaRecoveryState::Recovering { .. }
-    ) as usize;
-    let (live_fleet_admins, live_ship_admins) = live_admin_counts(ctx, snapshot);
+    let live_recovery_sessions = snapshot
+        .agent_sessions
+        .iter()
+        .filter(|agent| {
+            agent.admission_purpose == crate::governor::AdmissionPurpose::Recovery
+                && agent_has_durable_provider_intent(agent)
+        })
+        .count();
+    let (live_fleet_admins, live_ship_admin_scopes) = live_admin_counts(ctx, snapshot);
+    let live_ship_admins = live_ship_admin_scopes.values().copied().sum();
     Ok(crate::governor::RuntimeCapacity {
         live_sessions,
         machine_healthy,
@@ -24775,44 +25072,31 @@ fn runtime_capacity_from_evidence(
         provider_capacity_status: provider.status,
         available_worktrees,
         active_captains,
+        active_captain_ships,
         live_cortana,
         live_fleet_admins,
         live_ship_admins,
+        live_ship_admin_scopes,
         live_recovery_sessions,
     })
 }
 
-fn prospective_capacity(
-    mut capacity: crate::governor::RuntimeCapacity,
+fn admit_spawn<'a>(
+    ctx: &'a ControlContext,
     purpose: SpawnPurpose,
-) -> crate::governor::RuntimeCapacity {
-    match purpose {
-        SpawnPurpose::Ordinary => {}
-        SpawnPurpose::Cortana => {
-            capacity.live_cortana = capacity.live_cortana.saturating_add(1);
-        }
-        SpawnPurpose::FleetAdmin => {
-            capacity.live_fleet_admins = capacity.live_fleet_admins.saturating_add(1);
-        }
-        SpawnPurpose::ShipAdmin => {
-            capacity.live_ship_admins = capacity.live_ship_admins.saturating_add(1);
-        }
-        SpawnPurpose::Recovery => {
-            capacity.live_recovery_sessions = capacity.live_recovery_sessions.saturating_add(1);
-        }
-    }
-    capacity
-}
-
-fn admit_spawn(
-    ctx: &ControlContext,
-    purpose: SpawnPurpose,
-) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
+    requested_provider_lanes: usize,
+    excluded_history_terminal_id: Option<&str>,
+) -> Result<SpawnAdmissionGuard<'a>, crate::governor::Refusal> {
     let lock = ctx
         .dispatch_admission
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let capacity = evaluate_spawn_capacity(ctx, purpose)?;
+    let capacity = evaluate_spawn_capacity(
+        ctx,
+        &purpose,
+        requested_provider_lanes,
+        excluded_history_terminal_id,
+    )?;
     Ok(SpawnAdmissionGuard {
         _lock: lock,
         _capacity: capacity,
@@ -24825,13 +25109,17 @@ fn admit_spawn(
 /// rate token.
 fn evaluate_spawn_capacity(
     ctx: &ControlContext,
-    purpose: SpawnPurpose,
+    purpose: &SpawnPurpose,
+    requested_provider_lanes: usize,
+    excluded_history_terminal_id: Option<&str>,
 ) -> Result<crate::governor::CapacityReport, crate::governor::Refusal> {
     let snapshot = ctx.captains.snapshot();
     let live =
-        live_session_evidence(ctx, &snapshot).map_err(|message| crate::governor::Refusal {
-            code: "refused-evidence",
-            message: format!("spawn refused: {message}"),
+        live_session_evidence(ctx, &snapshot, excluded_history_terminal_id).map_err(|message| {
+            crate::governor::Refusal {
+                code: "refused-evidence",
+                message: format!("spawn refused: {message}"),
+            }
         })?;
     let capacity = runtime_capacity_from_evidence(
         ctx,
@@ -24852,10 +25140,13 @@ fn evaluate_spawn_capacity(
             mutable_schemas: BTreeSet::new(),
             mutable_interfaces: BTreeSet::new(),
         }],
+        requested_provider_lanes,
+        admission_purpose: durable_admission_purpose(purpose),
+        ship_admin_scope: ship_admin_scope(purpose),
         active_lanes: Vec::new(),
         satisfied_dependencies: BTreeSet::new(),
         integration_contracts: Vec::new(),
-        capacity: prospective_capacity(capacity, purpose),
+        capacity,
     };
     let capacity = ctx
         .governor
@@ -24869,12 +25160,60 @@ fn evaluate_spawn_capacity(
     Ok(capacity)
 }
 
+fn evaluate_spawn_capacity_for_new_ship(
+    ctx: &ControlContext,
+    ship_slug: &str,
+) -> Result<crate::governor::CapacityReport, crate::governor::Refusal> {
+    let snapshot = ctx.captains.snapshot();
+    let live = live_session_evidence(ctx, &snapshot, None).map_err(|message| {
+        crate::governor::Refusal {
+            code: "refused-evidence",
+            message: format!("spawn refused: {message}"),
+        }
+    })?;
+    let mut capacity = runtime_capacity_from_evidence(
+        ctx,
+        &snapshot,
+        &live,
+        crate::governor::HARD_SESSION_CEILING,
+    )
+    .map_err(|message| crate::governor::Refusal {
+        code: "refused-provider",
+        message: format!("spawn refused: {message}"),
+    })?;
+    capacity.active_captain_ships.insert(ship_slug.to_string());
+    capacity.active_captains = capacity.active_captain_ships.len();
+    let request = crate::governor::DispatchPreflight {
+        requested_lanes: vec![crate::governor::LaneClaim {
+            lane_id: "commission-captain".into(),
+            owner_id: "commission-captain".into(),
+            dependencies: Some(BTreeSet::new()),
+            mutable_files: BTreeSet::new(),
+            mutable_schemas: BTreeSet::new(),
+            mutable_interfaces: BTreeSet::new(),
+        }],
+        requested_provider_lanes: 1,
+        admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+        ship_admin_scope: None,
+        active_lanes: Vec::new(),
+        satisfied_dependencies: BTreeSet::new(),
+        integration_contracts: Vec::new(),
+        capacity,
+    };
+    ctx.governor
+        .preflight_dispatch(&request)
+        .map_err(|refusal| crate::governor::Refusal {
+            code: "refused-cap",
+            message: refusal.message,
+        })
+}
+
 fn dispatch_runtime_capacity(
     ctx: &ControlContext,
     snapshot: &CaptainsSnapshot,
     project_id: &str,
 ) -> Result<crate::governor::RuntimeCapacity, String> {
-    let live = live_session_evidence(ctx, snapshot)?;
+    let live = live_session_evidence(ctx, snapshot, None)?;
     let active_directories = snapshot
         .agent_sessions
         .iter()
@@ -25025,7 +25364,7 @@ fn start_agent(
     let integration_contracts = parse_integration_contracts(args, "start_agent")?;
     let spawn_purpose = requested_spawn_purpose("start_agent", args, caller, trusted_internal)
         .map_err(|refusal| format!("start_agent: {}", refusal.message))?;
-    let admission_purpose = durable_admission_purpose(spawn_purpose);
+    let admission_purpose = durable_admission_purpose(&spawn_purpose);
     let admission_lock = ctx
         .dispatch_admission
         .lock()
@@ -25107,13 +25446,13 @@ fn start_agent(
     };
     let preflight = crate::governor::DispatchPreflight {
         requested_lanes: vec![lane_claim.clone()],
+        requested_provider_lanes: 1,
+        admission_purpose,
+        ship_admin_scope: ship_admin_scope(&spawn_purpose),
         active_lanes: active_dispatch_lanes(&snapshot, &project.project_id),
         satisfied_dependencies,
         integration_contracts: integration_contracts.clone(),
-        capacity: prospective_capacity(
-            dispatch_runtime_capacity(ctx, &snapshot, &project.project_id)?,
-            spawn_purpose,
-        ),
+        capacity: dispatch_runtime_capacity(ctx, &snapshot, &project.project_id)?,
     };
     let dispatch_capacity = ctx
         .governor
@@ -25127,7 +25466,7 @@ fn start_agent(
         })?;
     git::require_clean_exact_baseline(&checkout, &source_commit)
         .map_err(|error| format!("start_agent: baseline changed during admission: {error}"))?;
-    let admission_capacity = evaluate_spawn_capacity(ctx, spawn_purpose)
+    let admission_capacity = evaluate_spawn_capacity(ctx, &spawn_purpose, 1, None)
         .map_err(|refusal| format!("start_agent: {}", refusal.message))?;
     let _admission = SpawnAdmissionGuard {
         _lock: admission_lock,
@@ -25174,7 +25513,7 @@ fn start_agent(
     });
     if matches!(
         spawn_purpose,
-        SpawnPurpose::FleetAdmin | SpawnPurpose::ShipAdmin | SpawnPurpose::Recovery
+        SpawnPurpose::FleetAdmin | SpawnPurpose::ShipAdmin { .. } | SpawnPurpose::Recovery
     ) {
         spawn_args["capability"] = json!("control");
     }
@@ -25193,10 +25532,22 @@ fn start_agent(
         Ok(spawned) => spawned,
         Err(error) => {
             let cleanup = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            let identity_cleanup = ctx.identity.retire_tile(&agent_session_id);
             return Err(match cleanup {
-                Ok(()) => error,
+                Ok(()) => match identity_cleanup {
+                    Ok(_) => error,
+                    Err(cleanup_error) => {
+                        format!("{error}; identity cleanup failed: {cleanup_error}")
+                    }
+                },
                 Err(cleanup_error) => {
-                    format!("{error}; agent failure state could not be persisted: {cleanup_error}")
+                    format!(
+                        "{error}; agent failure state could not be persisted: {cleanup_error}{}",
+                        identity_cleanup
+                            .err()
+                            .map(|e| format!("; identity cleanup failed: {e}"))
+                            .unwrap_or_default()
+                    )
                 }
             });
         }
@@ -25212,10 +25563,21 @@ fn start_agent(
         Ok(started) => started,
         Err(error) => {
             let _ = tmux::kill_session_tree(&tmux_target(&agent_session_id));
-            let _ = ctx.captains.mark_agent_unavailable(&agent_session_id);
-            return Err(format!(
+            ctx.tabs.retire_tile_locked(&agent_session_id);
+            let unavailable = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            let identity_cleanup = ctx.identity.retire_tile(&agent_session_id);
+            let mut detail = format!(
                 "start_agent: launch succeeded but durable start state could not be persisted: {error}"
-            ));
+            );
+            if let Err(cleanup) = unavailable {
+                detail.push_str(&format!(
+                    "; recovery-required: unavailable state could not be persisted: {cleanup}"
+                ));
+            }
+            if let Err(cleanup) = identity_cleanup {
+                detail.push_str(&format!("; identity cleanup failed: {cleanup}"));
+            }
+            return Err(detail);
         }
     };
     let started_source_baseline = started
@@ -25414,7 +25776,6 @@ fn spawn_terminal_with_private_pane_command_and_id(
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
-    let (mut elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
     let provider_harness = arg_str(args, "_providerHarness").or_else(|| {
         requested_session_id.and_then(|session_id| {
             ctx.captains
@@ -25425,11 +25786,18 @@ fn spawn_terminal_with_private_pane_command_and_id(
                 .map(|agent| agent.provider)
         })
     });
-    if let Some(provider_harness) = provider_harness {
-        if !matches!(provider_harness.as_str(), "codex" | "claude") {
+    if let Some(provider_harness) = provider_harness.as_deref() {
+        if !matches!(provider_harness, "codex" | "claude") {
             return Err("spawn_terminal: internal provider Harness marker is invalid".into());
         }
-        elevation.push((PROVIDER_SESSION_ENV.into(), provider_harness));
+    }
+    let (mut elevation, minted_identity) =
+        spawn_env_with_identity(ctx, args, "spawn_terminal", requested_session_id)?;
+    if let Some(provider_harness) = provider_harness {
+        elevation.push((
+            PROVIDER_SESSION_ENV.into(),
+            pending_provider_marker(&provider_harness),
+        ));
     }
     let spawn_result = match requested_session_id {
         Some(requested) => {
@@ -25451,9 +25819,13 @@ fn spawn_terminal_with_private_pane_command_and_id(
             return Err(e);
         }
     };
-    // Bind the minted identity to the tile id now it is known (the tile is a mutable
-    // pointer; the durable key is the minted identity id - item-2 re-key flagged).
-    if let Some(identity) = &minted_identity {
+    // A requested id is pre-bound before tmux starts so a privileged child can never
+    // observe a usable identity that is not yet tied to its durable AgentSession.
+    // Generic terminal ids remain unknown until tmux returns and bind here.
+    if let Some(identity) = minted_identity
+        .as_ref()
+        .filter(|_| requested_session_id.is_none())
+    {
         if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
             let _ = tmux::kill_session_tree(&tmux_session);
             let rollback = ctx.identity.retire(&identity.id);
@@ -25480,7 +25852,11 @@ fn spawn_terminal_with_private_pane_command_and_id(
             Err(error) => {
                 let _ = tmux::kill_session_tree(&tmux_session);
                 if let Some(identity) = &minted_identity {
-                    let _ = ctx.identity.retire(&identity.id);
+                    if let Err(cleanup) = ctx.identity.retire(&identity.id) {
+                        return Err(format!(
+                            "spawn_terminal: exact Workspace placement failed; identity cleanup failed: {cleanup}"
+                        ));
+                    }
                 }
                 return Err(format!(
                     "spawn_terminal: exact Workspace placement failed and the terminal was rolled back: {error}"
@@ -25490,6 +25866,21 @@ fn spawn_terminal_with_private_pane_command_and_id(
     } else {
         ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref())
     };
+
+    if placed_tab.is_none() {
+        let _ = tmux::kill_session_tree(&tmux_session);
+        ctx.tabs.retire_tile_locked(&id);
+        if let Some(identity) = &minted_identity {
+            if let Err(error) = ctx.identity.retire(&identity.id) {
+                return Err(format!(
+                    "spawn_terminal: Workspace placement failed and identity cleanup failed: {error}"
+                ));
+            }
+        }
+        return Err(
+            "spawn_terminal: Workspace placement failed and the terminal was rolled back".into(),
+        );
+    }
 
     // Captain-chat phase 2: record the crew link under the spawning captain.
     // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
@@ -26721,6 +27112,18 @@ mod tests {
     }
 
     fn seed_starting_agent(ctx: &ControlContext, agent_session_id: &str) {
+        seed_starting_agent_with_purpose(
+            ctx,
+            agent_session_id,
+            crate::governor::AdmissionPurpose::Ordinary,
+        );
+    }
+
+    fn seed_starting_agent_with_purpose(
+        ctx: &ControlContext,
+        agent_session_id: &str,
+        admission_purpose: crate::governor::AdmissionPurpose,
+    ) {
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "capacity-project".into(),
@@ -26769,7 +27172,7 @@ mod tests {
                 lane_claim: Some(lane_claim),
                 integration_contracts: Vec::new(),
                 dispatch_capacity: Some(dispatch_capacity),
-                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+                admission_purpose,
                 created_at: 2,
                 updated_at: 2,
             })
@@ -27914,6 +28317,9 @@ mod tests {
         };
         let request = crate::governor::DispatchPreflight {
             requested_lanes: vec![lane.clone()],
+            requested_provider_lanes: 1,
+            admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+            ship_admin_scope: None,
             active_lanes: Vec::new(),
             satisfied_dependencies: BTreeSet::new(),
             integration_contracts: Vec::new(),
@@ -27930,9 +28336,11 @@ mod tests {
                 },
                 available_worktrees: 8,
                 active_captains: 0,
+                active_captain_ships: BTreeSet::new(),
                 live_cortana: 1,
                 live_fleet_admins: 1,
                 live_ship_admins: 0,
+                live_ship_admin_scopes: BTreeMap::new(),
                 live_recovery_sessions: 1,
             },
         };
@@ -31813,7 +32221,7 @@ mod tests {
             assert!(response
                 .error
                 .unwrap_or_default()
-                .contains("terminal-bound"));
+                .contains("requires a valid T_HUB_SESSION_TOKEN"));
         }
         assert_eq!(captains.snapshot().seq, before_captains.seq);
         assert_eq!(captains.snapshot().captains, before_captains.captains);
@@ -34540,13 +34948,13 @@ mod tests {
                 }
             });
 
-        let refused = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        let refused = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).unwrap_err();
         assert_eq!(refused.code, "refused-evidence");
         assert!(refused.message.contains("injected enumeration outage"));
 
         available.store(true, Ordering::SeqCst);
         assert!(
-            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "an evidence refusal must not consume the sole rate token"
         );
     }
@@ -34570,7 +34978,7 @@ mod tests {
                 provider_capacity_from_environment(Err(std::env::VarError::NotPresent))
             })
             .with_provider_live_sessions(|_| Ok(0));
-        let admission = admit_spawn(&ctx, SpawnPurpose::Cortana).unwrap();
+        let admission = admit_spawn(&ctx, SpawnPurpose::Cortana, 1, None).unwrap();
         assert_eq!(admission._capacity.provider_session_limit, 32);
         assert_eq!(admission._capacity.provider_live_sessions, 0);
         assert_eq!(
@@ -34598,6 +35006,31 @@ mod tests {
         )))
         .unwrap_err();
         assert!(unavailable.contains("not valid Unicode"));
+    }
+
+    #[test]
+    fn legacy_captains_snapshot_derives_nested_provider_reservation_headroom() {
+        let ctx = test_ctx("legacy-capacity-snapshot");
+        seed_starting_agent(&ctx, "legacya1");
+        let mut document = serde_json::to_value(ctx.captains.snapshot()).unwrap();
+        let report = document["agentSessions"][0]["dispatchCapacity"]
+            .as_object_mut()
+            .expect("seeded dispatch report");
+        let provider_headroom = report["providerHeadroom"].as_u64().unwrap() as usize;
+        let reservation_deficit = report["reservations"]["totalDeficit"].as_u64().unwrap() as usize;
+        report.remove("requestedProviderLanes");
+        report.remove("providerHeadroomAfterReservations");
+
+        let restored: CaptainsSnapshot = serde_json::from_value(document).unwrap();
+        let restored = restored.agent_sessions[0]
+            .dispatch_capacity
+            .as_ref()
+            .unwrap();
+        assert_eq!(restored.requested_provider_lanes, restored.requested_lanes);
+        assert_eq!(
+            restored.provider_headroom_after_reservations,
+            provider_headroom.saturating_sub(reservation_deficit)
+        );
     }
 
     #[test]
@@ -34640,6 +35073,89 @@ mod tests {
     }
 
     #[test]
+    fn pending_ui_provider_marker_consumes_quota_before_harness_readiness() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "pending_ui_provider_marker_consumes_quota_before_harness_readiness: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let provider_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let provider_target = tmux_target(&provider_id);
+        create_test_tmux_session_with_env(
+            &provider_target,
+            "/tmp",
+            None,
+            &[(
+                PROVIDER_SESSION_ENV.into(),
+                pending_provider_marker("codex"),
+            )],
+        )
+        .unwrap();
+
+        let sessions = vec![provider_target.clone()];
+        let listed = sessions.clone();
+        let governor = SpawnGovernor::new(8, 20.0, 8.0).with_reservation_policy(
+            crate::governor::ReservationPolicy {
+                cortana: 0,
+                fleet_admins: 0,
+                ship_admins_per_active_captain: 0,
+                recovery: 0,
+            },
+        );
+        let ctx = test_ctx("pending-ui-provider")
+            .with_governor(Arc::new(governor))
+            .with_provider_capacity(|| Ok(1))
+            .with_live_sessions(move || Ok(listed.clone()));
+        assert_eq!(
+            inspect_provider_live_sessions(&ctx.captains.snapshot(), &sessions).unwrap(),
+            1
+        );
+        assert_eq!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None)
+                .unwrap_err()
+                .code,
+            "provider-capacity"
+        );
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 0, None).is_ok(),
+            "a generic shell remains admissible at full provider quota"
+        );
+
+        reap_test_tmux_session(&provider_target).unwrap();
+    }
+
+    #[test]
+    fn pending_history_provider_intent_is_counted_but_its_own_admission_is_not_double_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = history_service_at(temp.path());
+        seed_history_resume(&history, "pending-capacity", "histpend", false);
+        let governor = SpawnGovernor::new(8, 20.0, 8.0).with_reservation_policy(
+            crate::governor::ReservationPolicy {
+                cortana: 0,
+                fleet_admins: 0,
+                ship_admins_per_active_captain: 0,
+                recovery: 0,
+            },
+        );
+        let ctx = test_ctx("pending-history-provider")
+            .with_governor(Arc::new(governor))
+            .with_history_service(history)
+            .with_provider_capacity(|| Ok(1))
+            .with_provider_live_sessions(|_| Ok(0))
+            .with_live_sessions(|| Ok(Vec::new()));
+
+        assert_eq!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None)
+                .unwrap_err()
+                .code,
+            "provider-capacity"
+        );
+        assert!(admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, Some("histpend")).is_ok());
+    }
+
+    #[test]
     fn spawn_admission_fails_closed_without_provider_evidence_and_at_provider_limit() {
         let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let evidence = available.clone();
@@ -34653,12 +35169,12 @@ mod tests {
                     Err("injected provider outage".into())
                 }
             });
-        let unavailable = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        let unavailable = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).unwrap_err();
         assert_eq!(unavailable.code, "refused-provider");
         assert!(unavailable.message.contains("injected provider outage"));
         available.store(true, Ordering::SeqCst);
         assert!(
-            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "a provider-evidence refusal must not consume the sole rate token"
         );
 
@@ -34666,7 +35182,7 @@ mod tests {
             .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 8.0)))
             .with_live_sessions(|| Ok(vec!["th_live0001".into()]))
             .with_provider_capacity(|| Ok(1));
-        let refusal = admit_spawn(&at_limit, SpawnPurpose::Cortana).unwrap_err();
+        let refusal = admit_spawn(&at_limit, SpawnPurpose::Cortana, 1, None).unwrap_err();
         assert_eq!(refusal.code, "provider-capacity");
     }
 
@@ -34681,7 +35197,7 @@ mod tests {
             live_session_count(&ctx, &ctx.captains.snapshot()).unwrap(),
             1
         );
-        let refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        let refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).unwrap_err();
         assert_eq!(refusal.code, "reserved-capacity");
 
         let same_runtime_visible = test_ctx("pending-visible")
@@ -34700,15 +35216,104 @@ mod tests {
     }
 
     #[test]
+    fn durable_provider_intent_survives_starting_and_counts_once_when_tmux_appears() {
+        let absent = test_ctx("pending-provider-absent")
+            .with_governor(Arc::new(SpawnGovernor::new(16, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_provider_capacity(|| Ok(1))
+            .with_provider_live_sessions(|_| Ok(0));
+        seed_starting_agent(&absent, "pendprv1");
+        let refusal = admit_spawn(&absent, SpawnPurpose::Ordinary, 1, None).unwrap_err();
+        assert_eq!(refusal.code, "provider-capacity");
+
+        absent
+            .captains
+            .mark_agent_started("pendprv1", None)
+            .unwrap();
+        let refusal = admit_spawn(&absent, SpawnPurpose::Ordinary, 1, None).unwrap_err();
+        assert_eq!(refusal.code, "provider-capacity");
+
+        let visible = test_ctx("pending-provider-visible")
+            .with_governor(Arc::new(SpawnGovernor::new(16, 20.0, 8.0)))
+            .with_live_sessions(|| Ok(vec!["th_pendprv2".into()]))
+            .with_provider_capacity(|| Ok(2))
+            .with_provider_live_sessions(|_| Ok(1));
+        seed_starting_agent(&visible, "pendprv2");
+        let live = live_session_evidence(&visible, &visible.captains.snapshot(), None).unwrap();
+        let runtime =
+            runtime_capacity_from_evidence(&visible, &visible.captains.snapshot(), &live, 16)
+                .unwrap();
+        assert_eq!(runtime.provider_live_sessions, 1);
+
+        let baseline = "1111111111111111111111111111111111111111";
+        let resulting = "2222222222222222222222222222222222222222";
+        let mut integrated = visible.captains.snapshot().agent_sessions[0].clone();
+        integrated.work_stage = crate::agent_session::WorkStage::Complete;
+        let mut delivery = completed_delivery(baseline, resulting);
+        delivery
+            .record_integration(crate::agent_session::IntegrationEvidence {
+                source_commit: resulting.into(),
+                canonical_baseline: "main".into(),
+                canonical_commit: resulting.into(),
+                reference: "integration://provider-capacity".into(),
+                recorded_at: 3,
+                manifest: Some(crate::agent_session::IntegrationManifest {
+                    integration_owner_identity: "integration-owner".into(),
+                    inputs: vec![crate::agent_session::IntegrationInput {
+                        lane_id: "capacity-lane".into(),
+                        agent_session_id: integrated.agent_session_id.clone(),
+                        source_baseline: baseline.into(),
+                        resulting_commit: resulting.into(),
+                    }],
+                }),
+            })
+            .unwrap();
+        integrated.delivery = Some(delivery);
+        assert!(!agent_has_durable_provider_intent(&integrated));
+    }
+
+    #[test]
+    fn recovery_reservation_counts_only_nonterminal_recovery_agent_records() {
+        let ctx = test_ctx("recovery-agent-record")
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_provider_live_sessions(|_| Ok(0));
+        ctx.captains
+            .begin_cortana_recovery("recovering-state")
+            .unwrap();
+        let snapshot = ctx.captains.snapshot();
+        let live = live_session_evidence(&ctx, &snapshot, None).unwrap();
+        let runtime = runtime_capacity_from_evidence(&ctx, &snapshot, &live, 16).unwrap();
+        assert_eq!(runtime.live_recovery_sessions, 0);
+
+        seed_starting_agent_with_purpose(
+            &ctx,
+            "recovery1",
+            crate::governor::AdmissionPurpose::Recovery,
+        );
+        let snapshot = ctx.captains.snapshot();
+        let live = live_session_evidence(&ctx, &snapshot, None).unwrap();
+        let runtime = runtime_capacity_from_evidence(&ctx, &snapshot, &live, 16).unwrap();
+        assert_eq!(runtime.live_recovery_sessions, 1);
+
+        ctx.captains
+            .update_agent_stage("recovery1", crate::agent_session::WorkStage::Stopped)
+            .unwrap();
+        let snapshot = ctx.captains.snapshot();
+        let live = live_session_evidence(&ctx, &snapshot, None).unwrap();
+        let runtime = runtime_capacity_from_evidence(&ctx, &snapshot, &live, 16).unwrap();
+        assert_eq!(runtime.live_recovery_sessions, 0);
+    }
+
+    #[test]
     fn reserved_purposes_fill_only_their_authorized_slot() {
         let ctx = test_ctx("reserved-purpose")
             .with_governor(Arc::new(SpawnGovernor::new(4, 20.0, 8.0)))
             .with_live_sessions(|| Ok(vec!["th_existing".into()]));
-        let ordinary = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        let ordinary = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).unwrap_err();
         assert_eq!(ordinary.code, "reserved-capacity");
-        assert!(admit_spawn(&ctx, SpawnPurpose::FleetAdmin).is_ok());
-        assert!(admit_spawn(&ctx, SpawnPurpose::Recovery).is_ok());
-        assert!(admit_spawn(&ctx, SpawnPurpose::Cortana).is_ok());
+        assert!(admit_spawn(&ctx, SpawnPurpose::FleetAdmin, 1, None).is_ok());
+        assert!(admit_spawn(&ctx, SpawnPurpose::Recovery, 1, None).is_ok());
+        assert!(admit_spawn(&ctx, SpawnPurpose::Cortana, 1, None).is_ok());
     }
 
     #[test]
@@ -34752,7 +35357,9 @@ mod tests {
                 false,
             )
             .unwrap(),
-            SpawnPurpose::ShipAdmin
+            SpawnPurpose::ShipAdmin {
+                ship_slug: "ship-one".into()
+            }
         );
         assert!(requested_spawn_purpose(
             "start_agent",
@@ -34831,7 +35438,7 @@ mod tests {
         assert!(ctx.captains.snapshot().captains[0].crew.is_empty());
         assert!(sink.calls.lock().unwrap().is_empty());
         assert!(
-            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "a contract refusal must not consume the sole spawn-rate token"
         );
     }
@@ -34908,7 +35515,7 @@ mod tests {
         assert!(error.contains("must use start_agent"), "got: {error}");
         assert!(!worktree.exists());
         assert!(
-            admit_spawn(&ctx, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "a contract refusal must not consume the sole spawn-rate token"
         );
     }
@@ -34961,7 +35568,7 @@ mod tests {
         let first_ctx = ctx.clone();
         let first_live = live.clone();
         let first = std::thread::spawn(move || {
-            let guard = admit_spawn(&first_ctx, SpawnPurpose::FleetAdmin).unwrap();
+            let guard = admit_spawn(&first_ctx, SpawnPurpose::FleetAdmin, 1, None).unwrap();
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             first_live.lock().unwrap().push("th_newadmin".into());
@@ -34970,7 +35577,7 @@ mod tests {
         held_rx.recv().unwrap();
         let second_ctx = ctx.clone();
         let second = std::thread::spawn(move || {
-            admit_spawn(&second_ctx, SpawnPurpose::Ordinary)
+            admit_spawn(&second_ctx, SpawnPurpose::Ordinary, 1, None)
                 .expect_err("ordinary admission must be refused")
         });
         assert!(ctx.dispatch_admission.try_lock().is_err());
@@ -35117,7 +35724,7 @@ mod tests {
             .unwrap_or_default()
             .contains("history_previous_resume_closed"));
         assert!(
-            admit_spawn(&one_token, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&one_token, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "completed replay must not consume the sole spawn-rate token"
         );
     }
@@ -35171,7 +35778,7 @@ mod tests {
             .unwrap_or_default()
             .contains("history_resume_in_flight"));
         assert!(
-            admit_spawn(&one_token, SpawnPurpose::Ordinary).is_ok(),
+            admit_spawn(&one_token, SpawnPurpose::Ordinary, 1, None).is_ok(),
             "pending replay must not consume the sole spawn-rate token"
         );
     }
@@ -35427,7 +36034,20 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let ctx = test_ctx("atomic-start-agent").with_apply_sink(sink);
+        let governor = SpawnGovernor::new(8, 20.0, 8.0).with_reservation_policy(
+            crate::governor::ReservationPolicy {
+                cortana: 0,
+                fleet_admins: 0,
+                ship_admins_per_active_captain: 0,
+                recovery: 0,
+            },
+        );
+        let ctx = test_ctx("atomic-start-agent")
+            .with_governor(Arc::new(governor))
+            .with_provider_capacity(|| Ok(1))
+            .with_provider_live_sessions(|_| Ok(0))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_apply_sink(sink);
         let (base, repo_root, worktree) = scratch_repo_with_worktree();
         let source_commit = exact_head(&worktree);
         let checkout = worktree.to_string_lossy().to_string();
@@ -35488,6 +36108,13 @@ mod tests {
         );
         assert!(ctx.dispatch_admission.try_lock().is_err());
         assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        let snapshot = ctx.captains.snapshot();
+        let live = live_session_evidence(&ctx, &snapshot, None).unwrap();
+        let runtime = runtime_capacity_from_evidence(&ctx, &snapshot, &live, 8).unwrap();
+        assert_eq!(
+            runtime.provider_live_sessions, 1,
+            "the paused durable start must occupy the sole provider slot before tmux exists"
+        );
 
         let mut second_args = args;
         second_args["requestId"] = json!("atomic-start-second");
@@ -35629,7 +36256,7 @@ mod tests {
             )
             .unwrap();
 
-        let ordinary_refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary).unwrap_err();
+        let ordinary_refusal = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None).unwrap_err();
         assert_eq!(ordinary_refusal.code, "reserved-capacity");
 
         let error = dispatch(
@@ -35825,6 +36452,16 @@ mod tests {
             Some("start-fleet-admin"),
             "an authorized administrative lane must receive control capability"
         );
+        assert!(
+            tmux::session_environment(&tmux_target(agent_session_id), "GH_CONFIG_DIR")
+                .unwrap()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            tmux::session_environment(&tmux_target(agent_session_id), "NPM_TOKEN").unwrap(),
+            Some(String::new()),
+            "administrative control capability must not restore ambient credentials"
+        );
         let agent = ctx
             .captains
             .snapshot()
@@ -35893,6 +36530,51 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    fn fleet_admin_grant_fixture(
+        tag: &str,
+    ) -> (
+        ControlContext,
+        crate::identity::SessionIdentity,
+        crate::identity::SessionIdentity,
+        String,
+        String,
+    ) {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let cortana_tile = format!("co{}", &nonce[..6]);
+        let captain_tile = format!("ca{}", &nonce[..6]);
+        let admin_tile = format!("fa{}", &nonce[..6]);
+        let ctx = test_ctx(&format!("fleet-grant-{tag}-{}", &nonce[..6]));
+        ctx.captains
+            .claim_test(&captain_tile, Some(&format!("ship-{tag}")), vec![])
+            .unwrap();
+        ctx.captains
+            .record_crew(&captain_tile, &admin_tile)
+            .unwrap();
+        create_test_tmux_session(&tmux_target(&admin_tile)).unwrap();
+
+        let cortana_secret =
+            mint_current_cortana_session(&ctx.identity, &ctx.captains, &cortana_tile);
+        let cortana_identity = ctx.identity.resolve(&cortana_secret).unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, &admin_tile)
+            .unwrap();
+        let cortana = resolve_identity(&ctx, &cortana_secret).unwrap();
+        let appointed = appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": admin_tile,
+                "role": "fleetAdmin",
+                "permittedOperations": ["maintainFleetResource"]
+            }),
+            Some(&cortana),
+            false,
+        )
+        .unwrap();
+        let grant_id = appointed["grant"]["grantId"].as_str().unwrap().to_string();
+        (ctx, cortana_identity, admin_identity, grant_id, admin_tile)
     }
 
     #[test]
@@ -36285,6 +36967,71 @@ mod tests {
     }
 
     #[test]
+    fn fleet_admin_grants_invalidate_with_every_non_authoritative_cortana_state() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        for state in ["recovering", "degraded", "duplicate", "released"] {
+            let (ctx, cortana_identity, admin_identity, grant_id, admin_tile) =
+                fleet_admin_grant_fixture(state);
+            match state {
+                "recovering" => {
+                    ctx.captains
+                        .begin_cortana_recovery("test-recovering")
+                        .unwrap();
+                }
+                "degraded" => {
+                    ctx.captains
+                        .mark_cortana_degraded("test-degraded", "injected uncertainty")
+                        .unwrap();
+                }
+                "duplicate" => {
+                    let mut duplicate = ctx
+                        .captains
+                        .snapshot()
+                        .captains
+                        .into_iter()
+                        .find(|captain| captain.role == FleetRole::Cortana)
+                        .unwrap();
+                    duplicate.ship_slug = "cortana-duplicate".into();
+                    duplicate.assignment_id = "cortana-duplicate-assignment".into();
+                    duplicate.terminal_id = Some("duplicate".into());
+                    ctx.captains.lock().captains.push(duplicate);
+                }
+                "released" => {
+                    let cortana = resolve_identity(&ctx, &cortana_identity.secret).unwrap();
+                    release_captain(
+                        &ctx,
+                        &json!({"captainSessionId": cortana.tile.clone()}),
+                        Some(&cortana),
+                        false,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+            let denied = authorize_delegated_admin(
+                &ctx,
+                &admin,
+                crate::delegated_admin::AdminOperation::MaintainFleetResource,
+                crate::delegated_admin::AdminTarget::Fleet,
+                crate::delegated_admin::AdminSafeguards::default(),
+            )
+            .unwrap_err();
+            assert!(
+                denied.contains("supervisorInactive")
+                    || denied.contains("no active administrative grant"),
+                "unexpected {state} denial: {denied}"
+            );
+            assert!(matches!(
+                ctx.delegated_admin.get(&grant_id).unwrap().state,
+                crate::delegated_admin::GrantState::Invalidated { .. }
+            ));
+            reap_test_tmux_session(&tmux_target(&admin_tile)).unwrap();
+        }
+    }
+
+    #[test]
     fn dispatch_capacity_counts_one_live_harness_backed_ship_admin_per_ship() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("admin-capacity");
@@ -36340,11 +37087,20 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 1));
+        assert_eq!(
+            live_admin_counts(&ctx, &ctx.captains.snapshot()),
+            (0, [("alpha".to_string(), 2usize)].into_iter().collect())
+        );
         reap_test_tmux_session(&admin_targets[0]).unwrap();
-        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 1));
+        assert_eq!(
+            live_admin_counts(&ctx, &ctx.captains.snapshot()),
+            (0, [("alpha".to_string(), 1usize)].into_iter().collect())
+        );
         reap_test_tmux_session(&admin_targets[1]).unwrap();
-        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 0));
+        assert_eq!(
+            live_admin_counts(&ctx, &ctx.captains.snapshot()),
+            (0, BTreeMap::new())
+        );
         std::fs::remove_dir_all(harness_bin_dir).ok();
     }
 
@@ -36352,6 +37108,7 @@ mod tests {
     fn ship_admin_can_read_own_captain_status_but_cannot_run_dispatch_preflight() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("ship-admin-status");
+        let admin_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
                 project_id: "project-alpha".into(),
@@ -36371,9 +37128,9 @@ mod tests {
             .bind_ship_context("alpha", "project-alpha", "Assignment", "codex")
             .unwrap();
         ctx.captains
-            .record_crew("captain-alpha", "admin-alpha")
+            .record_crew("captain-alpha", &admin_id)
             .unwrap();
-        let admin_target = tmux_target("admin-alpha");
+        let admin_target = tmux_target(&admin_id);
         create_test_tmux_session(&admin_target).unwrap();
         let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
         ctx.identity
@@ -36381,13 +37138,13 @@ mod tests {
             .unwrap();
         let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&admin_identity.id, "admin-alpha")
+            .bind_tile(&admin_identity.id, &admin_id)
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
         appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "admin-alpha",
+                "actorSessionId": admin_id,
                 "role": "shipAdmin",
                 "permittedOperations": ["inspectStatus"]
             }),
@@ -36440,6 +37197,7 @@ mod tests {
                 tmux_probe_count.fetch_add(1, Ordering::SeqCst);
                 Err("tmux admission unavailable".into())
             });
+        let admin_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let (base, repo_root, _existing_worktree) = scratch_repo_with_worktree();
         ctx.captains
             .upsert_project(ProjectRecord {
@@ -36460,9 +37218,9 @@ mod tests {
             .bind_ship_context("alpha", "project-alpha", "Assignment", "codex")
             .unwrap();
         ctx.captains
-            .record_crew("captain-alpha", "admin-alpha")
+            .record_crew("captain-alpha", &admin_id)
             .unwrap();
-        let admin_target = tmux_target("admin-alpha");
+        let admin_target = tmux_target(&admin_id);
         create_test_tmux_session(&admin_target).unwrap();
         let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
         ctx.identity
@@ -36470,13 +37228,13 @@ mod tests {
             .unwrap();
         let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&admin_identity.id, "admin-alpha")
+            .bind_tile(&admin_identity.id, &admin_id)
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
         appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "admin-alpha",
+                "actorSessionId": admin_id,
                 "role": "shipAdmin",
                 "permittedOperations": ["maintainWorktree"]
             }),
@@ -36520,7 +37278,6 @@ mod tests {
 
         let tabs_before = ctx.tabs.snapshot_full();
         let identities_before = ctx.identity.len();
-        let sessions_before = tmux::list_sessions().unwrap();
         let maintained = dispatch_authenticated(
             &ctx,
             req_session(
@@ -36549,7 +37306,12 @@ mod tests {
             serde_json::to_value(tabs_before.tabs).unwrap()
         );
         assert_eq!(ctx.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        // The tmux namespace is shared by concurrent tests, so verify this
+        // fixture's exact runtime instead of comparing the global session list.
+        assert_eq!(
+            tmux::session_liveness(&admin_target),
+            tmux::SessionLiveness::Alive
+        );
         assert!(sink.calls.lock().unwrap().is_empty());
         assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
         assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
@@ -36574,7 +37336,10 @@ mod tests {
         assert!(!elevated_target.exists());
         assert_eq!(ctx.tabs.snapshot_full().seq, tabs_before.seq);
         assert_eq!(ctx.identity.len(), identities_before);
-        assert_eq!(tmux::list_sessions().unwrap(), sessions_before);
+        assert_eq!(
+            tmux::session_liveness(&admin_target),
+            tmux::SessionLiveness::Alive
+        );
         assert!(sink.calls.lock().unwrap().is_empty());
         assert_eq!(provider_probes.load(Ordering::SeqCst), 0);
         assert_eq!(tmux_probes.load(Ordering::SeqCst), 0);
@@ -36586,13 +37351,14 @@ mod tests {
     fn list_captains_exposes_active_admin_role_without_granting_captain_identity() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("admin-role-wire");
+        let admin_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         ctx.captains
             .claim_test("captain-alpha", Some("alpha"), vec![])
             .unwrap();
         ctx.captains
-            .record_crew("captain-alpha", "admin-alpha")
+            .record_crew("captain-alpha", &admin_id)
             .unwrap();
-        let admin_target = tmux_target("admin-alpha");
+        let admin_target = tmux_target(&admin_id);
         create_test_tmux_session(&admin_target).unwrap();
         let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
         ctx.identity
@@ -36600,13 +37366,13 @@ mod tests {
             .unwrap();
         let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&admin_identity.id, "admin-alpha")
+            .bind_tile(&admin_identity.id, &admin_id)
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
         appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "admin-alpha",
+                "actorSessionId": admin_id,
                 "role": "shipAdmin",
                 "permittedOperations": ["inspectStatus"]
             }),
@@ -36623,10 +37389,7 @@ mod tests {
         assert!(roster["captains"][0]["crew"][0]["delegatedGrantGeneration"]
             .as_u64()
             .is_some_and(|generation| generation > 0));
-        assert_eq!(
-            roster["captains"][0]["crew"][0]["terminalId"],
-            "admin-alpha"
-        );
+        assert_eq!(roster["captains"][0]["crew"][0]["terminalId"], admin_id);
         reap_test_tmux_session(&admin_target).unwrap();
     }
 
@@ -36635,6 +37398,7 @@ mod tests {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let ctx = test_ctx("admin-cleanup");
         let crew_target_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let admin_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         ctx.captains
             .claim_test("captain-alpha", Some("alpha"), vec![])
             .unwrap();
@@ -36642,9 +37406,9 @@ mod tests {
             .record_crew("captain-alpha", &crew_target_id)
             .unwrap();
         ctx.captains
-            .record_crew("captain-alpha", "admin-alpha")
+            .record_crew("captain-alpha", &admin_id)
             .unwrap();
-        let admin_target = tmux_target("admin-alpha");
+        let admin_target = tmux_target(&admin_id);
         create_test_tmux_session(&admin_target).unwrap();
         let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
         ctx.identity
@@ -36652,13 +37416,13 @@ mod tests {
             .unwrap();
         let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
         ctx.identity
-            .bind_tile(&admin_identity.id, "admin-alpha")
+            .bind_tile(&admin_identity.id, &admin_id)
             .unwrap();
         let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
         let grant = appoint_admin(
             &ctx,
             &json!({
-                "actorSessionId": "admin-alpha",
+                "actorSessionId": admin_id,
                 "role": "shipAdmin",
                 "permittedOperations": ["cleanupSession"]
             }),
@@ -36880,6 +37644,134 @@ mod tests {
         );
         assert!(grants.ok, "self grant listing failed: {:?}", grants.error);
         reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
+    fn privileged_agent_intent_is_permanent_admin_history_before_appointment_and_reload() {
+        for (label, purpose) in [
+            ("fleet", crate::governor::AdmissionPurpose::FleetAdmin),
+            ("ship", crate::governor::AdmissionPurpose::ShipAdmin),
+            ("recovery", crate::governor::AdmissionPurpose::Recovery),
+        ] {
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let captains_path = captains_tmp(&format!("intent-history-{label}-{nonce}"));
+            let identities_path = std::env::temp_dir().join(format!(
+                "t-hub-intent-history-identities-{label}-{nonce}.json"
+            ));
+            let agent_id = format!("{}{}", &label[..2], &nonce[..6]);
+            let admin_secret;
+            let general_secret;
+
+            {
+                let captains = Arc::new(CaptainsRegistry::load(captains_path.clone()));
+                let identities = Arc::new(crate::identity::IdentityStore::load(
+                    identities_path.clone(),
+                ));
+                let ctx = test_ctx(&format!("intent-history-{label}"))
+                    .with_captains_registry(captains)
+                    .with_identity_store(identities);
+                seed_starting_agent_with_purpose(&ctx, &agent_id, purpose);
+                admin_secret = mint_session(
+                    &ctx.identity,
+                    crate::identity::Role::Crew,
+                    "capacity-ship",
+                    &agent_id,
+                );
+                general_secret = mint_session(
+                    &ctx.identity,
+                    crate::identity::Role::General,
+                    "fleet",
+                    "general-intent",
+                );
+                let admin = resolve_identity(&ctx, &admin_secret).unwrap();
+                assert!(has_delegated_admin_history(&ctx, &admin.session_id));
+
+                let mutation = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        &format!("intent-history-{label}"),
+                        &admin_secret,
+                        "new_tab",
+                        json!({"name": "forbidden-before-appointment"}),
+                    ),
+                );
+                assert!(!mutation.ok);
+                assert!(mutation
+                    .error
+                    .unwrap_or_default()
+                    .contains("outside their exact administrative operation grants"));
+
+                let general = resolve_identity(&ctx, &general_secret).unwrap();
+                for role in [FleetRole::Captain, FleetRole::Cortana] {
+                    assert!(
+                        enforce_attach_authority(&ctx, Some(&general), false, &agent_id, role,)
+                            .unwrap_err()
+                            .contains("administrative Crew identity")
+                    );
+                }
+                for (command, args) in [
+                    (
+                        "claim_captain",
+                        json!({"captainSessionId": &agent_id, "shipSlug": "forbidden"}),
+                    ),
+                    (
+                        "attach_captain",
+                        json!({
+                            "captainSessionId": &agent_id,
+                            "projectId": "capacity-project",
+                            "assignment": "forbidden"
+                        }),
+                    ),
+                ] {
+                    let response = dispatch_authenticated(
+                        &ctx,
+                        req_session(
+                            &format!("intent-history-{label}"),
+                            &general_secret,
+                            command,
+                            args,
+                        ),
+                    );
+                    assert!(!response.ok, "{command} promoted {label} intent");
+                    assert!(response
+                        .error
+                        .unwrap_or_default()
+                        .contains("administrative Crew identity"));
+                }
+            }
+
+            {
+                let ctx = test_ctx(&format!("intent-history-{label}"))
+                    .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
+                    .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
+                        identities_path.clone(),
+                    )));
+                let admin = resolve_identity(&ctx, &admin_secret).unwrap();
+                assert!(has_delegated_admin_history(&ctx, &admin.session_id));
+                let mutation = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        &format!("intent-history-{label}"),
+                        &admin_secret,
+                        "new_tab",
+                        json!({"name": "forbidden-after-reload"}),
+                    ),
+                );
+                assert!(!mutation.ok);
+                assert!(mutation
+                    .error
+                    .unwrap_or_default()
+                    .contains("outside their exact administrative operation grants"));
+            }
+
+            for path in [
+                captains_path.with_extension("json.bak"),
+                captains_path,
+                identities_path,
+            ] {
+                std::fs::remove_file(path).ok();
+            }
+        }
     }
 
     #[test]
@@ -37392,7 +38284,7 @@ mod tests {
         assert_eq!(adopted["action"], "adopt");
         assert_eq!(adopted["terminalId"], terminal_id);
 
-        let admission = admit_spawn(&ctx, SpawnPurpose::Ordinary)
+        let admission = admit_spawn(&ctx, SpawnPurpose::Ordinary, 1, None)
             .expect("healthy no-spawn reconciliation must preserve the sole rate token");
         drop(admission);
         reap_test_tmux_session(&target).unwrap();
@@ -37911,6 +38803,14 @@ mod tests {
             "cortana_spawn_admission_required"
         );
 
+        let (commission_reached_tx, commission_reached_rx) = mpsc::sync_channel(1);
+        let (commission_resume_tx, commission_resume_rx) = mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "commission_initial_inspection",
+            reached: commission_reached_tx,
+            resume: commission_resume_rx,
+        }));
+
         let commission_ctx = Arc::clone(&ctx);
         let commission_command = harness_command.clone();
         let (commission_done_tx, commission_done_rx) = mpsc::sync_channel(1);
@@ -37936,17 +38836,22 @@ mod tests {
             commission_done_tx.send(response).unwrap();
         });
 
-        let lock_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if ctx.dispatch_admission.try_lock().is_err() {
-                break;
-            }
-            assert!(
-                Instant::now() < lock_deadline,
-                "Captain commission never acquired dispatch admission"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert_eq!(
+            commission_reached_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("Captain commission did not reach its inspection pass"),
+            "commission_initial_inspection"
+        );
+        commission_resume_tx.send(()).unwrap();
+
+        // Cortana still owns only provisioning during its inspection pass.
+        // Captain inspection may wait for that lock, but must not acquire spawn
+        // admission first and recreate the inverse ordering that deadlocked the
+        // old one-pass implementation.
+        assert!(
+            ctx.dispatch_admission.try_lock().is_ok(),
+            "Captain inspection held dispatch admission while waiting on provisioning"
+        );
         reconcile_resume_tx.send(()).unwrap();
 
         let commission = commission_done_rx
@@ -38001,7 +38906,9 @@ mod tests {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let ctx = test_ctx("secret").with_apply_sink(sink);
+        let ctx = test_ctx("secret")
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 2.0)))
+            .with_apply_sink(sink);
         ctx.tab_registry().replace(vec![
             TabRecord {
                 id: "project-tab".into(),
@@ -38033,6 +38940,7 @@ mod tests {
 
         let (harness_bin_dir, harness_command) = test_harness_command("codex");
         let args = json!({
+            "requestId": "commission-first-operation",
             "projectId": "project-e2e",
             "assignment": "Keep this project stable",
             "harness": "codex",
@@ -38075,10 +38983,16 @@ mod tests {
         assert!(claude_instructions.contains("Use /captain"));
         assert!(!claude_instructions.contains("Use $captain"));
 
-        let retry = dispatch(&ctx, "commission_captain", &args).unwrap();
+        let mut retry_args = args.clone();
+        retry_args["requestId"] = json!("commission-fresh-noop-operation");
+        let retry = dispatch(&ctx, "commission_captain", &retry_args).unwrap();
         assert_eq!(retry["alreadyCommissioned"], true);
         assert_eq!(retry["captain"]["terminalId"], terminal_id);
         assert_eq!(ctx.captains.snapshot().captains.len(), 1);
+        assert!(
+            admit_spawn(&ctx, SpawnPurpose::Ordinary, 0, None).is_ok(),
+            "an exact no-op commission with a fresh operation ID must not consume the remaining spawn-rate token"
+        );
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         std::fs::remove_dir_all(harness_bin_dir).unwrap();
@@ -41476,7 +42390,7 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
 
         // Default (untagged => READ) spawn: NO control-spawn audit record.
-        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal");
+        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal", None);
         let recs = read_audit(&dir);
         assert!(
             recs.iter().all(|r| r["decision"] != "control-spawn"),
@@ -41488,6 +42402,7 @@ mod tests {
             &ctx,
             &json!({"cwd": "/tmp", "capability": "control"}),
             "spawn_terminal",
+            None,
         );
         let recs = read_audit(&dir);
         let ctl: Vec<_> = recs
@@ -41915,7 +42830,8 @@ mod tests {
     fn spawn_env_mints_and_injects_a_per_session_identity_token() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env, minted) =
+            spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         // The tier token is injected; the item-3 default is the READ token ...
         assert!(env
             .iter()
@@ -41941,9 +42857,83 @@ mod tests {
 
         // Headless (no addr): no identity minted, env empty, spawns behave as before.
         ctx.addr = String::new();
-        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env2, minted2) =
+            spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn requested_session_identity_is_bound_before_launch_and_prebind_failure_rolls_back() {
+        let mut ctx = test_ctx("identity-prebind");
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let (_, minted) = spawn_env_with_identity(
+            &ctx,
+            &json!({"capability": "control"}),
+            "spawn_terminal",
+            Some("fa123456"),
+        )
+        .unwrap();
+        let minted = minted.unwrap();
+        assert_eq!(minted.session_tile.as_deref(), Some("fa123456"));
+        assert_eq!(
+            ctx.identity
+                .resolve(&minted.secret)
+                .and_then(|identity| identity.session_tile),
+            Some("fa123456".into())
+        );
+
+        let path = captains_tmp("identity-prebind-rollback");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        store.fail_persist_after(1);
+        let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
+        failing.addr = "127.0.0.1:4242".to_string();
+        let error = spawn_env_with_identity(
+            &failing,
+            &json!({"capability": "control"}),
+            "spawn_terminal",
+            Some("fa654321"),
+        )
+        .unwrap_err();
+        assert!(error.contains("identity pre-binding persistence failed"));
+        assert!(store.is_empty());
+        assert!(crate::identity::IdentityStore::load(path.clone()).is_empty());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn failed_requested_session_spawn_retires_the_prebound_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "failed_requested_session_spawn_retires_the_prebound_identity: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let mut ctx =
+            test_ctx("identity-prebound-spawn-rollback").with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let target = tmux_target(&session_id);
+        create_test_tmux_session(&target).unwrap();
+        let result = spawn_terminal_with_private_pane_command_and_id(
+            &ctx,
+            &json!({"cwd": "/tmp", "capability": "control"}),
+            None,
+            false,
+            false,
+            false,
+            Some(&session_id),
+        );
+        assert!(result.is_err());
+        assert!(ctx.identity.is_empty());
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        reap_test_tmux_session(&target).unwrap();
     }
 
     #[test]
@@ -42059,15 +43049,15 @@ mod tests {
     }
 
     #[test]
-    fn crew_spawn_is_credential_withheld_but_control_spawn_is_not() {
-        // item-3 §2.3.5: a read-class (crew) spawn gets gh withholding (GH_CONFIG_DIR at
-        // an empty dir) + blanked ambient tokens - the second wall behind the gate. A
-        // control-class spawn (captain) keeps its credentials. BYPASS-WOULD-FAIL: drop
-        // the crew_credential_withholding_env call and the GH_CONFIG_DIR assert goes RED.
+    fn every_crew_spawn_is_credential_withheld_regardless_of_capability() {
+        // item-3 §2.3.5: every Crew spawn gets gh withholding (GH_CONFIG_DIR at an
+        // empty dir) plus blanked ambient tokens.
+        // A delegated administrative Crew may receive a control token for exact
+        // operations, but that capability must not restore publishing credentials.
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
 
-        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
+        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", None).unwrap();
         let gh_dir = env
             .iter()
             .find(|(k, _)| k == "GH_CONFIG_DIR")
@@ -42092,13 +43082,36 @@ mod tests {
             "a crew spawn must blank the ambient GH_TOKEN"
         );
 
-        let (env2, _) =
-            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal")
-                .unwrap();
-        assert!(
-            !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
-            "a control-class spawn must keep its gh credentials"
-        );
+        for purpose in ["fleet-admin", "ship-admin", "recovery"] {
+            let (admin_env, _) = spawn_env_with_identity(
+                &ctx,
+                &json!({
+                    "capability": "control",
+                    "admissionPurpose": purpose
+                }),
+                "spawn_terminal",
+                None,
+            )
+            .unwrap();
+            assert!(
+                admin_env.iter().any(|(key, _)| key == "GH_CONFIG_DIR"),
+                "a {purpose} Crew spawn must still withhold gh credentials"
+            );
+            for token in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "NPM_TOKEN",
+                "NODE_AUTH_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+            ] {
+                assert!(
+                    admin_env
+                        .iter()
+                        .any(|(key, value)| key == token && value.is_empty()),
+                    "a {purpose} Crew spawn must blank ambient {token}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -42440,6 +43453,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn untrusted_full_mutations_require_identity_and_audit_omitted_or_invalid_tokens() {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let audit_dir = std::env::temp_dir().join(format!("t-hub-identity-gate-{nonce}"));
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let general_secret = mint_session(
+            &store,
+            crate::identity::Role::General,
+            "fleet",
+            "general-gate",
+        );
+        let ctx = test_ctx("identity-gate")
+            .with_identity_store(store)
+            .with_audit(Arc::new(AuditLog::new(audit_dir.clone())));
+
+        for (command, args) in [
+            ("new_tab", json!({"name": "must-not-exist"})),
+            (
+                "spawn_terminal",
+                json!({"cwd": "/tmp", "requestId": "must-not-spawn"}),
+            ),
+        ] {
+            for session in ["", "invalid-nonempty-session-token"] {
+                let response = dispatch_authenticated(
+                    &ctx,
+                    req_untrusted("identity-gate", session, command, args.clone()),
+                );
+                assert!(
+                    !response.ok,
+                    "{command} accepted an unidentified Full bearer"
+                );
+                assert!(response
+                    .error
+                    .unwrap_or_default()
+                    .contains("requires a valid T_HUB_SESSION_TOKEN"));
+            }
+        }
+        assert!(ctx.tabs.id_for_name("must-not-exist").is_none());
+        let records = read_audit(&audit_dir);
+        assert_eq!(records.len(), 4);
+        assert!(records
+            .iter()
+            .all(|record| record["decision"] == "refused-identity"));
+        assert!(records
+            .iter()
+            .all(|record| record["tokenTier"] == "control"));
+
+        let identified = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "identity-gate",
+                &general_secret,
+                "new_tab",
+                json!({"name": "identified"}),
+            ),
+        );
+        assert!(
+            identified.ok,
+            "identified Full mutation failed: {:?}",
+            identified.error
+        );
+
+        let trusted = dispatch_authenticated(
+            &ctx,
+            req("identity-gate", "new_tab", json!({"name": "trusted-host"})),
+        );
+        assert!(
+            trusted.ok,
+            "trusted host mutation failed: {:?}",
+            trusted.error
+        );
+        std::fs::remove_dir_all(audit_dir).ok();
     }
 
     #[test]

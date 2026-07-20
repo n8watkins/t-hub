@@ -65,13 +65,13 @@ export const PRESETS: Preset[] = [
     // Make it unambiguous: a NEW terminal opens, showing Claude's session picker
     // there so the user chooses which session to resume (it doesn't resume all).
     hint: "New terminal → pick a session to resume",
-    options: { startupCommand: CLAUDE_RESUME_CMD },
+    options: { startupCommand: CLAUDE_RESUME_CMD, providerIntent: "claude" },
   },
   {
     key: "codex",
     label: "Codex",
     hint: "New terminal → fresh Codex session",
-    options: { startupCommand: CODEX_CMD },
+    options: { startupCommand: CODEX_CMD, providerIntent: "codex" },
   },
   {
     key: "captain-codex",
@@ -85,7 +85,7 @@ export const PRESETS: Preset[] = [
     label: "Resume Codex…",
     // Symmetric with Resume Claude: opens Codex's own session picker in a new tile.
     hint: "New terminal → pick a Codex session to resume",
-    options: { startupCommand: CODEX_RESUME_CMD },
+    options: { startupCommand: CODEX_RESUME_CMD, providerIntent: "codex" },
   },
 ];
 
