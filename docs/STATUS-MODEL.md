@@ -40,6 +40,24 @@ Runtime health describes whether the bound terminal and Harness can continue wor
 Hot, warm, and cold terminal presentation states remain owned-resource lifecycle metadata.
 They must not be presented as agent work states or runtime failures when tmux and the Harness remain healthy.
 
+## Delivery and Release Provenance
+
+Work state and runtime health do not prove that a source change was reviewed, accepted, integrated, packaged, installed, or verified in the live application.
+T-Hub records those delivery states separately against exact commits and artifacts.
+
+- `implemented`: Code exists at the recorded exact commit.
+- `reviewed`: An independent reviewer approved that exact commit for the stated scope.
+- `tested`: The required acceptance checks passed on that exact commit.
+- `complete`: The stated scope is both independently reviewed and acceptance-tested on the same exact result commit.
+- `integrated`: The complete result commit is present in the named canonical baseline.
+- `packaged`: An artifact was built from that canonical baseline.
+- `installed`: That artifact replaced the intended installation.
+- `live-verified`: The required flow passed against the installed application, whether verified by a human or an AI agent.
+
+No surface may collapse `complete`, `integrated`, `packaged`, `installed`, or `live-verified` into one label.
+A completed Harness turn remains only a work-state observation and cannot establish any delivery state.
+Visible product bugs require packaged graphical end-to-end evidence before `tested` may satisfy `complete`.
+
 ## Authority and Freshness
 
 Every status observation must identify its source, observation time, and quality.
@@ -95,3 +113,6 @@ If exact resume identity cannot be proven, T-Hub retains a visible recovery-requ
 - Test reconnect deduplication for notifications and voice.
 - Test equivalent rendering and accessible labels across all product surfaces.
 - Test provider capability gaps without inventing unsupported events.
+- Test that delivery states remain distinct across backend, CLI, MCP, and graphical surfaces.
+- Test that `complete` requires independent review and acceptance tests for the exact result commit.
+- Test that visible product bugs cannot become `complete` from source-only tests.

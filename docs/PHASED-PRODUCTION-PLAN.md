@@ -6,8 +6,8 @@
 > [DEPOWDER-MIGRATION-PLAN.md](./DEPOWDER-MIGRATION-PLAN.md).
 > Powder boards, cards, claims, runs, and Crew dispatch below are historical compatibility evidence unless a section explicitly identifies a current agent-session contract.
 
-**Updated:** 2026-07-17.
-**Plan source:** `9d7c9f9` on `fix/captain-control-runtime` plus the General-directed scoped-autonomy integration recorded by this change.
+**Updated:** 2026-07-20.
+**Plan source:** implementation through `d777bf3` on `main` plus the supervisory-model activation recorded by this change.
 **Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
@@ -81,6 +81,12 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 39. Named authority profiles are visible templates that expand into explicit T34 grant records; `captain-standard`, `captain-project-builder`, and `captain-delivery` are distinct from T33 Harness and model work profiles, while `captain-production-operator` is never a default standing grant and normally resolves to exact one-time approvals.
 40. No standing or delegated Captain profile may authorize protected profile endpoint or credential-command mutation, system-global software installation, or public external repository creation; where supported, only a separately reviewed exact General one-time approval may authorize a narrow instance, while credential reading or export and cross-Project authority remain absolute denials.
 41. T35 atomically consumes the one-time bootstrap approval into an immutable operation-owned recovery lease before its first mutation; only the same durable Captain, ship, request digest, root, Assignment, profile, board, and operation may resume it through a verified replacement-generation handoff, and no new or changed request inherits that authority.
+42. Cortana startup uses idempotent backend reconciliation to recover or create exactly one durable identity with at most one authoritative active runtime, deterministic duplicate handling, preserved checkpoints, and a visible degraded state when authority is uncertain.
+43. Cortana and Captains retain decisions, prioritization, decomposition, delegation, evidence review, and escalation while delegating multi-step investigation and administrative execution to Crew.
+44. A Captain may appoint durable Ship Admin Crew within that exact ship, and Cortana may appoint durable Fleet Admin Crew within its fleet boundary, without transferring supervisory identity, role-granting authority, cross-boundary authority, or General-reserved authority.
+45. Every agent dispatch names an exact clean source commit and explicit lane, dependency, mutable-resource, and integration contracts, while the runtime governor determines safe parallelism without a fixed Crew-count cap.
+46. Implementation, independent review, acceptance testing, completion, integration, packaging, installation, and live verification are separately recorded states, and `complete` requires review plus required acceptance checks on the same exact commit.
+47. Visible product bugs require packaged graphical end-to-end evidence, while worktree removal and reuse remain suspended until one authoritative safety service can prove the exact target safe.
 
 ## Roadmap, Backlog, and Runtime Evidence
 
@@ -97,6 +103,23 @@ The T-Hub inbox is the durable dialogue layer for instructions, blockers, decisi
 Lifecycle events provide event-driven attention and runtime-health transitions without requiring periodic model polling.
 Git, tests, review, builds, and packaged acceptance remain the technical proof layer.
 The current handoff records the verified resume point across roadmap, backlog, runtime, and technical evidence.
+
+### Current Supervisory Implementation
+
+Commits `ed95ed3`, `5090efa`, and `a46c26c` implement and activate idempotent Cortana startup reconciliation with durable identity preservation, deterministic candidate selection, duplicate quarantine planning, degraded uncertainty reporting, and startup recovery.
+
+Commits `f6641b8`, `cc0b5ce`, and `90636cd` implement adaptive dispatch preflight, exact clean baseline enforcement, mutable-resource collision checks, integration ordering contracts, and reservations for Cortana, standing administrators, and recovery.
+
+Commits `4c30696`, `7a2001b`, and `0e923b0` implement durable Ship Admin and Fleet Admin grants, role-aware authorization, audit attribution, revocation, exact cleanup approvals, MCP administration, and visible administrator badges.
+
+Commit `233c67d` preserves distinct delivery evidence and provenance from source implementation through live verification.
+
+Commit `d777bf3` exposes dispatch preflight, delivery evidence, and delegated administration through the CLI, disables destructive worktree prune execution, and removes automatic worktree-pool recycling.
+
+The governor reserves the default standing administrator capacity and reports administrator deficits.
+Automatic administrator appointment remains open until a reviewed runtime actor can select and bind the intended durable Crew identity without broadening supervisor authority.
+
+Worktree removal, reuse, and fully automatic obsolete-worktree cleanup remain deferred behind the unified authoritative worktree safety service.
 
 ## Review-Derived Change Boundary
 
@@ -281,7 +304,7 @@ Later integration order is:
 | 8A | Active immediate Captain vertical slice, blocked from shipment. | Depends on P1 through P4, T1 through T3, and T17 before installed completion acceptance; worktree deletion remains disabled without T18. |
 | 8B | Blocked full orchestration acceptance. | Depends on Phase 8A, Phases 2 through 6, and T7 through T11 plus T17 through T18. |
 | 9 | Active partial product surfaces. | Individual packaged bugs may proceed; complete exit depends on shared identity, adapter, inbox, and resource contracts. |
-| 10 | Blocked for complete parity. | Depends on Phases 3, 4, and 6; fixture and local voice-engine checks may proceed. |
+| 10 | Active for singleton Cortana recovery and delegated administration; complete parity remains blocked. | Broader provider parity depends on Phases 3, 4, and 6, while the active reconciliation and authorization foundation may continue independently. |
 | 11 | Active measurement foundation. | T13, T14, T24, and T28 are required before the final packaged matrix and soak. |
 | 12 | Continuous preparation; final gate blocked. | T27 and every preceding phase exit are required for production release; T34, T35, and T36 also require independent security review plus installed role, retry, restart, concurrency, corruption, redaction, and provenance acceptance. |
 
@@ -1017,7 +1040,7 @@ The next History slice must add bounded fair discovery, source statuses, collisi
 
 ## Phase 10 - Cortana Operations, Context, Voice, and Notifications
 
-**Status:** Blocked for complete provider parity on Phases 3, 4, and 6, while local voice-engine checks and adapter fixtures may proceed.
+**Status:** Active for singleton Cortana recovery and delegated administration, while complete provider parity remains blocked on Phases 3, 4, and 6.
 
 ### Goal
 
@@ -1039,6 +1062,12 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 12. Consider per-Captain chime or voice identity only after the common cue path is reliable.
 13. Verify Claude and Codex header identity persistence across Refresh, remount, restart, and exact conversation resume.
 14. Fail visibly when a Harness cannot prove a needs-input transition rather than silently claiming voice parity.
+15. Reconcile Cortana startup through one stable operation identity and preserve its durable identity and checkpoints when the terminal, Harness, or application is replaced.
+16. Serialize concurrent startup attempts, select one authoritative generation, quarantine duplicates, and fail closed in a visible degraded state when identity is uncertain.
+17. Reserve runtime-governor capacity for Cortana, standing administrators, and recovery.
+18. Keep Cortana on bounded authoritative summaries and delegate multi-step investigation and administrative execution to Fleet Admin Crew.
+19. Persist role scope, delegating identity, grant generation, revocation state, permitted operations, and dual audit attribution for delegated administrators.
+20. Maintain one standing Fleet Admin by default when a suitable durable Crew identity and reserved capacity are available, and surface the deficit otherwise.
 
 ### Tests and Evidence
 
@@ -1048,6 +1077,10 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 - Test voice and notification transitions for both Harnesses.
 - Test Scribe hold and delayed delivery behavior.
 - Test TTS failure, fallback, recovery, and user-disabled states.
+- Prove concurrent startup calls converge on one Cortana identity and one authoritative live runtime.
+- Kill the Cortana terminal, Harness, and application independently and prove automatic recovery without identity or checkpoint loss.
+- Inject duplicate Cortana candidates and prove deterministic fail-closed reconciliation.
+- Test Ship Admin and Fleet Admin scope, denial, revocation, restart persistence, and audit attribution.
 
 ### Exit Gate
 
@@ -1313,6 +1346,8 @@ Release integration waits for every Phase 12 gate.
 12. Record interactive checks that cannot yet be automated and convert stable checks into automation later.
 13. Do not declare provider parity based only on both terminals launching.
 14. Test authoritative, derived, stale, unknown, and conflicting state explicitly rather than collapsing uncertainty into a healthy default.
+15. Record the exact source commit, artifact identity, installation target, installed binary identity, and observed flow for every packaged graphical acceptance result.
+16. Never collapse `complete`, `integrated`, `packaged`, `installed`, and `live-verified` into one status.
 
 ## Claude and Codex Parity Matrix
 
@@ -1407,8 +1442,10 @@ Recommended policy: require a checkpoint, stop the old runtime, start the replac
 
 ### Resource Budget
 
-The six-concurrent-Crew idea is an initial operational default rather than a proven hardware limit.
-Recommended policy: do not enforce a hard limit until packaged 1, 4, 8, and 16-session measurements establish warning and queue thresholds.
+No fixed Crew count is an operating policy or recommendation.
+Parallelize every genuinely independent lane whose ownership, dependencies, mutable resources, and integration order are explicit.
+The runtime governor bounds concurrency using machine health, Provider limits, worktree availability, active-lane collisions, and reservations for Cortana, standing administrators, and recovery.
+The packaged 1, 4, 8, and 16-session matrix remains a benchmarking tool for warning and queue thresholds rather than a policy cap.
 
 ## Outstanding Questions
 
