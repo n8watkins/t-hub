@@ -144,6 +144,7 @@ Endpoint discovery must remain compatible with the documented control environmen
 The supervisory workflow is active through the shared control operation catalog.
 
 - `th agents preflight` evaluates an exact source commit, lane identity, dependencies, mutable files, schemas, interfaces, integration contracts, and reserved runtime capacity without launching an agent.
+- Capacity output preserves `providerSessionLimit`, `providerLiveSessions`, `providerHeadroom`, and `providerCapacityStatus` with its source, degraded state, and optional detail.
 - `th agents start` requires the same exact dispatch baseline and concurrency contract and rejects a dirty checkout, abbreviated commit, stale commit, resource collision, missing ordering contract, or exhausted reserved capacity.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
 - `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
