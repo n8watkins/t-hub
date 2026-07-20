@@ -2797,6 +2797,30 @@ fn next_authority_registry_epoch() -> u64 {
 /// through to `captains.json`, and `load` seeds from it. The write-through happens
 /// AFTER the registry lock is dropped (see [`persist`](Self::persist)) so a slow
 /// state-file write never wedges a reader on the registry lock.
+enum AgentDeliveryUpdate {
+    Implemented(String),
+    Reviewed(crate::agent_session::ReviewEvidence),
+    Tested(crate::agent_session::AcceptanceTestEvidence),
+    Integrated(crate::agent_session::IntegrationEvidence),
+    Packaged(crate::agent_session::ArtifactEvidence),
+    Installed(crate::agent_session::InstallationEvidence),
+    LiveVerified(crate::agent_session::LiveVerificationEvidence),
+}
+
+impl AgentDeliveryUpdate {
+    fn apply(self, delivery: &mut crate::agent_session::DeliveryProvenance) -> Result<(), String> {
+        match self {
+            Self::Implemented(commit) => delivery.record_implementation(commit),
+            Self::Reviewed(evidence) => delivery.record_review(evidence),
+            Self::Tested(evidence) => delivery.record_acceptance_test(evidence),
+            Self::Integrated(evidence) => delivery.record_integration(evidence),
+            Self::Packaged(evidence) => delivery.record_artifact(evidence),
+            Self::Installed(evidence) => delivery.record_installation(evidence),
+            Self::LiveVerified(evidence) => delivery.record_live_verification(evidence),
+        }
+    }
+}
+
 pub struct CaptainsRegistry {
     inner: Mutex<CaptainsInner>,
     /// Unique in-process identity for this loaded registry instance. No request
@@ -4971,6 +4995,7 @@ impl CaptainsRegistry {
         }
         let runtime_state = current.agent_sessions[agent_index].runtime_state;
         let work_stage = current.agent_sessions[agent_index].work_stage;
+        let delivery_states = current.agent_sessions[agent_index].delivery_states();
         current.agent_checkpoints.push(checkpoint.clone());
         current.agent_events.push(AgentEvent {
             cursor,
@@ -4980,6 +5005,7 @@ impl CaptainsRegistry {
             runtime_state: Some(runtime_state),
             work_stage: Some(work_stage),
             checkpoint: Some(checkpoint.clone()),
+            delivery_states,
         });
         if current.agent_checkpoints.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
             let overflow =
@@ -4994,6 +5020,54 @@ impl CaptainsRegistry {
         current.seq = cursor;
         self.commit_mutation(current, previous)?;
         Ok(checkpoint)
+    }
+
+    fn record_agent_delivery(
+        &self,
+        agent_session_id: &str,
+        update: AgentDeliveryUpdate,
+    ) -> Result<AgentSessionRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let agent = current
+            .agent_sessions
+            .iter_mut()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .ok_or_else(|| {
+                format!("record_agent_delivery: agent '{agent_session_id}' was not found")
+            })?;
+        let delivery = agent
+            .delivery
+            .as_mut()
+            .ok_or("record_agent_delivery: legacy agent has no exact dispatch baseline")?;
+        update.apply(delivery)?;
+        let states = delivery.states();
+        if states.complete && agent.work_stage != crate::agent_session::WorkStage::Stopped {
+            agent.work_stage = crate::agent_session::WorkStage::Complete;
+        }
+        agent.updated_at = now_ms();
+        agent.validate()?;
+        let result = agent.clone();
+        let cursor = current.seq.saturating_add(1);
+        current.agent_events.push(AgentEvent {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            kind: "delivery_evidence".into(),
+            created_at: result.updated_at,
+            runtime_state: Some(result.runtime_state),
+            work_stage: Some(result.work_stage),
+            checkpoint: None,
+            delivery_states: Some(states),
+        });
+        if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_events.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_events.drain(0..overflow);
+        }
+        current.seq = cursor;
+        self.commit_mutation(current, previous)?;
+        Ok(result)
     }
 
     pub fn insert_agent_session(&self, record: AgentSessionRecord) -> Result<(), String> {
@@ -5095,6 +5169,7 @@ impl CaptainsRegistry {
             runtime_state: Some(result.runtime_state),
             work_stage: Some(result.work_stage),
             checkpoint: None,
+            delivery_states: result.delivery_states(),
         });
         if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
             let overflow =
@@ -5143,6 +5218,7 @@ impl CaptainsRegistry {
             runtime_state: Some(result.runtime_state),
             work_stage: Some(result.work_stage),
             checkpoint: None,
+            delivery_states: result.delivery_states(),
         });
         if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
             let overflow =
@@ -9467,7 +9543,9 @@ fn required_tier(command: &str) -> CommandTier {
         | "inbox_ack"
         // comms-plane Phase 3: `authorize` records a durable governance artifact
         // (mutating, audited); only the general originates (enforced by the handler ACL).
-        | "authorize" | "appoint_admin" | "revoke_admin" => CommandTier::Organization,
+        | "authorize" | "appoint_admin" | "revoke_admin" | "record_agent_delivery" => {
+            CommandTier::Organization
+        }
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
         // (least-privilege read token) can send up to its captain; the handler REQUIRES a
         // resolved session identity (or a Full host) and the `can_message` ACL is the real
@@ -10498,11 +10576,29 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                     && identity.fleet_role.is_none()
                     && identity.tile.as_deref() == Some(agent.as_str())
             });
+    let agent_self_delivery = req.command == "record_agent_delivery"
+        && matches!(
+            arg_str(&req.args, "state").as_deref(),
+            Some("implemented" | "tested")
+        )
+        && caller
+            .as_ref()
+            .zip(arg_str(&req.args, "agentSessionId"))
+            .is_some_and(|(identity, agent)| {
+                identity.mint_role == crate::identity::Role::Crew
+                    && identity.fleet_role.is_none()
+                    && identity.tile.as_deref() == Some(agent.as_str())
+            });
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
     // and ProcessChanging require the control token.
-    if !cap.allows(tier) && !inbox_self_ack && !crew_self_work_log && !agent_self_checkpoint {
+    if !cap.allows(tier)
+        && !inbox_self_ack
+        && !crew_self_work_log
+        && !agent_self_checkpoint
+        && !agent_self_delivery
+    {
         let message = format!(
             "unauthorized: '{}' requires the control capability (this token is read-only)",
             req.command
@@ -10522,6 +10618,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         || inbox_self_ack
         || crew_self_work_log
         || agent_self_checkpoint
+        || agent_self_delivery
     {
         crate::delegated_admin::ControlAccess::Read
     } else {
@@ -11036,6 +11133,7 @@ fn dispatch_with_caller(
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "agent_checkpoint" => agent_checkpoint(ctx, args, caller, trusted_internal),
+        "record_agent_delivery" => record_agent_delivery(ctx, args, caller, trusted_internal),
         "appoint_admin" => appoint_admin(ctx, args, caller, trusted_internal),
         "revoke_admin" => revoke_admin(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
@@ -11400,13 +11498,7 @@ fn list_agents(
         .into_iter()
         .skip(cursor)
         .take(limit)
-        .map(|agent| {
-            let mut summary = serde_json::to_value(agent).unwrap_or_else(|_| json!({}));
-            if let Some(object) = summary.as_object_mut() {
-                object.remove("assignment");
-            }
-            summary
-        })
+        .map(|agent| agent_status_value(agent, false))
         .collect();
     let next_cursor = (cursor + page.len()).min(total);
     Ok(json!({
@@ -11447,7 +11539,22 @@ fn get_agent(
         .into_iter()
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
-    serde_json::to_value(agent).map_err(|error| format!("get_agent serialization failed: {error}"))
+    Ok(agent_status_value(agent, true))
+}
+
+fn agent_status_value(agent: AgentSessionRecord, include_assignment: bool) -> Value {
+    let delivery_states = agent.delivery_states();
+    let mut value = serde_json::to_value(agent).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        if !include_assignment {
+            object.remove("assignment");
+        }
+        object.insert(
+            "deliveryStates".into(),
+            serde_json::to_value(delivery_states).unwrap_or(Value::Null),
+        );
+    }
+    value
 }
 
 fn agent_checkpoint(
@@ -11517,6 +11624,198 @@ fn agent_checkpoint(
     Ok(json!({
         "checkpoint": checkpoint,
         "eventCursor": checkpoint.cursor,
+    }))
+}
+
+fn required_delivery_evidence<'a>(
+    args: &'a Value,
+    state: &str,
+    fields: &[&str],
+) -> Result<&'a Value, String> {
+    let evidence = args
+        .get("evidence")
+        .filter(|value| value.is_object())
+        .ok_or("record_agent_delivery requires an evidence object")?;
+    require_exact_args(
+        evidence,
+        &format!("record_agent_delivery {state} evidence"),
+        fields,
+    )?;
+    Ok(evidence)
+}
+
+fn evidence_string(evidence: &Value, field: &str, state: &str) -> Result<String, String> {
+    arg_str(evidence, field)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!("record_agent_delivery {state} requires a non-empty evidence.{field}")
+        })
+}
+
+fn record_agent_delivery(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "record_agent_delivery",
+        &["agentSessionId", "state", "evidence"],
+    )?;
+    let agent_session_id = arg_str(args, "agentSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("record_agent_delivery requires a non-empty 'agentSessionId'")?;
+    let state = arg_str(args, "state")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("record_agent_delivery requires a non-empty 'state'")?;
+    let agent = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .find(|agent| agent.agent_session_id == agent_session_id)
+        .ok_or_else(|| {
+            format!("record_agent_delivery: agent '{agent_session_id}' was not found")
+        })?;
+    let authority = authorize_agent(
+        ctx,
+        &agent,
+        caller,
+        trusted_internal,
+        "record_agent_delivery",
+    )?;
+    if authority == AgentAuthority::Agent && !matches!(state.as_str(), "implemented" | "tested") {
+        return Err(format!(
+            "acl: an implementing agent may record only implemented or tested evidence, not '{state}'"
+        ));
+    }
+    let actor_identity = caller
+        .map(|identity| identity.session_id.clone())
+        .unwrap_or_else(|| "trusted-host".into());
+    let recorded_at = now_ms();
+    let update = match state.as_str() {
+        "implemented" => {
+            let evidence = required_delivery_evidence(args, &state, &["commit"])?;
+            AgentDeliveryUpdate::Implemented(evidence_string(evidence, "commit", &state)?)
+        }
+        "reviewed" => {
+            let evidence = required_delivery_evidence(args, &state, &["commit", "reference"])?;
+            AgentDeliveryUpdate::Reviewed(crate::agent_session::ReviewEvidence {
+                commit: evidence_string(evidence, "commit", &state)?,
+                reviewer_identity: actor_identity,
+                reference: evidence_string(evidence, "reference", &state)?,
+                recorded_at,
+            })
+        }
+        "tested" => {
+            let evidence = required_delivery_evidence(
+                args,
+                &state,
+                &["commit", "reference", "environment"],
+            )?;
+            let environment = serde_json::from_value::<crate::agent_session::AcceptanceEnvironment>(
+                evidence
+                    .get("environment")
+                    .cloned()
+                    .ok_or("record_agent_delivery tested requires evidence.environment")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery tested environment is invalid: {error}")
+            })?;
+            AgentDeliveryUpdate::Tested(crate::agent_session::AcceptanceTestEvidence {
+                commit: evidence_string(evidence, "commit", &state)?,
+                runner_identity: actor_identity,
+                reference: evidence_string(evidence, "reference", &state)?,
+                environment,
+                recorded_at,
+            })
+        }
+        "integrated" => {
+            let evidence = required_delivery_evidence(
+                args,
+                &state,
+                &[
+                    "sourceCommit",
+                    "canonicalBaseline",
+                    "canonicalCommit",
+                    "reference",
+                ],
+            )?;
+            AgentDeliveryUpdate::Integrated(crate::agent_session::IntegrationEvidence {
+                source_commit: evidence_string(evidence, "sourceCommit", &state)?,
+                canonical_baseline: evidence_string(evidence, "canonicalBaseline", &state)?,
+                canonical_commit: evidence_string(evidence, "canonicalCommit", &state)?,
+                reference: evidence_string(evidence, "reference", &state)?,
+                recorded_at,
+            })
+        }
+        "packaged" => {
+            let evidence = required_delivery_evidence(
+                args,
+                &state,
+                &["artifactId", "sourceBaseline", "reference"],
+            )?;
+            AgentDeliveryUpdate::Packaged(crate::agent_session::ArtifactEvidence {
+                artifact_id: evidence_string(evidence, "artifactId", &state)?,
+                source_baseline: evidence_string(evidence, "sourceBaseline", &state)?,
+                reference: evidence_string(evidence, "reference", &state)?,
+                recorded_at,
+            })
+        }
+        "installed" => {
+            let evidence = required_delivery_evidence(
+                args,
+                &state,
+                &["artifactId", "target", "reference"],
+            )?;
+            AgentDeliveryUpdate::Installed(crate::agent_session::InstallationEvidence {
+                artifact_id: evidence_string(evidence, "artifactId", &state)?,
+                target: evidence_string(evidence, "target", &state)?,
+                reference: evidence_string(evidence, "reference", &state)?,
+                recorded_at,
+            })
+        }
+        "liveVerified" => {
+            let evidence = required_delivery_evidence(
+                args,
+                &state,
+                &["artifactId", "target", "verifierKind", "reference"],
+            )?;
+            let verifier_kind = serde_json::from_value::<crate::agent_session::VerifierKind>(
+                evidence
+                    .get("verifierKind")
+                    .cloned()
+                    .ok_or("record_agent_delivery liveVerified requires evidence.verifierKind")?,
+            )
+            .map_err(|error| {
+                format!("record_agent_delivery liveVerified verifierKind is invalid: {error}")
+            })?;
+            AgentDeliveryUpdate::LiveVerified(crate::agent_session::LiveVerificationEvidence {
+                artifact_id: evidence_string(evidence, "artifactId", &state)?,
+                target: evidence_string(evidence, "target", &state)?,
+                verifier_identity: actor_identity,
+                verifier_kind,
+                reference: evidence_string(evidence, "reference", &state)?,
+                recorded_at,
+            })
+        }
+        _ => {
+            return Err(
+                "record_agent_delivery state must be implemented, reviewed, tested, integrated, packaged, installed, or liveVerified"
+                    .into(),
+            )
+        }
+    };
+    let agent = ctx
+        .captains
+        .record_agent_delivery(&agent_session_id, update)?;
+    Ok(json!({
+        "accepted": "record_agent_delivery",
+        "state": state,
+        "agent": agent_status_value(agent.clone(), true),
+        "deliveryStates": agent.delivery_states(),
+        "audited": true,
     }))
 }
 
@@ -28467,6 +28766,182 @@ mod tests {
         assert!(events["events"]
             .as_array()
             .is_some_and(|events| events.iter().any(|event| event["kind"] == "checkpoint")));
+    }
+
+    #[test]
+    fn agent_delivery_command_keeps_completion_and_release_states_distinct() {
+        const BASELINE: &str = "1111111111111111111111111111111111111111";
+        const RESULT: &str = "2222222222222222222222222222222222222222";
+        const CANONICAL: &str = "3333333333333333333333333333333333333333";
+        let ctx = test_ctx("agent-delivery");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-delivery".into(),
+                name: "Delivery".into(),
+                repo_root: "/tmp/project-delivery".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-delivery", Some("delivery-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "delivery-ship",
+                "project-delivery",
+                "Review delivery",
+                "codex",
+            )
+            .unwrap();
+        ctx.captains
+            .record_crew("captain-delivery", "agent-delivery")
+            .unwrap();
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-delivery".into(),
+                captain_session_id: "captain-delivery".into(),
+                project_id: "project-delivery".into(),
+                assignment: "Implement one scope".into(),
+                directory: "/tmp/project-delivery".into(),
+                worktree_path: None,
+                branch: Some("agent-delivery".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Running,
+                work_stage: crate::agent_session::WorkStage::Working,
+                delivery: Some(crate::agent_session::DeliveryProvenance::new(
+                    BASELINE, false,
+                )),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+        let captain_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("delivery-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-delivery")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let agent_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Crew, Some("delivery-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&agent_identity.id, "agent-delivery")
+            .unwrap();
+        let agent = resolve_identity(&ctx, &agent_identity.secret).unwrap();
+
+        let implemented = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "read-agent-delivery",
+                &agent_identity.secret,
+                "record_agent_delivery",
+                json!({
+                "agentSessionId": "agent-delivery",
+                "state": "implemented",
+                "evidence": { "commit": RESULT }
+                }),
+            ),
+        );
+        assert!(implemented.ok, "got: {:?}", implemented.error);
+        let self_review = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "reviewed",
+                "evidence": { "commit": RESULT, "reference": "review://self" }
+            }),
+            Some(&agent),
+            false,
+        )
+        .unwrap_err();
+        assert!(self_review.contains("implementing agent"));
+        dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "reviewed",
+                "evidence": { "commit": RESULT, "reference": "review://captain" }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let complete = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "tested",
+                "evidence": {
+                    "commit": RESULT,
+                    "reference": "test://acceptance",
+                    "environment": { "kind": "source" }
+                }
+            }),
+            Some(&agent),
+            false,
+        )
+        .unwrap();
+        assert_eq!(complete["deliveryStates"]["complete"], true);
+        assert_eq!(complete["deliveryStates"]["integrated"], false);
+        assert_eq!(complete["deliveryStates"]["installed"], false);
+        assert_eq!(complete["agent"]["workStage"], "complete");
+
+        let integrated = dispatch_with_caller(
+            &ctx,
+            "record_agent_delivery",
+            &json!({
+                "agentSessionId": "agent-delivery",
+                "state": "integrated",
+                "evidence": {
+                    "sourceCommit": RESULT,
+                    "canonicalBaseline": "main",
+                    "canonicalCommit": CANONICAL,
+                    "reference": "git://integration"
+                }
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(integrated["deliveryStates"]["complete"], true);
+        assert_eq!(integrated["deliveryStates"]["integrated"], true);
+        assert_eq!(integrated["deliveryStates"]["packaged"], false);
+
+        let status = get_agent(
+            &ctx,
+            &json!({ "agentSessionId": "agent-delivery" }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status["deliveryStates"]["complete"], true);
+        assert_eq!(status["deliveryStates"]["integrated"], true);
+        assert_eq!(status["deliveryStates"]["liveVerified"], false);
+        let events = agent_events(
+            &ctx,
+            &json!({ "agentSessionId": "agent-delivery", "cursor": "0" }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        assert!(events["events"].as_array().is_some_and(|events| events
+            .iter()
+            .any(|event| event["kind"] == "delivery_evidence"
+                && event["deliveryStates"]["complete"] == true)));
     }
 
     #[test]

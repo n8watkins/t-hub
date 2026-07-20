@@ -433,6 +433,145 @@ fn schema_agent_checkpoint() -> Value {
     })
 }
 
+fn schema_record_agent_delivery() -> Value {
+    let commit = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$" });
+    let reference = json!({ "type": "string", "minLength": 1, "maxLength": 16384 });
+    json!({
+        "type": "object",
+        "properties": {
+            "agentSessionId": { "type": "string", "minLength": 1 },
+            "state": {
+                "type": "string",
+                "enum": ["implemented", "reviewed", "tested", "integrated", "packaged", "installed", "liveVerified"]
+            },
+            "evidence": { "type": "object" }
+        },
+        "required": ["agentSessionId", "state", "evidence"],
+        "oneOf": [
+            {
+                "properties": {
+                    "state": { "const": "implemented" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": { "commit": commit.clone() },
+                        "required": ["commit"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "reviewed" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": { "commit": commit.clone(), "reference": reference.clone() },
+                        "required": ["commit", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "tested" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "commit": commit.clone(),
+                            "reference": reference.clone(),
+                            "environment": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": { "kind": { "const": "source" } },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "packagedGuiE2e" },
+                                            "artifactId": { "type": "string", "minLength": 1 },
+                                            "sourceCommit": commit.clone(),
+                                            "installationTarget": { "type": "string", "minLength": 1 }
+                                        },
+                                        "required": ["kind", "artifactId", "sourceCommit", "installationTarget"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            }
+                        },
+                        "required": ["commit", "reference", "environment"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "integrated" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "sourceCommit": commit.clone(),
+                            "canonicalBaseline": { "type": "string", "minLength": 1 },
+                            "canonicalCommit": commit.clone(),
+                            "reference": reference.clone()
+                        },
+                        "required": ["sourceCommit", "canonicalBaseline", "canonicalCommit", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "packaged" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "sourceBaseline": commit.clone(),
+                            "reference": reference.clone()
+                        },
+                        "required": ["artifactId", "sourceBaseline", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "installed" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "target": { "type": "string", "minLength": 1 },
+                            "reference": reference.clone()
+                        },
+                        "required": ["artifactId", "target", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            {
+                "properties": {
+                    "state": { "const": "liveVerified" },
+                    "evidence": {
+                        "type": "object",
+                        "properties": {
+                            "artifactId": { "type": "string", "minLength": 1 },
+                            "target": { "type": "string", "minLength": 1 },
+                            "verifierKind": { "type": "string", "enum": ["human", "aiAgent"] },
+                            "reference": reference
+                        },
+                        "required": ["artifactId", "target", "verifierKind", "reference"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        ],
+        "additionalProperties": false
+    })
+}
+
 fn schema_agent_events() -> Value {
     json!({
         "type": "object",
@@ -779,6 +918,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_agent_checkpoint,
         },
         ToolDef {
+            name: "record_agent_delivery",
+            tier: Tier::Organization,
+            summary: "Record immutable exact-commit evidence for implemented, reviewed, tested, complete, integrated, packaged, installed, and live-verified states. Complete is derived only from review plus acceptance testing.",
+            input_schema: schema_record_agent_delivery,
+        },
+        ToolDef {
             name: "register_project",
             tier: Tier::Organization,
             summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf.",
@@ -948,6 +1093,27 @@ mod tests {
         let schema = (find("list_agents").unwrap().input_schema)();
         let state = schema["properties"]["state"]["enum"].as_array().unwrap();
         assert_eq!(state, &vec![json!("active"), json!("removed")]);
+    }
+
+    #[test]
+    fn delivery_evidence_schema_keeps_every_state_explicit() {
+        let tool = find("record_agent_delivery").unwrap();
+        assert_eq!(tool.tier, Tier::Organization);
+        let schema = (tool.input_schema)();
+        let states = schema["properties"]["state"]["enum"].as_array().unwrap();
+        assert_eq!(
+            states,
+            &vec![
+                json!("implemented"),
+                json!("reviewed"),
+                json!("tested"),
+                json!("integrated"),
+                json!("packaged"),
+                json!("installed"),
+                json!("liveVerified"),
+            ]
+        );
+        assert_eq!(schema["oneOf"].as_array().unwrap().len(), states.len());
     }
 
     #[test]

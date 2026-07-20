@@ -452,6 +452,20 @@ impl DeliveryProvenance {
                     "artifact.sourceBaseline must equal integration.canonicalCommit".into(),
                 );
             }
+            if let Some(AcceptanceTestEvidence {
+                environment:
+                    AcceptanceEnvironment::PackagedGuiE2e {
+                        artifact_id,
+                        source_commit: _,
+                        installation_target: _,
+                    },
+                ..
+            }) = &self.acceptance_test
+            {
+                if artifact.artifact_id != *artifact_id {
+                    return Err("artifact.artifactId must equal packaged GUI E2E artifactId".into());
+                }
+            }
             validate_reference("artifact.reference", &artifact.reference)?;
             if artifact.recorded_at < integration.recorded_at {
                 return Err("artifact.recordedAt must not precede integration evidence".into());
@@ -465,6 +479,24 @@ impl DeliveryProvenance {
                 .ok_or("delivery provenance cannot be installed before it is packaged")?;
             if installation.artifact_id != artifact.artifact_id {
                 return Err("installation.artifactId must equal artifact.artifactId".into());
+            }
+            if let Some(AcceptanceTestEvidence {
+                environment:
+                    AcceptanceEnvironment::PackagedGuiE2e {
+                        artifact_id,
+                        source_commit: _,
+                        installation_target,
+                    },
+                ..
+            }) = &self.acceptance_test
+            {
+                if installation.artifact_id != *artifact_id
+                    || installation.target != *installation_target
+                {
+                    return Err(
+                        "installation must match packaged GUI E2E artifact and target".into(),
+                    );
+                }
             }
             validate_nonempty("installation.target", &installation.target)?;
             validate_reference("installation.reference", &installation.reference)?;
@@ -674,6 +706,8 @@ pub struct AgentEvent {
     pub work_stage: Option<WorkStage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<AgentCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_states: Option<DeliveryStates>,
 }
 
 pub fn snapshot_digest<T: Serialize>(snapshot: &T) -> Result<String, String> {

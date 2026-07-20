@@ -29,7 +29,7 @@
 // on a prompt bubbles amber onto its captain. Expanding a captain lists its
 // crewmates (each with its own status dot) above the captain's own subagent
 // tree.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Pencil } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { useWorkspace } from "../store/workspace";
@@ -51,6 +51,11 @@ import { ChevronIcon } from "./SidebarChrome";
 import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
 import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { StartAgentDialog } from "./StartAgentDialog";
+import {
+  DELIVERY_STATE_LABELS,
+  getAgent,
+  type DeliveryStates,
+} from "../ipc/agents";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
  *  terminal tile - the sidebar-row click behavior now that agents live as
@@ -480,6 +485,7 @@ function AgentRow({
  *  use the shared per-terminal hooks without a hook loop; identity-first like
  *  the captain rows (rename, else cwd basename). */
 function CrewRow({ terminalId }: { terminalId: string }) {
+  const [deliveryStates, setDeliveryStates] = useState<DeliveryStates | null>(null);
   const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
@@ -490,25 +496,65 @@ function CrewRow({ terminalId }: { terminalId: string }) {
     .at(-1);
   const identity =
     userLabel?.trim() || folder || workspaceName?.trim() || terminalId.slice(0, 8);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void getAgent(terminalId)
+        .then((agent) => {
+          if (active && agent.deliveryStates) setDeliveryStates(agent.deliveryStates);
+        })
+        .catch(() => {
+          // Legacy Crew records do not necessarily have an AgentSession record.
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [terminalId]);
   return (
-    <div
-      className="flex items-center gap-2 py-0.5"
-      data-crew-row={terminalId}
-    >
-      <CaptainStatusDot terminalId={terminalId} size={8} />
-      <span
-        className="min-w-0 flex-1 truncate text-[10px]"
-        style={{ color: "var(--th-fg)" }}
-      >
-        {identity}
-      </span>
-      {workspaceName != null && (
+    <div className="flex flex-col py-0.5" data-crew-row={terminalId}>
+      <div className="flex items-center gap-2">
+        <CaptainStatusDot terminalId={terminalId} size={8} />
         <span
-          className="shrink-0 truncate text-[9px]"
-          style={{ color: "var(--th-fg-muted)" }}
+          className="min-w-0 flex-1 truncate text-[10px]"
+          style={{ color: "var(--th-fg)" }}
         >
-          {workspaceName}
+          {identity}
         </span>
+        {workspaceName != null && (
+          <span
+            className="shrink-0 truncate text-[9px]"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {workspaceName}
+          </span>
+        )}
+      </div>
+      {deliveryStates && (
+        <div
+          className="ml-4 mt-1 flex flex-wrap gap-1"
+          aria-label={`Delivery states for ${identity}`}
+        >
+          {DELIVERY_STATE_LABELS.map(({ key, label }) => (
+            <span
+              key={key}
+              className="rounded border px-1 py-0.5 text-[8px] leading-none"
+              style={{
+                borderColor: deliveryStates[key]
+                  ? "color-mix(in srgb, var(--th-accent) 55%, transparent)"
+                  : "var(--th-border)",
+                color: deliveryStates[key] ? "var(--th-accent)" : "var(--th-fg-muted)",
+                opacity: deliveryStates[key] ? 1 : 0.45,
+              }}
+              title={`${label}: ${deliveryStates[key] ? "yes" : "no"}`}
+            >
+              {label}
+            </span>
+          ))}
+        </div>
       )}
     </div>
   );

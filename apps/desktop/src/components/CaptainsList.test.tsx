@@ -10,10 +10,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 const controlRequests: Array<{ command: string; args: Record<string, unknown> }> = [];
+const agentResponses = new Map<string, Record<string, unknown>>();
 vi.mock("../ipc/controlClient", () => ({
   onControlEvent: () => () => {},
   controlRequest: async (command: string, args: Record<string, unknown>) => {
     controlRequests.push({ command, args });
+    if (command === "get_agent") {
+      return agentResponses.get(String(args.agentSessionId)) ?? {};
+    }
     return {};
   },
 }));
@@ -61,6 +65,7 @@ function claim(
  *  session, no claim yet) whose tile lives in Workspace 2. */
 beforeEach(() => {
   controlRequests.length = 0;
+  agentResponses.clear();
   const tabs: WorkspaceTab[] = [
     { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0", "crewdon0"] },
     { id: "t2", name: "Workspace 2", order: ["bbb00001"] },
@@ -343,6 +348,32 @@ describe("CaptainsList expansion (crew + subagent tree)", () => {
     // The captain's own subagent tree still renders below (distinct from crew).
     expect(screen.getByTitle("running subagents").textContent).toBe("1 running");
     expect(screen.getByTitle("finished subagents").textContent).toBe("1 done");
+  });
+
+  it("renders every delivery state separately for a durable agent", async () => {
+    agentResponses.set("crewrun0", {
+      agentSessionId: "crewrun0",
+      runtimeState: "running",
+      workStage: "complete",
+      deliveryStates: {
+        implemented: true,
+        reviewed: true,
+        tested: true,
+        complete: true,
+        integrated: false,
+        packaged: false,
+        installed: false,
+        liveVerified: false,
+      },
+    });
+    render(<CaptainsList />);
+    fireEvent.click(within(row("cap00001")).getByLabelText(/Expand crew and subagents/));
+    const states = await screen.findByLabelText(/Delivery states for/);
+    expect(within(states).getByTitle("complete: yes")).toBeTruthy();
+    expect(within(states).getByTitle("integrated: no")).toBeTruthy();
+    expect(within(states).getByTitle("installed: no")).toBeTruthy();
+    expect(within(states).getByTitle("live-verified: no")).toBeTruthy();
+    expect(states.querySelectorAll("span")).toHaveLength(8);
   });
 
   it("shows the muted subagent hint for a captain with no session/crew yet", () => {
