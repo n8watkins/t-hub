@@ -21895,13 +21895,16 @@ fn current_delegating_supervisor(
         }
         crate::delegated_admin::DelegatingSupervisorRole::Captain => {
             let captain = grant.delegator.ship_slug.as_deref().and_then(|ship_slug| {
-                ctx.captains
+                let matches = ctx
+                    .captains
                     .snapshot()
                     .captains
                     .into_iter()
-                    .find(|captain| {
+                    .filter(|captain| {
                         captain.role == FleetRole::Captain && captain.ship_slug == ship_slug
                     })
+                    .collect::<Vec<_>>();
+                (matches.len() == 1).then(|| matches.into_iter().next().unwrap())
             });
             let current_identity = captain
                 .as_ref()
