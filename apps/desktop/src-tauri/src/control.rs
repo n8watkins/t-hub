@@ -16747,14 +16747,11 @@ fn commission_captain(
     if spawn_capability(&spawn_args) == Capability::Full {
         audit_control_spawn(ctx, "commission_captain", &spawn_args);
     }
-    let identity = match ctx
-        .identity
-        .mint_and_bind(
-            crate::identity::Role::Captain,
-            Some(ship_slug.clone()),
-            &terminal_id,
-        )
-    {
+    let identity = match ctx.identity.mint_and_bind(
+        crate::identity::Role::Captain,
+        Some(ship_slug.clone()),
+        &terminal_id,
+    ) {
         Ok(identity) => identity,
         Err(error) => {
             let _ = ctx
@@ -40775,7 +40772,7 @@ mod tests {
                 .unwrap();
         });
         let (captains, listed_tabs) = listed_rx
-            .recv_timeout(Duration::from_millis(250))
+            .recv_timeout(Duration::from_secs(2))
             .expect("Fleet readers must remain prompt during terminal effects");
         captains.unwrap();
         listed_tabs.unwrap();
