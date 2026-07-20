@@ -33,8 +33,8 @@ export interface SpawnOptions {
   /** Provider slot intent for built-in Codex and Claude presets. */
   providerIntent?: "codex" | "claude";
   /**
-   * T-Hub control-plane authority inherited by the spawned terminal.
-   * Omitted/read is least privilege; control is an explicit audited elevation.
+   * Compatibility input for terminal capability. Omitted/read creates a Crew
+   * session. Control is rejected; use Captain commissioning or delegated admin.
    */
   capability?: TerminalCapability;
 }

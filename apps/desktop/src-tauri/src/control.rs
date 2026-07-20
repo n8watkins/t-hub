@@ -8258,7 +8258,7 @@ struct DispatchReservationGuard {
     key: Option<DispatchReservationKey>,
 }
 
-/// Short-lived authority minted for one exact durable Captain identity.
+/// Short-lived authority minted for one exact durable orchestration identity.
 ///
 /// The secret exists only in the app and MCP process memories. It is never part
 /// of discovery, durable identity state, audit arguments, or global provider
@@ -8267,10 +8267,26 @@ struct DispatchReservationGuard {
 struct CaptainControlLease {
     identity_id: String,
     terminal_id: String,
-    ship_slug: String,
-    project_id: String,
-    generation: ScopedAuthorityGeneration,
+    authority: LeaseAuthority,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeaseAuthority {
+    Captain {
+        ship_slug: String,
+        project_id: String,
+        generation: ScopedAuthorityGeneration,
+    },
+    Cortana {
+        generation: u64,
+    },
+    DelegatedAdmin {
+        grant_id: String,
+        grant_generation: u64,
+        role: crate::delegated_admin::DelegatedAdminRole,
+        scope: crate::delegated_admin::AdminScope,
+    },
 }
 
 #[derive(Default)]
@@ -10035,33 +10051,111 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
 }
 
 #[derive(Clone)]
-struct CaptainLeaseAuthority {
+struct ControlLeaseAuthority {
     identity_id: String,
     terminal_id: String,
-    ship_slug: String,
-    project_id: String,
-    generation: ScopedAuthorityGeneration,
+    authority: LeaseAuthority,
 }
 
-/// Derive renewable Captain authority only from current durable state.
-///
-/// Possession of a read token, an old global control token, or a historical
-/// mint-time Captain role is insufficient. The exact identity, terminal, active
-/// Captain claim, Project binding, uniqueness, and live tmux session must agree.
-fn captain_lease_authority(
+fn exact_live_identity_terminal(
     ctx: &ControlContext,
     caller: &ResolvedIdentity,
-) -> Result<CaptainLeaseAuthority, String> {
+) -> Result<String, String> {
     let terminal_id = caller
         .tile
         .as_deref()
         .ok_or("control_reauthentication_required: identity is not terminal-bound")?;
-    if caller.mint_role != crate::identity::Role::Captain
-        || caller.fleet_role != Some(FleetRole::Captain)
-        || ctx.identity.count_for_tile(terminal_id) != 1
+    if ctx.identity.count_for_tile(terminal_id) != 1 {
+        return Err(
+            "control_reauthentication_required: terminal identity binding is missing or ambiguous"
+                .into(),
+        );
+    }
+    let live = (ctx.live_sessions)().map_err(|error| {
+        format!("control_reauthentication_required: terminal liveness is unavailable: {error}")
+    })?;
+    let target = tmux_target(terminal_id);
+    if !live
+        .iter()
+        .any(|session| session == terminal_id || session == &target)
     {
         return Err(
-            "control_reauthentication_required: identity is not the unique active Captain for this terminal"
+            "control_reauthentication_required: terminal is not alive; durable identity was preserved"
+                .into(),
+        );
+    }
+    Ok(terminal_id.to_string())
+}
+
+/// Derive renewable mutation authority only from current durable state.
+///
+/// Possession of a read token, an old global control token, or a historical
+/// mint-time role is insufficient. The exact identity, terminal, live runtime,
+/// current fleet binding, and current scoped grant must agree.
+fn control_lease_authority(
+    ctx: &ControlContext,
+    caller: &ResolvedIdentity,
+) -> Result<ControlLeaseAuthority, String> {
+    let terminal_id = exact_live_identity_terminal(ctx, caller)?;
+
+    if caller.fleet_role == Some(FleetRole::Cortana)
+        && caller.mint_role == crate::identity::Role::Cortana
+    {
+        let identity = ctx
+            .identity
+            .get(&caller.session_id)
+            .ok_or("control_reauthentication_required: durable Cortana identity is unavailable")?;
+        if !authoritative_cortana_identity(ctx, &identity) {
+            return Err(
+                "control_reauthentication_required: Cortana identity is not authoritative".into(),
+            );
+        }
+        return Ok(ControlLeaseAuthority {
+            identity_id: caller.session_id.clone(),
+            terminal_id,
+            authority: LeaseAuthority::Cortana {
+                generation: ctx.captains.cortana_identity().generation,
+            },
+        });
+    }
+
+    let active_grants = ctx
+        .delegated_admin
+        .grants_for_actor(&caller.session_id)
+        .into_iter()
+        .filter(|grant| grant.state.is_active())
+        .collect::<Vec<_>>();
+    if let [grant] = active_grants.as_slice() {
+        let supervisor = current_delegating_supervisor(ctx, grant);
+        let actor = current_admin_actor(ctx, grant);
+        ctx.delegated_admin
+            .validate_effective_grant(grant, &actor, &supervisor)
+            .map_err(|error| format!("control_reauthentication_required: {error}"))?;
+        if actor.identity_id != caller.session_id
+            || actor.session_tile.as_deref() != Some(terminal_id.as_str())
+        {
+            return Err(
+                "control_reauthentication_required: delegated administrator identity changed"
+                    .into(),
+            );
+        }
+        return Ok(ControlLeaseAuthority {
+            identity_id: caller.session_id.clone(),
+            terminal_id,
+            authority: LeaseAuthority::DelegatedAdmin {
+                grant_id: grant.grant_id.clone(),
+                grant_generation: grant.grant_generation,
+                role: grant.role,
+                scope: grant.scope.clone(),
+            },
+        });
+    }
+
+    if caller.mint_role != crate::identity::Role::Captain
+        || caller.fleet_role != Some(FleetRole::Captain)
+    {
+        return Err(
+            "control_reauthentication_required: identity has no active scoped mutation authority"
                 .into(),
         );
     }
@@ -10074,7 +10168,7 @@ fn captain_lease_authority(
         .filter(|captain| {
             captain.role == FleetRole::Captain
                 && captain.state == ClaimState::Active
-                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 && caller
                     .ship_slug
                     .as_deref()
@@ -10107,26 +10201,19 @@ fn captain_lease_authority(
         );
     }
 
-    let live = (ctx.live_sessions)().map_err(|error| {
-        format!("control_reauthentication_required: Captain liveness is unavailable: {error}")
-    })?;
-    let target = tmux_target(terminal_id);
-    if !live
-        .iter()
-        .any(|session| session == terminal_id || session == &target)
-    {
-        return Err(
-            "control_reauthentication_required: Captain terminal is not alive; durable identity was preserved"
-                .into(),
-        );
-    }
-
-    Ok(CaptainLeaseAuthority {
+    Ok(ControlLeaseAuthority {
         identity_id: caller.session_id.clone(),
-        terminal_id: terminal_id.to_string(),
-        ship_slug: captain.ship_slug.clone(),
-        project_id: project_id.to_string(),
-        generation: generations.scoped(registry_epoch, &captain.ship_slug, terminal_id, project_id),
+        terminal_id: terminal_id.clone(),
+        authority: LeaseAuthority::Captain {
+            ship_slug: captain.ship_slug.clone(),
+            project_id: project_id.to_string(),
+            generation: generations.scoped(
+                registry_epoch,
+                &captain.ship_slug,
+                &terminal_id,
+                project_id,
+            ),
+        },
     })
 }
 
@@ -10149,22 +10236,36 @@ fn renew_captain_control_lease(
     let caller = caller.ok_or(
         "control_reauthentication_required: durable session identity could not be verified",
     )?;
-    let authority = captain_lease_authority(ctx, caller)?;
+    let authority = control_lease_authority(ctx, caller)?;
     let expires_at = Instant::now() + CAPTAIN_CONTROL_LEASE_TTL;
+    let response_scope = match &authority.authority {
+        LeaseAuthority::Captain {
+            ship_slug,
+            project_id,
+            ..
+        } => json!({
+            "kind": "captain",
+            "shipSlug": ship_slug,
+            "projectId": project_id,
+        }),
+        LeaseAuthority::Cortana { .. } => json!({ "kind": "cortana" }),
+        LeaseAuthority::DelegatedAdmin { role, scope, .. } => json!({
+            "kind": "delegatedAdmin",
+            "role": role,
+            "scope": scope,
+        }),
+    };
     let secret = ctx.control_leases.issue(CaptainControlLease {
         identity_id: authority.identity_id,
         terminal_id: authority.terminal_id.clone(),
-        ship_slug: authority.ship_slug.clone(),
-        project_id: authority.project_id.clone(),
-        generation: authority.generation,
+        authority: authority.authority,
         expires_at,
     });
     Ok(json!({
         "lease": secret,
         "expiresAt": now_ms().saturating_add(CAPTAIN_CONTROL_LEASE_TTL.as_millis() as u64),
         "terminalId": authority.terminal_id,
-        "shipSlug": authority.ship_slug,
-        "projectId": authority.project_id,
+        "scope": response_scope,
         "capability": "control",
     }))
 }
@@ -10178,16 +10279,13 @@ fn resolve_captain_control_lease(
     let lease = ctx.control_leases.get(presented)?;
     if caller.session_id != lease.identity_id
         || caller.tile.as_deref() != Some(lease.terminal_id.as_str())
-        || caller.ship_slug.as_deref() != Some(lease.ship_slug.as_str())
     {
         return None;
     }
-    let authority = captain_lease_authority(ctx, caller).ok()?;
+    let authority = control_lease_authority(ctx, caller).ok()?;
     (authority.identity_id == lease.identity_id
         && authority.terminal_id == lease.terminal_id
-        && authority.ship_slug == lease.ship_slug
-        && authority.project_id == lease.project_id
-        && authority.generation == lease.generation)
+        && authority.authority == lease.authority)
         .then_some(Capability::ScopedControl)
 }
 
@@ -10770,49 +10868,26 @@ fn enforce_workspace_owner(
     }
 }
 
-/// Whether the pre-item-3 fail-OPEN spawn default is restored (instant rollback,
-/// §3.3). With `T_HUB_SPAWN_LEGACY_FULL=1`/`true` a spawn defaults to the FULL
-/// control token unless it explicitly asks for `capability:"read"` - the behavior
-/// before the least-privilege inversion. OFF by default: the ratified default is
-/// least-privilege (untagged spawn => READ).
-fn legacy_full_spawn_default() -> bool {
-    std::env::var("T_HUB_SPAWN_LEGACY_FULL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// The capability a spawned session is granted (item-3 Pillar A, HIGH-1: the root
-/// move). INVERTED least-privilege: the DEFAULT is READ. A control-capable child
-/// requires the caller to explicitly pass `capability:"control"`.
+/// Validate the public spawn capability contract.
 ///
-/// Why this is a WALL, not a painted line: every spawner is necessarily a Full-token
-/// caller (`spawn_terminal`/`create_worktree` are ProcessChanging/Organization - only
-/// Full may call them), so opting a child UP to control is a deliberate, audited act
-/// by a caller who already holds Full; a missed/typo'd tag under-privileges (fails
-/// SAFE to READ) instead of leaking the full token to crew. `T_HUB_SPAWN_LEGACY_FULL`
-/// restores the old fail-open default for an instant rollback.
-fn spawn_capability(args: &Value) -> Capability {
-    let declared = arg_str(args, "capability");
-    if legacy_full_spawn_default() {
-        // Pre-item-3 fail-open: control unless an explicit `read`.
-        let read_only = declared
-            .map(|c| c.eq_ignore_ascii_case("read"))
-            .unwrap_or(false);
-        return if read_only {
-            Capability::ReadOnly
-        } else {
-            Capability::Full
-        };
+/// Generic spawns always mint a Crew identity and therefore cannot safely request
+/// orchestration authority. Captain, Cortana, and delegated administrator authority
+/// is acquired only after the corresponding durable server-side binding exists.
+fn require_read_only_spawn(args: &Value, command: &str) -> Result<(), String> {
+    let Some(declared) = arg_str(args, "capability") else {
+        return Ok(());
+    };
+    if declared.eq_ignore_ascii_case("read") {
+        return Ok(());
     }
-    // Ratified inverted default: READ unless an explicit `control`.
-    let control = declared
-        .map(|c| c.eq_ignore_ascii_case("control"))
-        .unwrap_or(false);
-    if control {
-        Capability::Full
-    } else {
-        Capability::ReadOnly
+    if declared.eq_ignore_ascii_case("control") {
+        return Err(format!(
+            "{command}: capability 'control' is unsupported for generic Crew spawns; use the durable Captain, Cortana, or delegated-administrator workflow"
+        ));
     }
+    Err(format!(
+        "{command}: capability must be 'read' when supplied"
+    ))
 }
 
 /// Environment passed to a spawned session for durable control discovery.
@@ -10883,8 +10958,8 @@ fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
 /// tmux `-e KEY=` overrides any inherited value), so a crew that evades the gate still
 /// fails at the remote for lack of a credential.
 /// Capability and organizational role are independent: an administrative Crew may
-/// receive the control capability for its exact operations while still receiving no
-/// ambient publishing credentials.
+/// later acquire an identity-bound scoped lease while still receiving no ambient
+/// publishing credentials.
 pub(crate) fn crew_credential_withholding_env() -> Vec<(String, String)> {
     let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
@@ -10964,20 +11039,15 @@ fn spawn_env_with_identity(
     ),
     String,
 > {
+    require_read_only_spawn(args, command)?;
     let mut env = elevation_env(ctx, args);
     if env.is_empty() {
         // No addr => headless; do not mint (there is no channel for the session to
         // present its token over anyway).
         return Ok((env, None));
     }
-    // item-3 §2.1.1 piece 4: every control-capability spawn is audited so an
-    // elevation is never silent. The default (READ) spawn is not elevated.
-    let capability = spawn_capability(args);
-    if capability == Capability::Full {
-        audit_control_spawn(ctx, command, args);
-    }
-    // Every identity minted by this helper is Crew, including an administrator with
-    // the control capability. Role, not capability, decides ambient credential access.
+    // Every identity minted by this helper is Crew. A later durable appointment can
+    // let that exact identity acquire a scoped administrative lease.
     env.extend(crew_credential_withholding_env());
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
@@ -16719,7 +16789,6 @@ fn reconcile_cortana_inner(
         "cwd": home,
         "name": "Cortana",
         "startupCommand": startup_command,
-        "capability": "control",
         "tabId": CAPTAIN_WORKSPACE_ID,
     });
     let mut elevation = elevation_env(ctx, &spawn_args);
@@ -16981,7 +17050,6 @@ fn commission_captain(
         "cwd": project.repo_root,
         "name": format!("Captain - {}", project.name),
         "startupCommand": startup_command,
-        "capability": "control",
         "tabId": CAPTAIN_WORKSPACE_ID,
     });
     if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
@@ -17002,9 +17070,7 @@ fn commission_captain(
         harness.as_provider(),
     )?;
     let mut elevation = elevation_env(ctx, &spawn_args);
-    if spawn_capability(&spawn_args) == Capability::Full {
-        audit_control_spawn(ctx, "commission_captain", &spawn_args);
-    }
+    audit_control_spawn(ctx, "commission_captain", &spawn_args);
     let identity = match ctx.identity.mint_and_bind(
         crate::identity::Role::Captain,
         Some(ship_slug.clone()),
@@ -23526,9 +23592,8 @@ fn create_worktree_authorized(
     let mut terminal_id: Option<String> = None;
     let mut tab_id = tab_id;
     if has_ui {
-        // item-3: the worktree terminal follows the same inverted least-privilege
-        // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
-        // Phase 2 (§2.3): mint + inject its per-session identity token too.
+        // Worktree terminals are Crew and receive stable discovery plus a durable
+        // per-session identity token.
         let (elevation, minted_identity) =
             match spawn_env_with_identity(ctx, args, "create_worktree", None) {
                 Ok(value) => value,
@@ -25760,12 +25825,6 @@ fn start_agent(
         "startupCommand": launch,
         "spawnedBy": captain_session_id,
     });
-    if matches!(
-        spawn_purpose,
-        SpawnPurpose::FleetAdmin | SpawnPurpose::ShipAdmin { .. } | SpawnPurpose::Recovery
-    ) {
-        spawn_args["capability"] = json!("control");
-    }
     if let Some(tab_id) = arg_str(args, "workspaceTabId") {
         spawn_args["tabId"] = json!(tab_id);
     }
@@ -26021,10 +26080,8 @@ fn spawn_terminal_with_private_pane_command_and_id(
     let tmux_cwd = files::posix_form(&cwd_effective);
     let public_pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     let pane = private_pane_command.map(str::to_owned).or(public_pane);
-    // item-3: grant this session its capability token via env (READ by default,
-    // control only on an explicit `capability:"control"`), so its in-session MCP
-    // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
-    // + inject this session's per-session identity token alongside the tier token.
+    // Spawned terminals receive stable discovery plus a durable Crew identity.
+    // Orchestration authority is acquired later from authoritative server state.
     let provider_harness = arg_str(args, "_providerHarness").or_else(|| {
         requested_session_id.and_then(|session_id| {
             ctx.captains
@@ -37162,6 +37219,33 @@ mod tests {
         )
         .unwrap();
         let fleet_admin = resolve_identity(&ctx, &fleet_admin_identity.secret).unwrap();
+        let renewed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &fleet_admin_identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(renewed.ok, "{:?}", renewed.error);
+        let renewed = renewed.result.unwrap();
+        assert_eq!(renewed["scope"]["kind"], "delegatedAdmin");
+        assert_eq!(renewed["scope"]["role"], "fleetAdmin");
+        let fleet_admin_lease = renewed["lease"].as_str().unwrap();
+        let leased_mutation = dispatch_authenticated(
+            &ctx,
+            req_session(
+                fleet_admin_lease,
+                &fleet_admin_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "maintainFleetResource",
+                    "target": { "kind": "fleet" }
+                }),
+            ),
+        );
+        assert!(leased_mutation.ok, "{:?}", leased_mutation.error);
 
         let maintained = execute_admin_operation(
             &ctx,
@@ -37790,6 +37874,20 @@ mod tests {
         )
         .unwrap();
         let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+        let renewed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &admin_identity.secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(renewed.ok, "{:?}", renewed.error);
+        let renewed = renewed.result.unwrap();
+        assert_eq!(renewed["scope"]["kind"], "delegatedAdmin");
+        assert_eq!(renewed["scope"]["role"], "shipAdmin");
+        let admin_lease = renewed["lease"].as_str().unwrap().to_string();
 
         let read_denied = read_terminal(
             &ctx,
@@ -37831,12 +37929,7 @@ mod tests {
         ] {
             let response = dispatch_authenticated(
                 &ctx,
-                req_session(
-                    "admin-boundaries",
-                    &admin_identity.secret,
-                    command,
-                    json!({}),
-                ),
+                req_session(&admin_lease, &admin_identity.secret, command, json!({})),
             );
             assert!(
                 !response.ok,
@@ -37875,7 +37968,7 @@ mod tests {
         let maintained = dispatch_authenticated(
             &ctx,
             req_session(
-                "admin-boundaries",
+                &admin_lease,
                 &admin_identity.secret,
                 "execute_admin_operation",
                 json!({
@@ -37893,7 +37986,7 @@ mod tests {
         let grants = dispatch_authenticated(
             &ctx,
             req_session(
-                "admin-boundaries",
+                &admin_lease,
                 &admin_identity.secret,
                 "list_admin_grants",
                 json!({}),
@@ -42689,16 +42782,11 @@ mod tests {
     }
 
     #[test]
-    fn control_capability_spawn_is_audited_but_read_default_is_not() {
-        // item-3 §2.1.1 piece 4: every control-capability spawn emits a `control-spawn`
-        // audit record so an elevation is never silent; the least-privilege default
-        // (READ) does not. BYPASS-WOULD-FAIL: drop `audit_control_spawn` and the
-        // explicit-control assertion goes RED.
+    fn generic_control_spawn_is_refused_without_recording_a_false_elevation() {
         let dir = std::env::temp_dir().join("t-hub-item3-ctlspawn");
         let _ = std::fs::remove_dir_all(&dir);
         let mut ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
-        // A bound addr so the spawn tree injects a capability token, mints, and audits.
-        // Exercise the mint+audit unit directly (the no-UI gate sits upstream of it).
+        // A bound address enables stable discovery and identity minting.
         ctx.addr = "127.0.0.1:4242".to_string();
 
         // Default (untagged => READ) spawn: NO control-spawn audit record.
@@ -42709,25 +42797,17 @@ mod tests {
             "a read-default spawn must NOT emit a control-spawn audit record"
         );
 
-        // Explicit `capability:"control"`: emits exactly one control-spawn record.
-        let _ = spawn_env_with_identity(
+        // Explicit control is refused before identity mint or elevation audit.
+        let refused = spawn_env_with_identity(
             &ctx,
             &json!({"cwd": "/tmp", "capability": "control"}),
             "spawn_terminal",
             None,
-        );
+        )
+        .unwrap_err();
+        assert!(refused.contains("unsupported for generic Crew spawns"));
         let recs = read_audit(&dir);
-        let ctl: Vec<_> = recs
-            .iter()
-            .filter(|r| r["decision"] == "control-spawn")
-            .collect();
-        assert_eq!(
-            ctl.len(),
-            1,
-            "an explicit control spawn is audited exactly once"
-        );
-        assert_eq!(ctl[0]["tokenTier"], "control");
-        assert_eq!(ctl[0]["command"], "spawn_terminal");
+        assert!(recs.iter().all(|r| r["decision"] != "control-spawn"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -42963,9 +43043,8 @@ mod tests {
     fn phase3_hardened_publishes_read_token_and_default_spawn_is_read() {
         // With hardening ON (the item-3 default): what `control.json` publishes as
         // `token` is the READ token (so a raw scraper is read-only), AND the default
-        // spawn-tree env injection is now ALSO the READ token (item-3 flip #1 inverted
-        // least-privilege). Only an explicit `capability:"control"` spawn carries the
-        // full token. These facts together are the item-3 Pillar A contract.
+        // spawn-tree discovery contains no rotating capability token. Generic
+        // control requests are rejected by the spawn contract.
         let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
                                    // Discovery, hardened: publishes the read token, NOT the control token.
         let published = select_published_token(&ctx.token, &ctx.read_token, true);
@@ -43100,30 +43179,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_spawn_default_env_restores_fail_open() {
-        // The instant rollback (§3.3): `T_HUB_SPAWN_LEGACY_FULL=1` restores the
-        // pre-item-3 fail-OPEN default (control unless an explicit `read`). Guards
-        // that the rollback switch actually flips behavior. Process-global env var;
-        // saved/restored to stay hermetic.
-        let saved = std::env::var("T_HUB_SPAWN_LEGACY_FULL").ok();
-        std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL");
-        // Default (inverted): untagged => ReadOnly.
-        assert_eq!(spawn_capability(&json!({})), Capability::ReadOnly);
-        assert_eq!(
-            spawn_capability(&json!({"capability": "control"})),
-            Capability::Full
+    fn generic_spawn_refuses_control_capability_without_a_durable_authority() {
+        assert!(require_read_only_spawn(&json!({}), "spawn_terminal").is_ok());
+        assert!(require_read_only_spawn(&json!({"capability": "read"}), "spawn_terminal").is_ok());
+        assert!(
+            require_read_only_spawn(&json!({"capability": "control"}), "spawn_terminal")
+                .unwrap_err()
+                .contains("unsupported for generic Crew spawns")
         );
-        // Legacy rollback: untagged => Full (fail-open), explicit read => ReadOnly.
-        std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", "1");
-        assert_eq!(spawn_capability(&json!({})), Capability::Full);
-        assert_eq!(
-            spawn_capability(&json!({"capability": "read"})),
-            Capability::ReadOnly
+        assert!(
+            require_read_only_spawn(&json!({"capability": "unknown"}), "spawn_terminal").is_err()
         );
-        match saved {
-            Some(v) => std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", v),
-            None => std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL"),
-        }
     }
 
     #[test]
@@ -43170,46 +43236,18 @@ mod tests {
     }
 
     #[test]
-    fn requested_control_does_not_elevate_the_prebound_crew_identity() {
+    fn requested_control_is_refused_before_a_crew_identity_is_minted() {
         let mut ctx = test_ctx("identity-prebind");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (_, minted) = spawn_env_with_identity(
+        let error = spawn_env_with_identity(
             &ctx,
             &json!({"capability": "control"}),
             "spawn_terminal",
             Some("fa123456"),
         )
-        .unwrap();
-        let minted = minted.unwrap();
-        assert_eq!(minted.session_tile.as_deref(), Some("fa123456"));
-        assert_eq!(
-            ctx.identity
-                .resolve(&minted.secret)
-                .and_then(|identity| identity.session_tile),
-            Some("fa123456".into())
-        );
-
-        let path = captains_tmp("identity-prebind-rollback");
-        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
-        store.fail_persist_after(1);
-        let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
-        failing.addr = "127.0.0.1:4242".to_string();
-        let (_, identity) = spawn_env_with_identity(
-            &failing,
-            &json!({"capability": "control"}),
-            "spawn_terminal",
-            Some("fa654321"),
-        )
-        .unwrap();
-        let identity = identity.unwrap();
-        assert_eq!(identity.role, crate::identity::Role::Crew);
-        assert_eq!(identity.session_tile.as_deref(), Some("fa654321"));
-        assert_eq!(store.count_for_tile("fa654321"), 1);
-        assert_eq!(
-            crate::identity::IdentityStore::load(path.clone()).count_for_tile("fa654321"),
-            1
-        );
-        std::fs::remove_file(path).ok();
+        .unwrap_err();
+        assert!(error.contains("unsupported for generic Crew spawns"));
+        assert!(ctx.identity.is_empty());
     }
 
     #[test]
@@ -43505,8 +43543,9 @@ mod tests {
         assert_ne!(lease, ctx.token);
         assert_ne!(lease, ctx.read_token);
         assert_eq!(result["terminalId"], "lease-captain");
-        assert_eq!(result["shipSlug"], "lease-ship");
-        assert_eq!(result["projectId"], "lease-project");
+        assert_eq!(result["scope"]["kind"], "captain");
+        assert_eq!(result["scope"]["shipSlug"], "lease-ship");
+        assert_eq!(result["scope"]["projectId"], "lease-project");
         assert_eq!(captains.snapshot().captains, before.captains);
         assert_eq!(captains.snapshot().projects, before.projects);
 
@@ -43544,6 +43583,34 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_cortana_renews_a_fleet_scoped_lease_and_mutates() {
+        let terminal_id = "lease-cortana";
+        let live_target = tmux_target(terminal_id);
+        let ctx =
+            test_ctx("cortana-global").with_live_sessions(move || Ok(vec![live_target.clone()]));
+        let secret = mint_current_cortana_session(&ctx.identity, &ctx.captains, terminal_id);
+        let renewed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &secret,
+                "renew_captain_control_lease",
+                Value::Null,
+            ),
+        );
+        assert!(renewed.ok, "{:?}", renewed.error);
+        let renewed = renewed.result.unwrap();
+        assert_eq!(renewed["scope"]["kind"], "cortana");
+        let lease = renewed["lease"].as_str().unwrap();
+        let mutation = dispatch_authenticated(
+            &ctx,
+            req_session(lease, &secret, "new_tab", json!({"name": "Cortana Ops"})),
+        );
+        assert!(mutation.ok, "{:?}", mutation.error);
+        assert!(ctx.tabs.id_for_name("Cortana Ops").is_some());
+    }
+
+    #[test]
     fn captain_lease_renewal_rejects_dead_released_crew_and_duplicate_identities() {
         let (dead_ctx, _, _, dead_identity) = captain_lease_fixture(false);
         let dead = dispatch_authenticated(
@@ -43574,8 +43641,7 @@ mod tests {
         assert!(released
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("missing or ambiguous")
-                || error.contains("unique active Captain")));
+            .is_some_and(|error| error.contains("control_reauthentication_required")));
 
         let (duplicate_ctx, _, identities, identity) = captain_lease_fixture(true);
         identities
@@ -43597,7 +43663,7 @@ mod tests {
         assert!(duplicate
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("unique active Captain")));
+            .is_some_and(|error| error.contains("missing or ambiguous")));
 
         let crew_store = Arc::new(crate::identity::IdentityStore::ephemeral());
         let crew = crew_store
@@ -43619,9 +43685,10 @@ mod tests {
                 Value::Null,
             ),
         );
-        assert!(crew_result.error.as_deref().is_some_and(|error| {
-            error.contains("unique active Captain") || error.contains("registry binding")
-        }));
+        assert!(crew_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("control_reauthentication_required")));
 
         let (removed_ctx, _, removed_identities, removed_identity) = captain_lease_fixture(true);
         removed_identities.retire(&removed_identity.id).unwrap();
@@ -43644,13 +43711,15 @@ mod tests {
             CaptainControlLease {
                 identity_id: expired_identity.id.clone(),
                 terminal_id: "lease-captain".into(),
-                ship_slug: "lease-ship".into(),
-                project_id: "lease-project".into(),
-                generation: expired_ctx.captains.test_scoped_authority_generation(
-                    "lease-ship",
-                    "lease-captain",
-                    "lease-project",
-                ),
+                authority: LeaseAuthority::Captain {
+                    ship_slug: "lease-ship".into(),
+                    project_id: "lease-project".into(),
+                    generation: expired_ctx.captains.test_scoped_authority_generation(
+                        "lease-ship",
+                        "lease-captain",
+                        "lease-project",
+                    ),
+                },
                 expires_at: Instant::now() - Duration::from_secs(1),
             },
         );

@@ -35,8 +35,8 @@ export interface SpawnMenuProps {
   /** Close the menu without spawning (Escape / backdrop click / after a pick). */
   onClose: () => void;
   /**
-   * Spawn a terminal with the chosen typed options. The plain Shell preset sends
-   * an empty object; only Captain Codex requests control capability.
+   * Spawn a read-only Crew terminal with the chosen typed options. Captain
+   * creation uses the separate commissioning flow.
    */
   onSpawn: (selection: SpawnSelection) => void;
   /** A spawn is already in flight (#7) — disable the presets so a double-click
@@ -109,9 +109,6 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
     if (busy) return;
     if (preset.commission) {
       setCommissionOpen(true);
-      return;
-    }
-    if (preset.options.capability === "control") {
       return;
     }
     onSpawn({ options: preset.options, pinAsCaptain: preset.pinAsCaptain });

@@ -48,14 +48,10 @@ pub struct SpawnOptions {
     /// Explicit provider capacity intent for built-in UI agent presets.
     /// Generic shells omit it and therefore consume no provider slot.
     pub provider_intent: Option<String>,
-    /// item-3 §2.1.1 piece 3: the capability the UI-spawned session is granted.
-    /// INVERTED least-privilege - `None`/`"read"` (the default) injects the READ
-    /// token, so a UI-spawned terminal is a pure-work session that can observe but
-    /// not spawn/type/kill; `"control"` is a deliberate, audited elevation for an
-    /// orchestration terminal (it injects the in-process full control token). The
-    /// chosen token is injected at the tmux SESSION level so it OVERRIDES (scrubs)
-    /// any `T_HUB_CONTROL_TOKEN` the polluted app env would otherwise leak into the
-    /// child - env-inheritance must never decide a session's capability.
+    /// Compatibility input for the former spawn-time capability contract.
+    /// Omitted or `"read"` creates a read-only Crew session. `"control"` is
+    /// rejected because orchestration authority requires a durable Captain,
+    /// Cortana, or delegated-administrator binding.
     pub capability: Option<String>,
 }
 
@@ -127,17 +123,18 @@ fn ui_spawn_capability_env(
 ) -> Result<
     (
         Vec<(String, String)>,
-        bool,
         Option<crate::identity::SessionIdentity>,
     ),
     String,
 > {
-    // Preserve the input field for wire compatibility, but never convert a Crew
-    // request into Captain authority.
-    let _requested_control = opts
-        .capability
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("control"));
+    if let Some(capability) = opts.capability.as_deref() {
+        if capability.eq_ignore_ascii_case("control") {
+            return Err("spawn_terminal: capability 'control' is unsupported for generic Crew spawns; use the Captain commissioning flow".into());
+        }
+        if !capability.eq_ignore_ascii_case("read") {
+            return Err("spawn_terminal: capability must be 'read' when supplied".into());
+        }
+    }
     // LOW-1: the scrub is UNCONDITIONAL - env-inheritance must never decide a
     // session's capability. When the control endpoint is unresolvable / unbound (a
     // pre-bind race, no live control server), we still explicitly BLANK
@@ -158,10 +155,10 @@ fn ui_spawn_capability_env(
         env
     };
     let Ok(endpoint) = control_endpoint(app) else {
-        return Ok((scrub(), false, None));
+        return Ok((scrub(), None));
     };
     if endpoint.addr().is_empty() {
-        return Ok((scrub(), false, None));
+        return Ok((scrub(), None));
     }
     // Pass only the stable authoritative file location. Address and tier
     // credentials are rediscovered or reacquired in memory by the MCP process.
@@ -189,37 +186,7 @@ fn ui_spawn_capability_env(
             identity.secret.clone(),
         ));
     }
-    Ok((env, false, identity))
-}
-
-/// item-3 §2.1.1 piece 4: audit a UI control-capability spawn against the SHARED
-/// hash-chained audit log (managed in app state alongside the control server), so a
-/// UI elevation is never silent and a log review enumerates every control-spawn on
-/// all three paths. Best-effort: absence of the sink (very early startup) never
-/// blocks a spawn.
-fn audit_ui_control_spawn(app: &tauri::AppHandle, opts: &SpawnOptions) {
-    let Some(audit) = app.try_state::<std::sync::Arc<crate::audit::AuditLog>>() else {
-        return;
-    };
-    let args = serde_json::json!({
-        "capability": "control",
-        "cwd": opts.cwd,
-        "name": opts.name,
-        "source": "ui-spawn",
-    });
-    audit.record(
-        "spawn_terminal",
-        "process-changing",
-        "control-spawn",
-        &args,
-        crate::audit::AuditMeta {
-            peer: "loopback",
-            token_tier: "control",
-            session: None,
-            spawned_by: None,
-            error: None,
-        },
-    );
+    Ok((env, identity))
 }
 
 /// Decide which in-memory map entries are stale and must be evicted, given the
@@ -384,21 +351,14 @@ pub fn spawn_terminal(
     // `startupCommand` ("+" presets: Claude / Resume Claude / Custom…) is run
     // inside a login shell the pane execs back into (see `resolve_pane_command`).
     let command = resolve_pane_command(&opts);
-    // item-3 §2.1.1 piece 3: bring the UI spawn path under the same inverted
-    // least-privilege regime as the control-socket spawns. Inject the chosen
-    // capability token at the tmux SESSION level (`-e`), which OVERRIDES (scrubs) any
-    // inherited `T_HUB_CONTROL_TOKEN`/`_ADDR` the polluted app env would otherwise
-    // leak - env-inheritance must never decide a session's capability. Default READ;
-    // an explicit `capability:"control"` is a deliberate, audited elevation.
-    let (mut elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
+    // UI spawns are always Crew. Stable discovery plus durable identity is passed,
+    // while rotating credentials are scrubbed.
+    let (mut elevation, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
     if let Some(provider) = provider_intent {
         elevation.push((
             "T_HUB_PROVIDER_SESSION".to_string(),
             format!("pending:{provider}"),
         ));
-    }
-    if is_control {
-        audit_ui_control_spawn(&app, &opts);
     }
     if let Err(error) =
         tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
