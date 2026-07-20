@@ -114,7 +114,7 @@ fn unknown_admin_flags_fail_before_discovery() {
 
 #[test]
 fn exact_session_approval_and_cleanup_are_forwarded_without_authority_expansion() {
-    let (output, request) = cli_with_server(&[
+    let fabricated_scope = cli(&[
         "admin",
         "approve-session",
         "grant-1",
@@ -123,6 +123,14 @@ fn exact_session_approval_and_cleanup_are_forwarded_without_authority_expansion(
         "alpha",
         "--json",
     ]);
+    assert_eq!(fabricated_scope.status.code(), Some(2));
+    assert_eq!(
+        envelope(&fabricated_scope)["error"]["message"],
+        "unknown flag '--ship'"
+    );
+
+    let (output, request) =
+        cli_with_server(&["admin", "approve-session", "grant-1", "crew-1", "--json"]);
     assert!(output.status.success());
     assert_eq!(request["command"], "approve_admin_action");
     assert_eq!(
@@ -130,11 +138,7 @@ fn exact_session_approval_and_cleanup_are_forwarded_without_authority_expansion(
         serde_json::json!({
             "grantId": "grant-1",
             "operation": "cleanupSession",
-            "target": {
-                "kind": "crewSession",
-                "shipSlug": "alpha",
-                "sessionId": "crew-1",
-            }
+            "sessionId": "crew-1",
         })
     );
 

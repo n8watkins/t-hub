@@ -19503,7 +19503,7 @@ fn approve_admin_action(
     require_exact_args(
         args,
         "approve_admin_action",
-        &["grantId", "operation", "target"],
+        &["grantId", "operation", "sessionId", "target"],
     )?;
     require_socket_identity(caller, trusted_internal, "approve_admin_action")?;
     let caller = caller.ok_or("approve_admin_action requires a supervisor session identity")?;
@@ -19520,12 +19520,45 @@ fn approve_admin_action(
             .ok_or("approve_admin_action requires an operation")?,
     )
     .map_err(|error| format!("approve_admin_action operation is invalid: {error}"))?;
-    let target = serde_json::from_value::<crate::delegated_admin::AdminTarget>(
-        args.get("target")
-            .cloned()
-            .ok_or("approve_admin_action requires a target")?,
-    )
-    .map_err(|error| format!("approve_admin_action target is invalid: {error}"))?;
+    let target = match operation {
+        crate::delegated_admin::AdminOperation::CleanupSession => {
+            if args.get("target").is_some() {
+                return Err(
+                    "approve_admin_action cleanupSession accepts sessionId only; target kind and ownership are resolved authoritatively"
+                        .into(),
+                );
+            }
+            let session_id = arg_str(args, "sessionId")
+                .filter(|session_id| !session_id.trim().is_empty())
+                .ok_or("approve_admin_action cleanupSession requires a non-empty sessionId")?;
+            delegated_admin_target_for_terminal(ctx, &session_id)?
+        }
+        crate::delegated_admin::AdminOperation::CleanupWorktree => {
+            if args.get("sessionId").is_some() {
+                return Err(
+                    "approve_admin_action cleanupWorktree accepts an exact worktree target only"
+                        .into(),
+                );
+            }
+            let target = serde_json::from_value::<crate::delegated_admin::AdminTarget>(
+                args.get("target")
+                    .cloned()
+                    .ok_or("approve_admin_action cleanupWorktree requires a target")?,
+            )
+            .map_err(|error| format!("approve_admin_action target is invalid: {error}"))?;
+            if !matches!(target, crate::delegated_admin::AdminTarget::Worktree { .. }) {
+                return Err(
+                    "approve_admin_action cleanupWorktree requires a worktree target".into(),
+                );
+            }
+            target
+        }
+        _ => {
+            return Err(
+                "approve_admin_action supports only cleanupSession or cleanupWorktree".into(),
+            );
+        }
+    };
     let approval = ctx
         .delegated_admin
         .get(&grant_id)
@@ -30653,7 +30686,7 @@ mod tests {
             tmux::SessionLiveness::Alive
         );
 
-        let approval = approve_admin_action(
+        let fabricated = approve_admin_action(
             &ctx,
             &json!({
                 "grantId": grant["grant"]["grantId"],
@@ -30667,7 +30700,22 @@ mod tests {
             Some(&captain),
             false,
         )
+        .unwrap_err();
+        assert!(fabricated.contains("sessionId only"));
+
+        let approval = approve_admin_action(
+            &ctx,
+            &json!({
+                "grantId": grant["grant"]["grantId"],
+                "operation": "cleanupSession",
+                "sessionId": crew_target_id,
+            }),
+            Some(&captain),
+            false,
+        )
         .unwrap();
+        assert_eq!(approval["approval"]["target"]["kind"], "crewSession");
+        assert_eq!(approval["approval"]["target"]["shipSlug"], "alpha");
         let approval_id = approval["approval"]["approval"]["approvalId"]
             .as_str()
             .unwrap();

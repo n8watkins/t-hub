@@ -51,7 +51,7 @@ fn print_help() {
 list                                                  list grants visible to this identity\n\
 appoint <crewSessionId> --role ROLE --operations CSV  appoint a durable Ship or Fleet Admin\n\
 revoke <grantId> [--reason TEXT]                      revoke a grant and its active approvals\n\
-approve-session <grantId> <sessionId> --ship SLUG     approve one exact session cleanup\n\
+approve-session <grantId> <sessionId>                 approve one exact session cleanup\n\
 approve-worktree <grantId> <path> --ship SLUG         approve one exact worktree cleanup\n\
 cleanup-session <sessionId> --approval ID --confirm   consume approval and close the session\n\n\
 ROLE is shipAdmin or fleetAdmin.\n\
@@ -116,25 +116,17 @@ fn revoke(args: &[String]) -> Result<(), CliError> {
 }
 
 fn approve_session(args: &[String]) -> Result<(), CliError> {
-    let flags = StrictFlags::parse(args, &["--ship"], &["--json"])?;
-    flags.require_positionals(
-        2,
-        "th admin approve-session <grantId> <sessionId> --ship <slug> [--json]",
-    )?;
+    let flags = StrictFlags::parse(args, &[], &["--json"])?;
+    flags.require_positionals(2, "th admin approve-session <grantId> <sessionId> [--json]")?;
     let grant_id = positional(&flags, 0, "admin approve-session", "<grantId>")?;
     let session_id = positional(&flags, 1, "admin approve-session", "<sessionId>")?;
-    let ship_slug = required(&flags, "--ship", "admin approve-session")?;
     call_and_render(
         "admin approve-session",
         "approve_admin_action",
         json!({
             "grantId": grant_id,
             "operation": "cleanupSession",
-            "target": {
-                "kind": "crewSession",
-                "shipSlug": ship_slug,
-                "sessionId": session_id,
-            }
+            "sessionId": session_id,
         }),
         &flags,
     )

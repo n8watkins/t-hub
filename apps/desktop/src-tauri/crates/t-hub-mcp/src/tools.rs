@@ -533,56 +533,44 @@ fn schema_revoke_admin() -> Value {
     })
 }
 
-fn schema_admin_target() -> Value {
+fn schema_admin_worktree_target() -> Value {
     json!({
-        "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "kind": { "const": "crewSession" },
-                    "shipSlug": { "type": "string", "minLength": 1 },
-                    "sessionId": { "type": "string", "minLength": 1 }
-                },
-                "required": ["kind", "shipSlug", "sessionId"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "kind": { "const": "captain" },
-                    "shipSlug": { "type": "string", "minLength": 1 },
-                    "captainIdentityId": { "type": "string", "minLength": 1 }
-                },
-                "required": ["kind", "shipSlug", "captainIdentityId"],
-                "additionalProperties": false
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "kind": { "const": "worktree" },
-                    "shipSlug": { "type": "string", "minLength": 1 },
-                    "worktreeId": { "type": "string", "minLength": 1 }
-                },
-                "required": ["kind", "shipSlug", "worktreeId"],
-                "additionalProperties": false
-            }
-        ]
+        "type": "object",
+        "properties": {
+            "kind": { "const": "worktree" },
+            "shipSlug": { "type": "string", "minLength": 1 },
+            "worktreeId": { "type": "string", "minLength": 1 }
+        },
+        "required": ["kind", "shipSlug", "worktreeId"],
+        "additionalProperties": false
     })
 }
 
 fn schema_approve_admin_action() -> Value {
     json!({
         "type": "object",
-        "properties": {
-            "grantId": { "type": "string", "minLength": 1 },
-            "operation": {
-                "type": "string",
-                "enum": ["cleanupSession", "cleanupWorktree"]
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "grantId": { "type": "string", "minLength": 1 },
+                    "operation": { "const": "cleanupSession" },
+                    "sessionId": { "type": "string", "minLength": 1 }
+                },
+                "required": ["grantId", "operation", "sessionId"],
+                "additionalProperties": false
             },
-            "target": schema_admin_target()
-        },
-        "required": ["grantId", "operation", "target"],
-        "additionalProperties": false
+            {
+                "type": "object",
+                "properties": {
+                    "grantId": { "type": "string", "minLength": 1 },
+                    "operation": { "const": "cleanupWorktree" },
+                    "target": schema_admin_worktree_target()
+                },
+                "required": ["grantId", "operation", "target"],
+                "additionalProperties": false
+            }
+        ]
     })
 }
 
@@ -1129,7 +1117,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "approve_admin_action",
             tier: Tier::Organization,
-            summary: "Issue a durable one-time approval for one destructive delegated operation bound to the exact grant, actor, target, supervisor, and authority generation.",
+            summary: "Issue a durable one-time approval for one destructive delegated operation bound to the exact grant, actor, target, supervisor, and authority generation. Session target kind and ownership are derived by the backend from sessionId.",
             input_schema: schema_approve_admin_action,
         },
         ToolDef {
@@ -1788,8 +1776,16 @@ mod tests {
 
         let approve = find("approve_admin_action").unwrap();
         assert_eq!(approve.to_mcp()["annotations"]["t-hubTier"], "organization");
+        let approve_schema = (approve.input_schema)();
         assert_eq!(
-            (approve.input_schema)()["required"],
+            approve_schema["oneOf"][0]["required"],
+            json!(["grantId", "operation", "sessionId"])
+        );
+        assert!(approve_schema["oneOf"][0]["properties"]
+            .get("target")
+            .is_none());
+        assert_eq!(
+            approve_schema["oneOf"][1]["required"],
             json!(["grantId", "operation", "target"])
         );
         assert_eq!(
