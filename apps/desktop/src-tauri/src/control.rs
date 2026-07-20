@@ -40710,7 +40710,7 @@ mod tests {
         let server = LoopbackPowderServer::start(3);
         let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
-        let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
+        let crew_session_id = format!("p{}", &uuid::Uuid::new_v4().simple().to_string()[..7]);
         create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
         assert!(matches!(
             tmux::session_liveness(&tmux_target(&crew_session_id)),
