@@ -10382,6 +10382,8 @@ fn dispatch_with_caller(
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
+        "list_agents" => list_agents(ctx, args),
+        "get_agent" => get_agent(ctx, args),
         "list_powder_boards" => list_powder_boards(args),
         "project_board_snapshot" => project_board_snapshot(ctx, args),
         "read_crew_powder_evidence" => {
@@ -10580,6 +10582,102 @@ fn list_terminals() -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "terminals": terminals, "count": terminals.len() }))
+}
+
+fn agent_page_limit(args: &Value, command: &str) -> Result<usize, String> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
+    let limit = usize::try_from(limit).map_err(|_| format!("{command} limit is too large"))?;
+    if !(1..=100).contains(&limit) {
+        return Err(format!("{command} limit must be between 1 and 100"));
+    }
+    Ok(limit)
+}
+
+fn agent_page_cursor(args: &Value, command: &str) -> Result<usize, String> {
+    let cursor = args.get("cursor").and_then(Value::as_str).unwrap_or("0");
+    cursor
+        .parse::<usize>()
+        .map_err(|_| format!("{command} cursor must be a non-negative integer"))
+}
+
+fn list_agents(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "list_agents",
+        &["captainSessionId", "projectId", "cursor", "limit", "state"],
+    )?;
+    let captain_session_id = arg_str(args, "captainSessionId");
+    let project_id = arg_str(args, "projectId");
+    if captain_session_id.is_none() && project_id.is_none() {
+        return Err("list_agents requires 'captainSessionId' or 'projectId'".into());
+    }
+    if args
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state != "active")
+    {
+        return Err(
+            "list_agents state must be 'active' until removed-agent history is available".into(),
+        );
+    }
+    let cursor = agent_page_cursor(args, "list_agents")?;
+    let limit = agent_page_limit(args, "list_agents")?;
+    let mut records: Vec<_> = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .filter(|agent| {
+            captain_session_id
+                .as_deref()
+                .is_none_or(|captain| agent.captain_session_id == captain)
+                && project_id
+                    .as_deref()
+                    .is_none_or(|project| agent.project_id == project)
+        })
+        .collect();
+    records.sort_by(|left, right| left.agent_session_id.cmp(&right.agent_session_id));
+    let total = records.len();
+    let page: Vec<Value> = records
+        .into_iter()
+        .skip(cursor)
+        .take(limit)
+        .map(|agent| {
+            let mut summary = serde_json::to_value(agent).unwrap_or_else(|_| json!({}));
+            if let Some(object) = summary.as_object_mut() {
+                object.remove("assignment");
+            }
+            summary
+        })
+        .collect();
+    let next_cursor = (cursor + page.len()).min(total);
+    let digest = crate::agent_session::snapshot_digest(&page)?;
+    Ok(json!({
+        "agents": page,
+        "count": page.len(),
+        "total": total,
+        "cursor": cursor.to_string(),
+        "nextCursor": (next_cursor < total).then(|| next_cursor.to_string()),
+        "hasMore": next_cursor < total,
+        "digest": digest,
+        "eventCursor": 0,
+    }))
+}
+
+fn get_agent(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    require_exact_args(args, "get_agent", &["agentSessionId"])?;
+    let agent_session_id = arg_str(args, "agentSessionId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("get_agent requires a non-empty 'agentSessionId'")?;
+    let agent = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .find(|agent| agent.agent_session_id == agent_session_id)
+        .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
+    Ok(serde_json::to_value(agent)
+        .map_err(|error| format!("get_agent serialization failed: {error}"))?)
 }
 
 /// `get_status`: FR-012 status for one session id (from the supervision reducer)
@@ -26388,6 +26486,37 @@ mod tests {
         assert_eq!(v["captains"][0]["terminalId"], "cap-1");
         assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
         assert_eq!(v["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn list_agents_returns_a_bounded_assignment_free_snapshot() {
+        let ctx = test_ctx("secret");
+        let v = dispatch(
+            &ctx,
+            "list_agents",
+            &json!({"projectId": "project-1", "limit": 1}),
+        )
+        .unwrap();
+        assert_eq!(v["agents"], json!([]));
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["total"], 0);
+        assert_eq!(v["hasMore"], false);
+        assert_eq!(v["eventCursor"], 0);
+        assert!(v["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn get_agent_requires_an_existing_durable_agent_record() {
+        let ctx = test_ctx("secret");
+        let error = dispatch(
+            &ctx,
+            "get_agent",
+            &json!({"agentSessionId": "missing-agent"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("agent 'missing-agent' was not found"));
     }
 
     #[test]
