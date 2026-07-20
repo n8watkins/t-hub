@@ -1113,7 +1113,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 17;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 18;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -2460,6 +2460,10 @@ pub struct CaptainsSnapshot {
     pub seq: u64,
     #[serde(default)]
     pub captains: Vec<CaptainRecord>,
+    /// Durable identity, generation, continuity, and recovery state for the
+    /// singleton Cortana supervisor.
+    #[serde(default)]
+    pub cortana: crate::cortana_reconcile::CortanaDurableIdentity,
     /// Powder-independent durable agent sessions.
     /// Legacy Crew records remain in `captains` until compatibility migration
     /// is complete.
@@ -2722,6 +2726,7 @@ impl AuthorityGenerations {
 #[derive(Clone)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
+    cortana: crate::cortana_reconcile::CortanaDurableIdentity,
     agent_sessions: Vec<AgentSessionRecord>,
     agent_checkpoints: Vec<AgentCheckpoint>,
     agent_events: Vec<AgentEvent>,
@@ -2746,6 +2751,7 @@ impl Default for CaptainsInner {
     fn default() -> Self {
         Self {
             captains: Vec::new(),
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: Vec::new(),
             agent_checkpoints: Vec::new(),
             agent_events: Vec::new(),
@@ -2995,6 +3001,7 @@ impl CaptainsRegistry {
                 schema_version: CAPTAINS_SCHEMA_VERSION,
                 seq: 0,
                 captains: Vec::new(),
+                cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
                 agent_sessions: Vec::new(),
                 agent_checkpoints: Vec::new(),
                 agent_events: Vec::new(),
@@ -3095,9 +3102,12 @@ impl CaptainsRegistry {
                 // then reconciles the Cortana singleton from the live incumbent.
                 let mut captains = snap.captains;
                 Self::reconcile_on_load(&mut captains);
+                let mut cortana = snap.cortana;
+                Self::reconcile_cortana_on_load(&captains, &mut cortana);
                 let workspaces = Self::reconcile_durable_workspaces(&captains, snap.workspaces);
                 CaptainsInner {
                     captains,
+                    cortana,
                     agent_sessions: snap.agent_sessions,
                     agent_checkpoints: snap.agent_checkpoints,
                     agent_events: snap.agent_events,
@@ -3523,6 +3533,62 @@ impl CaptainsRegistry {
                 }
             }
         }
+        if snapshot.schema_version >= 18 {
+            let durable = &snapshot.cortana;
+            for (field, value) in [
+                ("identityId", durable.identity_id.as_deref()),
+                ("terminalId", durable.terminal_id.as_deref()),
+                ("harness", durable.harness.as_deref()),
+                ("providerSessionId", durable.provider_session_id.as_deref()),
+                ("conversationId", durable.conversation_id.as_deref()),
+                ("checkpoint", durable.checkpoint.as_deref()),
+            ] {
+                if value.is_some_and(|value| value.trim().is_empty()) {
+                    return Err(format!("durable Cortana has an empty {field}"));
+                }
+            }
+            if durable.identity_id.is_some() != (durable.generation > 0) {
+                return Err(
+                    "durable Cortana identity and positive generation must be recorded together"
+                        .into(),
+                );
+            }
+            match &durable.recovery {
+                crate::cortana_reconcile::CortanaRecoveryState::Uninitialized => {}
+                crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+                    operation_id,
+                    started_at,
+                } => {
+                    if operation_id.trim().is_empty() || *started_at == 0 {
+                        return Err("durable Cortana has an invalid recovery operation".into());
+                    }
+                }
+                crate::cortana_reconcile::CortanaRecoveryState::Healthy {
+                    operation_id,
+                    verified_at,
+                } => {
+                    if operation_id.trim().is_empty()
+                        || *verified_at == 0
+                        || durable.identity_id.is_none()
+                        || durable.terminal_id.is_none()
+                    {
+                        return Err("durable Cortana has an incomplete healthy state".into());
+                    }
+                }
+                crate::cortana_reconcile::CortanaRecoveryState::Degraded {
+                    operation_id,
+                    reason,
+                    detected_at,
+                } => {
+                    if operation_id.trim().is_empty()
+                        || reason.trim().is_empty()
+                        || *detected_at == 0
+                    {
+                        return Err("durable Cortana has an invalid degraded state".into());
+                    }
+                }
+            }
+        }
         if snapshot.schema_version >= 15 {
             if snapshot.pending_fleet_operations.len() > MAX_PENDING_FLEET_OPERATIONS {
                 return Err("captains registry contains too many pending Fleet operations".into());
@@ -3720,6 +3786,7 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            cortana: g.cortana.clone(),
             agent_sessions: g.agent_sessions.clone(),
             agent_checkpoints: g.agent_checkpoints.clone(),
             agent_events: g.agent_events.clone(),
@@ -3776,6 +3843,42 @@ impl CaptainsRegistry {
                     seen_cortana = true;
                 }
             }
+        }
+    }
+
+    fn reconcile_cortana_on_load(
+        captains: &[FleetIdentity],
+        durable: &mut crate::cortana_reconcile::CortanaDurableIdentity,
+    ) {
+        let incumbent = captains
+            .iter()
+            .find(|captain| captain.role == FleetRole::Cortana);
+        if let Some(incumbent) = incumbent {
+            if durable.terminal_id.is_none() {
+                durable.terminal_id = incumbent.terminal_id.clone();
+            }
+            if durable.harness.is_none() {
+                durable.harness = incumbent
+                    .provider
+                    .clone()
+                    .or_else(|| incumbent.harness.clone());
+            }
+            if durable.provider_session_id.is_none() {
+                durable.provider_session_id = incumbent.provider_session_id.clone();
+            }
+            if durable.conversation_id.is_none() {
+                durable.conversation_id = incumbent.conversation_id.clone();
+            }
+            if durable.checkpoint.is_none() {
+                durable.checkpoint = incumbent.resume_point.clone();
+            }
+        } else if durable.terminal_id.is_some() {
+            durable.terminal_id = None;
+            durable.recovery = crate::cortana_reconcile::CortanaRecoveryState::Degraded {
+                operation_id: "startup-load".into(),
+                reason: "durable Cortana points to a runtime with no Fleet registry claim".into(),
+                detected_at: now_ms().max(1),
+            };
         }
     }
 
@@ -4717,6 +4820,7 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            cortana: g.cortana.clone(),
             agent_sessions: g.agent_sessions.clone(),
             agent_checkpoints: g.agent_checkpoints.clone(),
             agent_events: g.agent_events.clone(),
@@ -4727,6 +4831,114 @@ impl CaptainsRegistry {
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
         }
+    }
+
+    pub fn cortana_identity(&self) -> crate::cortana_reconcile::CortanaDurableIdentity {
+        self.lock().cortana.clone()
+    }
+
+    fn begin_cortana_recovery(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        let operation_id = operation_id.trim();
+        if operation_id.is_empty() {
+            return Err("reconcile_cortana requires a stable non-empty operationId".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+            operation_id: active,
+            ..
+        } = &current.cortana.recovery
+        {
+            if active == operation_id {
+                return Ok(current.cortana.clone());
+            }
+            return Err(format!(
+                "reconcile_cortana operation '{active}' is already recovering the singleton"
+            ));
+        }
+        let previous = current.clone();
+        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+            operation_id: operation_id.to_string(),
+            started_at: now_ms().max(1),
+        };
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    fn mark_cortana_degraded(&self, operation_id: &str, reason: &str) -> Result<(), String> {
+        if operation_id.trim().is_empty() || reason.trim().is_empty() {
+            return Err("degraded Cortana state requires an operationId and reason".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Degraded {
+            operation_id: operation_id.to_string(),
+            reason: reason.to_string(),
+            detected_at: now_ms().max(1),
+        };
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn commit_cortana_runtime(
+        &self,
+        operation_id: &str,
+        identity_id: &str,
+        generation: u64,
+        terminal_id: &str,
+        harness: &str,
+        provider_session_id: Option<&str>,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        if operation_id.trim().is_empty()
+            || identity_id.trim().is_empty()
+            || generation == 0
+            || terminal_id.trim().is_empty()
+            || harness.trim().is_empty()
+        {
+            return Err("cannot commit an incomplete Cortana runtime identity".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let incumbent = current
+            .captains
+            .iter()
+            .find(|captain| {
+                captain.role == FleetRole::Cortana
+                    && captain.terminal_id.as_deref() == Some(terminal_id)
+                    && captain.state == ClaimState::Active
+            })
+            .ok_or("cannot commit Cortana before its active Fleet claim is authoritative")?;
+        if incumbent
+            .provider
+            .as_deref()
+            .or(incumbent.harness.as_deref())
+            != Some(harness)
+        {
+            return Err("Cortana runtime harness does not match its Fleet claim".into());
+        }
+        current.cortana.identity_id = Some(identity_id.to_string());
+        current.cortana.generation = generation;
+        current.cortana.terminal_id = Some(terminal_id.to_string());
+        current.cortana.harness = Some(harness.to_string());
+        if let Some(provider_session_id) = provider_session_id {
+            current.cortana.provider_session_id = Some(provider_session_id.to_string());
+            current.cortana.conversation_id = Some(provider_session_id.to_string());
+        }
+        current.cortana.recovery = crate::cortana_reconcile::CortanaRecoveryState::Healthy {
+            operation_id: operation_id.to_string(),
+            verified_at: now_ms().max(1),
+        };
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
     }
 
     pub fn append_agent_checkpoint(
@@ -5238,6 +5450,7 @@ impl CaptainsRegistry {
                 schema_version: CAPTAINS_SCHEMA_VERSION,
                 seq: g.seq,
                 captains: g.captains.clone(),
+                cortana: g.cortana.clone(),
                 agent_sessions: g.agent_sessions.clone(),
                 agent_checkpoints: g.agent_checkpoints.clone(),
                 agent_events: g.agent_events.clone(),
@@ -6316,14 +6529,20 @@ impl CaptainsRegistry {
         provider_session_id: Option<&str>,
     ) {
         let Some(provider) = provider else { return };
+        let provider_changed = captain.provider.as_deref() != Some(provider);
         captain.provider = Some(provider.to_string());
-        captain.provider_session_id = provider_session_id.map(str::to_string);
-        captain.claude_uuid = if provider == "claude" {
-            provider_session_id.map(str::to_string)
-        } else {
-            None
-        };
-        captain.conversation_id = provider_session_id.map(str::to_string);
+        captain.harness = Some(provider.to_string());
+        if let Some(provider_session_id) = provider_session_id {
+            captain.provider_session_id = Some(provider_session_id.to_string());
+            captain.claude_uuid = (provider == "claude").then(|| provider_session_id.to_string());
+            captain.conversation_id = Some(provider_session_id.to_string());
+        } else if provider_changed {
+            captain.provider_session_id = None;
+            captain.claude_uuid = None;
+            captain.conversation_id = None;
+        } else if provider != "claude" {
+            captain.claude_uuid = None;
+        }
     }
 
     fn apply_claim_binding(
@@ -6633,7 +6852,7 @@ impl CaptainsRegistry {
                         terminal_id: Some(terminal_id.to_string()),
                         project_id: None,
                         assignment: None,
-                        harness: None,
+                        harness: provider.map(str::to_string),
                         conversation_id: provider_session_id.map(str::to_string),
                         resume_point: None,
                         workspace_tab_ids,
@@ -9210,7 +9429,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "start_agent" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
+        "spawn_terminal" | "start_agent" | "reconcile_cortana" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -10433,6 +10652,7 @@ fn is_idempotent_command(command: &str) -> bool {
         command,
         "spawn_terminal"
             | "create_worktree"
+            | "reconcile_cortana"
             | "commission_captain"
             | "dispatch_crew"
             | "start_agent"
@@ -10823,6 +11043,7 @@ fn dispatch_with_caller(
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
         "start_agent" => start_agent(ctx, args, caller, trusted_internal),
+        "reconcile_cortana" => reconcile_cortana(ctx, args, trusted_internal),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
         "attach_captain" => attach_captain(ctx, args, caller, trusted_internal),
         "dispatch_crew" => dispatch_crew(ctx, args, caller, trusted_internal),
@@ -12762,6 +12983,480 @@ fn detected_harness(terminal_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+const CORTANA_GENERATION_ENV: &str = "T_HUB_CORTANA_GENERATION";
+
+fn orchestrator_home(args: &Value) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(path) = arg_str(args, "testOrchestratorHome") {
+        return Ok(path.trim_end_matches('/').to_string());
+    }
+    #[cfg(not(test))]
+    let _ = args;
+    files::user_home_path().map(|home| format!("{home}/.t-hub/orchestrator"))
+}
+
+fn runtime_evidence(value: tmux::SessionLiveness) -> crate::cortana_reconcile::RuntimeEvidence {
+    match value {
+        tmux::SessionLiveness::Alive => crate::cortana_reconcile::RuntimeEvidence::Alive,
+        tmux::SessionLiveness::Gone => crate::cortana_reconcile::RuntimeEvidence::Gone,
+        tmux::SessionLiveness::Unknown => crate::cortana_reconcile::RuntimeEvidence::Unknown,
+    }
+}
+
+fn discover_cortana_runtimes(
+    ctx: &ControlContext,
+    home: &str,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<Vec<crate::cortana_reconcile::CortanaRuntimeCandidate>, String> {
+    let panes = tmux::pane_info().map_err(|error| {
+        retryable_error(format!(
+            "reconcile_cortana: terminal inspection failed: {error}"
+        ))
+    })?;
+    let mut by_terminal = std::collections::BTreeMap::new();
+    for pane in panes {
+        if pane.cwd.trim_end_matches('/') != home.trim_end_matches('/') {
+            continue;
+        }
+        let terminal_id = pane
+            .session
+            .strip_prefix("th_")
+            .unwrap_or(&pane.session)
+            .to_string();
+        if by_terminal.contains_key(&terminal_id) {
+            continue;
+        }
+        let detected = pane.command.trim().to_ascii_lowercase();
+        let harness = if matches!(detected.as_str(), "codex" | "claude") {
+            detected
+        } else {
+            durable
+                .harness
+                .clone()
+                .or_else(|| detected_harness(&terminal_id))
+                .unwrap_or_else(|| "codex".into())
+        };
+        let control = tmux::session_environment(&pane.session, "T_HUB_CONTROL_TOKEN")
+            .map_err(|error| {
+                retryable_error(format!(
+                    "reconcile_cortana: control capability inspection failed for '{terminal_id}': {error}"
+                ))
+            })?;
+        let session_token =
+            tmux::session_environment(&pane.session, crate::identity::SESSION_TOKEN_ENV).map_err(
+                |error| {
+                    retryable_error(format!(
+                    "reconcile_cortana: identity inspection failed for '{terminal_id}': {error}"
+                ))
+                },
+            )?;
+        let identity = session_token
+            .as_deref()
+            .and_then(|token| ctx.identity.resolve(token));
+        let generation = tmux::session_environment(&pane.session, CORTANA_GENERATION_ENV)
+            .map_err(|error| {
+                retryable_error(format!(
+                    "reconcile_cortana: generation inspection failed for '{terminal_id}': {error}"
+                ))
+            })?
+            .and_then(|generation| generation.parse::<u64>().ok())
+            .unwrap_or_default();
+        let provider_session_id = if harness == "claude" {
+            ctx.status.session_for_terminal(&terminal_id)
+        } else {
+            tmux::session_environment(&pane.session, "CODEX_THREAD_ID")
+                .map_err(|error| {
+                    retryable_error(format!(
+                        "reconcile_cortana: provider identity inspection failed for '{terminal_id}': {error}"
+                    ))
+                })?
+                .filter(|value| !value.trim().is_empty())
+        };
+        let target = tmux_target(&terminal_id);
+        by_terminal.insert(
+            terminal_id.clone(),
+            crate::cortana_reconcile::CortanaRuntimeCandidate {
+                terminal_id,
+                identity_id: identity.as_ref().map(|identity| identity.id.clone()),
+                generation,
+                harness: harness.clone(),
+                provider_session_id,
+                terminal: runtime_evidence(tmux::session_liveness(&target)),
+                harness_process: runtime_evidence(tmux::harness_liveness(&target, &harness)),
+                current_control_capability: control
+                    .as_deref()
+                    .is_some_and(|token| ct_token_eq(token, &ctx.token)),
+                trusted_cortana_identity: identity
+                    .is_some_and(|identity| identity.role == crate::identity::Role::Cortana),
+            },
+        );
+    }
+    Ok(by_terminal.into_values().collect())
+}
+
+fn claim_cortana_runtime(
+    ctx: &ControlContext,
+    candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
+) -> Result<CaptainRecord, String> {
+    let result = claim_captain(
+        ctx,
+        &json!({
+            "captainSessionId": candidate.terminal_id,
+            "role": "cortana",
+            "provider": candidate.harness,
+            "providerSessionId": candidate.provider_session_id,
+        }),
+        None,
+        true,
+    )?;
+    serde_json::from_value(result["captain"].clone())
+        .map_err(|error| format!("reconcile_cortana: invalid Fleet claim result: {error}"))
+}
+
+fn cortana_reconcile_response(
+    operation_id: &str,
+    action: crate::cortana_reconcile::CortanaReconcileAction,
+    durable: crate::cortana_reconcile::CortanaDurableIdentity,
+    retired: Vec<String>,
+    reason: Option<String>,
+) -> Value {
+    json!({
+        "accepted": "reconcile_cortana",
+        "operationId": operation_id,
+        "action": action,
+        "healthy": action != crate::cortana_reconcile::CortanaReconcileAction::Degraded,
+        "terminalId": durable.terminal_id,
+        "identityId": durable.identity_id,
+        "generation": durable.generation,
+        "harness": durable.harness,
+        "providerSessionId": durable.provider_session_id,
+        "recovery": durable.recovery,
+        "retiredTerminalIds": retired,
+        "degradedReason": reason,
+        "audited": true,
+    })
+}
+
+fn rollback_cortana_identity_binding(
+    ctx: &ControlContext,
+    identity: &crate::identity::SessionIdentity,
+    previous_tile: Option<&str>,
+    newly_minted: bool,
+) -> Result<(), String> {
+    if newly_minted {
+        ctx.identity.retire(&identity.id).map(|_| ())
+    } else if let Some(previous_tile) = previous_tile {
+        ctx.identity.bind_tile(&identity.id, previous_tile)
+    } else {
+        Ok(())
+    }
+}
+
+fn reconcile_cortana(
+    ctx: &ControlContext,
+    args: &Value,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    if !trusted_internal {
+        return Err("acl: reconcile_cortana requires the trusted in-process app host".into());
+    }
+    let requested_operation_id = arg_str(args, "operationId")
+        .or_else(|| arg_str(args, "requestId"))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("reconcile_cortana requires a stable non-empty operationId")?;
+    let _provision = ctx.captains.provision_guard();
+    let existing = ctx.captains.cortana_identity();
+    let operation_id = match &existing.recovery {
+        crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. } => {
+            operation_id.clone()
+        }
+        _ => requested_operation_id,
+    };
+    let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
+    let result = reconcile_cortana_inner(ctx, args, &operation_id, durable);
+    if let Err(error) = &result {
+        let _ = ctx.captains.mark_cortana_degraded(&operation_id, error);
+    }
+    result
+}
+
+fn reconcile_cortana_inner(
+    ctx: &ControlContext,
+    args: &Value,
+    operation_id: &str,
+    durable: crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<Value, String> {
+    let home = orchestrator_home(args)?;
+    if home.is_empty() || !home.starts_with('/') {
+        return Err("reconcile_cortana: orchestrator home must be an absolute POSIX path".into());
+    }
+    std::fs::create_dir_all(files::to_host_path(&home))
+        .map_err(|error| format!("reconcile_cortana: could not create '{home}': {error}"))?;
+    let candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
+    if let Some(terminal_id) = durable.terminal_id.as_deref() {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.terminal_id == terminal_id)
+        {
+            match tmux::session_liveness(&tmux_target(terminal_id)) {
+                tmux::SessionLiveness::Gone => {}
+                tmux::SessionLiveness::Alive => {
+                    return Err(format!(
+                        "reconcile_cortana: incumbent '{terminal_id}' is alive but absent from reserved-scope runtime discovery"
+                    ));
+                }
+                tmux::SessionLiveness::Unknown => {
+                    return Err(retryable_error(format!(
+                        "reconcile_cortana: incumbent '{terminal_id}' has uncertain terminal evidence"
+                    )));
+                }
+            }
+        }
+    }
+    let plan = crate::cortana_reconcile::plan_reconciliation(&durable, operation_id, &candidates);
+    if plan.action == crate::cortana_reconcile::CortanaReconcileAction::Degraded {
+        let reason = plan
+            .degraded_reason
+            .clone()
+            .unwrap_or_else(|| "Cortana recovery evidence is ambiguous".into());
+        ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
+        return Ok(cortana_reconcile_response(
+            operation_id,
+            plan.action,
+            ctx.captains.cortana_identity(),
+            Vec::new(),
+            Some(reason),
+        ));
+    }
+
+    for terminal_id in &plan.retire_terminal_ids {
+        tmux::kill_session_tree(&tmux_target(terminal_id)).map_err(|error| {
+            format!(
+                "reconcile_cortana: lower generation runtime '{terminal_id}' could not be safely retired: {error}"
+            )
+        })?;
+        ctx.tabs.retire_tile_locked(terminal_id);
+        let _ = ctx.captains.remove_session(terminal_id)?;
+    }
+
+    if let Some(candidate) = plan.authoritative.as_ref() {
+        claim_cortana_runtime(ctx, candidate)?;
+        let identity_id = candidate
+            .identity_id
+            .as_deref()
+            .ok_or("reconcile_cortana: authoritative runtime has no identity")?;
+        let durable = ctx.captains.commit_cortana_runtime(
+            operation_id,
+            identity_id,
+            candidate.generation,
+            &candidate.terminal_id,
+            &candidate.harness,
+            candidate.provider_session_id.as_deref(),
+        )?;
+        let _ = captains_sync_apply(ctx);
+        return Ok(cortana_reconcile_response(
+            operation_id,
+            plan.action,
+            durable,
+            plan.retire_terminal_ids,
+            None,
+        ));
+    }
+
+    if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
+        return Err("reconcile_cortana: no UI is connected to adopt a recovered runtime".into());
+    }
+    ctx.governor
+        .check_spawn(live_session_count(), Instant::now())
+        .map_err(|refusal| refusal.message)?;
+    let harness_name = arg_str(args, "harness")
+        .or_else(|| durable.harness.clone())
+        .unwrap_or_else(|| "codex".into())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(harness_name.as_str(), "codex" | "claude") {
+        return Err(format!(
+            "reconcile_cortana: unsupported harness '{harness_name}'"
+        ));
+    }
+    if durable
+        .harness
+        .as_deref()
+        .is_some_and(|durable_harness| durable_harness != harness_name)
+    {
+        return Err("reconcile_cortana: changing the durable harness requires an explicit administrative update".into());
+    }
+    let harness = Harness::from_provider(&harness_name);
+    let anchor = durable
+        .provider_session_id
+        .as_deref()
+        .or(durable.conversation_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let startup_command = anchor.map_or_else(
+        || {
+            harness.adapter().fresh_argv_with_permissions(
+                "You are Cortana, T-Hub's singleton supervisor. Restore the durable fleet checkpoint, delegate administrative execution, and preserve ship boundaries.",
+                PermMode::Default,
+            )
+        },
+        |provider_session_id| harness.adapter().resume_argv(provider_session_id),
+    );
+    #[cfg(test)]
+    let startup_command =
+        arg_str(args, "testStartupCommand").unwrap_or_else(|| startup_command.clone());
+
+    let (identity, newly_minted) = match durable.identity_id.as_deref() {
+        Some(identity_id) => {
+            let identity = ctx.identity.get(identity_id).ok_or_else(|| {
+                format!(
+                    "reconcile_cortana: durable identity '{identity_id}' is unavailable or revoked"
+                )
+            })?;
+            if identity.role != crate::identity::Role::Cortana {
+                return Err(
+                    "reconcile_cortana: durable identity no longer has the Cortana role".into(),
+                );
+            }
+            (identity, false)
+        }
+        None => (ctx.identity.mint(crate::identity::Role::Cortana)?, true),
+    };
+    let previous_tile = identity.session_tile.clone();
+    if let Some(previous_terminal_id) = durable.terminal_id.as_deref() {
+        if tmux::session_liveness(&tmux_target(previous_terminal_id)) == tmux::SessionLiveness::Gone
+        {
+            ctx.tabs.retire_tile_locked(previous_terminal_id);
+            let _ = ctx.captains.remove_session(previous_terminal_id)?;
+        }
+    }
+    for candidate in &candidates {
+        if candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+            && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Gone
+            && candidate.current_control_capability
+            && candidate.identity_id.as_deref() == Some(identity.id.as_str())
+        {
+            tmux::kill_session_tree(&tmux_target(&candidate.terminal_id)).map_err(|error| {
+                format!(
+                    "reconcile_cortana: failed runtime '{}' could not be retired: {error}",
+                    candidate.terminal_id
+                )
+            })?;
+            ctx.tabs.retire_tile_locked(&candidate.terminal_id);
+            let _ = ctx.captains.remove_session(&candidate.terminal_id)?;
+        }
+    }
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let terminal_id = suffix[..8].to_string();
+    ctx.identity.bind_tile(&identity.id, &terminal_id)?;
+    let spawn_args = json!({
+        "cwd": home,
+        "name": "Cortana",
+        "startupCommand": startup_command,
+        "capability": "control",
+        "tabId": CAPTAIN_WORKSPACE_ID,
+    });
+    let mut elevation = elevation_env(ctx, &spawn_args);
+    audit_control_spawn(ctx, "reconcile_cortana", &spawn_args);
+    elevation.push((
+        crate::identity::SESSION_TOKEN_ENV.to_string(),
+        identity.secret.clone(),
+    ));
+    elevation.push((
+        CORTANA_GENERATION_ENV.to_string(),
+        plan.next_generation.to_string(),
+    ));
+    let pane = crate::commands::pane_command(None, Some(&startup_command));
+    let tmux_cwd = files::posix_form(&home);
+    let (_, tmux_session) =
+        match spawn_tmux_terminal_with_id(&terminal_id, &tmux_cwd, pane.as_deref(), &elevation) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let rollback = rollback_cortana_identity_binding(
+                    ctx,
+                    &identity,
+                    previous_tile.as_deref(),
+                    newly_minted,
+                );
+                return Err(format!(
+                    "reconcile_cortana: terminal startup failed: {error}{}",
+                    rollback
+                        .err()
+                        .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                        .unwrap_or_default()
+                ));
+            }
+        };
+    if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = rollback_cortana_identity_binding(
+            ctx,
+            &identity,
+            previous_tile.as_deref(),
+            newly_minted,
+        );
+        return Err(format!(
+            "reconcile_cortana: harness startup failed and the replacement was retired: {error}"
+        ));
+    }
+    let provider_session_id =
+        trusted_provider_session_id(ctx, &terminal_id, harness.as_provider(), None)?;
+    let candidate = crate::cortana_reconcile::CortanaRuntimeCandidate {
+        terminal_id: terminal_id.clone(),
+        identity_id: Some(identity.id.clone()),
+        generation: plan.next_generation,
+        harness: harness.as_provider().into(),
+        provider_session_id: provider_session_id.clone(),
+        terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+        harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+        current_control_capability: true,
+        trusted_cortana_identity: true,
+    };
+    if let Err(error) = claim_cortana_runtime(ctx, &candidate) {
+        let _ = tmux::kill_session_tree(&tmux_session);
+        let _ = rollback_cortana_identity_binding(
+            ctx,
+            &identity,
+            previous_tile.as_deref(),
+            newly_minted,
+        );
+        return Err(format!(
+            "reconcile_cortana: replacement Fleet claim failed and the runtime was retired: {error}"
+        ));
+    }
+    let durable = ctx.captains.commit_cortana_runtime(
+        operation_id,
+        &identity.id,
+        plan.next_generation,
+        &terminal_id,
+        harness.as_provider(),
+        provider_session_id.as_deref(),
+    )?;
+    let spawned = with_sync(
+        ctx,
+        json!({
+            "accepted": "spawn_terminal",
+            "id": terminal_id,
+            "tmuxSession": tmux_session,
+            "cwd": home,
+            "name": "Cortana",
+            "startupCommand": startup_command,
+            "tabId": CAPTAIN_WORKSPACE_ID,
+            "placed": true,
+            "audited": true,
+        }),
+    );
+    let _ = forward_apply(ctx, "spawn_terminal", &spawned);
+    let _ = captains_sync_apply(ctx);
+    Ok(cortana_reconcile_response(
+        operation_id,
+        plan.action,
+        durable,
+        Vec::new(),
+        None,
+    ))
 }
 
 fn trusted_provider_session_id(
@@ -26376,6 +27071,7 @@ mod tests {
             schema_version: 12,
             seq: 1,
             captains: vec![],
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: vec![],
             agent_checkpoints: vec![],
             agent_events: vec![],
@@ -26449,7 +27145,7 @@ mod tests {
             .unwrap();
 
         let file_name = path.file_name().unwrap().to_string_lossy();
-        let prefix = format!("{file_name}.migration-v17.");
+        let prefix = format!("{file_name}.migration-v{CAPTAINS_SCHEMA_VERSION}.");
         let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .flatten()
@@ -26475,7 +27171,7 @@ mod tests {
 
         let registry = CaptainsRegistry::load(path.clone());
         let snapshot = registry.snapshot();
-        assert_eq!(snapshot.schema_version, 17);
+        assert_eq!(snapshot.schema_version, CAPTAINS_SCHEMA_VERSION);
         assert_eq!(snapshot.seq, 108);
         assert_eq!(
             snapshot.agent_sessions[0].agent_session_id,
@@ -26488,12 +27184,13 @@ mod tests {
     }
 
     #[test]
-    fn first_schema_v17_write_creates_a_timestamped_migration_backup() {
-        let path = captains_tmp("schema-v17-migration-backup");
+    fn first_schema_v18_write_creates_a_timestamped_migration_backup() {
+        let path = captains_tmp("schema-v18-migration-backup");
         let legacy = CaptainsSnapshot {
-            schema_version: 16,
+            schema_version: 17,
             seq: 1,
             captains: vec![],
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: vec![],
             agent_checkpoints: vec![],
             agent_events: vec![],
@@ -26512,7 +27209,7 @@ mod tests {
             .unwrap();
 
         let file_name = path.file_name().unwrap().to_string_lossy();
-        let prefix = format!("{file_name}.migration-v17.");
+        let prefix = format!("{file_name}.migration-v{CAPTAINS_SCHEMA_VERSION}.");
         let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .flatten()
@@ -26899,6 +27596,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 4,
             captains: vec![],
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: vec![],
             agent_checkpoints: vec![],
             agent_events: vec![],
@@ -26999,6 +27697,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 1,
             captains: vec![],
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: vec![],
             agent_checkpoints: vec![],
             agent_events: vec![],
@@ -27519,6 +28218,154 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    #[test]
+    fn reconcile_cortana_is_idempotent_and_recovers_the_same_identity() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-control").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4242".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let first = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-startup-1",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(first["action"], "create");
+        assert_eq!(first["healthy"], true);
+        assert_eq!(first["generation"], 1);
+        let first_terminal = first["terminalId"].as_str().unwrap().to_string();
+        let identity_id = first["identityId"].as_str().unwrap().to_string();
+
+        let second = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-startup-1",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(second["action"], "keep");
+        assert_eq!(second["terminalId"], first_terminal);
+        assert_eq!(second["identityId"], identity_id);
+        assert_eq!(
+            ctx.captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana)
+                .count(),
+            1
+        );
+
+        reap_test_tmux_session_and_assert_absent(&tmux_target(&first_terminal));
+        let recovered = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-startup-2",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "recover");
+        assert_eq!(recovered["generation"], 2);
+        assert_eq!(recovered["identityId"], identity_id);
+        assert_ne!(recovered["terminalId"], first_terminal);
+        let recovered_terminal = recovered["terminalId"].as_str().unwrap();
+        assert!(tmux::has_session(&tmux_target(recovered_terminal)));
+
+        dispatch(
+            &ctx,
+            "close_terminal",
+            &json!({ "sessionId": recovered_terminal }),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn concurrent_cortana_startup_calls_produce_one_runtime() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-concurrent").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4243".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-concurrent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let ctx = ctx.clone();
+            let home = home.clone();
+            let harness_command = harness_command.clone();
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                dispatch(
+                    &ctx,
+                    "reconcile_cortana",
+                    &json!({
+                        "operationId": "cortana-concurrent-startup",
+                        "testOrchestratorHome": home,
+                        "testStartupCommand": harness_command,
+                    }),
+                )
+                .unwrap()
+            }));
+        }
+        start.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results[0]["terminalId"], results[1]["terminalId"]);
+        assert_eq!(results[0]["identityId"], results[1]["identityId"]);
+        assert_eq!(
+            ctx.captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana)
+                .count(),
+            1
+        );
+        let terminal_id = results[0]["terminalId"].as_str().unwrap();
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -32559,6 +33406,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 0,
             captains: vec![],
+            cortana: crate::cortana_reconcile::CortanaDurableIdentity::default(),
             agent_sessions: vec![],
             agent_checkpoints: vec![],
             agent_events: vec![],
