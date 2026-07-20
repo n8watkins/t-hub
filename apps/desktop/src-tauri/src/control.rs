@@ -18929,6 +18929,26 @@ fn spawn_terminal_with_private_pane_command(
     require_exact_tab: bool,
     forward_projection: bool,
 ) -> Result<Value, String> {
+    spawn_terminal_with_private_pane_command_and_id(
+        ctx,
+        args,
+        private_pane_command,
+        allow_captain_workspace,
+        require_exact_tab,
+        forward_projection,
+        None,
+    )
+}
+
+fn spawn_terminal_with_private_pane_command_and_id(
+    ctx: &ControlContext,
+    args: &Value,
+    private_pane_command: Option<&str>,
+    allow_captain_workspace: bool,
+    require_exact_tab: bool,
+    forward_projection: bool,
+    requested_session_id: Option<&str>,
+) -> Result<Value, String> {
     let _identity_transaction = ctx.tabs.identity_transaction();
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
@@ -18938,6 +18958,13 @@ fn spawn_terminal_with_private_pane_command(
     // Captain-chat phase 2: a captain spawning crew identifies itself so the
     // spawned session is recorded as crew in the captains registry.
     let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
+    if let Some(requested) = requested_session_id {
+        if requested.len() != 8 || !requested.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(
+                "spawn_terminal: requested session id must be eight alphanumeric bytes".into(),
+            );
+        }
+    }
 
     // #27: a REMOTE peer may spawn ONLY with a cwd under the operator allowlist —
     // the spawn execs a shell SERVER-SIDE at a peer-controlled dir. Loopback (the
@@ -19024,7 +19051,13 @@ fn spawn_terminal_with_private_pane_command(
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
     let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
-    let (id, tmux_session) = match spawn_tmux_terminal(&tmux_cwd, pane.as_deref(), &elevation) {
+    let spawn_result = match requested_session_id {
+        Some(requested) => {
+            spawn_tmux_terminal_with_id(requested, &tmux_cwd, pane.as_deref(), &elevation)
+        }
+        None => spawn_tmux_terminal(&tmux_cwd, pane.as_deref(), &elevation),
+    };
+    let (id, tmux_session) = match spawn_result {
         Ok(v) => v,
         Err(e) => {
             // Review L2: the mint persisted before this point, so a failed spawn would
