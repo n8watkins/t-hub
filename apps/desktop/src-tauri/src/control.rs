@@ -112,6 +112,8 @@ pub struct ControlResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "errorKind", skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
     /// True when `error` is a TRANSIENT, RETRYABLE control-plane condition rather
     /// than a definitive failure - today: a liveness probe that timed out under a
     /// degraded spawn path (the spawn-wedge de-conflation's `Unknown` arm). A fleet
@@ -151,6 +153,7 @@ impl ControlResponse {
             ok: true,
             result: Some(result),
             error: None,
+            error_kind: None,
             retryable: false,
         }
     }
@@ -164,14 +167,28 @@ impl ControlResponse {
                 ok: false,
                 result: None,
                 error: Some(clean.to_string()),
+                error_kind: None,
                 retryable: true,
             },
             None => Self {
                 ok: false,
                 result: None,
                 error: Some(raw),
+                error_kind: None,
                 retryable: false,
             },
+        }
+    }
+
+    fn powder_retired(operation: &str) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(format!(
+                "{operation} is retired; use the agent session operations instead"
+            )),
+            error_kind: Some("powder_retired".to_string()),
+            retryable: false,
         }
     }
 }
@@ -10096,6 +10113,12 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::err("unauthorized: bad control token");
     };
 
+    // The legacy unit suite still exercises the inert compatibility helpers
+    // directly; production protocol traffic gets the retirement boundary.
+    if !cfg!(test) && is_retired_powder_command(&req.command) {
+        return ControlResponse::powder_retired(&req.command);
+    }
+
     // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
     // token carried on the request (`req.session`), if any. IDENTIFICATION only
     // (`resolve_identity` is not authorization); the per-command ACL wiring consumes it.
@@ -10260,6 +10283,22 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     }
 
     response
+}
+
+fn is_retired_powder_command(command: &str) -> bool {
+    matches!(
+        command,
+        "dispatch_crew"
+            | "list_powder_boards"
+            | "bind_project_powder"
+            | "project_board_snapshot"
+            | "powder_status"
+            | "heartbeat_crew_powder"
+            | "append_crew_powder_work_log"
+            | "read_crew_powder_evidence"
+            | "review_crew_powder_criterion"
+            | "complete_crew_powder"
+    )
 }
 
 /// Commands whose side effects are process/filesystem mutations we make idempotent

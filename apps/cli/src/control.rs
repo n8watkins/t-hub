@@ -75,6 +75,8 @@ struct Response {
     result: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(rename = "errorKind", default)]
+    error_kind: Option<String>,
 }
 
 /// Resolve the control endpoint: env overrides first, then the handshake file.
@@ -417,9 +419,16 @@ fn call_once(
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
-        Err(CallFailure::Server(resp.error.unwrap_or_else(|| {
-            "control command failed (no error message)".to_string()
-        })))
+        Err(CallFailure::Server(match resp.error_kind.as_deref() {
+            Some("powder_retired") => format!(
+                "powder_retired:{}",
+                resp.error
+                    .unwrap_or_else(|| "Powder operation is retired".to_string())
+            ),
+            _ => resp
+                .error
+                .unwrap_or_else(|| "control command failed (no error message)".to_string()),
+        }))
     }
 }
 

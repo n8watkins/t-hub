@@ -65,6 +65,14 @@ impl CliError {
         }
     }
 
+    fn powder_retired(message: impl Into<String>) -> Self {
+        CliError {
+            code: exit::SERVER_ERROR,
+            kind: "powder_retired",
+            message: message.into(),
+        }
+    }
+
     /// A local git interrogation/mutation failed. Same exit tier as a server
     /// `ok:false` (4 = "the operation failed"), distinguished by `kind`.
     fn git(message: impl Into<String>) -> Self {
@@ -93,7 +101,9 @@ impl From<ControlError> for CliError {
                 message: m,
             },
             ControlError::Server(m) => {
-                if let Some(kind) = powder_mutation_error_kind(&m) {
+                if let Some(message) = m.strip_prefix("powder_retired:") {
+                    CliError::powder_retired(message)
+                } else if let Some(kind) = powder_mutation_error_kind(&m) {
                     CliError {
                         code: exit::SERVER_ERROR,
                         kind,
@@ -1036,7 +1046,6 @@ commands:\n\
   health                    WSL host snapshot                  [--json]\n\
   events                    stream the control event bus (Ctrl-C to stop)\n\
   agents                    start and supervise durable agent sessions\n\
-  powder                    Crew-bound Powder evidence lifecycle\n\
 \n\
 flags:\n\
   --json        stable machine envelope: {{ok, command, data, error}} (read cmds)\n\

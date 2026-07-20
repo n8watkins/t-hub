@@ -28,6 +28,11 @@ pub fn command_label(args: &[String]) -> String {
 }
 
 pub fn run(args: &[String]) -> Result<(), CliError> {
+    if !args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Err(CliError::powder_retired(
+            "Powder commands are retired; use `th agents` instead.",
+        ));
+    }
     if wants_help(args) {
         print_help();
         return Ok(());
