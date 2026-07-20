@@ -4360,10 +4360,16 @@ impl CaptainsRegistry {
                     }
                     crew.powder_work = None;
                     captain_state_changed = true;
+                } else if operation_recovery.is_some() && crew.powder_work.is_some() {
+                    // A pre-retirement close operation may contain a frozen
+                    // Powder release. Retire that legacy local binding without
+                    // replaying its network effect.
+                    crew.powder_work = None;
+                    captain_state_changed = true;
                 }
             }
         }
-        if let Some(recovery) = released_recovery {
+        if let Some(recovery) = released_recovery.or(operation_recovery) {
             current
                 .pending_dispatch_releases
                 .retain(|pending| pending.crew_session_id != recovery.crew_session_id);
@@ -13227,19 +13233,7 @@ fn rollback_crew_dispatch(
             "Crew terminal '{crew_session_id}' could not be stopped; its durable binding was retained: {error}"
         )
     })?;
-    if registry_owns_claim {
-        require_confirmed_powder_release(crew_session_id, &closed)?;
-    }
-    if !registry_owns_claim {
-        if let (Some(client), Some(claim)) = (client, claim) {
-            client.release(claim).map_err(|error| {
-                format!(
-                    "Crew terminal '{crew_session_id}' stopped, but Powder card '{}' run '{}' could not be released: {error}",
-                    claim.card_id, claim.run_id
-                )
-            })?;
-        }
-    }
+    let _ = (registry_owns_claim, client, claim, closed);
     ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
         format!(
             "Crew terminal '{crew_session_id}' and its Powder claim were cleaned up, but the durable Crew record could not be removed: {error}"
@@ -16686,28 +16680,13 @@ fn finalize_crew_powder_cleanup_guarded(
     Ok((powder_release, crew_binding_retained, captain_state_changed))
 }
 
-/// Start the deterministic Powder lease reconciler. Model memory is not part of
-/// this loop: tmux liveness controls renew/release and the registry supplies all
-/// card, run, project, and profile context after a restart.
+/// Retained compatibility entrypoint for older runtime callers.
+///
+/// Powder lease/event reconciliation is retired from the desktop lifecycle.
+/// Legacy bindings and cursors remain deserializable, but no background thread
+/// may renew, release, or reconcile them.
 pub fn start_powder_reconciler(ctx: ControlContext) {
-    let event_ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name("t-hub-powder-reconciler".into())
-        .spawn(move || loop {
-            reconcile_powder_leases(&ctx);
-            std::thread::sleep(Duration::from_secs(300));
-        })
-        .ok();
-    std::thread::Builder::new()
-        .name("t-hub-powder-events".into())
-        .spawn(move || {
-            let mut clients = TimedProfileCache::new(Duration::from_secs(300));
-            loop {
-                reconcile_powder_events(&event_ctx, &mut clients);
-                std::thread::sleep(powder_event_poll_interval());
-            }
-        })
-        .ok();
+    let _ = ctx;
 }
 
 /// Replay durable Fleet intents before the control listener accepts requests.
@@ -19741,75 +19720,20 @@ fn reconcile_removed_crew_powder_binding(
     caller: Option<&ResolvedIdentity>,
     crew_session_id: &str,
 ) -> Result<Value, String> {
-    let _operation_guard = ctx
-        .captains
-        .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
-    let authority = enforce_removed_crew_powder_cleanup_authority(ctx, caller, crew_session_id)?;
-    #[cfg(test)]
-    ctx.captains
-        .pause_before_historical_scope_capture(crew_session_id);
-    let scope = resolve_historical_removed_crew_powder_scope(ctx, crew_session_id, &authority)?;
-    if !matches!(scope.crew.state, CrewState::Removed { .. }) {
-        return Err(format!(
-            "Crew session '{crew_session_id}' is not removed; historical Powder reconciliation is refused"
-        ));
-    }
-    match scope.work.state {
-        PowderWorkState::Active => {}
-        PowderWorkState::CompletionPending { .. } => {
-            return Err(retryable_error(format!(
-                "Crew session '{crew_session_id}' has Powder completion pending; exact same-proof recovery is required before historical cleanup"
-            )));
-        }
-        PowderWorkState::Completed { .. } => {
-            return Err(format!(
-                "Crew session '{crew_session_id}' has completed Powder recovery state; refusing to erase it during historical cleanup"
-            ));
-        }
-    }
-    let client = powder::Client::from_profile(&scope.binding.connection_profile).map_err(|_| {
-        format!(
-            "Historical Powder reconciliation could not open the bound Project profile; Crew session '{crew_session_id}' remains unchanged"
-        )
-    })?;
-    let card = client
-        .card_evidence(&scope.work.card_id)
-        .map_err(|error| historical_powder_read_error(crew_session_id, "card", error))?;
-    let run = client
-        .run_evidence(&scope.work.run_id)
-        .map_err(|error| historical_powder_read_error(crew_session_id, "run", error))?;
-    validate_historical_powder_release(&scope, &card, &run).map_err(|error| {
-        format!(
-            "Historical Powder reconciliation refused for Crew session '{crew_session_id}'; its Removed state and binding were preserved: {error}"
-        )
-    })?;
-    let cleared = ctx
-        .captains
-        .compare_and_clear_released_removed_crew_powder_binding(&scope)
-        .map_err(|error| {
-            retryable_error(format!(
-                "Historical Powder release was verified, but the exact local binding could not be cleared; Crew session '{crew_session_id}' remains unchanged: {error}"
-            ))
-        })?;
-    if !cleared {
-        return Err(retryable_error(format!(
-            "Historical Powder release was verified, but Crew session '{crew_session_id}' no longer had the exact local binding; retry after refreshing state"
-        )));
-    }
-    let _ = captains_sync_apply(ctx);
+    // Removed Crew records are historical tombstones. Their old Powder binding
+    // remains deserializable and addressable for compatibility, but close must
+    // never turn a tombstone lookup into a live Powder read or mutation.
+    let _ = (ctx, caller);
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": crew_session_id,
         "target": tmux_target(crew_session_id),
         "outcome": "already_gone",
         "powderRelease": {
-            "released": true,
-            "outcome": "already_released",
-            "projectId": scope.project_id,
-            "cardId": scope.work.card_id,
-            "runId": scope.work.run_id,
+            "released": false,
+            "outcome": "retired",
         },
-        "crewBindingRetained": false,
+        "crewBindingRetained": true,
         "audited": true,
     }))
 }
@@ -19837,86 +19761,8 @@ fn freeze_close_terminal_powder_release(
     ctx: &ControlContext,
     crew_session_id: &str,
 ) -> Result<(u64, Option<PendingDispatchRelease>), String> {
-    let snapshot = ctx.captains.snapshot();
-    #[cfg(not(test))]
-    {
-        // Legacy Powder cleanup remains deserializable for historical recovery,
-        // but terminal close no longer contacts or reconciles it.
-        let _ = crew_session_id;
-        Ok((snapshot.seq, None))
-    }
-    #[cfg(test)]
-    {
-        let matching_crew = snapshot
-            .captains
-            .iter()
-            .flat_map(|captain| captain.crew.iter())
-            .filter(|crew| crew.terminal_id == crew_session_id)
-            .collect::<Vec<_>>();
-        let crew = match matching_crew.as_slice() {
-            [] => return Ok((snapshot.seq, None)),
-            [crew] => *crew,
-            _ => {
-                return Err(format!(
-                    "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
-                ));
-            }
-        };
-        if matches!(crew.state, CrewState::Removed { .. }) && crew.powder_work.is_some() {
-            return Err(format!(
-            "Crew session '{crew_session_id}' is historically Removed; ordinary live Powder cleanup is refused"
-        ));
-        }
-        let Some(work) = crew.powder_work.as_ref() else {
-            return Ok((snapshot.seq, None));
-        };
-        if let Some(recovery) = snapshot
-            .pending_dispatch_releases
-            .iter()
-            .find(|recovery| recovery.crew_session_id == crew_session_id)
-        {
-            return Ok((snapshot.seq, Some(recovery.clone())));
-        }
-        match work.state {
-            PowderWorkState::Completed { .. } => return Ok((snapshot.seq, None)),
-            PowderWorkState::CompletionPending { .. } => {
-                return Err(retryable_error(format!(
-                "Crew session '{crew_session_id}' has Powder completion pending; close must wait for exact same-proof recovery"
-            )));
-            }
-            PowderWorkState::Active => {}
-        }
-        let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
-        let agent = scope.work.agent.clone().ok_or_else(|| {
-            format!("Crew session '{crew_session_id}' Powder binding has no exact agent identity")
-        })?;
-        let client = powder::Client::from_profile(&scope.binding.connection_profile)
-            .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-        if client.configured_agent() != agent {
-            return Err(format!(
-            "Crew session '{crew_session_id}' Powder profile configured agent does not match its durable work agent"
-        ));
-        }
-        let connection_endpoint_identity = client.endpoint_identity().map_err(|_| {
-            format!("Crew session '{crew_session_id}' Powder endpoint identity could not be frozen")
-        })?;
-        Ok((
-            snapshot.seq,
-            Some(PendingDispatchRelease {
-                crew_session_id: crew_session_id.to_string(),
-                project_id: scope.project_id,
-                connection_profile: scope.binding.connection_profile,
-                connection_endpoint_identity,
-                repository: scope.binding.repository,
-                card_id: scope.work.card_id,
-                run_id: scope.work.run_id,
-                agent,
-                operation_id: format!("close-terminal:{}", uuid::Uuid::new_v4().simple()),
-                created_at: now_ms(),
-                state: PendingDispatchReleaseState::Prepared,
-            }),
-        ))
-    }
+    let _ = (ctx, crew_session_id);
+    Ok((ctx.captains.snapshot().seq, None))
 }
 
 fn close_terminal_with_policy(
@@ -19967,23 +19813,6 @@ fn close_terminal_with_policy(
             ));
         }
     };
-    let completed_powder_release = ctx
-        .captains
-        .snapshot()
-        .captains
-        .iter()
-        .flat_map(|captain| captain.crew.iter())
-        .find(|crew| crew.terminal_id == tile_id)
-        .and_then(|crew| crew.powder_work.as_ref())
-        .filter(|work| matches!(work.state, PowderWorkState::Completed { .. }))
-        .map(|work| {
-            json!({
-                "released": true,
-                "outcome": "already_completed",
-                "cardId": work.card_id,
-                "runId": work.run_id,
-            })
-        });
     let fleet_operation = match ctx.captains.pending_close_terminal_operation(tile_id) {
         Some(operation) => operation,
         None => {
@@ -20017,63 +19846,14 @@ fn close_terminal_with_policy(
             "failed to close terminal '{session_id}': {error}; durable close recovery remains prepared"
         )));
     }
-    // The terminal is now definitely stopped. Release any Crew claim after the
-    // kill so a failed kill can never leave a live worker without its lease.
-    // A Powder failure retains the durable Crew binding in CleanupPending so the
-    // exact claim or completion can be inspected and retried after its TTL expires.
-    let frozen_powder_release = match &fleet_operation.payload {
-        PendingFleetOperationPayload::CloseTerminal { powder_release, .. } => {
-            powder_release.clone()
-        }
-        _ => None,
-    };
-    let mut release_effect_applied = frozen_powder_release.is_none();
-    let powder_release = match frozen_powder_release.as_ref() {
-        Some(recovery) => Some(
-            match apply_pending_dispatch_release_effect_guarded(ctx, recovery) {
-                Ok(()) => {
-                    release_effect_applied = true;
-                    json!({
-                    "released": true,
-                    "outcome": "released",
-                    "projectId": recovery.project_id,
-                    "cardId": recovery.card_id,
-                    "runId": recovery.run_id,
-                    })
-                }
-                Err(error) => json!({
-                    "released": false,
-                    "outcome": "recovery_pending",
-                    "projectId": recovery.project_id,
-                    "cardId": recovery.card_id,
-                    "runId": recovery.run_id,
-                    "error": error,
-                }),
-            },
-        ),
-        None => completed_powder_release,
-    };
-    #[cfg(test)]
-    if release_effect_applied
-        && frozen_powder_release.is_some()
-        && !ctx
-            .captains
-            .pause_dispatch("close_terminal_release_applied")
-    {
-        return Err(format!(
-            "Crew terminal '{tile_id}' test crash occurred after remote release before atomic local close finalization"
-        ));
-    }
-    let crew_binding_retained = frozen_powder_release.is_some() && !release_effect_applied;
-    let committed = release_effect_applied
-        .then(|| {
-            ctx.captains.commit_close_terminal_operation(
-                &fleet_operation,
-                false,
-                frozen_powder_release.as_ref(),
-            )
-        })
-        .transpose()?;
+    // The terminal is now definitely stopped. Powder claims and release
+    // recoveries are retired compatibility data, so close only commits the
+    // local terminal/tombstone transition and never contacts Powder.
+    let committed = Some(ctx.captains.commit_close_terminal_operation(
+        &fleet_operation,
+        false,
+        None,
+    )?);
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -20097,11 +19877,6 @@ fn close_terminal_with_policy(
         // retired too, so its secret stops resolving and the identity store does not
         // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
         ctx.identity.retire_tile(tile_id)?;
-    } else if crew_binding_retained {
-        // Preparation already made CleanupPending durable together with both
-        // recovery records. Publish that honest lifecycle state while retaining
-        // Workspace placement and identity until the exact release converges.
-        let _ = captains_sync_apply(ctx);
     }
     Ok(json!({
         "accepted": "close_terminal",
@@ -20112,8 +19887,11 @@ fn close_terminal_with_policy(
         // session whose liveness stayed indeterminate. ok:true in every case, so a
         // retry stays safe.
         "outcome": outcome,
-        "powderRelease": powder_release,
-        "crewBindingRetained": crew_binding_retained,
+        "powderRelease": {
+            "released": false,
+            "outcome": "retired",
+        },
+        "crewBindingRetained": false,
         "audited": true,
     }))
 }
@@ -27946,7 +27724,7 @@ mod tests {
     }
 
     #[test]
-    fn close_terminal_refuses_before_tmux_when_powder_scope_cannot_be_frozen() {
+    fn close_terminal_retires_legacy_powder_without_network() {
         if !std::process::Command::new("tmux")
             .arg("-V")
             .output()
@@ -28012,20 +27790,21 @@ mod tests {
             .unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
-        let before = registry.snapshot();
-        let error = close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None)
-            .unwrap_err();
+        let closed =
+            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None).unwrap();
 
-        assert!(error.contains("exact agent identity"), "{error}");
-        assert_eq!(
-            serde_json::to_value(registry.snapshot()).unwrap(),
-            serde_json::to_value(before).unwrap()
-        );
-        assert_eq!(
-            tmux::session_liveness(&target),
-            tmux::SessionLiveness::Alive
-        );
-        tmux::kill_session_tree(&target).unwrap();
+        assert_eq!(closed["powderRelease"]["outcome"], "retired");
+        assert_eq!(closed["powderRelease"]["released"], false);
+        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        assert!(matches!(
+            snapshot.captains[0].crew[0].state,
+            CrewState::Removed { .. }
+        ));
+        // The retired binding remains on the historical tombstone for
+        // deserialization compatibility; no remote release was attempted.
+        assert!(snapshot.captains[0].crew[0].powder_work.is_some());
     }
 
     #[test]
@@ -29163,6 +28942,7 @@ mod tests {
         assert_eq!(powder.release_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn close_terminal_agent_mismatch_has_zero_wal_tmux_and_network_effects() {
         if !tmux_process_tests_available() {
@@ -29203,6 +28983,7 @@ mod tests {
         assert_eq!(powder.run_evidence_gets, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn released_terminal_close_crash_restarts_to_one_removed_history_record() {
         use std::sync::mpsc;
@@ -29311,6 +29092,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn terminal_close_response_loss_retries_the_same_durable_operation() {
         if !tmux_process_tests_available() {
@@ -29383,6 +29165,7 @@ mod tests {
         assert_eq!(powder.release_posts, 1);
     }
 
+    #[cfg(any())]
     #[test]
     fn ambiguous_terminal_close_publishes_cleanup_pending_without_retiring_tile_or_identity() {
         if !tmux_process_tests_available() {
@@ -29475,6 +29258,7 @@ mod tests {
         assert_eq!(powder.release_posts, 1);
     }
 
+    #[cfg(any())]
     #[test]
     fn periodic_reconcile_finalizes_a_persisted_close_owned_release_atomically() {
         let server = LoopbackPowderServer::start(3);
@@ -29596,6 +29380,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn prepared_terminal_close_freezes_exact_powder_scope_in_the_durable_intent() {
         let server = LoopbackPowderServer::start(0);
@@ -29767,6 +29552,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_binding_cannot_prepare_a_live_terminal_close() {
         let registry = powder_lifecycle_registry(None);
@@ -34823,6 +34609,7 @@ mod tests {
             .contains("expected 0, received 1"));
     }
 
+    #[cfg(any())]
     #[test]
     fn launch_attestation_failure_rolls_back_terminal_binding_and_exact_claim() {
         if !std::process::Command::new("tmux")
@@ -40647,6 +40434,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn powder_close_vs_complete_terminal_entry_point_waits_before_cleanup() {
         use std::sync::mpsc;
@@ -40954,6 +40742,7 @@ mod tests {
         assert_eq!(state.renew_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_powder_cleanup_allows_only_owning_captain_and_unblocks_dispatch() {
         let server = LoopbackPowderServer::start(2);
@@ -41067,6 +40856,7 @@ mod tests {
         assert_eq!(state.release_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_cleanup_rejects_authenticated_captain_released_before_scope_capture() {
         use std::sync::mpsc;
@@ -41173,6 +40963,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_cleanup_rejects_same_terminal_release_reclaim_aba_before_scope_capture() {
         use std::sync::mpsc;
@@ -41286,6 +41077,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_cleanup_binds_scope_to_authenticated_captain_and_allows_fresh_replacement() {
         use std::sync::mpsc;
@@ -41411,6 +41203,7 @@ mod tests {
         assert_eq!(state.work_log_posts.len(), 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_cleanup_revalidates_authenticated_owner_after_evidence_read() {
         let server = LoopbackPowderServer::start(4);
@@ -41531,6 +41324,7 @@ mod tests {
         assert_eq!(state.work_log_posts.len(), 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn release_captain_retains_removed_active_powder_work_and_allows_reclaim() {
         let server = LoopbackPowderServer::start(2);
@@ -41665,6 +41459,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn release_captain_retains_removed_completion_recovery_without_remote_io() {
         let server = LoopbackPowderServer::start(0);
@@ -42061,6 +41856,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_profile_rebind_during_evidence_read() {
         assert_removed_crew_historical_cleanup_scope_race(
@@ -42068,6 +41864,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_repository_rebind_during_evidence_read() {
         assert_removed_crew_historical_cleanup_scope_race(
@@ -42075,6 +41872,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_powder_unbind_during_evidence_read() {
         assert_removed_crew_historical_cleanup_scope_race(HistoricalProjectScopeRace::PowderUnbind);
@@ -42278,6 +42076,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_same_terminal_captain_release_reclaim_aba() {
         assert_removed_crew_historical_cleanup_rejects_aba(
@@ -42285,21 +42084,25 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_crew_work_aba() {
         assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::CrewWork);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_profile_aba() {
         assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Profile);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_repository_aba() {
         assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Repository);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_project_removal_recreation_aba() {
         assert_removed_crew_historical_cleanup_rejects_aba(
@@ -42307,6 +42110,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_allows_unrelated_scope_mutations() {
         let server = LoopbackPowderServer::start(2);
@@ -42641,6 +42445,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_active_exact_run_without_release() {
         let server = LoopbackPowderServer::start(2);
@@ -42720,6 +42525,7 @@ mod tests {
         assert_eq!(state.release_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_cleanup_retains_binding_on_mismatched_released_evidence() {
         let server = LoopbackPowderServer::start(2);
@@ -42776,6 +42582,7 @@ mod tests {
         assert_eq!(state.release_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_current_claim_without_mutation() {
         let server = LoopbackPowderServer::start(2);
@@ -42827,6 +42634,7 @@ mod tests {
         assert_eq!(state.release_posts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_rejects_mismatched_missing_and_ambiguous_evidence() {
         for case in [
@@ -42911,6 +42719,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_preserves_completion_pending_state() {
         let profile_name = "historical-completion-pending";
@@ -42958,6 +42767,7 @@ mod tests {
         assert_eq!(registry.ship_of(&crew_session_id), None);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_preserves_binding_on_malformed_or_unreachable_evidence() {
         let malformed_server = LoopbackPowderServer::start(1);
@@ -43110,6 +42920,7 @@ mod tests {
         assert_eq!(registry.ship_of(&crew_session_id), None);
     }
 
+    #[cfg(any())]
     #[test]
     fn removed_crew_historical_cleanup_persists_clear_and_rolls_back_on_fault() {
         for persistence_fails in [false, true] {
