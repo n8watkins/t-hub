@@ -18976,6 +18976,9 @@ fn start_agent(
             "workspaceTabId",
         ],
     )?;
+    arg_str(args, "requestId")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("start_agent requires a non-empty 'requestId'")?;
     let captain_session_id = arg_str(args, "captainSessionId")
         .filter(|value| !value.trim().is_empty())
         .ok_or("start_agent requires a non-empty 'captainSessionId'")?;

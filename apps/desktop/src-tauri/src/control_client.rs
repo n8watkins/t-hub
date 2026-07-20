@@ -51,7 +51,7 @@ const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" => LONG_ORCHESTRATION_TIMEOUT,
+        "commission_captain" | "dispatch_crew" | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
 }
