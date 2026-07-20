@@ -4,7 +4,7 @@ import { Canvas } from "./components/Canvas";
 import { useCaptain, agentOrder } from "./store/captain";
 import {
   CORTANA_RECONCILE_OPERATION_ID,
-  parseCortanaReconcileResult,
+  createCortanaReconciliationMonitor,
 } from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -212,32 +212,37 @@ export default function App() {
     };
   }, []);
 
-  // Cortana startup (main window only): the backend atomically keeps, adopts,
-  // recovers, or creates exactly one durable supervisor. Every window uses the
-  // same operation id, so duplicate startup calls serialize into one recovery.
-  // A malformed, failed, or explicitly degraded result stays visible.
+  // Cortana lifetime reconciliation (main window only): the backend atomically
+  // keeps, adopts, recovers, or creates exactly one durable supervisor. The
+  // frontend reacts to observed terminal death and periodically asks the backend
+  // to verify harness liveness. The monitor deduplicates overlapping signals and
+  // never polls the model, its transcript, or token usage.
   useEffect(() => {
     if (SATELLITE) return;
-    let disposed = false;
-    void controlRequest("reconcile_cortana", {
-      operationId: CORTANA_RECONCILE_OPERATION_ID,
-    })
-      .then((value) => {
-        if (disposed) return;
-        const result = parseCortanaReconcileResult(value);
+    const monitor = createCortanaReconciliationMonitor({
+      reconcile: () =>
+        controlRequest("reconcile_cortana", {
+          operationId: CORTANA_RECONCILE_OPERATION_ID,
+        }),
+      onResult: (result) => {
         setCortanaRecoveryProblem(
           result.healthy
             ? null
             : (result.degradedReason ?? "Cortana identity evidence is ambiguous."),
         );
-      })
-      .catch((cause) => {
-        if (!disposed) {
-          setCortanaRecoveryProblem(cause instanceof Error ? cause.message : String(cause));
-        }
-      });
+      },
+      onError: (cause) => {
+        setCortanaRecoveryProblem(cause instanceof Error ? cause.message : String(cause));
+      },
+    });
+    monitor.start();
+    monitor.observeTerminals(useWorkspace.getState().terminals);
+    const unsubscribe = useWorkspace.subscribe((state) => {
+      monitor.observeTerminals(state.terminals);
+    });
     return () => {
-      disposed = true;
+      unsubscribe();
+      monitor.stop();
     };
   }, []);
 

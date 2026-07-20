@@ -23,6 +23,13 @@ export const ORCHESTRATOR_DISPLAY_NAME = "Cortana";
  *  reconcile under one idempotent backend operation identity. */
 export const CORTANA_RECONCILE_OPERATION_ID = "t-hub.desktop.cortana.startup.v1";
 
+/**
+ * Backend reconciliation is cheap bounded control-plane work. This interval is
+ * frequent enough to recover a dead harness without asking the model for status
+ * and slow enough to avoid turning supervision into a polling workload.
+ */
+export const CORTANA_RECONCILE_INTERVAL_MS = 30_000;
+
 export interface CortanaReconcileResult {
   operationId: string;
   action: "keep" | "adopt" | "recover" | "create" | "degraded";
@@ -81,6 +88,103 @@ export function isOrchestratorCwd(cwd: string | undefined | null): boolean {
 export interface OrchestratorTerminal {
   cwd?: string;
   state?: string;
+}
+
+export interface CortanaReconciliationMonitorOptions {
+  reconcile: () => Promise<unknown>;
+  onResult: (result: CortanaReconcileResult) => void;
+  onError: (error: unknown) => void;
+  intervalMs?: number;
+}
+
+export interface CortanaReconciliationMonitor {
+  start: () => void;
+  observeTerminals: (terminals: Record<string, OrchestratorTerminal>) => void;
+  stop: () => void;
+}
+
+/**
+ * Keep backend-owned Cortana reconciliation active for the desktop lifetime.
+ *
+ * The monitor reacts immediately when the UI observes its authoritative terminal
+ * exit, and also performs a bounded periodic backend check so a dead harness in
+ * an otherwise-live terminal is recovered. Only one request may be in flight.
+ * Timer or liveness signals received during a request collapse into one trailing
+ * reconciliation. No model prompt, token, transcript, or provider API is polled.
+ */
+export function createCortanaReconciliationMonitor({
+  reconcile,
+  onResult,
+  onError,
+  intervalMs = CORTANA_RECONCILE_INTERVAL_MS,
+}: CortanaReconciliationMonitorOptions): CortanaReconciliationMonitor {
+  if (!Number.isFinite(intervalMs) || intervalMs < 1_000) {
+    throw new Error("Cortana reconciliation interval must be at least one second.");
+  }
+
+  let started = false;
+  let stopped = false;
+  let inFlight = false;
+  let trailingRun = false;
+  let timer: ReturnType<typeof globalThis.setInterval> | undefined;
+  let terminalId: string | null = null;
+  let terminalWasObserved = false;
+
+  const run = () => {
+    if (stopped) return;
+    if (inFlight) {
+      trailingRun = true;
+      return;
+    }
+    inFlight = true;
+    void reconcile()
+      .then((value) => {
+        if (stopped) return;
+        const result = parseCortanaReconcileResult(value);
+        if (terminalId !== result.terminalId) terminalWasObserved = false;
+        terminalId = result.terminalId;
+        onResult(result);
+      })
+      .catch((error) => {
+        if (!stopped) onError(error);
+      })
+      .finally(() => {
+        inFlight = false;
+        if (!stopped && trailingRun) {
+          trailingRun = false;
+          run();
+        }
+      });
+  };
+
+  return {
+    start() {
+      if (started || stopped) return;
+      started = true;
+      run();
+      timer = globalThis.setInterval(run, intervalMs);
+    },
+    observeTerminals(terminals) {
+      if (stopped || !terminalId) return;
+      const terminal = terminals[terminalId];
+      if (terminal?.state === "live" || terminal?.state === "detached") {
+        terminalWasObserved = true;
+        return;
+      }
+      if (terminal?.state === "exited" || terminal?.state === "error") {
+        run();
+        return;
+      }
+      if (!terminal && terminalWasObserved) run();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      trailingRun = false;
+      if (timer !== undefined) globalThis.clearInterval(timer);
+      timer = undefined;
+    },
+  };
 }
 
 /**
