@@ -15941,6 +15941,7 @@ fn reconcile_cortana(
         .ok_or("reconcile_cortana requires a stable non-empty operationId")?;
     let operation_id;
     {
+        let _identity_transaction = ctx.tabs.identity_transaction();
         let _provision = ctx.captains.provision_guard();
         let existing = ctx.captains.cortana_identity();
         operation_id = match &existing.recovery {
@@ -15970,6 +15971,7 @@ fn reconcile_cortana(
         .dispatch_admission
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _identity_transaction = ctx.tabs.identity_transaction();
     let _provision = ctx.captains.provision_guard();
     let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
     let result = reconcile_cortana_inner(ctx, args, &operation_id, durable, true);
@@ -21751,6 +21753,14 @@ fn appoint_admin(
     if !supervisor.active {
         return Err("appoint_admin requires an active supervisor".into());
     }
+    if supervisor.role == crate::delegated_admin::DelegatingSupervisorRole::Cortana
+        && !matches!(
+            ctx.captains.snapshot().cortana.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        )
+    {
+        return Err("appoint_admin requires Cortana recovery to be healthy".into());
+    }
     let actor_session_id = arg_str(args, "actorSessionId")
         .or_else(|| arg_str(args, "actor_session_id"))
         .ok_or("appoint_admin requires an actorSessionId")?;
@@ -25147,11 +25157,20 @@ fn start_agent(
         Err(error) => {
             let _ = tmux::kill_session_tree(&tmux_target(&agent_session_id));
             ctx.tabs.retire_tile_locked(&agent_session_id);
-            let _ = ctx.captains.mark_agent_unavailable(&agent_session_id);
-            let _ = ctx.identity.retire_tile(&agent_session_id);
-            return Err(format!(
+            let unavailable = ctx.captains.mark_agent_unavailable(&agent_session_id);
+            let identity_cleanup = ctx.identity.retire_tile(&agent_session_id);
+            let mut detail = format!(
                 "start_agent: launch succeeded but durable start state could not be persisted: {error}"
-            ));
+            );
+            if let Err(cleanup) = unavailable {
+                detail.push_str(&format!(
+                    "; recovery-required: unavailable state could not be persisted: {cleanup}"
+                ));
+            }
+            if let Err(cleanup) = identity_cleanup {
+                detail.push_str(&format!("; identity cleanup failed: {cleanup}"));
+            }
+            return Err(detail);
         }
     };
     Ok(json!({
