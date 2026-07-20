@@ -50,6 +50,7 @@ import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
 import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
 import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
+import { StartAgentDialog } from "./StartAgentDialog";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
  *  terminal tile - the sidebar-row click behavior now that agents live as
@@ -173,6 +174,7 @@ function AgentRow({
   // for the orchestrator - its name is the fixed brand label.
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [startAgentOpen, setStartAgentOpen] = useState(false);
 
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
   // The tab the captain's tile lives in; undefined = popped out / gone, the
@@ -430,6 +432,21 @@ function AgentRow({
             <Pencil size={11} className="pointer-events-none" aria-hidden />
           </button>
         )}
+        {!editing && !orchestrator && claim?.projectId && cwd && (
+          <button
+            type="button"
+            aria-label={`Start agent for ${identity}`}
+            title="Start agent"
+            onClick={(event) => {
+              event.stopPropagation();
+              setStartAgentOpen(true);
+            }}
+            className="relative flex h-6 shrink-0 items-center rounded px-1 text-[10px] opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            + agent
+          </button>
+        )}
       </div>
 
       {/* Expanded: the real crew (registry spawnedBy links), each with its own
@@ -447,6 +464,13 @@ function AgentRow({
           <SupervisionTreeView sessionId={sessionId ?? ""} label={identity} />
         </div>
       )}
+      <StartAgentDialog
+        open={startAgentOpen}
+        captainSessionId={terminalId}
+        directory={cwd ?? ""}
+        onClose={() => setStartAgentOpen(false)}
+        onStarted={() => setExpanded(true)}
+      />
     </div>
   );
 }
