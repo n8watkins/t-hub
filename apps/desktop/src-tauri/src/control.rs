@@ -4742,6 +4742,44 @@ impl CaptainsRegistry {
         Ok(checkpoint)
     }
 
+    pub fn insert_agent_session(&self, record: AgentSessionRecord) -> Result<(), String> {
+        record.validate()?;
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        if current
+            .agent_sessions
+            .iter()
+            .any(|agent| agent.agent_session_id == record.agent_session_id)
+        {
+            return Err(format!(
+                "agent session '{}' already exists",
+                record.agent_session_id
+            ));
+        }
+        if !current
+            .projects
+            .iter()
+            .any(|project| project.project_id == record.project_id)
+        {
+            return Err(format!(
+                "agent session '{}' references unknown projectId '{}'",
+                record.agent_session_id, record.project_id
+            ));
+        }
+        if !current.captains.iter().any(|captain| {
+            captain.terminal_id.as_deref() == Some(record.captain_session_id.as_str())
+        }) {
+            return Err(format!(
+                "agent session '{}' references unknown captainSessionId '{}'",
+                record.agent_session_id, record.captain_session_id
+            ));
+        }
+        current.agent_sessions.push(record);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
     fn pending_dispatch_claim(
         &self,
         connection_profile: &str,
@@ -26711,6 +26749,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(events_error.contains("agent 'missing-agent' was not found"));
+    }
+
+    #[test]
+    fn durable_agent_checkpoint_persists_and_advances_the_event_cursor() {
+        let ctx = test_ctx("secret");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-1".into(),
+                name: "Project".into(),
+                repo_root: "/tmp/project-1".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-1", Some("captain"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context("captain", "project-1", "Assignment", "codex")
+            .unwrap();
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "agent-1".into(),
+                captain_session_id: "captain-1".into(),
+                project_id: "project-1".into(),
+                assignment: "Do the work".into(),
+                directory: "/tmp/project-1".into(),
+                worktree_path: None,
+                branch: None,
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: crate::agent_session::RuntimeState::Starting,
+                work_stage: crate::agent_session::WorkStage::Assigned,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+        let response = dispatch(
+            &ctx,
+            "agent_checkpoint",
+            &json!({
+                "agentSessionId": "agent-1",
+                "authorSessionId": "captain-1",
+                "summary": "finished the first slice"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            response["checkpoint"]["summary"],
+            "finished the first slice"
+        );
+        assert!(response["eventCursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 0));
+        let events = dispatch(
+            &ctx,
+            "agent_events",
+            &json!({"agentSessionId": "agent-1", "cursor": "0", "limit": 10}),
+        )
+        .unwrap();
+        assert_eq!(events["count"], 1);
+        assert_eq!(events["events"][0]["kind"], "checkpoint");
     }
 
     #[test]
