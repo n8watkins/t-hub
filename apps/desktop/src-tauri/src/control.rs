@@ -14130,6 +14130,8 @@ fn history_resume(
     {
         return Err("history_unavailable: conversation is not resumable".to_string());
     }
+    let mut fresh_admission_lock = None;
+    let mut fresh_capacity = None;
     let (pending, reserved_here) = match ctx.history.pending_resume(&request_id)? {
         Some(pending) => {
             if pending.history_id != entry.history_id
@@ -14144,6 +14146,13 @@ fn history_resume(
             (pending, false)
         }
         None => {
+            // Serialize creation of fresh durable intents with admission.  If
+            // two resumes race, the second cannot become invisible pending
+            // demand while the first is being admitted.
+            let admission_lock = ctx
+                .dispatch_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (authorized_ship_slug, authorized_project_id, authorized_assignment_id) =
                 history_resume_owner(&authority);
             let pending = crate::history::HistoryPendingResume {
@@ -14165,21 +14174,42 @@ fn history_resume(
                     error
                 });
             }
+            let capacity = match evaluate_spawn_capacity(
+                ctx,
+                &SpawnPurpose::Ordinary,
+                1,
+                Some(&pending.terminal_id),
+            ) {
+                Ok(capacity) => capacity,
+                Err(refusal) => {
+                    let _ = ctx.history.cancel_resume_reservation(&pending);
+                    return Err(refusal.message);
+                }
+            };
+            fresh_admission_lock = Some(admission_lock);
+            fresh_capacity = Some(capacity);
             (pending, true)
         }
     };
-    let _admission = match admit_spawn(ctx, SpawnPurpose::Ordinary, 1, Some(&pending.terminal_id)) {
-        Ok(admission) => admission,
-        Err(refusal) => {
-            if reserved_here {
-                if let Err(cleanup) = ctx.history.cancel_resume_reservation(&pending) {
-                    return Err(retryable_error(format!(
-                        "{}; durable reservation cleanup also failed: {cleanup}",
-                        refusal.message
-                    )));
+    let _admission = if let Some(lock) = fresh_admission_lock {
+        SpawnAdmissionGuard {
+            _lock: lock,
+            _capacity: fresh_capacity.expect("fresh capacity accompanies its admission lock"),
+        }
+    } else {
+        match admit_spawn(ctx, SpawnPurpose::Ordinary, 1, Some(&pending.terminal_id)) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                if reserved_here {
+                    if let Err(cleanup) = ctx.history.cancel_resume_reservation(&pending) {
+                        return Err(retryable_error(format!(
+                            "{}; durable reservation cleanup also failed: {cleanup}",
+                            refusal.message
+                        )));
+                    }
                 }
+                return Err(refusal.message);
             }
-            return Err(refusal.message);
         }
     };
     let mut spawn_args = json!({
@@ -16385,8 +16415,22 @@ fn commission_captain(
     {
         return Ok(response);
     }
-    let _capacity = evaluate_spawn_capacity(ctx, &SpawnPurpose::Ordinary, 1, None)
-        .map_err(|refusal| refusal.message)?;
+    let capacity =
+        evaluate_spawn_capacity_for_new_ship(ctx, &ship_slug).map_err(|refusal| refusal.message)?;
+    // Commissioning consumes the Captain's provider slot, but the new ship
+    // must also have room for its standing Ship Admin.  Keep that slot
+    // prospective so a provider cap of one cannot admit a ship that can never
+    // satisfy its required administration invariant.
+    let standing_admin_needed = capacity.reservations.ship_admins.deficit;
+    if capacity.provider_headroom < 1usize.saturating_add(standing_admin_needed)
+        || capacity.session_headroom_before_reservations
+            < 1usize.saturating_add(standing_admin_needed)
+    {
+        return Err(format!(
+            "commission_captain: insufficient capacity for Captain and standing Ship Admin (provider headroom {}, session headroom {})",
+            capacity.provider_headroom, capacity.session_headroom_before_reservations
+        ));
+    }
 
     let provisional = CaptainRecord {
         ship_slug: ship_slug.clone(),
@@ -24666,7 +24710,18 @@ fn inspect_provider_live_sessions(
                 }
             }
             tmux::SessionLiveness::Gone if pending => {
+                // A dead terminal cannot become the provider runtime it was
+                // reserving.  Clear the marker and release the quota instead
+                // of leaking one provider slot forever after Harness exit.
+                // Count this observation once so the in-flight transition is
+                // fail-closed, then the cleared marker prevents future leaks.
                 live = live.saturating_add(1);
+                tmux::set_session_environment(tmux_session, PROVIDER_SESSION_ENV, "none")
+                    .map_err(|error| {
+                        format!(
+                            "provider pending marker could not be cleared for tmux session '{tmux_session}': {error}"
+                        )
+                    })?;
             }
             tmux::SessionLiveness::Gone => {}
             tmux::SessionLiveness::Unknown => {
@@ -24844,6 +24899,54 @@ fn evaluate_spawn_capacity(
     ctx.governor
         .check_spawn(live.total_live_sessions, Instant::now())?;
     Ok(capacity)
+}
+
+fn evaluate_spawn_capacity_for_new_ship(
+    ctx: &ControlContext,
+    ship_slug: &str,
+) -> Result<crate::governor::CapacityReport, crate::governor::Refusal> {
+    let snapshot = ctx.captains.snapshot();
+    let live = live_session_evidence(ctx, &snapshot, None).map_err(|message| {
+        crate::governor::Refusal {
+            code: "refused-evidence",
+            message: format!("spawn refused: {message}"),
+        }
+    })?;
+    let mut capacity = runtime_capacity_from_evidence(
+        ctx,
+        &snapshot,
+        &live,
+        crate::governor::HARD_SESSION_CEILING,
+    )
+    .map_err(|message| crate::governor::Refusal {
+        code: "refused-provider",
+        message: format!("spawn refused: {message}"),
+    })?;
+    capacity.active_captain_ships.insert(ship_slug.to_string());
+    capacity.active_captains = capacity.active_captain_ships.len();
+    let request = crate::governor::DispatchPreflight {
+        requested_lanes: vec![crate::governor::LaneClaim {
+            lane_id: "commission-captain".into(),
+            owner_id: "commission-captain".into(),
+            dependencies: Some(BTreeSet::new()),
+            mutable_files: BTreeSet::new(),
+            mutable_schemas: BTreeSet::new(),
+            mutable_interfaces: BTreeSet::new(),
+        }],
+        requested_provider_lanes: 1,
+        admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+        ship_admin_scope: None,
+        active_lanes: Vec::new(),
+        satisfied_dependencies: BTreeSet::new(),
+        integration_contracts: Vec::new(),
+        capacity,
+    };
+    ctx.governor
+        .preflight_dispatch(&request)
+        .map_err(|refusal| crate::governor::Refusal {
+            code: "refused-cap",
+            message: refusal.message,
+        })
 }
 
 fn dispatch_runtime_capacity(

@@ -525,10 +525,24 @@ impl SpawnGovernor {
                 .len()
                 .saturating_mul(self.reservations.ship_admins_per_active_captain)
         };
+        // Do not let duplicate administrators in one ship satisfy another
+        // ship's standing slot.  Capacity is scoped, so each active ship can
+        // contribute at most its required number of live administrators.
         let live_ship_admins = if runtime.live_ship_admin_scopes.is_empty() {
             runtime.live_ship_admins
         } else {
-            runtime.live_ship_admin_scopes.values().copied().sum()
+            runtime
+                .active_captain_ships
+                .iter()
+                .map(|ship| {
+                    runtime
+                        .live_ship_admin_scopes
+                        .get(ship)
+                        .copied()
+                        .unwrap_or(0)
+                        .min(self.reservations.ship_admins_per_active_captain)
+                })
+                .sum()
         };
         let cortana = ReservationClassReport::new(self.reservations.cortana, runtime.live_cortana);
         let fleet_admins =
