@@ -2294,7 +2294,10 @@ mod tests {
         );
         for command in IDEMPOTENT_COMMANDS {
             let (_, request_id) = ensure_request_id(command, &Value::Null);
-            assert!(request_id.is_some(), "{command} did not receive a requestId");
+            assert!(
+                request_id.is_some(),
+                "{command} did not receive a requestId"
+            );
         }
     }
 

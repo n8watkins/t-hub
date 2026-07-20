@@ -493,16 +493,18 @@ impl ControlProc {
             stop_child(child)?;
         }
         self.child.take();
-        let old_addr = self.addr.parse::<SocketAddr>().map_err(|error| {
-            format!("parse control helper address before restart: {error}")
-        })?;
+        let old_addr = self
+            .addr
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("parse control helper address before restart: {error}"))?;
         if TcpStream::connect_timeout(&old_addr, Duration::from_millis(100)).is_ok() {
             return Err("old control listener remained reachable across restart".into());
         }
         for path in [&self.stop_file, &self.auth_file] {
             if path.exists() {
-                fs::remove_file(path)
-                    .map_err(|error| format!("remove restart marker '{}': {error}", path.display()))?;
+                fs::remove_file(path).map_err(|error| {
+                    format!("remove restart marker '{}': {error}", path.display())
+                })?;
             }
         }
         self.child = Some(Self::launch_helper(
@@ -1148,17 +1150,25 @@ fn continuity_control_fixture() -> (
                 t_hub_lib::delegated_admin::DelegatedAdminStore::load(grants_path)
                     .expect("reload delegated admin fixture"),
             ),
-            serde_json::from_slice(&fs::read(credentials_path).expect("read continuity credentials"))
-                .expect("parse continuity credentials"),
+            serde_json::from_slice(
+                &fs::read(credentials_path).expect("read continuity credentials"),
+            )
+            .expect("parse continuity credentials"),
         );
     }
 
     let registry = control::CaptainsRegistry::load(captains_path.clone());
     for (project_id, root_path) in [
         ("continuity-project", "/tmp/continuity-project"),
-        ("continuity-foreign-project", "/tmp/continuity-foreign-project"),
+        (
+            "continuity-foreign-project",
+            "/tmp/continuity-foreign-project",
+        ),
         ("continuity-dead-project", "/tmp/continuity-dead-project"),
-        ("continuity-duplicate-project", "/tmp/continuity-duplicate-project"),
+        (
+            "continuity-duplicate-project",
+            "/tmp/continuity-duplicate-project",
+        ),
     ] {
         registry
             .upsert_project(control::ProjectRecord {
@@ -1310,7 +1320,9 @@ fn continuity_control_fixture() -> (
             "continuity-revoked",
         )
         .expect("mint revoked fixture");
-    identities.revoke(&revoked.id).expect("revoke fixture identity");
+    identities
+        .revoke(&revoked.id)
+        .expect("revoke fixture identity");
     let removed = identities
         .mint_and_bind(
             control::SessionIdentityRole::Captain,
@@ -1318,7 +1330,9 @@ fn continuity_control_fixture() -> (
             "continuity-removed",
         )
         .expect("mint removed fixture");
-    identities.retire(&removed.id).expect("retire fixture identity");
+    identities
+        .retire(&removed.id)
+        .expect("retire fixture identity");
 
     let mut snapshot = registry.snapshot();
     snapshot.cortana = control::CortanaDurableIdentity {
@@ -1511,13 +1525,7 @@ fn tool_error_text(response: &Value) -> &str {
         .expect("tool error text")
 }
 
-fn raw_control_call(
-    addr: &str,
-    token: &str,
-    session: &str,
-    command: &str,
-    args: Value,
-) -> Value {
+fn raw_control_call(addr: &str, token: &str, session: &str, command: &str, args: Value) -> Value {
     let mut stream = TcpStream::connect(addr).expect("connect raw control fixture");
     stream
         .set_read_timeout(Some(FIXTURE_IO_TIMEOUT))
@@ -1548,7 +1556,11 @@ fn add_tmux_fixture_session(socket: &str, terminal_id: &str) {
     let target = format!("th_{terminal_id}");
     let output = bounded_tmux_output(socket, &["new-session", "-d", "-s", &target, "sleep 300"])
         .expect("start continuity tmux session");
-    assert!(output.status.success(), "failed to start {target}: {}", command_failure(&output));
+    assert!(
+        output.status.success(),
+        "failed to start {target}: {}",
+        command_failure(&output)
+    );
 }
 
 fn spawn_fixture_terminal(mcp: &McpProc, id: u64, capability: &str) -> String {
@@ -1966,11 +1978,9 @@ fn captain_control_continuity_process_merge_gate() {
     let bin = locate_mcp_binary();
     let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
     let tmux_socket = format!("t-hub-continuity-{}-{test_id}", std::process::id());
-    let mut tmux_guard = TmuxServerGuard::start(
-        tmux_socket.clone(),
-        format!("th_{CONTINUITY_CAPTAIN}"),
-    )
-    .expect("start continuity tmux server");
+    let mut tmux_guard =
+        TmuxServerGuard::start(tmux_socket.clone(), format!("th_{CONTINUITY_CAPTAIN}"))
+            .expect("start continuity tmux server");
     for terminal in [
         CONTINUITY_FOREIGN_CAPTAIN,
         CONTINUITY_CREW,
@@ -2009,8 +2019,16 @@ fn captain_control_continuity_process_merge_gate() {
         Some(&shadow_home),
     );
     initialize_mcp(&captain, 200);
-    let initial_mutation = call_tool(&captain, 201, "new_tab", json!({"name": "Stable discovery"}));
-    assert_eq!(initial_mutation["result"]["isError"], false, "{initial_mutation}");
+    let initial_mutation = call_tool(
+        &captain,
+        201,
+        "new_tab",
+        json!({"name": "Stable discovery"}),
+    );
+    assert_eq!(
+        initial_mutation["result"]["isError"], false,
+        "{initial_mutation}"
+    );
 
     let before_rebind = current_handshake(&control.handshake_file);
     let lease_response = raw_control_call(
@@ -2032,12 +2050,18 @@ fn captain_control_continuity_process_merge_gate() {
         "rebind_control",
         Value::Null,
     );
-    assert_eq!(bridge_rebind["ok"], true, "scoped bridge-shaped rebind failed");
+    assert_eq!(
+        bridge_rebind["ok"], true,
+        "scoped bridge-shaped rebind failed"
+    );
     let after_rebind = current_handshake(&control.handshake_file);
     assert_ne!(after_rebind["addr"], before_rebind["addr"]);
     assert_eq!(after_rebind["token"], before_rebind["token"]);
     let rebound_mutation = call_tool(&captain, 202, "new_tab", json!({"name": "Port rebound"}));
-    assert_eq!(rebound_mutation["result"]["isError"], false, "{rebound_mutation}");
+    assert_eq!(
+        rebound_mutation["result"]["isError"], false,
+        "{rebound_mutation}"
+    );
 
     thread::sleep(Duration::from_millis(1_100));
     let expired = raw_control_call(
@@ -2054,7 +2078,10 @@ fn captain_control_continuity_process_merge_gate() {
         "new_tab",
         json!({"name": "Renewed after expiry"}),
     );
-    assert_eq!(renewed_after_expiry["result"]["isError"], false, "{renewed_after_expiry}");
+    assert_eq!(
+        renewed_after_expiry["result"]["isError"], false,
+        "{renewed_after_expiry}"
+    );
 
     let ship_appointment = call_tool(
         &captain,
@@ -2066,7 +2093,10 @@ fn captain_control_continuity_process_merge_gate() {
             "permittedOperations": ["maintainSession"]
         }),
     );
-    assert_eq!(ship_appointment["result"]["isError"], false, "{ship_appointment}");
+    assert_eq!(
+        ship_appointment["result"]["isError"], false,
+        "{ship_appointment}"
+    );
 
     let mut cortana = McpProc::spawn(
         &bin,
@@ -2077,7 +2107,10 @@ fn captain_control_continuity_process_merge_gate() {
     );
     initialize_mcp(&cortana, 210);
     let cortana_mutation = call_tool(&cortana, 211, "new_tab", json!({"name": "Cortana scoped"}));
-    assert_eq!(cortana_mutation["result"]["isError"], false, "{cortana_mutation}");
+    assert_eq!(
+        cortana_mutation["result"]["isError"], false,
+        "{cortana_mutation}"
+    );
     let fleet_appointment = call_tool(
         &cortana,
         212,
@@ -2088,7 +2121,10 @@ fn captain_control_continuity_process_merge_gate() {
             "permittedOperations": ["maintainFleetResource"]
         }),
     );
-    assert_eq!(fleet_appointment["result"]["isError"], false, "{fleet_appointment}");
+    assert_eq!(
+        fleet_appointment["result"]["isError"], false,
+        "{fleet_appointment}"
+    );
 
     let mut ship_admin = McpProc::spawn(
         &bin,
@@ -2211,7 +2247,10 @@ fn captain_control_continuity_process_merge_gate() {
             "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
         }),
     );
-    assert_eq!(admin_post_restart["result"]["isError"], false, "{admin_post_restart}");
+    assert_eq!(
+        admin_post_restart["result"]["isError"], false,
+        "{admin_post_restart}"
+    );
 
     for (id, label, secret_key, expected) in [
         (270, "dead", "deadCaptain", "not alive"),
@@ -2266,7 +2305,9 @@ fn captain_control_continuity_process_merge_gate() {
         process.shutdown().expect("stop continuity MCP process");
     }
     control.shutdown().expect("stop continuity control helper");
-    tmux_guard.shutdown().expect("stop continuity tmux fixtures");
+    tmux_guard
+        .shutdown()
+        .expect("stop continuity tmux fixtures");
 }
 
 #[test]

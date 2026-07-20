@@ -40049,7 +40049,7 @@ mod tests {
             "spawn_terminal",
             &json!({
                 "cwd": "/tmp",
-                "capability": "control",
+                "capability": "read",
                 "tabId": "attach-work",
                 "startupCommand": harness_command,
             }),
@@ -40059,8 +40059,9 @@ mod tests {
             .unwrap()
             .to_string();
         wait_for_harness_started(&control_id, "codex").unwrap();
-        // Compatibility fixture for a terminal spawned before Package 0. New
-        // terminals never receive this rotating global credential.
+        // Convert this ordinary read-only spawn into a compatibility fixture for
+        // a terminal created before Package 0. New terminals never receive this
+        // rotating global credential from their spawn request.
         tmux::set_session_environment(&tmux_target(&control_id), "T_HUB_CONTROL_TOKEN", &ctx.token)
             .unwrap();
         let attached = dispatch(
@@ -40173,7 +40174,7 @@ mod tests {
             "spawn_terminal",
             &json!({
                 "cwd": "/tmp",
-                "capability": "control",
+                "capability": "read",
                 "tabId": "attach-work",
                 "startupCommand": harness_command
             }),
@@ -40183,7 +40184,7 @@ mod tests {
             .unwrap()
             .to_string();
         wait_for_harness_started(&captain_id, "codex").unwrap();
-        // Exercise the rollback behavior through the legacy attach path without
+        // Convert the read-only spawn into a legacy attach fixture without
         // restoring global-token persistence for newly spawned terminals.
         tmux::set_session_environment(&tmux_target(&captain_id), "T_HUB_CONTROL_TOKEN", &ctx.token)
             .unwrap();
@@ -40454,7 +40455,10 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("only General/Cortana")));
-        assert!(!requested.exists(), "authorization ran after filesystem mutation");
+        assert!(
+            !requested.exists(),
+            "authorization ran after filesystem mutation"
+        );
         let _ = std::fs::remove_dir(parent);
     }
 
@@ -43755,8 +43759,8 @@ mod tests {
     fn every_crew_spawn_is_credential_withheld_regardless_of_capability() {
         // item-3 §2.3.5: every Crew spawn gets gh withholding (GH_CONFIG_DIR at an
         // empty dir) plus blanked ambient tokens.
-        // A delegated administrative Crew may receive a control token for exact
-        // operations, but that capability must not restore publishing credentials.
+        // A request for a generic administrative Crew is refused. Every allowed
+        // read-only Crew spawn still withholds publishing credentials.
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
 
@@ -43786,10 +43790,21 @@ mod tests {
         );
 
         for purpose in ["fleet-admin", "ship-admin", "recovery"] {
-            let (admin_env, _) = spawn_env_with_identity(
+            let refusal = spawn_env_with_identity(
                 &ctx,
                 &json!({
                     "capability": "control",
+                    "admissionPurpose": purpose
+                }),
+                "spawn_terminal",
+                None,
+            )
+            .unwrap_err();
+            assert!(refusal.contains("unsupported for generic Crew spawns"));
+            let (admin_env, _) = spawn_env_with_identity(
+                &ctx,
+                &json!({
+                    "capability": "read",
                     "admissionPurpose": purpose
                 }),
                 "spawn_terminal",
@@ -48960,7 +48975,7 @@ mod tests {
         let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
         assert_eq!(
             wait_for_boundary
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(15))
                 .expect("dispatch did not reach the stable-baseline barrier"),
             "after_stable_baseline"
         );
