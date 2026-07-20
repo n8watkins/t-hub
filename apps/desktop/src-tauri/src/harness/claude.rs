@@ -48,6 +48,15 @@ impl HarnessAdapter for ClaudeHarness {
         format!("claude --resume {}", sh_single_quote(session_id))
     }
 
+    fn resume_argv_with_permissions(&self, session_id: &str, perm: PermMode) -> String {
+        let flags = self.permission_map(perm).join(" ");
+        if flags.is_empty() {
+            self.resume_argv(session_id)
+        } else {
+            format!("claude --resume {} {flags}", sh_single_quote(session_id))
+        }
+    }
+
     fn exec_turn_argv(&self, prompt: &str, resume: Option<&str>, perm: PermMode) -> String {
         // Claude's headless print mode. Phase 1 crews are Codex `exec`; this
         // Claude form exists for symmetry/tests and does NOT change any live
@@ -161,6 +170,10 @@ mod tests {
         // No-regression lock: the recall path emits exactly this for a Claude row.
         let a = ClaudeHarness;
         assert_eq!(a.resume_argv("abc-123"), "claude --resume 'abc-123'");
+        assert_eq!(
+            a.resume_argv_with_permissions("abc-123", PermMode::Default),
+            "claude --resume 'abc-123'"
+        );
     }
 
     #[test]

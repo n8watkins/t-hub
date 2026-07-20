@@ -13302,7 +13302,11 @@ fn reconcile_cortana_inner(
                 PermMode::Default,
             )
         },
-        |provider_session_id| harness.adapter().resume_argv(provider_session_id),
+        |provider_session_id| {
+            harness
+                .adapter()
+                .resume_argv_with_permissions(provider_session_id, PermMode::Default)
+        },
     );
     #[cfg(test)]
     let startup_command =

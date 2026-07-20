@@ -321,6 +321,10 @@ pub trait HarnessAdapter: Send + Sync {
     /// frontend-only string in `SpawnMenu.tsx`.
     fn resume_argv(&self, session_id: &str) -> String;
 
+    /// Interactive resume with an explicit permission posture. Recovery paths
+    /// use this instead of inheriting a potentially broader user default.
+    fn resume_argv_with_permissions(&self, session_id: &str, perm: PermMode) -> String;
+
     /// The HEADLESS crew-turn pipeline string: one `exec`-style turn whose
     /// lifecycle streams into the t-hub journal via the producer tap. `resume =
     /// Some(id)` continues an existing thread/session; `None` starts fresh.

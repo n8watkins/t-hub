@@ -43,15 +43,17 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This bounds memory, parsing work, and any structured error derived from a peer.
 const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Commissioning and dispatch cross bounded git, tmux, and harness-start
-/// operations. Their response window must outlive the server's normal request
-/// phase so the client receives the authoritative result instead of abandoning a
-/// mutation that is still running.
+/// Commissioning, dispatch, and Cortana recovery cross bounded git, tmux, and
+/// harness-start operations. Their response window must outlive the server's
+/// normal request phase so the client receives the authoritative result instead
+/// of abandoning a mutation that is still running.
 const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        "commission_captain" | "dispatch_crew" | "reconcile_cortana" | "start_agent" => {
+            LONG_ORCHESTRATION_TIMEOUT
+        }
         _ => CONTROL_DEADLINE,
     }
 }
@@ -878,6 +880,10 @@ mod tests {
         );
         assert_eq!(
             response_timeout_for_command("dispatch_crew"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("reconcile_cortana"),
             LONG_ORCHESTRATION_TIMEOUT
         );
     }
