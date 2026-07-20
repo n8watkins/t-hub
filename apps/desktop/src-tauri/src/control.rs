@@ -8174,6 +8174,12 @@ pub struct ControlContext {
     /// dispatch. The reservation spans all Powder reads, spawn, claim,
     /// attestation, and transactional rollback work.
     dispatch_reservations: Arc<DispatchReservations>,
+    /// Serializes modern Crew admission from its authoritative snapshot through
+    /// exact-baseline verification, dependency ancestry, governor preflight, and
+    /// durable insertion. This closes the check-then-insert race where two
+    /// concurrent starts could otherwise observe the same free capacity and
+    /// mutable resources before either record became visible.
+    dispatch_admission: Arc<Mutex<()>>,
     /// The orchestrator-wake watch registry. Armed by `watch_fleet` / cleared by
     /// `unwatch_fleet`; read by the [`crate::fleet::FleetNotifier`] wired in
     /// `setup()`, which shares the same `Arc`. In-memory only (a watch is
@@ -21802,6 +21808,64 @@ fn parse_integration_contracts(
     .map_err(|error| format!("{command} integrationContracts are invalid: {error}"))
 }
 
+fn validate_dependency_result_ancestry(
+    snapshot: &CaptainsSnapshot,
+    project_id: &str,
+    dependencies: &BTreeSet<String>,
+    checkout: &str,
+    source_commit: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut satisfied = BTreeSet::new();
+    for dependency in dependencies {
+        let completed = snapshot
+            .agent_sessions
+            .iter()
+            .filter(|agent| agent.project_id == project_id)
+            .filter(|agent| {
+                agent
+                    .lane_claim
+                    .as_ref()
+                    .is_some_and(|lane| lane.lane_id == *dependency)
+            })
+            .filter(|agent| {
+                agent
+                    .delivery_states()
+                    .is_some_and(|states| states.complete)
+            })
+            .collect::<Vec<_>>();
+        if completed.is_empty() {
+            return Err(format!(
+                "start_agent: dependency '{dependency}' has no complete lane in project '{project_id}'"
+            ));
+        }
+
+        let mut result_commits = BTreeSet::new();
+        for agent in completed {
+            let resulting_commit = agent
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.resulting_commit.as_deref())
+                .ok_or_else(|| {
+                    format!(
+                        "start_agent: dependency '{dependency}' has complete delivery without an exact resulting commit"
+                    )
+                })?;
+            result_commits.insert(resulting_commit.to_string());
+        }
+        for resulting_commit in result_commits {
+            git::require_commit_ancestor(checkout, &resulting_commit, source_commit).map_err(
+                |error| {
+                    format!(
+                        "start_agent: dependency '{dependency}' result '{resulting_commit}' is not present in sourceCommit '{source_commit}': {error}"
+                    )
+                },
+            )?;
+        }
+        satisfied.insert(dependency.clone());
+    }
+    Ok(satisfied)
+}
+
 fn start_agent(
     ctx: &ControlContext,
     args: &Value,
@@ -21857,6 +21921,10 @@ fn start_agent(
     let mutable_schemas = string_set_arg(args, "mutableSchemas", "start_agent")?;
     let mutable_interfaces = string_set_arg(args, "mutableInterfaces", "start_agent")?;
     let integration_contracts = parse_integration_contracts(args, "start_agent")?;
+    let admission = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -21919,6 +21987,13 @@ fn start_agent(
             break candidate;
         }
     };
+    let satisfied_dependencies = validate_dependency_result_ancestry(
+        &snapshot,
+        &project.project_id,
+        &dependencies,
+        &checkout,
+        &source_commit,
+    )?;
     let lane_claim = crate::governor::LaneClaim {
         lane_id,
         owner_id: agent_session_id.clone(),
@@ -21927,17 +22002,6 @@ fn start_agent(
         mutable_schemas,
         mutable_interfaces,
     };
-    let satisfied_dependencies = snapshot
-        .agent_sessions
-        .iter()
-        .filter(|agent| agent.project_id == project.project_id)
-        .filter(|agent| {
-            agent
-                .delivery_states()
-                .is_some_and(|states| states.complete)
-        })
-        .filter_map(|agent| agent.lane_claim.as_ref().map(|lane| lane.lane_id.clone()))
-        .collect();
     let preflight = crate::governor::DispatchPreflight {
         requested_lanes: vec![lane_claim.clone()],
         active_lanes: active_dispatch_lanes(&snapshot, &project.project_id),
@@ -21955,6 +22019,8 @@ fn start_agent(
                 refusal.message
             )
         })?;
+    git::require_clean_exact_baseline(&checkout, &source_commit)
+        .map_err(|error| format!("start_agent: baseline changed during admission: {error}"))?;
     let now = now_ms();
     let record = AgentSessionRecord {
         agent_session_id: agent_session_id.clone(),
@@ -21984,6 +22050,9 @@ fn start_agent(
         updated_at: now,
     };
     ctx.captains.insert_agent_session(record)?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("start_agent_admitted");
+    drop(admission);
 
     let launch = crew_launch_argv(harness, &assignment);
     let mut spawn_args = json!({
@@ -23229,6 +23298,7 @@ impl ControlContext {
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
             dispatch_reservations: Arc::new(DispatchReservations::default()),
+            dispatch_admission: Arc::new(Mutex::new(())),
             fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
@@ -24510,6 +24580,34 @@ mod tests {
             .preflight_dispatch(&request)
             .unwrap();
         (lane, capacity)
+    }
+
+    fn completed_delivery(
+        baseline: &str,
+        resulting_commit: &str,
+    ) -> crate::agent_session::DeliveryProvenance {
+        let mut delivery = crate::agent_session::DeliveryProvenance::new(baseline, false);
+        delivery
+            .record_implementation(resulting_commit.to_string())
+            .unwrap();
+        delivery
+            .record_review(crate::agent_session::ReviewEvidence {
+                commit: resulting_commit.to_string(),
+                reviewer_identity: "independent-reviewer".into(),
+                reference: "review://dependency".into(),
+                recorded_at: 2,
+            })
+            .unwrap();
+        delivery
+            .record_acceptance_test(crate::agent_session::AcceptanceTestEvidence {
+                commit: resulting_commit.to_string(),
+                runner_identity: "acceptance-runner".into(),
+                reference: "test://dependency".into(),
+                environment: crate::agent_session::AcceptanceEnvironment::Source,
+                recorded_at: 2,
+            })
+            .unwrap();
+        delivery
     }
 
     #[cfg(not(windows))]
@@ -30479,6 +30577,252 @@ mod tests {
     }
 
     #[test]
+    fn start_agent_rejects_dependency_result_missing_from_source_baseline() {
+        let ctx = test_ctx("dependency-ancestry");
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let initial_commit = exact_head(&worktree);
+        std::fs::write(worktree.join("source.txt"), "dependent source\n").unwrap();
+        let worktree_path = worktree.to_string_lossy().to_string();
+        let run = |cwd: &str, args: &[&str]| {
+            let (ok, stdout, stderr) = git::run_git_for_test(cwd, args).unwrap();
+            assert!(ok, "git {args:?} failed: {stderr}");
+            stdout
+        };
+        run(&worktree_path, &["add", "source.txt"]);
+        run(
+            &worktree_path,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "dependent source",
+            ],
+        );
+        let source_commit = exact_head(&worktree);
+
+        let repo_path = repo_root.to_string_lossy().to_string();
+        std::fs::write(repo_root.join("dependency.txt"), "dependency result\n").unwrap();
+        run(&repo_path, &["add", "dependency.txt"]);
+        run(
+            &repo_path,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "divergent dependency result",
+            ],
+        );
+        let dependency_result = exact_head(&repo_root);
+
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-dependency".into(),
+                name: "Dependency Project".into(),
+                repo_root: repo_path,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-dependency", Some("captain-dependency"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-dependency",
+                "project-dependency",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+        let (lane_claim, dispatch_capacity) =
+            test_dispatch_evidence("dependency-lane", "dependency-agent");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "dependency-agent".into(),
+                captain_session_id: "captain-dependency".into(),
+                project_id: "project-dependency".into(),
+                assignment: "Build dependency".into(),
+                directory: repo_root.to_string_lossy().to_string(),
+                worktree_path: None,
+                branch: Some("main".into()),
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Exited,
+                work_stage: crate::agent_session::WorkStage::Complete,
+                delivery: Some(completed_delivery(&initial_commit, &dependency_result)),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+
+        let mut ancestor_snapshot = ctx.captains.snapshot();
+        ancestor_snapshot.agent_sessions[0].delivery =
+            Some(completed_delivery(&initial_commit, &initial_commit));
+        assert_eq!(
+            validate_dependency_result_ancestry(
+                &ancestor_snapshot,
+                "project-dependency",
+                &BTreeSet::from(["dependency-lane".to_string()]),
+                &worktree_path,
+                &source_commit,
+            )
+            .unwrap(),
+            BTreeSet::from(["dependency-lane".to_string()])
+        );
+
+        let error = start_agent(
+            &ctx,
+            &json!({
+                "requestId": "dependency-ancestry-rejected",
+                "captainSessionId": "captain-dependency",
+                "assignment": "Build dependent lane",
+                "directory": worktree_path,
+                "sourceCommit": source_commit,
+                "visibleProductBug": false,
+                "laneId": "dependent-lane",
+                "dependencies": ["dependency-lane"],
+                "mutableFiles": ["src/dependent.rs"],
+                "mutableSchemas": [],
+                "mutableInterfaces": [],
+                "integrationContracts": []
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("dependency-lane"), "got: {error}");
+        assert!(
+            error.contains("not present in sourceCommit"),
+            "got: {error}"
+        );
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn concurrent_start_agent_admission_cannot_double_claim_a_checkout() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "concurrent_start_agent_admission_cannot_double_claim_a_checkout: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("atomic-start-agent").with_apply_sink(sink);
+        let (base, repo_root, worktree) = scratch_repo_with_worktree();
+        let source_commit = exact_head(&worktree);
+        let checkout = worktree.to_string_lossy().to_string();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-atomic-start".into(),
+                name: "Atomic Start Project".into(),
+                repo_root: repo_root.to_string_lossy().to_string(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-atomic-start", Some("captain-atomic-start"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "captain-atomic-start",
+                "project-atomic-start",
+                "Assignment",
+                "codex",
+            )
+            .unwrap();
+
+        let args = json!({
+            "requestId": "atomic-start-first",
+            "captainSessionId": "captain-atomic-start",
+            "assignment": "Own the shared checkout",
+            "directory": checkout,
+            "harness": "codex",
+            "sourceCommit": source_commit,
+            "visibleProductBug": false,
+            "laneId": "atomic-lane-first",
+            "dependencies": [],
+            "mutableFiles": ["src/shared.rs"],
+            "mutableSchemas": [],
+            "mutableInterfaces": [],
+            "integrationContracts": []
+        });
+        let (reached, wait_for_admission) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_start) = std::sync::mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "start_agent_admitted",
+            reached,
+            resume: continue_start,
+        }));
+        let first_ctx = ctx.clone();
+        let first_args = args.clone();
+        let first = std::thread::spawn(move || start_agent(&first_ctx, &first_args, None, true));
+        assert_eq!(
+            wait_for_admission
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first start did not reach durable admission"),
+            "start_agent_admitted"
+        );
+        assert!(ctx.dispatch_admission.try_lock().is_err());
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+
+        let mut second_args = args;
+        second_args["requestId"] = json!("atomic-start-second");
+        second_args["laneId"] = json!("atomic-lane-second");
+        let second_ctx = ctx.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let result = start_agent(&second_ctx, &second_args, None, true);
+            finished_tx.send(result).unwrap();
+        });
+        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        resume.send(()).unwrap();
+        let first_result = first.join().unwrap().unwrap();
+        let second_error = finished_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        second.join().unwrap();
+        assert!(
+            second_error.contains("already owned"),
+            "got: {second_error}"
+        );
+        assert_eq!(ctx.captains.snapshot().agent_sessions.len(), 1);
+        let agent_session_id = first_result["agentSessionId"].as_str().unwrap();
+        reap_test_tmux_session(&tmux_target(agent_session_id)).unwrap();
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
     fn start_agent_persists_before_a_launch_failure_and_records_unavailable() {
         let ctx = test_ctx("secret");
         let (base, repo_root, worktree) = scratch_repo_with_worktree();
@@ -30515,7 +30859,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-failure",
                 "dependencies": [],
-                "mutableFiles": [repo],
+                "mutableFiles": ["src/start-failure.rs"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
@@ -30591,7 +30935,7 @@ mod tests {
                 "visibleProductBug": false,
                 "laneId": "lane-start-success",
                 "dependencies": [],
-                "mutableFiles": [repo],
+                "mutableFiles": ["src/start-success.rs"],
                 "mutableSchemas": [],
                 "mutableInterfaces": [],
                 "integrationContracts": []
