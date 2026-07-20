@@ -4835,6 +4835,57 @@ impl CaptainsRegistry {
         .map(|_| ())
     }
 
+    /// Reconcile runtime evidence without changing the explicit work stage.
+    /// Provider identity is write-once from trusted runtime evidence, while an
+    /// absent identity remains unknown until the provider reports one.
+    pub fn reconcile_agent_runtime(
+        &self,
+        agent_session_id: &str,
+        runtime_state: RuntimeState,
+        provider_conversation_id: Option<String>,
+    ) -> Result<AgentSessionRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let agent = current
+            .agent_sessions
+            .iter_mut()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .ok_or_else(|| format!("agent session '{agent_session_id}' was not found"))?;
+        let changed = agent.runtime_state != runtime_state
+            || provider_conversation_id
+                .as_deref()
+                .is_some_and(|id| agent.provider_conversation_id.as_deref() != Some(id));
+        if !changed {
+            return Ok(agent.clone());
+        }
+        agent.runtime_state = runtime_state;
+        if provider_conversation_id.is_some() {
+            agent.provider_conversation_id = provider_conversation_id;
+        }
+        agent.updated_at = now_ms();
+        agent.validate()?;
+        let result = agent.clone();
+        let cursor = current.seq.saturating_add(1);
+        current.agent_events.push(AgentEvent {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            kind: "runtime_reconciled".into(),
+            created_at: result.updated_at,
+            runtime_state: Some(result.runtime_state),
+            work_stage: Some(result.work_stage),
+            checkpoint: None,
+        });
+        if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_events.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_events.drain(0..overflow);
+        }
+        current.seq = cursor;
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     pub fn update_agent_stage(
         &self,
         agent_session_id: &str,
@@ -10964,6 +11015,44 @@ fn authorize_agent_filter(
     Ok(Some(captain.ship_slug.clone()))
 }
 
+/// Refresh one durable agent from terminal and provider evidence.
+/// Unknown probes are deliberately non-mutating so a transient WSL or tmux
+/// failure cannot turn a live agent into an exited one.
+fn reconcile_agent_runtime(ctx: &ControlContext, agent_session_id: &str) {
+    let snapshot = ctx.captains.snapshot();
+    let Some(agent) = snapshot
+        .agent_sessions
+        .iter()
+        .find(|agent| agent.agent_session_id == agent_session_id)
+        .cloned()
+    else {
+        return;
+    };
+    let runtime_state = match tmux::session_liveness(&tmux_target(&agent.agent_session_id)) {
+        tmux::SessionLiveness::Gone => RuntimeState::Exited,
+        tmux::SessionLiveness::Unknown => return,
+        tmux::SessionLiveness::Alive => {
+            match tmux::harness_liveness(&tmux_target(&agent.agent_session_id), &agent.provider) {
+                tmux::SessionLiveness::Alive => RuntimeState::Running,
+                tmux::SessionLiveness::Gone => RuntimeState::Idle,
+                tmux::SessionLiveness::Unknown => return,
+            }
+        }
+    };
+    let provider_conversation_id = if matches!(runtime_state, RuntimeState::Running) {
+        trusted_provider_session_id(ctx, &agent.agent_session_id, &agent.provider, None)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let _ = ctx.captains.reconcile_agent_runtime(
+        &agent.agent_session_id,
+        runtime_state,
+        provider_conversation_id,
+    );
+}
+
 fn list_agents(
     ctx: &ControlContext,
     args: &Value,
@@ -10995,6 +11084,24 @@ fn list_agents(
         trusted_internal,
         "list_agents",
     )?;
+    let candidate_ids: Vec<String> = ctx
+        .captains
+        .snapshot()
+        .agent_sessions
+        .into_iter()
+        .filter(|agent| {
+            captain_session_id
+                .as_deref()
+                .is_none_or(|captain| agent.captain_session_id == captain)
+                && project_id
+                    .as_deref()
+                    .is_none_or(|project| agent.project_id == project)
+        })
+        .map(|agent| agent.agent_session_id)
+        .collect();
+    for agent_session_id in candidate_ids {
+        reconcile_agent_runtime(ctx, &agent_session_id);
+    }
     let cursor = agent_page_cursor(args, "list_agents")?;
     let limit = agent_page_limit(args, "list_agents")?;
     let snapshot = ctx.captains.snapshot();
@@ -11068,6 +11175,7 @@ fn get_agent(
     let agent_session_id = arg_str(args, "agentSessionId")
         .filter(|value| !value.trim().is_empty())
         .ok_or("get_agent requires a non-empty 'agentSessionId'")?;
+    reconcile_agent_runtime(ctx, &agent_session_id);
     let agent = ctx
         .captains
         .snapshot()
@@ -27194,15 +27302,17 @@ mod tests {
             &json!({"projectId": "project-1", "limit": 10}),
         )
         .unwrap();
-        assert_eq!(listed["eventCursor"], response["eventCursor"]);
+        assert!(listed["eventCursor"].as_u64() >= response["eventCursor"].as_u64());
         let events = dispatch(
             &ctx,
             "agent_events",
             &json!({"agentSessionId": "agent-1", "cursor": "0", "limit": 10}),
         )
         .unwrap();
-        assert_eq!(events["count"], 1);
-        assert_eq!(events["events"][0]["kind"], "checkpoint");
+        assert!(events["count"].as_u64().is_some_and(|count| count >= 1));
+        assert!(events["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|event| event["kind"] == "checkpoint")));
     }
 
     #[test]
