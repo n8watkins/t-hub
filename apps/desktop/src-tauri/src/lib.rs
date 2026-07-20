@@ -14,6 +14,7 @@ mod tmux;
 
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
+pub mod agent_session; // Powder-independent durable agent-session contract
 mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
