@@ -11388,13 +11388,21 @@ fn authorize_agent_filter(
     command: &str,
     allow_delegated_status: bool,
 ) -> Result<AgentFilterAuthorization, String> {
-    if caller_is_apex(caller, trusted_internal) {
+    let active_admin_grant = caller.and_then(|caller| {
+        ctx.delegated_admin
+            .grants_for_actor(&caller.session_id)
+            .into_iter()
+            .find(|grant| grant.state.is_active())
+    });
+    if active_admin_grant.is_none() && caller_is_apex(caller, trusted_internal) {
         return Ok(AgentFilterAuthorization::default());
     }
     let caller = caller.ok_or_else(|| {
         format!("acl: '{command}' requires the owning Captain or a fleet supervisor")
     })?;
-    if caller.fleet_role != Some(FleetRole::Captain) && !allow_delegated_status {
+    if !allow_delegated_status
+        && (active_admin_grant.is_some() || caller.fleet_role != Some(FleetRole::Captain))
+    {
         return Err(format!(
             "acl: '{command}' requires the owning Captain or a fleet supervisor"
         ));
@@ -11408,11 +11416,13 @@ fn authorize_agent_filter(
             && captain_session_id.is_none_or(|id| captain.terminal_id.as_deref() == Some(id))
             && project_id.is_none_or(|id| captain.project_id.as_deref() == Some(id))
     });
-    if let Some(captain) = owned {
-        return Ok(AgentFilterAuthorization {
-            caller_ship: Some(captain.ship_slug.clone()),
-            delegated_audit: None,
-        });
+    if active_admin_grant.is_none() {
+        if let Some(captain) = owned {
+            return Ok(AgentFilterAuthorization {
+                caller_ship: Some(captain.ship_slug.clone()),
+                delegated_audit: None,
+            });
+        }
     }
     if !allow_delegated_status {
         return Err(format!(
@@ -11420,14 +11430,9 @@ fn authorize_agent_filter(
         ));
     }
 
-    let grant = ctx
-        .delegated_admin
-        .grants_for_actor(&caller.session_id)
-        .into_iter()
-        .find(|grant| grant.state.is_active())
-        .ok_or_else(|| {
-            format!("acl: '{command}' requires the owning Captain or a delegated administrator")
-        })?;
+    let grant = active_admin_grant.ok_or_else(|| {
+        format!("acl: '{command}' requires the owning Captain or a delegated administrator")
+    })?;
     match grant.role {
         crate::delegated_admin::DelegatedAdminRole::FleetAdmin => {
             let audit = authorize_delegated_admin(
@@ -19731,18 +19736,14 @@ fn read_terminal(
     // Phase 3 (§2.6 H3): the cross-ship READ hole - `read_terminal` captures another
     // session's scrollback directly via tmux, bypassing the plane entirely. An
     // identified session may read a pane ONLY on its own ship; the proven host is unrestricted.
-    let delegated_audit = if let Err(acl_error) =
-        enforce_session_access(ctx, caller, trusted_internal, &session_id)
-    {
-        let caller = caller.ok_or_else(|| acl_error.clone())?;
-        if !ctx
-            .delegated_admin
+    let caller_has_active_admin_grant = caller.is_some_and(|caller| {
+        ctx.delegated_admin
             .grants_for_actor(&caller.session_id)
             .iter()
             .any(|grant| grant.state.is_active())
-        {
-            return Err(acl_error);
-        }
+    });
+    let delegated_audit = if caller_has_active_admin_grant {
+        let caller = caller.expect("an active delegated grant requires an identified caller");
         let target = delegated_admin_target_for_terminal(ctx, &session_id)?;
         Some(authorize_delegated_admin(
             ctx,
@@ -19752,6 +19753,7 @@ fn read_terminal(
             crate::delegated_admin::AdminSafeguards::default(),
         )?)
     } else {
+        enforce_session_access(ctx, caller, trusted_internal, &session_id)?;
         None
     };
     let result = (|| {
@@ -20119,7 +20121,13 @@ fn authorize_worktree_maintenance(
     startup_command: Option<&str>,
     spawned_by: Option<&str>,
 ) -> Result<Option<crate::delegated_admin::AdminAuditContext>, String> {
-    if caller_is_apex(caller, trusted_internal) {
+    let active_admin_grant = caller.and_then(|caller| {
+        ctx.delegated_admin
+            .grants_for_actor(&caller.session_id)
+            .into_iter()
+            .find(|grant| grant.state.is_active())
+    });
+    if active_admin_grant.is_none() && caller_is_apex(caller, trusted_internal) {
         return Ok(None);
     }
     let caller = caller.ok_or("acl: create_worktree requires a session identity")?;
@@ -20136,7 +20144,7 @@ fn authorize_worktree_maintenance(
         })
         .ok_or("acl: create_worktree repository is not a registered Project")?;
 
-    if caller.fleet_role == Some(FleetRole::Captain) {
+    if active_admin_grant.is_none() && caller.fleet_role == Some(FleetRole::Captain) {
         let captain = snapshot.captains.iter().find(|captain| {
             captain.role == FleetRole::Captain
                 && captain.state == ClaimState::Active
@@ -20160,11 +20168,7 @@ fn authorize_worktree_maintenance(
                 .into(),
         );
     }
-    let grant = ctx
-        .delegated_admin
-        .grants_for_actor(&caller.session_id)
-        .into_iter()
-        .find(|grant| grant.state.is_active())
+    let grant = active_admin_grant
         .ok_or("acl: create_worktree requires the owning Captain or a Ship Admin grant")?;
     let ship_slug = match &grant.scope {
         crate::delegated_admin::AdminScope::Ship { ship_slug } => ship_slug.clone(),
@@ -22366,74 +22370,36 @@ fn close_terminal_authorized(
     // Authorize the target from ownership-only registry state before checking
     // historical Removed Crew state, which can lead to Project and Powder scope
     // resolution. Foreign callers must not use close as a binding-state oracle.
-    let (captain_authority, delegated_authority) =
-        match enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target) {
-            Ok(authority) => (authority, None),
-            Err(lifecycle_error) => {
-                let Some(caller) = caller else {
-                    return Err(lifecycle_error);
-                };
-                if !ctx
-                    .delegated_admin
-                    .grants_for_actor(&caller.session_id)
-                    .iter()
-                    .any(|grant| grant.state.is_active())
-                {
-                    return Err(lifecycle_error);
-                }
-                let approval_id = arg_str(args, "approvalId")
-                    .filter(|approval_id| !approval_id.trim().is_empty())
-                    .ok_or(
-                        "delegated admin: close_terminal requires an exact supervisor approvalId",
-                    )?;
-                let admin_target = delegated_admin_target_for_terminal(ctx, &target)?;
-                let grant = ctx
-                    .delegated_admin
-                    .grants_for_actor(&caller.session_id)
-                    .into_iter()
-                    .find(|grant| grant.state.is_active())
-                    .ok_or("delegated admin: caller has no active administrative grant")?;
-                let supervisor = current_delegating_supervisor(ctx, &grant);
-                let actor = current_admin_actor(ctx, &grant);
-                let consumed_approval = ctx
-                    .delegated_admin
-                    .consume_exact_approval(
-                        &approval_id,
-                        &crate::delegated_admin::AdminActor {
-                            identity_id: caller.session_id.clone(),
-                            session_tile: caller.tile.clone(),
-                            ..actor
-                        },
-                        &supervisor,
-                        crate::delegated_admin::AdminOperation::CleanupSession,
-                        &admin_target,
-                    )
-                    .map_err(|error| format!("{}: {error}", error.code()))?;
-                let audit = authorize_delegated_admin(
-                    ctx,
-                    caller,
-                    crate::delegated_admin::AdminOperation::CleanupSession,
-                    admin_target,
-                    crate::delegated_admin::AdminSafeguards {
-                        authoritative_ownership_verified: true,
-                        consumed_approval: Some(consumed_approval.clone()),
-                        worktree_safety: None,
-                    },
-                )?;
-                (
-                    None,
-                    Some(DelegatedCleanupAuthority {
-                        audit,
-                        consumed_approval,
-                    }),
-                )
-            }
-        };
+    let delegated_caller = caller.filter(|caller| {
+        ctx.delegated_admin
+            .grants_for_actor(&caller.session_id)
+            .iter()
+            .any(|grant| grant.state.is_active())
+    });
+    let (captain_authority, delegated_authority) = if let Some(caller) = delegated_caller {
+        (
+            None,
+            Some(authorize_delegated_cleanup(ctx, args, caller, &target)?),
+        )
+    } else {
+        (
+            enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?,
+            None,
+        )
+    };
     let delegated_audit = delegated_authority
         .as_ref()
         .map(|authority| authority.audit.clone());
     let target_identity_id = ctx.identity.for_tile(&target).map(|identity| identity.id);
-    if ctx.captains.removed_crew_powder_ship(&target)?.is_some() {
+    let removed_crew = match ctx.captains.removed_crew_powder_ship(&target) {
+        Ok(removed_crew) => removed_crew,
+        Err(error) => {
+            let result = Err(error);
+            record_delegated_admin_outcome(ctx, delegated_audit.as_ref(), &result);
+            return result;
+        }
+    };
+    if removed_crew.is_some() {
         let result =
             reconcile_removed_crew_powder_binding(ctx, caller, &target).and_then(|value| {
                 invalidate_retired_admin_identity(ctx, target_identity_id.as_deref(), &target)?;
@@ -22452,6 +22418,55 @@ fn close_terminal_authorized(
         });
     record_delegated_admin_outcome(ctx, delegated_audit.as_ref(), &result);
     result
+}
+
+fn authorize_delegated_cleanup(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: &ResolvedIdentity,
+    target: &str,
+) -> Result<DelegatedCleanupAuthority, String> {
+    let approval_id = arg_str(args, "approvalId")
+        .filter(|approval_id| !approval_id.trim().is_empty())
+        .ok_or("delegated admin: close_terminal requires an exact supervisor approvalId")?;
+    let admin_target = delegated_admin_target_for_terminal(ctx, target)?;
+    let grant = ctx
+        .delegated_admin
+        .grants_for_actor(&caller.session_id)
+        .into_iter()
+        .find(|grant| grant.state.is_active())
+        .ok_or("delegated admin: caller has no active administrative grant")?;
+    let supervisor = current_delegating_supervisor(ctx, &grant);
+    let actor = current_admin_actor(ctx, &grant);
+    let consumed_approval = ctx
+        .delegated_admin
+        .consume_exact_approval(
+            &approval_id,
+            &crate::delegated_admin::AdminActor {
+                identity_id: caller.session_id.clone(),
+                session_tile: caller.tile.clone(),
+                ..actor
+            },
+            &supervisor,
+            crate::delegated_admin::AdminOperation::CleanupSession,
+            &admin_target,
+        )
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    let audit = authorize_delegated_admin(
+        ctx,
+        caller,
+        crate::delegated_admin::AdminOperation::CleanupSession,
+        admin_target,
+        crate::delegated_admin::AdminSafeguards {
+            authoritative_ownership_verified: true,
+            consumed_approval: Some(consumed_approval.clone()),
+            worktree_safety: None,
+        },
+    )?;
+    Ok(DelegatedCleanupAuthority {
+        audit,
+        consumed_approval,
+    })
 }
 
 fn invalidate_retired_admin_identity(
@@ -30765,13 +30780,42 @@ mod tests {
             &json!({
                 "actorSessionId": "admin-alpha",
                 "role": "shipAdmin",
-                "permittedOperations": ["inspectStatus"]
+                "permittedOperations": ["maintainSession"]
             }),
             Some(&captain),
             false,
         )
         .unwrap();
         let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+
+        let read_denied = read_terminal(
+            &ctx,
+            &json!({"sessionId": "admin-alpha"}),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(read_denied.contains("operationNotGranted"));
+        let list_denied = list_agents(
+            &ctx,
+            &json!({"captainSessionId": "captain-alpha"}),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(list_denied.contains("operationNotGranted"));
+        let close_denied = close_terminal_authorized(
+            &ctx,
+            &json!({"sessionId": "admin-alpha"}),
+            Some(&admin),
+            false,
+        )
+        .unwrap_err();
+        assert!(close_denied.contains("exact supervisor approvalId"));
+        assert_eq!(
+            tmux::session_liveness(&admin_target),
+            tmux::SessionLiveness::Alive
+        );
 
         for command in [
             "spawn_terminal",
@@ -30817,7 +30861,7 @@ mod tests {
             &json!({
                 "actorSessionId": "admin-alpha",
                 "role": "shipAdmin",
-                "permittedOperations": ["inspectStatus"]
+                "permittedOperations": ["maintainSession"]
             }),
             Some(&admin),
             false,
