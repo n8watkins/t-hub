@@ -8,7 +8,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 mod catalog;
 
 pub use catalog::{
-    AssociationLiveness, HistoryAssociation, HistoryFilter, HistoryService, HISTORY_ENTRY_LIMIT,
+    AssociationLiveness, HistoryAssociation, HistoryBinding, HistoryFilter, HistoryService,
+    HISTORY_ENTRY_LIMIT,
 };
 
 use serde::{Deserialize, Serialize};

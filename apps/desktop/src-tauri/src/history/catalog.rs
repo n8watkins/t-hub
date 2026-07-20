@@ -73,6 +73,14 @@ pub struct HistoryAssociation {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryBinding {
+    pub history_id: String,
+    pub harness: Harness,
+    pub conversation_id: String,
+    pub terminal_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HistorySourceStatus {
@@ -115,6 +123,7 @@ pub struct HistoryService {
     codex_root: PathBuf,
     cache_ttl: Duration,
     cache: Mutex<Option<CachedCatalog>>,
+    bindings: Mutex<BTreeMap<String, HistoryBinding>>,
 }
 
 impl HistoryService {
@@ -139,11 +148,22 @@ impl HistoryService {
             codex_root,
             cache_ttl,
             cache: Mutex::new(None),
+            bindings: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn invalidate(&self) {
         *self.cache.lock() = None;
+    }
+
+    pub fn record_binding(&self, binding: HistoryBinding) {
+        self.bindings
+            .lock()
+            .insert(binding.history_id.clone(), binding);
+    }
+
+    pub fn bindings(&self) -> Vec<HistoryBinding> {
+        self.bindings.lock().values().cloned().collect()
     }
 
     pub fn list(

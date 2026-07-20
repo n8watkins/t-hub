@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Digest;
 
 use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
@@ -2947,10 +2948,14 @@ enum RequestSlot {
     /// A first caller reserved this id and is running the command now. A
     /// concurrent duplicate (a retry that raced the original, Incident B) sees
     /// this and must NOT run the command again.
-    InFlight { since: std::time::Instant },
+    InFlight {
+        since: std::time::Instant,
+        signature: String,
+    },
     /// The command finished; its outcome is cached for replay to a retry.
     Done {
         at: std::time::Instant,
+        signature: String,
         outcome: Result<Value, String>,
     },
 }
@@ -3052,7 +3057,7 @@ impl RequestCache {
         order.retain(|id| {
             let expired = match slots.get(id) {
                 Some(RequestSlot::Done { at, .. }) => now.duration_since(*at) >= ttl,
-                Some(RequestSlot::InFlight { since }) => {
+                Some(RequestSlot::InFlight { since, .. }) => {
                     now.duration_since(*since) >= inflight_reap
                 }
                 None => true,
@@ -3067,7 +3072,12 @@ impl RequestCache {
     /// Reserve `id` for a first caller, or report that it is a duplicate/in-flight.
     /// The reservation (InFlight) and the completed-outcome lookup are one atomic
     /// step so two racing retries can never both reserve the same id.
+    #[cfg(test)]
     fn begin(&self, id: &str) -> BeginOutcome {
+        self.begin_bound(id, "")
+    }
+
+    fn begin_bound(&self, id: &str, signature: &str) -> BeginOutcome {
         let now = std::time::Instant::now();
         let mut inner = self.lock();
         // M1 full fix: was THIS id a reservation that just aged out? Capture it
@@ -3076,16 +3086,45 @@ impl RequestCache {
         // (FreshAfterReap) that must re-probe reality before re-applying.
         let reaped = matches!(
             inner.slots.get(id),
-            Some(RequestSlot::InFlight { since }) if now.duration_since(*since) >= self.inflight_reap
+            Some(RequestSlot::InFlight { since, .. }) if now.duration_since(*since) >= self.inflight_reap
         );
         Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
         match inner.slots.get(id) {
-            Some(RequestSlot::Done { outcome, .. }) => BeginOutcome::Duplicate(outcome.clone()),
-            Some(RequestSlot::InFlight { .. }) => BeginOutcome::InFlight,
+            Some(RequestSlot::Done {
+                signature: existing,
+                outcome,
+                ..
+            }) => {
+                if existing == signature {
+                    BeginOutcome::Duplicate(outcome.clone())
+                } else {
+                    BeginOutcome::Duplicate(Err(
+                        "request_conflict: requestId is already bound to a different command or argument set"
+                            .to_string(),
+                    ))
+                }
+            }
+            Some(RequestSlot::InFlight {
+                signature: existing,
+                ..
+            }) => {
+                if existing == signature {
+                    BeginOutcome::InFlight
+                } else {
+                    BeginOutcome::Duplicate(Err(
+                        "request_conflict: requestId is already bound to a different command or argument set"
+                            .to_string(),
+                    ))
+                }
+            }
             None => {
-                inner
-                    .slots
-                    .insert(id.to_string(), RequestSlot::InFlight { since: now });
+                inner.slots.insert(
+                    id.to_string(),
+                    RequestSlot::InFlight {
+                        since: now,
+                        signature: signature.to_string(),
+                    },
+                );
                 inner.order.push_back(id.to_string());
                 // Capacity bound: evict the oldest COMPLETED entries (never an
                 // in-flight reservation) until back under the cap.
@@ -3117,6 +3156,11 @@ impl RequestCache {
     /// for any future retry.
     fn finish(&self, id: &str, outcome: Result<Value, String>) -> Result<Value, String> {
         let mut inner = self.lock();
+        let signature = match inner.slots.get(id) {
+            Some(RequestSlot::InFlight { signature, .. })
+            | Some(RequestSlot::Done { signature, .. }) => signature.clone(),
+            None => String::new(),
+        };
         // M2: normally `begin` already put the id in `order`, so we must NOT
         // double-insert. BUT if the reservation outlived the reap window (a
         // >`inflight_reap` handler still running), `evict_expired` already dropped
@@ -3131,6 +3175,7 @@ impl RequestCache {
             id.to_string(),
             RequestSlot::Done {
                 at: std::time::Instant::now(),
+                signature,
                 outcome: outcome.clone(),
             },
         );
@@ -4562,7 +4607,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        "spawn_terminal" | "history_resume" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -4570,7 +4615,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "abort_session" | "plane_admin" => {
             CommandTier::ProcessChanging
         }
-        "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
+        "focus_session" | "history_focus" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
@@ -5248,7 +5293,7 @@ fn governor_gate(
 ) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" | "commission_captain" | "dispatch_crew" => {
+        "spawn_terminal" | "history_resume" | "commission_captain" | "dispatch_crew" => {
             ctx.governor.check_spawn(live_session_count(), now)
         }
         "close_terminal" => ctx.governor.check_destructive(now),
@@ -5379,7 +5424,8 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         None
     };
     if let Some(id) = &request_id {
-        match ctx.requests.begin(id) {
+        let signature = request_signature(&req.command, &req.args);
+        match ctx.requests.begin_bound(id, &signature) {
             // This exact request already completed: replay its stored outcome. Do
             // NOT re-run, re-charge, or re-audit - the side effect is already done.
             BeginOutcome::Duplicate(outcome) => return replay_response(outcome),
@@ -5477,8 +5523,27 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 fn is_idempotent_command(command: &str) -> bool {
     matches!(
         command,
-        "spawn_terminal" | "create_worktree" | "commission_captain" | "dispatch_crew"
+        "spawn_terminal"
+            | "history_resume"
+            | "create_worktree"
+            | "commission_captain"
+            | "dispatch_crew"
     )
+}
+
+fn request_signature(command: &str, args: &Value) -> String {
+    let normalized = if command == "history_resume" {
+        json!({
+            "command": command,
+            "historyId": arg_str(args, "historyId").or_else(|| arg_str(args, "history_id")),
+            "targetTabId": arg_str(args, "targetTabId")
+                .or_else(|| arg_str(args, "target_tab_id"))
+                .or_else(|| arg_str(args, "tabId")),
+        })
+    } else {
+        json!({ "command": command, "args": args })
+    };
+    format!("{:x}", sha2::Sha256::digest(normalized.to_string()))
 }
 
 /// M1 full fix: when an InFlight reservation was REAPED (presumed dead after the
@@ -5509,6 +5574,23 @@ fn reprobe_reaped_request(
     args: &Value,
 ) -> Option<Result<Value, String>> {
     match command {
+        "history_resume" => {
+            let (entry, associations) = history_entry(ctx, args).ok()?;
+            if entry.continuity_state != crate::history::ContinuityState::Active {
+                return None;
+            }
+            let terminal_id = exact_active_history_terminal(&entry, &associations).ok()?;
+            Some(Ok(json!({
+                "accepted": "history_resume",
+                "requestId": arg_str(args, "requestId").or_else(|| arg_str(args, "request_id")),
+                "historyId": entry.history_id,
+                "harness": entry.harness,
+                "conversationId": entry.conversation_id,
+                "terminalId": terminal_id,
+                "status": "active",
+                "reprobedAfterReap": true,
+            })))
+        }
         "create_worktree" => {
             let repo_root = arg_str(args, "repoRoot").or_else(|| arg_str(args, "repo_root"))?;
             let worktree_path =
@@ -5795,6 +5877,7 @@ fn dispatch_with_caller(
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
         "focus_session" => organization_apply(ctx, "focus_session", args),
+        "history_focus" => history_focus(ctx, args),
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
         // forward the registry snapshot for the UI to render from.
@@ -5850,6 +5933,7 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
+        "history_resume" => history_resume(ctx, args),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
         "attach_captain" => attach_captain(ctx, args, caller, trusted_internal),
         "dispatch_crew" => dispatch_crew(ctx, args, caller, trusted_internal),
@@ -6399,6 +6483,29 @@ fn history_associations(ctx: &ControlContext) -> Vec<crate::history::HistoryAsso
         }
     }
 
+    for binding in ctx.history.bindings() {
+        if associations.iter().any(|association| {
+            association.harness == binding.harness
+                && association.conversation_id == binding.conversation_id
+                && association.terminal_id.as_deref() == Some(binding.terminal_id.as_str())
+        }) {
+            continue;
+        }
+        associations.push(crate::history::HistoryAssociation {
+            harness: binding.harness,
+            conversation_id: binding.conversation_id,
+            terminal_id: Some(binding.terminal_id.clone()),
+            liveness: history_registry_liveness(true, Some(&binding.terminal_id), &live_sessions),
+            project_id: None,
+            project_name: None,
+            captain_id: None,
+            role: None,
+            workspace_id: None,
+            worktree_id: None,
+            branch: None,
+        });
+    }
+
     let mut runtime = Vec::<(crate::history::Harness, String, String)>::new();
     if let Ok(live) = &live_sessions {
         for status in ctx.status.all() {
@@ -6466,6 +6573,145 @@ fn history_associations(ctx: &ControlContext) -> Vec<crate::history::HistoryAsso
     });
     associations.dedup();
     associations
+}
+
+fn history_entry(
+    ctx: &ControlContext,
+    args: &Value,
+) -> Result<
+    (
+        crate::history::HistoryEntry,
+        Vec<crate::history::HistoryAssociation>,
+    ),
+    String,
+> {
+    let history_id = arg_str(args, "historyId")
+        .or_else(|| arg_str(args, "history_id"))
+        .ok_or("history_invalid_request: historyId is required")?;
+    let associations = history_associations(ctx);
+    let entry = ctx
+        .history
+        .find(&history_id, &associations)?
+        .ok_or_else(|| "history_missing: History conversation was not found".to_string())?;
+    Ok((entry, associations))
+}
+
+fn exact_active_history_terminal(
+    entry: &crate::history::HistoryEntry,
+    associations: &[crate::history::HistoryAssociation],
+) -> Result<String, String> {
+    let terminals = associations
+        .iter()
+        .filter(|association| {
+            association.harness == entry.harness
+                && association.conversation_id == entry.conversation_id
+                && association.liveness == crate::history::AssociationLiveness::Active
+        })
+        .filter_map(|association| association.terminal_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if terminals.len() != 1 {
+        return Err(
+            "history_unavailable: conversation has no unique authoritative live terminal"
+                .to_string(),
+        );
+    }
+    let terminal_id = terminals.into_iter().next().expect("checked one terminal");
+    if tmux::session_liveness(&tmux_target(&terminal_id)) != tmux::SessionLiveness::Alive {
+        return Err(
+            "history_unavailable: conversation terminal is no longer verifiably active".to_string(),
+        );
+    }
+    Ok(terminal_id)
+}
+
+/// Focus an exact active History identity. The frontend cannot nominate a tile.
+fn history_focus(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let (entry, associations) = history_entry(ctx, args)?;
+    if entry.continuity_state != crate::history::ContinuityState::Active
+        || entry.actions.focus.status != crate::history::ActionStatus::Supported
+    {
+        return Err("history_unavailable: conversation is not active".to_string());
+    }
+    let terminal_id = exact_active_history_terminal(&entry, &associations)?;
+    let applied = organization_apply(ctx, "focus_session", &json!({ "sessionId": terminal_id }))?;
+    Ok(json!({
+        "accepted": "history_focus",
+        "historyId": entry.history_id,
+        "terminalId": terminal_id,
+        "status": "focused",
+        "applied": applied.get("applied").cloned().unwrap_or(Value::Bool(false)),
+    }))
+}
+
+fn history_request_id(args: &Value) -> Result<String, String> {
+    let request_id = arg_str(args, "requestId")
+        .or_else(|| arg_str(args, "request_id"))
+        .ok_or("history_invalid_request: requestId is required")?;
+    let valid = !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'));
+    if !valid {
+        return Err(
+            "history_invalid_request: requestId must be 1-128 ASCII identifier characters"
+                .to_string(),
+        );
+    }
+    Ok(request_id)
+}
+
+fn history_resume_command(entry: &crate::history::HistoryEntry) -> String {
+    let harness = match entry.harness {
+        crate::history::Harness::Claude => Harness::Claude,
+        crate::history::Harness::Codex => Harness::Codex,
+    };
+    harness.adapter().resume_argv(&entry.conversation_id)
+}
+
+/// Resume one exact provider conversation. The backend owns cwd, Harness, native
+/// identity, and executable command; callers provide only the opaque History ID,
+/// stable request ID, and optional destination tab.
+fn history_resume(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let request_id = history_request_id(args)?;
+    let (entry, _) = history_entry(ctx, args)?;
+    if entry.continuity_state != crate::history::ContinuityState::Resumable
+        || entry.actions.resume.status != crate::history::ActionStatus::Supported
+    {
+        return Err("history_unavailable: conversation is not resumable".to_string());
+    }
+    let target_tab = arg_str(args, "targetTabId")
+        .or_else(|| arg_str(args, "target_tab_id"))
+        .or_else(|| arg_str(args, "tabId"));
+    let mut spawn_args = json!({
+        "cwd": entry.cwd.clone(),
+        "startupCommand": history_resume_command(&entry),
+    });
+    if let Some(tab_id) = target_tab.as_deref() {
+        spawn_args["tabId"] = json!(tab_id);
+    }
+    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let terminal_id = spawned
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("history_resume_failed: spawn returned no terminal identity")?
+        .to_string();
+    ctx.history.record_binding(crate::history::HistoryBinding {
+        history_id: entry.history_id.clone(),
+        harness: entry.harness,
+        conversation_id: entry.conversation_id.clone(),
+        terminal_id: terminal_id.clone(),
+    });
+    Ok(json!({
+        "accepted": "history_resume",
+        "requestId": request_id,
+        "historyId": entry.history_id,
+        "harness": entry.harness,
+        "conversationId": entry.conversation_id,
+        "terminalId": terminal_id,
+        "tabId": spawned.get("tabId").cloned().unwrap_or(Value::Null),
+        "status": "active",
+    }))
 }
 
 /// `archive_recent_project`: the Recent list's × made durable. Moves the project
@@ -16796,8 +17042,13 @@ mod tests {
             required_tier("close_terminal"),
             CommandTier::ProcessChanging
         );
+        assert_eq!(
+            required_tier("history_resume"),
+            CommandTier::ProcessChanging
+        );
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
         assert_eq!(required_tier("new_tab"), CommandTier::Organization);
+        assert_eq!(required_tier("history_focus"), CommandTier::Organization);
         assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("list_terminals"), CommandTier::Read);
@@ -16862,6 +17113,37 @@ mod tests {
                 |entry| entry["harness"] == "claude" && entry["conversationId"] == "claude-control"
             ));
         assert_eq!(value["sources"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_resume_command_is_selected_only_from_exact_backend_harness() {
+        let codex_id = "22222222-2222-4222-8222-222222222222";
+        let codex = crate::history::parse_codex_rollout(
+            std::path::Path::new(
+                "rollout-2026-07-20T10-00-00-22222222-2222-4222-8222-222222222222.jsonl",
+            ),
+            &json!({"type":"session_meta","payload":{"id":codex_id,"cwd":"/repo"}}).to_string(),
+            1,
+        )
+        .unwrap()
+        .entry;
+        let claude = crate::history::parse_claude_transcript(
+            std::path::Path::new("claude-exact.jsonl"),
+            r#"{"type":"user","cwd":"/repo","message":{"content":"task"}}"#,
+            1,
+            false,
+        )
+        .unwrap()
+        .entry;
+
+        assert_eq!(
+            history_resume_command(&codex),
+            "codex resume '22222222-2222-4222-8222-222222222222'"
+        );
+        assert_eq!(
+            history_resume_command(&claude),
+            "claude --resume 'claude-exact'"
+        );
     }
 
     #[test]
@@ -18567,6 +18849,24 @@ mod tests {
                 panic!("a completed id must replay, not reap-and-re-reserve")
             }
             BeginOutcome::InFlight => panic!("a completed id must replay, not report InFlight"),
+        }
+    }
+
+    #[test]
+    fn request_cache_rejects_reusing_an_id_for_different_arguments() {
+        let cache = RequestCache::new();
+        assert!(matches!(
+            cache.begin_bound("history-request", "resume:one"),
+            BeginOutcome::Fresh
+        ));
+        cache
+            .finish("history-request", Ok(json!({"terminalId": "one"})))
+            .unwrap();
+        match cache.begin_bound("history-request", "resume:two") {
+            BeginOutcome::Duplicate(Err(error)) => {
+                assert!(error.starts_with("request_conflict:"));
+            }
+            _ => panic!("a requestId must remain bound to its original arguments"),
         }
     }
 
