@@ -1,8 +1,8 @@
 //! Core-side **agent bridge** (PLAN.md Workstream A, core half).
 //!
 //! Owns the long-lived connection to the WSL-side `t-hub-agent`:
-//!   - launches `wsl.exe -d <distro> --cd ~ -e bash -lc 'exec t-hub-agent --stdio'` on Windows, or
-//!     `t-hub-agent --stdio` directly on a unix dev box ([`launch_argv`]);
+//!   - launches the WSL-side `t-hub-agent` on Windows, or the agent directly on
+//!     a unix dev box ([`launch_argv`]);
 //!   - performs the [`Hello`]/[`Ready`] handshake;
 //!   - correlates [`AgentRequest`]s with [`AgentResponse`]s by [`RequestId`];
 //!   - consumes streamed/replayed [`EventJournalEntry`]s, advances the journal
@@ -74,8 +74,47 @@ use emit::{
 /// PATH or the distro.
 ///
 /// Called by SUBAGENT(agent-bridge)'s transport when it spawns the child.
+fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
+    let mut argv = vec![program.to_string()];
+    if let Some(dir) = journal_dir {
+        argv.push("--journal-dir".to_string());
+        argv.push(dir.to_string());
+    }
+    argv.push("--stdio".to_string());
+    argv
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "wsl.exe".to_string(),
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        "~".to_string(),
+        "-e".to_string(),
+        "bash".to_string(),
+        "-lc".to_string(),
+    ];
+    if let Some(dir) = journal_dir {
+        // The value is passed as a positional argument rather than interpolated
+        // into shell source, so spaces and shell metacharacters remain inert.
+        argv.extend([
+            "exec t-hub-agent --journal-dir \"$1\" --stdio".to_string(),
+            "t-hub-agent".to_string(),
+            dir.to_string(),
+        ]);
+    } else {
+        argv.push("exec t-hub-agent --stdio".to_string());
+    }
+    argv
+}
+
 #[allow(dead_code)]
 pub fn launch_argv(distro: &str) -> Vec<String> {
+    let journal_dir = std::env::var("T_HUB_AGENT_JOURNAL_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     #[cfg(windows)]
     {
         // Escape hatch: if T_HUB_AGENT_BIN is set, spawn it verbatim (no
@@ -85,7 +124,7 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
             .ok()
             .filter(|s| !s.is_empty())
         {
-            return vec![bin, "--stdio".to_string()];
+            return direct_agent_argv(&bin, journal_dir.as_deref());
         }
         // Login shell so the user's profile is sourced and `~/.local/bin`
         // (where the orchestrator installs the agent) is on PATH. `exec` so the
@@ -94,22 +133,13 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         // the user's DEFAULT login shell (zsh here), NOT bash (see the note on
         // tmux.rs::pane_info_command). bash's login PATH also has ~/.local/bin, so
         // the agent still resolves; `-e` just keeps us in the shell we intend.
-        vec![
-            "wsl.exe".to_string(),
-            "-d".to_string(),
-            distro.to_string(),
-            "--cd".to_string(),
-            "~".to_string(),
-            "-e".to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            "exec t-hub-agent --stdio".to_string(),
-        ]
+        windows_agent_argv(distro, journal_dir.as_deref())
     }
     #[cfg(unix)]
     {
         let _ = distro; // distro is irrelevant when launching directly.
-        vec!["t-hub-agent".to_string(), "--stdio".to_string()]
+        let _ = journal_dir; // inherited env resolves a relative path against HOME.
+        direct_agent_argv("t-hub-agent", None)
     }
 }
 
@@ -1063,6 +1093,35 @@ mod tests {
             assert_eq!(argv, vec!["C:/tmp/t-hub-agent.exe", "--stdio"]);
             std::env::remove_var("T_HUB_AGENT_BIN");
         }
+    }
+
+    #[test]
+    fn isolated_journal_is_forwarded_without_shell_interpolation() {
+        assert_eq!(
+            direct_agent_argv("t-hub-agent", Some(".t-hub-dev/journal dir")),
+            vec![
+                "t-hub-agent",
+                "--journal-dir",
+                ".t-hub-dev/journal dir",
+                "--stdio",
+            ]
+        );
+        assert_eq!(
+            windows_agent_argv("Ubuntu-24.04", Some(".t-hub-dev/journal dir")),
+            vec![
+                "wsl.exe",
+                "-d",
+                "Ubuntu-24.04",
+                "--cd",
+                "~",
+                "-e",
+                "bash",
+                "-lc",
+                "exec t-hub-agent --journal-dir \"$1\" --stdio",
+                "t-hub-agent",
+                ".t-hub-dev/journal dir",
+            ]
+        );
     }
 
     #[test]

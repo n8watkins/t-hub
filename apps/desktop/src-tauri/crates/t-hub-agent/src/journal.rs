@@ -28,6 +28,8 @@ use t_hub_protocol::{EventJournalEntry, JournalSource};
 
 /// Default journal location relative to `$HOME`: `~/.t-hub/journal`.
 const JOURNAL_SUBDIR: &str = ".t-hub/journal";
+/// Environment override inherited by agents launched from an isolated runtime.
+const JOURNAL_DIR_ENV: &str = "T_HUB_AGENT_JOURNAL_DIR";
 /// The append-only log file name within the journal directory.
 const JOURNAL_FILE: &str = "events.ndjson";
 
@@ -37,16 +39,35 @@ const JOURNAL_FILE: &str = "events.ndjson";
 /// statusline-snapshot stream. See [`Journal::compact_dropping_status`].
 pub const COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Resolve the journal directory: an explicit override, else `$HOME/.t-hub/
-/// journal`, else a process-relative fallback.
-pub fn resolve_journal_dir(override_dir: Option<&str>) -> PathBuf {
-    if let Some(dir) = override_dir.filter(|d| !d.trim().is_empty()) {
+/// Pure journal path resolver.
+/// An explicit CLI argument wins, followed by the environment override, followed
+/// by the production default under the user's home directory.
+fn resolve_journal_dir_from(
+    override_dir: Option<&str>,
+    env_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    if let Some(dir) = override_dir.filter(|dir| !dir.trim().is_empty()) {
         return PathBuf::from(dir);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Path::new(&home).join(JOURNAL_SUBDIR);
+    if let Some(dir) = env_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        if dir.is_absolute() {
+            return dir.to_path_buf();
+        }
+        return home.map_or_else(|| dir.to_path_buf(), |home| home.join(dir));
     }
-    PathBuf::from(JOURNAL_SUBDIR)
+    home.map_or_else(
+        || PathBuf::from(JOURNAL_SUBDIR),
+        |home| home.join(JOURNAL_SUBDIR),
+    )
+}
+
+/// Resolve the journal directory from the CLI, process environment, or the
+/// unchanged production default.
+pub fn resolve_journal_dir(override_dir: Option<&str>) -> PathBuf {
+    let env_dir = std::env::var_os(JOURNAL_DIR_ENV).map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_journal_dir_from(override_dir, env_dir.as_deref(), home.as_deref())
 }
 
 /// An open append-only journal. Cheap to clone-share behind an `Arc`; all
@@ -408,6 +429,31 @@ mod tests {
             payload: serde_json::json!({"k": entity}),
             result: None,
         }
+    }
+
+    #[test]
+    fn journal_path_precedence_and_relative_environment_resolution() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            resolve_journal_dir_from(
+                Some("/explicit/journal"),
+                Some(Path::new(".t-hub-dev/journal")),
+                Some(home),
+            ),
+            PathBuf::from("/explicit/journal")
+        );
+        assert_eq!(
+            resolve_journal_dir_from(None, Some(Path::new(".t-hub-dev/journal")), Some(home)),
+            PathBuf::from("/home/tester/.t-hub-dev/journal")
+        );
+        assert_eq!(
+            resolve_journal_dir_from(None, Some(Path::new("/var/tmp/journal")), Some(home)),
+            PathBuf::from("/var/tmp/journal")
+        );
+        assert_eq!(
+            resolve_journal_dir_from(None, None, Some(home)),
+            PathBuf::from("/home/tester/.t-hub/journal")
+        );
     }
 
     #[test]

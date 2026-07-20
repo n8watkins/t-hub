@@ -10309,12 +10309,17 @@ fn crew_empty_gh_config_dir() -> String {
 /// string is built with explicit forward slashes (NOT `PathBuf::join`, which
 /// emits `\` on a Windows binary), so the result is ALWAYS a backslash-free POSIX
 /// path.
+#[cfg(feature = "devbuild")]
+const CREW_GH_CONFIG_SUBDIR: &str = ".t-hub-dev/crew-gh-empty";
+#[cfg(not(feature = "devbuild"))]
+const CREW_GH_CONFIG_SUBDIR: &str = ".t-hub/crew-gh-empty";
+
 fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
     let base = home
         .filter(|h| h.starts_with('/'))
         .unwrap_or("/tmp")
         .trim_end_matches('/');
-    format!("{base}/.t-hub/crew-gh-empty")
+    format!("{base}/{CREW_GH_CONFIG_SUBDIR}")
 }
 
 /// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
@@ -13622,14 +13627,41 @@ fn detected_harness(terminal_id: &str) -> Option<String> {
 
 const CORTANA_GENERATION_ENV: &str = "T_HUB_CORTANA_GENERATION";
 
+#[cfg(feature = "devbuild")]
+const CORTANA_HOME_DEFAULT: &str = ".t-hub-dev/orchestrator";
+#[cfg(not(feature = "devbuild"))]
+const CORTANA_HOME_DEFAULT: &str = ".t-hub/orchestrator";
+
+fn resolve_orchestrator_home(user_home: &str, configured: Option<&str>) -> Result<String, String> {
+    let requested = configured
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(CORTANA_HOME_DEFAULT)
+        .trim_end_matches('/');
+    if requested.is_empty()
+        || requested.contains('\\')
+        || requested
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Err("T_HUB_CORTANA_HOME must be a safe POSIX directory path".to_string());
+    }
+    if requested.starts_with('/') {
+        return Ok(requested.to_string());
+    }
+    Ok(format!("{}/{}", user_home.trim_end_matches('/'), requested))
+}
+
 fn orchestrator_home(args: &Value) -> Result<String, String> {
     #[cfg(test)]
     if let Some(path) = arg_str(args, "testOrchestratorHome") {
         return Ok(path.trim_end_matches('/').to_string());
     }
-    #[cfg(not(test))]
     let _ = args;
-    files::user_home_path().map(|home| format!("{home}/.t-hub/orchestrator"))
+    let user_home = files::user_home_path()?;
+    resolve_orchestrator_home(
+        &user_home,
+        std::env::var("T_HUB_CORTANA_HOME").ok().as_deref(),
+    )
 }
 
 fn runtime_evidence(value: tmux::SessionLiveness) -> crate::cortana_reconcile::RuntimeEvidence {
@@ -36515,26 +36547,45 @@ mod tests {
         // A POSIX-absolute HOME (WSL-launched app) is used verbatim.
         assert_eq!(
             crew_gh_config_dir_from_home(Some("/home/natkins")),
-            "/home/natkins/.t-hub/crew-gh-empty"
+            format!("/home/natkins/{CREW_GH_CONFIG_SUBDIR}")
         );
         // A trailing slash is normalized (no doubled `//`).
         assert_eq!(
             crew_gh_config_dir_from_home(Some("/home/natkins/")),
-            "/home/natkins/.t-hub/crew-gh-empty"
+            format!("/home/natkins/{CREW_GH_CONFIG_SUBDIR}")
         );
         // A Windows USERPROFILE-style value is REJECTED (the crux of the bug): it
         // falls back to a fixed POSIX path, never a backslash/drive path.
         for windows_home in [r"C:\Users\natha", r"C:\Users\natha\", r"D:\home"] {
             let dir = crew_gh_config_dir_from_home(Some(windows_home));
-            assert_eq!(dir, "/tmp/.t-hub/crew-gh-empty");
+            assert_eq!(dir, format!("/tmp/{CREW_GH_CONFIG_SUBDIR}"));
             assert!(!dir.contains('\\'), "no backslash: {dir}");
             assert!(!dir.contains(":\\"), "no drive path: {dir}");
         }
         // An absent HOME also falls back to the POSIX path (native-Windows launch).
         assert_eq!(
             crew_gh_config_dir_from_home(None),
-            "/tmp/.t-hub/crew-gh-empty"
+            format!("/tmp/{CREW_GH_CONFIG_SUBDIR}")
         );
+    }
+
+    #[test]
+    fn orchestrator_home_is_scoped_and_rejects_traversal() {
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", None).unwrap(),
+            format!("/home/tester/{CORTANA_HOME_DEFAULT}")
+        );
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", Some(".t-hub-dev/custom-orchestrator"))
+                .unwrap(),
+            "/home/tester/.t-hub-dev/custom-orchestrator"
+        );
+        assert_eq!(
+            resolve_orchestrator_home("/home/tester", Some("/srv/t-hub/cortana")).unwrap(),
+            "/srv/t-hub/cortana"
+        );
+        assert!(resolve_orchestrator_home("/home/tester", Some("../production")).is_err());
+        assert!(resolve_orchestrator_home("/home/tester", Some(r"C:\production")).is_err());
     }
 
     #[test]

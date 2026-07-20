@@ -151,6 +151,7 @@ fn spawn_agent_connect(state: &AppState) {
 /// they DO (including stale `__termhub_managed__` entries from an upgraded
 /// `termhub` build), it migrates them to the current marker + resolved agent
 /// path. The outcome is summarized via `diag::diag_log`.
+#[cfg(not(feature = "devbuild"))]
 fn spawn_reconcile_managed_hooks() {
     std::thread::Builder::new()
         .name("t-hub-claude-reconcile".into())
@@ -370,40 +371,139 @@ fn start_control_listener(
     }
 }
 
-/// When built as the side-by-side DEV variant (`--features devbuild`), point the
-/// app's runtime state at an isolated namespace BEFORE anything reads it, so a
-/// dev build never collides with — or clobbers — a production T-Hub running at
-/// the same time: a separate tmux socket (`t-hub-dev`, so dev terminals never
-/// appear in / kill prod's live sessions) and a separate state dir
-/// (`~/.t-hub-dev`) for the MCP control channel + diag log. This reuses the
-/// existing `T_HUB_*` env hooks (tmux.rs / control.rs / diag.rs all read them
-/// lazily on first use), so no path code changes; each var is set only when the
-/// user hasn't already overridden it. No-op in production builds.
+/// Return every environment default that separates a development runtime from
+/// production. Relative WSL paths are intentional because a native Windows app
+/// cannot safely construct the distro user's absolute home path.
+#[cfg(feature = "devbuild")]
+fn devbuild_env_defaults(dev_home: &std::path::Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    use std::ffi::OsString;
+
+    vec![
+        ("T_HUB_TMUX_SOCKET", OsString::from("t-hub-dev")),
+        (
+            "T_HUB_CONTROL_FILE",
+            dev_home.join("control.json").into_os_string(),
+        ),
+        (
+            "T_HUB_DIAG_FILE",
+            dev_home.join("diag.log").into_os_string(),
+        ),
+        (
+            "T_HUB_CAPTAINS_FILE",
+            dev_home.join("captains.json").into_os_string(),
+        ),
+        (
+            "T_HUB_IDENTITIES_FILE",
+            dev_home.join("identities.json").into_os_string(),
+        ),
+        (
+            "T_HUB_AUTHORIZATIONS_FILE",
+            dev_home.join("authorizations.json").into_os_string(),
+        ),
+        (
+            "T_HUB_DELEGATED_ADMIN_FILE",
+            dev_home.join("delegated-admin.json").into_os_string(),
+        ),
+        ("T_HUB_INBOX_DIR", dev_home.join("inbox").into_os_string()),
+        ("T_HUB_AUDIT_DIR", dev_home.join("audit").into_os_string()),
+        (
+            "T_HUB_SERVER_KEY_FILE",
+            dev_home.join("server-key").into_os_string(),
+        ),
+        (
+            "T_HUB_SERVER_READ_KEY_FILE",
+            dev_home.join("server-read-key").into_os_string(),
+        ),
+        (
+            "T_HUB_VOICE_FILE",
+            dev_home.join("voice.json").into_os_string(),
+        ),
+        (
+            "T_HUB_POWDER_PROFILES_FILE",
+            dev_home.join("powder-profiles.json").into_os_string(),
+        ),
+        ("T_HUB_CONFIG_DIR", dev_home.join("config").into_os_string()),
+        ("T_HUB_DB_NAME", OsString::from("t-hub-dev.db")),
+        (
+            "T_HUB_AGENT_JOURNAL_DIR",
+            OsString::from(".t-hub-dev/journal"),
+        ),
+        (
+            "T_HUB_CORTANA_HOME",
+            OsString::from(".t-hub-dev/orchestrator"),
+        ),
+    ]
+}
+
+/// Point every mutable default owned by the side-by-side development variant
+/// at an isolated namespace before any lazy path or runtime is initialized.
+/// Explicit operator overrides still win. Production builds do not call this
+/// implementation and retain their existing defaults.
 #[cfg(feature = "devbuild")]
 fn apply_devbuild_isolation() {
-    if std::env::var_os("T_HUB_TMUX_SOCKET").is_none() {
-        std::env::set_var("T_HUB_TMUX_SOCKET", "t-hub-dev");
-    }
     let dev_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
-        .map(|h| h.join(".t-hub-dev"));
-    if let Some(dir) = dev_home {
-        let _ = std::fs::create_dir_all(&dir);
-        if std::env::var_os("T_HUB_CONTROL_FILE").is_none() {
-            std::env::set_var("T_HUB_CONTROL_FILE", dir.join("control.json"));
-        }
-        if std::env::var_os("T_HUB_DIAG_FILE").is_none() {
-            std::env::set_var("T_HUB_DIAG_FILE", dir.join("diag.log"));
-        }
-        if std::env::var_os("T_HUB_CAPTAINS_FILE").is_none() {
-            std::env::set_var("T_HUB_CAPTAINS_FILE", dir.join("captains.json"));
+        .map(|home| home.join(".t-hub-dev"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".t-hub-dev"));
+    let _ = std::fs::create_dir_all(&dev_home);
+    for (key, value) in devbuild_env_defaults(&dev_home) {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
         }
     }
 }
 
 #[cfg(not(feature = "devbuild"))]
 fn apply_devbuild_isolation() {}
+
+#[cfg(all(test, feature = "devbuild"))]
+mod devbuild_isolation_tests {
+    use super::devbuild_env_defaults;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn every_mutable_default_has_a_unique_isolated_target() {
+        let root = PathBuf::from("/tmp/t-hub-dev-isolation-test");
+        let defaults = devbuild_env_defaults(&root);
+        let keys: HashSet<_> = defaults.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys.len(),
+            defaults.len(),
+            "environment keys must be unique"
+        );
+
+        let values: HashMap<_, _> = defaults
+            .into_iter()
+            .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+            .collect();
+        for key in [
+            "T_HUB_CONTROL_FILE",
+            "T_HUB_DIAG_FILE",
+            "T_HUB_CAPTAINS_FILE",
+            "T_HUB_IDENTITIES_FILE",
+            "T_HUB_AUTHORIZATIONS_FILE",
+            "T_HUB_DELEGATED_ADMIN_FILE",
+            "T_HUB_INBOX_DIR",
+            "T_HUB_AUDIT_DIR",
+            "T_HUB_SERVER_KEY_FILE",
+            "T_HUB_SERVER_READ_KEY_FILE",
+            "T_HUB_VOICE_FILE",
+            "T_HUB_POWDER_PROFILES_FILE",
+            "T_HUB_CONFIG_DIR",
+        ] {
+            assert!(
+                Path::new(values.get(key).expect("required isolation key")).starts_with(&root),
+                "{key} must be rooted in the development state directory"
+            );
+        }
+        assert_eq!(values["T_HUB_TMUX_SOCKET"], "t-hub-dev");
+        assert_eq!(values["T_HUB_DB_NAME"], "t-hub-dev.db");
+        assert_eq!(values["T_HUB_AGENT_JOURNAL_DIR"], ".t-hub-dev/journal");
+        assert_eq!(values["T_HUB_CORTANA_HOME"], ".t-hub-dev/orchestrator");
+    }
+}
 
 /// The user-facing app name — "T-Hub Dev" for the side-by-side dev build, "T-Hub"
 /// for production. Single source so the dev build is visibly distinct everywhere it
@@ -577,7 +677,12 @@ pub fn run() {
             // marker + resolved `t-hub-agent` path. It NEVER installs where nothing
             // managed exists (no silent new consent). Detached + error-swallowed so
             // it can never block or abort launch (a WSL hop / file write runs here).
+            #[cfg(not(feature = "devbuild"))]
             spawn_reconcile_managed_hooks();
+            #[cfg(feature = "devbuild")]
+            diag::diag_log(
+                "claude_hooks: startup reconciliation disabled for isolated devbuild".to_string(),
+            );
             // Start the MCP control listener so `t-hub-mcp` can forward
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is

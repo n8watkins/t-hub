@@ -1,128 +1,146 @@
-# T-Hub — Dev build (side-by-side "T-Hub Dev")
+# T-Hub Dev build
 
-> **Naming:** the project is **100% `t-hub`** (renamed 2026-06-20, rollback
-> tag `pre-thub-rename`). Brand is `T-Hub`;
-> internal tokens are `t-hub` (kebab) / `t_hub` (Rust idents, env vars
-> `T_HUB_*`) / `t-hub-desktop` (the pnpm package, distinct from the root
-> `t-hub`).
+> **Naming:** The project is `t-hub`, the product brand is `T-Hub`, Rust identifiers use `t_hub`, and environment variables use the `T_HUB_*` prefix.
 
-T-Hub ships in **two installable Windows variants that coexist on one machine**:
+T-Hub ships as two installable Windows variants that can run on the same machine.
 
-| | **T-Hub** (production) | **T-Hub Dev** (sandbox) |
-|---|---|---|
-| Windows app name (`productName`) | `T-Hub` | `T-Hub Dev` |
+| Surface | T-Hub production | T-Hub Dev |
+| --- | --- | --- |
+| Windows app name | `T-Hub` | `T-Hub Dev` |
 | Bundle identifier | `com.t-hub.app` | `com.t-hub.dev` |
 | tmux socket | `t-hub` | `t-hub-dev` |
+| T-Hub state root | `~/.t-hub` | `~/.t-hub-dev` |
 | MCP control channel | `~/.t-hub/control.json` | `~/.t-hub-dev/control.json` |
-| diag log | `~/.t-hub/diag.log` | `~/.t-hub-dev/diag.log` |
-| workspace DB + WebView2 data | `%APPDATA%\com.t-hub.app\…` | `%APPDATA%\com.t-hub.dev\…` |
-| window title (frameless; alt-tab/taskbar) | `T-Hub` | `T-Hub Dev` |
+| Agent journal | `~/.t-hub/journal` | `~/.t-hub-dev/journal` |
+| Cortana working directory | `~/.t-hub/orchestrator` | `~/.t-hub-dev/orchestrator` |
+| Windows app data and WebView data | `%APPDATA%\com.t-hub.app\...` | `%APPDATA%\com.t-hub.dev\...` |
+| Workspace database | `t-hub.db` | `t-hub-dev.db` |
+| Updater endpoint | Production release manifest | Disabled |
 
-**They are separate Windows apps.** Installing one never touches the other:
-separate Start-menu entries, separate Add/Remove-Programs entries, separate
-install dirs. You can run both at the same time.
+Installing a new T-Hub Dev build replaces only the previous T-Hub Dev installation.
+Installing a production build replaces only the previous production installation.
+The distinct bundle identifiers provide separate install directories, Start menu entries, application data, WebView profiles, and uninstall records.
 
-**Installing a new T-Hub Dev replaces the previous T-Hub Dev** (same identifier
-`com.t-hub.dev` → the NSIS installer recognizes it as the same app and upgrades
-in place). Likewise a new T-Hub replaces the previous T-Hub. The two never
-replace each other because their identifiers differ.
+## Isolation contract
 
-## What's isolated vs shared
+The `devbuild` Cargo feature applies isolation before any lazy runtime path is resolved.
+Each development default is installed only when the operator has not supplied an explicit environment override.
+Production builds do not run this setup and retain their historical defaults.
 
-**Isolated** (a dev experiment can NEVER disturb production):
-- **tmux sessions** — dev runs on the `t-hub-dev` socket, so its terminals
-  never appear in, and can never kill, your production sessions. *(This is the
-  safety-critical one.)*
-- **MCP control channel** + **diag log** — under `~/.t-hub-dev/`.
-- **Workspace DB, cookies/WebView2 data** — Tauri keys its `app_data_dir` on
-  the bundle identifier, so `com.t-hub.dev` gets its own directory automatically.
+The following T-Hub-owned mutable surfaces are isolated:
 
-**Shared** (intentional / harmless):
-- **App theme** (`~/.config/t-hub/theme.json`) — both variants read the same
-  theme. The ~6 themes are stock (compiled in), so nothing is lost; only the
-  active selection / any hand-tweaks live in that file.
-- **Recents** — derived from your actual `~/.claude` session transcripts (your
-  real Claude/Codex sessions), not a T-Hub-owned store.
+- tmux sessions use the `t-hub-dev` socket.
+- The MCP handshake, diagnostics log, Captain registry, identity store, authorization store, and delegated administration grants live under `~/.t-hub-dev`.
+- Durable inbox queues, audit logs, control keys, read keys, voice settings, and Powder compatibility profiles live under `~/.t-hub-dev`.
+- The agent bridge and every tmux-launched agent inherit `T_HUB_AGENT_JOURNAL_DIR=.t-hub-dev/journal`.
+- Relative agent journal paths are resolved against the WSL user's home directory.
+- Cortana uses `~/.t-hub-dev/orchestrator` and development Crew use `~/.t-hub-dev/crew-gh-empty` for the empty GitHub CLI profile.
+- Theme and portable workspace layout files use `~/.t-hub-dev/config` through `T_HUB_CONFIG_DIR`.
+- The workspace database uses the development filename inside the already separate development application data directory.
+- The development bundle identifier isolates frontend local storage, cookies, cache, and WebView data.
+- Automatic Claude settings reconciliation is disabled in development builds.
+- The development updater has no endpoints and cannot consume a production release manifest.
 
-## How it's built
+The concrete environment defaults are:
 
-The variant is a **compile-time Cargo feature** (`devbuild`) plus a tiny Tauri
-**config overlay** (`apps/desktop/src-tauri/tauri.dev.conf.json`). The prod
-build is byte-for-byte unchanged — `pnpm tauri build` with no flags.
+| Variable | Development default |
+| --- | --- |
+| `T_HUB_TMUX_SOCKET` | `t-hub-dev` |
+| `T_HUB_CONTROL_FILE` | `~/.t-hub-dev/control.json` |
+| `T_HUB_DIAG_FILE` | `~/.t-hub-dev/diag.log` |
+| `T_HUB_CAPTAINS_FILE` | `~/.t-hub-dev/captains.json` |
+| `T_HUB_IDENTITIES_FILE` | `~/.t-hub-dev/identities.json` |
+| `T_HUB_AUTHORIZATIONS_FILE` | `~/.t-hub-dev/authorizations.json` |
+| `T_HUB_DELEGATED_ADMIN_FILE` | `~/.t-hub-dev/delegated-admin.json` |
+| `T_HUB_INBOX_DIR` | `~/.t-hub-dev/inbox` |
+| `T_HUB_AUDIT_DIR` | `~/.t-hub-dev/audit` |
+| `T_HUB_SERVER_KEY_FILE` | `~/.t-hub-dev/server-key` |
+| `T_HUB_SERVER_READ_KEY_FILE` | `~/.t-hub-dev/server-read-key` |
+| `T_HUB_VOICE_FILE` | `~/.t-hub-dev/voice.json` |
+| `T_HUB_POWDER_PROFILES_FILE` | `~/.t-hub-dev/powder-profiles.json` |
+| `T_HUB_CONFIG_DIR` | `~/.t-hub-dev/config` |
+| `T_HUB_DB_NAME` | `t-hub-dev.db` |
+| `T_HUB_AGENT_JOURNAL_DIR` | `.t-hub-dev/journal` relative to WSL home |
+| `T_HUB_CORTANA_HOME` | `.t-hub-dev/orchestrator` relative to WSL home |
 
-- **Feature `devbuild`** (`apps/desktop/src-tauri/Cargo.toml`): the only thing it
-  changes is `apply_devbuild_isolation()` in `src/lib.rs`, which — *before any
-  `T_HUB_*`-backed path is first read* — sets `T_HUB_TMUX_SOCKET=t-hub-dev`,
-  `T_HUB_CONTROL_FILE=~/.t-hub-dev/control.json`,
-  `T_HUB_DIAG_FILE=~/.t-hub-dev/diag.log` (each only if not already overridden).
-  It also sets the window title to "T-Hub Dev". No path code was refactored — it
-  reuses env hooks that already exist in `tmux.rs`, `control.rs`, and `diag.rs`.
-- **Overlay** `tauri.dev.conf.json`: deep-merges over `tauri.conf.json`, changing
-  only `productName` → `T-Hub Dev` and `identifier` → `com.t-hub.dev`.
+## Intentionally shared external surfaces
 
-### CI (GitHub Actions) — the normal path
+Development T-Hub still operates real coding harnesses and real project repositories.
+These external surfaces remain shared by design:
 
-`release.yml` has a `workflow_dispatch` input `variant` (default **dev**):
+- Recents are read from the user's actual Claude and Codex transcripts.
+- Claude and Codex provider configuration, credentials, and session stores remain available to the harnesses they launch.
+- Scribe control and status sources are observed read-only.
+- User-selected repositories and worktrees are real targets of explicit terminal and product actions.
+- Explicit Claude hook install or uninstall actions still operate on the user's selected Claude configuration and require their existing consent gates.
+- Explicit environment overrides can point a development process at another location and therefore transfer responsibility to the operator.
+
+No automatic development startup path writes `~/.claude/settings.json`.
+
+## How it is built
+
+The variant combines the compile-time Cargo feature `devbuild` with `apps/desktop/src-tauri/tauri.dev.conf.json`.
+The overlay changes the product name, bundle identifier, and updater endpoints.
+The production build uses neither the feature nor the overlay.
+
+### CI
+
+The release workflow accepts a `variant` input and defaults manual dispatches to development.
 
 ```bash
-# DEV installer (default) → artifact "t-hub-dev-installer"
+# Build the development installer.
 gh workflow run release.yml --ref main -f variant=dev
 
-# PROD installer → artifact "t-hub-prod-installer"
+# Build the production installer.
 gh workflow run release.yml --ref main -f variant=prod
 ```
 
-Tag pushes (`v*`) always build **prod** and publish a release. Manual dispatch
-produces a downloadable artifact only (no public release / no `latest.json`).
-Download with `gh run download <run-id> -n t-hub-dev-installer -D <dir>`.
-The dev installer is named `T-Hub Dev_<version>_x64-setup.exe`.
+Tag pushes matching `v*` always build production and publish a release.
+Manual dispatch produces a downloadable artifact without publishing `latest.json`.
 
-### Local build (Windows host only)
+```bash
+gh run download <run-id> -n t-hub-dev-installer -D <dir>
+```
+
+The development installer is named `T-Hub Dev_<version>_x64-setup.exe`.
+
+### Local Windows build
 
 ```bash
 cd apps/desktop
-pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json   # dev
-pnpm tauri build                                                       # prod
+pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json
 ```
 
-### Local hot-reload dev instance (WSLg/Linux) — unchanged
-
-The fast iteration loop is still the WSLg instance, which isolates via the same
-env hooks:
+The unchanged production command is:
 
 ```bash
 cd apps/desktop
-T_HUB_TMUX_SOCKET=t-hub-dev pnpm tauri dev
+pnpm tauri build
 ```
 
-Note: WSLg can't exercise Windows-only features (OS file-drop, clipboard-image,
-true frameless titlebar) — for those, install the **T-Hub Dev** Windows build.
+### Local WSLg hot reload
 
-## Caveat: the updater
+The WSLg development loop must also compile the `devbuild` feature and load the overlay.
 
-Both variants carry the same `plugins.updater` config (endpoint → the prod
-repo's `latest.json`). Since dispatch builds publish no `latest.json`, the dev
-app's update check is a no-op today. If a prod `v*` release is ever published,
-the dev app *could* offer to "update" to it — but because prod's identifier
-differs (`com.t-hub.app`), that would install prod **alongside** dev rather than
-replacing it. Disable/repoint the updater in the overlay later if it gets noisy.
+```bash
+cd apps/desktop
+pnpm tauri dev -f devbuild --config src-tauri/tauri.dev.conf.json
+```
 
----
+WSLg cannot exercise Windows-only behavior such as operating-system file drop, clipboard images, or the native frameless title bar.
+Install the T-Hub Dev Windows build for those checks.
 
-## Canonical `t-hub` identifiers (reference)
+## Canonical identifiers
 
 | Thing | Value |
-|---|---|
-| Brand / window title / tray | `T-Hub` |
-| Prod bundle id | `com.t-hub.app` |
-| Dev bundle id | `com.t-hub.dev` |
-| Cargo app crate / lib | `t-hub` / `t_hub_lib` |
-| Sub-crates | `t-hub-protocol`, `t-hub-agent`, `t-hub-mcp` |
+| --- | --- |
+| Production brand and window title | `T-Hub` |
+| Development brand and window title | `T-Hub Dev` |
+| Production bundle identifier | `com.t-hub.app` |
+| Development bundle identifier | `com.t-hub.dev` |
+| Cargo app crate and library | `t-hub` and `t_hub_lib` |
+| Subcrates | `t-hub-protocol`, `t-hub-agent`, `t-hub-mcp` |
 | pnpm packages | root `t-hub`, desktop `t-hub-desktop`, site `t-hub-site` |
-| tmux socket (prod / dev) | `t-hub` / `t-hub-dev` |
-| MCP server name | `t-hub` (tools are `mcp__t-hub__*`) |
-| State dir (prod / dev) | `~/.t-hub` / `~/.t-hub-dev` |
-| Workspace DB | `t-hub.db` (under `app_data_dir`) |
-| Hook marker (in `~/.claude/settings.json`) | `__t_hub_managed__` |
-| Env hooks | `T_HUB_TMUX_SOCKET`, `T_HUB_CONTROL_FILE`, `T_HUB_DIAG_FILE`, `T_HUB_DB_NAME`, `T_HUB_DISTRO`, `T_HUB_AGENT_BIN` |
-| GitHub repo | `n8watkins/t-hub` |
+| MCP server name | `t-hub` |
+| Hook marker | `__t_hub_managed__` |
+| Repository | `n8watkins/t-hub` |

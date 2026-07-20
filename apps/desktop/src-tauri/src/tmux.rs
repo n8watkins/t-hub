@@ -423,6 +423,22 @@ pub(crate) fn fail_next_session_environment_set_for(name: &str) {
 /// inherited global env, this is also how item-3's UI spawn path SCRUBS an inherited
 /// `T_HUB_CONTROL_TOKEN` (it sets its own value at the session level). `env` empty ⇒
 /// a plain login-shell session with no injected capability env.
+fn session_env_with_agent_journal(
+    env: &[(String, String)],
+    configured_journal: Option<String>,
+) -> Vec<(String, String)> {
+    let mut effective = env.to_vec();
+    if !effective
+        .iter()
+        .any(|(key, _)| key == "T_HUB_AGENT_JOURNAL_DIR")
+    {
+        if let Some(journal) = configured_journal.filter(|value| !value.trim().is_empty()) {
+            effective.push(("T_HUB_AGENT_JOURNAL_DIR".to_string(), journal));
+        }
+    }
+    effective
+}
+
 pub fn new_session_with_env(
     name: &str,
     cwd: &str,
@@ -443,7 +459,12 @@ pub fn new_session_with_env(
     // Session environment (`-e KEY=VALUE`, socket-gate Phase 2b). Pre-format so the
     // backing strings outlive `args`. tmux ≥3.2 supports `-e`; this codebase already
     // targets ≥3.4 (see the geometry note above).
-    let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let effective_env =
+        session_env_with_agent_journal(env, std::env::var("T_HUB_AGENT_JOURNAL_DIR").ok());
+    let env_pairs: Vec<String> = effective_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
     for pair in &env_pairs {
         args.push("-e");
         args.push(pair);
@@ -1200,6 +1221,32 @@ mod tests {
         );
         assert!(parse_pane_generation("$0|0|@0|%0|456").is_none());
         assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
+    }
+
+    #[test]
+    fn session_environment_inherits_isolated_agent_journal() {
+        let inherited = session_env_with_agent_journal(
+            &[("EXISTING".to_string(), "value".to_string())],
+            Some(".t-hub-dev/journal".to_string()),
+        );
+        assert!(inherited.iter().any(|(key, value)| {
+            key == "T_HUB_AGENT_JOURNAL_DIR" && value == ".t-hub-dev/journal"
+        }));
+
+        let explicit = session_env_with_agent_journal(
+            &[(
+                "T_HUB_AGENT_JOURNAL_DIR".to_string(),
+                "/explicit/journal".to_string(),
+            )],
+            Some(".t-hub-dev/journal".to_string()),
+        );
+        assert_eq!(
+            explicit,
+            vec![(
+                "T_HUB_AGENT_JOURNAL_DIR".to_string(),
+                "/explicit/journal".to_string()
+            )]
+        );
     }
 
     // NB: the generic `output_with_timeout` bound (kill-a-hung-child, fast
