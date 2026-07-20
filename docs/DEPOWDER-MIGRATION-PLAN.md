@@ -370,7 +370,7 @@ Do not install, restart, publish, push, or release without separate General auth
 
 ### Registry and migration tests
 
-- Load sanitized real-shaped schema-13 and current schema-16 fixtures containing active, completed, cleanup-pending, and ambiguous Powder records.
+- Load sanitized real-shaped schema-13 and current schema-17 fixtures containing active, completed, cleanup-pending, and ambiguous Powder records.
 - Prove both legacy fixtures load without opening a network connection and migrate to schema 17 on the first successful write.
 - Load a schema-17 fixture as the migrated-output compatibility case.
 - Prove assignments, provider conversations, directories, worktrees, branches, checkpoints, and Captain ownership survive migration.

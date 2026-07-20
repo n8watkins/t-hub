@@ -43,7 +43,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This bounds memory, parsing work, and any structured error derived from a peer.
 const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Commissioning and dispatch cross bounded Powder, git, tmux, and harness-start
+/// Commissioning and dispatch cross bounded git, tmux, and harness-start
 /// operations. Their response window must outlive the server's normal request
 /// phase so the client receives the authoritative result instead of abandoning a
 /// mutation that is still running.

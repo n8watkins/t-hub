@@ -112,7 +112,7 @@ pub enum PermMode {
 
 /// The General-authorized local execution posture for dispatched Crew in this
 /// Captain fleet. This grants full local worktree execution through the
-/// provider Harness, but does not expand Crew scope, T-Hub capability, Powder
+/// provider Harness, but does not expand Crew scope, T-Hub capability, legacy
 /// authority, or authority over destructive and outward-facing actions.
 pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 

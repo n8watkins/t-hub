@@ -977,11 +977,11 @@ pub async fn git_worktree_remove(
 /// removal decision required by `docs/WORKTREE-STATUS-CONTRACT.md`.
 ///
 /// A tmux-only check is insufficient: canonical path identity, dirty and locked
-/// Git state, durable ownership, leases, Powder claims, and spawn/removal
+/// Git state, durable ownership, leases, and spawn/removal
 /// serialization must agree in one backend decision. Keeping this gate central
 /// makes Tauri, control, MCP, and CLI callers receive the same refusal without
 /// detaching UI state or invoking Git.
-pub(crate) const WORKTREE_REMOVAL_UNAVAILABLE: &str = "worktree removal is temporarily unavailable until T-Hub can verify canonical Git state, live terminals, durable ownership, leases, and Powder claims through the unified worktree status service";
+pub(crate) const WORKTREE_REMOVAL_UNAVAILABLE: &str = "worktree removal is temporarily unavailable until T-Hub can verify canonical Git state, live terminals, durable ownership, leases, and spawn/removal serialization through the unified worktree status service";
 
 pub(crate) fn require_worktree_removal_safety_service() -> Result<(), String> {
     Err(WORKTREE_REMOVAL_UNAVAILABLE.to_string())

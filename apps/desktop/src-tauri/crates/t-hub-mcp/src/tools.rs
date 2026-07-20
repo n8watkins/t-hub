@@ -508,7 +508,7 @@ fn schema_commission_captain() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "projectId": { "type": "string", "description": "Registered Project to supervise." },
             "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
             "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
             "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
@@ -524,7 +524,7 @@ fn schema_attach_captain() -> Value {
         "type": "object",
         "properties": {
             "captainSessionId": { "type": "string", "description": "Live terminal to attach. It must already have control capability; read-only terminals are refused without elevation." },
-            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "projectId": { "type": "string", "description": "Registered Project to supervise." },
             "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
             "provider": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
             "providerSessionId": { "type": "string", "description": "Provider-native conversation id to checkpoint immediately." },
@@ -541,7 +541,7 @@ fn schema_powder_status() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "projectId": { "type": "string", "description": "Registered Powder-bound project id." }
+            "projectId": { "type": "string", "description": "Registered Project id." }
         },
         "required": ["projectId"],
         "additionalProperties": false
