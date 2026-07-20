@@ -13,6 +13,7 @@ import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
 import { useWindowMaximized } from "./lib/windowMaximized";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
+import { controlRequest } from "./ipc/controlClient";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -126,6 +127,8 @@ function useTitlebarReveal(
 }
 
 export default function App() {
+  const [cortanaRecoveryError, setCortanaRecoveryError] = useState<string | null>(null);
+  const [cortanaRecoveryRetry, setCortanaRecoveryRetry] = useState(0);
   // A satellite starts with the supervision sidebar hidden — it's a focused
   // terminal canvas, not the full command center. The main window restores the
   // user's persisted collapse mode (#1: full / rail / hidden).
@@ -207,15 +210,27 @@ export default function App() {
     };
   }, []);
 
-  // Orchestrator startup (main window only): once the live terminal list has
-  // seeded, ADOPT an existing orchestrator (persisted-alive, else by cwd
-  // ~/.t-hub/orchestrator - never spawn), then RECONCILE every designated agent
+  // Orchestrator startup (main window only): ask the trusted app host to adopt
+  // or recover the durable Cortana singleton, then reconcile the live terminal
+  // list into the reserved Captains workspace tab.
   // (orchestrator + pinned captains) into the reserved Captains workspace tab.
   // The reconcile also migrates an upgrading user whose captains were persisted
   // in work tabs before this tab existed. Runs at most once.
   useEffect(() => {
     if (SATELLITE) return;
     let done = false;
+    let cancelled = false;
+    void controlRequest("ensure_cortana", {})
+      .then(() => {
+        if (!cancelled) setCortanaRecoveryError(null);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setCortanaRecoveryError(
+            typeof error === "string" ? error : "Cortana startup could not be completed",
+          );
+        }
+      });
     const run = (terminals: Record<string, { cwd?: string; state?: string }>) => {
       if (done || Object.keys(terminals).length === 0) return;
       done = true;
@@ -235,8 +250,11 @@ export default function App() {
     // Terminals may already be seeded when this runs; check now, then watch.
     run(useWorkspace.getState().terminals);
     const unsub = useWorkspace.subscribe((s) => run(s.terminals));
-    return unsub;
-  }, []);
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, [cortanaRecoveryRetry]);
 
   const maximized = useWindowMaximized();
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
@@ -340,6 +358,21 @@ export default function App() {
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
+      {cortanaRecoveryError && !SATELLITE && (
+        <div
+          className="absolute left-1/2 top-10 z-50 flex -translate-x-1/2 items-center gap-3 rounded border border-red-700/70 bg-red-950/95 px-4 py-2 text-xs text-red-100 shadow-lg"
+          role="alert"
+        >
+          <span>Cortana startup failed: {cortanaRecoveryError}</span>
+          <button
+            type="button"
+            className="rounded bg-red-800 px-2 py-1 font-medium hover:bg-red-700"
+            onClick={() => setCortanaRecoveryRetry((value) => value + 1)}
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {/* Lifecycle keybinds (feat/lifecycle): Ctrl/Cmd+Shift+W deletes the focused
           terminal's session behind a confirm (Ctrl/Cmd+W still detaches). Renders
           only its confirm dialog when armed. */}
