@@ -2014,6 +2014,13 @@ fn validate_unique_workspace_placements(tabs: &[TabRecord]) -> Result<(), String
     Ok(())
 }
 
+fn validate_work_workspace_present(tabs: &[TabRecord]) -> Result<(), String> {
+    if tabs.iter().any(|tab| tab.kind() == WorkspaceKind::Work) {
+        return Ok(());
+    }
+    Err("Workspace report must retain at least one Work Workspace".into())
+}
+
 fn reconcile_supervisor_workspace_candidates(
     captains: &[CaptainRecord],
     tabs: &mut [TabRecord],
@@ -2235,6 +2242,7 @@ pub fn apply_workspace_report(
 ) -> Result<(ReportOutcome, bool, bool), String> {
     let _identity_transaction = tabs_registry.identity_transaction();
     let mut tabs = TabRegistry::normalize_tabs(tabs)?;
+    validate_work_workspace_present(&tabs)?;
     validate_unique_workspace_placements(&tabs)?;
     let _mutation = captains_registry
         .mutation
@@ -23574,9 +23582,11 @@ mod tests {
         assert_eq!(tabs["tabs"][1]["name"], "ops");
         assert_eq!(tabs["tabs"][2]["id"], CAPTAIN_WORKSPACE_ID);
 
-        // A later report REPLACES wholesale (last writer wins, webview parity).
-        dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": []})).unwrap();
-        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 1);
+        // A report may not erase the last Work Workspace. The reserved Captain
+        // Workspace is not a usable canvas for ordinary terminals.
+        let err = dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": []})).unwrap_err();
+        assert!(err.contains("at least one Work Workspace"), "got: {err}");
+        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 3);
 
         // Malformed shapes are a clear error, not a partial replace.
         let err = dispatch(&ctx, "report_workspace_tabs", &json!({})).unwrap_err();
