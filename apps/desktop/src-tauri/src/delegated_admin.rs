@@ -876,6 +876,26 @@ impl DelegatedAdminStore {
             .collect()
     }
 
+    /// Revalidate one active grant against the current supervisor and Crew
+    /// evidence without authorizing a specific operation.
+    ///
+    /// Capacity accounting uses this to distinguish an effective standing aide
+    /// from a persisted grant whose supervisor, ownership, generation, or actor
+    /// membership has changed.
+    /// Invalid grants receive the same durable tombstone as an operation-time
+    /// authorization failure.
+    pub fn validate_effective_grant(
+        &self,
+        grant: &DelegatedAdminGrant,
+        actor: &AdminActor,
+        current_supervisor: &SupervisorAuthority,
+    ) -> Result<(), DelegatedAdminError> {
+        if !grant.state.is_active() {
+            return Err(DelegatedAdminError::GrantRevoked(grant.grant_id.clone()));
+        }
+        self.ensure_effective_grant(grant, actor, current_supervisor)
+    }
+
     pub fn get_approval(&self, approval_id: &str) -> Option<DelegatedAdminApproval> {
         self.lock().approvals.get(approval_id).cloned()
     }

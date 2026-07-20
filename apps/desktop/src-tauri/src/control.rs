@@ -21371,7 +21371,10 @@ fn active_dispatch_lanes(
 fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (bool, usize) {
     let metrics = ctx.metrics.as_ref().and_then(|fetch| fetch().ok());
     let Some(metrics) = metrics else {
+        #[cfg(test)]
         return (true, ctx.governor.max_sessions());
+        #[cfg(not(test))]
+        return (false, live_sessions);
     };
     let cpu_count = usize::try_from(metrics.cpu_count).unwrap_or(1).max(1);
     let load_healthy = metrics.load_avg[0].is_finite()
@@ -21393,26 +21396,67 @@ fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (boo
     )
 }
 
-fn live_admin_counts(ctx: &ControlContext) -> (usize, usize) {
-    let mut fleet_admins = 0;
-    let mut ship_admins = 0;
+fn recorded_admin_harness(snapshot: &CaptainsSnapshot, terminal_id: &str) -> Option<String> {
+    snapshot
+        .agent_sessions
+        .iter()
+        .find(|agent| agent.agent_session_id == terminal_id)
+        .map(|agent| agent.provider.clone())
+        .or_else(|| {
+            snapshot.captains.iter().find_map(|captain| {
+                captain
+                    .crew
+                    .iter()
+                    .find(|crew| crew.terminal_id == terminal_id)
+                    .and_then(|crew| crew.harness.clone().or_else(|| crew.provider.clone()))
+            })
+        })
+}
+
+fn live_admin_counts(ctx: &ControlContext, snapshot: &CaptainsSnapshot) -> (usize, usize) {
+    let active_captain_ships = snapshot
+        .captains
+        .iter()
+        .filter(|captain| captain.role == FleetRole::Captain && captain.state == ClaimState::Active)
+        .map(|captain| captain.ship_slug.clone())
+        .collect::<BTreeSet<_>>();
+    let mut fleet_admin_actors = BTreeSet::new();
+    let mut ship_admin_scopes = BTreeSet::new();
     for grant in ctx.delegated_admin.active_grants() {
-        let live = ctx
-            .identity
-            .get(&grant.actor_identity_id)
-            .and_then(|identity| identity.session_tile)
-            .is_some_and(|tile| {
-                tmux::session_liveness(&tmux_target(&tile)) == tmux::SessionLiveness::Alive
-            });
-        if !live {
+        let actor = current_admin_actor(ctx, &grant);
+        let supervisor = current_delegating_supervisor(ctx, &grant);
+        if ctx
+            .delegated_admin
+            .validate_effective_grant(&grant, &actor, &supervisor)
+            .is_err()
+        {
+            continue;
+        }
+        let Some(terminal_id) = actor.session_tile.as_deref() else {
+            continue;
+        };
+        let Some(harness) = recorded_admin_harness(snapshot, terminal_id) else {
+            continue;
+        };
+        if tmux::harness_liveness(&tmux_target(terminal_id), &harness)
+            != tmux::SessionLiveness::Alive
+        {
             continue;
         }
         match grant.role {
-            crate::delegated_admin::DelegatedAdminRole::FleetAdmin => fleet_admins += 1,
-            crate::delegated_admin::DelegatedAdminRole::ShipAdmin => ship_admins += 1,
+            crate::delegated_admin::DelegatedAdminRole::FleetAdmin => {
+                fleet_admin_actors.insert(grant.actor_identity_id);
+            }
+            crate::delegated_admin::DelegatedAdminRole::ShipAdmin => {
+                if let crate::delegated_admin::AdminScope::Ship { ship_slug } = grant.scope {
+                    if active_captain_ships.contains(&ship_slug) {
+                        ship_admin_scopes.insert(ship_slug);
+                    }
+                }
+            }
         }
     }
-    (fleet_admins, ship_admins)
+    (fleet_admin_actors.len(), ship_admin_scopes.len())
 }
 
 fn dispatch_runtime_capacity(
@@ -21456,7 +21500,9 @@ fn dispatch_runtime_capacity(
         .captains
         .iter()
         .filter(|captain| captain.role == FleetRole::Captain && captain.state == ClaimState::Active)
-        .count();
+        .map(|captain| captain.ship_slug.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
     let live_cortana = snapshot
         .cortana
         .terminal_id
@@ -21465,13 +21511,17 @@ fn dispatch_runtime_capacity(
             matches!(
                 &snapshot.cortana.recovery,
                 crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
-            ) && tmux::session_liveness(&tmux_target(terminal_id)) == tmux::SessionLiveness::Alive
+            ) && snapshot.cortana.harness.as_deref().is_some_and(|harness| {
+                tmux::session_liveness(&tmux_target(terminal_id)) == tmux::SessionLiveness::Alive
+                    && tmux::harness_liveness(&tmux_target(terminal_id), harness)
+                        == tmux::SessionLiveness::Alive
+            })
         }) as usize;
     let live_recovery_sessions = matches!(
         &snapshot.cortana.recovery,
         crate::cortana_reconcile::CortanaRecoveryState::Recovering { .. }
     ) as usize;
-    let (live_fleet_admins, live_ship_admins) = live_admin_counts(ctx);
+    let (live_fleet_admins, live_ship_admins) = live_admin_counts(ctx, snapshot);
     Ok(crate::governor::RuntimeCapacity {
         live_sessions,
         machine_healthy,
@@ -22410,7 +22460,10 @@ fn close_terminal_authorized(
     }
     let authority = captain_authority
         .map(CloseLifecycleAuthority::Captain)
-        .or_else(|| delegated_authority.map(CloseLifecycleAuthority::Delegated));
+        .or_else(|| {
+            delegated_authority
+                .map(|authority| CloseLifecycleAuthority::Delegated(Box::new(authority)))
+        });
     let result =
         close_terminal_with_policy(ctx, args, false, authority.as_ref()).and_then(|value| {
             invalidate_retired_admin_identity(ctx, target_identity_id.as_deref(), &target)?;
@@ -22501,7 +22554,7 @@ struct DelegatedCleanupAuthority {
 #[derive(Debug, Clone)]
 enum CloseLifecycleAuthority {
     Captain(TargetLifecycleAuthority),
-    Delegated(DelegatedCleanupAuthority),
+    Delegated(Box<DelegatedCleanupAuthority>),
 }
 
 fn revalidate_close_lifecycle_authority(
@@ -30443,6 +30496,70 @@ mod tests {
         .unwrap_err();
         assert!(revoked.contains("no active administrative grant"));
         reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
+    fn dispatch_capacity_counts_one_live_harness_backed_ship_admin_per_ship() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let ctx = test_ctx("admin-capacity");
+        ctx.captains
+            .claim_test("captain-alpha", Some("alpha"), vec![])
+            .unwrap();
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-alpha")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let mut admin_targets = Vec::new();
+
+        for admin_id in ["adminalfa", "adminbeta"] {
+            ctx.captains.record_crew("captain-alpha", admin_id).unwrap();
+            ctx.captains
+                .bind_crew_context(
+                    "captain-alpha",
+                    admin_id,
+                    "standing administration",
+                    "codex",
+                    None,
+                    None,
+                    PowderWorkBinding {
+                        card_id: format!("card-{admin_id}"),
+                        run_id: format!("run-{admin_id}"),
+                        agent: None,
+                        claim_expires_at: None,
+                        mutation_intent: None,
+                        dispatch_release_recovery: false,
+                        state: PowderWorkState::Active,
+                    },
+                )
+                .unwrap();
+            let target = tmux_target(admin_id);
+            tmux::new_session_with_env(&target, "/tmp", Some(&harness_command), &[]).unwrap();
+            wait_for_harness_started(admin_id, "codex").unwrap();
+            admin_targets.push(target);
+
+            let identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+            ctx.identity.bind_tile(&identity.id, admin_id).unwrap();
+            appoint_admin(
+                &ctx,
+                &json!({
+                    "actorSessionId": admin_id,
+                    "role": "shipAdmin",
+                    "permittedOperations": ["inspectStatus"]
+                }),
+                Some(&captain),
+                false,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 1));
+        reap_test_tmux_session(&admin_targets[0]).unwrap();
+        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 1));
+        reap_test_tmux_session(&admin_targets[1]).unwrap();
+        assert_eq!(live_admin_counts(&ctx, &ctx.captains.snapshot()), (0, 0));
+        std::fs::remove_dir_all(harness_bin_dir).ok();
     }
 
     #[test]
