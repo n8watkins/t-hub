@@ -14,7 +14,6 @@ interface WslFolderPickerProps {
   onPathChange: (path: string) => void;
   onFolderMetadataChange?: (selection: WslFolderSelection) => void;
   metadataRefreshToken?: number;
-  listingRefreshToken?: number;
 }
 
 export interface WslFolderSelection {
@@ -44,7 +43,6 @@ export function WslFolderPicker({
   onPathChange,
   onFolderMetadataChange,
   metadataRefreshToken = 0,
-  listingRefreshToken = 0,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -118,7 +116,6 @@ export function WslFolderPicker({
         if (cancelled || generation !== requestGeneration.current) return;
         const message = cause instanceof Error ? cause.message : String(cause);
         setListing({ kind: "error", message });
-        setError(message);
         updateSelection({ listingStatus: "error", listingError: message });
       })
       .finally(() => {
@@ -128,7 +125,7 @@ export function WslFolderPicker({
     return () => {
       cancelled = true;
     };
-  }, [listingRefreshToken, localListingRefreshToken, onFolderMetadataChange, path]);
+  }, [localListingRefreshToken, onFolderMetadataChange, path]);
 
   useEffect(() => {
     if (!path || !onFolderMetadataChange) return;
@@ -294,7 +291,7 @@ export function WslFolderPicker({
             Loading folders...
           </p>
         ) : listing.kind === "error" ? (
-          <div className="px-2 py-3 text-xs text-red-300">
+          <div role="alert" className="px-2 py-3 text-xs text-red-300">
             <p>Could not list this folder: {listing.message}</p>
             <button
               type="button"
