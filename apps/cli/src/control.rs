@@ -642,20 +642,9 @@ mod tests {
 
     #[test]
     fn raw_wire_error_details_survive_cli_control_adapter() {
-        let details = serde_json::json!({
-            "code": "git_required",
-            "operation": "baseline",
-            "capability": "git",
-            "action": "initialize_git"
-        });
-        let response = serde_json::to_vec(&serde_json::json!({
-            "ok": false,
-            "error": "Git capability is required for baseline",
-            "errorKind": "git_required",
-            "errorDetails": details,
-            "retryable": false
-        }))
-        .unwrap();
+        let fixture =
+            include_str!("../tests/fixtures/explicit-none-dispatch-preflight-response.json");
+        let response = fixture.as_bytes().to_vec();
         let mut response = response;
         response.push(b'\n');
         let addr = raw_response_server(response);
@@ -669,7 +658,7 @@ mod tests {
 
         let error = call_with_deadline(
             &endpoint,
-            "baseline",
+            "dispatch_preflight",
             &Value::Null,
             Duration::from_secs(1),
             Duration::from_millis(250),
@@ -682,9 +671,20 @@ mod tests {
                 retryable,
                 details: actual,
             } => {
-                assert_eq!(message, "Git capability is required for baseline");
+                assert_eq!(
+                    message,
+                    "Git capability is required for dispatch_preflight; initialize Git with initialize_git"
+                );
                 assert!(!retryable);
-                assert_eq!(actual, Some(details));
+                assert_eq!(
+                    actual,
+                    Some(serde_json::json!({
+                        "code": "git_required",
+                        "operation": "dispatch_preflight",
+                        "capability": "git",
+                        "action": "initialize_git"
+                    }))
+                );
             }
             other => panic!("expected structured server error, got {other:?}"),
         }

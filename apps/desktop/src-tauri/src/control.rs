@@ -23785,7 +23785,26 @@ fn resolve_admin_worktree_target(
     let mut matches = Vec::new();
     for project in &snapshot.projects {
         if project.vcs_capability.as_deref() == Some("none") {
-            require_registered_git_capability(ctx, "admin_worktree", &requested_path)?;
+            // An explicit non-Git Project still has an authoritative worktree
+            // namespace for delegated-admin authorization.  Resolve that namespace
+            // from durable registry identity only; the capability gate belongs after
+            // the delegated Ship Admin grant is authorized in execute_admin_operation.
+            let project_root =
+                files::posix_form(project.root_path.as_deref().unwrap_or(&project.repo_root))
+                    .trim_end_matches('/')
+                    .to_string();
+            if requested_path != project_root
+                && !requested_path.starts_with(&format!("{project_root}/"))
+            {
+                continue;
+            }
+            for captain in snapshot.captains.iter().filter(|captain| {
+                captain.role == FleetRole::Captain
+                    && captain.state == ClaimState::Active
+                    && captain.project_id.as_deref() == Some(project.project_id.as_str())
+            }) {
+                matches.push((captain.ship_slug.clone(), requested_path.clone()));
+            }
             continue;
         }
         let worktrees = git::worktree_list(&files::posix_form(&project.repo_root))?;
@@ -24261,6 +24280,9 @@ fn execute_admin_operation(
         target.authorization_target.clone(),
         crate::delegated_admin::AdminSafeguards::default(),
     )?;
+    if let AdminExecutionResource::Worktree(path) = &target.resource {
+        require_registered_git_capability(ctx, "admin_worktree", path)?;
+    }
     let result = match operation {
         crate::delegated_admin::AdminOperation::MaintainSession => {
             if !matches!(target.resource, AdminExecutionResource::Session(_)) {
@@ -27003,10 +27025,6 @@ fn start_agent(
     let spawn_purpose = requested_spawn_purpose("start_agent", args, caller, trusted_internal)
         .map_err(|refusal| format!("start_agent: {}", refusal.message))?;
     let admission_purpose = durable_admission_purpose(&spawn_purpose);
-    let admission_lock = ctx
-        .dispatch_admission
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -27034,6 +27052,10 @@ fn start_agent(
         .cloned()
         .ok_or_else(|| format!("start_agent: unknown projectId '{project_id}'"))?;
     require_registered_git_capability(ctx, "start_agent", &project.repo_root)?;
+    let admission_lock = ctx
+        .dispatch_admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let checkout = validate_crew_checkout(&project, Some(directory))
         .map_err(|error| error.replacen("dispatch_crew", "start_agent", 1))?;
     let worktree = git::worktree_list(&files::posix_form(&project.repo_root))
@@ -34915,6 +34937,452 @@ mod tests {
         }
     }
 
+    fn assert_native_git_required(response: ControlResponse, operation: &str) {
+        assert!(!response.ok, "unexpected success: {response:?}");
+        assert_eq!(response.error_kind.as_deref(), Some("git_required"));
+        assert!(!response.retryable);
+        assert_eq!(
+            response.error_details,
+            Some(json!({
+                "code": "git_required",
+                "operation": operation,
+                "capability": "git",
+                "action": "initialize_git",
+            }))
+        );
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("initialize_git")));
+    }
+
+    #[test]
+    fn explicit_none_dispatcher_response_matches_cli_mcp_parity_fixture() {
+        let ctx = test_ctx("dispatcher-parity-fixture");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/dispatcher-parity-fixture".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "dispatcher-parity-fixture".into(),
+                name: "Dispatcher parity fixture".into(),
+                repo_root: "/tmp/dispatcher-parity-fixture".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "dispatcher-parity-fixture",
+                "dispatch_preflight",
+                json!({
+                    "projectId": "dispatcher-parity-fixture",
+                    "sourceCommit": "1111111111111111111111111111111111111111",
+                    "requestedLanes": [],
+                    "integrationContracts": []
+                }),
+            ),
+        );
+        let actual = serde_json::to_value(response).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/explicit-none-dispatch-preflight-response.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, fixture);
+    }
+
+    #[test]
+    fn real_dispatch_preflight_and_delivery_gates_return_native_git_required_without_mutation() {
+        let ctx = test_ctx("native-git-gates");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/native-git-gates".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "native-git-gates-project".into(),
+                name: "Native Git Gates".into(),
+                repo_root: "/tmp/native-git-gates".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        git::reset_worktree_list_calls();
+        let preflight = dispatch_authenticated(
+            &ctx,
+            req(
+                "native-git-gates",
+                "dispatch_preflight",
+                json!({
+                    "projectId": "native-git-gates-project",
+                    "sourceCommit": "1111111111111111111111111111111111111111",
+                    "requestedLanes": [],
+                    "integrationContracts": []
+                }),
+            ),
+        );
+        assert_native_git_required(preflight, "dispatch_preflight");
+
+        ctx.captains
+            .claim_test("native-git-captain", Some("native-git-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "native-git-ship",
+                "native-git-gates-project",
+                "Native gate assignment",
+                "codex",
+            )
+            .unwrap();
+        let start = dispatch_authenticated(
+            &ctx,
+            req(
+                "native-git-gates",
+                "start_agent",
+                json!({
+                    "requestId": "native-start",
+                    "captainSessionId": "native-git-captain",
+                    "assignment": "Native gate assignment",
+                    "directory": "/tmp/native-git-gates/worktree",
+                    "harness": "codex",
+                    "name": "Native gate agent",
+                    "workspaceTabId": "work",
+                    "sourceCommit": "1111111111111111111111111111111111111111",
+                    "visibleProductBug": false,
+                    "laneId": "native-lane",
+                    "dependencies": [],
+                    "mutableFiles": [],
+                    "mutableSchemas": [],
+                    "mutableInterfaces": [],
+                    "integrationContracts": [],
+                    "admissionPurpose": "ordinary"
+                }),
+            ),
+        );
+        assert_native_git_required(start, "start_agent");
+
+        let (lane_claim, dispatch_capacity) =
+            test_dispatch_evidence("native-delivery-lane", "native-delivery-agent");
+        ctx.captains
+            .insert_agent_session(AgentSessionRecord {
+                agent_session_id: "native-delivery-agent".into(),
+                captain_session_id: "native-git-captain".into(),
+                project_id: "native-git-gates-project".into(),
+                assignment: "Native delivery gate".into(),
+                directory: "/tmp/native-git-gates/delivery".into(),
+                worktree_path: None,
+                branch: None,
+                workspace_tab_id: None,
+                harness: "codex".into(),
+                provider: "codex".into(),
+                provider_conversation_id: None,
+                resume_point: None,
+                runtime_state: RuntimeState::Starting,
+                work_stage: crate::agent_session::WorkStage::Assigned,
+                delivery: Some(crate::agent_session::DeliveryProvenance::new(
+                    "1111111111111111111111111111111111111111",
+                    false,
+                )),
+                lane_claim: Some(lane_claim),
+                integration_contracts: Vec::new(),
+                dispatch_capacity: Some(dispatch_capacity),
+                admission_purpose: crate::governor::AdmissionPurpose::Ordinary,
+                created_at: 2,
+                updated_at: 2,
+            })
+            .unwrap();
+        let delivery_before = ctx.captains.snapshot();
+        let delivery = dispatch_authenticated(
+            &ctx,
+            req(
+                "native-git-gates",
+                "record_agent_delivery",
+                json!({
+                    "agentSessionId": "native-delivery-agent",
+                    "state": "implemented",
+                    "evidence": {}
+                }),
+            ),
+        );
+        assert_native_git_required(delivery, "delivery");
+        let integration = dispatch_authenticated(
+            &ctx,
+            req(
+                "native-git-gates",
+                "record_agent_delivery",
+                json!({
+                    "agentSessionId": "native-delivery-agent",
+                    "state": "integrated",
+                    "evidence": {}
+                }),
+            ),
+        );
+        assert_native_git_required(integration, "integration");
+        let after = ctx.captains.snapshot();
+        assert_eq!(after.seq, delivery_before.seq);
+        let agent = after
+            .agent_sessions
+            .iter()
+            .find(|agent| agent.agent_session_id == "native-delivery-agent")
+            .unwrap();
+        assert!(agent
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.resulting_commit.is_none()));
+        assert_eq!(git::worktree_list_calls(), 0);
+    }
+
+    #[test]
+    fn worktree_list_counter_observes_calls_across_threads() {
+        git::reset_worktree_list_calls();
+        let calls = std::thread::spawn(|| {
+            git::reset_worktree_list_calls();
+            let _ = git::worktree_list("/tmp/worktree-counter-positive-control");
+            git::worktree_list_calls()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn native_worktree_dispatchers_gate_registered_none_before_probe_or_mutation() {
+        let ctx = test_ctx("native-worktree-gates");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/native-worktree-gates".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "native-worktree-gates".into(),
+                name: "Native worktree gates".into(),
+                repo_root: "/tmp/native-worktree-gates".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        for (command, args, operation) in [
+            (
+                "create_worktree",
+                json!({
+                    "repoRoot": "/tmp/native-worktree-gates",
+                    "worktreePath": "/tmp/native-worktree-gates-wt"
+                }),
+                "create_worktree",
+            ),
+            (
+                "remove_worktree",
+                json!({
+                    "repoRoot": "/tmp/native-worktree-gates",
+                    "worktreePath": "/tmp/native-worktree-gates-wt"
+                }),
+                "remove_worktree",
+            ),
+            (
+                "list_worktrees",
+                json!({ "cwd": "/tmp/native-worktree-gates" }),
+                "list_worktrees",
+            ),
+            (
+                "git_worktree_list",
+                json!({ "cwd": "/tmp/native-worktree-gates" }),
+                "list_worktrees",
+            ),
+        ] {
+            let before = ctx.captains.snapshot();
+            git::reset_worktree_list_calls();
+            let response =
+                dispatch_authenticated(&ctx, req("native-worktree-gates", command, args));
+            assert_native_git_required(response, operation);
+            assert_eq!(ctx.captains.snapshot().seq, before.seq);
+            assert!(ctx.captains.snapshot().pending_fleet_operations.is_empty());
+            assert_eq!(git::worktree_list_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn stale_create_worktree_reprobe_authorizes_then_gates_without_worktree_probe() {
+        let mut ctx = test_ctx("stale-native-worktree-gate");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/stale-native-worktree-gate".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "stale-native-worktree-gate".into(),
+                name: "Stale native worktree gate".into(),
+                repo_root: "/tmp/stale-native-worktree-gate".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let args = json!({
+            "requestId": "stale-native-worktree-request",
+            "repoRoot": "/tmp/stale-native-worktree-gate",
+            "worktreePath": "/tmp/stale-native-worktree-gate-stale",
+        });
+        ctx.requests = Arc::new(RequestCache::with_bounds(
+            8,
+            Duration::from_secs(600),
+            Duration::from_millis(1),
+        ));
+        let signature = request_signature("create_worktree", &args);
+        assert!(matches!(
+            ctx.requests
+                .begin_bound_with_reservation("stale-native-worktree-request", &signature)
+                .0,
+            BeginOutcome::Fresh
+        ));
+        std::thread::sleep(Duration::from_millis(5));
+        let before = ctx.captains.snapshot();
+        git::reset_worktree_list_calls();
+        let response = dispatch_authenticated(
+            &ctx,
+            req("stale-native-worktree-gate", "create_worktree", args),
+        );
+        assert_native_git_required(response, "create_worktree");
+        assert_eq!(ctx.captains.snapshot().seq, before.seq);
+        assert!(ctx.captains.snapshot().pending_fleet_operations.is_empty());
+        assert_eq!(git::worktree_list_calls(), 0);
+        assert!(!std::path::Path::new("/tmp/stale-native-worktree-gate-stale").exists());
+    }
+
+    #[test]
+    fn delegated_none_worktree_admin_authorizes_before_git_gate_and_rejects_expired_grants() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let ctx = test_ctx("delegated-none-worktree-gate");
+        let admin_tile = "delegated-none-admin";
+        let worktree = "/tmp/delegated-none-worktree-gate/worktree";
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/delegated-none-worktree-gate".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "delegated-none-worktree-project".into(),
+                name: "Delegated none worktree".into(),
+                repo_root: "/tmp/delegated-none-worktree-gate".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test(
+                "delegated-none-captain",
+                Some("delegated-none-ship"),
+                vec![],
+            )
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "delegated-none-ship",
+                "delegated-none-worktree-project",
+                "Delegated none assignment",
+                "codex",
+            )
+            .unwrap();
+        ctx.captains
+            .record_crew("delegated-none-captain", admin_tile)
+            .unwrap();
+        create_test_tmux_session(&tmux_target(admin_tile)).unwrap();
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "delegated-none-captain")
+            .unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, admin_tile)
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let appointed = appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": admin_tile,
+                "role": "shipAdmin",
+                "permittedOperations": ["recoverResource"]
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let grant_id = appointed["grant"]["grantId"].as_str().unwrap().to_string();
+        let before = ctx.captains.snapshot();
+        git::reset_worktree_list_calls();
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.token,
+                &admin_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "recoverResource",
+                    "target": { "kind": "worktree", "path": worktree }
+                }),
+            ),
+        );
+        assert_native_git_required(response, "admin_worktree");
+        assert_eq!(ctx.captains.snapshot().seq, before.seq);
+        assert_eq!(git::worktree_list_calls(), 0);
+
+        let foreign_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&foreign_identity.id, "delegated-none-foreign")
+            .unwrap();
+        let unauthorized = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.token,
+                &foreign_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "recoverResource",
+                    "target": { "kind": "worktree", "path": worktree }
+                }),
+            ),
+        );
+        assert!(!unauthorized.ok);
+        assert!(unauthorized.error.unwrap().contains("administrative grant"));
+        assert_eq!(unauthorized.error_kind, None);
+        assert_eq!(git::worktree_list_calls(), 0);
+
+        revoke_admin(
+            &ctx,
+            &json!({ "grantId": grant_id, "reason": "expired-test" }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let expired = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.token,
+                &admin_identity.secret,
+                "execute_admin_operation",
+                json!({
+                    "operation": "recoverResource",
+                    "target": { "kind": "worktree", "path": worktree }
+                }),
+            ),
+        );
+        assert!(!expired.ok);
+        assert!(expired.error.unwrap().contains("administrative grant"));
+        assert_eq!(expired.error_kind, None);
+        assert_eq!(git::worktree_list_calls(), 0);
+        reap_test_tmux_session(&tmux_target(admin_tile)).unwrap();
+    }
+
     #[test]
     fn registered_git_gate_uses_the_most_specific_project_independent_of_order() {
         for (outer_capability, inner_capability, expected_error) in
@@ -41354,6 +41822,21 @@ mod tests {
                     .unwrap()
                     .to_string(),
             );
+            let before_dispatch = ctx.captains.snapshot();
+            let dispatch_refusal = dispatch_authenticated(
+                &ctx,
+                req(
+                    "non-git-captain",
+                    "dispatch_crew",
+                    json!({
+                        "captainSessionId": terminal_ids.last().unwrap(),
+                        "cardId": "non-git-card",
+                        "task": "must refuse before Git"
+                    }),
+                ),
+            );
+            assert_native_git_required(dispatch_refusal, "dispatch_crew");
+            assert_eq!(ctx.captains.snapshot().seq, before_dispatch.seq);
             let checkpoint = dispatch(
                 &ctx,
                 "captain_checkpoint",
@@ -41382,11 +41865,11 @@ mod tests {
             }));
         for (project_id, ship_slug, terminal_id) in [
             (
-                &"non-git-populated"[..],
+                "non-git-populated",
                 "non-git-populated-ship",
                 &terminal_ids[0],
             ),
-            (&"non-git-empty"[..], "non-git-empty-ship", &terminal_ids[1]),
+            ("non-git-empty", "non-git-empty-ship", &terminal_ids[1]),
         ] {
             let project = restarted
                 .captains
@@ -41408,6 +41891,14 @@ mod tests {
             assert_eq!(bootstrap["project"]["projectId"], project_id);
             assert_eq!(bootstrap["project"]["vcsCapability"], "none");
             assert_eq!(bootstrap["captain"]["shipSlug"], ship_slug);
+            assert_eq!(
+                bootstrap["captain"]["conversationId"],
+                format!("conversation-{project_id}")
+            );
+            assert_eq!(
+                bootstrap["captain"]["resumePoint"],
+                format!("resume-{project_id}")
+            );
             assert_eq!(
                 bootstrap["captain"]["terminalId"].as_str(),
                 Some(terminal_id.as_str())
@@ -41446,6 +41937,7 @@ mod tests {
         assert_eq!(restarted.captains.snapshot().captains.len(), 2);
         assert!(populated.join(".git").metadata().is_err());
         assert!(empty.join(".git").metadata().is_err());
+        assert_eq!(git::worktree_list_calls(), 0);
         for terminal_id in terminal_ids {
             let _ = dispatch(
                 &restarted,
@@ -41540,6 +42032,140 @@ mod tests {
             Some("none")
         );
         assert!(std::path::Path::new(&root).join(".git").metadata().is_err());
+        std::fs::remove_dir_all(&harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_non_git_commissions_converge_and_conflicts_fail_closed() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-non-git-captain-concurrent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let registry = Arc::new(CaptainsRegistry::load(base.join("captains.json")));
+        registry
+            .upsert_project(ProjectRecord {
+                root_path: Some(root.clone()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "non-git-concurrent".into(),
+                name: "Non-Git concurrent".into(),
+                repo_root: root,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "non-git-concurrent-tab".into(),
+                name: "Concurrent".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            },
+        ]);
+        let context = Arc::new(
+            test_ctx("non-git-concurrent")
+                .with_captains_registry(Arc::clone(&registry))
+                .with_tab_registry(tabs)
+                .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 2.0)))
+                .with_apply_sink(Arc::new(RecordingSink {
+                    calls: StdMutex::new(Vec::new()),
+                })),
+        );
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let joins = (0..2)
+            .map(|index| {
+                let context = Arc::clone(&context);
+                let barrier = Arc::clone(&barrier);
+                let harness_command = harness_command.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &context,
+                        "commission_captain",
+                        &json!({
+                            "requestId": format!("concurrent-{index}"),
+                            "projectId": "non-git-concurrent",
+                            "assignment": "Same explicit-none assignment",
+                            "harness": "codex",
+                            "shipSlug": "non-git-concurrent-ship",
+                            "workspaceTabIds": ["non-git-concurrent-tab"],
+                            "testStartupCommand": harness_command,
+                            "testSkipPowderHealth": true,
+                        }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok), "results: {results:?}");
+        let result_terminal_ids = results
+            .iter()
+            .map(|result| {
+                result.as_ref().unwrap()["captain"]["terminalId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result_terminal_ids.len(), 2);
+        assert_eq!(result_terminal_ids[0], result_terminal_ids[1]);
+        assert_eq!(registry.snapshot().captains.len(), 1);
+        assert_eq!(registry.snapshot().pending_fleet_operations.len(), 0);
+        let terminal_id = registry.snapshot().captains[0].terminal_id.clone().unwrap();
+        assert_eq!(terminal_id, result_terminal_ids[0]);
+        let matching_sessions = tmux::list_sessions()
+            .unwrap()
+            .into_iter()
+            .filter(|session| session == &tmux_target(&terminal_id))
+            .collect::<Vec<_>>();
+        assert_eq!(matching_sessions, vec![tmux_target(&terminal_id)]);
+        let before_conflict = registry.snapshot();
+        let conflict = dispatch(
+            &context,
+            "commission_captain",
+            &json!({
+                "requestId": "concurrent-conflict",
+                "projectId": "non-git-concurrent",
+                "assignment": "Conflicting assignment",
+                "harness": "codex",
+                "shipSlug": "non-git-concurrent-ship",
+                "workspaceTabIds": ["non-git-concurrent-tab"],
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict,
+            "commission_captain: project 'Non-Git concurrent' already has live Captain 'non-git-concurrent-ship' with a different assignment, harness, or shipSlug; release or update that Captain explicitly"
+        );
+        assert_eq!(registry.snapshot().captains.len(), 1);
+        assert_eq!(registry.snapshot().seq, before_conflict.seq);
+        assert!(base.join("source/.git").metadata().is_err());
+        let _ = dispatch(
+            &context,
+            "close_terminal",
+            &json!({ "sessionId": terminal_id }),
+        );
         std::fs::remove_dir_all(&harness_bin_dir).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -41643,16 +42269,27 @@ mod tests {
     fn commission_crash_recovery_reaps_exact_tmux_identity_and_unprojected_intent() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let path = captains_tmp("commission-crash-recovery");
+        let non_git_root = std::env::temp_dir().join(format!(
+            "t-hub-commission-crash-non-git-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&non_git_root).unwrap();
+        std::fs::write(non_git_root.join("README"), b"non-Git crash fixture\n").unwrap();
+        let non_git_root = non_git_root
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let identity_path = path.with_extension("identities.json");
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         captains
             .upsert_project(ProjectRecord {
-                root_path: None,
-                vcs_capability: None,
+                root_path: Some(non_git_root.clone()),
+                vcs_capability: Some("none".into()),
                 git_main_root: None,
                 project_id: "project-commission-crash".into(),
                 name: "Commission Crash".into(),
-                repo_root: "/tmp".into(),
+                repo_root: non_git_root.clone(),
                 remote_url: None,
                 default_branch: Some("main".into()),
                 powder: Some(PowderProjectBinding {
@@ -41677,6 +42314,7 @@ mod tests {
                 .with_identity_store(Arc::clone(&identities))
                 .with_apply_sink(sink.clone()),
         );
+        git::reset_worktree_list_calls();
         let (harness_bin_dir, harness_command) = test_harness_command("codex");
         let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
@@ -41687,7 +42325,8 @@ mod tests {
         }));
         let commissioning_context = Arc::clone(&context);
         let commissioning = std::thread::spawn(move || {
-            dispatch(
+            git::reset_worktree_list_calls();
+            let result = dispatch(
                 &commissioning_context,
                 "commission_captain",
                 &json!({
@@ -41699,7 +42338,8 @@ mod tests {
                 "testSkipPowderHealth": true,
                 "testCrashAfterTmux": true
                 }),
-            )
+            );
+            (result, git::worktree_list_calls())
         });
         assert_eq!(
             reached_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -41713,8 +42353,10 @@ mod tests {
             .all(|workspace| workspace["tileIds"].as_array().unwrap().is_empty()));
         assert!(dispatch(&context, "list_captains", &Value::Null).is_ok());
         resume_tx.send(()).unwrap();
-        let error = commissioning.join().unwrap().unwrap_err();
+        let (commission_result, commission_worktree_calls) = commissioning.join().unwrap();
+        let error = commission_result.unwrap_err();
         assert!(error.contains("injected commission crash"));
+        assert_eq!(commission_worktree_calls, 0);
         let durable = captains.snapshot();
         assert!(durable.captains.is_empty());
         assert_eq!(durable.pending_fleet_operations.len(), 1);
@@ -41753,6 +42395,7 @@ mod tests {
             .with_captains_registry(Arc::clone(&restarted_captains))
             .with_tab_registry(Arc::clone(&restarted_tabs))
             .with_identity_store(Arc::clone(&restarted_identities));
+        git::reset_worktree_list_calls();
         recover_pending_fleet_operations(&restarted);
         assert!(!tmux::has_session(&tmux_target(&terminal_id)));
         assert_eq!(restarted_identities.len(), 0);
@@ -41761,12 +42404,46 @@ mod tests {
             .pending_fleet_operations
             .is_empty());
         assert!(restarted_captains.snapshot().captains.is_empty());
+        assert_eq!(restarted_captains.projects().len(), 1);
+        assert_eq!(
+            restarted_captains.projects()[0].vcs_capability.as_deref(),
+            Some("none")
+        );
+        assert!(std::path::Path::new(&non_git_root)
+            .join(".git")
+            .metadata()
+            .is_err());
+        assert_eq!(git::worktree_list_calls(), 0);
+
+        drop(restarted);
+        drop(restarted_tabs);
+        drop(restarted_identities);
+        drop(restarted_captains);
+        let second_captains = Arc::new(CaptainsRegistry::load(path.clone()));
+        let second_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let second = test_ctx("commission-crash-recovery-second-restart")
+            .with_captains_registry(Arc::clone(&second_captains))
+            .with_identity_store(second_identities);
+        git::reset_worktree_list_calls();
+        recover_pending_fleet_operations(&second);
+        assert!(second_captains
+            .snapshot()
+            .pending_fleet_operations
+            .is_empty());
+        assert!(second_captains.snapshot().captains.is_empty());
+        assert_eq!(second_captains.projects().len(), 1);
+        assert!(std::path::Path::new(&non_git_root)
+            .join(".git")
+            .metadata()
+            .is_err());
 
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_file(identity_path.with_extension("json.bak"));
         let _ = std::fs::remove_file(identity_path);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&non_git_root);
     }
 
     #[test]
