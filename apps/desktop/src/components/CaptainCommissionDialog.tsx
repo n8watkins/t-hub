@@ -236,7 +236,7 @@ export function CaptainCommissionDialog({
                     }))}
                   onPathChange={setRepoRoot}
                   onFolderMetadataChange={handleFolderMetadataChange}
-                  refreshToken={metadataRetry}
+                  metadataRefreshToken={metadataRetry}
                 />
                 {wslHomeError && (
                   <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
@@ -383,7 +383,8 @@ export function CaptainCommissionDialog({
               mode === "saved"
                 ? !selected
                 : mode === "existing"
-                  ? !folderSelection || folderSelection.path !== repoRoot.trim() || folderSelection.status !== "ready"
+                  ? !folderSelection || folderSelection.path !== repoRoot.trim() ||
+                    !["valid-empty", "valid-populated"].includes(folderSelection.listingStatus)
                   : false
             )}
           >
@@ -465,6 +466,9 @@ function ReviewSummary({
         <ReviewRow label="Source" value={source} />
         <ReviewRow label="Codebase name" value={displayName.trim() || "Required"} />
         <ReviewRow label="Codebase" value={location} />
+        {mode === "existing" && (
+          <ReviewRow label="Folder validation" value={folderValidationSummary(folderSelection, repoRoot)} />
+        )}
         {mode === "saved" && (
           <VersionControlSummary project={selected} />
         )}
@@ -486,6 +490,14 @@ function ReviewSummary({
       </dl>
     </section>
   );
+}
+
+function folderValidationSummary(selection: WslFolderSelection | null, rootPath: string): string {
+  if (!selection || selection.path !== rootPath.trim()) return "Checking...";
+  if (selection.listingStatus === "loading") return "Checking...";
+  if (selection.listingStatus === "stale") return "Refreshing...";
+  if (selection.listingStatus === "error") return `Unavailable: ${selection.listingError ?? "directory listing failed"}`;
+  return selection.listingStatus === "valid-empty" ? "Valid empty folder" : "Valid folder";
 }
 
 function VersionControlSummary({
@@ -520,13 +532,13 @@ function VersionControlSummary({
       />
     );
   }
-  if (!selection || selection.status === "loading") {
+  if (!selection || selection.metadataStatus === "checking") {
     return <ReviewRow label="Version control" value="Checking..." />;
   }
-  if (selection.status === "error") {
+  if (selection.metadataStatus === "unavailable") {
     return (
       <>
-        <ReviewRow label="Version control" value={`Unavailable: ${selection.error ?? "unknown error"}`} />
+        <ReviewRow label="Version control" value={`Unavailable: ${selection.metadataError ?? "unknown error"}`} />
         {onRetry && (
           <dd className="col-start-2">
             <button type="button" className="text-xs underline" onClick={onRetry}>

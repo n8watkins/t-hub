@@ -6,7 +6,8 @@ import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 const pickerSelection = vi.hoisted(() => ({
   current: {
-    status: "ready" as string,
+    listingStatus: "valid-populated" as string,
+    metadataStatus: "ready" as string,
     git: { isRepo: false } as Record<string, unknown>,
     worktreeCount: 0,
     worktrees: null,
@@ -24,16 +25,16 @@ vi.mock("./WslFolderPicker", () => ({
     path,
     onPathChange,
     onFolderMetadataChange,
-    refreshToken,
+    metadataRefreshToken,
   }: {
     path: string;
     onPathChange: (path: string) => void;
     onFolderMetadataChange?: (selection: unknown) => void;
-    refreshToken?: number;
+    metadataRefreshToken?: number;
   }) => (
     <input
       aria-label="Manual WSL path"
-      data-refresh-token={refreshToken}
+      data-refresh-token={metadataRefreshToken}
       value={path}
       onChange={(event) => {
         const nextPath = event.target.value;
@@ -48,7 +49,8 @@ describe("CaptainCommissionDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     pickerSelection.current = {
-      status: "ready",
+      listingStatus: "valid-populated",
+      metadataStatus: "ready",
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
@@ -106,7 +108,8 @@ describe("CaptainCommissionDialog", () => {
 
   it("shows Git metadata without changing the registration payload", async () => {
     pickerSelection.current = {
-      status: "ready",
+      listingStatus: "valid-populated",
+      metadataStatus: "ready",
       git: {
         isRepo: true,
         remoteUrl: "https://example.test/app.git",
@@ -214,7 +217,8 @@ describe("CaptainCommissionDialog", () => {
 
   it("blocks existing-folder commission while Version Control is checking", async () => {
     pickerSelection.current = {
-      status: "loading",
+      listingStatus: "valid-populated",
+      metadataStatus: "checking",
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
@@ -228,9 +232,10 @@ describe("CaptainCommissionDialog", () => {
     expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("blocks unavailable Version Control and exposes a retry action", async () => {
+  it("allows a valid root with unavailable Version Control and exposes retry", async () => {
     pickerSelection.current = {
-      status: "error",
+      listingStatus: "valid-populated",
+      metadataStatus: "unavailable",
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
@@ -241,11 +246,28 @@ describe("CaptainCommissionDialog", () => {
       target: { value: "/home/me/blocked" },
     });
     expect(screen.getByText("Unavailable: permission denied")).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(false);
     const picker = screen.getByLabelText("Manual WSL path");
     const before = picker.getAttribute("data-refresh-token");
     fireEvent.click(screen.getByRole("button", { name: "Retry Version control check" }));
     expect(picker.getAttribute("data-refresh-token")).not.toBe(before);
+  });
+
+  it("blocks an invalid root even when Git metadata is ready", async () => {
+    pickerSelection.current = {
+      listingStatus: "error",
+      metadataStatus: "ready",
+      git: { isRepo: true },
+      worktreeCount: 1,
+      worktrees: [],
+      error: "directory missing",
+    };
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
+      target: { value: "/home/me/missing" },
+    });
+    expect(screen.getByText("Unavailable: directory missing")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps display name separate from the new destination leaf", async () => {
