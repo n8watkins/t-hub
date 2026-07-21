@@ -120,6 +120,8 @@ Config and recovery cleanup continues to use secure truncate-and-unlink semantic
 Non-secret executable deployment stages use a separate digest-and-inode-verified unlink operation, so Linux can retire a displaced executable path while existing MCP processes continue on the anonymous live inode without `ETXTBSY`.
 The atomic journal remains durable until its displaced candidate is securely scrubbed or safely released, and SIGKILL recovery applies the same cleanup policy without waiting for existing sessions to drain.
 Delete intents publish a durable cleanup phase, so recovery can distinguish intact rollback evidence, an already released executable inode, and an already scrubbed empty recovery inode without retaining plaintext configuration bytes.
+After renaming a delete target to its recovery path, the helper verifies the complete displaced content and metadata state before committing cleanup.
+A same-inode concurrent content or metadata change is durably renamed back to the canonical target, and mismatch restoration is itself recoverable before and after the restoring rename for both secure configuration deletion and executable release.
 Recovery refusals remain represented by the restricted transaction journal and sanitized stderr rather than a second persistent log that could diverge from the authoritative evidence.
 Unsupported platforms or filesystems fail closed instead of falling back to a weaker copy-based replacement.
 When a Codex registration has tool allowlists, denylists, timeouts, environment, arguments, or another user-authored policy, provisioning preserves it if the command is already correct and otherwise refuses to repoint it.
