@@ -146,6 +146,15 @@ impl From<ControlError> for CliError {
                         suggestion: Some("Run `th projects init <rootPath> --name NAME`".into()),
                         details,
                     }
+                } else if structured_kind == Some("git_init_recovery") {
+                    CliError {
+                        code: exit::SERVER_ERROR,
+                        kind: "git_init_recovery",
+                        message: m,
+                        retryable,
+                        suggestion: None,
+                        details,
+                    }
                 } else if let Some(kind) = powder_mutation_error_kind(&m) {
                     CliError {
                         code: exit::SERVER_ERROR,
@@ -1138,5 +1147,24 @@ mod tests {
             "Run `th projects init <rootPath> --name NAME`"
         );
         assert!(!envelope.to_string().contains("git_required:"));
+    }
+
+    #[test]
+    fn git_init_recovery_json_contract_preserves_machine_details() {
+        let error: CliError = ControlError::Server {
+            message: "owned Git initialization recovery is blocked".into(),
+            retryable: false,
+            details: Some(json!({
+                "code": "git_init_recovery",
+                "operation": "git-init-123",
+                "phase": "recovery_blocked"
+            })),
+        }
+        .into();
+        assert_eq!(error.kind, "git_init_recovery");
+        let envelope = json_error_envelope("projects init", &error);
+        assert_eq!(envelope["error"]["kind"], "git_init_recovery");
+        assert_eq!(envelope["error"]["details"]["phase"], "recovery_blocked");
+        assert!(!envelope.to_string().contains("git_init_recovery:"));
     }
 }
