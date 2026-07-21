@@ -101,14 +101,19 @@ Recovery distinguishes prepared, exchanged-before-phase, verified, committed, mi
 The transaction exchanges same-directory files, verifies the exact displaced prestate after the atomic swap, and swaps back to preserve a noncooperative concurrent writer when the prestate does not match.
 Symlinks, hard links, path-identity changes, cross-directory candidates, unsupported filesystems, and ownership or extended-attribute failures are refused without a copy-based fallback.
 The installer keeps its persistent transaction at `~/.t-hub/transactions/install-current` and takes `~/.t-hub/captain/install.lock` before recovering or starting work.
-Its manifest binds recovery to the exact MCP binary, installer/helper/skill source digest, destination paths, config paths, migration option, and repair option used by the interrupted invocation.
+Its manifest binds recovery to the exact MCP binary, installer and helper sources, the actual configured skill-source path and tree, every configured skill and command destination, config paths, migration option, and repair option used by the interrupted invocation.
+The skill-source tree fingerprint covers regular-file contents, modes, directories, and symlink targets, and unsupported special source paths are refused.
 It journals the binary, both registration helpers, the atomic helper, Claude registration, Codex registration, and all managed skill targets before their first mutation.
+Skill entries publish separate prepared, target-intent, target-acquired, target-installed, sidecar-intent, sidecar-acquired, sidecar-installed, and applied boundaries with exact inode and content/tree evidence.
+Recovery removes or restores a skill path only while its durable evidence proves installer ownership, so a concurrent target created after intent publication is preserved and the original journal remains available for inspection.
 On the next invocation after SIGKILL, WSL termination, or power loss, it either restores every completed owned stage, completes a journaled skills stage, or refuses when live ownership or invocation provenance no longer matches.
+Refused recovery never reports success, purges the original transaction, or begins a replacement transaction.
 Compatible partial states are an exact pre-install state, an exact helper-published poststate awaiting rollback, or a fully verified skills stage awaiting transaction cleanup.
 Any other partial state remains journaled and is refused for inspection instead of being adopted.
 The installer uses the helpers' still-locked before and post publications directly and never takes a new ownership snapshot after a helper returns.
 Codex rollback restores the helper-published exact file boundary only while the full post fingerprint still matches.
 Claude rollback compares the owned `t-hub` node fingerprint, restores its exact absent, null, empty-parent, or present semantics, and preserves unrelated sibling metadata.
+Claude rollback restores pre-install file metadata only while live mode, ownership, and extended attributes still equal the helper-published post boundary; concurrent metadata changes are preserved.
 Rollback bytes and extended-attribute values exist only in mode `0600` recovery files under the mode `0700` transaction directory.
 Descriptors and logs contain fingerprints and presence/type information but no config values, and successful commit or recovery securely truncates and removes recovery material.
 Unsupported platforms or filesystems fail closed instead of falling back to a weaker copy-based replacement.
