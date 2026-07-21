@@ -8,6 +8,14 @@ interface TauriConfig {
   productName?: string;
 }
 
+interface TauriConfigSchema {
+  properties?: {
+    mainBinaryName?: {
+      type?: string[];
+    };
+  };
+}
+
 const tauriDir = resolve(process.cwd(), "src-tauri");
 
 function readJsonConfig(name: string): TauriConfig {
@@ -33,5 +41,15 @@ describe("Tauri build variant configuration", () => {
     expect(development.mainBinaryName).not.toBe(production.mainBinaryName ?? cargoBinary);
     expect(development.productName).toBe("T-Hub Dev");
     expect(development.identifier).toBe("com.t-hub.dev");
+  });
+
+  it("uses the root mainBinaryName field defined by the installed Tauri schema", () => {
+    const schemaPath = resolve(process.cwd(), "node_modules/@tauri-apps/cli/config.schema.json");
+    const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as TauriConfigSchema;
+    const development = readJsonConfig("tauri.dev.conf.json");
+
+    expect(schema.properties?.mainBinaryName?.type).toContain("string");
+    expect(development.mainBinaryName).toBe("t-hub-dev");
+    expect(development.mainBinaryName).not.toMatch(/\.exe$/i);
   });
 });

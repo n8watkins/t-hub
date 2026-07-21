@@ -68,6 +68,11 @@ jobs:
         shell: bash
         run: bash apps/desktop/scripts/check-version.sh --history --tag "${GITHUB_REF_NAME}"
 
+      - name: Test development installer validator
+        if: ${{ github.event.inputs.variant == 'dev' }}
+        shell: pwsh
+        run: ./scripts/windows/validate-dev-installer.test.ps1
+
       - name: Build installers
         working-directory: apps/desktop
         shell: pwsh
@@ -84,11 +89,36 @@ jobs:
         run: |
           if ("${{ github.event.inputs.variant }}" -eq "dev") {
             Write-Host "Building DEV variant: T-Hub Dev (com.t-hub.dev, isolated t-hub-dev socket)"
-            pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json
+            pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json --no-bundle
+            Copy-Item "src-tauri/target/release/t-hub-dev.exe" "src-tauri/target/release/t-hub-dev.raw.exe"
+            pnpm tauri bundle -f devbuild --config src-tauri/tauri.dev.conf.json
           } else {
             Write-Host "Building PROD variant: T-Hub (com.t-hub.app)"
             pnpm tauri build
           }
+
+      - name: Validate development installer isolation
+        if: ${{ github.event.inputs.variant == 'dev' }}
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          $nsisDir = "src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem -Path $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "No development NSIS installer found" }
+          $installerScript = Get-ChildItem -Path "src-tauri/target/release/nsis" -Filter "installer.nsi" -Recurse | Select-Object -First 1
+          if (-not $installerScript) { throw "No generated installer.nsi found" }
+          $extractDir = "src-tauri/target/release/dev-installer-extracted"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          7z x $installer.FullName "-o$extractDir" -y | Out-Host
+          $extractedBinary = Get-ChildItem -Path $extractDir -Filter "t-hub-dev.exe" -Recurse | Select-Object -First 1
+          if (-not $extractedBinary) { throw "No t-hub-dev.exe payload found in development installer" }
+          & "../../scripts/windows/validate-dev-installer.ps1" `
+            -InstallerScriptPath $installerScript.FullName `
+            -InstallerPath $installer.FullName `
+            -RawBinaryPath "src-tauri/target/release/t-hub-dev.raw.exe" `
+            -ExtractedBinaryPath $extractedBinary.FullName |
+            Set-Content "$nsisDir/dev-installer-validation.json" -Encoding utf8
+          Get-Content "$nsisDir/dev-installer-validation.json"
 
       # The in-app updater fetches latest.json from the latest release; it points
       # at the signed NSIS installer of this release.
@@ -133,3 +163,4 @@ jobs:
           path: |
             apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
             apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            apps/desktop/src-tauri/target/release/bundle/nsis/dev-installer-validation.json

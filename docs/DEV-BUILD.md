@@ -7,6 +7,7 @@ T-Hub ships as two installable Windows variants that can run on the same machine
 | Surface | T-Hub production | T-Hub Dev |
 | --- | --- | --- |
 | Windows app name | `T-Hub` | `T-Hub Dev` |
+| Main executable and process | `t-hub.exe` | `t-hub-dev.exe` |
 | Bundle identifier | `com.t-hub.app` | `com.t-hub.dev` |
 | tmux socket | `t-hub` | `t-hub-dev` |
 | T-Hub state root | `~/.t-hub` | `~/.t-hub-dev` |
@@ -20,6 +21,7 @@ T-Hub ships as two installable Windows variants that can run on the same machine
 Installing a new T-Hub Dev build replaces only the previous T-Hub Dev installation.
 Installing a production build replaces only the previous production installation.
 The distinct bundle identifiers provide separate install directories, Start menu entries, application data, WebView profiles, and uninstall records.
+The distinct main executable names ensure that development install, update, and uninstall checks never target the production process.
 
 ## Isolation contract
 
@@ -38,6 +40,7 @@ The following T-Hub-owned mutable surfaces are isolated:
 - Theme and portable workspace layout files use `~/.t-hub-dev/config` through `T_HUB_CONFIG_DIR`.
 - The workspace database uses the development filename inside the already separate development application data directory.
 - The development bundle identifier isolates frontend local storage, cookies, cache, and WebView data.
+- The development main binary is `t-hub-dev.exe`, and every NSIS process check, payload, shortcut, and uninstall reference must resolve to that name.
 - Automatic Claude settings reconciliation is disabled in development builds.
 - The development updater has no endpoints and cannot consume a production release manifest.
 
@@ -80,7 +83,7 @@ No automatic development startup path writes `~/.claude/settings.json`.
 ## How it is built
 
 The variant combines the compile-time Cargo feature `devbuild` with `apps/desktop/src-tauri/tauri.dev.conf.json`.
-The overlay changes the product name, bundle identifier, and updater endpoints.
+The overlay changes the product name, main binary name, bundle identifier, and updater endpoints.
 The production build uses neither the feature nor the overlay.
 
 ### CI
@@ -106,9 +109,13 @@ The development installer is named `T-Hub Dev_<version>_x64-setup.exe`.
 
 ### Local Windows build
 
-```bash
+The development build is split into compile and bundle stages so the unpatched raw binary can be retained for bundle-marker provenance checks.
+
+```powershell
 cd apps/desktop
-pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json
+pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json --no-bundle
+Copy-Item src-tauri/target/release/t-hub-dev.exe src-tauri/target/release/t-hub-dev.raw.exe
+pnpm tauri bundle -f devbuild --config src-tauri/tauri.dev.conf.json
 ```
 
 The unchanged production command is:
@@ -130,12 +137,75 @@ pnpm tauri dev -f devbuild --config src-tauri/tauri.dev.conf.json
 WSLg cannot exercise Windows-only behavior such as operating-system file drop, clipboard images, or the native frameless title bar.
 Install the T-Hub Dev Windows build for those checks.
 
+## Development installer acceptance
+
+Never install or distribute a development installer until the tracked validator accepts its generated NSIS script and extracted payload.
+The validator derives hashes from the artifacts under test and does not contain a release-specific expected hash.
+The raw binary must contain exactly one canonical Tauri `__TAURI_BUNDLE_TYPE_VAR_UNK` marker.
+The installer-extracted and installed binaries must contain exactly one `__TAURI_BUNDLE_TYPE_VAR_NSS` marker and no unknown marker.
+The extracted and installed hashes must match each other, and both must differ from the unpatched raw hash.
+
+Run the source configuration regression before building:
+
+```bash
+pnpm --dir apps/desktop exec vitest run src/devBuildConfig.test.ts
+```
+
+On Windows, extract the generated installer and run the pre-install validator:
+
+```powershell
+$nsisDir = "apps/desktop/src-tauri/target/release/bundle/nsis"
+$installer = Get-ChildItem $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
+$installerScript = Get-ChildItem "apps/desktop/src-tauri/target/release/nsis" -Filter "installer.nsi" -Recurse | Select-Object -First 1
+$extractDir = "apps/desktop/src-tauri/target/release/dev-installer-extracted"
+New-Item -ItemType Directory -Force $extractDir | Out-Null
+7z x $installer.FullName "-o$extractDir" -y
+$extractedBinary = Get-ChildItem $extractDir -Filter "t-hub-dev.exe" -Recurse | Select-Object -First 1
+& scripts/windows/validate-dev-installer.ps1 `
+  -InstallerScriptPath $installerScript.FullName `
+  -InstallerPath $installer.FullName `
+  -RawBinaryPath "apps/desktop/src-tauri/target/release/t-hub-dev.raw.exe" `
+  -ExtractedBinaryPath $extractedBinary.FullName
+```
+
+The pre-install result must show production `t-hub`, development `t-hub-dev`, the canonical `UNK -> NSS` transformation, and separate raw, installer, and extracted SHA-256 values.
+After installing into the development install directory, run the same command with `-InstalledBinaryPath "$env:LOCALAPPDATA\T-Hub Dev\t-hub-dev.exe"`.
+Record the raw binary, installer, extracted binary, and installed binary SHA-256 values with the build evidence.
+Do not substitute the post-bundle `target/release/t-hub-dev.exe` for the retained `t-hub-dev.raw.exe`, because Tauri patches the bundle marker during bundling.
+
+Run the Windows validator fixture suite whenever its contract changes:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/validate-dev-installer.test.ps1
+```
+
+## Package 1 Windows end-to-end acceptance
+
+Package 1 is not accepted from source checks or installer inspection alone.
+It requires a real Windows install, update, and uninstall sequence with a running production fixture.
+
+Before the development install, record the production process ID, process start time, installed executable SHA-256, control-file path and contents, listener address and instance identity, and the result of one authenticated live control call.
+Install the validated T-Hub Dev installer and verify that production retains the same process ID, start time, executable hash, control-file evidence, listener evidence, and successful live call.
+Record the development process ID, start time, installed `t-hub-dev.exe` hash, `~/.t-hub-dev/control.json` evidence, listener identity, and one authenticated development live call.
+Update T-Hub Dev with a second validated installer and verify that only the development process ID and start time change while production evidence remains byte-for-byte and identity-for-identity stable.
+Uninstall T-Hub Dev and verify that only the development process exits and development install files are removed while production evidence and its live call remain unchanged.
+The install, update, and uninstall logs must show that both `CheckIfAppIsRunning` calls target only `t-hub-dev.exe` and never `t-hub.exe`.
+
+### Legacy development installer migration
+
+Development installers built before the distinct main binary contract may have installed a development executable named `t-hub.exe`.
+That legacy process name is indistinguishable from production by image name, so automation must never use `taskkill /IM t-hub.exe` as migration cleanup.
+Before the first fixed upgrade, explicitly exit the legacy T-Hub Dev window by its development installation identity and confirm that production remains running.
+The fixed installer can then migrate the same `com.t-hub.dev` installation to `t-hub-dev.exe`; verify the complete Windows end-to-end contract before relying on normal update behavior.
+
 ## Canonical identifiers
 
 | Thing | Value |
 | --- | --- |
 | Production brand and window title | `T-Hub` |
 | Development brand and window title | `T-Hub Dev` |
+| Production main executable | `t-hub.exe` |
+| Development main executable | `t-hub-dev.exe` |
 | Production bundle identifier | `com.t-hub.app` |
 | Development bundle identifier | `com.t-hub.dev` |
 | Cargo app crate and library | `t-hub` and `t_hub_lib` |
