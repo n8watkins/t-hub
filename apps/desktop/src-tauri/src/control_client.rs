@@ -242,7 +242,7 @@ fn request_with_deadline(
         Err(RequestError::Protocol(message)) => Err(ControlRequestError::message(message)),
         Err(first) if first.retryable() => {
             if Instant::now() >= deadline {
-                return Err(ControlRequestError::message(timeout_message(
+                return Err(ControlRequestError::retryable_message(timeout_message(
                     command,
                     1,
                     first.stage(),
@@ -255,7 +255,7 @@ fn request_with_deadline(
                 }
                 _ => {
                     let Some(fresh) = endpoint.refresh_addr_after(&first_addr) else {
-                        return Err(ControlRequestError::message(failure_message(
+                        return Err(ControlRequestError::retryable_message(failure_message(
                             command, 1, &first, false, overall,
                         )));
                     };
@@ -285,7 +285,7 @@ fn request_with_deadline(
                     details,
                 }),
                 Err(RequestError::Protocol(message)) => Err(ControlRequestError::message(message)),
-                Err(second) => Err(ControlRequestError::message(failure_message(
+                Err(second) => Err(ControlRequestError::retryable_message(failure_message(
                     command, 2, &second, true, overall,
                 ))),
             }
@@ -315,15 +315,25 @@ fn failure_message(
 pub struct ControlRequestError {
     message: String,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<Value>,
 }
 
 impl ControlRequestError {
     fn message(message: String) -> Self {
+        Self::retryable_message_with(message, false)
+    }
+
+    fn retryable_message(message: String) -> Self {
+        Self::retryable_message_with(message, true)
+    }
+
+    fn retryable_message_with(message: String, retryable: bool) -> Self {
         Self {
             message,
-            retryable: false,
+            retryable,
             kind: None,
             details: None,
         }
@@ -1098,6 +1108,67 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn absent_optional_native_error_fields_keep_the_legacy_bridge_shape() {
+        let endpoint = test_endpoint(
+            raw_response_server(
+                b"{\"ok\":false,\"error\":\"validation failed\",\"retryable\":false}\n".to_vec(),
+            ),
+            None,
+        );
+        let error = request_with_deadline(
+            &endpoint,
+            "register_project",
+            &json!({}),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            json!({"message": "validation failed", "retryable": false})
+        );
+    }
+
+    #[test]
+    fn malformed_native_response_is_a_nonstructured_bridge_error() {
+        let endpoint = test_endpoint(raw_response_server(b"{not-json}\n".to_vec()), None);
+        let error = request_with_deadline(
+            &endpoint,
+            "list_dir",
+            &json!({}),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("malformed response"));
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            json!({"message": error.message, "retryable": false})
+        );
+    }
+
+    #[test]
+    fn retryable_transport_failure_is_structured_without_string_encoding() {
+        let endpoint = test_endpoint(dead_addr(), None);
+        let error = request_with_deadline(
+            &endpoint,
+            "list_dir",
+            &json!({}),
+            Duration::from_millis(100),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert!(error.retryable);
+        assert!(error.message.contains("control_unavailable"));
+        assert_eq!(error.kind, None);
+        assert_eq!(error.details, None);
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            json!({"message": error.message, "retryable": true})
+        );
     }
 
     #[test]
