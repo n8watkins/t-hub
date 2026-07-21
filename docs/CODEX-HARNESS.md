@@ -116,6 +116,10 @@ Claude rollback compares the owned `t-hub` node fingerprint, restores its exact 
 Claude rollback restores pre-install file metadata only while live mode, ownership, and extended attributes still equal the helper-published post boundary; concurrent metadata changes are preserved.
 Rollback bytes and extended-attribute values exist only in mode `0600` recovery files under the mode `0700` transaction directory.
 Descriptors and logs contain fingerprints and presence/type information but no config values, and successful commit or recovery securely truncates and removes recovery material.
+Config and recovery cleanup continues to use secure truncate-and-unlink semantics.
+Non-secret executable deployment stages use a separate digest-and-inode-verified unlink operation, so Linux can retire a displaced executable path while existing MCP processes continue on the anonymous live inode without `ETXTBSY`.
+The atomic journal remains durable until its displaced candidate is securely scrubbed or safely released, and SIGKILL recovery applies the same cleanup policy without waiting for existing sessions to drain.
+Recovery refusals remain represented by the restricted transaction journal and sanitized stderr rather than a second persistent log that could diverge from the authoritative evidence.
 Unsupported platforms or filesystems fail closed instead of falling back to a weaker copy-based replacement.
 When a Codex registration has tool allowlists, denylists, timeouts, environment, arguments, or another user-authored policy, provisioning preserves it if the command is already correct and otherwise refuses to repoint it.
 Claude registration follows the same preserve-or-refuse rule for custom arguments and environment.
