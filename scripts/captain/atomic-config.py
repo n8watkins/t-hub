@@ -376,6 +376,31 @@ def cleanup_deleted_recovery(intent: Dict[str, Any], recovery: str, expected: st
         discard(recovery)
 
 
+def restore_delete_mismatch(
+    journal: str,
+    intent: Dict[str, Any],
+    cleanup: bool,
+) -> str:
+    target = intent["target"]
+    recovery = intent["candidate"]
+    if os.path.lexists(target):
+        raise AtomicError("delete mismatch target was recreated concurrently")
+    require_single_link(recovery)
+    if identity(recovery) != intent["recovery"].get("target_identity"):
+        raise AtomicError("delete mismatch recovery identity changed")
+    if intent["phase"] != "mismatch":
+        set_phase(journal, intent, "mismatch")
+    crash("mismatch-before-restore")
+    os.rename(recovery, target)
+    fsync_file(target)
+    fsync_directory(os.path.dirname(target))
+    crash("restored-before-phase")
+    set_phase(journal, intent, "restored")
+    if cleanup:
+        remove_journal(journal)
+    return "restored"
+
+
 def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     target = intent["target"]
     recovery = intent["candidate"]
@@ -392,6 +417,8 @@ def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
             set_phase(journal, intent, "committed")
         if cleanup:
             set_phase(journal, intent, "cleanup")
+            if state_digest(recovery) != expected:
+                return restore_delete_mismatch(journal, intent, cleanup)
             cleanup_deleted_recovery(intent, recovery, expected)
             remove_journal(journal)
         return "committed"
@@ -408,8 +435,18 @@ def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
             discard(recovery)
             remove_journal(journal)
         return "committed"
+    if target_digest is None and recovery_digest is not None:
+        return restore_delete_mismatch(journal, intent, cleanup)
     if target_digest == expected and recovery_digest is None:
         set_phase(journal, intent, "restored")
+        if cleanup:
+            remove_journal(journal)
+        return "restored"
+    if recovery_digest is None and target_digest is not None \
+        and intent["phase"] in {"mismatch", "restored"} \
+        and identity(target) == intent["recovery"].get("target_identity"):
+        if intent["phase"] != "restored":
+            set_phase(journal, intent, "restored")
         if cleanup:
             remove_journal(journal)
         return "restored"
@@ -496,12 +533,18 @@ def delete(target: str, expected: str, journal: str, unlink_only: bool = False) 
     fsync_file(recovery)
     fsync_directory(os.path.dirname(target))
     crash("renamed-before-phase")
+    if state_digest(recovery) != expected:
+        restore_delete_mismatch(journal, intent, True)
+        raise AtomicError("delete displaced state changed; concurrent state restored")
     set_phase(journal, intent, "verified")
     crash("verified")
     set_phase(journal, intent, "committed")
     crash("committed")
     set_phase(journal, intent, "cleanup")
     crash("cleanup")
+    if state_digest(recovery) != expected:
+        restore_delete_mismatch(journal, intent, True)
+        raise AtomicError("delete cleanup state changed; concurrent state restored")
     cleanup_deleted_recovery(intent, recovery, expected)
     crash("cleaned-before-journal")
     remove_journal(journal)
