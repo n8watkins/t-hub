@@ -345,6 +345,19 @@ The next package starts only after the previous commit, test evidence, independe
 
 ## Open Product Decision
 
+## Audit Consolidation - 2026-07-21
+
+The historical `audit-core`, `audit-live`, and `audit-shell` reports were re-read against the current `main` implementation and active itinerary.
+Their actionable findings are already represented by the package sequence and verification gates in this document.
+
+The core report's terminal lifecycle, status, panel, worktree-dialog, and interaction findings map to Captain control continuity, Git-optional Captain creation, responsive Preview headers, Preview runtime, and packaged acceptance.
+The live report's crash, attach, keystroke, terminal-liveness, workspace-identity, notification, titlebar, sidebar, and divider findings map to the same control-continuity, UI, and packaged-E2E packages.
+The shell report's worktree dialogs, command-palette affordances, settings and theming, titlebar, transition, and native-surface findings map to the responsive-header, Preview, and performance packages.
+
+These reports were produced against an older product snapshot and do not establish that every listed gap still exists.
+Any item not covered by a package acceptance flow must be revalidated in the current packaged Windows build before new implementation work is opened.
+The reports are therefore treated as completed evidence artifacts, while this itinerary remains the canonical source for actionable follow-up.
+
 The General reported that Kokoro is silent for Codex commands.
 The current policy speaks only permission and question events, so successful command completion is silent by design.
 The recommended contract is to keep permission and question announcements enabled by the existing attention setting and add separate configurable completion and failure announcements with conservative defaults.
