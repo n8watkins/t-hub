@@ -14,15 +14,19 @@ interface WslFolderPickerProps {
   onPathChange: (path: string) => void;
   onFolderMetadataChange?: (selection: WslFolderSelection) => void;
   refreshToken?: number;
+  metadataRefreshToken?: number;
 }
 
 export interface WslFolderSelection {
   path: string;
-  status: "loading" | "ready" | "error";
+  listingStatus: "loading" | "valid-empty" | "valid-populated" | "error" | "stale";
+  listingPrior?: "empty" | "populated";
+  listingError?: string;
+  metadataStatus: "checking" | "ready" | "unavailable";
+  metadataError?: string;
   git: GitInfo | null;
   worktreeCount: number | null;
   worktrees: WorktreeInfo[] | null;
-  error?: string;
 }
 
 type ListingState =
@@ -40,6 +44,7 @@ export function WslFolderPicker({
   onPathChange,
   onFolderMetadataChange,
   refreshToken = 0,
+  metadataRefreshToken = 0,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -47,11 +52,14 @@ export function WslFolderPicker({
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestGeneration = useRef(0);
+  const metadataGeneration = useRef(0);
   const navigationGeneration = useRef(0);
+  const selectionRef = useRef<WslFolderSelection | null>(null);
 
   useEffect(() => () => {
     navigationGeneration.current += 1;
     requestGeneration.current += 1;
+    metadataGeneration.current += 1;
   }, []);
 
   useEffect(() => setManualPath(path), [path]);
@@ -67,63 +75,109 @@ export function WslFolderPicker({
         : listing.kind === "stale"
           ? listing.prior
           : null;
-    setListing(() =>
-      priorKind ? { kind: "stale", prior: priorKind } : { kind: "loading" },
-    );
-    setError(null);
-    onFolderMetadataChange?.({
+    const nextListing = priorKind
+      ? { kind: "stale" as const, prior: priorKind }
+      : { kind: "loading" as const };
+    const initialSelection: WslFolderSelection = {
       path,
-      status: "loading",
+      listingStatus: nextListing.kind,
+      listingPrior: nextListing.kind === "stale" ? nextListing.prior : undefined,
+      metadataStatus: "checking",
       git: null,
       worktreeCount: null,
       worktrees: null,
-    });
+    };
+    selectionRef.current = initialSelection;
+    setListing(() =>
+      nextListing,
+    );
+    setError(null);
+    onFolderMetadataChange?.(initialSelection);
+    const updateSelection = (patch: Partial<WslFolderSelection>) => {
+      if (selectionRef.current?.path !== path) return;
+      const nextSelection = { ...selectionRef.current, ...patch };
+      selectionRef.current = nextSelection;
+      onFolderMetadataChange?.(nextSelection);
+    };
     listDir(path)
       .then((nextEntries) => {
         if (cancelled || generation !== requestGeneration.current) return;
         const directories = nextEntries.filter((entry) => entry.isDir);
         setEntries(directories);
         setListing({ kind: directories.length === 0 ? "loaded-empty" : "loaded-populated" });
+        updateSelection({
+          listingStatus: directories.length === 0 ? "valid-empty" : "valid-populated",
+          listingPrior: undefined,
+          listingError: undefined,
+        });
       })
       .catch((cause) => {
         if (cancelled || generation !== requestGeneration.current) return;
         const message = cause instanceof Error ? cause.message : String(cause);
         setListing({ kind: "error", message });
         setError(message);
+        updateSelection({ listingStatus: "error", listingError: message });
       })
       .finally(() => {
         // The explicit listing state prevents an error from being rendered as
         // the successful empty-folder state.
     });
+    return () => {
+      cancelled = true;
+    };
+  }, [onFolderMetadataChange, path, refreshToken]);
+
+  useEffect(() => {
+    if (!path) return;
+    const generation = ++metadataGeneration.current;
+    let cancelled = false;
+    const updateSelection = (patch: Partial<WslFolderSelection>) => {
+      if (selectionRef.current?.path !== path) return;
+      const nextSelection = { ...selectionRef.current, ...patch };
+      selectionRef.current = nextSelection;
+      onFolderMetadataChange?.(nextSelection);
+    };
+    updateSelection({
+      metadataStatus: "checking",
+      metadataError: undefined,
+      git: null,
+      worktreeCount: null,
+      worktrees: null,
+    });
     void gitInfo(path)
       .then(async (git) => {
         if (!git.isRepo) return { git, worktreeCount: 0, worktrees: [] };
-        if (cancelled || generation !== requestGeneration.current) return null;
+        if (cancelled || generation !== metadataGeneration.current) return null;
         const worktrees = await gitWorktreeList(path);
-        if (cancelled || generation !== requestGeneration.current) return null;
+        if (cancelled || generation !== metadataGeneration.current) return null;
         return { git, worktreeCount: worktrees.length, worktrees };
       })
       .then((result) => {
-        if (!result || cancelled || generation !== requestGeneration.current) return;
+        if (!result || cancelled || generation !== metadataGeneration.current) return;
         const { git, worktreeCount, worktrees } = result;
-        onFolderMetadataChange?.({ path, status: "ready", git, worktreeCount, worktrees });
+        updateSelection({
+          metadataStatus: "ready",
+          metadataError: undefined,
+          git,
+          worktreeCount,
+          worktrees,
+        });
       })
       .catch((cause) => {
-        if (cancelled || generation !== requestGeneration.current) return;
+        if (cancelled || generation !== metadataGeneration.current) return;
         const message = cause instanceof Error ? cause.message : String(cause);
-        onFolderMetadataChange?.({
-          path,
-          status: "error",
+        updateSelection({
+          metadataStatus: "unavailable",
+          metadataError: message,
           git: null,
           worktreeCount: null,
           worktrees: null,
-          error: message,
         });
       });
     return () => {
       cancelled = true;
     };
-  }, [onFolderMetadataChange, path, refreshToken]);
+  }, [onFolderMetadataChange, path, metadataRefreshToken]);
 
   const navigate = (nextPath: string) => {
     const generation = ++navigationGeneration.current;

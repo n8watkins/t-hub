@@ -218,9 +218,10 @@ describe("WslFolderPicker", () => {
         onFolderMetadataChange={onFolderMetadataChange}
       />,
     );
-    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith({
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/me",
-      status: "ready",
+      listingStatus: "valid-populated",
+      metadataStatus: "ready",
       git: expect.objectContaining({ isRepo: true, headCommit: "abc123" }),
       worktreeCount: 2,
       worktrees: [
@@ -242,9 +243,10 @@ describe("WslFolderPicker", () => {
         onFolderMetadataChange={onFolderMetadataChange}
       />,
     );
-    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith({
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/empty",
-      status: "ready",
+      listingStatus: "valid-empty",
+      metadataStatus: "ready",
       git: expect.objectContaining({ isRepo: false }),
       worktreeCount: 0,
       worktrees: [],
@@ -287,7 +289,7 @@ describe("WslFolderPicker", () => {
     } as never);
     await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/new",
-      status: "ready",
+      metadataStatus: "ready",
       worktreeCount: 0,
     })));
     resolveOld({ isRepo: true } as never);
@@ -307,13 +309,41 @@ describe("WslFolderPicker", () => {
     const view = render(<WslFolderPicker {...props} />);
     await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/me",
-      status: "ready",
+      metadataStatus: "ready",
     })));
     view.rerender(<WslFolderPicker {...props} />);
     await Promise.resolve();
     expect(gitInfo).toHaveBeenCalledTimes(1);
     expect(listDir).toHaveBeenCalledTimes(1);
-    expect(onFolderMetadataChange).toHaveBeenCalledTimes(2);
+    expect(onFolderMetadataChange).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries VCS metadata without refreshing authoritative directory validation", async () => {
+    const onFolderMetadataChange = vi.fn();
+    const view = render(
+      <WslFolderPicker
+        path="/home/me"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+        metadataRefreshToken={0}
+      />,
+    );
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      listingStatus: "valid-populated",
+      metadataStatus: "ready",
+    })));
+    view.rerender(
+      <WslFolderPicker
+        path="/home/me"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+        metadataRefreshToken={1}
+      />,
+    );
+    await waitFor(() => expect(gitInfo).toHaveBeenCalledTimes(2));
+    expect(listDir).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the newer Git metadata when an older Git response arrives later", async () => {
@@ -355,14 +385,14 @@ describe("WslFolderPicker", () => {
     resolveNew(gitSelection as never);
     await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/new",
-      status: "ready",
+      metadataStatus: "ready",
       worktreeCount: 1,
     })));
     resolveOld({ isRepo: true, headCommit: "old-head" } as never);
     await Promise.resolve();
     expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/new",
-      status: "ready",
+      metadataStatus: "ready",
       worktreeCount: 1,
     }));
     expect(gitWorktreeList).toHaveBeenCalledTimes(1);
