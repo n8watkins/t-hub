@@ -225,7 +225,7 @@ if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e \
   --arg bin "$BIN" --argjson legacy_env_vars "$LEGACY_ENV_VARS_JSON" '
   .enabled == true and .disabled_reason == null and
   .transport.type == "stdio" and .transport.command == $bin and
-  .transport.args == [] and .transport.env == {} and
+  .transport.args == [] and (.transport.env == null or .transport.env == {}) and
   .transport.env_vars == $legacy_env_vars and .transport.cwd == null and
   .enabled_tools == null and .disabled_tools == null and
   .startup_timeout_sec == null and .tool_timeout_sec == null
@@ -274,14 +274,18 @@ migrate_legacy_registration() {
   if ! printf '%s' "$verified" | jq -e --arg bin "$BIN" --argjson env_vars "$ENV_VARS_JSON" '
     .enabled == true and .disabled_reason == null and
     .transport.type == "stdio" and .transport.command == $bin and
-    .transport.args == [] and .transport.env == {} and
+    .transport.args == [] and (.transport.env == null or .transport.env == {}) and
     .transport.env_vars == $env_vars and .transport.cwd == null
   ' >/dev/null; then
     echo "ensure-thub-codex: migrated registration verification failed" >&2
     return 1
   fi
-  before_semantics="$(printf '%s' "$CURRENT" | jq -Sc 'del(.transport.env_vars)')"
-  after_semantics="$(printf '%s' "$verified" | jq -Sc 'del(.transport.env_vars)')"
+  before_semantics="$(printf '%s' "$CURRENT" | jq -Sc '
+    .transport.env = (.transport.env // {}) | del(.transport.env_vars)
+  ')"
+  after_semantics="$(printf '%s' "$verified" | jq -Sc '
+    .transport.env = (.transport.env // {}) | del(.transport.env_vars)
+  ')"
   if [ "$before_semantics" != "$after_semantics" ]; then
     echo "ensure-thub-codex: migration changed registration semantics beyond env_vars" >&2
     return 1
