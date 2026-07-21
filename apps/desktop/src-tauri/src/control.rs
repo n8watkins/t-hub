@@ -7559,6 +7559,12 @@ impl CaptainsRegistry {
                  terminalId + shipSlug of every claim)"
             ));
         };
+        if g.captains[idx].role == FleetRole::Cortana {
+            return Err(
+                "release_captain: Cortana is a durable backend-owned singleton; use the dedicated reconciliation or replacement operation"
+                    .into(),
+            );
+        }
         let requires_retention = g.captains[idx].crew.iter().any(|crew| {
             !matches!(crew.state, CrewState::Removed { .. })
                 || crew.powder_work.as_ref().is_some_and(|work| {
@@ -48338,7 +48344,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_current_durable_cortana_identity_is_apex_across_reload_and_release() {
+    fn durable_cortana_stays_authoritative_across_reload_and_generic_release_denial() {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let captains_path = captains_tmp(&format!("cortana-apex-{nonce}"));
         let identities_path =
@@ -48389,42 +48395,57 @@ mod tests {
                 "unexpected denial: {error}"
             );
 
-            release_captain(
+            let denied_release = release_captain(
                 &ctx,
                 &json!({"captainSessionId": current_tile}),
                 Some(&current),
                 false,
             )
-            .unwrap();
-            let released = resolve_identity(&ctx, &current_secret).unwrap();
-            assert_eq!(released.fleet_role, None);
-            assert_eq!(released.mint_role, crate::identity::Role::Unknown);
-            assert!(!caller_is_apex(Some(&released), false));
+            .unwrap_err();
+            assert!(denied_release.contains("durable backend-owned singleton"));
+
+            let preserved = resolve_identity(&ctx, &current_secret).unwrap();
+            assert_eq!(preserved.fleet_role, Some(FleetRole::Cortana));
+            assert_eq!(preserved.mint_role, crate::identity::Role::Cortana);
+            assert!(caller_is_apex(Some(&preserved), false));
+            let snapshot = ctx.captains.snapshot();
+            assert_eq!(
+                snapshot.cortana.terminal_id.as_deref(),
+                Some(current_tile.as_str())
+            );
+            assert_eq!(
+                snapshot
+                    .captains
+                    .iter()
+                    .filter(|record| record.role == FleetRole::Cortana)
+                    .count(),
+                1
+            );
         }
 
-        // The released token stays non-apex after the next durable-state reload.
+        // The same durable identity, Fleet claim, and bearer survive reload.
         {
             let ctx = test_ctx("cortana-apex-token")
                 .with_captains_registry(Arc::new(CaptainsRegistry::load(captains_path.clone())))
                 .with_identity_store(Arc::new(crate::identity::IdentityStore::load(
                     identities_path.clone(),
                 )));
-            let released = resolve_identity(&ctx, &current_secret).unwrap();
-            assert!(!caller_is_apex(Some(&released), false));
-            let denied = dispatch_authenticated(
-                &ctx,
-                req_session(
-                    "cortana-apex-token",
-                    &current_secret,
-                    "commission_captain",
-                    json!({}),
-                ),
+            let preserved = resolve_identity(&ctx, &current_secret).unwrap();
+            assert_eq!(preserved.fleet_role, Some(FleetRole::Cortana));
+            assert_eq!(preserved.mint_role, crate::identity::Role::Cortana);
+            assert!(caller_is_apex(Some(&preserved), false));
+            let snapshot = ctx.captains.snapshot();
+            assert_eq!(
+                snapshot.cortana.terminal_id.as_deref(),
+                Some(current_tile.as_str())
             );
-            assert!(!denied.ok);
-            let error = denied.error.unwrap_or_default();
-            assert!(
-                error.contains("General/Cortana"),
-                "unexpected denial: {error}"
+            assert_eq!(
+                snapshot
+                    .captains
+                    .iter()
+                    .filter(|record| record.role == FleetRole::Cortana)
+                    .count(),
+                1
             );
         }
 
