@@ -259,6 +259,7 @@ export function WslFolderPicker({
                 <span className="min-w-0 flex-1 truncate">{entry.name}</span>
               </button>
             ))}
+          </>
         ) : listing.kind === "loaded-empty" ? (
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
             This folder is empty.
