@@ -37,11 +37,6 @@ import { useWorkspace, registerCaptainRegistry } from "./workspace";
 
 const PERSIST_KEY = "t-hub.captain.v2";
 
-/** The reserved ship slug the server captains registry gives the Cortana
- *  singleton (mirrors `CORTANA_SLUG` in control.rs). The orchestrator mark is a
- *  claim on THIS slug with `role: "cortana"`, so releasing/claiming it addresses
- *  the singleton regardless of which terminal currently holds it. */
-export const CORTANA_SLUG = "cortana";
 /** The pre-list single-captain key (PR #9). Read-only now: migrated into the
  *  v2 list on first load, never written again, left in place so a rollback to
  *  an older build still finds its pin. */
@@ -194,68 +189,6 @@ export interface CaptainClaimRecord {
   state?: { kind: "active" | "orphaned" | "vacant"; since?: number };
 }
 
-/** Count of in-flight Cortana releases. Kept for transfer sequencing diagnostics. */
-let pendingReleases = 0;
-export function captainReleasesInFlight(): number {
-  return pendingReleases;
-}
-
-/** Make the "Mark as Cortana" affordance REAL: claim/transfer the Cortana
- *  singleton in the SERVER captains registry (the crown's source of truth), with
- *  most-recent-wins semantics per the general.
- *
- *  The server refuses to seize the reserved slug off a LIVE incumbent (one
- *  captain per ship - it only auto-transfers on unambiguous death), so a clean
- *  transfer is release-then-claim: free the `cortana` slug off whoever holds it,
- *  THEN claim it for the newly-marked tile. Best-effort like every other server
- *  captaincy mutation - outside Tauri or with the control channel down the
- *  optimistic local mark stands and the next adopted snapshot reconciles.
- *
- *  The release phase is counted into `pendingReleases` (like {@link serverCaptaincy})
- *  so a transient empty snapshot mid-transfer can't trip the A1 guard into wiping
- *  local designations; the count is balanced exactly once via `uncount`. */
-function serverClaimCortana(id: TerminalId): void {
-  pendingReleases += 1;
-  let counted = true;
-  const uncount = () => {
-    if (counted) {
-      counted = false;
-      pendingReleases -= 1;
-    }
-  };
-  void import("../ipc/controlClient")
-    .then(async (m) => {
-      // Free the singleton off any prior holder. An absent/unknown slug is a
-      // strict server error - swallowed, the claim below is the load-bearing half.
-      await m.controlRequest("release_captain", { shipSlug: CORTANA_SLUG }).catch(() => {});
-      uncount();
-      await m.controlRequest("claim_captain", { captainSessionId: id, role: "cortana" });
-    })
-    .catch(() => {
-      // Control channel unavailable (tests / dev browser) or the claim raced a
-      // server mutation - the optimistic local mark stands and reconciles.
-    })
-    .finally(uncount);
-}
-
-/** Clear the Cortana singleton server-side (the "Unmark Cortana" affordance / a
- *  killed orchestrator tile): release the reserved slug by ship, so it drops the
- *  holder even when the local `orchestratorId` has gone stale. Best-effort. */
-function serverReleaseCortana(): void {
-  pendingReleases += 1;
-  let counted = true;
-  const uncount = () => {
-    if (counted) {
-      counted = false;
-      pendingReleases -= 1;
-    }
-  };
-  void import("../ipc/controlClient")
-    .then((m) => m.controlRequest("release_captain", { shipSlug: CORTANA_SLUG }))
-    .catch(() => {})
-    .finally(uncount);
-}
-
 /** The tile focused before the overlay opened, restored on close. Module-level
  *  (not store state): it's transient plumbing, never rendered or persisted. */
 let prevFocusedId: TerminalId | null = null;
@@ -324,7 +257,7 @@ export interface CaptainState {
   toggleOverlay: () => void;
   /** Show/hide the titlebar anchor dropdown. */
   setAnchorMenu: (open: boolean) => void;
-  /** Designate (or clear, with null) the orchestrator terminal. Persisted. */
+  /** Update the local projection of the backend-owned Cortana terminal. Persisted. */
   setOrchestratorId: (id: TerminalId | null) => void;
   /** Commit dragged/resized geometry (persisted). */
   setGeometry: (g: { x: number; y: number; width: number; height: number }) => void;
@@ -349,12 +282,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
     persist();
   };
 
-  /** Apply an orchestrator designation LOCALLY only (state + persist + tile
-   *  placement), WITHOUT driving the server. The public `setOrchestratorId`
-   *  wraps this and then mutates the server registry; `adoptCaptainsRegistry`
-   *  reuses it to converge on a server-declared Cortana without re-driving the
-   *  server (which would loop: adopt -> claim -> snapshot -> adopt). Returns true
-   *  when it actually changed. */
+  /** Apply the backend-owned Cortana projection locally (state + persistence +
+   *  tile placement). Runtime creation, replacement, and retirement belong to
+   *  the durable backend reconciliation transaction. Presentation cleanup must
+   *  never mutate that authority. Returns true when it actually changed. */
   const applyOrchestrator = (id: TerminalId | null): boolean => {
     if (get().orchestratorId === id) return false;
     const prev = get().orchestratorId;
@@ -445,21 +376,18 @@ export const useCaptain = create<CaptainState>((set, get) => {
       if (serverCortanaId && serverCortanaId !== get().orchestratorId) {
         applyOrchestrator(serverCortanaId);
       }
-      // Reconcile a STALE orchestrator: after a relaunch where the designated
-      // session did not return, its id dangles (the strip shows a raw id, the
-      // input stays disabled). Clear it if the terminal is no longer present.
-      // Guarded on a non-empty terminals map so a not-yet-loaded workspace at
-      // boot never false-clears a valid designation. Reads the CURRENT
-      // designation (post cortana-reconciliation) so a freshly-adopted server
-      // Cortana is validated against live terminals, not the stale pre-adopt id.
+      // Reconcile a stale LOCAL projection only when the server did not declare
+      // a Cortana. A fresh backend reconciliation may publish its authoritative
+      // claim before the spawned terminal reaches the workspace inventory. That
+      // ordering is normal and must never clear, release, or detach the singleton.
       const orch = get().orchestratorId;
-      if (orch != null) {
+      if (serverCortanaId == null && orch != null) {
         const terminals = useWorkspace.getState().terminals;
         if (
           Object.keys(terminals).length > 0 &&
           terminals[orch] === undefined
         ) {
-          get().setOrchestratorId(null);
+          applyOrchestrator(null);
         }
       }
     },
@@ -567,14 +495,7 @@ export const useCaptain = create<CaptainState>((set, get) => {
     },
 
     setOrchestratorId: (id) => {
-      if (!applyOrchestrator(id)) return;
-      // Make the mark REAL (per the general): the orchestrator IS the Cortana
-      // singleton in the server captains registry, so a mark claims/transfers
-      // that role server-side (most-recent-wins) and clearing it releases the
-      // slug. The local state above is the optimistic mirror; the crown then
-      // renders from the adopted server snapshot (adoptCaptainsRegistry).
-      if (id) serverClaimCortana(id);
-      else serverReleaseCortana();
+      applyOrchestrator(id);
     },
 
     setGeometry: (g) => {

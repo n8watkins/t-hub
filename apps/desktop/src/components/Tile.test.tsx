@@ -278,7 +278,7 @@ describe("Tile responsive header controls", () => {
   });
 });
 
-describe("Tile header context menu: IDs + Mark as Cortana", () => {
+describe("Tile header context menu: IDs", () => {
   /** Right-click the header to open the context menu, then return the menu's
    *  root (it renders fixed to the document, not inside the header). */
   function openMenu(terminalId: string): HTMLElement {
@@ -420,15 +420,12 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     expect(clipboardWrites).toEqual(["restored-claude-id"]);
   });
 
-  it("labels the mark affordance 'Mark as Cortana' and 'Unmark Cortana' when set", () => {
+  it("does not expose obsolete Mark or Unmark Cortana mutations", () => {
     let menu = openMenu("cap00001");
-    expect(within(menu).getByText("Mark as Cortana")).toBeTruthy();
-    // Mark it, then re-open: the affordance flips to the unmark label.
-    act(() => {
-      useCaptain.setState({ orchestratorId: "cap00001" });
-    });
+    expect(within(menu).queryByText("Mark as Cortana")).toBeNull();
+    act(() => useCaptain.setState({ orchestratorId: "cap00001" }));
     menu = openMenu("cap00001");
-    expect(within(menu).getByText("Unmark Cortana")).toBeTruthy();
+    expect(within(menu).queryByText("Unmark Cortana")).toBeNull();
   });
 
   it("keeps kill and restart available when the narrow header hides it", () => {
@@ -442,16 +439,6 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     expect(dialog?.textContent).toContain("Kill & restart this session?");
   });
 
-  it("marking Cortana from the menu sets the designation and flashes the next-steps hint", () => {
-    const menu = openMenu("cap00001");
-    act(() => {
-      fireEvent.click(within(menu).getByText("Mark as Cortana"));
-    });
-    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
-    // The honest hint points at the still-unbuilt follow-on flow.
-    expect(document.body.textContent).toContain("Marked as Cortana");
-    expect(document.body.textContent).toContain("capability elevation");
-  });
 });
 
 describe("Tile kill+restart confirm (captain de-captain warning)", () => {

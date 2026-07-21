@@ -695,76 +695,11 @@ describe("orchestrator reconcile on adopt", () => {
   });
 });
 
-describe("Mark as Cortana (server captains-registry singleton)", () => {
-  // The cortana-related control mutations, in capture order: the reserved-slug
-  // release (the transfer's "move it off the previous holder" half) and the
-  // role:"cortana" claim (the "point it here" half).
-  const cortanaOps = () =>
-    controlRequests.filter(
-      (r) =>
-        (r.command === "release_captain" &&
-          (r.args as { shipSlug?: string }).shipSlug === "cortana") ||
-        (r.command === "claim_captain" &&
-          (r.args as { role?: string }).role === "cortana"),
-    );
-
-  it("marking a tile claims the Cortana role server-side (release-then-claim)", async () => {
+describe("backend-owned Cortana projection", () => {
+  it("never turns local projection changes into claim or release operations", () => {
     useCaptain.getState().setOrchestratorId("cap00001");
-    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
-    await vi.waitFor(() => {
-      expect(cortanaOps()).toEqual([
-        { command: "release_captain", args: { shipSlug: "cortana" } },
-        {
-          command: "claim_captain",
-          args: { captainSessionId: "cap00001", role: "cortana" },
-        },
-      ]);
-    });
-  });
-
-  it("marking a NEW tile moves the Cortana role off the previous holder (singleton transfer, most-recent-wins)", async () => {
-    // Mark cap first, let its claim settle.
-    useCaptain.getState().setOrchestratorId("cap00001");
-    await vi.waitFor(() => {
-      expect(cortanaOps()).toEqual([
-        { command: "release_captain", args: { shipSlug: "cortana" } },
-        {
-          command: "claim_captain",
-          args: { captainSessionId: "cap00001", role: "cortana" },
-        },
-      ]);
-    });
-    controlRequests.length = 0;
-
-    // Now mark bbb: the most-recent mark wins. Locally the singleton field flips
-    // to bbb (never both), and server-side the reserved slug is released off cap
-    // BEFORE bbb claims it - the transfer that this test guards. If the singleton
-    // transfer were reverted (e.g. back to a local-only mark, or the release
-    // dropped), this expectation goes RED.
-    useCaptain.getState().setOrchestratorId("bbb00001");
-    expect(useCaptain.getState().orchestratorId).toBe("bbb00001");
-    await vi.waitFor(() => {
-      expect(cortanaOps()).toEqual([
-        { command: "release_captain", args: { shipSlug: "cortana" } },
-        {
-          command: "claim_captain",
-          args: { captainSessionId: "bbb00001", role: "cortana" },
-        },
-      ]);
-    });
-  });
-
-  it("unmarking Cortana releases the reserved slug server-side", async () => {
-    useCaptain.getState().setOrchestratorId("cap00001");
-    await vi.waitFor(() => expect(cortanaOps().length).toBe(2));
-    controlRequests.length = 0;
     useCaptain.getState().setOrchestratorId(null);
-    expect(useCaptain.getState().orchestratorId).toBeNull();
-    await vi.waitFor(() => {
-      expect(cortanaOps()).toEqual([
-        { command: "release_captain", args: { shipSlug: "cortana" } },
-      ]);
-    });
+    expect(controlRequests).toHaveLength(0);
   });
 
   it("adopts a server-declared Cortana as the orchestrator and keeps it OUT of the captain pin list", () => {
@@ -816,6 +751,41 @@ describe("Mark as Cortana (server captains-registry singleton)", () => {
     expect(useCaptain.getState().orchestratorId).toBe("ddd00001");
     // Reconciling from a server snapshot is LOCAL-only: it must not re-drive the
     // server (which would loop adopt -> claim -> snapshot -> adopt).
+    expect(controlRequests).toHaveLength(0);
+  });
+
+  it("keeps a fresh server Cortana when its terminal projection arrives later", () => {
+    useCaptain.setState({ orchestratorId: null, claims: {} });
+    useWorkspace.setState({ terminals: { bbb00001: term("bbb00001") } });
+
+    useCaptain.getState().adoptCaptainsRegistry([
+      {
+        terminalId: "fresh001",
+        shipSlug: "cortana",
+        role: "cortana",
+        workspaceTabIds: [],
+        crew: [],
+      },
+    ]);
+
+    expect(useCaptain.getState().orchestratorId).toBe("fresh001");
+    expect(useCaptain.getState().claims.fresh001?.role).toBe("cortana");
+    expect(controlRequests).toHaveLength(0);
+
+    useWorkspace.setState((state) => ({
+      terminals: { ...state.terminals, fresh001: term("fresh001") },
+    }));
+    useCaptain.getState().adoptCaptainsRegistry([
+      {
+        terminalId: "fresh001",
+        shipSlug: "cortana",
+        role: "cortana",
+        workspaceTabIds: [],
+        crew: [],
+      },
+    ]);
+
+    expect(useCaptain.getState().orchestratorId).toBe("fresh001");
     expect(controlRequests).toHaveLength(0);
   });
 });

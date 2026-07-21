@@ -301,7 +301,6 @@ export function Tile({
   // input this once fed was retired in PR #22 - the orchestrator is now just the
   // designated agent, no bottom input exists.)
   const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
-  const setOrchestratorId = useCaptain((s) => s.setOrchestratorId);
   // The Claude session UUID bound to this tile, for the header menu's copyable
   // ID row. The supervision index is Claude-only and can briefly retain a stale
   // binding after a tile starts Codex, so the menu also gates it on `client`.
@@ -1239,28 +1238,6 @@ export function Tile({
               onClick={() => {
                 setCtxMenu(null);
                 toggleCaptain(terminalId);
-              }}
-            />
-            <CtxItem
-              label={
-                isOrchestrator
-                  ? `Unmark ${ORCHESTRATOR_DISPLAY_NAME}`
-                  : `Mark as ${ORCHESTRATOR_DISPLAY_NAME}`
-              }
-              hint={
-                isOrchestrator
-                  ? `This session is ${ORCHESTRATOR_DISPLAY_NAME} - unmark to release the role`
-                  : `Make this session ${ORCHESTRATOR_DISPLAY_NAME}, the fleet orchestrator (claims the role in the captains registry)`
-              }
-              onClick={() => {
-                setCtxMenu(null);
-                const next = isOrchestrator ? null : terminalId;
-                setOrchestratorId(next);
-                if (next) {
-                  flash(
-                    `Marked as ${ORCHESTRATOR_DISPLAY_NAME} - the captains registry now points here. Context resume + capability elevation are a separate, upcoming step.`,
-                  );
-                }
               }}
             />
             <CtxItem
