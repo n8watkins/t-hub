@@ -323,7 +323,10 @@ class AtomicConfigTest(unittest.TestCase):
 
     def test_delete_is_durable_at_every_phase(self) -> None:
         helper = load_helper()
-        for phase in ("prepared", "renamed-before-phase", "verified", "committed"):
+        for phase in (
+            "prepared", "renamed-before-phase", "verified", "committed",
+            "cleanup", "discard-truncated", "cleaned-before-journal",
+        ):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 target = root / "config"
@@ -348,6 +351,80 @@ class AtomicConfigTest(unittest.TestCase):
                     self.assertEqual(outcome, "committed")
                     self.assertFalse(target.exists())
                     self.assertEqual(list(root.glob("config.t-hub-delete.*")), [])
+
+    def test_normal_unlink_only_delete_completes_for_running_executable(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "running"
+            journal = root / "journal"
+            target.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            target.chmod(0o700)
+            process = subprocess.Popen([str(target), "120"])
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(HELPER), "delete", "--target", str(target),
+                     "--expected-digest", helper.state_digest(str(target)),
+                     "--journal", str(journal), "--unlink-only"],
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse(target.exists())
+                self.assertEqual(list(root.glob("running.t-hub-delete.*")), [])
+                self.assertFalse(journal.exists())
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_normal_secure_delete_scrubs_secret_and_removes_evidence(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "config"
+            journal = root / "journal"
+            secret = b"normal-delete-secret-value"
+            target.write_bytes(secret + b"\n")
+            result = subprocess.run(
+                [sys.executable, str(HELPER), "delete", "--target", str(target),
+                 "--expected-digest", helper.state_digest(str(target)),
+                 "--journal", str(journal)],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(root.glob("config.t-hub-delete.*")), [])
+            self.assertFalse(journal.exists())
+            for path in root.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(secret, path.read_bytes())
+
+    def test_secure_delete_truncates_recovery_before_unlink(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "config"
+            journal = root / "journal"
+            target.write_bytes(b"secret recovery bytes\n")
+            expected = helper.state_digest(str(target))
+            real_unlink = helper.os.unlink
+            observed_recovery = False
+
+            def verifying_unlink(path, *args, **kwargs):
+                nonlocal observed_recovery
+                if ".t-hub-delete." in os.fspath(path):
+                    observed_recovery = True
+                    self.assertEqual(pathlib.Path(path).read_bytes(), b"")
+                return real_unlink(path, *args, **kwargs)
+
+            helper.os.unlink = verifying_unlink
+            try:
+                helper.delete(str(target), expected, str(journal))
+            finally:
+                helper.os.unlink = real_unlink
+            self.assertTrue(observed_recovery)
+            self.assertFalse(target.exists())
+            self.assertFalse(journal.exists())
 
     def test_capture_materialize_preserves_exact_metadata_in_restricted_recovery(self) -> None:
         helper = load_helper()

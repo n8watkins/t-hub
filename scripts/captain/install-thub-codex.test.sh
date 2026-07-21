@@ -584,7 +584,8 @@ if [ "$(cat "$ROLLBACK_BIN_DIR/t-hub-mcp")" = "old binary" ] \
   && [ ! -e "$ROLLBACK_CAPTAIN_DIR/ensure-thub-codex.sh" ] \
   && [ ! -e "$ROLLBACK_CAPTAIN_DIR/ensure-thub-claude.sh" ] \
   && [ ! -e "$ROLLBACK_CODEX_HOME/skills" ] \
-  && [ ! -e "$ROLLBACK_CLAUDE_HOME/skills" ]; then
+  && [ ! -e "$ROLLBACK_CLAUDE_HOME/skills" ] \
+  && ! find "$ROLLBACK_WORK" -name '*.t-hub-delete.*' | grep -q .; then
   pass "top-level rollback restores binary, helpers, configs, and skills"
 else
   fail "top-level rollback left a partial installation"
