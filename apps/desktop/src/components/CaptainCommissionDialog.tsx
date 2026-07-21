@@ -393,7 +393,8 @@ export function CaptainCommissionDialog({
                 ? !selected
                 : mode === "existing"
                   ? !folderSelection || folderSelection.path !== repoRoot.trim() ||
-                    !["valid-empty", "valid-populated"].includes(folderSelection.listingStatus)
+                    !["valid-empty", "valid-populated"].includes(folderSelection.listingStatus) ||
+                    folderSelection.metadataStatus === "checking"
                   : false
             )}
           >

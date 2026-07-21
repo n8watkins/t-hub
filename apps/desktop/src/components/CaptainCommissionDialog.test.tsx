@@ -11,7 +11,8 @@ const pickerSelection = vi.hoisted(() => ({
     git: { isRepo: false } as Record<string, unknown>,
     worktreeCount: 0,
     worktrees: null,
-    error: undefined as string | undefined,
+    listingError: undefined as string | undefined,
+    metadataError: undefined as string | undefined,
   },
 }));
 
@@ -54,7 +55,8 @@ describe("CaptainCommissionDialog", () => {
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
-      error: undefined,
+      listingError: undefined,
+      metadataError: undefined,
     };
     vi.mocked(listProjects).mockResolvedValue({
       projects: [],
@@ -122,7 +124,8 @@ describe("CaptainCommissionDialog", () => {
       },
       worktreeCount: 3,
       worktrees: null,
-      error: undefined,
+      listingError: undefined,
+      metadataError: undefined,
     };
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     fireEvent.change(await screen.findByLabelText("Codebase name"), {
@@ -223,7 +226,8 @@ describe("CaptainCommissionDialog", () => {
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
-      error: undefined,
+      listingError: undefined,
+      metadataError: undefined,
     };
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
@@ -240,7 +244,8 @@ describe("CaptainCommissionDialog", () => {
       git: { isRepo: false },
       worktreeCount: 0,
       worktrees: null,
-      error: "permission denied",
+      listingError: undefined,
+      metadataError: "permission denied",
     };
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
@@ -261,7 +266,8 @@ describe("CaptainCommissionDialog", () => {
       git: { isRepo: true },
       worktreeCount: 1,
       worktrees: [],
-      error: "directory missing",
+      listingError: "directory missing",
+      metadataError: undefined,
     };
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
@@ -270,6 +276,26 @@ describe("CaptainCommissionDialog", () => {
     expect(screen.getByText("Unavailable: directory missing")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it.each(["loading", "stale"] as const)(
+    "blocks a %s root listing even when Git metadata is ready",
+    async (listingStatus) => {
+      pickerSelection.current = {
+        listingStatus,
+        metadataStatus: "ready",
+        git: { isRepo: true },
+        worktreeCount: 1,
+        worktrees: [],
+        listingError: undefined,
+        metadataError: undefined,
+      };
+      render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+      fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
+        target: { value: `/home/me/${listingStatus}` },
+      });
+      expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
+    },
+  );
 
   it("keeps display name separate from the new destination leaf", async () => {
     vi.mocked(registerProject).mockResolvedValueOnce({
