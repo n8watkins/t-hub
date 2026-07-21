@@ -95,8 +95,22 @@ After inspecting that registration, run `scripts/captain/install-thub-codex.sh -
 The migration option composes with `--repair-skills`, applies only to Codex, never invokes `codex mcp remove` or `codex mcp add`, and never persists an environment value.
 Migration preserves nested tool approval policy and every unrelated TOML byte, verifies the parsed before-and-after registration semantics, and rolls back the exact original bytes on verification failure unless a concurrent writer has changed the file.
 Migration commit and installer-owned rollback durability is supported only on Linux and WSL filesystems that provide `renameat2(RENAME_EXCHANGE)` plus file and directory `fsync`.
+Before every exchange, the atomic helper writes a mode `0600` intent inside a current-user-owned mode `0700` journal and fsyncs the intent, candidate, target, journal directory, and target directory.
+The intent records exact content and metadata fingerprints, path identities, the desired fingerprint, and the current phase.
+Recovery distinguishes prepared, exchanged-before-phase, verified, committed, mismatch-before-restore, and restored states without reconstructing or overwriting displaced concurrent bytes.
 The transaction exchanges same-directory files, verifies the exact displaced prestate after the atomic swap, and swaps back to preserve a noncooperative concurrent writer when the prestate does not match.
-The installer adopts helper changes only after the still-locked helper durably publishes its exact committed state and the installer verifies that the live hash and Claude registration structure still match.
+Symlinks, hard links, path-identity changes, cross-directory candidates, unsupported filesystems, and ownership or extended-attribute failures are refused without a copy-based fallback.
+The installer keeps its persistent transaction at `~/.t-hub/transactions/install-current` and takes `~/.t-hub/captain/install.lock` before recovering or starting work.
+Its manifest binds recovery to the exact MCP binary, installer/helper/skill source digest, destination paths, config paths, migration option, and repair option used by the interrupted invocation.
+It journals the binary, both registration helpers, the atomic helper, Claude registration, Codex registration, and all managed skill targets before their first mutation.
+On the next invocation after SIGKILL, WSL termination, or power loss, it either restores every completed owned stage, completes a journaled skills stage, or refuses when live ownership or invocation provenance no longer matches.
+Compatible partial states are an exact pre-install state, an exact helper-published poststate awaiting rollback, or a fully verified skills stage awaiting transaction cleanup.
+Any other partial state remains journaled and is refused for inspection instead of being adopted.
+The installer uses the helpers' still-locked before and post publications directly and never takes a new ownership snapshot after a helper returns.
+Codex rollback restores the helper-published exact file boundary only while the full post fingerprint still matches.
+Claude rollback compares the owned `t-hub` node fingerprint, restores its exact absent, null, empty-parent, or present semantics, and preserves unrelated sibling metadata.
+Rollback bytes and extended-attribute values exist only in mode `0600` recovery files under the mode `0700` transaction directory.
+Descriptors and logs contain fingerprints and presence/type information but no config values, and successful commit or recovery securely truncates and removes recovery material.
 Unsupported platforms or filesystems fail closed instead of falling back to a weaker copy-based replacement.
 When a Codex registration has tool allowlists, denylists, timeouts, environment, arguments, or another user-authored policy, provisioning preserves it if the command is already correct and otherwise refuses to repoint it.
 Claude registration follows the same preserve-or-refuse rule for custom arguments and environment.
