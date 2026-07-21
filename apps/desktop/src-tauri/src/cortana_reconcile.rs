@@ -25,6 +25,9 @@ pub struct CortanaRuntimeCandidate {
     pub provider_session_id: Option<String>,
     pub terminal: RuntimeEvidence,
     pub harness_process: RuntimeEvidence,
+    pub identity_bound_to_terminal: bool,
+    pub canonical_control_file: bool,
+    pub rotating_control_env_scrubbed: bool,
     pub current_control_capability: bool,
     pub trusted_cortana_identity: bool,
 }
@@ -135,6 +138,9 @@ impl CortanaReconcilePlan {
 fn full_capability_runtime(candidate: &CortanaRuntimeCandidate) -> bool {
     candidate.terminal == RuntimeEvidence::Alive
         && candidate.harness_process == RuntimeEvidence::Alive
+        && candidate.identity_bound_to_terminal
+        && candidate.canonical_control_file
+        && candidate.rotating_control_env_scrubbed
         && candidate.current_control_capability
         && candidate.trusted_cortana_identity
         && candidate.identity_id.is_some()
@@ -201,6 +207,9 @@ pub fn plan_reconciliation(
             && (!candidate.current_control_capability
                 || !candidate.trusted_cortana_identity
                 || candidate.identity_id.is_none()
+                || !candidate.identity_bound_to_terminal
+                || !candidate.canonical_control_file
+                || !candidate.rotating_control_env_scrubbed
                 || candidate.generation == 0 && candidate.harness_process != RuntimeEvidence::Alive)
     }) {
         return CortanaReconcilePlan::degraded(
@@ -405,6 +414,9 @@ mod tests {
             provider_session_id: Some("thread-1".into()),
             terminal: RuntimeEvidence::Alive,
             harness_process: RuntimeEvidence::Alive,
+            identity_bound_to_terminal: true,
+            canonical_control_file: true,
+            rotating_control_env_scrubbed: true,
             current_control_capability: true,
             trusted_cortana_identity: true,
         }
@@ -768,5 +780,22 @@ mod tests {
         let plan = plan_reconciliation(&durable(), "startup-5", &[runtime]);
         assert_eq!(plan.action, CortanaReconcileAction::Degraded);
         assert!(plan.degraded_reason.unwrap().contains("durable harness"));
+    }
+
+    #[test]
+    fn exact_runtime_binding_and_control_environment_are_mandatory() {
+        for mutate in [
+            |candidate: &mut CortanaRuntimeCandidate| candidate.identity_bound_to_terminal = false,
+            |candidate: &mut CortanaRuntimeCandidate| candidate.canonical_control_file = false,
+            |candidate: &mut CortanaRuntimeCandidate| {
+                candidate.rotating_control_env_scrubbed = false
+            },
+        ] {
+            let mut observed = candidate("term-4", "cortana-identity", 4);
+            mutate(&mut observed);
+            let plan = plan_reconciliation(&durable(), "startup-binding", &[observed]);
+            assert_eq!(plan.action, CortanaReconcileAction::Degraded);
+            assert!(plan.authoritative.is_none());
+        }
     }
 }
