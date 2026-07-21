@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 18,
+  "seq": 108,
+  "captains": [
+    {
+      "shipSlug": "aurora",
+      "assignmentId": "assignment:project-aurora:aurora",
+      "displayName": "Aurora",
+      "role": "captain",
+      "provider": "codex",
+      "providerSessionId": "00000000-0000-7000-8000-000000000017",
+      "terminalId": "tile-aurora-captain",
+      "projectId": "project-aurora",
+      "assignment": "Coordinate the Aurora implementation",
+      "harness": "codex",
+      "conversationId": "conversation-aurora-18",
+      "resumePoint": "checkpoint-aurora-18",
+      "workspaceTabIds": ["workspace-aurora"],
+      "crew": [
+        {
+          "terminalId": "tile-aurora-worker",
+          "provider": "codex",
+          "providerSessionId": "00000000-0000-7000-8000-000000000018",
+          "conversationId": "conversation-aurora-worker-18",
+          "resumePoint": "worker-checkpoint-18",
+          "task": "Review the v18 Project migration",
+          "harness": "codex",
+          "workspaceTabId": "workspace-aurora",
+          "powderWork": {
+            "cardId": "card-aurora",
+            "runId": "run-aurora",
+            "agent": "agent-aurora-worker",
+            "claimExpiresAt": 1700000020000,
+            "dispatchReleaseRecovery": true,
+            "state": { "kind": "active" }
+          },
+          "state": { "kind": "cleanupPending", "since": 1700000016000 }
+        }
+      ],
+      "state": { "kind": "active" }
+    }
+  ],
+  "cortana": { "generation": 0 },
+  "agentSessions": [
+    {
+      "agentSessionId": "agent-aurora-18",
+      "captainSessionId": "tile-aurora-captain",
+      "projectId": "project-aurora",
+      "assignment": "Review the v18 Project migration",
+      "directory": "/sanitized/workspaces/aurora",
+      "worktreePath": "/sanitized/worktrees/aurora-worker",
+      "branch": "migration/project-root-identity",
+      "workspaceTabId": "workspace-aurora",
+      "harness": "codex",
+      "provider": "codex",
+      "providerConversationId": "conversation-agent-aurora-18",
+      "resumePoint": "agent-checkpoint-18",
+      "runtimeState": "idle",
+      "workStage": "working",
+      "createdAt": 1700000010000,
+      "updatedAt": 1700000018000
+    }
+  ],
+  "agentCheckpoints": [
+    {
+      "cursor": 7,
+      "agentSessionId": "agent-aurora-18",
+      "authorSessionId": "tile-aurora-captain",
+      "summary": "The v18 fixture was captured before migration.",
+      "createdAt": 1700000018000
+    }
+  ],
+  "agentEvents": [
+    {
+      "cursor": 7,
+      "agentSessionId": "agent-aurora-18",
+      "kind": "checkpoint",
+      "createdAt": 1700000018000,
+      "checkpoint": {
+        "cursor": 7,
+        "agentSessionId": "agent-aurora-18",
+        "authorSessionId": "tile-aurora-captain",
+        "summary": "The v18 fixture was captured before migration.",
+        "createdAt": 1700000018000
+      }
+    }
+  ],
+  "projects": [
+    {
+      "projectId": "project-aurora",
+      "name": "Aurora",
+      "repoRoot": "/sanitized/workspaces/aurora",
+      "remoteUrl": "https://example.invalid/aurora.git",
+      "defaultBranch": "main",
+      "createdAt": 1700000000000,
+      "updatedAt": 1700000015000
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "captains-reserved",
+      "name": "Captain Workspace",
+      "kind": "captain",
+      "tileIds": ["tile-aurora-captain"]
+    },
+    {
+      "id": "workspace-aurora",
+      "name": "Aurora Work",
+      "kind": "work",
+      "owner": {
+        "projectId": "project-aurora",
+        "assignmentId": "assignment:project-aurora:aurora",
+        "shipSlug": "aurora"
+      },
+      "tileIds": ["tile-aurora-worker"]
+    }
+  ],
+  "pendingFleetOperations": [],
+  "retiredFleetTileIds": [],
+  "pendingDispatchClaims": [],
+  "pendingDispatchReleases": [
+    {
+      "crewSessionId": "tile-aurora-worker",
+      "projectId": "project-aurora",
+      "connectionProfile": "default",
+      "connectionEndpointIdentity": "hmac-sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "repository": "aurora",
+      "cardId": "card-aurora",
+      "runId": "run-aurora",
+      "agent": "agent-aurora-worker",
+      "operationId": "initial-claim:aurora:18",
+      "createdAt": 1700000016000,
+      "state": "in_flight"
+    }
+  ]
+}

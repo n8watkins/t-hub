@@ -38,7 +38,7 @@ fn register(args: &[String]) -> Result<(), CliError> {
     let flags = Flags::parse(args, &["--name", "--remote-url"])?;
     let root = flags.positional(0, "projects register", "<rootPath>")?;
     let name = required_name(&flags, "projects register")?;
-    let mut input = json!({ "repoRoot": root, "name": name });
+    let mut input = json!({ "rootPath": root, "name": name });
     if let Some(remote) = flags.opts.get("--remote-url") {
         input["remoteUrl"] = Value::String(remote.clone());
     }
@@ -58,7 +58,7 @@ fn initialize_git(args: &[String]) -> Result<(), CliError> {
     let result = control::call(
         &endpoint()?,
         "initialize_git",
-        json!({ "repoRoot": root, "name": name }),
+        json!({ "rootPath": root, "name": name }),
     )?;
     if flags.json {
         emit_json_ok("projects init", result);

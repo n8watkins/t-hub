@@ -4,7 +4,7 @@ export interface RegisteredProject {
   projectId: string;
   name: string;
   repoRoot: string;
-  rootPath?: string;
+  rootPath: string;
   vcsCapability?: "git" | "none";
   gitMainRoot?: string;
   remoteUrl?: string;
@@ -26,12 +26,29 @@ export function listProjects(): Promise<ProjectCatalog> {
 }
 
 export function registerProject(input: {
-  repoRoot: string;
-  name?: string;
+  rootPath: string;
+  /** @deprecated Use rootPath. */
+  repoRoot?: string;
+  name: string;
   remoteUrl?: string;
   createDirectory?: boolean;
 }): Promise<RegisteredProject> {
+  if (!input.name.trim()) {
+    return Promise.reject(new Error("register_project requires a non-empty name"));
+  }
   return controlRequest("register_project", input) as Promise<RegisteredProject>;
+}
+
+export function initializeGit(input: {
+  rootPath: string;
+  /** @deprecated Use rootPath. */
+  repoRoot?: string;
+  name: string;
+}): Promise<RegisteredProject> {
+  if (!input.name.trim()) {
+    return Promise.reject(new Error("initialize_git requires a non-empty name"));
+  }
+  return controlRequest("initialize_git", input) as Promise<RegisteredProject>;
 }
 
 export interface CaptainIdentity {

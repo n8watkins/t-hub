@@ -400,12 +400,18 @@ fn schema_register_project() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "repoRoot": { "type": "string", "description": "Existing POSIX WSL Project root, whether Git-enabled or not." },
-            "createDirectory": { "type": "boolean", "description": "Explicitly create repoRoot as one absent leaf for a new empty non-Git codebase." },
+            "rootPath": { "type": "string", "description": "Authoritative existing POSIX WSL Project root, whether Git-enabled or not." },
+            "repoRoot": { "type": "string", "description": "Deprecated compatibility alias for rootPath." },
+            "repo_root": { "type": "string", "description": "Deprecated compatibility alias for rootPath." },
+            "createDirectory": { "type": "boolean", "description": "Explicitly create rootPath as one absent leaf for a new empty non-Git codebase." },
             "name": { "type": "string", "minLength": 1, "description": "Required explicit Project display name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
         },
-        "required": ["repoRoot", "name"],
+        "anyOf": [
+            { "required": ["rootPath", "name"] },
+            { "required": ["repoRoot", "name"] },
+            { "required": ["repo_root", "name"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -414,10 +420,16 @@ fn schema_initialize_git() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "repoRoot": { "type": "string", "description": "Existing POSIX WSL Project root to initialize." },
+            "rootPath": { "type": "string", "description": "Authoritative existing POSIX WSL Project root to initialize." },
+            "repoRoot": { "type": "string", "description": "Deprecated compatibility alias for rootPath." },
+            "repo_root": { "type": "string", "description": "Deprecated compatibility alias for rootPath." },
             "name": { "type": "string", "minLength": 1, "description": "Required when the Project is not already registered." }
         },
-        "required": ["repoRoot"],
+        "anyOf": [
+            { "required": ["rootPath", "name"] },
+            { "required": ["repoRoot", "name"] },
+            { "required": ["repo_root", "name"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -1837,6 +1849,39 @@ mod tests {
         assert_eq!(
             (heartbeat.input_schema)()["required"],
             json!(["crewSessionId"])
+        );
+    }
+
+    #[test]
+    fn project_root_schemas_make_root_path_primary_with_legacy_alias_support() {
+        let register = find("register_project").unwrap();
+        assert_eq!(register.tier, Tier::Organization);
+        assert_eq!(
+            (register.input_schema)()["anyOf"],
+            json!([
+                { "required": ["rootPath", "name"] },
+                { "required": ["repoRoot", "name"] },
+                { "required": ["repo_root", "name"] }
+            ])
+        );
+        assert_eq!(
+            (register.input_schema)()["properties"]["name"]["minLength"],
+            1
+        );
+        assert_eq!(
+            (register.input_schema)()["properties"]["repoRoot"]["description"],
+            "Deprecated compatibility alias for rootPath."
+        );
+
+        let initialize = find("initialize_git").unwrap();
+        assert_eq!(initialize.tier, Tier::Organization);
+        assert_eq!(
+            (initialize.input_schema)()["anyOf"],
+            json!([
+                { "required": ["rootPath", "name"] },
+                { "required": ["repoRoot", "name"] },
+                { "required": ["repo_root", "name"] }
+            ])
         );
     }
 

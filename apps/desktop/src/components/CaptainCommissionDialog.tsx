@@ -125,12 +125,12 @@ export function CaptainCommissionDialog({
       if (mode === "existing") {
         if (!repoRoot.trim()) throw new Error("WSL folder is required.");
         project = await registerProject({
-          repoRoot: repoRoot.trim(),
+          rootPath: repoRoot.trim(),
           name: projectName.trim(),
         });
       } else if (mode === "new") {
         project = await registerProject({
-          repoRoot: newCodebaseDestination!,
+          rootPath: newCodebaseDestination!,
           name: newName.trim(),
           createDirectory: true,
         });
