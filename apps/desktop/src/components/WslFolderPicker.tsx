@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { listDir } from "../ipc/files";
-import { gitInfo, gitWorktreeList, type GitInfo } from "../ipc/git";
+import { gitInfo, gitWorktreeList, type GitInfo, type WorktreeInfo } from "../ipc/git";
 import type { DirEntry } from "../ipc/types";
 import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
 
@@ -13,6 +13,7 @@ interface WslFolderPickerProps {
   recentPaths: Array<{ label: string; path: string }>;
   onPathChange: (path: string) => void;
   onFolderMetadataChange?: (selection: WslFolderSelection) => void;
+  refreshToken?: number;
 }
 
 export interface WslFolderSelection {
@@ -20,6 +21,7 @@ export interface WslFolderSelection {
   status: "loading" | "ready" | "error";
   git: GitInfo | null;
   worktreeCount: number | null;
+  worktrees: WorktreeInfo[] | null;
   error?: string;
 }
 
@@ -37,6 +39,7 @@ export function WslFolderPicker({
   recentPaths,
   onPathChange,
   onFolderMetadataChange,
+  refreshToken = 0,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -73,6 +76,7 @@ export function WslFolderPicker({
       status: "loading",
       git: null,
       worktreeCount: null,
+      worktrees: null,
     });
     listDir(path)
       .then((nextEntries) => {
@@ -93,16 +97,16 @@ export function WslFolderPicker({
     });
     void gitInfo(path)
       .then(async (git) => {
-        if (!git.isRepo) return { git, worktreeCount: 0 };
+        if (!git.isRepo) return { git, worktreeCount: 0, worktrees: [] };
         if (cancelled || generation !== requestGeneration.current) return null;
         const worktrees = await gitWorktreeList(path);
         if (cancelled || generation !== requestGeneration.current) return null;
-        return { git, worktreeCount: worktrees.length };
+        return { git, worktreeCount: worktrees.length, worktrees };
       })
       .then((result) => {
         if (!result || cancelled || generation !== requestGeneration.current) return;
-        const { git, worktreeCount } = result;
-        onFolderMetadataChange?.({ path, status: "ready", git, worktreeCount });
+        const { git, worktreeCount, worktrees } = result;
+        onFolderMetadataChange?.({ path, status: "ready", git, worktreeCount, worktrees });
       })
       .catch((cause) => {
         if (cancelled || generation !== requestGeneration.current) return;
@@ -112,13 +116,14 @@ export function WslFolderPicker({
           status: "error",
           git: null,
           worktreeCount: null,
+          worktrees: null,
           error: message,
         });
       });
     return () => {
       cancelled = true;
     };
-  }, [onFolderMetadataChange, path]);
+  }, [onFolderMetadataChange, path, refreshToken]);
 
   const navigate = (nextPath: string) => {
     const generation = ++navigationGeneration.current;

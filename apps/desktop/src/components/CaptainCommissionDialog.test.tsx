@@ -6,9 +6,11 @@ import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 const pickerSelection = vi.hoisted(() => ({
   current: {
-    status: "ready",
-    git: { isRepo: false },
+    status: "ready" as string,
+    git: { isRepo: false } as Record<string, unknown>,
     worktreeCount: 0,
+    worktrees: null,
+    error: undefined as string | undefined,
   },
 }));
 
@@ -22,13 +24,16 @@ vi.mock("./WslFolderPicker", () => ({
     path,
     onPathChange,
     onFolderMetadataChange,
+    refreshToken,
   }: {
     path: string;
     onPathChange: (path: string) => void;
     onFolderMetadataChange?: (selection: unknown) => void;
+    refreshToken?: number;
   }) => (
     <input
       aria-label="Manual WSL path"
+      data-refresh-token={refreshToken}
       value={path}
       onChange={(event) => {
         const nextPath = event.target.value;
@@ -46,6 +51,8 @@ describe("CaptainCommissionDialog", () => {
       status: "ready",
       git: { isRepo: false },
       worktreeCount: 0,
+      worktrees: null,
+      error: undefined,
     };
     vi.mocked(listProjects).mockResolvedValue({
       projects: [],
@@ -107,6 +114,8 @@ describe("CaptainCommissionDialog", () => {
         headCommit: "abc123",
       },
       worktreeCount: 3,
+      worktrees: null,
+      error: undefined,
     };
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     fireEvent.change(await screen.findByLabelText("Codebase name"), {
@@ -148,6 +157,95 @@ describe("CaptainCommissionDialog", () => {
     expect(await screen.findByText("/home/me/canonical-app")).toBeTruthy();
     expect(screen.queryByText("/compatibility/wrong-root")).toBeNull();
     expect(screen.getByText("Canonical App")).toBeTruthy();
+  });
+
+  it("shows saved non-Git capability and allows commission preflight", async () => {
+    vi.mocked(listProjects).mockResolvedValueOnce({
+      projects: [{
+        projectId: "saved-none",
+        name: "Plain App",
+        rootPath: "/home/me/plain-app",
+        repoRoot: "/home/me/plain-app",
+        vcsCapability: "none",
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      count: 1,
+      seq: 1,
+      wslHome: "/home/me",
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    expect(await screen.findByText("None")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("shows saved Git capability and available metadata", async () => {
+    vi.mocked(listProjects).mockResolvedValueOnce({
+      projects: [{
+        projectId: "saved-git",
+        name: "Git App",
+        rootPath: "/home/me/git-app",
+        repoRoot: "/home/me/git-app",
+        vcsCapability: "git",
+        gitMainRoot: "/home/me/git-app",
+        remoteUrl: "https://example.test/git.git",
+        defaultBranch: "main",
+        branch: "feature",
+        headCommit: "saved-head",
+        dirtyCount: 2,
+        worktreeCount: 2,
+        isLinkedWorktree: true,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      count: 1,
+      seq: 1,
+      wslHome: "/home/me",
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    expect(await screen.findByText("Git")).toBeTruthy();
+    expect(screen.getByText("https://example.test/git.git")).toBeTruthy();
+    expect(screen.getByText("feature")).toBeTruthy();
+    expect(screen.getByText("saved-head")).toBeTruthy();
+    expect(screen.getAllByText("2").length).toBeGreaterThan(0);
+    expect(screen.getByText("Linked")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("blocks existing-folder commission while Version Control is checking", async () => {
+    pickerSelection.current = {
+      status: "loading",
+      git: { isRepo: false },
+      worktreeCount: 0,
+      worktrees: null,
+      error: undefined,
+    };
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
+      target: { value: "/home/me/checking" },
+    });
+    expect(screen.getByText("Checking...")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("blocks unavailable Version Control and exposes a retry action", async () => {
+    pickerSelection.current = {
+      status: "error",
+      git: { isRepo: false },
+      worktreeCount: 0,
+      worktrees: null,
+      error: "permission denied",
+    };
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
+      target: { value: "/home/me/blocked" },
+    });
+    expect(screen.getByText("Unavailable: permission denied")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(true);
+    const picker = screen.getByLabelText("Manual WSL path");
+    const before = picker.getAttribute("data-refresh-token");
+    fireEvent.click(screen.getByRole("button", { name: "Retry Version control check" }));
+    expect(picker.getAttribute("data-refresh-token")).not.toBe(before);
   });
 
   it("keeps display name separate from the new destination leaf", async () => {

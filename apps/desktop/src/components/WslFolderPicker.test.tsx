@@ -223,6 +223,10 @@ describe("WslFolderPicker", () => {
       status: "ready",
       git: expect.objectContaining({ isRepo: true, headCommit: "abc123" }),
       worktreeCount: 2,
+      worktrees: [
+        { path: "/home/me", branch: "main", isLinked: false },
+        { path: "/home/me-linked", branch: "feature", isLinked: true },
+      ],
     }));
     expect(gitInfo).toHaveBeenCalledTimes(1);
     expect(gitWorktreeList).toHaveBeenCalledTimes(1);
@@ -243,6 +247,7 @@ describe("WslFolderPicker", () => {
       status: "ready",
       git: expect.objectContaining({ isRepo: false }),
       worktreeCount: 0,
+      worktrees: [],
     }));
     expect(gitWorktreeList).not.toHaveBeenCalled();
   });
