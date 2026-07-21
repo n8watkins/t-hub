@@ -32,6 +32,7 @@ export function CaptainCommissionDialog({
   const [newDisplayName, setNewDisplayName] = useState("");
   const [newDestinationLeaf, setNewDestinationLeaf] = useState("");
   const [folderSelection, setFolderSelection] = useState<WslFolderSelection | null>(null);
+  const [metadataRetry, setMetadataRetry] = useState(0);
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -68,6 +69,9 @@ export function CaptainCommissionDialog({
 
   const handleFolderMetadataChange = useCallback((selection: WslFolderSelection) => {
     setFolderSelection(selection);
+  }, []);
+  const retryFolderMetadata = useCallback(() => {
+    setMetadataRetry((current) => current + 1);
   }, []);
 
   if (!open) return null;
@@ -232,6 +236,7 @@ export function CaptainCommissionDialog({
                     }))}
                   onPathChange={setRepoRoot}
                   onFolderMetadataChange={handleFolderMetadataChange}
+                  refreshToken={metadataRetry}
                 />
                 {wslHomeError && (
                   <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
@@ -344,6 +349,7 @@ export function CaptainCommissionDialog({
                   ? projectName
                   : newDisplayName
             }
+            onRetryFolderMetadata={retryFolderMetadata}
             repoRoot={repoRoot}
             assignment={assignment}
             harness={harness}
@@ -373,7 +379,13 @@ export function CaptainCommissionDialog({
               color: "var(--th-accent-fg, var(--th-fg))",
             }}
             onClick={() => void submit()}
-            disabled={busy}
+            disabled={busy || (
+              mode === "saved"
+                ? !selected
+                : mode === "existing"
+                  ? !folderSelection || folderSelection.path !== repoRoot.trim() || folderSelection.status !== "ready"
+                  : false
+            )}
           >
             {busy ? "Creating..." : "Create Captain"}
           </button>
@@ -407,6 +419,7 @@ function ReviewSummary({
   selected,
   folderSelection,
   displayName,
+  onRetryFolderMetadata,
   repoRoot,
   assignment,
   harness,
@@ -417,6 +430,7 @@ function ReviewSummary({
   selected?: RegisteredProject;
   folderSelection: WslFolderSelection | null;
   displayName: string;
+  onRetryFolderMetadata: () => void;
   repoRoot: string;
   assignment: string;
   harness: "codex" | "claude";
@@ -451,9 +465,13 @@ function ReviewSummary({
         <ReviewRow label="Source" value={source} />
         <ReviewRow label="Codebase name" value={displayName.trim() || "Required"} />
         <ReviewRow label="Codebase" value={location} />
+        {mode === "saved" && (
+          <VersionControlSummary project={selected} />
+        )}
         {mode === "existing" && (
           <VersionControlSummary
             selection={folderSelection?.path === repoRoot.trim() ? folderSelection : null}
+            onRetry={onRetryFolderMetadata}
           />
         )}
         {mode === "new" && (
@@ -470,23 +488,102 @@ function ReviewSummary({
   );
 }
 
-function VersionControlSummary({ selection }: { selection: WslFolderSelection | null }) {
+function VersionControlSummary({
+  selection = null,
+  project,
+  onRetry,
+}: {
+  selection?: WslFolderSelection | null;
+  project?: RegisteredProject;
+  onRetry?: () => void;
+}) {
+  if (project) {
+    if (project.vcsCapability === "none") {
+      return <ReviewRow label="Version control" value="None" />;
+    }
+    return (
+      <GitMetadataRows
+        git={{
+          isRepo: true,
+          branch: project.branch ?? null,
+          worktreeRoot: project.gitMainRoot ?? project.rootPath,
+          isLinkedWorktree: project.isLinkedWorktree ?? false,
+          dirtyCount: project.dirtyCount ?? 0,
+          headCommit: project.headCommit ?? null,
+          remoteUrl: project.remoteUrl ?? null,
+          defaultBranch: project.defaultBranch ?? null,
+        }}
+        worktreeCount={project.worktreeCount ?? null}
+        worktrees={null}
+        dirtyCount={project.dirtyCount ?? null}
+        selectedWorktree={project.isLinkedWorktree ?? null}
+      />
+    );
+  }
   if (!selection || selection.status === "loading") {
     return <ReviewRow label="Version control" value="Checking..." />;
   }
   if (selection.status === "error") {
-    return <ReviewRow label="Version control" value={`Unavailable: ${selection.error ?? "unknown error"}`} />;
+    return (
+      <>
+        <ReviewRow label="Version control" value={`Unavailable: ${selection.error ?? "unknown error"}`} />
+        {onRetry && (
+          <dd className="col-start-2">
+            <button type="button" className="text-xs underline" onClick={onRetry}>
+              Retry Version control check
+            </button>
+          </dd>
+        )}
+      </>
+    );
   }
   if (!selection.git?.isRepo) {
     return <ReviewRow label="Version control" value="None" />;
   }
   return (
+    <GitMetadataRows
+      git={selection.git}
+      worktreeCount={selection.worktreeCount}
+      worktrees={selection.worktrees}
+      dirtyCount={selection.git.dirtyCount}
+      selectedWorktree={selection.git.isLinkedWorktree}
+    />
+  );
+}
+
+function GitMetadataRows({
+  git,
+  worktreeCount,
+  worktrees,
+  dirtyCount,
+  selectedWorktree,
+}: {
+  git: NonNullable<WslFolderSelection["git"]>;
+  worktreeCount: number | null;
+  worktrees: WslFolderSelection["worktrees"];
+  dirtyCount: number | null;
+  selectedWorktree: boolean | null;
+}) {
+  const mainCount = worktrees?.filter((worktree) => !worktree.isLinked).length;
+  const linkedCount = worktrees?.filter((worktree) => worktree.isLinked).length;
+  const worktreeValue = worktreeCount === null
+    ? "Unknown"
+    : mainCount === undefined || linkedCount === undefined
+      ? String(worktreeCount)
+      : `${worktreeCount} (main ${mainCount}, linked ${linkedCount})`;
+  return (
     <>
       <ReviewRow label="Version control" value="Git" />
-      <ReviewRow label="Remote" value={selection.git.remoteUrl || "None configured"} />
-      <ReviewRow label="Default branch" value={selection.git.defaultBranch || "Unknown"} />
-      <ReviewRow label="HEAD" value={selection.git.headCommit || "Unknown"} />
-      <ReviewRow label="Worktrees" value={String(selection.worktreeCount ?? 0)} />
+      <ReviewRow label="Remote" value={git.remoteUrl || "None configured"} />
+      <ReviewRow label="Default branch" value={git.defaultBranch || "Unknown"} />
+      <ReviewRow label="Current branch" value={git.branch || "Detached"} />
+      <ReviewRow label="HEAD" value={git.headCommit || "Unknown"} />
+      <ReviewRow label="Dirty entries" value={dirtyCount === null ? "Unknown" : String(dirtyCount)} />
+      <ReviewRow label="Worktrees" value={worktreeValue} />
+      <ReviewRow
+        label="Selected worktree"
+        value={selectedWorktree === null ? "Unknown" : selectedWorktree ? "Linked" : "Main"}
+      />
     </>
   );
 }
