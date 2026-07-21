@@ -166,7 +166,11 @@ export function WslFolderPicker({
       </div>
 
       <div className="max-h-40 overflow-y-auto rounded border" style={{ borderColor: "var(--th-border)" }}>
-        {listing.kind === "loading" ? (
+        {listing.kind === "idle" ? (
+          <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+            Choose a WSL folder.
+          </p>
+        ) : listing.kind === "loading" ? (
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
             Loading folders...
           </p>
@@ -178,7 +182,11 @@ export function WslFolderPicker({
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
             Folder listing is stale. Choose the folder again to refresh.
           </p>
-        ) : entries.length > 0 ? (
+        ) : listing.kind === "loaded" && listing.empty ? (
+          <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+            This folder is empty.
+          </p>
+        ) : listing.kind === "loaded" ? (
           entries.map((entry) => (
             <button
               key={entry.path}
@@ -197,11 +205,7 @@ export function WslFolderPicker({
               )}
             </button>
           ))
-        ) : (
-          <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
-            This folder is empty.
-          </p>
-        )}
+        ) : null}
       </div>
 
       {selectedGit && (

@@ -116,6 +116,22 @@ describe("WslFolderPicker", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
   });
 
+  it("does not let an older directory response replace the current folder", async () => {
+    let resolveOld!: (entries: never[]) => void;
+    let resolveNew!: (entries: never[]) => void;
+    vi.mocked(listDir)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const view = render(
+      <WslFolderPicker path="/home/old" recentPaths={[]} onPathChange={vi.fn()} />,
+    );
+    view.rerender(<WslFolderPicker path="/home/new" recentPaths={[]} onPathChange={vi.fn()} />);
+    resolveOld([{ name: "old", path: "/home/old/old", isDir: true, isGitRepo: false, size: 0 }] as never[]);
+    resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
+    expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "old" })).toBeNull();
+  });
+
   it("opens Explorer and adopts only its validated WSL selection", async () => {
     const onPathChange = vi.fn();
     vi.mocked(pickWslFolder).mockResolvedValue("/home/me/project");

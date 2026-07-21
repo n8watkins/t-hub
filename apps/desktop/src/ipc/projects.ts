@@ -4,8 +4,10 @@ export interface RegisteredProject {
   projectId: string;
   name: string;
   repoRoot: string;
+  rootPath?: string;
+  vcsCapability?: "git" | "none";
+  gitMainRoot?: string;
   remoteUrl?: string;
-  initializeGit?: boolean;
   defaultBranch?: string;
   createdAt: number;
   updatedAt: number;
@@ -28,7 +30,6 @@ export function registerProject(input: {
   name?: string;
   remoteUrl?: string;
   createDirectory?: boolean;
-  initializeGit?: boolean;
 }): Promise<RegisteredProject> {
   return controlRequest("register_project", input) as Promise<RegisteredProject>;
 }
