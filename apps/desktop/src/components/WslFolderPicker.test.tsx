@@ -309,6 +309,7 @@ describe("WslFolderPicker", () => {
     const view = render(<WslFolderPicker {...props} />);
     await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
       path: "/home/me",
+      listingStatus: "valid-populated",
       metadataStatus: "ready",
     })));
     view.rerender(<WslFolderPicker {...props} />);
@@ -316,6 +317,17 @@ describe("WslFolderPicker", () => {
     expect(gitInfo).toHaveBeenCalledTimes(1);
     expect(listDir).toHaveBeenCalledTimes(1);
     expect(onFolderMetadataChange).toHaveBeenCalledTimes(4);
+    expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      listingStatus: "valid-populated",
+      metadataStatus: "ready",
+    }));
+  });
+
+  it("does not probe Git when no metadata callback is provided", async () => {
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+    expect(gitInfo).not.toHaveBeenCalled();
+    expect(gitWorktreeList).not.toHaveBeenCalled();
   });
 
   it("retries VCS metadata without refreshing authoritative directory validation", async () => {
