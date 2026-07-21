@@ -15555,9 +15555,17 @@ fn project_by_id(projects: &[ProjectRecord], project_id: &str) -> Result<Project
 }
 
 fn canonical_board_root(path: &str) -> Result<std::path::PathBuf, String> {
-    std::fs::canonicalize(files::to_host_path(path)).map_err(|error| {
-        format!("project_board_snapshot: could not canonicalize Project root: {error}")
-    })
+    let posix = files::posix_form(path);
+    #[cfg(windows)]
+    {
+        Ok(std::path::PathBuf::from(posix))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(&posix).map_err(|error| {
+            format!("project_board_snapshot: could not canonicalize Project root: {error}")
+        })
+    }
 }
 
 fn board_project_json(project: &ProjectRecord) -> Value {
@@ -15728,20 +15736,13 @@ fn register_project(
         .or_else(|| args.get("create_directory"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if create_directory && !initialize_git {
-        return Err(
-            "register_project: createDirectory requires initializeGit: true for a new codebase"
-                .into(),
-        );
-    }
+    let canonical_root = canonical_project_root(&requested_root, create_directory)?;
     if create_directory || initialize_git {
         let registered_project_id = ctx
             .captains
             .projects()
             .into_iter()
-            .find(|project| {
-                files::posix_form(&project.repo_root) == files::posix_form(&requested_root)
-            })
+            .find(|project| files::posix_form(&project.repo_root) == canonical_root)
             .map(|project| project.project_id);
         enforce_project_authority(
             ctx,
@@ -15751,28 +15752,28 @@ fn register_project(
         )?;
     }
     if create_directory && !ctx.peer_is_loopback {
-        files::scoped_create_path(&requested_root, true, files::remote_file_roots())?;
+        files::scoped_create_path(&canonical_root, true, files::remote_file_roots())?;
     }
     let created_directory = if create_directory {
-        create_new_project_directory(&requested_root)?;
+        create_new_project_directory(&canonical_root)?;
         true
     } else {
         false
     };
-    let (worktrees, initialized_git) = if created_directory {
-        if let Err(error) = git::initialize_repository(&requested_root) {
+    let (worktrees, initialized_git) = if created_directory && initialize_git {
+        if let Err(error) = git::initialize_repository(&canonical_root) {
             return Err(rollback_project_creation_error(
-                &requested_root,
+                &canonical_root,
                 false,
                 true,
                 format!("register_project: Git initialization failed: {error}"),
             ));
         }
-        let worktrees = match git::worktree_list(&requested_root) {
+        let worktrees = match git::worktree_list(&canonical_root) {
             Ok(worktrees) => worktrees,
             Err(error) => {
                 return Err(rollback_project_creation_error(
-                    &requested_root,
+                    &canonical_root,
                     true,
                     true,
                     format!("register_project: initialized repository validation failed: {error}"),
@@ -15780,19 +15781,24 @@ fn register_project(
             }
         };
         (worktrees, true)
+    } else if created_directory {
+        (Vec::new(), false)
     } else {
-        let mut worktrees = git::worktree_list(&requested_root)
-            .map_err(|e| format!("register_project: repository validation failed: {e}"))?;
-        let initialized_git = if worktrees.iter().any(|worktree| !worktree.is_linked) {
-            false
-        } else if initialize_git {
-            git::initialize_repository(&requested_root)
+        let git_info = git::git_info_cached(&canonical_root);
+        let mut worktrees = if git_info.is_repo {
+            git::worktree_list(&canonical_root)
+                .map_err(|e| format!("register_project: repository validation failed: {e}"))?
+        } else {
+            Vec::new()
+        };
+        let initialized_git = if !git_info.is_repo && initialize_git {
+            git::initialize_repository(&canonical_root)
                 .map_err(|error| format!("register_project: Git initialization failed: {error}"))?;
-            worktrees = match git::worktree_list(&requested_root) {
+            worktrees = match git::worktree_list(&canonical_root) {
                 Ok(worktrees) => worktrees,
                 Err(error) => {
                     return Err(rollback_initialized_git_error(
-                        &requested_root,
+                        &canonical_root,
                         format!(
                             "register_project: initialized repository validation failed: {error}"
                         ),
@@ -15800,24 +15806,20 @@ fn register_project(
                 }
             };
             true
+        } else if git_info.is_repo {
+            false
         } else {
-            return Err(
-                "register_project: path is not inside a Git repository with a main worktree"
-                    .to_string(),
-            );
+            false
         };
         (worktrees, initialized_git)
     };
 
     let result = (|| {
-        let main = worktrees
-            .iter()
-            .find(|worktree| !worktree.is_linked)
-            .ok_or("register_project: initialized repository has no main worktree")?;
-        let repo_root = std::fs::canonicalize(&main.path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&main.path))
-            .to_string_lossy()
-            .into_owned();
+        let main = worktrees.iter().find(|worktree| !worktree.is_linked);
+        let repo_root = main
+            .and_then(|worktree| git::git_info_cached(&worktree.path).worktree_root)
+            .map(|root| files::posix_form(&root))
+            .unwrap_or_else(|| canonical_root.clone());
         let name = arg_str(args, "name")
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
@@ -15860,7 +15862,7 @@ fn register_project(
                         .as_ref()
                         .and_then(|project| project.default_branch.clone())
                 })
-                .or_else(|| main.branch.clone()),
+                .or_else(|| main.and_then(|worktree| worktree.branch.clone())),
             powder: existing.as_ref().and_then(|project| project.powder.clone()),
             created_at: existing.as_ref().map_or(0, |project| project.created_at),
             updated_at: 0,
@@ -15871,7 +15873,7 @@ fn register_project(
     if let Err(error) = result {
         if initialized_git || created_directory {
             return Err(rollback_project_creation_error(
-                &requested_root,
+                &canonical_root,
                 initialized_git,
                 created_directory,
                 error,
@@ -15880,6 +15882,35 @@ fn register_project(
         return Err(error);
     }
     result
+}
+
+/// Project identity is always the canonical POSIX root seen by WSL.
+/// Host-side `Path::is_absolute` and `canonicalize` are intentionally absent:
+/// they reject or rewrite valid WSL roots when the daemon runs on Windows.
+fn canonical_project_root(requested: &str, allow_missing: bool) -> Result<String, String> {
+    let raw = requested.trim();
+    if raw.split(['/', '\\']).any(|part| part == "..") {
+        return Err("register_project: path traversal is not allowed".into());
+    }
+    let root = files::posix_form(raw);
+    if root.is_empty() || !root.starts_with('/') || root.starts_with("//") || root.contains('\0') {
+        return Err("register_project: rootPath must be an absolute WSL path".into());
+    }
+    let metadata = match std::fs::metadata(files::to_host_path(&root)) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(root)
+        }
+        Err(error) => {
+            return Err(format!(
+                "register_project: could not inspect root '{root}': {error}"
+            ));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err("register_project: rootPath must refer to a directory".into());
+    }
+    Ok(root)
 }
 
 fn create_new_project_directory(repo_root: &str) -> Result<(), String> {
@@ -17805,6 +17836,7 @@ fn validate_crew_checkout(
     project: &ProjectRecord,
     requested: Option<String>,
 ) -> Result<String, String> {
+    require_git_capability("dispatch_crew", &project.repo_root)?;
     let requested = requested.unwrap_or_else(|| project.repo_root.clone());
     require_checkout_wsl_distro(&project.repo_root, "Project root")?;
     require_checkout_wsl_distro(&requested, "requested checkout")?;
@@ -23674,6 +23706,7 @@ fn create_worktree(
     let worktree_path = arg_str(args, "worktreePath")
         .or_else(|| arg_str(args, "worktree_path"))
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
+    require_git_capability("create_worktree", &repo_root)?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
     // The command the worktree terminal execs into, same contract + exec path as
@@ -23708,6 +23741,24 @@ fn create_worktree(
     );
     record_delegated_admin_outcome(ctx, delegated_audit.as_ref(), &result);
     result
+}
+
+/// Stable capability failure shared by Git-only control operations.
+/// The JSON envelope is part of the error contract so adapters do not parse
+/// locale-dependent Git output.
+fn require_git_capability(operation: &str, root: &str) -> Result<(), String> {
+    let posix_root = files::posix_form(root);
+    if git::git_info_cached(&posix_root).is_repo {
+        return Ok(());
+    }
+    Err(json!({
+        "code": "git_required",
+        "operation": operation,
+        "capability": "git",
+        "message": "This operation requires a Git-enabled Project.",
+        "action": "Initialize Git explicitly, then retry the operation."
+    })
+    .to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24251,6 +24302,7 @@ fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             .to_string_lossy()
             .into_owned()
     };
+    require_git_capability("list_worktrees", &cwd)?;
     let list = git::worktree_list(&cwd)?;
     Ok(json!({ "worktrees": list }))
 }
@@ -40585,7 +40637,7 @@ mod tests {
     }
 
     #[test]
-    fn register_project_refuses_a_non_repository() {
+    fn register_project_accepts_a_non_repository_without_initializing_git() {
         let ctx = test_ctx("secret");
         let dir = std::env::temp_dir().join(format!(
             "t-hub-register-nonrepo-{}-{}",
@@ -40593,13 +40645,14 @@ mod tests {
             now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let error = dispatch(
+        let project = dispatch(
             &ctx,
             "register_project",
             &json!({"repoRoot": dir.to_string_lossy()}),
         )
-        .unwrap_err();
-        assert!(error.contains("Git repository"), "got: {error}");
+        .unwrap();
+        assert_eq!(project["repoRoot"], dir.to_string_lossy().to_string());
+        assert!(!dir.join(".git").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -40793,7 +40846,7 @@ mod tests {
     }
 
     #[test]
-    fn register_project_new_codebase_requires_safe_explicit_creation() {
+    fn register_project_new_codebase_can_remain_non_git() {
         let ctx = test_ctx("secret");
         let parent = std::env::temp_dir().join(format!(
             "t-hub-register-new-invalid-{}-{}",
@@ -40802,7 +40855,7 @@ mod tests {
         ));
         std::fs::create_dir(&parent).unwrap();
         let destination = parent.join("missing-init");
-        let error = dispatch(
+        let project = dispatch(
             &ctx,
             "register_project",
             &json!({
@@ -40810,12 +40863,16 @@ mod tests {
                 "createDirectory": true
             }),
         )
-        .unwrap_err();
-        assert!(error.contains("requires initializeGit: true"));
-        assert!(!destination.exists());
+        .unwrap();
+        assert_eq!(
+            project["repoRoot"],
+            destination.to_string_lossy().to_string()
+        );
+        assert!(destination.is_dir());
+        assert!(!destination.join(".git").exists());
 
         let trailing_slash = format!("{}/", parent.join("ambiguous").to_string_lossy());
-        let error = dispatch(
+        let initialized = dispatch(
             &ctx,
             "register_project",
             &json!({
@@ -40824,9 +40881,12 @@ mod tests {
                 "initializeGit": true
             }),
         )
-        .unwrap_err();
-        assert!(error.contains("absolute WSL path"), "got: {error}");
-        assert!(!parent.join("ambiguous").exists());
+        .unwrap();
+        assert_eq!(
+            initialized["repoRoot"],
+            parent.join("ambiguous").to_string_lossy().to_string()
+        );
+        assert!(parent.join("ambiguous/.git").is_dir());
 
         let missing_parent = parent.join("missing").join("child");
         let error = dispatch(

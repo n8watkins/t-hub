@@ -101,6 +101,21 @@ describe("WslFolderPicker", () => {
     expect(screen.queryByText("git unavailable")).toBeNull();
   });
 
+  it("distinguishes a true empty folder from a directory-list failure", async () => {
+    vi.mocked(listDir).mockResolvedValueOnce([]);
+    const { unmount } = render(
+      <WslFolderPicker path="/home/empty" recentPaths={[]} onPathChange={vi.fn()} />,
+    );
+    expect(await screen.findByText("This folder is empty.")).toBeTruthy();
+
+    unmount();
+    vi.mocked(listDir).mockRejectedValueOnce(new Error("permission denied"));
+    render(<WslFolderPicker path="/home/blocked" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByText("Could not list this folder.")).toBeTruthy();
+    expect(screen.queryByText("This folder is empty.")).toBeNull();
+    expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
+  });
+
   it("opens Explorer and adopts only its validated WSL selection", async () => {
     const onPathChange = vi.fn();
     vi.mocked(pickWslFolder).mockResolvedValue("/home/me/project");
