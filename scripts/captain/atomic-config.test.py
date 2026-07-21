@@ -211,6 +211,85 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"before\n")
             self.assertFalse(journal.exists())
 
+    def test_absent_target_create_is_durable_at_every_phase(self) -> None:
+        for phase in ("prepared", "renamed-before-phase", "verified", "committed"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                target = root / "new-config"
+                candidate = root / ".candidate"
+                journal = root / "journal"
+                candidate.write_bytes(b"created\n")
+                environment = os.environ.copy()
+                environment["T_HUB_ATOMIC_CRASH_AT"] = phase
+                result = subprocess.run(
+                    [sys.executable, str(HELPER), "install", "--target", str(target),
+                     "--candidate", str(candidate), "--expected-digest", "absent",
+                     "--journal", str(journal)], env=environment, check=False,
+                )
+                self.assertEqual(result.returncode, 89)
+                outcome = subprocess.check_output(
+                    [sys.executable, str(HELPER), "recover", "--journal", str(journal)], text=True
+                ).strip()
+                if phase == "prepared":
+                    self.assertEqual(outcome, "restored")
+                    self.assertFalse(target.exists())
+                    self.assertEqual(candidate.read_bytes(), b"created\n")
+                else:
+                    self.assertEqual(outcome, "committed")
+                    self.assertEqual(target.read_bytes(), b"created\n")
+
+    def test_delete_is_durable_at_every_phase(self) -> None:
+        helper = load_helper()
+        for phase in ("prepared", "renamed-before-phase", "verified", "committed"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                target = root / "config"
+                journal = root / "journal"
+                target.write_bytes(b"delete me\n")
+                expected = helper.state_digest(str(target))
+                environment = os.environ.copy()
+                environment["T_HUB_ATOMIC_CRASH_AT"] = phase
+                result = subprocess.run(
+                    [sys.executable, str(HELPER), "delete", "--target", str(target),
+                     "--expected-digest", expected, "--journal", str(journal)],
+                    env=environment, check=False,
+                )
+                self.assertEqual(result.returncode, 89)
+                outcome = subprocess.check_output(
+                    [sys.executable, str(HELPER), "recover", "--journal", str(journal)], text=True
+                ).strip()
+                if phase == "prepared":
+                    self.assertEqual(outcome, "restored")
+                    self.assertEqual(target.read_bytes(), b"delete me\n")
+                else:
+                    self.assertEqual(outcome, "committed")
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.glob("config.t-hub-delete.*")), [])
+
+    def test_capture_materialize_preserves_exact_metadata_in_restricted_recovery(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            source = root / "source"
+            recovery = state / "before.bin"
+            candidate = root / "candidate"
+            source.write_bytes(b"secret bytes\n")
+            source.chmod(0o640)
+            os.setxattr(source, "user.t-hub-test", b"metadata-secret")
+            subprocess.run(
+                [sys.executable, str(HELPER), "capture", "--source", str(source),
+                 "--recovery", str(recovery)], check=True, stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [sys.executable, str(HELPER), "materialize", "--recovery", str(recovery),
+                 "--candidate", str(candidate)], check=True,
+            )
+            self.assertEqual(helper.state_digest(str(source)), helper.state_digest(str(candidate)))
+            self.assertEqual(stat.S_IMODE(recovery.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(pathlib.Path(f"{recovery}.metadata").stat().st_mode), 0o600)
+
     def test_mismatched_prestate_is_restored_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

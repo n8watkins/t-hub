@@ -7,6 +7,7 @@ recover operation resolves every durable phase without guessing ownership.
 """
 
 import argparse
+import base64
 import ctypes
 import errno
 import hashlib
@@ -178,8 +179,10 @@ def read_intent(journal: str) -> Dict[str, Any]:
         "version", "operation", "target", "candidate", "expected",
         "desired", "phase", "recovery",
     }
-    if set(value) != required or value["version"] != VERSION or value["operation"] != "exchange":
-        raise AtomicError("invalid exchange intent")
+    if set(value) != required or value["version"] != VERSION or value["operation"] not in {
+        "exchange", "create", "delete"
+    }:
+        raise AtomicError("invalid atomic intent")
     if value["phase"] not in {
         "prepared", "exchanged", "mismatch", "restored", "verified", "committed"
     }:
@@ -233,6 +236,10 @@ def durable_exchange(target: str, candidate: str) -> None:
 def recover_exchange(journal: str, cleanup: bool = True) -> str:
     journal = os.path.abspath(journal)
     intent = read_intent(journal)
+    if intent["operation"] == "create":
+        return recover_create(journal, intent, cleanup)
+    if intent["operation"] == "delete":
+        return recover_delete(journal, intent, cleanup)
     target = intent["target"]
     candidate = intent["candidate"]
     if os.path.dirname(target) != os.path.dirname(candidate):
@@ -301,6 +308,123 @@ def recover_exchange(journal: str, cleanup: bool = True) -> str:
         return "restored"
 
     raise AtomicError("live paths do not match a recoverable journal state")
+
+
+def recover_create(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
+    target = intent["target"]
+    candidate = intent["candidate"]
+    desired = intent["desired"]["digest"]
+    target_digest = inspect_digest(target)
+    candidate_digest = inspect_digest(candidate)
+    if target_digest == desired and candidate_digest is None:
+        if intent["phase"] != "committed":
+            set_phase(journal, intent, "committed")
+        if cleanup:
+            remove_journal(journal)
+        return "committed"
+    if target_digest is None and candidate_digest == desired:
+        set_phase(journal, intent, "restored")
+        if cleanup:
+            remove_journal(journal)
+        return "restored"
+    raise AtomicError("live paths do not match a recoverable create journal")
+
+
+def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
+    target = intent["target"]
+    recovery = intent["candidate"]
+    expected = intent["expected"]["digest"]
+    target_digest = inspect_digest(target)
+    recovery_digest = inspect_digest(recovery)
+    if target_digest is None and recovery_digest == expected:
+        if intent["phase"] != "committed":
+            set_phase(journal, intent, "committed")
+        discard(recovery)
+        if cleanup:
+            remove_journal(journal)
+        return "committed"
+    if target_digest == expected and recovery_digest is None:
+        set_phase(journal, intent, "restored")
+        if cleanup:
+            remove_journal(journal)
+        return "restored"
+    raise AtomicError("live paths do not match a recoverable delete journal")
+
+
+def create(target: str, candidate: str, journal: str) -> None:
+    target = os.path.abspath(target)
+    candidate = os.path.abspath(candidate)
+    journal = os.path.abspath(journal)
+    if os.path.dirname(target) != os.path.dirname(candidate):
+        raise AtomicError("target and candidate must share a directory")
+    if os.path.lexists(target):
+        raise AtomicError("create target is not absent")
+    desired_description = description(candidate)
+    desired_digest = description_digest(desired_description)
+    fsync_file(candidate)
+    fsync_directory(os.path.dirname(target))
+    journal = restricted_directory(journal, True)
+    if os.listdir(journal):
+        raise AtomicError("journal is not empty; recover it first")
+    intent = {
+        "version": VERSION,
+        "operation": "create",
+        "target": target,
+        "candidate": candidate,
+        "expected": {"digest": "absent"},
+        "desired": {"digest": desired_digest, "description": desired_description},
+        "phase": "prepared",
+        "recovery": {"prestate": "absent"},
+    }
+    write_json(os.path.join(journal, "intent.json"), intent)
+    crash("prepared")
+    os.rename(candidate, target)
+    fsync_file(target)
+    fsync_directory(os.path.dirname(target))
+    crash("renamed-before-phase")
+    set_phase(journal, intent, "verified")
+    crash("verified")
+    set_phase(journal, intent, "committed")
+    crash("committed")
+    remove_journal(journal)
+
+
+def delete(target: str, expected: str, journal: str) -> None:
+    target = os.path.abspath(target)
+    journal = os.path.abspath(journal)
+    actual = state_digest(target)
+    if actual != expected:
+        raise AtomicError("delete target prestate changed")
+    recovery = f"{target}.t-hub-delete.{os.getpid()}"
+    if os.path.lexists(recovery):
+        raise AtomicError("delete recovery path already exists")
+    fsync_file(target)
+    fsync_directory(os.path.dirname(target))
+    journal = restricted_directory(journal, True)
+    if os.listdir(journal):
+        raise AtomicError("journal is not empty; recover it first")
+    intent = {
+        "version": VERSION,
+        "operation": "delete",
+        "target": target,
+        "candidate": recovery,
+        "expected": {"digest": expected},
+        "desired": {"digest": "absent"},
+        "phase": "prepared",
+        "recovery": {"displaced_prestate": "candidate-after-rename"},
+    }
+    write_json(os.path.join(journal, "intent.json"), intent)
+    crash("prepared")
+    os.rename(target, recovery)
+    fsync_file(recovery)
+    fsync_directory(os.path.dirname(target))
+    crash("renamed-before-phase")
+    set_phase(journal, intent, "verified")
+    crash("verified")
+    set_phase(journal, intent, "committed")
+    crash("committed")
+    discard(recovery)
+    remove_journal(journal)
 
 
 def exchange(target: str, candidate: str, expected: str, journal: str) -> None:
@@ -414,6 +538,18 @@ def capture(source: str, recovery: str) -> Dict[str, Any]:
                 os.fsync(output_file.fileno())
             os.replace(temporary, recovery)
             fsync_directory(os.path.dirname(recovery))
+            metadata_recovery = {
+                "uid": os.lstat(source).st_uid,
+                "gid": os.lstat(source).st_gid,
+                "mode": stat.S_IMODE(os.lstat(source).st_mode),
+                "xattrs": {
+                    name: base64.b64encode(
+                        os.getxattr(source, name, follow_symlinks=False)
+                    ).decode("ascii")
+                    for name in sorted(os.listxattr(source, follow_symlinks=False))
+                },
+            }
+            write_json(f"{recovery}.metadata", metadata_recovery)
         except BaseException:
             try:
                 os.close(input_descriptor)
@@ -436,7 +572,51 @@ def capture(source: str, recovery: str) -> Dict[str, Any]:
         }
     if os.path.exists(recovery):
         discard(recovery)
+    if os.path.exists(f"{recovery}.metadata"):
+        discard(f"{recovery}.metadata")
     return {"presence": "absent", "digest": "absent", "recovery": None}
+
+
+def materialize(recovery: str, candidate: str) -> None:
+    recovery = os.path.abspath(recovery)
+    candidate = os.path.abspath(candidate)
+    require_regular(recovery)
+    with open(f"{recovery}.metadata", "r", encoding="utf-8") as source:
+        metadata = json.load(source)
+    if set(metadata) != {"uid", "gid", "mode", "xattrs"}:
+        raise AtomicError("invalid recovery metadata")
+    input_descriptor = os.open(recovery, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    output_descriptor = os.open(
+        candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        with os.fdopen(input_descriptor, "rb") as input_file, os.fdopen(
+            output_descriptor, "wb"
+        ) as output_file:
+            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                output_file.write(chunk)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.chown(candidate, metadata["uid"], metadata["gid"], follow_symlinks=False)
+        os.chmod(candidate, metadata["mode"], follow_symlinks=False)
+        for name, encoded in metadata["xattrs"].items():
+            os.setxattr(candidate, name, base64.b64decode(encoded), follow_symlinks=False)
+        fsync_file(candidate)
+        fsync_directory(os.path.dirname(candidate))
+    except BaseException:
+        try:
+            os.close(input_descriptor)
+        except OSError:
+            pass
+        try:
+            os.close(output_descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def discard(path: str) -> None:
@@ -461,6 +641,15 @@ def main() -> int:
     exchange_parser.add_argument("--expected-sha")
     exchange_parser.add_argument("--expected-digest")
     exchange_parser.add_argument("--journal")
+    install_parser = subparsers.add_parser("install")
+    install_parser.add_argument("--target", required=True)
+    install_parser.add_argument("--candidate", required=True)
+    install_parser.add_argument("--expected-digest", required=True)
+    install_parser.add_argument("--journal", required=True)
+    delete_parser = subparsers.add_parser("delete")
+    delete_parser.add_argument("--target", required=True)
+    delete_parser.add_argument("--expected-digest", required=True)
+    delete_parser.add_argument("--journal", required=True)
     recover_parser = subparsers.add_parser("recover")
     recover_parser.add_argument("--journal", required=True)
     recover_parser.add_argument("--keep-journal", action="store_true")
@@ -469,6 +658,9 @@ def main() -> int:
     capture_parser = subparsers.add_parser("capture")
     capture_parser.add_argument("--source", required=True)
     capture_parser.add_argument("--recovery", required=True)
+    materialize_parser = subparsers.add_parser("materialize")
+    materialize_parser.add_argument("--recovery", required=True)
+    materialize_parser.add_argument("--candidate", required=True)
     publish_parser = subparsers.add_parser("publish")
     publish_parser.add_argument("--path", required=True)
     publish_parser.add_argument("--value", required=True)
@@ -486,6 +678,18 @@ def main() -> int:
                 expected,
                 arguments.journal or default_journal(arguments.candidate),
             )
+        elif arguments.command == "install":
+            if arguments.expected_digest == "absent":
+                create(arguments.target, arguments.candidate, arguments.journal)
+            else:
+                exchange(
+                    arguments.target,
+                    arguments.candidate,
+                    arguments.expected_digest,
+                    arguments.journal,
+                )
+        elif arguments.command == "delete":
+            delete(arguments.target, arguments.expected_digest, arguments.journal)
         elif arguments.command == "recover":
             print(recover_exchange(arguments.journal, not arguments.keep_journal))
         elif arguments.command == "describe":
@@ -493,6 +697,8 @@ def main() -> int:
             print(json.dumps({"digest": description_digest(value), "description": value}, sort_keys=True))
         elif arguments.command == "capture":
             print(json.dumps(capture(arguments.source, arguments.recovery), sort_keys=True))
+        elif arguments.command == "materialize":
+            materialize(arguments.recovery, arguments.candidate)
         elif arguments.command == "publish":
             publish(arguments.path, arguments.value)
         else:
