@@ -27,7 +27,7 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 
 - **General:** The human user and final authority.
 - **Cortana:** The permanent lightweight T-Hub orchestrator identity.
-- **Project:** A saved codebase and its canonical repository or main worktree metadata.
+- **Project:** A saved codebase identified by canonical `rootPath`, with `vcsCapability` set to `git` or `none` and optional Git main-root metadata.
 - **Assignment:** The durable responsibility given to one Captain within a Project.
 - **Captain:** A durable agent identity responsible for an Assignment and any Crew it creates.
 - **Workspace:** A coherent workstream or feature grouping controlled by a Captain.
@@ -76,8 +76,8 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 34. Captain autonomy uses typed scoped delegation rather than a blanket Captain role exception or fleet-wide control.
 35. Durable organizational identity, T-Hub capability, scoped grants, and Harness-local execution permission are separate authority axes, and none silently expands another.
 36. A live control-capable Captain without a Project may consume only an exact one-time existing-repository bootstrap approval with `maxUses=1` that was issued by the General or by Cortana under an exact pre-existing issuance delegation and binds the Captain's durable identity, current session generation, ship, canonical root, Assignment, protected profile identifier, existing board, operation, request digest, and expiry.
-37. `register_project` must not receive a blanket Captain exception because its current transaction can create or initialize Git and update Project metadata or external compatibility bindings before or after the present role check.
-38. Appturnity is the first installed end-user reproduction for the self-bootstrap slice, and no Appturnity agent session may start implementation until its Project, Captain, Assignment, protected profile, and any compatibility binding are authoritatively persisted and reread.
+37. `register_project` must not receive a blanket Captain exception because its transaction updates canonical Project identity and metadata before or after the present role check.
+38. Appturnity is the first deferred packaged end-user reproduction for the self-bootstrap slice, and no Appturnity agent session may start implementation until its Project, Captain, Assignment, protected profile, and any compatibility binding are authoritatively persisted and reread.
 39. Named authority profiles are visible templates that expand into explicit T34 grant records; `captain-standard`, `captain-project-builder`, and `captain-delivery` are distinct from T33 Harness and model work profiles, while `captain-production-operator` is never a default standing grant and normally resolves to exact one-time approvals.
 40. No standing or delegated Captain profile may authorize protected profile endpoint or credential-command mutation, system-global software installation, or public external repository creation; where supported, only a separately reviewed exact General one-time approval may authorize a narrow instance, while credential reading or export and cross-Project authority remain absolute denials.
 41. T35 atomically consumes the one-time bootstrap approval into an immutable operation-owned recovery lease before its first mutation; only the same durable Captain, ship, request digest, root, Assignment, profile, board, and operation may resume it through a verified replacement-generation handoff, and no new or changed request inherits that authority.
@@ -781,10 +781,10 @@ Make Captain creation understandable for saved, existing, and completely new cod
 3. Rename **Powder repository** to **Powder board** or **Work board**.
 4. Move protected connection-profile selection under **Advanced** and default it when unambiguous.
 5. Add saved codebase, existing WSL folder, and new codebase entry paths.
-6. Build a WSL-native folder picker with home and recent shortcuts, breadcrumbs, parent navigation, Git indicators, and manual-path fallback.
-7. Detect the canonical main worktree, remote, default branch, dirty state, and existing worktrees.
+6. Build a WSL-native folder picker with home and recent shortcuts, breadcrumbs, parent navigation, explicit loading and error states, and manual-path fallback.
+7. Preserve the selected canonical `rootPath` and optional `gitMainRoot`, remote, default branch, and Git state when capability metadata exists.
 8. Use the unified worktree status contract for preflight identity, ownership, freshness, and safety decisions.
-9. Offer explicit Git initialization for non-repository folders.
+9. Keep Git initialization as a separate explicit operation for non-repository folders.
 10. Add a reviewed new-codebase transaction for empty projects, templates, and clones.
 11. Never silently replace a directory or initialize version control.
 12. Add Powder board selection and explicit creation when Powder authorization permits it.
@@ -811,14 +811,14 @@ Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 ar
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
 Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.
 Packaged verification listed all 25 real boards from `n8desktop-wsl`, including `t-hub` with its one acceptance card, and preserved the selection in preflight.
-Installed `0.3.74` adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf, initializes Git with `main`, and reports the exact filesystem and external effects before creation.
+The current source adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf, preserves `vcsCapability: "none"` unless Git initialization is explicitly requested, and reports the exact filesystem effects before creation.
 Packaged cancel verification reviewed `/home/natkins/t-hub-cancel-proof-0-3-74`, closed the dialog, and confirmed that no directory was created.
-Installed `0.3.86` reproduced the open template and clone gap: **Create new codebase** offers only **Starting point: Empty Git repository** and states that template and clone starting points will be added later.
+The current source retains the open template and clone gap: **Create new codebase** offers an explicitly named empty non-Git Project and states that template and clone starting points will be added later.
 The graphical flow currently sequences `register_project` and `commission_captain` in the frontend.
-Registration transactionally owns its optional directory, Git initialization, Project record, and selected Powder binding, while commissioning separately rolls back only incomplete Captain state.
+Registration transactionally owns its optional directory and Project record, while explicit Git initialization and commissioning separately roll back only their incomplete state.
 One reviewed backend transaction shared by graphical and Cortana flows, including explicit cross-operation resume or rollback, remains open.
 The complete graphical packaged E2E matrix for existing non-Git success, empty success, template, and clone flows remains open.
-The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
+The shared registration contract persists `rootPath`, explicit display `name`, and `vcsCapability`, while its Rust integration tests cover non-Git registration and separate explicit Git initialization.
 Automatic Powder board creation for a new codebase is blocked by Powder's current repository API contract and P5.
 `POST /api/v1/repositories` is an upsert without a create-only or conditional precondition, so a T-Hub read-then-create sequence could overwrite a board created concurrently by another actor.
 T-Hub must fail closed rather than use that upsert as create-if-absent, and Powder must not be modified merely to accommodate T-Hub.
