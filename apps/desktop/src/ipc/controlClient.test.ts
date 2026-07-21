@@ -24,6 +24,8 @@ describe("controlRequest", () => {
     mocks.invoke.mockRejectedValue({
       message: "history_resume_failed: placement remained uncertain",
       retryable: true,
+      kind: "history_resume_failed",
+      details: { phase: "placement" },
     });
 
     const failure = await controlRequest("history_resume").catch((reason) => reason);
@@ -32,6 +34,8 @@ describe("controlRequest", () => {
     expect(failure).toMatchObject({
       message: "history_resume_failed: placement remained uncertain",
       retryable: true,
+      kind: "history_resume_failed",
+      details: { phase: "placement" },
     });
     expect(isRetryableControlError(failure)).toBe(true);
   });

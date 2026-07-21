@@ -336,5 +336,83 @@ describe("CaptainCommissionDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Codebase name is required");
     expect(registerProject).not.toHaveBeenCalled();
+    });
   });
-});
+
+  it("reports registration failure without attempting commission", async () => {
+    vi.mocked(registerProject).mockRejectedValueOnce({
+      message: "permission denied",
+      kind: "unauthorized",
+      details: { code: "project_authority" },
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Codebase name"), { target: { value: "Appturnity" } });
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/me/app" } });
+    fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("not authorized");
+    expect((await screen.findByRole("alert")).textContent).toContain("project_authority");
+    expect(commissionCaptain).not.toHaveBeenCalled();
+  });
+
+  it("retains a registered Project and retries only commission after failure", async () => {
+    let rejectCommission!: (cause: unknown) => void;
+    vi.mocked(commissionCaptain)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectCommission = reject; }))
+      .mockResolvedValueOnce({ alreadyCommissioned: false, captain: { workspaceTabIds: [], crew: [] }, project: {}, instructions: "" } as never);
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Codebase name"), { target: { value: "Appturnity" } });
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/me/app" } });
+    fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() => expect(commissionCaptain).toHaveBeenCalledTimes(1));
+    rejectCommission({ message: "terminal unavailable", kind: "capacity", details: { code: "capacity" } });
+    expect((await screen.findByRole("alert")).textContent).toContain("was registered as Project project-none");
+    expect(screen.getByRole("alert").textContent).toContain("capacity is unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() => expect(commissionCaptain).toHaveBeenCalledTimes(2));
+    expect(registerProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("guards backdrop and Escape close while registration or commission is busy", async () => {
+    let resolveRegistration!: (project: never) => void;
+    vi.mocked(registerProject).mockImplementationOnce(() => new Promise((resolve) => { resolveRegistration = resolve; }));
+    const onClose = vi.fn();
+    render(<CaptainCommissionDialog open onClose={onClose} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Codebase name"), { target: { value: "Appturnity" } });
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/me/app" } });
+    fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    fireEvent.pointerDown(screen.getByRole("presentation"));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    resolveRegistration({
+      projectId: "project-none",
+      name: "Appturnity",
+      rootPath: "/home/me/app",
+      repoRoot: "/home/me/app",
+      vcsCapability: "none",
+      createdAt: 1,
+      updatedAt: 1,
+    } as never);
+    await waitFor(() => expect(commissionCaptain).toHaveBeenCalled());
+  });
+
+  it("guards close during commission and permits close after it settles", async () => {
+    let resolveCommission!: (result: never) => void;
+    vi.mocked(commissionCaptain).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCommission = resolve; }),
+    );
+    const onClose = vi.fn();
+    render(<CaptainCommissionDialog open onClose={onClose} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Codebase name"), { target: { value: "Appturnity" } });
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/me/app" } });
+    fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() => expect(commissionCaptain).toHaveBeenCalledTimes(1));
+    fireEvent.pointerDown(screen.getByRole("presentation"));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    resolveCommission({ alreadyCommissioned: false } as never);
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+  });
