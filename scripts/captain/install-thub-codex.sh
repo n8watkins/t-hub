@@ -136,15 +136,86 @@ write_stage() {
 }
 
 recover_atomic_ops() {
-  local op
+  local op intent operation candidate outcome candidate_digest candidate_device candidate_inode
+  local expected_digest expected_device expected_inode cleanup_mode name
   for op in "$TXN"/ops/* "$CODEX_CONFIG".t-hub-*.journal "$CLAUDE_CONFIG".t-hub-*.journal; do
     [ -d "$op" ] || continue
-    python3 "$ATOMIC_SOURCE" recover --journal "$op" >/dev/null
+    intent="$(cat "$op/intent.json")"
+    operation="$(printf '%s' "$intent" | jq -r .operation)"
+    candidate="$(printf '%s' "$intent" | jq -r .candidate)"
+    outcome="$(python3 "$ATOMIC_SOURCE" recover --journal "$op" --keep-journal)" || return 1
+    if [ "$operation" = exchange ] && [ -f "$candidate" ]; then
+      candidate_digest="$(describe_digest "$candidate")"
+      candidate_device="$(stat -c %d "$candidate")"
+      candidate_inode="$(stat -c %i "$candidate")"
+      if [ "$outcome" = committed ]; then
+        expected_digest="$(printf '%s' "$intent" | jq -r .expected.digest)"
+        expected_device="$(printf '%s' "$intent" | jq -r .recovery.target_identity.device)"
+        expected_inode="$(printf '%s' "$intent" | jq -r .recovery.target_identity.inode)"
+      else
+        expected_digest="$(printf '%s' "$intent" | jq -r .desired.digest)"
+        expected_device="$(printf '%s' "$intent" | jq -r .recovery.candidate_identity.device)"
+        expected_inode="$(printf '%s' "$intent" | jq -r .recovery.candidate_identity.inode)"
+      fi
+      if [ "$candidate_digest" != "$expected_digest" ] \
+        || [ "$candidate_device" != "$expected_device" ] \
+        || [ "$candidate_inode" != "$expected_inode" ]; then
+        echo "install-thub-codex: atomic recovery candidate ownership changed: $candidate" >&2
+        return 1
+      fi
+      name="$(basename "$op")"
+      cleanup_mode=scrub
+      case "$name" in
+        binary|codex-helper|claude-helper|atomic-helper|rollback-binary|rollback-codex-helper|rollback-claude-helper|rollback-atomic-helper)
+          cleanup_mode=release
+          ;;
+      esac
+      if [ "$cleanup_mode" = release ]; then
+        python3 "$ATOMIC_SOURCE" release --path "$candidate" \
+          --expected-digest "$expected_digest" --expected-device "$expected_device" \
+          --expected-inode "$expected_inode" || return 1
+      else
+        python3 "$ATOMIC_SOURCE" discard --path "$candidate" || return 1
+      fi
+    fi
+    python3 "$ATOMIC_SOURCE" recover --journal "$op" >/dev/null || return 1
   done
+}
+
+release_file_stage_candidate() {
+  local name="$1" stage candidate live_digest live_device live_inode
+  local before_digest before_device before_inode desired_digest desired_device desired_inode
+  [ -f "$TXN/stages/$name.json" ] || return 0
+  stage="$(cat "$TXN/stages/$name.json")"
+  candidate="$(printf '%s' "$stage" | jq -r '.candidate // empty')"
+  [ -n "$candidate" ] && [ -f "$candidate" ] || return 0
+  live_digest="$(describe_digest "$candidate")"
+  live_device="$(stat -c %d "$candidate")"
+  live_inode="$(stat -c %i "$candidate")"
+  before_digest="$(printf '%s' "$stage" | jq -r .before.digest)"
+  before_device="$(printf '%s' "$stage" | jq -r '.before_identity.device // empty')"
+  before_inode="$(printf '%s' "$stage" | jq -r '.before_identity.inode // empty')"
+  desired_digest="$(printf '%s' "$stage" | jq -r .desired.digest)"
+  desired_device="$(printf '%s' "$stage" | jq -r .candidate_identity.device)"
+  desired_inode="$(printf '%s' "$stage" | jq -r .candidate_identity.inode)"
+  if [ "$live_digest" = "$before_digest" ] && [ "$live_device" = "$before_device" ] \
+    && [ "$live_inode" = "$before_inode" ]; then
+    :
+  elif [ "$live_digest" = "$desired_digest" ] && [ "$live_device" = "$desired_device" ] \
+    && [ "$live_inode" = "$desired_inode" ]; then
+    :
+  else
+    echo "install-thub-codex: executable stage cleanup ownership changed: $candidate" >&2
+    return 1
+  fi
+  python3 "$ATOMIC_SOURCE" release --path "$candidate" --expected-digest "$live_digest" \
+    --expected-device "$live_device" --expected-inode "$live_inode"
 }
 
 rollback_file_stage() {
   local name="$1" stage target live desired before_presence before_digest recovery candidate
+  local candidate_digest candidate_device candidate_inode
+  local -a delete_args
   [ -f "$TXN/stages/$name.json" ] || return 0
   stage="$(cat "$TXN/stages/$name.json")"
   target="$(printf '%s' "$stage" | jq -r .target)"
@@ -152,24 +223,40 @@ rollback_file_stage() {
   before_presence="$(printf '%s' "$stage" | jq -r .before.presence)"
   before_digest="$(printf '%s' "$stage" | jq -r .before.digest)"
   live="$(describe_digest "$target")"
-  if [ "$live" = "$before_digest" ]; then return 0; fi
-  if [ "$live" != "$desired" ]; then
-    echo "install-thub-codex: $target left helper ownership; recovery refused" >&2
-    return 1
+  if [ "$live" != "$before_digest" ]; then
+    if [ "$live" != "$desired" ]; then
+      echo "install-thub-codex: $target left helper ownership; recovery refused" >&2
+      return 1
+    fi
+    if [ "$before_presence" = absent ]; then
+      delete_args=()
+      case "$name" in
+        binary|codex-helper|claude-helper|atomic-helper) delete_args=(--unlink-only) ;;
+      esac
+      python3 "$ATOMIC_SOURCE" delete --target "$target" --expected-digest "$live" \
+        --journal "$TXN/ops/rollback-$name" "${delete_args[@]}"
+    else
+      recovery="$(printf '%s' "$stage" | jq -r --arg fallback "$TXN/recovery/$name.bin" '.recovery // $fallback')"
+      candidate="$(mktemp "$(dirname "$target")/.t-hub-rollback.XXXXXX")"
+      python3 "$ATOMIC_SOURCE" discard --path "$candidate"
+      python3 "$ATOMIC_SOURCE" materialize --recovery "$recovery" --candidate "$candidate"
+      python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
+        --expected-digest "$live" --preserve-candidate-metadata \
+        --journal "$TXN/ops/rollback-$name"
+      candidate_digest="$(describe_digest "$candidate")"
+      candidate_device="$(stat -c %d "$candidate")"
+      candidate_inode="$(stat -c %i "$candidate")"
+      case "$name" in
+        binary|codex-helper|claude-helper|atomic-helper)
+          python3 "$ATOMIC_SOURCE" release --path "$candidate" \
+            --expected-digest "$candidate_digest" --expected-device "$candidate_device" \
+            --expected-inode "$candidate_inode"
+          ;;
+        *) python3 "$ATOMIC_SOURCE" discard --path "$candidate" ;;
+      esac
+    fi
   fi
-  if [ "$before_presence" = absent ]; then
-    python3 "$ATOMIC_SOURCE" delete --target "$target" --expected-digest "$live" \
-      --journal "$TXN/ops/rollback-$name"
-  else
-    recovery="$(printf '%s' "$stage" | jq -r --arg fallback "$TXN/recovery/$name.bin" '.recovery // $fallback')"
-    candidate="$(mktemp "$(dirname "$target")/.t-hub-rollback.XXXXXX")"
-    python3 "$ATOMIC_SOURCE" discard --path "$candidate"
-    python3 "$ATOMIC_SOURCE" materialize --recovery "$recovery" --candidate "$candidate"
-    python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
-      --expected-digest "$live" --preserve-candidate-metadata \
-      --journal "$TXN/ops/rollback-$name"
-    python3 "$ATOMIC_SOURCE" discard --path "$candidate"
-  fi
+  release_file_stage_candidate "$name"
 }
 
 adopt_interrupted_claude_boundary() {
@@ -366,21 +453,31 @@ python3 "$ATOMIC_SOURCE" publish --path "$TXN/manifest.json" --value "$manifest"
 
 install_file_stage() {
   local source="$1" target="$2" name="$3" before candidate desired stage
+  local before_identity candidate_identity
   install -d -m 700 "$(dirname "$target")"
   before="$(python3 "$ATOMIC_SOURCE" capture --source "$target" \
     --recovery "$TXN/recovery/$name.bin")"
   candidate="$(mktemp "$(dirname "$target")/.t-hub-stage.XXXXXX")"
   install -m 700 "$source" "$candidate"
   desired="$(python3 "$ATOMIC_SOURCE" describe --path "$candidate")"
+  before_identity=null
+  if [ -f "$target" ]; then
+    before_identity="$(jq -cn --arg device "$(stat -c %d "$target")" \
+      --arg inode "$(stat -c %i "$target")" '{device:$device,inode:$inode}')"
+  fi
+  candidate_identity="$(jq -cn --arg device "$(stat -c %d "$candidate")" \
+    --arg inode "$(stat -c %i "$candidate")" '{device:$device,inode:$inode}')"
   stage="$(jq -cn --arg target "$target" --argjson before "$before" \
-    --argjson desired "$desired" \
-    '{status:"prepared",target:$target,before:$before,desired:$desired}')"
+    --arg candidate "$candidate" --argjson desired "$desired" \
+    --argjson before_identity "$before_identity" --argjson candidate_identity "$candidate_identity" \
+    '{status:"prepared",target:$target,candidate:$candidate,before:$before,desired:$desired,
+      before_identity:$before_identity,candidate_identity:$candidate_identity}')"
   write_stage "$name" "$stage"
   python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
     --expected-digest "$(printf '%s' "$before" | jq -r .digest)" \
     --preserve-candidate-metadata \
     --journal "$TXN/ops/$name"
-  if [ -f "$candidate" ]; then python3 "$ATOMIC_SOURCE" discard --path "$candidate"; fi
+  release_file_stage_candidate "$name"
   stage="$(printf '%s' "$stage" | jq '.status="applied"')"
   write_stage "$name" "$stage"
   if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = "$name" ]; then kill -KILL "$$"; fi

@@ -209,6 +209,19 @@ def set_phase(journal: str, intent: Dict[str, Any], phase: str) -> None:
 
 def crash(point: str) -> None:
     if os.environ.get("T_HUB_ATOMIC_CRASH_AT") == point:
+        once_path = os.environ.get("T_HUB_ATOMIC_CRASH_ONCE_FILE")
+        if once_path:
+            try:
+                descriptor = os.open(
+                    once_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    0o600,
+                )
+            except FileExistsError:
+                return
+            os.fsync(descriptor)
+            os.close(descriptor)
+            fsync_directory(os.path.dirname(os.path.abspath(once_path)))
         os._exit(89)
 
 
@@ -356,6 +369,13 @@ def recover_create(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     raise AtomicError("live paths do not match a recoverable create journal")
 
 
+def cleanup_deleted_recovery(intent: Dict[str, Any], recovery: str, expected: str) -> None:
+    if intent["recovery"].get("cleanup") == "unlink":
+        release(recovery, expected, intent["recovery"]["target_identity"])
+    else:
+        discard(recovery)
+
+
 def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     target = intent["target"]
     recovery = intent["candidate"]
@@ -370,8 +390,8 @@ def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     if target_digest is None and recovery_digest == expected:
         if intent["phase"] != "committed":
             set_phase(journal, intent, "committed")
-        discard(recovery)
         if cleanup:
+            cleanup_deleted_recovery(intent, recovery, expected)
             remove_journal(journal)
         return "committed"
     if target_digest == expected and recovery_digest is None:
@@ -424,7 +444,7 @@ def create(target: str, candidate: str, journal: str) -> None:
     remove_journal(journal)
 
 
-def delete(target: str, expected: str, journal: str) -> None:
+def delete(target: str, expected: str, journal: str, unlink_only: bool = False) -> None:
     target = os.path.abspath(target)
     journal = os.path.abspath(journal)
     require_single_link(target)
@@ -451,6 +471,7 @@ def delete(target: str, expected: str, journal: str) -> None:
         "recovery": {
             "displaced_prestate": "candidate-after-rename",
             "target_identity": target_identity,
+            "cleanup": "unlink" if unlink_only else "scrub",
         },
     }
     write_json(os.path.join(journal, "intent.json"), intent)
@@ -465,7 +486,7 @@ def delete(target: str, expected: str, journal: str) -> None:
     crash("verified")
     set_phase(journal, intent, "committed")
     crash("committed")
-    discard(recovery)
+    cleanup_deleted_recovery(intent, recovery, before_digest)
     remove_journal(journal)
 
 
@@ -848,6 +869,22 @@ def discard(path: str) -> None:
     fsync_directory(os.path.dirname(path))
 
 
+def release(
+    path: str,
+    expected_digest: str,
+    expected_identity: Optional[Dict[str, int]] = None,
+) -> None:
+    """Durably unlink a non-secret staging inode without opening it for writing."""
+    path = os.path.abspath(path)
+    require_single_link(path)
+    if expected_identity is not None and identity(path) != expected_identity:
+        raise AtomicError("release path identity changed")
+    if state_digest(path) != expected_digest:
+        raise AtomicError("release path digest changed")
+    os.unlink(path)
+    fsync_directory(os.path.dirname(path))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -868,6 +905,7 @@ def main() -> int:
     delete_parser.add_argument("--target", required=True)
     delete_parser.add_argument("--expected-digest", required=True)
     delete_parser.add_argument("--journal", required=True)
+    delete_parser.add_argument("--unlink-only", action="store_true")
     recover_parser = subparsers.add_parser("recover")
     recover_parser.add_argument("--journal", required=True)
     recover_parser.add_argument("--keep-journal", action="store_true")
@@ -896,6 +934,11 @@ def main() -> int:
     publish_parser.add_argument("--value", required=True)
     discard_parser = subparsers.add_parser("discard")
     discard_parser.add_argument("--path", required=True)
+    release_parser = subparsers.add_parser("release")
+    release_parser.add_argument("--path", required=True)
+    release_parser.add_argument("--expected-digest", required=True)
+    release_parser.add_argument("--expected-device", type=int)
+    release_parser.add_argument("--expected-inode", type=int)
     arguments = parser.parse_args()
     try:
         if arguments.command == "exchange":
@@ -921,7 +964,12 @@ def main() -> int:
                     arguments.preserve_candidate_metadata,
                 )
         elif arguments.command == "delete":
-            delete(arguments.target, arguments.expected_digest, arguments.journal)
+            delete(
+                arguments.target,
+                arguments.expected_digest,
+                arguments.journal,
+                arguments.unlink_only,
+            )
         elif arguments.command == "recover":
             print(recover_exchange(arguments.journal, not arguments.keep_journal))
         elif arguments.command == "describe":
@@ -943,6 +991,16 @@ def main() -> int:
             fsync_directory(os.path.abspath(arguments.path))
         elif arguments.command == "publish":
             publish(arguments.path, arguments.value)
+        elif arguments.command == "release":
+            expected_identity = None
+            if arguments.expected_device is not None or arguments.expected_inode is not None:
+                if arguments.expected_device is None or arguments.expected_inode is None:
+                    raise AtomicError("release identity requires both device and inode")
+                expected_identity = {
+                    "device": arguments.expected_device,
+                    "inode": arguments.expected_inode,
+                }
+            release(arguments.path, arguments.expected_digest, expected_identity)
         else:
             discard(arguments.path)
     except (OSError, AtomicError, ValueError, json.JSONDecodeError) as error:
