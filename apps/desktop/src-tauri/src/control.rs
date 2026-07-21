@@ -34176,7 +34176,15 @@ mod tests {
                     "repoRoot": "/home/natkins/project/.claude/worktrees/feature",
                     "rootPath": "/home/natkins/project/.claude/worktrees/feature",
                     "vcsCapability": "git",
-                    "gitMainRoot": "/home/natkins/project"
+                    "gitMainRoot": "/home/natkins/project",
+                    "createdAt": 1,
+                    "updatedAt": 1
+                }],
+                "workspaces": [{
+                    "id": "captains-reserved",
+                    "name": "Captain Workspace",
+                    "kind": "captain",
+                    "tileIds": []
                 }]
             })
             .to_string(),

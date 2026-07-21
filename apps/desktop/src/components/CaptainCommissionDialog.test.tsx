@@ -95,7 +95,7 @@ describe("CaptainCommissionDialog", () => {
       target: { value: "Run the project" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Codebase name is required");
+    expect((await screen.findByRole("alert")).textContent).toContain("Codebase name is required");
     expect(registerProject).not.toHaveBeenCalled();
   });
 });
