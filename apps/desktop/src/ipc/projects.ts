@@ -79,6 +79,15 @@ export function captainBootstrap(input: {
   return controlRequest("captain_bootstrap", input) as Promise<CaptainBootstrap>;
 }
 
+export function captainCheckpoint(input: {
+  shipSlug?: string;
+  captainSessionId?: string;
+  conversationId: string;
+  resumePoint: string;
+}): Promise<{ accepted: string }> {
+  return controlRequest("captain_checkpoint", input) as Promise<{ accepted: string }>;
+}
+
 export function commissionCaptain(input: {
   projectId: string;
   assignment: string;

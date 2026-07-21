@@ -6,6 +6,7 @@ vi.mock("./controlClient", () => ({ controlRequest }));
 
 import {
   captainBootstrap,
+  captainCheckpoint,
   commissionCaptain,
   initializeGit,
   registerProject,
@@ -74,6 +75,47 @@ describe("Project and Captain bridge contracts", () => {
       assignment: "Checkpoint",
       harness: "codex",
     });
+  });
+
+  it("round-trips the native explicit-none lifecycle response contract", async () => {
+    // The Rust control.rs test `non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects`
+    // is the real dispatcher/filesystem/tmux gate.
+    // This frontend seam consumes the same native command names and response fields at the bridge boundary.
+    const project = {
+      projectId: "project-none-real-dispatch",
+      rootPath: "/home/me/non-git",
+      repoRoot: "/home/me/non-git",
+      name: "Non-Git",
+      vcsCapability: "none",
+    };
+    const captain = {
+      shipSlug: "non-git-ship",
+      terminalId: "th_cap_native",
+      projectId: project.projectId,
+      workspaceTabIds: [],
+      crew: [],
+      conversationId: "conversation-native",
+      resumePoint: "resume-native",
+    };
+    const responses = {
+      register_project: project,
+      commission_captain: { alreadyCommissioned: false, project, captain, instructions: "" },
+      captain_checkpoint: { accepted: "captain_checkpoint" },
+      captain_bootstrap: { project, captain, instructions: "", recoverySource: "captains-registry" },
+    };
+    controlRequest.mockImplementation(async (command: string) => responses[command as keyof typeof responses]);
+    const registered = await registerProject({ rootPath: project.rootPath, name: project.name });
+    const commissioned = await commissionCaptain({ projectId: registered.projectId, assignment: "Checkpoint", harness: "codex" });
+    await captainCheckpoint({ shipSlug: captain.shipSlug, conversationId: captain.conversationId, resumePoint: captain.resumePoint });
+    const reloaded = await captainBootstrap({ shipSlug: captain.shipSlug });
+    expect(reloaded.project).toMatchObject(project);
+    expect(reloaded.captain).toMatchObject(captain);
+    expect(commissioned.project).toMatchObject(project);
+    expect(controlRequest).toHaveBeenNthCalledWith(1, "register_project", { rootPath: project.rootPath, name: project.name });
+    expect(controlRequest).toHaveBeenNthCalledWith(2, "commission_captain", { projectId: project.projectId, assignment: "Checkpoint", harness: "codex" });
+    expect(controlRequest).toHaveBeenNthCalledWith(3, "captain_checkpoint", { shipSlug: captain.shipSlug, conversationId: captain.conversationId, resumePoint: captain.resumePoint });
+    expect(controlRequest).toHaveBeenNthCalledWith(4, "captain_bootstrap", { shipSlug: captain.shipSlug });
+    expect(project.vcsCapability).toBe("none");
   });
 
   it("rejects blank display names before any bridge request", async () => {
