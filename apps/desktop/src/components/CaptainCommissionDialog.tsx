@@ -30,7 +30,7 @@ export function CaptainCommissionDialog({
   onClose,
   onCommissioned,
 }: CaptainCommissionDialogProps) {
-  const [mode, setMode] = useState<ProjectMode>("saved");
+  const [mode, setMode] = useState<ProjectMode>("existing");
   const [projects, setProjects] = useState<RegisteredProject[]>([]);
   const [wslHome, setWslHome] = useState("");
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
@@ -71,7 +71,10 @@ export function CaptainCommissionDialog({
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
         setRepoRoot((current) => current || catalog.wslHome || first?.rootPath || "/home");
-        if (catalog.projects.length === 0) setMode("existing");
+        setMode((current) => {
+          if (current !== "existing") return current;
+          return catalog.projects.length > 0 ? "saved" : "existing";
+        });
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));

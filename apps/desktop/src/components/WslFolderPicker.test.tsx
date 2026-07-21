@@ -83,7 +83,7 @@ describe("WslFolderPicker", () => {
       target: { value: "/home/me/../other/" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Go" }));
-    expect(screen.getByRole("alert").textContent).toContain("traversal");
+    expect((await screen.findByRole("alert")).textContent).toContain("traversal");
     await waitFor(() => expect(listDir).toHaveBeenCalledWith("/home/me"));
   });
 
@@ -197,10 +197,11 @@ describe("WslFolderPicker", () => {
       .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
     const onPathChange = vi.fn();
     const view = render(<WslFolderPicker path="/home/old" recentPaths={[]} onPathChange={onPathChange} />);
-    const oldEntry = await screen.findByRole("button", { name: "old" });
+    await screen.findByRole("button", { name: "old" });
     view.rerender(<WslFolderPicker path="/home/new" recentPaths={[]} onPathChange={onPathChange} />);
     expect(await screen.findByText("Refreshing this folder listing.", { exact: false })).toBeTruthy();
     expect(screen.getByText(/Review only; select after refresh completes/)).toBeTruthy();
+    const oldEntry = screen.getByRole("button", { name: "old" });
     expect((oldEntry as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(oldEntry);
     expect(onPathChange).not.toHaveBeenCalled();
@@ -273,12 +274,13 @@ describe("WslFolderPicker", () => {
         { path: "/home/me", branch: "main", isLinked: false },
         { path: "/home/me-linked", branch: "feature", isLinked: true },
       ],
-    }));
+    })));
     expect(gitInfo).toHaveBeenCalledTimes(1);
     expect(gitWorktreeList).toHaveBeenCalledTimes(1);
   });
 
   it("reports non-Git capability without enumerating worktrees", async () => {
+    vi.mocked(listDir).mockResolvedValueOnce([]);
     const onFolderMetadataChange = vi.fn();
     render(
       <WslFolderPicker
@@ -295,7 +297,7 @@ describe("WslFolderPicker", () => {
       git: expect.objectContaining({ isRepo: false }),
       worktreeCount: 0,
       worktrees: [],
-    }));
+    })));
     expect(gitWorktreeList).not.toHaveBeenCalled();
   });
 

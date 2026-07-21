@@ -10,7 +10,7 @@ const pickerSelection = vi.hoisted(() => ({
     metadataStatus: "ready" as string,
     git: { isRepo: false } as Record<string, unknown>,
     worktreeCount: 0,
-    worktrees: null,
+    worktrees: null as unknown[] | null,
     listingError: undefined as string | undefined,
     metadataError: undefined as string | undefined,
   },
@@ -48,7 +48,7 @@ vi.mock("./WslFolderPicker", () => ({
 
 describe("CaptainCommissionDialog", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     pickerSelection.current = {
       listingStatus: "valid-populated",
       metadataStatus: "ready",
@@ -166,9 +166,9 @@ describe("CaptainCommissionDialog", () => {
       wslHome: "/home/me",
     });
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
-    expect(await screen.findByText("/home/me/canonical-app")).toBeTruthy();
+    expect(await screen.findByText(/Canonical App · \/home\/me\/canonical-app/)).toBeTruthy();
     expect(screen.queryByText("/compatibility/wrong-root")).toBeNull();
-    expect(screen.getByText("Canonical App")).toBeTruthy();
+    expect(screen.getAllByText("Canonical App").length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows saved non-Git capability and allows commission preflight", async () => {
@@ -330,6 +330,9 @@ describe("CaptainCommissionDialog", () => {
 
   it("requires an explicit non-empty codebase name", async () => {
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Manual WSL path"), {
+      target: { value: "/home/me/app" },
+    });
     fireEvent.change(await screen.findByLabelText("Assignment"), {
       target: { value: "Run the project" },
     });
@@ -356,6 +359,15 @@ describe("CaptainCommissionDialog", () => {
 
   it("retains a registered Project and retries only commission after failure", async () => {
     let rejectCommission!: (cause: unknown) => void;
+    vi.mocked(registerProject).mockResolvedValueOnce({
+      projectId: "project-none",
+      name: "Appturnity",
+      rootPath: "/home/me/app",
+      repoRoot: "/home/me/app",
+      vcsCapability: "none",
+      createdAt: 1,
+      updatedAt: 1,
+    });
     vi.mocked(commissionCaptain)
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectCommission = reject; }))
       .mockResolvedValueOnce({ alreadyCommissioned: false, captain: { workspaceTabIds: [], crew: [] }, project: {}, instructions: "" } as never);
@@ -442,7 +454,7 @@ describe("CaptainCommissionDialog", () => {
       retryable: false,
     });
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
-    await screen.findByText("Existing App");
+    await screen.findAllByText("Existing App");
     fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
     const alert = await screen.findByRole("alert");

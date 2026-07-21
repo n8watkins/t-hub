@@ -17,11 +17,23 @@ describe("Project and Captain bridge contracts", () => {
 
   it("sends only rootPath and explicit name for non-Git registration", async () => {
     controlRequest.mockResolvedValue({
-      projectId: "project-none",
-      rootPath: "/home/me/app",
-      repoRoot: "/home/me/app",
-      name: "App",
-      vcsCapability: "none",
+      project: {
+        projectId: "project-none",
+        rootPath: "/home/me/app",
+        repoRoot: "/home/me/app",
+        name: "App",
+        vcsCapability: "none",
+      },
+      captain: {
+        shipSlug: "app-captain",
+        terminalId: "th_cap",
+        projectId: "project-none",
+        assignment: "Checkpoint",
+        conversationId: "conversation-1",
+        resumePoint: "checkpoint-1",
+        workspaceTabIds: [],
+        crew: [],
+      },
     });
     await registerProject({ rootPath: " /home/me/app ", name: " App " });
     expect(controlRequest).toHaveBeenCalledWith("register_project", {
@@ -42,11 +54,13 @@ describe("Project and Captain bridge contracts", () => {
 
   it("preserves one Project and Captain identity through bootstrap", async () => {
     controlRequest.mockResolvedValue({
-      projectId: "project-none",
-      rootPath: "/home/me/app",
-      repoRoot: "/home/me/app",
-      name: "App",
-      vcsCapability: "none",
+      project: {
+        projectId: "project-none",
+        rootPath: "/home/me/app",
+        repoRoot: "/home/me/app",
+        name: "App",
+        vcsCapability: "none",
+      },
       captain: {
         shipSlug: "app-captain",
         terminalId: "th_cap",
