@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ShipWheel, X } from "lucide-react";
 import {
   commissionCaptain,
@@ -47,6 +47,10 @@ export function CaptainCommissionDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [registeredProject, setRegisteredProject] = useState<RegisteredProject | null>(null);
+  const sourceChoiceOwned = useRef(false);
+  const claimSourceChoice = useCallback(() => {
+    sourceChoiceOwned.current = true;
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -72,7 +76,7 @@ export function CaptainCommissionDialog({
         setProjectId((current) => current || first?.projectId || "");
         setRepoRoot((current) => current || catalog.wslHome || first?.rootPath || "/home");
         setMode((current) => {
-          if (current !== "existing") return current;
+          if (sourceChoiceOwned.current || current !== "existing") return current;
           return catalog.projects.length > 0 ? "saved" : "existing";
         });
       })
@@ -231,6 +235,7 @@ export function CaptainCommissionDialog({
                       : "var(--th-fg-muted)",
                 }}
                 onClick={() => {
+                  claimSourceChoice();
                   setMode(value);
                   setRegisteredProject(null);
                   setError(null);
@@ -250,7 +255,10 @@ export function CaptainCommissionDialog({
               <select
                 aria-label="Saved codebase"
                 value={projectId}
-                onChange={(event) => setProjectId(event.target.value)}
+                onChange={(event) => {
+                  claimSourceChoice();
+                  setProjectId(event.target.value);
+                }}
                 className={inputClass}
                 style={fieldStyle}
               >
@@ -275,6 +283,7 @@ export function CaptainCommissionDialog({
                       path: project.rootPath ?? project.repoRoot,
                     }))}
                   onPathChange={(path) => {
+                    claimSourceChoice();
                     setRepoRoot(path);
                     setRegisteredProject(null);
                   }}
@@ -290,6 +299,7 @@ export function CaptainCommissionDialog({
                   aria-label="Codebase name"
                   value={projectName}
                   onChange={(event) => {
+                    claimSourceChoice();
                     setProjectName(event.target.value);
                     setRegisteredProject(null);
                   }}
@@ -312,6 +322,7 @@ export function CaptainCommissionDialog({
                       path: project.rootPath ?? project.repoRoot,
                     }))}
                   onPathChange={(path) => {
+                    claimSourceChoice();
                     setNewParent(path);
                     setRegisteredProject(null);
                   }}
@@ -322,6 +333,7 @@ export function CaptainCommissionDialog({
                   aria-label="New codebase name"
                   value={newDisplayName}
                   onChange={(event) => {
+                    claimSourceChoice();
                     setNewDisplayName(event.target.value);
                     setRegisteredProject(null);
                   }}
@@ -335,6 +347,7 @@ export function CaptainCommissionDialog({
                   aria-label="Destination folder name"
                   value={newDestinationLeaf}
                   onChange={(event) => {
+                    claimSourceChoice();
                     setNewDestinationLeaf(event.target.value);
                     setRegisteredProject(null);
                   }}

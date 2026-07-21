@@ -17,25 +17,21 @@ describe("Project and Captain bridge contracts", () => {
 
   it("sends only rootPath and explicit name for non-Git registration", async () => {
     controlRequest.mockResolvedValue({
-      project: {
-        projectId: "project-none",
-        rootPath: "/home/me/app",
-        repoRoot: "/home/me/app",
-        name: "App",
-        vcsCapability: "none",
-      },
-      captain: {
-        shipSlug: "app-captain",
-        terminalId: "th_cap",
-        projectId: "project-none",
-        assignment: "Checkpoint",
-        conversationId: "conversation-1",
-        resumePoint: "checkpoint-1",
-        workspaceTabIds: [],
-        crew: [],
-      },
+      projectId: "project-none",
+      rootPath: "/home/me/app",
+      repoRoot: "/home/me/app",
+      name: "App",
+      vcsCapability: "none",
+      createdAt: 1,
+      updatedAt: 1,
     });
-    await registerProject({ rootPath: " /home/me/app ", name: " App " });
+    const project = await registerProject({ rootPath: " /home/me/app ", name: " App " });
+    expect(project).toMatchObject({
+      projectId: "project-none",
+      rootPath: "/home/me/app",
+      name: "App",
+      vcsCapability: "none",
+    });
     expect(controlRequest).toHaveBeenCalledWith("register_project", {
       rootPath: " /home/me/app ",
       name: " App ",

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { commissionCaptain, listProjects, registerProject } from "../ipc/projects";
@@ -169,6 +169,72 @@ describe("CaptainCommissionDialog", () => {
     expect(await screen.findByText(/Canonical App · \/home\/me\/canonical-app/)).toBeTruthy();
     expect(screen.queryByText("/compatibility/wrong-root")).toBeNull();
     expect(screen.getAllByText("Canonical App").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("preserves an explicitly chosen existing codebase while the catalog is loading", async () => {
+    let resolveCatalog!: (catalog: Awaited<ReturnType<typeof listProjects>>) => void;
+    vi.mocked(listProjects).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCatalog = resolve; }),
+    );
+    vi.mocked(registerProject).mockResolvedValueOnce({
+      projectId: "registered-project",
+      name: "User Project",
+      rootPath: "/home/me/user-project",
+      repoRoot: "/home/me/user-project",
+      vcsCapability: "none",
+      createdAt: 2,
+      updatedAt: 2,
+    });
+
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Choose existing WSL folder" }));
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), {
+      target: { value: "/home/me/user-project" },
+    });
+    fireEvent.change(screen.getByLabelText("Codebase name"), {
+      target: { value: "User Project" },
+    });
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Continue the user-selected project" },
+    });
+
+    await act(async () => {
+      resolveCatalog({
+        projects: [{
+          projectId: "saved-project",
+          name: "Delayed Saved Project",
+          rootPath: "/home/me/saved-project",
+          repoRoot: "/home/me/saved-project",
+          vcsCapability: "none",
+          createdAt: 1,
+          updatedAt: 1,
+        }],
+        count: 1,
+        seq: 1,
+        wslHome: "/home/me",
+      });
+    });
+
+    expect(screen.getByRole("button", { name: "Choose existing WSL folder" }).getAttribute("aria-pressed"))
+      .toBe("true");
+    expect((screen.getByLabelText("Manual WSL path") as HTMLInputElement).value)
+      .toBe("/home/me/user-project");
+    expect((screen.getByLabelText("Codebase name") as HTMLInputElement).value)
+      .toBe("User Project");
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() => expect(registerProject).toHaveBeenCalledWith({
+      rootPath: "/home/me/user-project",
+      name: "User Project",
+    }));
+    await waitFor(() => expect(commissionCaptain).toHaveBeenCalledWith({
+      projectId: "registered-project",
+      assignment: "Continue the user-selected project",
+      harness: "codex",
+    }));
+    expect(commissionCaptain).not.toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "saved-project",
+    }));
   });
 
   it("shows saved non-Git capability and allows commission preflight", async () => {
