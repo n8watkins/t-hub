@@ -196,7 +196,7 @@ def read_intent(journal: str) -> Dict[str, Any]:
     }:
         raise AtomicError("invalid atomic intent")
     if value["phase"] not in {
-        "prepared", "exchanged", "mismatch", "restored", "verified", "committed"
+        "prepared", "exchanged", "mismatch", "restored", "verified", "committed", "cleanup"
     }:
         raise AtomicError("invalid exchange phase")
     return value
@@ -388,10 +388,24 @@ def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     ):
         raise AtomicError("prepared delete path identity changed")
     if target_digest is None and recovery_digest == expected:
-        if intent["phase"] != "committed":
+        if intent["phase"] not in {"committed", "cleanup"}:
             set_phase(journal, intent, "committed")
         if cleanup:
+            set_phase(journal, intent, "cleanup")
             cleanup_deleted_recovery(intent, recovery, expected)
+            remove_journal(journal)
+        return "committed"
+    if target_digest is None and recovery_digest is None \
+        and intent["phase"] in {"committed", "cleanup"}:
+        if cleanup:
+            remove_journal(journal)
+        return "committed"
+    if target_digest is None and intent["phase"] in {"committed", "cleanup"} \
+        and intent["recovery"].get("cleanup") != "unlink" \
+        and identity(recovery) == intent["recovery"].get("target_identity") \
+        and os.lstat(recovery).st_size == 0:
+        if cleanup:
+            discard(recovery)
             remove_journal(journal)
         return "committed"
     if target_digest == expected and recovery_digest is None:
@@ -486,7 +500,10 @@ def delete(target: str, expected: str, journal: str, unlink_only: bool = False) 
     crash("verified")
     set_phase(journal, intent, "committed")
     crash("committed")
-    cleanup_deleted_recovery(intent, recovery, before_digest)
+    set_phase(journal, intent, "cleanup")
+    crash("cleanup")
+    cleanup_deleted_recovery(intent, recovery, expected)
+    crash("cleaned-before-journal")
     remove_journal(journal)
 
 
@@ -865,6 +882,7 @@ def discard(path: str) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    crash("discard-truncated")
     os.unlink(path)
     fsync_directory(os.path.dirname(path))
 

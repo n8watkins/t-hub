@@ -234,15 +234,16 @@ rollback_file_stage() {
         binary|codex-helper|claude-helper|atomic-helper) delete_args=(--unlink-only) ;;
       esac
       python3 "$ATOMIC_SOURCE" delete --target "$target" --expected-digest "$live" \
-        --journal "$TXN/ops/rollback-$name" "${delete_args[@]}"
+        --journal "$TXN/ops/rollback-$name" "${delete_args[@]}" || return 1
     else
       recovery="$(printf '%s' "$stage" | jq -r --arg fallback "$TXN/recovery/$name.bin" '.recovery // $fallback')"
       candidate="$(mktemp "$(dirname "$target")/.t-hub-rollback.XXXXXX")"
-      python3 "$ATOMIC_SOURCE" discard --path "$candidate"
-      python3 "$ATOMIC_SOURCE" materialize --recovery "$recovery" --candidate "$candidate"
+      python3 "$ATOMIC_SOURCE" discard --path "$candidate" || return 1
+      python3 "$ATOMIC_SOURCE" materialize --recovery "$recovery" \
+        --candidate "$candidate" || return 1
       python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
         --expected-digest "$live" --preserve-candidate-metadata \
-        --journal "$TXN/ops/rollback-$name"
+        --journal "$TXN/ops/rollback-$name" || return 1
       candidate_digest="$(describe_digest "$candidate")"
       candidate_device="$(stat -c %d "$candidate")"
       candidate_inode="$(stat -c %i "$candidate")"
@@ -250,13 +251,13 @@ rollback_file_stage() {
         binary|codex-helper|claude-helper|atomic-helper)
           python3 "$ATOMIC_SOURCE" release --path "$candidate" \
             --expected-digest "$candidate_digest" --expected-device "$candidate_device" \
-            --expected-inode "$candidate_inode"
+            --expected-inode "$candidate_inode" || return 1
           ;;
-        *) python3 "$ATOMIC_SOURCE" discard --path "$candidate" ;;
+        *) python3 "$ATOMIC_SOURCE" discard --path "$candidate" || return 1 ;;
       esac
     fi
   fi
-  release_file_stage_candidate "$name"
+  release_file_stage_candidate "$name" || return 1
 }
 
 adopt_interrupted_claude_boundary() {
