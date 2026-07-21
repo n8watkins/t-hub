@@ -52920,9 +52920,14 @@ mod tests {
         });
         let dispatch_ctx = ctx.clone();
         let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        // This barrier follows tmux respawn, harness startup, process
+        // attestations, durable attestation, and registry sync.  Those are
+        // ordinary slow-test work, so three seconds races the healthy path
+        // under parallel scheduling.  Keep the longer deadline local to this
+        // test helper; it does not change any production wait.
         assert_eq!(
             wait_for_boundary
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("dispatch did not reach its post-bind authority barrier"),
             phase
         );
