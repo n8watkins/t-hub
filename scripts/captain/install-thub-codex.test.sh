@@ -37,6 +37,20 @@ chmod 700 "$SOURCE"
 BIN_DIR="$WORK/install/bin"
 CAPTAIN_DIR="$WORK/install/captain"
 
+for bad_args in \
+  '--repair-skills --repair-skills' \
+  '--migrate-legacy-registration --migrate-legacy-registration' \
+  '--unknown-option'; do
+  # shellcheck disable=SC2086
+  T_HUB_MCP_SOURCE="$SOURCE" bash "$SCRIPT" $bad_args >/dev/null 2>&1
+  bad_status=$?
+  if [ "$bad_status" -eq 2 ]; then
+    pass "installer refuses duplicate or unknown flags: $bad_args"
+  else
+    fail "installer accepted or misclassified flags: $bad_args"
+  fi
+done
+
 if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "isolated install exits 0"
 else
@@ -314,6 +328,44 @@ else
   fail "Codex adoption mismatch overwrote the concurrent edit"
 fi
 
+CLAUDE_KILL="$ADOPTION_WORK/claude-kill"
+mkdir -p "$CLAUDE_KILL/home" "$CLAUDE_KILL/codex" "$CLAUDE_KILL/claude" \
+  "$CLAUDE_KILL/bin" "$CLAUDE_KILL/captain"
+cat > "$CLAUDE_KILL/atomic-kill-wrapper.py" <<'EOF'
+#!/usr/bin/env python3
+import json, os, pathlib, signal, subprocess, sys, time
+published = json.loads(sys.argv[-1]) if sys.argv[1] == "publish" else {}
+is_claude_state = any(pathlib.Path(value).name == "claude-state.json" for value in sys.argv[2:])
+if sys.argv[1] == "publish" and is_claude_state and published.get("status") == "committed":
+    os.kill(os.getppid(), signal.SIGKILL)
+    time.sleep(0.2)
+    raise SystemExit(137)
+raise SystemExit(subprocess.run([sys.executable, os.environ["REAL_ATOMIC"], *sys.argv[1:]]).returncode)
+EOF
+chmod 700 "$CLAUDE_KILL/atomic-kill-wrapper.py"
+if HOME="$CLAUDE_KILL/home" CODEX_HOME="$CLAUDE_KILL/codex" CLAUDE_HOME="$CLAUDE_KILL/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CLAUDE_KILL/bin" \
+  T_HUB_CAPTAIN_DIR="$CLAUDE_KILL/captain" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$CLAUDE_KILL/atomic-kill-wrapper.py" \
+  REAL_ATOMIC="$REAL_ATOMIC" bash "$SCRIPT" >"$CLAUDE_KILL/install.log" 2>&1; then
+  fail "killed Claude helper unexpectedly succeeded"
+elif [ ! -e "$CLAUDE_KILL/home/.t-hub/transactions/install-current" ] \
+  && jq -e '
+    (has("mcpServers") | not) or
+    ((.mcpServers | type) == "object" and (.mcpServers | has("t-hub") | not))
+  ' "$CLAUDE_KILL/home/.claude.json" >/dev/null; then
+  pass "parent adopts and rolls back Claude before-only publication"
+else
+  fail "Claude before-only publication wedged or left partial state"
+fi
+if HOME="$CLAUDE_KILL/home" CODEX_HOME="$CLAUDE_KILL/codex" CLAUDE_HOME="$CLAUDE_KILL/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CLAUDE_KILL/bin" \
+  T_HUB_CAPTAIN_DIR="$CLAUDE_KILL/captain" bash "$SCRIPT" >/dev/null 2>&1; then
+  pass "rerun converges after killed Claude helper"
+else
+  fail "rerun remained wedged after killed Claude helper"
+fi
+
 ROLLBACK_WORK="$WORK/rollback"
 ROLLBACK_HOME="$ROLLBACK_WORK/home"
 ROLLBACK_CODEX_HOME="$ROLLBACK_WORK/codex-home"
@@ -453,6 +505,31 @@ if T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
 else
   fail "mid-copy skill recovery did not converge cleanly"
 fi
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_KILL_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_KILL_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_KILL_TXN" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  T_HUB_SKILL_CRASH_AFTER_INDEX=3 \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1; then
+  fail "managed-target skill SIGKILL unexpectedly succeeded"
+elif [ -f "$SKILL_KILL_CLAUDE/commands/handoff.md" ] \
+  && [ -f "$SKILL_KILL_CLAUDE/commands/handoff.md.t-hub-managed" ]; then
+  pass "SIGKILL does not delete untouched future managed targets"
+else
+  fail "SIGKILL damaged an untouched future managed target"
+fi
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_KILL_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_KILL_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_KILL_TXN" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1 \
+  && [ ! -e "$SKILL_KILL_TXN" ]; then
+  pass "pre-existing managed targets recover after mid-copy SIGKILL"
+else
+  fail "pre-existing managed target recovery wedged"
+fi
 
 for crash_stage in binary codex-helper claude-helper atomic-helper claude-config codex-config skills; do
   CRASH_WORK="$WORK/crash-$crash_stage"
@@ -462,13 +539,30 @@ for crash_stage in binary codex-helper claude-helper atomic-helper claude-config
   CRASH_BIN="$CRASH_WORK/install/bin"
   CRASH_CAPTAIN="$CRASH_WORK/install/captain"
   mkdir -p "$CRASH_HOME" "$CRASH_CODEX" "$CRASH_CLAUDE"
+  if [ "$crash_stage" = codex-config ]; then
+    printf '{"cachedMetadata":{"secret":"journal-secret-value"}}\n' > "$CRASH_HOME/.claude.json"
+  fi
   if HOME="$CRASH_HOME" CODEX_HOME="$CRASH_CODEX" CLAUDE_HOME="$CRASH_CLAUDE" \
     T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CRASH_BIN" \
     T_HUB_CAPTAIN_DIR="$CRASH_CAPTAIN" \
     T_HUB_INSTALL_CRASH_AFTER_STAGE="$crash_stage" \
-    bash "$SCRIPT" >/dev/null 2>&1; then
+    bash "$SCRIPT" >"$CRASH_WORK/crash.log" 2>&1; then
     fail "whole-installer SIGKILL unexpectedly succeeded at $crash_stage"
     continue
+  fi
+  if [ "$crash_stage" = codex-config ]; then
+    CRASH_TXN="$CRASH_HOME/.t-hub/transactions/install-current"
+    if [ "$(stat -c %a "$CRASH_TXN")" = 700 ] \
+      && ! find "$CRASH_TXN" -type d -printf '%m\n' | grep -vx 700 >/dev/null \
+      && ! find "$CRASH_TXN" -type f -printf '%m\n' | grep -vx 600 >/dev/null \
+      && grep -Fq 'journal-secret-value' "$CRASH_TXN/helper-state/claude-before.bin" \
+      && ! find "$CRASH_TXN" -type f ! -name '*.bin' -print0 \
+        | xargs -0 grep -F 'journal-secret-value' >/dev/null 2>&1 \
+      && ! grep -Fq 'journal-secret-value' "$CRASH_WORK/crash.log"; then
+      pass "secret recovery is restricted and absent from descriptors and logs"
+    else
+      fail "secret recovery permissions, redaction, or placement is unsafe"
+    fi
   fi
   if HOME="$CRASH_HOME" CODEX_HOME="$CRASH_CODEX" CLAUDE_HOME="$CRASH_CLAUDE" \
     T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CRASH_BIN" \
@@ -487,6 +581,77 @@ for crash_stage in binary codex-helper claude-helper atomic-helper claude-config
     fail "whole-installer recovery failed after $crash_stage"
   fi
 done
+
+PROVENANCE_WORK="$WORK/provenance"
+PROVENANCE_HOME="$PROVENANCE_WORK/home"
+PROVENANCE_CODEX="$PROVENANCE_WORK/codex"
+PROVENANCE_CLAUDE="$PROVENANCE_WORK/claude"
+PROVENANCE_BIN="$PROVENANCE_WORK/install/bin"
+PROVENANCE_CAPTAIN="$PROVENANCE_WORK/install/captain"
+PROVENANCE_SOURCE="$PROVENANCE_WORK/source-t-hub-mcp"
+mkdir -p "$PROVENANCE_HOME" "$PROVENANCE_CODEX" "$PROVENANCE_CLAUDE"
+cp -p "$SOURCE" "$PROVENANCE_SOURCE"
+HOME="$PROVENANCE_HOME" CODEX_HOME="$PROVENANCE_CODEX" CLAUDE_HOME="$PROVENANCE_CLAUDE" \
+  T_HUB_MCP_SOURCE="$PROVENANCE_SOURCE" T_HUB_BIN_DIR="$PROVENANCE_BIN" \
+  T_HUB_CAPTAIN_DIR="$PROVENANCE_CAPTAIN" T_HUB_INSTALL_CRASH_AFTER_STAGE=binary \
+  bash "$SCRIPT" >/dev/null 2>&1 || true
+printf '# changed source provenance\n' >> "$PROVENANCE_SOURCE"
+if HOME="$PROVENANCE_HOME" CODEX_HOME="$PROVENANCE_CODEX" CLAUDE_HOME="$PROVENANCE_CLAUDE" \
+  T_HUB_MCP_SOURCE="$PROVENANCE_SOURCE" T_HUB_BIN_DIR="$PROVENANCE_BIN" \
+  T_HUB_CAPTAIN_DIR="$PROVENANCE_CAPTAIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "changed source adopted an interrupted transaction"
+elif [ -d "$PROVENANCE_HOME/.t-hub/transactions/install-current" ]; then
+  pass "interrupted transaction refuses changed source provenance"
+else
+  fail "provenance mismatch destroyed recovery state"
+fi
+cp -p "$SOURCE" "$PROVENANCE_SOURCE"
+if HOME="$PROVENANCE_HOME" CODEX_HOME="$PROVENANCE_CODEX" CLAUDE_HOME="$PROVENANCE_CLAUDE" \
+  T_HUB_MCP_SOURCE="$PROVENANCE_SOURCE" T_HUB_BIN_DIR="$PROVENANCE_BIN" \
+  T_HUB_CAPTAIN_DIR="$PROVENANCE_CAPTAIN" bash "$SCRIPT" >/dev/null 2>&1 \
+  && [ ! -e "$PROVENANCE_HOME/.t-hub/transactions/install-current" ]; then
+  pass "matching provenance recovers the interrupted transaction"
+else
+  fail "matching provenance did not recover"
+fi
+
+OPTION_WORK="$WORK/provenance-option"
+OPTION_HOME="$OPTION_WORK/home"
+OPTION_CODEX="$OPTION_WORK/codex"
+OPTION_CLAUDE="$OPTION_WORK/claude"
+OPTION_BIN="$OPTION_WORK/install/bin"
+OPTION_CAPTAIN="$OPTION_WORK/install/captain"
+mkdir -p "$OPTION_HOME" "$OPTION_CODEX" "$OPTION_CLAUDE"
+cat > "$OPTION_CODEX/config.toml" <<EOF
+[mcp_servers.t-hub]
+command = "$OPTION_BIN/t-hub-mcp"
+args = []
+env = {}
+env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]
+EOF
+HOME="$OPTION_HOME" CODEX_HOME="$OPTION_CODEX" CLAUDE_HOME="$OPTION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$OPTION_BIN" \
+  T_HUB_CAPTAIN_DIR="$OPTION_CAPTAIN" T_HUB_INSTALL_CRASH_AFTER_STAGE=binary \
+  bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 || true
+if HOME="$OPTION_HOME" CODEX_HOME="$OPTION_CODEX" CLAUDE_HOME="$OPTION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$OPTION_BIN" \
+  T_HUB_CAPTAIN_DIR="$OPTION_CAPTAIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "changed migration option adopted an interrupted transaction"
+elif [ -d "$OPTION_HOME/.t-hub/transactions/install-current" ]; then
+  pass "interrupted transaction binds the migration option"
+else
+  fail "migration-option mismatch destroyed recovery state"
+fi
+if HOME="$OPTION_HOME" CODEX_HOME="$OPTION_CODEX" CLAUDE_HOME="$OPTION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$OPTION_BIN" \
+  T_HUB_CAPTAIN_DIR="$OPTION_CAPTAIN" \
+  bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  && grep -Fq 'env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]' \
+    "$OPTION_CODEX/config.toml"; then
+  pass "matching migration option recovers and converges"
+else
+  fail "matching migration option did not recover"
+fi
 
 SERIAL_WORK="$WORK/serialization"
 SERIAL_HOME="$SERIAL_WORK/home"

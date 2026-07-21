@@ -77,6 +77,16 @@ HAD_CONFIG=false
 EXPECTED_HASH=absent
 BEFORE_DESCRIPTOR='{"presence":"absent","digest":"absent","recovery":null}'
 config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+atomic_exchange() {
+  local target="$1" candidate="$2" expected="$3" outcome
+  if python3 "$ATOMIC_HELPER" exchange --target "$target" --candidate "$candidate" \
+    --expected-sha "$expected" --journal "$candidate.journal"; then
+    return 0
+  fi
+  [ -d "$candidate.journal" ] || return 1
+  outcome="$(python3 "$ATOMIC_HELPER" recover --journal "$candidate.journal")" || return 1
+  [ "$outcome" = committed ]
+}
 publish_before_state() {
   if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
   BEFORE_DESCRIPTOR="$(python3 "$ATOMIC_HELPER" capture \
@@ -119,8 +129,7 @@ rollback() {
     return
   fi
   if "$HAD_CONFIG"; then
-    if ! python3 "$ATOMIC_HELPER" exchange --target "$CONFIG" --candidate "$BACKUP" \
-      --expected-sha "$EXPECTED_HASH"; then
+    if ! atomic_exchange "$CONFIG" "$BACKUP" "$EXPECTED_HASH"; then
       echo "ensure-thub-codex: durable atomic rollback failed" >&2
       return
     fi
@@ -248,8 +257,7 @@ migrate_legacy_registration() {
   } > "$update"
   chmod --reference="$CONFIG" "$update"
 
-  if ! python3 "$ATOMIC_HELPER" exchange --target "$CONFIG" --candidate "$update" \
-    --expected-sha "$source_hash"; then
+  if ! atomic_exchange "$CONFIG" "$update" "$source_hash"; then
     rm -f "$update"
     echo "ensure-thub-codex: config changed concurrently; refusing replacement" >&2
     return 1
@@ -384,14 +392,12 @@ insert_env_vars() {
     rm -f "$update"
     return 1
   fi
-  current_hash=absent
-  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
-  if [ "$current_hash" != "$source_hash" ]; then
+  if ! atomic_exchange "$CONFIG" "$update" "$source_hash"; then
     rm -f "$update"
     echo "ensure-thub-codex: config changed concurrently; refusing replacement" >&2
     return 1
   fi
-  mv -f "$update" "$CONFIG"
+  python3 "$ATOMIC_HELPER" discard --path "$update"
 }
 
 POLICY_BEFORE=""

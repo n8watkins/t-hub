@@ -69,28 +69,39 @@ recover_skill_transaction() {
     temp="$(jq -r .temp "$entry")"
     original_target="$(jq -r .original_target "$entry")"
     original_sidecar="$(jq -r .original_sidecar "$entry")"
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      python3 "$ATOMIC_HELPER" purge --path "$target"
-    fi
-    if [ "$original_target" = true ]; then
-      [ -e "$backup" ] || [ -L "$backup" ] || {
-        echo "install-captain-skills: missing durable target backup: $target" >&2
-        return 1
-      }
-      mv "$backup" "$target"
-      python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+    entry_status="$(jq -r .status "$entry")"
+    if [ "$entry_status" != prepared ]; then
+      if [ "$original_target" = true ]; then
+        if [ -e "$backup" ] || [ -L "$backup" ]; then
+          if [ -e "$target" ] || [ -L "$target" ]; then
+            python3 "$ATOMIC_HELPER" purge --path "$target"
+          fi
+          mv "$backup" "$target"
+          python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+        elif [ ! -e "$target" ] && [ ! -L "$target" ]; then
+          echo "install-captain-skills: target and durable backup are both missing: $target" >&2
+          return 1
+        fi
+      elif [ -e "$target" ] || [ -L "$target" ]; then
+        python3 "$ATOMIC_HELPER" purge --path "$target"
+      fi
     fi
     if [ "$(jq -r .kind "$entry")" = command ]; then
-      if [ -e "$target.t-hub-managed" ]; then
-        python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
-      fi
-      if [ "$original_sidecar" = true ]; then
-        [ -e "$sidecar_backup" ] || {
-          echo "install-captain-skills: missing durable marker backup: $target" >&2
-          return 1
-        }
-        mv "$sidecar_backup" "$target.t-hub-managed"
-        python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+      if [ "$entry_status" != prepared ]; then
+        if [ "$original_sidecar" = true ]; then
+          if [ -e "$sidecar_backup" ]; then
+            if [ -e "$target.t-hub-managed" ]; then
+              python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
+            fi
+            mv "$sidecar_backup" "$target.t-hub-managed"
+            python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+          elif [ ! -e "$target.t-hub-managed" ]; then
+            echo "install-captain-skills: marker and durable backup are both missing: $target" >&2
+            return 1
+          fi
+        elif [ -e "$target.t-hub-managed" ]; then
+          python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
+        fi
       fi
     fi
     if [ -e "$temp" ] || [ -L "$temp" ]; then
@@ -270,7 +281,7 @@ if [ -n "$SKILL_TXN" ]; then
       --arg backup "${BACKUPS[$index]}" --arg sidecar_backup "${SIDECAR_BACKUPS[$index]}" \
       --arg kind "${KINDS[$index]}" --argjson original_target "$original_target" \
       --argjson original_sidecar "$original_sidecar" \
-      '{target:$target,temp:$temp,backup:$backup,sidecar_backup:$sidecar_backup,
+      '{status:"prepared",target:$target,temp:$temp,backup:$backup,sidecar_backup:$sidecar_backup,
         kind:$kind,original_target:$original_target,original_sidecar:$original_sidecar}')"
     python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
   done
@@ -281,6 +292,10 @@ for index in "${!TARGETS[@]}"; do
   backup="${BACKUPS[$index]}"
   # Mark the slot before its first mutation so every partial swap is restorable.
   INSTALLED=$((index + 1))
+  if [ -n "$SKILL_TXN" ]; then
+    entry="$(jq '.status="mutating"' "$SKILL_TXN/entries/$index.json")"
+    python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+  fi
   if [ -e "$target" ] || [ -L "$target" ]; then
     mv "$target" "$backup"
     python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
@@ -295,6 +310,10 @@ for index in "${!TARGETS[@]}"; do
     printf 'managed by T-Hub\nhash-version=2\nsource-sha256=%s\n' \
       "$(file_hash "${SOURCES[$index]}")" > "$target.t-hub-managed"
     python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+  fi
+  if [ -n "$SKILL_TXN" ]; then
+    entry="$(jq '.status="applied"' "$SKILL_TXN/entries/$index.json")"
+    python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
   fi
   if [ "${T_HUB_SKILL_CRASH_AFTER_INDEX:-}" = "$index" ]; then kill -KILL "$$"; fi
 done

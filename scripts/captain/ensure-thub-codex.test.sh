@@ -239,6 +239,29 @@ if jq -e --arg before "$LEGACY_BEFORE_DIGEST" --arg post "$LEGACY_POST_DIGEST" '
 else
   fail "helper Codex ownership boundary is incomplete or secret-bearing"
 fi
+cp -p "$LEGACY_SNAP" "$WORK/config.toml"
+ATOMIC_CRASH_WRAPPER="$WORK/atomic-crash-wrapper.py"
+cat > "$ATOMIC_CRASH_WRAPPER" <<'EOF'
+#!/usr/bin/env python3
+import os, pathlib, subprocess, sys
+environment = os.environ.copy()
+if len(sys.argv) > 1 and sys.argv[1] == "exchange" and not pathlib.Path(os.environ["CRASH_ONCE"]).exists():
+    pathlib.Path(os.environ["CRASH_ONCE"]).touch()
+    environment["T_HUB_ATOMIC_CRASH_AT"] = "exchanged-before-phase"
+result = subprocess.run([sys.executable, os.environ["REAL_ATOMIC"], *sys.argv[1:]], env=environment)
+raise SystemExit(result.returncode)
+EOF
+chmod 700 "$ATOMIC_CRASH_WRAPPER"
+if PATH="$MIGRATION_WRAPPER_DIR:$PATH" REAL_CODEX="$REAL_CODEX" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$ATOMIC_CRASH_WRAPPER" REAL_ATOMIC="$HERE/atomic-config.py" \
+  CRASH_ONCE="$WORK/atomic-crash-once" T_HUB_MCP_BIN="$FAKE_BIN" \
+  bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  && cmp -s "$LEGACY_EXPECTED" "$WORK/config.toml" \
+  && ! find "$WORK" -type d -name '*.journal' -print -quit | grep -q .; then
+  pass "helper recovers an exchange killed before phase publication"
+else
+  fail "helper lost or stranded an exchange journal before publication"
+fi
 if codex mcp get t-hub --json | jq -e --argjson expected "$EXPECTED_ENV_VARS" '
   .transport.env_vars == $expected and
   .transport.env == {} and .transport.args == [] and .transport.cwd == null

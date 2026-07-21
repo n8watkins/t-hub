@@ -535,6 +535,7 @@ def exchange(
         durable_exchange(target, candidate)
         crash("restored-before-phase")
         set_phase(journal, intent, "restored")
+        remove_journal(journal)
         raise AtomicError("target prestate changed during exchange; concurrent state restored")
     set_phase(journal, intent, "exchanged")
     crash("exchanged")
@@ -542,6 +543,7 @@ def exchange(
         set_phase(journal, intent, "mismatch")
         durable_exchange(target, candidate)
         set_phase(journal, intent, "restored")
+        remove_journal(journal)
         raise AtomicError("replacement verification failed; prestate restored")
     set_phase(journal, intent, "verified")
     crash("verified")
@@ -579,32 +581,63 @@ def capture(source: str, recovery: str) -> Dict[str, Any]:
     recovery = os.path.abspath(recovery)
     restricted_directory(os.path.dirname(recovery), False)
     if os.path.lexists(source):
-        require_single_link(source)
-        descriptor_value = description(source)
         input_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         output_descriptor, temporary = tempfile.mkstemp(
             prefix=f".{os.path.basename(recovery)}.", dir=os.path.dirname(recovery)
         )
         try:
+            opened = os.fstat(input_descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise AtomicError(f"refusing non-regular or hard-linked capture source: {source}")
+            source_xattrs = {
+                name: os.getxattr(input_descriptor, name)
+                for name in sorted(os.listxattr(input_descriptor))
+            }
+            digest = hashlib.sha256()
             os.fchmod(output_descriptor, 0o600)
             with os.fdopen(input_descriptor, "rb") as input_file, os.fdopen(
                 output_descriptor, "wb"
             ) as output_file:
                 for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
                     output_file.write(chunk)
                 output_file.flush()
                 os.fsync(output_file.fileno())
+            after = os.stat(source, follow_symlinks=False)
+            if (
+                after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino
+                or after.st_nlink != 1
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or after.st_ctime_ns != opened.st_ctime_ns
+            ):
+                raise AtomicError("capture source changed while it was read")
+            current_xattrs = {
+                name: os.getxattr(source, name, follow_symlinks=False)
+                for name in sorted(os.listxattr(source, follow_symlinks=False))
+            }
+            if current_xattrs != source_xattrs:
+                raise AtomicError("capture source xattrs changed while it was read")
+            descriptor_value = {
+                "content_sha256": digest.hexdigest(),
+                "uid": opened.st_uid,
+                "gid": opened.st_gid,
+                "mode": stat.S_IMODE(opened.st_mode),
+                "xattrs": {
+                    name: hashlib.sha256(value).hexdigest()
+                    for name, value in source_xattrs.items()
+                },
+            }
             os.replace(temporary, recovery)
             fsync_directory(os.path.dirname(recovery))
             metadata_recovery = {
-                "uid": os.lstat(source).st_uid,
-                "gid": os.lstat(source).st_gid,
-                "mode": stat.S_IMODE(os.lstat(source).st_mode),
+                "uid": opened.st_uid,
+                "gid": opened.st_gid,
+                "mode": stat.S_IMODE(opened.st_mode),
                 "xattrs": {
-                    name: base64.b64encode(
-                        os.getxattr(source, name, follow_symlinks=False)
-                    ).decode("ascii")
-                    for name in sorted(os.listxattr(source, follow_symlinks=False))
+                    name: base64.b64encode(value).decode("ascii")
+                    for name, value in source_xattrs.items()
                 },
             }
             write_json(f"{recovery}.metadata", metadata_recovery)
@@ -677,6 +710,22 @@ def materialize(recovery: str, candidate: str) -> None:
         raise
 
 
+def apply_recovery_metadata(recovery: str, candidate: str) -> None:
+    require_regular(candidate)
+    with open(f"{os.path.abspath(recovery)}.metadata", "r", encoding="utf-8") as source:
+        metadata = json.load(source)
+    if set(metadata) != {"uid", "gid", "mode", "xattrs"}:
+        raise AtomicError("invalid recovery metadata")
+    os.chown(candidate, metadata["uid"], metadata["gid"], follow_symlinks=False)
+    os.chmod(candidate, metadata["mode"], follow_symlinks=False)
+    desired_names = set(metadata["xattrs"])
+    for name in set(os.listxattr(candidate, follow_symlinks=False)) - desired_names:
+        os.removexattr(candidate, name, follow_symlinks=False)
+    for name, encoded in metadata["xattrs"].items():
+        os.setxattr(candidate, name, base64.b64decode(encoded), follow_symlinks=False)
+    fsync_file(candidate)
+
+
 def inherit_metadata(source: str, candidate: str) -> None:
     metadata = require_regular(source)
     require_regular(candidate)
@@ -743,7 +792,16 @@ def claude_rollback(target: str, state_path: str, recovery: str, journal: str) -
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        exchange(target, candidate, expected, journal)
+        preserve_metadata = before_file["presence"] == "present"
+        if preserve_metadata:
+            apply_recovery_metadata(recovery, candidate)
+        exchange(
+            target,
+            candidate,
+            expected,
+            journal,
+            preserve_candidate_metadata=preserve_metadata,
+        )
     except BaseException:
         try:
             os.unlink(candidate)

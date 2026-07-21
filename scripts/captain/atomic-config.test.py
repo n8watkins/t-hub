@@ -308,6 +308,24 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"before\n")
             self.assertEqual(linked.read_bytes(), b"before\n")
 
+    def test_cross_directory_candidate_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            other = root / "other"
+            other.mkdir()
+            target = root / "config"
+            candidate = other / "candidate"
+            target.write_bytes(b"before\n")
+            candidate.write_bytes(b"after\n")
+            result = subprocess.run(
+                [sys.executable, str(HELPER), "exchange", "--target", str(target),
+                 "--candidate", str(candidate), "--expected-sha", digest(b"before\n")],
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_bytes(), b"before\n")
+            self.assertEqual(candidate.read_bytes(), b"after\n")
+
     def test_same_digest_path_swap_after_prepare_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -332,6 +350,147 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_bytes(), b"same\n")
             self.assertTrue(journal.exists())
+
+    def test_claude_rollback_preserves_presence_semantics_and_siblings(self) -> None:
+        helper = load_helper()
+        cases = (
+            ("absent-parent", {}, False, False, "absent"),
+            ("empty-parent", {"mcpServers": {}}, True, False, "absent"),
+            ("key-absent", {"mcpServers": {"other": {"keep": True}}}, True, False, "absent"),
+            ("explicit-null", {"mcpServers": {"t-hub": None}}, True, True, "null"),
+        )
+        for name, before_document, parent_present, key_present, key_type in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                recovery_dir = root / "recovery"
+                recovery_dir.mkdir(mode=0o700)
+                before_path = root / "before.json"
+                recovery = recovery_dir / "claude-before.bin"
+                before_path.write_text(json.dumps(before_document) + "\n")
+                before_path.chmod(0o640)
+                os.setxattr(before_path, "user.t-hub-test", b"before-metadata")
+                before_file = helper.capture(str(before_path), str(recovery))
+                target = root / "claude.json"
+                current = {
+                    "cachedMetadata": {"concurrent": "preserved"},
+                    "mcpServers": {
+                        "t-hub": {"type": "stdio", "command": "/new", "args": [], "env": {}},
+                        "concurrent-sibling": {"keep": True},
+                    },
+                }
+                target.write_text(json.dumps(current) + "\n")
+                target.chmod(0o600)
+                os.setxattr(target, "user.t-hub-test", b"post-metadata")
+                node = current["mcpServers"]["t-hub"]
+                state = {
+                    "before_file": before_file,
+                    "before": {
+                        "file_presence": "present",
+                        "parent": {"presence": parent_present, "type": "object" if parent_present else "absent"},
+                        "key": {"presence": key_present, "type": key_type, "digest": "unused"},
+                    },
+                    "post_structure": {
+                        "key": {
+                            "presence": True,
+                            "type": "object",
+                            "digest": helper.canonical_json_digest(node),
+                        }
+                    },
+                }
+                state_path = recovery_dir / "claude-state.json"
+                state_path.write_text(json.dumps(state) + "\n")
+                state_path.chmod(0o600)
+                subprocess.run(
+                    [sys.executable, str(HELPER), "claude-rollback", "--target", str(target),
+                     "--state", str(state_path), "--recovery", str(recovery),
+                     "--journal", str(root / "journal")], check=True,
+                )
+                restored = json.loads(target.read_text())
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+                self.assertEqual(os.getxattr(target, "user.t-hub-test"), b"before-metadata")
+                self.assertEqual(restored["cachedMetadata"], {"concurrent": "preserved"})
+                self.assertEqual(restored["mcpServers"]["concurrent-sibling"], {"keep": True})
+                if key_present:
+                    self.assertIn("t-hub", restored["mcpServers"])
+                    self.assertIsNone(restored["mcpServers"]["t-hub"])
+                else:
+                    self.assertNotIn("t-hub", restored["mcpServers"])
+                    if parent_present and not before_document["mcpServers"]:
+                        # The concurrent sibling keeps the parent non-empty; its
+                        # bytes are never removed to recreate an empty snapshot.
+                        self.assertIn("mcpServers", restored)
+
+    def test_claude_rollback_refuses_changed_owner_and_malformed_parent(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            recovery_dir = root / "recovery"
+            recovery_dir.mkdir(mode=0o700)
+            before = root / "before.json"
+            before.write_text("{}\n")
+            recovery = recovery_dir / "before.bin"
+            before_file = helper.capture(str(before), str(recovery))
+            expected_node = {"command": "/expected"}
+            state = {
+                "before_file": before_file,
+                "before": {
+                    "file_presence": "present",
+                    "parent": {"presence": False, "type": "absent"},
+                    "key": {"presence": False, "type": "absent", "digest": "absent"},
+                },
+                "post_structure": {"key": {
+                    "presence": True, "type": "object",
+                    "digest": helper.canonical_json_digest(expected_node),
+                }},
+            }
+            state_path = recovery_dir / "state.json"
+            state_path.write_text(json.dumps(state) + "\n")
+            state_path.chmod(0o600)
+            for value in (
+                {"mcpServers": {"t-hub": {"command": "/concurrent-owner"}}},
+                {"mcpServers": None},
+            ):
+                target = root / "claude.json"
+                target.write_text(json.dumps(value) + "\n")
+                snapshot = target.read_bytes()
+                result = subprocess.run(
+                    [sys.executable, str(HELPER), "claude-rollback", "--target", str(target),
+                     "--state", str(state_path), "--recovery", str(recovery),
+                     "--journal", str(root / "journal")], check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(target.read_bytes(), snapshot)
+
+    def test_capture_refuses_same_content_path_swap_after_open(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            source = root / "source"
+            replacement = root / "replacement"
+            recovery = state / "before.bin"
+            source.write_bytes(b"same content\n")
+            replacement.write_bytes(b"same content\n")
+            real_open = helper.os.open
+            raced = False
+
+            def racing_open(path, flags, *args, **kwargs):
+                nonlocal raced
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if os.fspath(path) == str(source) and not raced:
+                    raced = True
+                    os.replace(replacement, source)
+                return descriptor
+
+            helper.os.open = racing_open
+            try:
+                with self.assertRaises(helper.AtomicError):
+                    helper.capture(str(source), str(recovery))
+            finally:
+                helper.os.open = real_open
+            self.assertFalse(recovery.exists())
+            self.assertFalse(pathlib.Path(f"{recovery}.metadata").exists())
 
     def test_mismatched_prestate_is_restored_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

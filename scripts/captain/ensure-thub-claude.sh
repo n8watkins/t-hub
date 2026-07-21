@@ -117,6 +117,16 @@ BEFORE_STATE='{}'
 POST_STATE='{}'
 EXPECTED_NODE="$(jq -Scn --arg bin "$BIN" '{type:"stdio", command:$bin, args:[], env:{}}')"
 config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+atomic_exchange() {
+  local target="$1" candidate="$2" expected="$3" outcome
+  if python3 "$ATOMIC_HELPER" exchange --target "$target" --candidate "$candidate" \
+    --expected-sha "$expected" --journal "$candidate.journal"; then
+    return 0
+  fi
+  [ -d "$candidate.journal" ] || return 1
+  outcome="$(python3 "$ATOMIC_HELPER" recover --journal "$candidate.journal")" || return 1
+  [ "$outcome" = committed ]
+}
 config_state() {
   if [ -f "$CONFIG" ]; then
     jq -Sc '{
@@ -183,8 +193,7 @@ rollback() {
   if ! "$HAD_CONFIG" && jq -e 'keys == []' "$update" >/dev/null; then
     remove_restored_config=true
   fi
-  if ! python3 "$ATOMIC_HELPER" exchange --target "$CONFIG" --candidate "$update" \
-    --expected-sha "$source_hash"; then
+  if ! atomic_exchange "$CONFIG" "$update" "$source_hash"; then
     echo "ensure-thub-claude: config changed concurrently during rollback; preserving latest file" >&2
     rm -f "$update"
     [ -z "$BACKUP" ] || rm -f "$BACKUP"
