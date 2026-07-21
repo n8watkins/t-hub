@@ -13453,6 +13453,26 @@ fn agent_followup(
 ) -> Result<Value, String> {
     let followup = parse_agent_followup(args)
         .map_err(|error| agent_followup_error("invalid_request", error))?;
+    let outcome = apply_agent_followup(ctx, &followup, caller, trusted_internal)?;
+    Ok(json!({
+        "accepted": "agent_followup",
+        "requestId": outcome.request_id,
+        "captainSessionId": outcome.captain_session_id,
+        "shipSlug": outcome.ship_slug,
+        "projectId": outcome.project_id,
+        "agentSessionId": outcome.agent_session_id,
+        "messageSeq": outcome.message_seq,
+        "idempotentReplay": outcome.idempotent_replay,
+        "assignmentChanged": outcome.assignment_changed,
+    }))
+}
+
+fn apply_agent_followup(
+    ctx: &ControlContext,
+    followup: &crate::agent_session::AgentFollowup,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<crate::agent_session::AgentFollowupOutcome, String> {
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -13552,17 +13572,16 @@ fn agent_followup(
             .replace_agent_assignment(&followup.agent_session_id, replacement)
             .map_err(|error| agent_followup_error("persistence_failed", error))?;
     }
-    Ok(json!({
-        "accepted": "agent_followup",
-        "requestId": followup.request_id,
-        "captainSessionId": followup.captain_session_id,
-        "shipSlug": followup.ship_slug,
-        "projectId": followup.project_id,
-        "agentSessionId": followup.agent_session_id,
-        "messageSeq": enqueue.seq,
-        "idempotentReplay": enqueue.duplicate,
-        "assignmentChanged": assignment_changed,
-    }))
+    Ok(crate::agent_session::AgentFollowupOutcome {
+        request_id: followup.request_id.clone(),
+        captain_session_id: followup.captain_session_id.clone(),
+        ship_slug: followup.ship_slug.clone(),
+        project_id: followup.project_id.clone(),
+        agent_session_id: followup.agent_session_id.clone(),
+        message_seq: enqueue.seq,
+        idempotent_replay: enqueue.duplicate,
+        assignment_changed,
+    })
 }
 
 fn agent_status_value(agent: AgentSessionRecord, include_assignment: bool) -> Value {
