@@ -383,6 +383,8 @@ describe("CaptainCommissionDialog", () => {
     fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/me/app" } });
     fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    expect(screen.getByRole("dialog").getAttribute("aria-busy")).toBe("true");
+    expect((screen.getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.pointerDown(screen.getByRole("presentation"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
@@ -410,9 +412,43 @@ describe("CaptainCommissionDialog", () => {
     fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
     await waitFor(() => expect(commissionCaptain).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("dialog").getAttribute("aria-busy")).toBe("true");
+    expect((screen.getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.pointerDown(screen.getByRole("presentation"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
     resolveCommission({ alreadyCommissioned: false } as never);
     await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
   });
+
+  it("does not imply registration when saved Captain creation fails", async () => {
+    vi.mocked(listProjects).mockResolvedValueOnce({
+      projects: [{
+        projectId: "saved-project",
+        name: "Existing App",
+        rootPath: "/home/me/existing-app",
+        repoRoot: "/home/me/existing-app",
+        vcsCapability: "none",
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      count: 1,
+      seq: 1,
+      wslHome: "/home/me",
+    });
+    vi.mocked(commissionCaptain).mockRejectedValueOnce({
+      message: "capacity unavailable",
+      kind: "capacity",
+      details: { code: "capacity" },
+      retryable: false,
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    await screen.findByText("Existing App");
+    fireEvent.change(screen.getByLabelText("Assignment"), { target: { value: "Run" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Captain creation failed for existing codebase");
+    expect(alert.textContent).not.toContain("was registered");
+    expect(registerProject).not.toHaveBeenCalled();
+  });
+});

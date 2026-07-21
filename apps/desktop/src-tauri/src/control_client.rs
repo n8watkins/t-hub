@@ -18,6 +18,7 @@
 //! event re-emit). They meet at the NDJSON wire protocol and the shared
 //! [`crate::control::EventFanout`].
 
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -159,7 +160,11 @@ impl ControlEndpoint {
 /// Open a one-shot connection to the control listener, send one request frame, and
 /// await one response line. Connections are short-lived by design (the listener is
 /// built for one MCP round-trip per connection); pooling is a later M1 widening.
-fn request(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
+fn request(
+    endpoint: &ControlEndpoint,
+    command: &str,
+    args: &Value,
+) -> Result<Value, ControlRequestError> {
     request_with_deadline(
         endpoint,
         command,
@@ -174,7 +179,12 @@ enum RequestError {
     Transport(&'static str),
     Timeout(&'static str),
     EndpointChanged(String),
-    App { message: String, retryable: bool },
+    App {
+        message: String,
+        retryable: bool,
+        kind: Option<String>,
+        details: Option<Value>,
+    },
     Protocol(String),
 }
 
@@ -204,7 +214,7 @@ fn request_with_deadline(
     args: &Value,
     overall: Duration,
     attempt_timeout: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, ControlRequestError> {
     let deadline = Instant::now() + overall;
     let first_addr = endpoint.addr();
     match request_once(
@@ -218,13 +228,26 @@ fn request_with_deadline(
         Some(endpoint),
     ) {
         Ok(value) => Ok(value),
-        Err(RequestError::App { message, retryable }) => {
-            Err(encode_control_error(message, retryable))
-        }
-        Err(RequestError::Protocol(message)) => Err(message),
+        Err(RequestError::App {
+            message,
+            retryable,
+            kind,
+            details,
+        }) => Err(ControlRequestError {
+            message,
+            retryable,
+            kind,
+            details,
+        }),
+        Err(RequestError::Protocol(message)) => Err(ControlRequestError::message(message)),
         Err(first) if first.retryable() => {
             if Instant::now() >= deadline {
-                return Err(timeout_message(command, 1, first.stage(), overall));
+                return Err(ControlRequestError::message(timeout_message(
+                    command,
+                    1,
+                    first.stage(),
+                    overall,
+                )));
             }
             let fresh = match &first {
                 RequestError::EndpointChanged(observed) => {
@@ -232,7 +255,9 @@ fn request_with_deadline(
                 }
                 _ => {
                     let Some(fresh) = endpoint.refresh_addr_after(&first_addr) else {
-                        return Err(failure_message(command, 1, &first, false, overall));
+                        return Err(ControlRequestError::message(failure_message(
+                            command, 1, &first, false, overall,
+                        )));
                     };
                     fresh
                 }
@@ -248,11 +273,21 @@ fn request_with_deadline(
                 Some(endpoint),
             ) {
                 Ok(value) => Ok(value),
-                Err(RequestError::App { message, retryable }) => {
-                    Err(encode_control_error(message, retryable))
-                }
-                Err(RequestError::Protocol(message)) => Err(message),
-                Err(second) => Err(failure_message(command, 2, &second, true, overall)),
+                Err(RequestError::App {
+                    message,
+                    retryable,
+                    kind,
+                    details,
+                }) => Err(ControlRequestError {
+                    message,
+                    retryable,
+                    kind,
+                    details,
+                }),
+                Err(RequestError::Protocol(message)) => Err(ControlRequestError::message(message)),
+                Err(second) => Err(ControlRequestError::message(failure_message(
+                    command, 2, &second, true, overall,
+                ))),
             }
         }
         Err(_) => unreachable!("app and protocol errors returned above"),
@@ -275,35 +310,29 @@ fn failure_message(
     )
 }
 
-const RETRYABLE_CONTROL_ERROR_MARKER: &str = "\u{1}retryable-control\u{1}";
-
-fn encode_control_error(message: String, retryable: bool) -> String {
-    if retryable {
-        format!("{RETRYABLE_CONTROL_ERROR_MARKER}{message}")
-    } else {
-        message
-    }
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlRequestError {
     message: String,
     retryable: bool,
+    kind: Option<String>,
+    details: Option<Value>,
 }
 
 impl ControlRequestError {
-    fn from_encoded(message: String) -> Self {
-        match message.strip_prefix(RETRYABLE_CONTROL_ERROR_MARKER) {
-            Some(clean) => Self {
-                message: clean.to_string(),
-                retryable: true,
-            },
-            None => Self {
-                message,
-                retryable: false,
-            },
+    fn message(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+            kind: None,
+            details: None,
         }
+    }
+}
+
+impl fmt::Display for ControlRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
     }
 }
 
@@ -455,6 +484,11 @@ fn request_once(
                 .get("retryable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            kind: resp
+                .get("errorKind")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            details: resp.get("errorDetails").cloned(),
         })
     }
 }
@@ -485,8 +519,9 @@ pub async fn control_request(
         .map_err(|error| ControlRequestError {
             message: format!("control_request: task join failed: {error}"),
             retryable: true,
+            kind: None,
+            details: None,
         })?
-        .map_err(ControlRequestError::from_encoded)
 }
 
 /// The production [`EventEmitter`]: writes every backend event to the control
@@ -952,7 +987,7 @@ mod tests {
         .unwrap_err();
         server.join().unwrap();
         assert!(
-            matches!(error, RequestError::App { message, retryable: false } if
+            matches!(error, RequestError::App { message, retryable: false, .. } if
             message == "commissioning failed after rollback")
         );
     }
@@ -985,12 +1020,84 @@ mod tests {
         .unwrap_err();
         server.join().unwrap();
 
-        let structured = ControlRequestError::from_encoded(error);
+        let structured = error;
         assert!(structured.retryable);
         assert_eq!(
             structured.message,
             "history_resume_failed: placement uncertain"
         );
+    }
+
+    #[test]
+    fn native_control_response_errors_survive_the_tauri_bridge_losslessly() {
+        let cases = [
+            (
+                "register_project",
+                "registration_validation",
+                json!({"code": "invalid_root", "operation": "register_project"}),
+                "The selected folder is not a valid project root",
+            ),
+            (
+                "commission_captain",
+                "capacity",
+                json!({"code": "capacity", "operation": "commission_captain"}),
+                "Captain capacity is unavailable",
+            ),
+            (
+                "commission_captain",
+                "commission_failed",
+                json!({"code": "commission_failed", "operation": "commission_captain"}),
+                "Captain creation failed",
+            ),
+            (
+                "list_dir",
+                "listing_error",
+                json!({"code": "listing_error", "operation": "list_dir"}),
+                "Could not list this folder",
+            ),
+            (
+                "register_project",
+                "validation_error",
+                json!({"code": "unauthorized", "operation": "register_project"}),
+                "The selected folder is not authorized",
+            ),
+        ];
+
+        for (command, kind, details, message) in cases {
+            let response = json!({
+                "ok": false,
+                "error": message,
+                "retryable": false,
+                "errorKind": kind,
+                "errorDetails": details,
+            });
+            let endpoint = test_endpoint(
+                raw_response_server(format!("{response}\n").into_bytes()),
+                None,
+            );
+            let error = request_with_deadline(
+                &endpoint,
+                command,
+                &json!({}),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.message, message);
+            assert!(!error.retryable);
+            assert_eq!(error.kind.as_deref(), Some(kind));
+            assert_eq!(error.details, Some(details.clone()));
+            assert_eq!(
+                serde_json::to_value(&error).unwrap(),
+                json!({
+                    "message": message,
+                    "retryable": false,
+                    "kind": kind,
+                    "details": details,
+                })
+            );
+        }
     }
 
     #[test]
@@ -1097,7 +1204,7 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap_err();
-        assert!(error.contains("control_timeout"), "error: {error}");
+        assert!(error.message.contains("control_timeout"), "error: {error}");
         assert!(started.elapsed() < Duration::from_millis(150));
     }
 
@@ -1134,11 +1241,11 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.contains("response frame exceeds"));
-        assert!(!error.contains(secret));
-        assert!(!error.contains("full-control"));
-        assert!(!error.contains("host-only"));
-        assert!(!error.contains(&addr));
+        assert!(error.message.contains("response frame exceeds"));
+        assert!(!error.message.contains(secret));
+        assert!(!error.message.contains("full-control"));
+        assert!(!error.message.contains("host-only"));
+        assert!(!error.message.contains(&addr));
     }
 
     #[test]
@@ -1155,8 +1262,8 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.contains("unterminated response frame"));
-        assert!(!error.contains(secret));
+        assert!(error.message.contains("unterminated response frame"));
+        assert!(!error.message.contains(secret));
     }
 
     #[test]
@@ -1173,8 +1280,8 @@ mod tests {
             Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.contains("malformed response"));
-        assert!(!error.contains(secret));
+        assert!(error.message.contains("malformed response"));
+        assert!(!error.message.contains(secret));
     }
 
     #[test]
@@ -1189,11 +1296,11 @@ mod tests {
             Duration::from_millis(60),
         )
         .unwrap_err();
-        assert!(error.contains("control_timeout"), "error: {error}");
-        assert!(error.contains("retry_state=exhausted"));
-        assert!(!error.contains(&addr));
-        assert!(!error.contains("full-control"));
-        assert!(!error.contains("host-only"));
+        assert!(error.message.contains("control_timeout"), "error: {error}");
+        assert!(error.message.contains("retry_state=exhausted"));
+        assert!(!error.message.contains(&addr));
+        assert!(!error.message.contains("full-control"));
+        assert!(!error.message.contains("host-only"));
     }
 
     /// F1 REGRESSION (PR #50 fix round): the app's OWN client must follow the server

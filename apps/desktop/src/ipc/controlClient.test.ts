@@ -14,37 +14,36 @@ import {
   controlRequest,
   isRetryableControlError,
 } from "./controlClient";
+import nativeControlErrors from "./fixtures/native-control-error-bridge.json";
 
 beforeEach(() => {
   mocks.invoke.mockReset();
 });
 
 describe("controlRequest", () => {
+  it("preserves native serialized bridge errors without reconstructing them", async () => {
+    for (const response of Object.values(nativeControlErrors)) {
+      mocks.invoke.mockRejectedValueOnce(response);
+      const failure = await controlRequest("native_dispatcher_command").catch((reason) => reason);
+      expect(failure).toBeInstanceOf(ControlRequestError);
+      expect(failure).toMatchObject(response);
+    }
+  });
+
   it("preserves a structured retryable backend rejection", async () => {
-    mocks.invoke.mockRejectedValue({
-      message: "history_resume_failed: placement remained uncertain",
-      retryable: true,
-      kind: "history_resume_failed",
-      details: { phase: "placement" },
-    });
+    mocks.invoke.mockRejectedValue(nativeControlErrors.retryable);
 
     const failure = await controlRequest("history_resume").catch((reason) => reason);
 
     expect(failure).toBeInstanceOf(ControlRequestError);
     expect(failure).toMatchObject({
-      message: "history_resume_failed: placement remained uncertain",
-      retryable: true,
-      kind: "history_resume_failed",
-      details: { phase: "placement" },
+      ...nativeControlErrors.retryable,
     });
     expect(isRetryableControlError(failure)).toBe(true);
   });
 
   it("does not promote a definitive backend rejection to retryable", async () => {
-    mocks.invoke.mockRejectedValue({
-      message: "history_unavailable: conversation is not resumable",
-      retryable: false,
-    });
+    mocks.invoke.mockRejectedValue(nativeControlErrors.validation);
 
     const failure = await controlRequest("history_resume").catch((reason) => reason);
 

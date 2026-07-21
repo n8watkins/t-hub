@@ -152,7 +152,7 @@ export function CaptainCommissionDialog({
       });
       onCommissioned();
     } catch (cause) {
-      setError(formatCommissionFailure(cause, project));
+      setError(formatCommissionFailure(cause, project, mode !== "saved"));
       setBusy(false);
       return;
     } finally {
@@ -175,6 +175,7 @@ export function CaptainCommissionDialog({
       <div
         role="dialog"
         aria-modal="true"
+        aria-busy={busy}
         aria-labelledby="create-captain-title"
         className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-lg border shadow-2xl"
         style={{ background: "var(--th-tile-bg)", borderColor: "var(--th-border)" }}
@@ -197,6 +198,8 @@ export function CaptainCommissionDialog({
             onClick={() => {
               if (!busy) onClose();
             }}
+            disabled={busy}
+            aria-disabled={busy}
             aria-label="Close"
             title="Close"
           >
@@ -487,8 +490,11 @@ function formatRegistrationFailure(cause: unknown): string {
   return `Codebase registration failed. ${failureEvidence(failure)}`;
 }
 
-function formatCommissionFailure(cause: unknown, project: RegisteredProject): string {
+function formatCommissionFailure(cause: unknown, project: RegisteredProject, registered: boolean): string {
   const failure = structuredFailure(cause);
+  if (!registered) {
+    return `Captain creation failed for existing codebase "${project.name}": ${failureEvidence(failure)} Retry Captain creation.`;
+  }
   const normalized = `${failure.kind ?? ""} ${failure.message}`.toLowerCase();
   const action = normalized.includes("capacity")
     ? "Captain capacity is unavailable; retry after capacity is released."
