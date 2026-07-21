@@ -47,6 +47,16 @@ export function CaptainCommissionDialog({
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [registeredProject, setRegisteredProject] = useState<RegisteredProject | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [busy, onClose, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -113,36 +123,46 @@ export function CaptainCommissionDialog({
     }
     setBusy(true);
     setError(null);
+    let project: RegisteredProject;
     try {
-      let project: RegisteredProject;
       if (mode === "existing") {
         if (!repoRoot.trim()) throw new Error("WSL folder is required.");
-        project = await registerProject({
-          rootPath: repoRoot.trim(),
-          name: projectName.trim(),
-        });
+        project = registeredProject?.rootPath === repoRoot.trim() && registeredProject.name === projectName.trim()
+          ? registeredProject
+          : await registerProject({ rootPath: repoRoot.trim(), name: projectName.trim() });
       } else if (mode === "new") {
-        project = await registerProject({
-          rootPath: newCodebaseDestination!,
-          name: newDisplayName.trim(),
-          createDirectory: true,
-        });
+        project = registeredProject?.rootPath === newCodebaseDestination && registeredProject.name === newDisplayName.trim()
+          ? registeredProject
+          : await registerProject({
+              rootPath: newCodebaseDestination!,
+              name: newDisplayName.trim(),
+              createDirectory: true,
+            });
       } else {
         if (!selected) throw new Error("Select a saved codebase.");
         project = selected;
       }
+      if (mode !== "saved") setRegisteredProject(project);
+    } catch (cause) {
+      setError(formatRegistrationFailure(cause));
+      setBusy(false);
+      return;
+    }
+    try {
       await commissionCaptain({
         projectId: project.projectId,
         assignment: assignment.trim(),
         harness,
       });
       onCommissioned();
-      onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(formatCommissionFailure(cause, project));
+      setBusy(false);
+      return;
     } finally {
       setBusy(false);
     }
+    onClose();
   };
 
   const inputClass =
@@ -152,7 +172,9 @@ export function CaptainCommissionDialog({
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 p-4"
       role="presentation"
-      onPointerDown={onClose}
+      onPointerDown={() => {
+        if (!busy) onClose();
+      }}
     >
       <div
         role="dialog"
@@ -176,7 +198,9 @@ export function CaptainCommissionDialog({
           <button
             type="button"
             className="flex h-8 w-8 items-center justify-center rounded hover:bg-white/10"
-            onClick={onClose}
+            onClick={() => {
+              if (!busy) onClose();
+            }}
             aria-label="Close"
             title="Close"
           >
@@ -206,6 +230,7 @@ export function CaptainCommissionDialog({
                 }}
                 onClick={() => {
                   setMode(value);
+                  setRegisteredProject(null);
                   setError(null);
                 }}
               >
@@ -247,7 +272,10 @@ export function CaptainCommissionDialog({
                       label: project.name,
                       path: project.rootPath ?? project.repoRoot,
                     }))}
-                  onPathChange={setRepoRoot}
+                  onPathChange={(path) => {
+                    setRepoRoot(path);
+                    setRegisteredProject(null);
+                  }}
                   onFolderMetadataChange={handleFolderMetadataChange}
                   metadataRefreshToken={metadataRetry}
                   listingRefreshToken={listingRetry}
@@ -260,7 +288,10 @@ export function CaptainCommissionDialog({
                 <input
                   aria-label="Codebase name"
                   value={projectName}
-                  onChange={(event) => setProjectName(event.target.value)}
+                  onChange={(event) => {
+                    setProjectName(event.target.value);
+                    setRegisteredProject(null);
+                  }}
                   className={inputClass}
                   style={fieldStyle}
                   placeholder="Enter a codebase name"
@@ -279,14 +310,20 @@ export function CaptainCommissionDialog({
                       label: project.name,
                       path: project.rootPath ?? project.repoRoot,
                     }))}
-                  onPathChange={setNewParent}
+                  onPathChange={(path) => {
+                    setNewParent(path);
+                    setRegisteredProject(null);
+                  }}
                 />
               </Field>
               <Field label="Codebase name">
                 <input
                   aria-label="New codebase name"
                   value={newDisplayName}
-                  onChange={(event) => setNewDisplayName(event.target.value)}
+                  onChange={(event) => {
+                    setNewDisplayName(event.target.value);
+                    setRegisteredProject(null);
+                  }}
                   className={inputClass}
                   style={fieldStyle}
                   placeholder="my-project"
@@ -296,7 +333,10 @@ export function CaptainCommissionDialog({
                 <input
                   aria-label="Destination folder name"
                   value={newDestinationLeaf}
-                  onChange={(event) => setNewDestinationLeaf(event.target.value)}
+                  onChange={(event) => {
+                    setNewDestinationLeaf(event.target.value);
+                    setRegisteredProject(null);
+                  }}
                   className={inputClass}
                   style={fieldStyle}
                   placeholder="project-folder"
@@ -383,7 +423,14 @@ export function CaptainCommissionDialog({
           className="flex items-center justify-end gap-2 border-t px-4 py-3"
           style={{ borderColor: "var(--th-border)" }}
         >
-          <button type="button" className="h-9 px-3 text-sm" onClick={onClose} disabled={busy}>
+          <button
+            type="button"
+            className="h-9 px-3 text-sm"
+            onClick={() => {
+              if (!busy) onClose();
+            }}
+            disabled={busy}
+          >
             Cancel
           </button>
           <button
@@ -410,6 +457,49 @@ export function CaptainCommissionDialog({
       </div>
     </div>
   );
+}
+
+function structuredFailure(cause: unknown): {
+  message: string;
+  kind?: string;
+  details?: unknown;
+} {
+  if (cause && typeof cause === "object") {
+    const value = cause as { message?: unknown; kind?: unknown; errorKind?: unknown; details?: unknown; errorDetails?: unknown };
+    return {
+      message: typeof value.message === "string" ? value.message : String(cause),
+      kind: typeof value.kind === "string" ? value.kind : typeof value.errorKind === "string" ? value.errorKind : undefined,
+      details: value.details ?? value.errorDetails,
+    };
+  }
+  return { message: cause instanceof Error ? cause.message : String(cause) };
+}
+
+function failureEvidence(failure: ReturnType<typeof structuredFailure>): string {
+  const kind = failure.kind ? ` [${failure.kind}]` : "";
+  const details = failure.details === undefined ? "" : ` Details: ${JSON.stringify(failure.details)}`;
+  return `${failure.message}${kind}${details}`;
+}
+
+function formatRegistrationFailure(cause: unknown): string {
+  const failure = structuredFailure(cause);
+  const normalized = `${failure.kind ?? ""} ${failure.message}`.toLowerCase();
+  if (normalized.includes("unauthor") || normalized.includes("acl")) {
+    return `Codebase registration is not authorized. ${failureEvidence(failure)}`;
+  }
+  if (normalized.includes("list") || normalized.includes("folder") || normalized.includes("path")) {
+    return `Codebase registration could not validate the selected folder. ${failureEvidence(failure)}`;
+  }
+  return `Codebase registration failed. ${failureEvidence(failure)}`;
+}
+
+function formatCommissionFailure(cause: unknown, project: RegisteredProject): string {
+  const failure = structuredFailure(cause);
+  const normalized = `${failure.kind ?? ""} ${failure.message}`.toLowerCase();
+  const action = normalized.includes("capacity")
+    ? "Captain capacity is unavailable; retry after capacity is released."
+    : "Retry Captain creation to commission the registered Project.";
+  return `Codebase "${project.name}" was registered as Project ${project.projectId}, but Captain creation failed: ${failureEvidence(failure)} ${action}`;
 }
 
 function previewNewCodebaseDestination(parent: string, name: string): string {

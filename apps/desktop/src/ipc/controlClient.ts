@@ -38,7 +38,7 @@ export function controlRequest(
 ): Promise<unknown> {
   return invoke("control_request", { command, args }).catch((reason: unknown) => {
     if (isControlRequestFailure(reason)) {
-      throw new ControlRequestError(reason.message, reason.retryable);
+      throw new ControlRequestError(reason.message, reason.retryable, reason.kind, reason.details);
     }
     throw reason;
   });
@@ -47,15 +47,21 @@ export function controlRequest(
 interface ControlRequestFailure {
   message: string;
   retryable: boolean;
+  kind?: string;
+  details?: unknown;
 }
 
 export class ControlRequestError extends Error {
   readonly retryable: boolean;
+  readonly kind?: string;
+  readonly details?: unknown;
 
-  constructor(message: string, retryable: boolean) {
+  constructor(message: string, retryable: boolean, kind?: string, details?: unknown) {
     super(message);
     this.name = "ControlRequestError";
     this.retryable = retryable;
+    this.kind = kind;
+    this.details = details;
   }
 }
 
