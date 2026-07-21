@@ -52,11 +52,11 @@ describe("Project and Captain bridge contracts", () => {
         terminalId: "th_cap",
         projectId: "project-none",
         assignment: "Checkpoint",
+        conversationId: "conversation-1",
+        resumePoint: "checkpoint-1",
         workspaceTabIds: [],
         crew: [],
       },
-      resumePoint: "checkpoint-1",
-      conversationId: "conversation-1",
     });
     const boot = await captainBootstrap({ shipSlug: "app-captain" });
     expect(boot.project.projectId).toBe("project-none");
@@ -77,10 +77,10 @@ describe("Project and Captain bridge contracts", () => {
     });
   });
 
-  it("round-trips the native explicit-none lifecycle response contract", async () => {
-    // The Rust control.rs test `non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects`
-    // is the real dispatcher/filesystem/tmux gate.
-    // This frontend seam consumes the same native command names and response fields at the bridge boundary.
+  it("covers the frontend IPC contract paired with the real explicit-none Rust lifecycle", async () => {
+    // The named Rust test `non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects`
+    // is the real dispatcher/filesystem/tmux/restart gate for populated and empty roots.
+    // This test deliberately covers only the frontend bridge contract and does not claim to run that dispatcher.
     const project = {
       projectId: "project-none-real-dispatch",
       rootPath: "/home/me/non-git",
@@ -100,17 +100,34 @@ describe("Project and Captain bridge contracts", () => {
     const responses = {
       register_project: project,
       commission_captain: { alreadyCommissioned: false, project, captain, instructions: "" },
-      captain_checkpoint: { accepted: "captain_checkpoint" },
+      captain_checkpoint: {
+        accepted: "captain_checkpoint" as const,
+        audited: true,
+        captain,
+        target: "captain" as const,
+      },
       captain_bootstrap: { project, captain, instructions: "", recoverySource: "captains-registry" },
     };
     controlRequest.mockImplementation(async (command: string) => responses[command as keyof typeof responses]);
     const registered = await registerProject({ rootPath: project.rootPath, name: project.name });
     const commissioned = await commissionCaptain({ projectId: registered.projectId, assignment: "Checkpoint", harness: "codex" });
-    await captainCheckpoint({ shipSlug: captain.shipSlug, conversationId: captain.conversationId, resumePoint: captain.resumePoint });
+    const checkpoint = await captainCheckpoint({
+      shipSlug: captain.shipSlug,
+      conversationId: captain.conversationId,
+      resumePoint: captain.resumePoint,
+    });
     const reloaded = await captainBootstrap({ shipSlug: captain.shipSlug });
     expect(reloaded.project).toMatchObject(project);
     expect(reloaded.captain).toMatchObject(captain);
     expect(commissioned.project).toMatchObject(project);
+    expect(checkpoint).toMatchObject({
+      accepted: "captain_checkpoint",
+      audited: true,
+      target: "captain",
+      captain: { conversationId: "conversation-native", resumePoint: "resume-native" },
+    });
+    expect(reloaded.captain.conversationId).toBe("conversation-native");
+    expect(reloaded.captain.resumePoint).toBe("resume-native");
     expect(controlRequest).toHaveBeenNthCalledWith(1, "register_project", { rootPath: project.rootPath, name: project.name });
     expect(controlRequest).toHaveBeenNthCalledWith(2, "commission_captain", { projectId: project.projectId, assignment: "Checkpoint", harness: "codex" });
     expect(controlRequest).toHaveBeenNthCalledWith(3, "captain_checkpoint", { shipSlug: captain.shipSlug, conversationId: captain.conversationId, resumePoint: captain.resumePoint });
