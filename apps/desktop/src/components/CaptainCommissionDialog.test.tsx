@@ -4,6 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { commissionCaptain, listProjects, registerProject } from "../ipc/projects";
 import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
+const pickerSelection = vi.hoisted(() => ({
+  current: {
+    status: "ready",
+    git: { isRepo: false },
+    worktreeCount: 0,
+  },
+}));
+
 vi.mock("../ipc/projects", () => ({
   commissionCaptain: vi.fn(),
   listProjects: vi.fn(),
@@ -13,14 +21,20 @@ vi.mock("./WslFolderPicker", () => ({
   WslFolderPicker: ({
     path,
     onPathChange,
+    onFolderMetadataChange,
   }: {
     path: string;
     onPathChange: (path: string) => void;
+    onFolderMetadataChange?: (selection: unknown) => void;
   }) => (
     <input
       aria-label="Manual WSL path"
       value={path}
-      onChange={(event) => onPathChange(event.target.value)}
+      onChange={(event) => {
+        const nextPath = event.target.value;
+        onPathChange(nextPath);
+        onFolderMetadataChange?.({ ...pickerSelection.current, path: nextPath });
+      }}
     />
   ),
 }));
@@ -28,6 +42,11 @@ vi.mock("./WslFolderPicker", () => ({
 describe("CaptainCommissionDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    pickerSelection.current = {
+      status: "ready",
+      git: { isRepo: false },
+      worktreeCount: 0,
+    };
     vi.mocked(listProjects).mockResolvedValue({
       projects: [],
       count: 0,
@@ -73,9 +92,41 @@ describe("CaptainCommissionDialog", () => {
       }),
     );
     expect(vi.mocked(registerProject).mock.calls[0][0]).not.toHaveProperty("initializeGit");
-    expect(screen.queryByText(/Git/i)).toBeNull();
+    expect(screen.getByText("None")).toBeTruthy();
     await waitFor(() => expect(commissionCaptain).toHaveBeenCalled());
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("shows Git metadata without changing the registration payload", async () => {
+    pickerSelection.current = {
+      status: "ready",
+      git: {
+        isRepo: true,
+        remoteUrl: "https://example.test/app.git",
+        defaultBranch: "main",
+        headCommit: "abc123",
+      },
+      worktreeCount: 3,
+    };
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.change(await screen.findByLabelText("Codebase name"), {
+      target: { value: "Appturnity" },
+    });
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), {
+      target: { value: "/home/natkins/appturnity/monorepo-app" },
+    });
+    expect(screen.getByText("Git")).toBeTruthy();
+    expect(screen.getByText("https://example.test/app.git")).toBeTruthy();
+    expect(screen.getByText("abc123")).toBeTruthy();
+    expect(screen.getByText("3")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Run the project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() => expect(registerProject).toHaveBeenCalledWith({
+      rootPath: "/home/natkins/appturnity/monorepo-app",
+      name: "Appturnity",
+    }));
   });
 
   it("keeps display name separate from the new destination leaf", async () => {
