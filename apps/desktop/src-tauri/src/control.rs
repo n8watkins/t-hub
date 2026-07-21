@@ -29561,6 +29561,10 @@ mod tests {
     use std::sync::{mpsc, Mutex as StdMutex};
     use std::thread;
 
+    // Real tmux fixture progress can be delayed substantially by the parallel
+    // workspace suite, while thirty seconds remains a bounded failure signal.
+    const TEST_ASYNC_FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[test]
     fn control_request_debug_redacts_all_credential_and_argument_values() {
         let request = ControlRequest {
@@ -52230,11 +52234,11 @@ mod tests {
         }
 
         fn wait_for_invocation(&self) {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + TEST_ASYNC_FIXTURE_TIMEOUT;
             while !self.was_invoked() {
                 assert!(
                     Instant::now() < deadline,
-                    "fake Harness command was not invoked"
+                    "fake Harness command was not invoked within the test fixture deadline"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -52426,6 +52430,31 @@ mod tests {
             }
             for terminal_id in self.dispatched_terminal_ids() {
                 let _ = reap_test_tmux_session(&tmux_target(&terminal_id));
+            }
+        }
+    }
+
+    fn wait_for_dispatch_boundary(
+        receiver: &mpsc::Receiver<&'static str>,
+        completion: &AtomicBool,
+        description: &str,
+    ) -> &'static str {
+        let deadline = Instant::now() + TEST_ASYNC_FIXTURE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "dispatch did not reach {description} within the test fixture deadline"
+            );
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(boundary) => return boundary,
+                Err(mpsc::RecvTimeoutError::Timeout) => assert!(
+                    !completion.load(Ordering::SeqCst),
+                    "dispatch worker completed before reaching {description}"
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("dispatch boundary channel disconnected before reaching {description}")
+                }
             }
         }
     }
@@ -54331,12 +54360,15 @@ mod tests {
             "harness": "codex",
             "testHarnessCommand": provider.command,
         });
-        let dispatch_ctx = ctx.clone();
-        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        let completion = Arc::new(AtomicBool::new(false));
+        let mut worker =
+            DispatchWorker::start(ctx.clone(), args, sink.clone(), resume, completion.clone());
         assert_eq!(
-            wait_for_boundary
-                .recv_timeout(Duration::from_secs(3))
-                .expect("dispatch did not reach the private-respawn authority barrier"),
+            wait_for_dispatch_boundary(
+                &wait_for_boundary,
+                &completion,
+                "the private-respawn authority barrier",
+            ),
             boundary
         );
         if boundary == "after_respawn" {
@@ -54372,8 +54404,6 @@ mod tests {
                 .connection_profile = "replacement-powder-profile".into();
             registry.upsert_project(replacement_project).unwrap();
         }
-        resume.send(()).unwrap();
-
         let error = worker.join().unwrap().unwrap_err();
         let expected_phase = if boundary == "before_respawn" {
             "immediately before provider send"
@@ -54576,17 +54606,15 @@ mod tests {
             "harness": "codex",
             "testHarnessCommand": provider.command,
         });
-        let dispatch_ctx = ctx.clone();
-        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
-        // This barrier follows tmux respawn, harness startup, process
-        // attestations, durable attestation, and registry sync.  Those are
-        // ordinary slow-test work, so three seconds races the healthy path
-        // under parallel scheduling.  Keep the longer deadline local to this
-        // test helper; it does not change any production wait.
+        let completion = Arc::new(AtomicBool::new(false));
+        let mut worker =
+            DispatchWorker::start(ctx.clone(), args, sink.clone(), resume, completion.clone());
         assert_eq!(
-            wait_for_boundary
-                .recv_timeout(Duration::from_secs(10))
-                .expect("dispatch did not reach its post-bind authority barrier"),
+            wait_for_dispatch_boundary(
+                &wait_for_boundary,
+                &completion,
+                "its post-bind authority barrier",
+            ),
             phase
         );
         registry.release("dispatch-attestation").unwrap();
@@ -54622,7 +54650,7 @@ mod tests {
                 reached: release_reached,
                 resume: continue_release,
             }));
-            resume.send(()).unwrap();
+            worker.resume();
             assert_eq!(
                 wait_for_release
                     .recv_timeout(Duration::from_secs(3))
@@ -54632,7 +54660,7 @@ mod tests {
             registry.fail_next_persist("injected ambiguous release persistence failure");
             release_resume.send(()).unwrap();
         } else {
-            resume.send(()).unwrap();
+            worker.resume();
         }
 
         let error = worker.join().unwrap().unwrap_err();
