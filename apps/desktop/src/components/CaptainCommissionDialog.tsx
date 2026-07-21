@@ -6,12 +6,6 @@ import {
   registerProject,
   type RegisteredProject,
 } from "../ipc/projects";
-import {
-  gitInfo,
-  gitWorktreeList,
-  type GitInfo,
-  type WorktreeInfo,
-} from "../ipc/git";
 import { WslFolderPicker } from "./WslFolderPicker";
 
 interface CaptainCommissionDialogProps {
@@ -31,13 +25,12 @@ export function CaptainCommissionDialog({
   const [projects, setProjects] = useState<RegisteredProject[]>([]);
   const [wslHome, setWslHome] = useState("");
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
-  const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
-  const [folderWorktrees, setFolderWorktrees] = useState<WorktreeInfo[]>([]);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
   const [newParent, setNewParent] = useState("");
-  const [newName, setNewName] = useState("");
+  const [newDisplayName, setNewDisplayName] = useState("");
+  const [newDestinationLeaf, setNewDestinationLeaf] = useState("");
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -56,7 +49,7 @@ export function CaptainCommissionDialog({
         setNewParent((current) => current || catalog.wslHome || "/home");
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
-        setRepoRoot((current) => current || catalog.wslHome || first?.repoRoot || "/home");
+        setRepoRoot((current) => current || catalog.wslHome || first?.rootPath || "/home");
         if (catalog.projects.length === 0) setMode("existing");
       })
       .catch((cause) => {
@@ -71,30 +64,6 @@ export function CaptainCommissionDialog({
     () => projects.find((project) => project.projectId === projectId),
     [projectId, projects],
   );
-
-  useEffect(() => {
-    if (mode !== "existing" || !repoRoot) return;
-    let cancelled = false;
-    setFolderGit(null);
-    setFolderWorktrees([]);
-    void gitInfo(repoRoot)
-      .then((info) => {
-        if (!cancelled) {
-          setFolderGit(info);
-          if (info.isRepo) {
-            void gitWorktreeList(repoRoot)
-              .then((worktrees) => {
-                if (!cancelled) setFolderWorktrees(worktrees);
-              })
-              .catch(() => undefined);
-          }
-        }
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [mode, repoRoot]);
 
   if (!open) return null;
 
@@ -112,7 +81,9 @@ export function CaptainCommissionDialog({
     let newCodebaseDestination: string | null = null;
     if (mode === "new") {
       try {
-        newCodebaseDestination = validateNewCodebaseDestination(newParent, newName);
+        validateNewCodebaseDestination(newParent, newDestinationLeaf);
+        if (!newDisplayName.trim()) throw new Error("Codebase name is required.");
+        newCodebaseDestination = `${newParent.trim().replace(/\/+$/, "")}/${newDestinationLeaf.trim()}`;
       } catch (validationError) {
         setError(validationError instanceof Error ? validationError.message : String(validationError));
         return;
@@ -131,7 +102,7 @@ export function CaptainCommissionDialog({
       } else if (mode === "new") {
         project = await registerProject({
           rootPath: newCodebaseDestination!,
-          name: newName.trim(),
+          name: newDisplayName.trim(),
           createDirectory: true,
         });
       } else {
@@ -289,16 +260,26 @@ export function CaptainCommissionDialog({
               <Field label="Codebase name">
                 <input
                   aria-label="New codebase name"
-                  value={newName}
-                  onChange={(event) => setNewName(event.target.value)}
+                  value={newDisplayName}
+                  onChange={(event) => setNewDisplayName(event.target.value)}
                   className={inputClass}
                   style={fieldStyle}
                   placeholder="my-project"
                 />
               </Field>
+              <Field label="Destination folder name">
+                <input
+                  aria-label="Destination folder name"
+                  value={newDestinationLeaf}
+                  onChange={(event) => setNewDestinationLeaf(event.target.value)}
+                  className={inputClass}
+                  style={fieldStyle}
+                  placeholder="project-folder"
+                />
+              </Field>
               <Field label="Destination">
                 <output className="block min-h-9 break-all rounded border px-2 py-2 font-mono text-xs" style={fieldStyle}>
-                  {previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name"}
+                  {previewNewCodebaseDestination(newParent, newDestinationLeaf) || "Choose a parent and destination folder"}
                 </output>
               </Field>
               <div className="rounded border border-blue-400/30 bg-blue-400/10 px-3 py-2 text-xs sm:col-span-2">
@@ -352,10 +333,8 @@ export function CaptainCommissionDialog({
             repoRoot={repoRoot}
             assignment={assignment}
             harness={harness}
-            folderGit={folderGit}
-            folderWorktrees={folderWorktrees}
             newParent={newParent}
-            newName={newName}
+            newDestinationLeaf={newDestinationLeaf}
           />
 
           {error && (
@@ -396,15 +375,15 @@ function previewNewCodebaseDestination(parent: string, name: string): string {
   return base && leaf ? `${base}/${leaf}` : "";
 }
 
-function validateNewCodebaseDestination(parent: string, name: string): string {
+export function validateNewCodebaseDestination(parent: string, name: string): string {
   const base = parent.trim().replace(/\/+$/, "");
   const leaf = name.trim();
   if (!base.startsWith("/") || base.startsWith("//") || base.includes("\\")) {
     throw new Error("Parent must be an absolute WSL path.");
   }
-  if (!leaf) throw new Error("Codebase name is required.");
+  if (!leaf) throw new Error("Destination folder name is required.");
   if (leaf === "." || leaf === ".." || /[\\/\u0000-\u001f\u007f]/.test(leaf)) {
-    throw new Error("Codebase name must be one safe folder name.");
+    throw new Error("Destination folder name must be one safe folder name.");
   }
   return `${base}/${leaf}`;
 }
@@ -415,20 +394,16 @@ function ReviewSummary({
   repoRoot,
   assignment,
   harness,
-  folderGit,
-  folderWorktrees,
   newParent,
-  newName,
+  newDestinationLeaf,
 }: {
   mode: ProjectMode;
   selected?: RegisteredProject;
   repoRoot: string;
   assignment: string;
   harness: "codex" | "claude";
-  folderGit: GitInfo | null;
-  folderWorktrees: WorktreeInfo[];
   newParent: string;
-  newName: string;
+  newDestinationLeaf: string;
 }) {
   const source =
     mode === "saved"
@@ -443,7 +418,7 @@ function ReviewSummary({
         : "Select a codebase"
       : mode === "existing"
         ? repoRoot.trim() || "Choose a WSL folder"
-        : previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name";
+        : previewNewCodebaseDestination(newParent, newDestinationLeaf) || "Choose a parent and destination folder";
 
   return (
     <section
@@ -457,38 +432,6 @@ function ReviewSummary({
       <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <ReviewRow label="Source" value={source} />
         <ReviewRow label="Codebase" value={location} />
-        {mode === "existing" && folderGit && (
-          <>
-            <ReviewRow
-              label="Git"
-              value={
-                folderGit.isRepo
-                  ? `${folderGit.branch ?? "Detached HEAD"} · ${folderGit.dirtyCount ? `${folderGit.dirtyCount} changed` : "clean"} · ${folderGit.isLinkedWorktree ? "linked worktree" : "main worktree"}`
-                    : "Not a Git repository - Git operations unavailable"
-              }
-            />
-            {folderGit.isRepo && (
-              <>
-                <ReviewRow
-                  label="Remote"
-                  value={folderGit.remoteUrl || "No origin remote"}
-                />
-                <ReviewRow
-                  label="Default branch"
-                  value={folderGit.defaultBranch || "Not advertised by origin"}
-                />
-                <ReviewRow
-                  label="HEAD"
-                  value={folderGit.headCommit?.slice(0, 12) || "Unknown"}
-                />
-                <ReviewRow
-                  label="Worktrees"
-                  value={`${folderWorktrees.length || 1} detected`}
-                />
-              </>
-            )}
-          </>
-        )}
         {mode === "new" && (
           <>
             <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
