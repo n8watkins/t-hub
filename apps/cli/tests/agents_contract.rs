@@ -349,6 +349,60 @@ fn start_rejects_unknown_admission_purpose_before_control_call() {
 }
 
 #[test]
+fn followup_forwards_the_typed_owned_agent_contract_and_explicit_scope_change() {
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "followup",
+        "agent-1",
+        "Continue the reviewed change",
+        "--request-id",
+        "followup-1",
+        "--captain",
+        "captain-1",
+        "--ship",
+        "ship-1",
+        "--project",
+        "project-1",
+        "--replacement-assignment",
+        "Expanded explicit Assignment",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "agent_followup");
+    assert_eq!(request["args"]["requestId"], "followup-1");
+    assert_eq!(request["args"]["captainSessionId"], "captain-1");
+    assert_eq!(request["args"]["shipSlug"], "ship-1");
+    assert_eq!(request["args"]["projectId"], "project-1");
+    assert_eq!(request["args"]["agentSessionId"], "agent-1");
+    assert_eq!(
+        request["args"]["replacementAssignment"],
+        "Expanded explicit Assignment"
+    );
+}
+
+#[test]
+fn followup_omits_assignment_metadata_when_scope_is_unchanged() {
+    let (output, request) = cli_with_server(&[
+        "agents",
+        "followup",
+        "agent-1",
+        "Continue inside current scope",
+        "--request-id",
+        "followup-2",
+        "--captain",
+        "captain-1",
+        "--ship",
+        "ship-1",
+        "--project",
+        "project-1",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "agent_followup");
+    assert!(request["args"].get("replacementAssignment").is_none());
+}
+
+#[test]
 fn delivery_forwards_the_ordered_integration_manifest_without_rewriting_it() {
     let baseline = "a".repeat(40);
     let interface_commit = "b".repeat(40);

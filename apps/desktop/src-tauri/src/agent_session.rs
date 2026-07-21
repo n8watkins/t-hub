@@ -15,6 +15,67 @@ pub const MAX_INTEGRATION_INPUTS: usize = 256;
 pub const MAX_INTEGRATION_ID_BYTES: usize = 1024;
 pub const MAX_EVENT_BATCH: usize = 128;
 pub const MAX_CHECKPOINT_HISTORY: usize = 4096;
+pub const MAX_FOLLOWUP_BYTES: usize = 16 * 1024;
+
+/// Provider-neutral durable follow-up intent. Control transports parse into this
+/// type, while validation stays independent of MCP, sockets, terminal delivery,
+/// and JSON response formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFollowup {
+    pub request_id: String,
+    pub captain_session_id: String,
+    pub ship_slug: String,
+    pub project_id: String,
+    pub agent_session_id: String,
+    pub message: String,
+    /// Replaces durable Assignment metadata only when explicitly supplied.
+    pub replacement_assignment: Option<String>,
+}
+
+impl AgentFollowup {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("requestId", self.request_id.as_str()),
+            ("captainSessionId", self.captain_session_id.as_str()),
+            ("shipSlug", self.ship_slug.as_str()),
+            ("projectId", self.project_id.as_str()),
+            ("agentSessionId", self.agent_session_id.as_str()),
+            ("message", self.message.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("agent_followup requires a non-empty '{field}'"));
+            }
+        }
+        if self.request_id.len() > 128
+            || !self.request_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+        {
+            return Err(
+                "agent_followup requestId must be at most 128 URL-safe identifier characters"
+                    .into(),
+            );
+        }
+        if self.message.len() > MAX_FOLLOWUP_BYTES {
+            return Err(format!(
+                "agent_followup message must be at most {MAX_FOLLOWUP_BYTES} bytes"
+            ));
+        }
+        if let Some(assignment) = &self.replacement_assignment {
+            if assignment.trim().is_empty() {
+                return Err(
+                    "agent_followup replacementAssignment must be non-empty when supplied".into(),
+                );
+            }
+            if assignment.len() > MAX_ASSIGNMENT_BYTES {
+                return Err(format!(
+                    "agent_followup replacementAssignment must be at most {MAX_ASSIGNMENT_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeState {
@@ -1567,6 +1628,25 @@ mod tests {
             created_at: 11,
         };
         assert!(checkpoint.validate().is_err());
+    }
+
+    #[test]
+    fn followup_validation_requires_stable_identity_and_explicit_valid_scope() {
+        let mut followup = AgentFollowup {
+            request_id: "followup:one".into(),
+            captain_session_id: "captain-1".into(),
+            ship_slug: "ship-1".into(),
+            project_id: "project-1".into(),
+            agent_session_id: "agent-1".into(),
+            message: "Continue with the reviewed fix.".into(),
+            replacement_assignment: None,
+        };
+        followup.validate().unwrap();
+        followup.request_id = "bad request".into();
+        assert!(followup.validate().is_err());
+        followup.request_id = "followup:one".into();
+        followup.replacement_assignment = Some(String::new());
+        assert!(followup.validate().is_err());
     }
 
     #[test]

@@ -722,6 +722,34 @@ fn schema_agent_checkpoint() -> Value {
     })
 }
 
+fn schema_agent_followup() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "requestId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+                "description": "Stable idempotency key. Reuse the same value only to retry this exact follow-up."
+            },
+            "captainSessionId": { "type": "string", "minLength": 1 },
+            "shipSlug": { "type": "string", "minLength": 1 },
+            "projectId": { "type": "string", "minLength": 1 },
+            "agentSessionId": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1, "maxLength": 16384 },
+            "replacementAssignment": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+                "description": "Optional explicit replacement of durable Assignment metadata. Omit when scope is unchanged."
+            }
+        },
+        "required": ["requestId", "captainSessionId", "shipSlug", "projectId", "agentSessionId", "message"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_record_agent_delivery() -> Value {
     let commit = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$" });
     let installer_sha256 = json!({ "type": "string", "pattern": "^[0-9a-fA-F]{64}$" });
@@ -1325,6 +1353,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Append a bounded human-readable checkpoint to a durable agent session.",
             input_schema: schema_agent_checkpoint,
+        },
+        ToolDef {
+            name: "agent_followup",
+            tier: Tier::Organization,
+            summary: "Deliver a restart-safe, idempotent follow-up to an existing owned agent session through its durable inbox. Assignment metadata changes only when replacementAssignment is supplied.",
+            input_schema: schema_agent_followup,
         },
         ToolDef {
             name: "record_agent_delivery",
@@ -1975,6 +2009,28 @@ mod tests {
                 "{name} must not expose reserved Crew capacity outside start_agent"
             );
         }
+    }
+
+    #[test]
+    fn agent_followup_is_typed_idempotent_and_keeps_scope_change_explicit() {
+        let tool = find("agent_followup").unwrap();
+        let mcp = tool.to_mcp();
+        assert_eq!(mcp["annotations"]["t-hubTier"], "organization");
+        assert_eq!(mcp["annotations"]["confirmationRequired"], false);
+        let schema = (tool.input_schema)();
+        assert_eq!(
+            schema["required"],
+            json!([
+                "requestId",
+                "captainSessionId",
+                "shipSlug",
+                "projectId",
+                "agentSessionId",
+                "message"
+            ])
+        );
+        assert!(schema["properties"]["replacementAssignment"].is_object());
+        assert!(find("dispatch_preflight").is_some());
     }
 
     #[test]
