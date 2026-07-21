@@ -25,13 +25,14 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         "list" => list(&args[1..]),
         "show" => show(&args[1..]),
         "checkpoint" => checkpoint(&args[1..]),
+        "followup" => followup(&args[1..]),
         "delivery" => delivery(&args[1..]),
         "events" => events(&args[1..]),
         "" => Err(CliError::usage(
-            "usage: th agents <preflight|start|list|show|checkpoint|delivery|events> ...",
+            "usage: th agents <preflight|start|list|show|checkpoint|followup|delivery|events> ...",
         )),
         other => Err(CliError::usage(format!(
-            "unknown agents subcommand '{other}' (expected preflight|start|list|show|checkpoint|delivery|events)"
+            "unknown agents subcommand '{other}' (expected preflight|start|list|show|checkpoint|followup|delivery|events)"
         ))),
     }
 }
@@ -44,6 +45,7 @@ start      --request-id ID --captain ID --directory PATH --assignment TEXT --sou
 list       --captain ID or --project ID [--cursor N] [--limit N] [--state active|removed] [--json]\n\
 show       <agentSessionId> [--json]\n\
 checkpoint <agentSessionId> <summary> --author ID [--stage STAGE] [--json]\n\
+followup   <agentSessionId> <message> --request-id ID --captain ID --ship SLUG --project ID [--replacement-assignment TEXT] [--json]\n\
 delivery   <agentSessionId> <state> --evidence-json JSON [--json]\n\
 events     <agentSessionId> [--cursor N] [--limit N] [--json]"
     );
@@ -233,6 +235,38 @@ fn checkpoint(args: &[String]) -> Result<(), CliError> {
         input["stage"] = json!(stage);
     }
     call_and_render("agents checkpoint", "agent_checkpoint", input, &flags)
+}
+
+fn followup(args: &[String]) -> Result<(), CliError> {
+    let flags = AgentFlags::parse(
+        args,
+        &[
+            "--request-id",
+            "--captain",
+            "--ship",
+            "--project",
+            "--replacement-assignment",
+        ],
+        &["--json"],
+    )?;
+    flags.require_positionals(
+        2,
+        "th agents followup <agentSessionId> <message> --request-id <id> --captain <id> --ship <slug> --project <id> [--replacement-assignment <text>] [--json]",
+    )?;
+    let agent = positional(&flags, 0, "agents followup", "<agentSessionId>")?;
+    let message = positional(&flags, 1, "agents followup", "<message>")?;
+    let mut input = json!({
+        "requestId": required(&flags, "--request-id", "agents followup")?,
+        "captainSessionId": required(&flags, "--captain", "agents followup")?,
+        "shipSlug": required(&flags, "--ship", "agents followup")?,
+        "projectId": required(&flags, "--project", "agents followup")?,
+        "agentSessionId": agent,
+        "message": message,
+    });
+    if let Some(assignment) = flags.options.get("--replacement-assignment") {
+        input["replacementAssignment"] = json!(assignment);
+    }
+    call_and_render("agents followup", "agent_followup", input, &flags)
 }
 
 fn delivery(args: &[String]) -> Result<(), CliError> {

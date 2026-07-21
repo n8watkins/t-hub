@@ -45,7 +45,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This bounds memory, parsing work, and any structured error derived from a peer.
 const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Spawn-class commands whose retries must dedup via a client `requestId`
+/// Side-effecting commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
 const IDEMPOTENT_COMMANDS: &[&str] = &[
     "spawn_terminal",
@@ -55,6 +55,7 @@ const IDEMPOTENT_COMMANDS: &[&str] = &[
     "commission_captain",
     "dispatch_crew",
     "start_agent",
+    "agent_followup",
 ];
 
 fn is_idempotent_command(command: &str) -> bool {
@@ -2609,6 +2610,7 @@ mod tests {
                 "commission_captain",
                 "dispatch_crew",
                 "start_agent",
+                "agent_followup",
             ]
         );
         for command in IDEMPOTENT_COMMANDS {

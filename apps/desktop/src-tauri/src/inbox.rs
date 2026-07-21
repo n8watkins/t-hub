@@ -42,6 +42,7 @@
 //! gap that closing would need fsync (a crate-wide change, deliberately not made here).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -94,6 +95,11 @@ pub enum ReceiptState {
 pub struct InboxRecord {
     /// Per-recipient monotonic sequence (the FIFO ordering key).
     pub seq: u64,
+    /// Stable producer request identity. Present for typed control-plane sends so
+    /// retries after an app restart replay the original enqueue instead of
+    /// creating a second instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// App-stamped provenance. Phase 2: the coarse subsystem label for app-originated
     /// messages (e.g. the fleet wake), OR a per-session identity id for a
     /// session-originated message. This module NEVER authorizes it (that is Phase 3);
@@ -151,6 +157,17 @@ struct RecipientQueue {
     inflight: Option<u64>,
     /// The messages, in enqueue order.
     records: Vec<InboxRecord>,
+    /// Permanent, body-free idempotency receipts. Processed message bodies may be
+    /// compacted, but a producer request id must never become reusable.
+    #[serde(default)]
+    idempotency: HashMap<String, IdempotencyReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdempotencyReceipt {
+    seq: u64,
+    signature: String,
 }
 
 impl RecipientQueue {
@@ -180,6 +197,7 @@ impl RecipientQueue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnqueueOutcome {
     pub seq: u64,
+    pub duplicate: bool,
 }
 
 /// Why an enqueue was refused. Phase 2 only refuses on overflow (D5 backpressure);
@@ -194,6 +212,13 @@ pub enum EnqueueError {
         depth: usize,
         max: usize,
     },
+    IdempotencyConflict {
+        request_id: String,
+    },
+    Persistence {
+        recipient: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for EnqueueError {
@@ -206,6 +231,14 @@ impl std::fmt::Display for EnqueueError {
             } => write!(
                 f,
                 "inbox overflow for recipient '{recipient}': {depth} open messages at bound {max}"
+            ),
+            EnqueueError::IdempotencyConflict { request_id } => write!(
+                f,
+                "inbox requestId '{request_id}' was already used with a different message"
+            ),
+            EnqueueError::Persistence { recipient, message } => write!(
+                f,
+                "inbox persistence failed for recipient '{recipient}': {message}"
             ),
         }
     }
@@ -393,6 +426,33 @@ impl Inbox {
         body: &str,
         enter: bool,
     ) -> Result<EnqueueOutcome, EnqueueError> {
+        self.enqueue_once(recipient, sender, priority, body, enter, None)
+    }
+
+    /// Enqueue exactly once for a stable producer request id. The idempotency
+    /// receipt is stored in the same atomic segment as the message, so replay
+    /// remains safe across process restart and after body compaction.
+    pub fn enqueue_idempotent(
+        &self,
+        recipient: &str,
+        sender: &str,
+        priority: Priority,
+        body: &str,
+        enter: bool,
+        request_id: &str,
+    ) -> Result<EnqueueOutcome, EnqueueError> {
+        self.enqueue_once(recipient, sender, priority, body, enter, Some(request_id))
+    }
+
+    fn enqueue_once(
+        &self,
+        recipient: &str,
+        sender: &str,
+        priority: Priority,
+        body: &str,
+        enter: bool,
+        request_id: Option<&str>,
+    ) -> Result<EnqueueOutcome, EnqueueError> {
         let mut queues = self.lock();
         let q = queues
             .entry(recipient.to_string())
@@ -400,6 +460,29 @@ impl Inbox {
                 recipient: recipient.to_string(),
                 ..Default::default()
             });
+        let signature = request_id.map(|_| {
+            let value = serde_json::json!({
+                "sender": sender,
+                "priority": priority,
+                "body": body,
+                "enter": enter,
+            });
+            format!("{:x}", Sha256::digest(value.to_string()))
+        });
+        if let (Some(request_id), Some(signature)) = (request_id, signature.as_deref()) {
+            if let Some(receipt) = q.idempotency.get(request_id) {
+                return if receipt.signature == signature {
+                    Ok(EnqueueOutcome {
+                        seq: receipt.seq,
+                        duplicate: true,
+                    })
+                } else {
+                    Err(EnqueueError::IdempotencyConflict {
+                        request_id: request_id.to_string(),
+                    })
+                };
+            }
+        }
         if priority != Priority::Emergency && q.open_records() >= self.max_depth {
             return Err(EnqueueError::Overflow {
                 recipient: recipient.to_string(),
@@ -411,6 +494,7 @@ impl Inbox {
         q.next_seq += 1;
         let record = InboxRecord {
             seq,
+            request_id: request_id.map(str::to_string),
             sender: sender.to_string(),
             priority,
             body: body.to_string(),
@@ -422,10 +506,31 @@ impl Inbox {
             write_attempts: 0,
         };
         q.records.push(record.clone());
-        self.persist(q);
+        if let (Some(request_id), Some(signature)) = (request_id, signature) {
+            q.idempotency.insert(
+                request_id.to_string(),
+                IdempotencyReceipt { seq, signature },
+            );
+        }
+        if let Some(dir) = &self.dir {
+            if let Err(error) = write_segment(dir, q) {
+                q.records.pop();
+                q.next_seq = seq;
+                if let Some(request_id) = request_id {
+                    q.idempotency.remove(request_id);
+                }
+                return Err(EnqueueError::Persistence {
+                    recipient: recipient.to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
         drop(queues);
         self.emit(recipient, &record, "enqueued");
-        Ok(EnqueueOutcome { seq })
+        Ok(EnqueueOutcome {
+            seq,
+            duplicate: false,
+        })
     }
 
     /// Drain AT MOST ONE record for `recipient` at a turn boundary the CALLER has
@@ -795,6 +900,51 @@ mod tests {
         let d = inbox.depth("t1");
         assert_eq!(d.enqueued, 2);
         assert_eq!(d.next_seq, 2);
+    }
+
+    #[test]
+    fn idempotent_enqueue_replays_after_restart_and_rejects_payload_reuse() {
+        let (inbox, dir) = temp_inbox();
+        let first = inbox
+            .enqueue_idempotent(
+                "agent-1",
+                "captain:captain-1",
+                Priority::Standard,
+                "continue",
+                true,
+                "followup-1",
+            )
+            .unwrap();
+        assert_eq!(first.seq, 0);
+        assert!(!first.duplicate);
+        drop(inbox);
+
+        let restored = Inbox::open(dir);
+        let replay = restored
+            .enqueue_idempotent(
+                "agent-1",
+                "captain:captain-1",
+                Priority::Standard,
+                "continue",
+                true,
+                "followup-1",
+            )
+            .unwrap();
+        assert_eq!(replay.seq, 0);
+        assert!(replay.duplicate);
+        assert_eq!(restored.depth("agent-1").enqueued, 1);
+
+        assert!(matches!(
+            restored.enqueue_idempotent(
+                "agent-1",
+                "captain:captain-1",
+                Priority::Standard,
+                "different",
+                true,
+                "followup-1",
+            ),
+            Err(EnqueueError::IdempotencyConflict { .. })
+        ));
     }
 
     #[test]

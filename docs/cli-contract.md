@@ -158,6 +158,7 @@ The supervisory workflow is active through the shared control operation catalog.
 - `th agents start` requires the same exact dispatch baseline and concurrency contract and rejects a dirty checkout, abbreviated commit, stale commit, resource collision, missing ordering contract, or exhausted reserved capacity.
 - A successful `start_agent` response returns `sourceCommit`, `sourceBaseline`, and `admissionPurpose` from the durable admitted record so callers can verify launch provenance without inferring it from their request.
 - `th agents delivery` records evidence for implementation, independent review, acceptance testing, integration, packaging, installation, and live verification without collapsing those states.
+- `th agents followup` delivers one idempotent durable inbox instruction to an exact owned agent session and forwards `--replacement-assignment` only when scope explicitly changes.
 - `th admin list`, `appoint`, `revoke`, `approve-session`, `approve-worktree`, `cleanup-session`, `maintain-session`, `recover-resource`, `prepare-retirement`, and `maintain-fleet-resource` expose durable delegated administration through the same authorization service used by MCP and control clients.
 - `th admin approve-session` sends only the exact session ID, and the backend derives the target kind, ship, and ownership from the authoritative fleet registry.
 - `th admin cleanup-session` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.

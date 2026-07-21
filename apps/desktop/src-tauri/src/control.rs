@@ -161,6 +161,11 @@ fn is_false(b: &bool) -> bool {
 /// [`ControlResponse::retryable`], leaving the human text clean. Callers never write
 /// this by hand - they build retryable errors through [`retryable_error`].
 const RETRYABLE_ERROR_MARKER: &str = "\u{1}retryable\u{1}";
+const AGENT_FOLLOWUP_ERROR_MARKER: &str = "\u{1}agent-followup\u{1}";
+
+fn agent_followup_error(code: &str, message: impl std::fmt::Display) -> String {
+    format!("{AGENT_FOLLOWUP_ERROR_MARKER}{code}\u{1}{message}")
+}
 
 /// Build a dispatcher error tagged RETRYABLE: the human `message` prefixed with the
 /// machine [`RETRYABLE_ERROR_MARKER`]. Any `ControlResponse::err` built from this
@@ -201,6 +206,22 @@ impl ControlResponse {
                 return Self::plain_error(raw);
             };
             return Self::git_init_recovery(operation, phase, message);
+        }
+        if let Some((code, message)) = raw
+            .strip_prefix(AGENT_FOLLOWUP_ERROR_MARKER)
+            .and_then(|rest| rest.split_once('\u{1}'))
+        {
+            return Self {
+                ok: false,
+                result: None,
+                error: Some(message.to_string()),
+                error_details: Some(json!({
+                    "code": code,
+                    "operation": "agent_followup",
+                })),
+                error_kind: Some(code.to_string()),
+                retryable: code == "persistence_failed",
+            };
         }
         match raw.strip_prefix(RETRYABLE_ERROR_MARKER) {
             Some(clean) => Self {
@@ -5465,6 +5486,47 @@ impl CaptainsRegistry {
         })
     }
 
+    pub fn replace_agent_assignment(
+        &self,
+        agent_session_id: &str,
+        assignment: &str,
+    ) -> Result<AgentSessionRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let agent = current
+            .agent_sessions
+            .iter_mut()
+            .find(|agent| agent.agent_session_id == agent_session_id)
+            .ok_or_else(|| format!("agent session '{agent_session_id}' was not found"))?;
+        if agent.assignment == assignment {
+            return Ok(agent.clone());
+        }
+        agent.assignment = assignment.to_string();
+        agent.updated_at = now_ms();
+        agent.validate()?;
+        let result = agent.clone();
+        let cursor = current.seq.saturating_add(1);
+        current.agent_events.push(AgentEvent {
+            cursor,
+            agent_session_id: agent_session_id.to_string(),
+            kind: "assignment_replaced".into(),
+            created_at: result.updated_at,
+            runtime_state: Some(result.runtime_state),
+            work_stage: Some(result.work_stage),
+            checkpoint: None,
+            delivery_states: result.delivery_states(),
+        });
+        if current.agent_events.len() > crate::agent_session::MAX_CHECKPOINT_HISTORY {
+            let overflow =
+                current.agent_events.len() - crate::agent_session::MAX_CHECKPOINT_HISTORY;
+            current.agent_events.drain(0..overflow);
+        }
+        current.seq = cursor;
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     fn update_agent_session_with_event(
         &self,
         agent_session_id: &str,
@@ -10323,7 +10385,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "inbox_ack"
         // comms-plane Phase 3: `authorize` records a durable governance artifact
         // (mutating, audited); only the general originates (enforced by the handler ACL).
-        | "authorize" | "appoint_admin" | "approve_admin_action" | "execute_admin_operation" | "revoke_admin" | "record_agent_delivery" => {
+        | "authorize" | "appoint_admin" | "approve_admin_action" | "execute_admin_operation" | "revoke_admin" | "record_agent_delivery" | "agent_followup" => {
             CommandTier::Organization
         }
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
@@ -12128,7 +12190,20 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         match begin {
             // This exact request already completed: replay its stored outcome. Do
             // NOT re-run, re-charge, or re-audit - the side effect is already done.
-            BeginOutcome::Duplicate(outcome) => return replay_response(outcome),
+            BeginOutcome::Duplicate(outcome) => {
+                let outcome = if req.command == "agent_followup" {
+                    outcome.map_err(|error| {
+                        if error.starts_with("request_conflict:") {
+                            agent_followup_error("request_conflict", error)
+                        } else {
+                            error
+                        }
+                    })
+                } else {
+                    outcome
+                };
+                return replay_response(outcome);
+            }
             // A prior identical request is still running (a retry that raced the
             // original, Incident B): refuse to spawn a second one. The caller polls
             // get_request_status (or retries) until it resolves.
@@ -12235,9 +12310,12 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     );
     let outcome = match &request_id {
         Some(id)
-            if outcome
-                .as_ref()
-                .is_err_and(|error| error.starts_with(RETRYABLE_ERROR_MARKER)) =>
+            if outcome.as_ref().is_err_and(|error| {
+                error.starts_with(RETRYABLE_ERROR_MARKER)
+                    || error.starts_with(&format!(
+                        "{AGENT_FOLLOWUP_ERROR_MARKER}persistence_failed\u{1}"
+                    ))
+            }) =>
         {
             ctx.requests.cancel_reserved(
                 id,
@@ -12290,11 +12368,9 @@ fn is_retired_powder_command(command: &str) -> bool {
     )
 }
 
-/// Commands whose side effects are process/filesystem mutations we make idempotent
-/// via a client `requestId` (ask #1). Deliberately narrow: only the spawn-class
-/// commands from the field incidents (a create-then-register that can leave a
-/// ghost, or a spawn that can duplicate on retry). Read/organization commands are
-/// naturally re-runnable and need no dedup.
+/// Commands whose side effects require a client `requestId`. This includes the
+/// spawn-class commands from the field incidents and typed durable follow-up
+/// delivery, where a transport retry must not enqueue a second instruction.
 const IDEMPOTENT_COMMANDS: &[&str] = &[
     "spawn_terminal",
     "create_worktree",
@@ -12303,6 +12379,7 @@ const IDEMPOTENT_COMMANDS: &[&str] = &[
     "commission_captain",
     "dispatch_crew",
     "start_agent",
+    "agent_followup",
 ];
 
 fn is_idempotent_command(command: &str) -> bool {
@@ -12718,6 +12795,7 @@ fn dispatch_with_caller(
         "rename_captain" => rename_captain(ctx, args, caller, trusted_internal),
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "agent_checkpoint" => agent_checkpoint(ctx, args, caller, trusted_internal),
+        "agent_followup" => agent_followup(ctx, args, caller, trusted_internal),
         "record_agent_delivery" => record_agent_delivery(ctx, args, caller, trusted_internal),
         "appoint_admin" => appoint_admin(ctx, args, caller, trusted_internal),
         "approve_admin_action" => approve_admin_action(ctx, args, caller, trusted_internal),
@@ -13331,6 +13409,160 @@ fn get_agent(
         .find(|agent| agent.agent_session_id == agent_session_id)
         .ok_or_else(|| format!("get_agent: agent '{}' was not found", agent_session_id))?;
     Ok(agent_status_value(agent, true))
+}
+
+fn parse_agent_followup(args: &Value) -> Result<crate::agent_session::AgentFollowup, String> {
+    require_exact_args(
+        args,
+        "agent_followup",
+        &[
+            "requestId",
+            "captainSessionId",
+            "shipSlug",
+            "projectId",
+            "agentSessionId",
+            "message",
+            "replacementAssignment",
+        ],
+    )?;
+    let required = |field: &str| {
+        arg_str(args, field).ok_or_else(|| format!("agent_followup requires a non-empty '{field}'"))
+    };
+    let followup = crate::agent_session::AgentFollowup {
+        request_id: required("requestId")?,
+        captain_session_id: required("captainSessionId")?,
+        ship_slug: required("shipSlug")?,
+        project_id: required("projectId")?,
+        agent_session_id: required("agentSessionId")?,
+        message: required("message")?,
+        replacement_assignment: arg_str(args, "replacementAssignment"),
+    };
+    followup.validate()?;
+    Ok(followup)
+}
+
+/// Deliver an owned agent a durable follow-up without terminal injection. The
+/// inbox is keyed by durable agentSessionId, and its request receipt provides the
+/// restart-safe idempotency boundary. Assignment metadata changes only through
+/// the explicit replacementAssignment field.
+fn agent_followup(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let followup = parse_agent_followup(args)
+        .map_err(|error| agent_followup_error("invalid_request", error))?;
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain.terminal_id.as_deref() == Some(followup.captain_session_id.as_str())
+        })
+        .ok_or_else(|| {
+            agent_followup_error(
+                "captain_not_found",
+                format!(
+                    "agent_followup: Captain '{}' was not found",
+                    followup.captain_session_id
+                ),
+            )
+        })?;
+    if captain.role != FleetRole::Captain
+        || captain.state != ClaimState::Active
+        || captain.ship_slug != followup.ship_slug
+        || captain.project_id.as_deref() != Some(followup.project_id.as_str())
+    {
+        return Err(agent_followup_error(
+            "ownership_mismatch",
+            "agent_followup: Captain, ship, and Project ownership do not match",
+        ));
+    }
+    let agent = snapshot
+        .agent_sessions
+        .iter()
+        .find(|agent| agent.agent_session_id == followup.agent_session_id)
+        .cloned()
+        .ok_or_else(|| {
+            agent_followup_error(
+                "agent_not_found",
+                format!(
+                    "agent_followup: agent '{}' was not found",
+                    followup.agent_session_id
+                ),
+            )
+        })?;
+    if agent.captain_session_id != followup.captain_session_id
+        || agent.project_id != followup.project_id
+    {
+        return Err(agent_followup_error(
+            "ownership_mismatch",
+            "agent_followup: agent is not owned by the specified Captain and Project",
+        ));
+    }
+    if authorize_agent(ctx, &agent, caller, trusted_internal, "agent_followup")
+        != Ok(AgentAuthority::Captain)
+    {
+        return Err(agent_followup_error(
+            "unauthorized",
+            "acl: 'agent_followup' requires the exact active owning Captain",
+        ));
+    }
+    if agent.runtime_state == RuntimeState::Exited
+        || agent.work_stage == crate::agent_session::WorkStage::Stopped
+    {
+        return Err(agent_followup_error(
+            "agent_exited",
+            format!(
+                "agent_followup: agent '{}' has exited and cannot receive follow-up work",
+                followup.agent_session_id
+            ),
+        ));
+    }
+
+    let sender = format!("captain:{}", followup.captain_session_id);
+    let enqueue = ctx
+        .inbox
+        .enqueue_idempotent(
+            &followup.agent_session_id,
+            &sender,
+            crate::inbox::Priority::Standard,
+            &followup.message,
+            true,
+            &followup.request_id,
+        )
+        .map_err(|error| match error {
+            crate::inbox::EnqueueError::IdempotencyConflict { .. } => {
+                agent_followup_error("request_conflict", error)
+            }
+            crate::inbox::EnqueueError::Persistence { .. } => {
+                agent_followup_error("persistence_failed", error)
+            }
+            crate::inbox::EnqueueError::Overflow { .. } => {
+                agent_followup_error("inbox_overflow", error)
+            }
+        })?;
+    let assignment_changed = followup
+        .replacement_assignment
+        .as_deref()
+        .is_some_and(|replacement| replacement != agent.assignment);
+    if let Some(replacement) = &followup.replacement_assignment {
+        ctx.captains
+            .replace_agent_assignment(&followup.agent_session_id, replacement)
+            .map_err(|error| agent_followup_error("persistence_failed", error))?;
+    }
+    Ok(json!({
+        "accepted": "agent_followup",
+        "requestId": followup.request_id,
+        "captainSessionId": followup.captain_session_id,
+        "shipSlug": followup.ship_slug,
+        "projectId": followup.project_id,
+        "agentSessionId": followup.agent_session_id,
+        "messageSeq": enqueue.seq,
+        "idempotentReplay": enqueue.duplicate,
+        "assignmentChanged": assignment_changed,
+    }))
 }
 
 fn agent_status_value(agent: AgentSessionRecord, include_assignment: bool) -> Value {
@@ -28676,6 +28908,14 @@ impl ControlContext {
         self
     }
 
+    /// Attach the process-durable inbox resolved from `T_HUB_INBOX_DIR` or the
+    /// normal user data location. Headless control hosts use this to preserve the
+    /// same restart semantics as the desktop application.
+    pub fn with_durable_inbox(mut self) -> Self {
+        self.inbox = Arc::new(crate::inbox::Inbox::open_default());
+        self
+    }
+
     /// Attach the durable [`crate::authz::AuthzStore`] (comms-plane Phase 3 delegation-
     /// gate carrier). `lib.rs` builds it with `AuthzStore::load` over
     /// `authorizations.json` and shares the same `Arc`; headless tests keep the
@@ -36687,6 +36927,140 @@ mod tests {
         assert!(events["events"]
             .as_array()
             .is_some_and(|events| events.iter().any(|event| event["kind"] == "checkpoint")));
+    }
+
+    #[test]
+    fn authenticated_agent_followup_is_owned_durable_idempotent_and_scope_explicit() {
+        let ctx = test_ctx("agent-followup");
+        seed_starting_agent(&ctx, "followup-agent");
+        let captain_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("capacity-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "capacity-captain")
+            .unwrap();
+        let call = |request_id: &str, message: &str, replacement: Option<&str>| {
+            let mut args = json!({
+                "requestId": request_id,
+                "captainSessionId": "capacity-captain",
+                "shipSlug": "capacity-ship",
+                "projectId": "capacity-project",
+                "agentSessionId": "followup-agent",
+                "message": message,
+            });
+            if let Some(replacement) = replacement {
+                args["replacementAssignment"] = json!(replacement);
+            }
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    "agent-followup",
+                    &captain_identity.secret,
+                    "agent_followup",
+                    args,
+                ),
+            )
+        };
+
+        let first = call("followup-1", "Continue the bounded repair.", None);
+        assert!(first.ok, "got: {:?}", first.error);
+        assert_eq!(
+            first.result.as_ref().unwrap()["agentSessionId"],
+            "followup-agent"
+        );
+        assert_eq!(first.result.as_ref().unwrap()["messageSeq"], 0);
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 1);
+        assert_eq!(
+            ctx.captains.snapshot().agent_sessions[0].assignment,
+            "Pending durable start"
+        );
+
+        let replay = call("followup-1", "Continue the bounded repair.", None);
+        assert!(replay.ok, "got: {:?}", replay.error);
+        assert_eq!(replay.result.as_ref().unwrap()["idempotentReplay"], true);
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 1);
+        let conflict = call("followup-1", "Changed retry payload.", None);
+        assert!(!conflict.ok);
+        assert_eq!(conflict.error_kind.as_deref(), Some("request_conflict"));
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 1);
+
+        let replacement = call(
+            "followup-2",
+            "The reviewed scope is now explicit.",
+            Some("Replacement bounded assignment"),
+        );
+        assert!(replacement.ok, "got: {:?}", replacement.error);
+        assert_eq!(
+            replacement.result.as_ref().unwrap()["assignmentChanged"],
+            true
+        );
+        assert_eq!(
+            ctx.captains.snapshot().agent_sessions[0].assignment,
+            "Replacement bounded assignment"
+        );
+    }
+
+    #[test]
+    fn agent_followup_rejects_foreign_and_exited_agents_with_structured_errors() {
+        let ctx = test_ctx("agent-followup-errors");
+        seed_starting_agent(&ctx, "followup-agent");
+        let foreign_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("foreign-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&foreign_identity.id, "foreign-captain")
+            .unwrap();
+        let args = json!({
+            "requestId": "followup-foreign",
+            "captainSessionId": "capacity-captain",
+            "shipSlug": "capacity-ship",
+            "projectId": "capacity-project",
+            "agentSessionId": "followup-agent",
+            "message": "Do not deliver this.",
+        });
+        let foreign = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup-errors",
+                &foreign_identity.secret,
+                "agent_followup",
+                args.clone(),
+            ),
+        );
+        assert!(!foreign.ok);
+        assert_eq!(foreign.error_kind.as_deref(), Some("unauthorized"));
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 0);
+
+        let captain_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("capacity-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "capacity-captain")
+            .unwrap();
+        ctx.captains
+            .reconcile_agent_runtime("followup-agent", RuntimeState::Exited, None)
+            .unwrap();
+        let mut exited_args = args;
+        exited_args["requestId"] = json!("followup-exited");
+        let exited = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup-errors",
+                &captain_identity.secret,
+                "agent_followup",
+                exited_args,
+            ),
+        );
+        assert!(!exited.ok);
+        assert_eq!(exited.error_kind.as_deref(), Some("agent_exited"));
+        assert_eq!(
+            exited.error_details.as_ref().unwrap()["operation"],
+            "agent_followup"
+        );
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 0);
     }
 
     #[test]

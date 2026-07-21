@@ -35,6 +35,7 @@ static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 const CONTINUITY_CAPTAIN: &str = "ctcap001";
 const CONTINUITY_FOREIGN_CAPTAIN: &str = "frcap001";
 const CONTINUITY_CREW: &str = "ctcrew01";
+const CONTINUITY_AGENT: &str = "ctagent1";
 const CONTINUITY_FOREIGN_CREW: &str = "frcrew01";
 const CONTINUITY_CORTANA: &str = "cort0001";
 const CONTINUITY_SHIP_ADMIN: &str = "shadm001";
@@ -456,6 +457,7 @@ impl ControlProc {
             .env("T_HUB_MCP_CONTROL_SEED_READY_FILE", seed_ready_file)
             .env("T_HUB_MCP_POWDER_STATE_FILE", powder_state_file)
             .env("T_HUB_TMUX_SOCKET", tmux_socket)
+            .env("T_HUB_INBOX_DIR", temp_dir.join("inbox"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
@@ -1204,6 +1206,7 @@ fn mcp_control_helper() {
             .with_captains_registry(registry.clone())
             .with_identity_store(identities)
             .with_delegated_admin(delegated_admin)
+            .with_durable_inbox()
             .with_apply_sink(Arc::new(NoopApplySink));
     let handshake = control::start(context).expect("control listener starts");
     assert_eq!(handshake.local_control_token, token);
@@ -1465,6 +1468,23 @@ fn continuity_control_fixture() -> (
         .expect("retire fixture identity");
 
     let mut snapshot = registry.snapshot();
+    snapshot.agent_sessions.push(
+        serde_json::from_value(json!({
+            "agentSessionId": CONTINUITY_AGENT,
+            "captainSessionId": CONTINUITY_CAPTAIN,
+            "projectId": "continuity-project",
+            "assignment": "Original continuity Assignment",
+            "directory": "/tmp/continuity-project",
+            "harness": "codex",
+            "provider": "codex",
+            "runtimeState": "starting",
+            "workStage": "assigned",
+            "admissionPurpose": "ordinary",
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .expect("seed continuity agent session"),
+    );
     snapshot.cortana = control::CortanaDurableIdentity {
         identity_id: Some(cortana.id.clone()),
         generation: 1,
@@ -2320,6 +2340,14 @@ fn captain_control_continuity_process_merge_gate() {
         Some(&shadow_home),
     );
     initialize_mcp(&captain, 200);
+    let catalog = captain.request(json!({ "jsonrpc": "2.0", "id": 199, "method": "tools/list" }));
+    let catalog_tools = catalog["result"]["tools"].as_array().unwrap();
+    for required in ["dispatch_preflight", "agent_followup"] {
+        assert!(
+            catalog_tools.iter().any(|tool| tool["name"] == required),
+            "continuity tools/list missing {required}"
+        );
+    }
     let initial_mutation = call_tool(
         &captain,
         201,
@@ -2382,6 +2410,28 @@ fn captain_control_continuity_process_merge_gate() {
     assert_eq!(
         renewed_after_expiry["result"]["isError"], false,
         "{renewed_after_expiry}"
+    );
+
+    let followup_args = json!({
+        "requestId": "continuity-followup-1",
+        "captainSessionId": CONTINUITY_CAPTAIN,
+        "shipSlug": "continuity-ship",
+        "projectId": "continuity-project",
+        "agentSessionId": CONTINUITY_AGENT,
+        "message": "Continue the durable continuity proof."
+    });
+    let followup = call_tool(&captain, 205, "agent_followup", followup_args.clone());
+    assert_eq!(followup["result"]["isError"], false, "{followup}");
+    let followup_data = tool_structured(&followup);
+    assert_eq!(followup_data["messageSeq"], 0);
+    assert_eq!(followup_data["assignmentChanged"], false);
+    let persisted: Value = serde_json::from_slice(
+        &fs::read(control.temp_dir.join("captains.json")).expect("read continuity registry"),
+    )
+    .expect("parse continuity registry");
+    assert_eq!(
+        persisted["agentSessions"][0]["assignment"],
+        "Original continuity Assignment"
     );
 
     let ship_appointment = call_tool(
@@ -2518,6 +2568,20 @@ fn captain_control_continuity_process_merge_gate() {
         json!({"orchestratorSessionId": CONTINUITY_CAPTAIN, "scope": "all"}),
     );
     assert!(tool_error_text(&foreign_watch).contains("own or same-ship watch"));
+    let foreign_followup = call_tool(
+        &foreign,
+        252,
+        "agent_followup",
+        json!({
+            "requestId": "continuity-foreign-followup",
+            "captainSessionId": CONTINUITY_CAPTAIN,
+            "shipSlug": "continuity-ship",
+            "projectId": "continuity-project",
+            "agentSessionId": CONTINUITY_AGENT,
+            "message": "This foreign instruction must be refused."
+        }),
+    );
+    assert!(tool_error_text(&foreign_followup).contains("exact active owning Captain"));
 
     let old_read_token = first_auth["readToken"].as_str().unwrap().to_string();
     let pre_restart_handshake = current_handshake(&control.handshake_file);
@@ -2539,6 +2603,14 @@ fn captain_control_continuity_process_merge_gate() {
         json!({"name": "Same MCP after app restart"}),
     );
     assert_eq!(post_restart["result"]["isError"], false, "{post_restart}");
+    let followup_replay = call_tool(&captain, 262, "agent_followup", followup_args);
+    assert_eq!(
+        followup_replay["result"]["isError"], false,
+        "{followup_replay}"
+    );
+    let followup_replay_data = tool_structured(&followup_replay);
+    assert_eq!(followup_replay_data["messageSeq"], 0);
+    assert_eq!(followup_replay_data["idempotentReplay"], true);
     let admin_post_restart = call_tool(
         &ship_admin,
         261,
