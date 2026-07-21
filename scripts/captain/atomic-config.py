@@ -779,7 +779,8 @@ def claude_rollback(target: str, state_path: str, recovery: str, journal: str) -
         if not before["parent"]["presence"] and not parent:
             current.pop("mcpServers", None)
 
-    expected = state_digest(target)
+    live_description = description(target)
+    expected = description_digest(live_description)
     if before_file["presence"] == "absent" and not current:
         delete(target, expected, journal)
         return
@@ -792,7 +793,13 @@ def claude_rollback(target: str, state_path: str, recovery: str, journal: str) -
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        preserve_metadata = before_file["presence"] == "present"
+        metadata_fields = ("uid", "gid", "mode", "xattrs")
+        post_description = state.get("post", {}).get("description", {})
+        metadata_still_owned = all(
+            live_description.get(field) == post_description.get(field)
+            for field in metadata_fields
+        )
+        preserve_metadata = before_file["presence"] == "present" and metadata_still_owned
         if preserve_metadata:
             apply_recovery_metadata(recovery, candidate)
         exchange(

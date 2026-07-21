@@ -57,8 +57,76 @@ recorded_hash() {
   sed -n 's/^source-sha256=//p' "$1"
 }
 
+path_evidence() {
+  local path="$1"
+  if [ -L "$path" ]; then
+    jq -cn --arg type symlink --arg device "$(stat -c %d "$path")" \
+      --arg inode "$(stat -c %i "$path")" --arg mode "$(stat -c %a "$path")" \
+      --arg digest "$(printf '%s' "$(readlink "$path")" | sha256sum | awk '{print $1}')" \
+      '{presence:"present",type:$type,device:$device,inode:$inode,mode:$mode,digest:$digest}'
+  elif [ -d "$path" ]; then
+    jq -cn --arg type directory --arg device "$(stat -c %d "$path")" \
+      --arg inode "$(stat -c %i "$path")" --arg mode "$(stat -c %a "$path")" \
+      --arg digest "$(tree_hash "$path")" \
+      '{presence:"present",type:$type,device:$device,inode:$inode,mode:$mode,digest:$digest}'
+  elif [ -f "$path" ]; then
+    jq -cn --arg type file --arg device "$(stat -c %d "$path")" \
+      --arg inode "$(stat -c %i "$path")" --arg mode "$(stat -c %a "$path")" \
+      --arg digest "$(file_hash "$path")" \
+      '{presence:"present",type:$type,device:$device,inode:$inode,mode:$mode,digest:$digest}'
+  elif [ -e "$path" ]; then
+    echo "install-captain-skills: unsupported path type: $path" >&2
+    return 1
+  else
+    printf '%s\n' '{"presence":"absent"}'
+  fi
+}
+
+path_matches_evidence() {
+  local path="$1" expected="$2" actual
+  actual="$(path_evidence "$path")" || return 1
+  [ "$(printf '%s' "$actual" | jq -cS .)" = "$(printf '%s' "$expected" | jq -cS .)" ]
+}
+
+recover_owned_path() {
+  local target="$1" backup="$2" original="$3" staged="$4"
+  if [ "$(printf '%s' "$original" | jq -r .presence)" = present ]; then
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+      if ! path_matches_evidence "$backup" "$original"; then
+        echo "install-captain-skills: durable backup ownership changed: $backup" >&2
+        return 1
+      fi
+      if [ -e "$target" ] || [ -L "$target" ]; then
+        if ! path_matches_evidence "$target" "$staged"; then
+          echo "install-captain-skills: target left installer ownership: $target" >&2
+          return 1
+        fi
+        python3 "$ATOMIC_HELPER" purge --path "$target"
+      fi
+      mv "$backup" "$target"
+      python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+    elif ! path_matches_evidence "$target" "$original"; then
+      echo "install-captain-skills: original target and durable backup are unavailable: $target" >&2
+      return 1
+    fi
+  else
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+      echo "install-captain-skills: unexpected backup for absent target: $target" >&2
+      return 1
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if ! path_matches_evidence "$target" "$staged"; then
+        echo "install-captain-skills: absent target was created concurrently: $target" >&2
+        return 1
+      fi
+      python3 "$ATOMIC_HELPER" purge --path "$target"
+    fi
+  fi
+}
+
 recover_skill_transaction() {
-  local entry index target backup sidecar_backup original_target original_sidecar temp
+  local entry index target backup sidecar_backup temp sidecar_temp status original staged
+  local original_sidecar staged_sidecar
   [ -n "$SKILL_TXN" ] && [ -d "$SKILL_TXN" ] || return 0
   for ((index = 6; index >= 0; index--)); do
     entry="$SKILL_TXN/entries/$index.json"
@@ -67,45 +135,28 @@ recover_skill_transaction() {
     backup="$(jq -r .backup "$entry")"
     sidecar_backup="$(jq -r .sidecar_backup "$entry")"
     temp="$(jq -r .temp "$entry")"
-    original_target="$(jq -r .original_target "$entry")"
-    original_sidecar="$(jq -r .original_sidecar "$entry")"
-    entry_status="$(jq -r .status "$entry")"
-    if [ "$entry_status" != prepared ]; then
-      if [ "$original_target" = true ]; then
-        if [ -e "$backup" ] || [ -L "$backup" ]; then
-          if [ -e "$target" ] || [ -L "$target" ]; then
-            python3 "$ATOMIC_HELPER" purge --path "$target"
-          fi
-          mv "$backup" "$target"
-          python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
-        elif [ ! -e "$target" ] && [ ! -L "$target" ]; then
-          echo "install-captain-skills: target and durable backup are both missing: $target" >&2
-          return 1
-        fi
-      elif [ -e "$target" ] || [ -L "$target" ]; then
-        python3 "$ATOMIC_HELPER" purge --path "$target"
-      fi
+    sidecar_temp="$(jq -r .sidecar_temp "$entry")"
+    status="$(jq -r .status "$entry")"
+    original="$(jq -c .original "$entry")"
+    staged="$(jq -c .staged "$entry")"
+    original_sidecar="$(jq -c .original_sidecar "$entry")"
+    staged_sidecar="$(jq -c .staged_sidecar "$entry")"
+    if [ "$status" != prepared ]; then
+      recover_owned_path "$target" "$backup" "$original" "$staged" || return 1
     fi
     if [ "$(jq -r .kind "$entry")" = command ]; then
-      if [ "$entry_status" != prepared ]; then
-        if [ "$original_sidecar" = true ]; then
-          if [ -e "$sidecar_backup" ]; then
-            if [ -e "$target.t-hub-managed" ]; then
-              python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
-            fi
-            mv "$sidecar_backup" "$target.t-hub-managed"
-            python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
-          elif [ ! -e "$target.t-hub-managed" ]; then
-            echo "install-captain-skills: marker and durable backup are both missing: $target" >&2
-            return 1
-          fi
-        elif [ -e "$target.t-hub-managed" ]; then
-          python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
-        fi
-      fi
+      case "$status" in
+        sidecar-intent|sidecar-acquired|sidecar-installed|applied)
+          recover_owned_path "$target.t-hub-managed" "$sidecar_backup" \
+            "$original_sidecar" "$staged_sidecar" || return 1
+          ;;
+      esac
     fi
     if [ -e "$temp" ] || [ -L "$temp" ]; then
       python3 "$ATOMIC_HELPER" purge --path "$temp"
+    fi
+    if [ "$sidecar_temp" != null ] && { [ -e "$sidecar_temp" ] || [ -L "$sidecar_temp" ]; }; then
+      python3 "$ATOMIC_HELPER" purge --path "$sidecar_temp"
     fi
   done
   python3 "$ATOMIC_HELPER" purge --path "$SKILL_TXN"
@@ -213,6 +264,7 @@ if [ "$MODE" = verify ]; then
 fi
 
 TEMPS=()
+SIDECAR_TEMPS=()
 BACKUPS=()
 SIDECAR_BACKUPS=()
 INSTALLED=0
@@ -237,6 +289,9 @@ rollback() {
   for temp in "${TEMPS[@]}"; do
     rm -rf "$temp"
   done
+  for temp in "${SIDECAR_TEMPS[@]}"; do
+    rm -f "$temp"
+  done
   for backup in "${BACKUPS[@]}"; do
     rm -rf "$backup"
   done
@@ -259,6 +314,10 @@ for index in "${!SOURCES[@]}"; do
   else
     temp="$(mktemp "$target_root/.$name.staged.XXXXXX")"
     install -m 600 "$source" "$temp"
+    sidecar_temp="$(mktemp "$target_root/.$name.marker.staged.XXXXXX")"
+    printf 'managed by T-Hub\nhash-version=2\nsource-sha256=%s\n' \
+      "$(file_hash "$source")" > "$sidecar_temp"
+    SIDECAR_TEMPS[$index]="$sidecar_temp"
   fi
   TEMPS[$index]="$temp"
   BACKUPS[$index]="$target_root/.$name.previous.$$"
@@ -271,18 +330,27 @@ if [ -n "$SKILL_TXN" ]; then
     --value '{"version":1,"status":"running"}'
   for index in "${!TARGETS[@]}"; do
     target="${TARGETS[$index]}"
-    original_target=false
-    original_sidecar=false
-    if [ -e "$target" ] || [ -L "$target" ]; then original_target=true; fi
-    if [ "${KINDS[$index]}" = command ] && [ -e "$target.t-hub-managed" ]; then
-      original_sidecar=true
+    original="$(path_evidence "$target")"
+    staged="$(path_evidence "${TEMPS[$index]}")"
+    original_sidecar='{"presence":"absent"}'
+    staged_sidecar='{"presence":"absent"}'
+    if [ "${KINDS[$index]}" = command ]; then
+      original_sidecar="$(path_evidence "$target.t-hub-managed")"
+      staged_sidecar="$(path_evidence "${SIDECAR_TEMPS[$index]}")"
     fi
+    sidecar_temp=null
+    if [ "${KINDS[$index]}" = command ]; then sidecar_temp="${SIDECAR_TEMPS[$index]}"; fi
     entry="$(jq -cn --arg target "$target" --arg temp "${TEMPS[$index]}" \
+      --arg sidecar_temp "$sidecar_temp" \
       --arg backup "${BACKUPS[$index]}" --arg sidecar_backup "${SIDECAR_BACKUPS[$index]}" \
-      --arg kind "${KINDS[$index]}" --argjson original_target "$original_target" \
-      --argjson original_sidecar "$original_sidecar" \
-      '{status:"prepared",target:$target,temp:$temp,backup:$backup,sidecar_backup:$sidecar_backup,
-        kind:$kind,original_target:$original_target,original_sidecar:$original_sidecar}')"
+      --arg kind "${KINDS[$index]}" --argjson original "$original" \
+      --argjson staged "$staged" --argjson original_sidecar "$original_sidecar" \
+      --argjson staged_sidecar "$staged_sidecar" \
+      '{status:"prepared",target:$target,temp:$temp,
+        sidecar_temp:(if $sidecar_temp == "null" then null else $sidecar_temp end),
+        backup:$backup,sidecar_backup:$sidecar_backup,
+        kind:$kind,original:$original,staged:$staged,
+        original_sidecar:$original_sidecar,staged_sidecar:$staged_sidecar}')"
     python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
   done
 fi
@@ -290,26 +358,48 @@ fi
 for index in "${!TARGETS[@]}"; do
   target="${TARGETS[$index]}"
   backup="${BACKUPS[$index]}"
-  # Mark the slot before its first mutation so every partial swap is restorable.
+  # Publish intent before mutation, then durable acquisition and installation
+  # boundaries. Recovery still verifies exact inode and digest evidence because
+  # a kill can occur between any rename and its following phase publication.
   INSTALLED=$((index + 1))
   if [ -n "$SKILL_TXN" ]; then
-    entry="$(jq '.status="mutating"' "$SKILL_TXN/entries/$index.json")"
+    entry="$(jq '.status="target-intent"' "$SKILL_TXN/entries/$index.json")"
     python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
   fi
+  if [ "${T_HUB_SKILL_CRASH_AFTER_TARGET_INTENT_INDEX:-}" = "$index" ]; then kill -KILL "$$"; fi
   if [ -e "$target" ] || [ -L "$target" ]; then
     mv "$target" "$backup"
     python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
   fi
-  if [ "${KINDS[$index]}" = command ] && [ -e "$target.t-hub-managed" ]; then
-    mv "$target.t-hub-managed" "${SIDECAR_BACKUPS[$index]}"
-    python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+  if [ -n "$SKILL_TXN" ]; then
+    entry="$(jq '.status="target-acquired"' "$SKILL_TXN/entries/$index.json")"
+    python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
   fi
   mv "${TEMPS[$index]}" "$target"
   python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+  if [ -n "$SKILL_TXN" ]; then
+    entry="$(jq '.status="target-installed"' "$SKILL_TXN/entries/$index.json")"
+    python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+  fi
   if [ "${KINDS[$index]}" = command ]; then
-    printf 'managed by T-Hub\nhash-version=2\nsource-sha256=%s\n' \
-      "$(file_hash "${SOURCES[$index]}")" > "$target.t-hub-managed"
+    if [ -n "$SKILL_TXN" ]; then
+      entry="$(jq '.status="sidecar-intent"' "$SKILL_TXN/entries/$index.json")"
+      python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+    fi
+    if [ -e "$target.t-hub-managed" ]; then
+      mv "$target.t-hub-managed" "${SIDECAR_BACKUPS[$index]}"
+      python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+    fi
+    if [ -n "$SKILL_TXN" ]; then
+      entry="$(jq '.status="sidecar-acquired"' "$SKILL_TXN/entries/$index.json")"
+      python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+    fi
+    mv "${SIDECAR_TEMPS[$index]}" "$target.t-hub-managed"
     python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+    if [ -n "$SKILL_TXN" ]; then
+      entry="$(jq '.status="sidecar-installed"' "$SKILL_TXN/entries/$index.json")"
+      python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+    fi
   fi
   if [ -n "$SKILL_TXN" ]; then
     entry="$(jq '.status="applied"' "$SKILL_TXN/entries/$index.json")"
@@ -339,6 +429,9 @@ for backup in "${BACKUPS[@]}"; do
 done
 for backup in "${SIDECAR_BACKUPS[@]}"; do
   rm -f "$backup"
+done
+for temp in "${SIDECAR_TEMPS[@]}"; do
+  rm -f "$temp"
 done
 if [ -n "$SKILL_TXN" ] && [ -d "$SKILL_TXN" ]; then
   python3 "$ATOMIC_HELPER" purge --path "$SKILL_TXN"

@@ -77,6 +77,10 @@ flock -x 8
 ATOMIC_SOURCE="$HERE/atomic-config.py"
 TRANSACTION_ROOT="${T_HUB_TRANSACTION_ROOT:-${HOME}/.t-hub/transactions}"
 TXN="$TRANSACTION_ROOT/install-current"
+SKILLS_SOURCE="${T_HUB_SKILLS_SOURCE:-$REPO_ROOT/skills}"
+CODEX_SKILLS_DEST="${T_HUB_CODEX_SKILLS_DIR:-${CODEX_HOME:-${HOME}/.codex}/skills}"
+CLAUDE_SKILLS_DEST="${T_HUB_CLAUDE_SKILLS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/skills}"
+CLAUDE_COMMANDS_DEST="${T_HUB_CLAUDE_COMMANDS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/commands}"
 install -d -m 700 "$TRANSACTION_ROOT"
 if [ "$(stat -c %u "$TRANSACTION_ROOT")" != "$(id -u)" ] \
   || [ "$(stat -c %a "$TRANSACTION_ROOT")" != 700 ]; then
@@ -94,10 +98,29 @@ describe_digest() {
 
 integration_source_digest() {
   {
-    sha256sum "$HERE/atomic-config.py" "$HERE/ensure-thub-codex.sh" \
+    for source in "$HERE/atomic-config.py" "$HERE/ensure-thub-codex.sh" \
       "$HERE/ensure-thub-claude.sh" "$HERE/install-captain-skills.sh" \
-      "$HERE/install-thub-codex.sh"
-    find "$REPO_ROOT/skills" -type f -print0 | sort -z | xargs -0 sha256sum
+      "$HERE/install-thub-codex.sh"; do
+      printf 'f\0%s\0%s\0' "$(basename "$source")" "$(stat -c %a "$source")"
+      sha256sum "$source"
+    done
+    (
+      cd "$SKILLS_SOURCE"
+      printf 'd\0.\0%s\0' "$(stat -c %a .)"
+      find . -mindepth 1 -print0 | sort -z | while IFS= read -r -d '' entry; do
+        if [ -L "$entry" ]; then
+          printf 'l\0%s\0%s\0%s\0' "$entry" "$(stat -c %a "$entry")" "$(readlink "$entry")"
+        elif [ -d "$entry" ]; then
+          printf 'd\0%s\0%s\0' "$entry" "$(stat -c %a "$entry")"
+        elif [ -f "$entry" ]; then
+          printf 'f\0%s\0%s\0' "$entry" "$(stat -c %a "$entry")"
+          sha256sum "$entry"
+        else
+          echo "install-thub-codex: unsupported skill source path: $SKILLS_SOURCE/$entry" >&2
+          exit 1
+        fi
+      done
+    )
   } | sha256sum | awk '{print $1}'
 }
 
@@ -192,8 +215,42 @@ adopt_interrupted_claude_boundary() {
   flock -u 7
 }
 
+adopt_interrupted_codex_boundary() {
+  local state live before current post
+  [ -f "$TXN/helper-state/codex-state.json" ] || return 1
+  state="$(cat "$TXN/helper-state/codex-state.json")"
+  [ "$(printf '%s' "$state" | jq -r .status)" = before ] || return 0
+  exec 6>"${CODEX_CONFIG}.t-hub.lock"
+  flock -x 6
+  live="$(describe_digest "$CODEX_CONFIG")"
+  before="$(printf '%s' "$state" | jq -r .before.digest)"
+  if [ "$live" != "$before" ]; then
+    current="$(CODEX_HOME="$(dirname "$CODEX_CONFIG")" codex mcp get t-hub --json 2>/dev/null || true)"
+    if [ -z "$current" ] || ! printf '%s' "$current" | jq -e --arg bin "$DEST" '
+      .enabled == true and .disabled_reason == null and
+      .transport.type == "stdio" and .transport.command == $bin and
+      .transport.args == [] and (.transport.env == null or .transport.env == {}) and
+      .transport.env_vars == ["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"] and
+      .transport.cwd == null and .enabled_tools == null and .disabled_tools == null and
+      .startup_timeout_sec == null and .tool_timeout_sec == null
+    ' >/dev/null; then
+      flock -u 6
+      echo "install-thub-codex: interrupted Codex helper has no adoptable owned poststate" >&2
+      return 1
+    fi
+  fi
+  if [ -f "$CODEX_CONFIG" ]; then
+    post="$(python3 "$ATOMIC_SOURCE" describe --path "$CODEX_CONFIG")"
+    post="$(printf '%s' "$post" | jq -c '{presence:"present",digest:.digest,description:.description}')"
+  else
+    post='{"presence":"absent","digest":"absent"}'
+  fi
+  state="$(printf '%s' "$state" | jq --argjson post "$post" '.status="committed" | .post=$post')"
+  python3 "$ATOMIC_SOURCE" publish --path "$TXN/helper-state/codex-state.json" --value "$state"
+  flock -u 6
+}
+
 rollback_transaction() {
-  set +e
   recover_atomic_ops || return 1
   if [ -d "$TXN/skills" ]; then
     T_HUB_SKILL_TRANSACTION_DIR="$TXN/skills" T_HUB_SKILL_RECOVER_ONLY=1 \
@@ -202,6 +259,13 @@ rollback_transaction() {
   fi
   if [ "$(jq -r .status "$TXN/manifest.json" 2>/dev/null)" = claude-running ]; then
     adopt_interrupted_claude_boundary || return 1
+  fi
+  if [ "$(jq -r .status "$TXN/manifest.json" 2>/dev/null)" = codex-running ]; then
+    adopt_interrupted_codex_boundary || return 1
+    codex_stage="$(jq --arg recovery "$TXN/helper-state/codex-before.bin" \
+      '{status:"applied",target:.target,before:.before,desired:.post,recovery:$recovery}' \
+      "$TXN/helper-state/codex-state.json")" || return 1
+    write_stage codex-config "$codex_stage" || return 1
   fi
   if [ -f "$TXN/stages/codex-config.json" ]; then
     rollback_file_stage codex-config || return 1
@@ -239,21 +303,24 @@ recover_previous_transaction() {
     --argjson repair "$( [ "${SKILL_ARGS[*]:-}" = --repair ] && printf true || printf false )" \
     --argjson migrate "$( [ "${CODEX_ARGS[*]:-}" = --migrate-legacy-registration ] && printf true || printf false )" \
     --arg dest "$DEST" --arg captain_dir "$CAPTAIN_DIR" \
+    --arg skills_source "$(readlink -f "$SKILLS_SOURCE")" \
+    --arg codex_skills_dest "$CODEX_SKILLS_DEST" \
+    --arg claude_skills_dest "$CLAUDE_SKILLS_DEST" \
+    --arg claude_commands_dest "$CLAUDE_COMMANDS_DEST" \
     --arg codex_config "$CODEX_CONFIG" --arg claude_config "$CLAUDE_CONFIG" '
       .source == $source and .source_digest == $source_digest and
       .integration_digest == $integration_digest and
       .repair_skills == $repair and .migrate_legacy == $migrate and
       .dest == $dest and .captain_dir == $captain_dir and
+      .skills_source == $skills_source and .codex_skills_dest == $codex_skills_dest and
+      .claude_skills_dest == $claude_skills_dest and
+      .claude_commands_dest == $claude_commands_dest and
       .codex_config == $codex_config and .claude_config == $claude_config
     ' "$TXN/manifest.json" >/dev/null; then
     echo "install-thub-codex: interrupted transaction provenance does not match this invocation" >&2
     return 1
   fi
   recover_atomic_ops
-  if [ "$status" = codex-running ]; then
-    echo "install-thub-codex: helper stopped before publishing its post boundary; recovery refused" >&2
-    return 1
-  fi
   if [ "$status" = skills-running ] || [ "$status" = skills-applied ]; then
     repair="$(jq -r .repair_skills "$TXN/manifest.json")"
     recovery_args=()
@@ -265,7 +332,10 @@ recover_previous_transaction() {
     echo "install-thub-codex: completed interrupted skills stage"
     return 0
   fi
-  rollback_transaction
+  if ! rollback_transaction; then
+    echo "install-thub-codex: interrupted transaction recovery safely refused; original journal retained" >&2
+    return 1
+  fi
   echo "install-thub-codex: rolled back interrupted transaction"
 }
 
@@ -281,10 +351,16 @@ manifest="$(jq -cn --arg status active --argjson repair "$repair_skills" \
   --arg source "$(readlink -f "$SOURCE")" \
   --arg source_digest "$(sha256sum "$SOURCE" | awk '{print $1}')" \
   --arg dest "$DEST" --arg captain_dir "$CAPTAIN_DIR" \
+  --arg skills_source "$(readlink -f "$SKILLS_SOURCE")" \
+  --arg codex_skills_dest "$CODEX_SKILLS_DEST" \
+  --arg claude_skills_dest "$CLAUDE_SKILLS_DEST" \
+  --arg claude_commands_dest "$CLAUDE_COMMANDS_DEST" \
   --arg codex_config "$CODEX_CONFIG" --arg claude_config "$CLAUDE_CONFIG" \
   '{version:1,status:$status,repair_skills:$repair,migrate_legacy:$migrate,
     integration_digest:$integration_digest,source:$source,
     source_digest:$source_digest,dest:$dest,captain_dir:$captain_dir,
+    skills_source:$skills_source,codex_skills_dest:$codex_skills_dest,
+    claude_skills_dest:$claude_skills_dest,claude_commands_dest:$claude_commands_dest,
     codex_config:$codex_config,claude_config:$claude_config}')"
 python3 "$ATOMIC_SOURCE" publish --path "$TXN/manifest.json" --value "$manifest"
 
