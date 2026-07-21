@@ -678,8 +678,10 @@ fn recover_after_auth_rejection(
     command: &str,
     args: &Value,
     budget: CallBudget,
-) -> Result<Value, String> {
-    let ambient = discovery.resolve_from_file()?;
+) -> Result<Value, ControlCallError> {
+    let ambient = discovery
+        .resolve_from_file()
+        .map_err(ControlCallError::from)?;
     match call_classified(&ambient, command, args, budget, Some(discovery)) {
         Ok(value)
             if command == "my_capability"
@@ -687,15 +689,49 @@ fn recover_after_auth_rejection(
         {
             let leased = renew_captain_endpoint(discovery, budget)?;
             call_classified(&leased, command, args, budget, Some(discovery))
-                .map_err(|error| error.into_message(command, 3, true))
+                .map_err(|error| call_error_to_control(error, command, 3, true))
         }
         Ok(value) => Ok(value),
         Err(CallError::App { message, .. }) if is_auth_rejection(&message) => {
-            let leased = renew_captain_endpoint(discovery, budget)?;
+            let leased =
+                renew_captain_endpoint(discovery, budget).map_err(ControlCallError::from)?;
             call_classified(&leased, command, args, budget, Some(discovery))
-                .map_err(|error| error.into_message(command, 3, true))
+                .map_err(|error| call_error_to_control(error, command, 3, true))
         }
-        Err(error) => Err(error.into_message(command, 2, true)),
+        Err(error) => Err(call_error_to_control(error, command, 2, true)),
+    }
+}
+
+fn call_error_to_control(
+    error: CallError,
+    command: &str,
+    attempts: u8,
+    endpoint_replaced: bool,
+) -> ControlCallError {
+    match error {
+        CallError::App {
+            message,
+            kind,
+            details,
+        } => ControlCallError {
+            message,
+            retryable: false,
+            kind,
+            details,
+        },
+        CallError::RetryableApp {
+            message,
+            kind,
+            details,
+        } => ControlCallError {
+            message,
+            retryable: true,
+            kind,
+            details,
+        },
+        other => {
+            ControlCallError::from_message(other.into_message(command, attempts, endpoint_replaced))
+        }
     }
 }
 
@@ -774,7 +810,6 @@ fn resolve_and_call_with_deadline(
             wedge_detector().on_success();
             if is_auth_rejection(&msg) && !discovery.session_token().is_empty() {
                 recover_after_auth_rejection(discovery, command, &args, budget)
-                    .map_err(ControlCallError::from)
             } else {
                 Err(ControlCallError {
                     message: msg,
@@ -808,7 +843,7 @@ fn resolve_and_call_with_deadline(
         Err(first) => {
             let first_is_timeout = first.is_timeout();
             let first_stage = first.stage();
-            let first_msg = first.into_message(command, 1, false);
+            let first_error = call_error_to_control(first, command, 1, false);
 
             if Instant::now() >= budget.deadline {
                 return Err(timeout_message(command, 1, first_stage).into());
@@ -858,14 +893,14 @@ fn resolve_and_call_with_deadline(
                     command,
                     &args,
                     id,
-                    first_msg,
+                    first_error,
                     (discovery, discovery.has_env_pin()),
                     budget,
                 );
                 if r.is_ok() {
                     wedge_detector().on_success();
                 }
-                return r.map_err(ControlCallError::from);
+                return r;
             }
 
             // Non-idempotent command. If control.json named a DIFFERENT live endpoint,
@@ -878,7 +913,11 @@ fn resolve_and_call_with_deadline(
                         wedge_detector().on_success();
                         Ok(v)
                     }
-                    Err(CallError::App { message: msg, .. }) => {
+                    Err(CallError::App {
+                        message: msg,
+                        kind,
+                        details,
+                    }) => {
                         wedge_detector().on_success();
                         // We reached the fresh addr but the app rejected the call. When
                         // we kept an env token across the rotation and the rejection is
@@ -887,11 +926,15 @@ fn resolve_and_call_with_deadline(
                         // (never a silent read-only slide onto control.json's token).
                         if !discovery.session_token().is_empty() && is_auth_rejection(&msg) {
                             recover_after_auth_rejection(discovery, command, &args, budget)
-                                .map_err(ControlCallError::from)
                         } else if discovery.has_env_pin() && is_auth_rejection(&msg) {
                             Err(stale_env_token_error(&msg).into())
                         } else {
-                            Err(msg.into())
+                            Err(ControlCallError {
+                                message: msg,
+                                retryable: false,
+                                kind,
+                                details,
+                            })
                         }
                     }
                     Err(CallError::RetryableApp {
@@ -911,17 +954,15 @@ fn resolve_and_call_with_deadline(
                     Err(CallError::PartialResponse) => Err(partial_response_message().into()),
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
-                        let e2_msg = e2.into_message(command, 2, true);
                         maybe_heal_and_retry(
                             discovery,
                             command,
                             &args,
                             f,
-                            e2_msg,
+                            call_error_to_control(e2, command, 2, true),
                             e2_is_timeout,
                             budget,
                         )
-                        .map_err(ControlCallError::from)
                     }
                 }
             } else {
@@ -931,11 +972,10 @@ fn resolve_and_call_with_deadline(
                     command,
                     &args,
                     endpoint,
-                    first_msg,
+                    first_error,
                     first_is_timeout,
                     budget,
                 )
-                .map_err(ControlCallError::from)
             }
         }
     }
@@ -955,10 +995,10 @@ fn maybe_heal_and_retry(
     command: &str,
     args: &Value,
     tried: ControlEndpoint,
-    err: String,
+    err: ControlCallError,
     timeout_class: bool,
     budget: CallBudget,
-) -> Result<Value, String> {
+) -> Result<Value, ControlCallError> {
     if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
         if let Some(healed) = try_bridge_rebind(discovery, &tried, budget.deadline) {
             return match call_classified(&healed, command, args, budget, Some(discovery)) {
@@ -970,24 +1010,52 @@ fn maybe_heal_and_retry(
                 // so an AUTH refusal here means a REAL token rotation - name it loudly
                 // rather than returning the terse "unauthorized" (mirrors the primary
                 // stale-pin path; never a silent read-only slide).
-                Err(CallError::App { message: msg, .. }) if is_auth_rejection(&msg) => {
+                Err(CallError::App {
+                    message: msg,
+                    kind,
+                    details,
+                }) if is_auth_rejection(&msg) => {
                     if discovery.session_token().is_empty() {
                         if discovery.has_env_pin() {
-                            Err(stale_env_token_error(&msg))
+                            Err(stale_env_token_error(&msg).into())
                         } else {
-                            Err(msg)
+                            Err(ControlCallError {
+                                message: msg,
+                                retryable: false,
+                                kind,
+                                details,
+                            })
                         }
                     } else {
-                        let leased = renew_captain_endpoint(discovery, budget)?;
+                        let leased = renew_captain_endpoint(discovery, budget)
+                            .map_err(ControlCallError::from)?;
                         call_classified(&leased, command, args, budget, Some(discovery))
-                            .map_err(|error| error.into_message(command, 4, true))
+                            .map_err(|error| call_error_to_control(error, command, 4, true))
                     }
                 }
-                Err(CallError::App { message: msg, .. }) | Err(CallError::Protocol(msg)) => {
-                    Err(msg)
-                }
-                Err(CallError::PartialResponse) => Err(partial_response_message()),
-                Err(other) => Err(other.into_message(command, 3, true)),
+                Err(CallError::App {
+                    message,
+                    kind,
+                    details,
+                }) => Err(ControlCallError {
+                    message,
+                    retryable: false,
+                    kind,
+                    details,
+                }),
+                Err(CallError::RetryableApp {
+                    message,
+                    kind,
+                    details,
+                }) => Err(ControlCallError {
+                    message,
+                    retryable: true,
+                    kind,
+                    details,
+                }),
+                Err(CallError::Protocol(msg)) => Err(msg.into()),
+                Err(CallError::PartialResponse) => Err(partial_response_message().into()),
+                Err(other) => Err(call_error_to_control(other, command, 3, true)),
             };
         }
     }
@@ -1042,6 +1110,25 @@ fn pending_request_message(command: &str, request_id: &str, first_err: &str) -> 
     )
 }
 
+fn status_error(status: &Value) -> ControlCallError {
+    ControlCallError {
+        message: status
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("control command failed (no error message)")
+            .to_string(),
+        retryable: status
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        kind: status
+            .get("errorKind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        details: status.get("errorDetails").cloned(),
+    }
+}
+
 /// Resolve an ambiguous spawn-class transport failure (ask #1/#2): the command was
 /// possibly accepted but its response leg failed. Query `get_request_status` for
 /// the SAME `request_id` and act on the authoritative answer:
@@ -1059,10 +1146,10 @@ fn resolve_ambiguous_request(
     command: &str,
     args: &Value,
     request_id: &str,
-    first_err: String,
+    first_err: ControlCallError,
     auth: (&Discovery, bool),
     budget: CallBudget,
-) -> Result<Value, String> {
+) -> Result<Value, ControlCallError> {
     let (discovery, has_env_pin) = auth;
     let status_args = serde_json::json!({ "requestId": request_id });
     let mut reissue_state = MutationReissueState::NotAttempted;
@@ -1079,11 +1166,7 @@ fn resolve_ambiguous_request(
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
                         return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                     }
-                    return Err(v
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("control command failed (no error message)")
-                        .to_string());
+                    return Err(status_error(&v));
                 }
                 Some("inFlight") => {
                     if Instant::now() >= budget.deadline {
@@ -1093,7 +1176,12 @@ fn resolve_ambiguous_request(
                         // an unambiguous "accepted/pending" framing. MCP does not
                         // expose the internal status command, so recovery reissues
                         // the same command with the same idempotency key.
-                        return Err(pending_request_message(command, request_id, &first_err));
+                        return Err(pending_request_message(
+                            command,
+                            request_id,
+                            &first_err.message,
+                        )
+                        .into());
                     }
                     sleep_within(budget.deadline, Duration::from_millis(200));
                 }
@@ -1103,13 +1191,14 @@ fn resolve_ambiguous_request(
                 // resolution; a later unknown is authoritative and never mutates.
                 _ => {
                     if reissue_state == MutationReissueState::Attempted {
-                        return Err(unknown_after_reissue_message(command, request_id));
+                        return Err(unknown_after_reissue_message(command, request_id).into());
                     }
                     if Instant::now() >= budget.deadline {
                         return Err(format!(
                             "{}; request_id='{request_id}'",
                             timeout_message(command, 2, "request status")
-                        ));
+                        )
+                        .into());
                     }
                     reissue_state = MutationReissueState::Attempted;
                     match call_classified(endpoint, command, args, budget, Some(discovery)) {
@@ -1117,13 +1206,13 @@ fn resolve_ambiguous_request(
                         Err(CallError::App { message: msg, .. })
                             if has_env_pin && is_auth_rejection(&msg) =>
                         {
-                            return Err(stale_env_token_error(&msg));
+                            return Err(stale_env_token_error(&msg).into());
                         }
-                        Err(CallError::App { message: msg, .. })
-                        | Err(CallError::Protocol(msg)) => {
-                            return Err(msg);
+                        Err(error @ CallError::App { .. })
+                        | Err(error @ CallError::RetryableApp { .. }) => {
+                            return Err(call_error_to_control(error, command, 2, false));
                         }
-                        Err(CallError::RetryableApp { message: msg, .. }) => return Err(msg),
+                        Err(CallError::Protocol(msg)) => return Err(msg.into()),
                         Err(CallError::PartialResponse)
                         | Err(CallError::Transport(_))
                         | Err(CallError::Timeout(_)) => continue,
@@ -1138,7 +1227,8 @@ fn resolve_ambiguous_request(
             // don't guess, surface the original error.
             Err(CallError::App { message: msg, .. }) => {
                 if has_env_pin && is_auth_rejection(&msg) && !discovery.session_token().is_empty() {
-                    let leased = renew_captain_endpoint(discovery, budget)?;
+                    let leased = renew_captain_endpoint(discovery, budget)
+                        .map_err(ControlCallError::from)?;
                     return resolve_ambiguous_request(
                         &leased,
                         command,
@@ -1150,12 +1240,12 @@ fn resolve_ambiguous_request(
                     );
                 }
                 if has_env_pin && is_auth_rejection(&msg) {
-                    return Err(stale_env_token_error(&msg));
+                    return Err(stale_env_token_error(&msg).into());
                 }
                 return Err(first_err);
             }
             Err(CallError::RetryableApp { .. }) => return Err(first_err),
-            Err(CallError::Protocol(msg)) => return Err(msg),
+            Err(CallError::Protocol(msg)) => return Err(msg.into()),
             Err(CallError::PartialResponse) => return Err(first_err),
             // The channel is still unreachable (fast transport failure) or wedged
             // (timeout): keep trying to reach the status endpoint until the deadline,
@@ -1165,7 +1255,8 @@ fn resolve_ambiguous_request(
                     return Err(format!(
                         "{}; request_id='{request_id}'",
                         timeout_message(command, 2, "request status")
-                    ));
+                    )
+                    .into());
                 }
                 sleep_within(budget.deadline, Duration::from_millis(200));
             }
@@ -1617,6 +1708,119 @@ mod tests {
                 "action": "initialize_git"
             }))
         );
+    }
+
+    #[test]
+    fn endpoint_replacement_preserves_native_error_details() {
+        let (fresh_addr, _captured) = scripted_server(vec![Some(
+            r#"{"ok":false,"error":"Git capability is required for baseline","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"baseline","capability":"git","action":"initialize_git"},"retryable":false}"#,
+        )]);
+        let dir = std::env::temp_dir().join(format!("th-mcp-error-rebind-{}", epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{fresh_addr}","token":"READ","pid":1}}"#),
+        )
+        .unwrap();
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead);
+        let discovery = Discovery {
+            addr: Some(dead_addr),
+            token: Some("STALE".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "baseline",
+            &Value::Null,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind.as_deref(), Some("git_required"));
+        assert_eq!(error.details.as_ref().unwrap()["operation"], "baseline");
+        assert!(!error.retryable);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_rebind_preserves_native_error_details_after_fresh_endpoint_response() {
+        let (fresh_addr, _captured) = scripted_server(vec![Some(
+            r#"{"ok":false,"error":"Git capability is required for delivery","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"delivery","capability":"git","action":"initialize_git"},"retryable":false}"#,
+        )]);
+        let dir = std::env::temp_dir().join(format!("th-mcp-error-restart-{}", epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{fresh_addr}","token":"READ","pid":2}}"#),
+        )
+        .unwrap();
+        let discovery = Discovery {
+            addr: Some("127.0.0.1:9".into()),
+            token: Some("STALE".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "delivery",
+            &Value::Null,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind.as_deref(), Some("git_required"));
+        assert_eq!(error.details.as_ref().unwrap()["operation"], "delivery");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auth_recovery_preserves_native_error_details_from_reauthenticated_endpoint() {
+        let (addr, _captured) = scripted_server(vec![
+            Some(r#"{"ok":false,"error":"unauthorized: bad control token"}"#),
+            Some(r#"{"ok":false,"error":"unauthorized: read token"}"#),
+            Some(r#"{"ok":true,"result":{"lease":"SCOPED","expiresAt":9999999999999}}"#),
+            Some(
+                r#"{"ok":false,"error":"Git capability is required for integration","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"integration","capability":"git","action":"initialize_git"},"retryable":false}"#,
+            ),
+        ]);
+        let dir = std::env::temp_dir().join(format!("th-mcp-error-auth-{}", epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{addr}","token":"READ","pid":3}}"#),
+        )
+        .unwrap();
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("STALE".into()),
+            file: Some(file.clone()),
+            session: Some("CAPTAIN".into()),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "integration",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind.as_deref(), Some("git_required"));
+        assert_eq!(error.details.as_ref().unwrap()["operation"], "integration");
+        assert!(!error.retryable);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn byte_scripted_server(replies: Vec<ScriptedReply>) -> (String, Arc<Mutex<Vec<Value>>>) {
