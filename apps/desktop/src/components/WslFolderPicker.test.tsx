@@ -247,7 +247,7 @@ describe("WslFolderPicker", () => {
     expect(gitWorktreeList).not.toHaveBeenCalled();
   });
 
-  it("ignores stale Git metadata after a newer folder selection", async () => {
+  it("does not enumerate worktrees for a stale old-path Git result", async () => {
     let resolveOld!: (info: never) => void;
     let resolveNew!: (info: never) => void;
     vi.mocked(gitInfo)
@@ -289,6 +289,26 @@ describe("WslFolderPicker", () => {
     await Promise.resolve();
     expect(onFolderMetadataChange).not.toHaveBeenLastCalledWith(expect.objectContaining({ path: "/home/old" }));
     expect(gitWorktreeList).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch metadata when rerendered with the same stable selection", async () => {
+    const onFolderMetadataChange = vi.fn();
+    const props = {
+      path: "/home/me",
+      recentPaths: [],
+      onPathChange: vi.fn(),
+      onFolderMetadataChange,
+    };
+    const view = render(<WslFolderPicker {...props} />);
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      path: "/home/me",
+      status: "ready",
+    })));
+    view.rerender(<WslFolderPicker {...props} />);
+    await Promise.resolve();
+    expect(gitInfo).toHaveBeenCalledTimes(1);
+    expect(listDir).toHaveBeenCalledTimes(1);
+    expect(onFolderMetadataChange).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the newer Git metadata when an older Git response arrives later", async () => {
