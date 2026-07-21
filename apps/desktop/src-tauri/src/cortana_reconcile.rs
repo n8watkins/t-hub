@@ -52,6 +52,21 @@ pub enum CortanaRecoveryState {
         operation_id: String,
         started_at: u64,
     },
+    /// Durable authorization to retire one exact reserved-scope runtime whose
+    /// bearer no longer resolves in the identity store, then replace it at the
+    /// next generation. The record is written before the external tmux effect
+    /// and retained until the replacement Fleet claim and durable identity are
+    /// committed together.
+    ReplacingOrphan {
+        operation_id: String,
+        started_at: u64,
+        orphan_terminal_id: String,
+        orphan_identity_id: String,
+        orphan_generation: u64,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_identity_id: Option<String>,
+    },
     Healthy {
         operation_id: String,
         verified_at: u64,
