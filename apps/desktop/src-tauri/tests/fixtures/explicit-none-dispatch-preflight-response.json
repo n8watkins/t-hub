@@ -1,0 +1,1 @@
+{"ok":false,"error":"Git capability is required for dispatch_preflight; initialize Git with initialize_git","errorDetails":{"code":"git_required","operation":"dispatch_preflight","capability":"git","action":"initialize_git"},"errorKind":"git_required"}

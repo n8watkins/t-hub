@@ -1678,9 +1678,9 @@ mod tests {
 
     #[test]
     fn raw_wire_error_details_survive_mcp_control_adapter() {
-        let (addr, _captured) = scripted_server(vec![Some(
-            r#"{"ok":false,"error":"Git capability is required for baseline","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"baseline","capability":"git","action":"initialize_git"},"retryable":false}"#,
-        )]);
+        let fixture =
+            include_str!("../tests/fixtures/explicit-none-dispatch-preflight-response.json");
+        let (addr, _captured) = scripted_server(vec![Some(fixture)]);
         let discovery = Discovery {
             addr: Some(addr),
             token: Some("control-token".into()),
@@ -1689,21 +1689,24 @@ mod tests {
 
         let error = resolve_and_call_with_deadline(
             &discovery,
-            "baseline",
+            "dispatch_preflight",
             &Value::Null,
             Duration::from_secs(1),
             Duration::from_millis(250),
         )
         .unwrap_err();
 
-        assert_eq!(error.message, "Git capability is required for baseline");
+        assert_eq!(
+            error.message,
+            "Git capability is required for dispatch_preflight; initialize Git with initialize_git"
+        );
         assert!(!error.retryable);
         assert_eq!(error.kind.as_deref(), Some("git_required"));
         assert_eq!(
             error.details,
             Some(json!({
                 "code": "git_required",
-                "operation": "baseline",
+                "operation": "dispatch_preflight",
                 "capability": "git",
                 "action": "initialize_git"
             }))

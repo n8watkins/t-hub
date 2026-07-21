@@ -22,6 +22,8 @@
 //! Boundaries: this module is self-contained. It owns no managed state and shares
 //! nothing with the file index / agent / supervision modules.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,21 @@ use t_hub_protocol::GitInfo as AgentGitInfo;
 
 use crate::agent::GitInfoBridgeError;
 use crate::bounded_exec::output_with_timeout;
+
+#[cfg(test)]
+thread_local! {
+    static WORKTREE_LIST_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_worktree_list_calls() {
+    WORKTREE_LIST_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn worktree_list_calls() -> usize {
+    WORKTREE_LIST_CALLS.with(Cell::get)
+}
 
 /// Default per-command timeout for a `git`/`wsl.exe` subprocess (the symmetric half
 /// of the tmux control-flap fix — see [`crate::bounded_exec`]).
@@ -1044,6 +1061,8 @@ pub async fn git_worktree_list(cwd: String) -> Result<Vec<WorktreeInfo>, String>
 /// Synchronous core of [`git_worktree_list`], shared with the control channel
 /// (`control::list_worktrees`, T-B) so both call exactly one implementation.
 pub(crate) fn worktree_list(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
+    #[cfg(test)]
+    WORKTREE_LIST_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     match run_git(cwd, &["worktree", "list", "--porcelain"]) {
         Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
         // Not a repo / no worktrees / git unavailable: empty list (best-effort).

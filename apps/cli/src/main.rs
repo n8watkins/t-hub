@@ -1150,6 +1150,37 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_fixture_drives_cli_json_and_human_contracts() {
+        let wire: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/explicit-none-dispatch-preflight-response.json"
+        ))
+        .unwrap();
+        let error: CliError = ControlError::Server {
+            message: wire["error"].as_str().unwrap().to_string(),
+            retryable: wire["retryable"].as_bool().unwrap_or(false),
+            details: Some(wire["errorDetails"].clone()),
+        }
+        .into();
+        assert_eq!(error.code, 4);
+        assert_eq!(error.kind, "git_required");
+        assert_eq!(
+            error.details.as_ref().unwrap()["operation"],
+            "dispatch_preflight"
+        );
+        assert_eq!(error.details.as_ref().unwrap()["capability"], "git");
+        assert_eq!(error.details.as_ref().unwrap()["action"], "initialize_git");
+        assert_eq!(
+            error.suggestion.as_deref(),
+            Some("Run `th projects init <rootPath> --name NAME`")
+        );
+        let envelope = json_error_envelope("agents preflight", &error);
+        assert_eq!(envelope["error"]["code"], 4);
+        assert_eq!(envelope["error"]["kind"], "git_required");
+        assert_eq!(envelope["error"]["details"], wire["errorDetails"]);
+        assert!(format!("th: {}", error.message).contains("initialize Git"));
+    }
+
+    #[test]
     fn git_init_recovery_json_contract_preserves_machine_details() {
         let error: CliError = ControlError::Server {
             message: "owned Git initialization recovery is blocked".into(),
