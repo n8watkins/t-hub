@@ -113,7 +113,7 @@ describe("WslFolderPicker", () => {
     render(<WslFolderPicker path="/home/blocked" recentPaths={[]} onPathChange={vi.fn()} />);
     expect(await screen.findByText("Could not list this folder.")).toBeTruthy();
     expect(screen.queryByText("This folder is empty.")).toBeNull();
-    expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
+    expect((await screen.findByRole("alert")).textContent).toContain("permission denied");
   });
 
   it("does not let an older directory response replace the current folder", async () => {
