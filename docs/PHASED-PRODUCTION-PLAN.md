@@ -205,7 +205,7 @@ Review findings must not disappear merely because a card is deferred, completed,
 The General-directed [Captain autonomy and scoped grants integration plan](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is integration input for this existing roadmap.
 It does not replace the active goal, phase order, current Powder work, or the existing owners named below.
 The live Appturnity reproduction returned `acl: only General/Cortana may register a new project` before any Project or Powder binding mutation became observable, but it did not establish which read-only normalization steps ran.
-Current source independently confirms that `enforce_project_authority` rejects a new Project for a Captain and that `register_project` reaches filesystem and Git preparation before its Project authority decision.
+Current source independently confirms that `enforce_project_authority` rejects an unauthorized Project request before canonical metadata, filesystem, or Git preparation probes.
 
 | Requirement group | Classification | Canonical owner and required delta |
 | --- | --- | --- |
