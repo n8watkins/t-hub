@@ -8,6 +8,15 @@ import {
 } from "../ipc/projects";
 import { WslFolderPicker, type WslFolderSelection } from "./WslFolderPicker";
 
+interface GitReviewInfo {
+  remoteUrl?: string | null;
+  defaultBranch?: string | null;
+  branch?: string | null;
+  headCommit?: string | null;
+  dirtyCount?: number;
+  isLinkedWorktree?: boolean;
+}
+
 interface CaptainCommissionDialogProps {
   open: boolean;
   onClose: () => void;
@@ -516,19 +525,12 @@ function VersionControlSummary({
     return (
       <GitMetadataRows
         git={{
-          isRepo: true,
-          branch: project.branch ?? null,
-          worktreeRoot: project.gitMainRoot ?? project.rootPath,
-          isLinkedWorktree: project.isLinkedWorktree ?? false,
-          dirtyCount: project.dirtyCount ?? 0,
-          headCommit: project.headCommit ?? null,
           remoteUrl: project.remoteUrl ?? null,
           defaultBranch: project.defaultBranch ?? null,
         }}
-        worktreeCount={project.worktreeCount ?? null}
+        gitMainRoot={project.gitMainRoot ?? null}
+        worktreeCount={null}
         worktrees={null}
-        dirtyCount={project.dirtyCount ?? null}
-        selectedWorktree={project.isLinkedWorktree ?? null}
       />
     );
   }
@@ -555,26 +557,23 @@ function VersionControlSummary({
   return (
     <GitMetadataRows
       git={selection.git}
+      gitMainRoot={selection.git.worktreeRoot}
       worktreeCount={selection.worktreeCount}
       worktrees={selection.worktrees}
-      dirtyCount={selection.git.dirtyCount}
-      selectedWorktree={selection.git.isLinkedWorktree}
     />
   );
 }
 
 function GitMetadataRows({
   git,
+  gitMainRoot,
   worktreeCount,
   worktrees,
-  dirtyCount,
-  selectedWorktree,
 }: {
-  git: NonNullable<WslFolderSelection["git"]>;
+  git: GitReviewInfo;
+  gitMainRoot: string | null;
   worktreeCount: number | null;
   worktrees: WslFolderSelection["worktrees"];
-  dirtyCount: number | null;
-  selectedWorktree: boolean | null;
 }) {
   const mainCount = worktrees?.filter((worktree) => !worktree.isLinked).length;
   const linkedCount = worktrees?.filter((worktree) => worktree.isLinked).length;
@@ -586,15 +585,16 @@ function GitMetadataRows({
   return (
     <>
       <ReviewRow label="Version control" value="Git" />
+      <ReviewRow label="Git main root" value={gitMainRoot || "Unknown"} />
       <ReviewRow label="Remote" value={git.remoteUrl || "None configured"} />
       <ReviewRow label="Default branch" value={git.defaultBranch || "Unknown"} />
-      <ReviewRow label="Current branch" value={git.branch || "Detached"} />
+      <ReviewRow label="Current branch" value={git.branch === undefined ? "Unknown" : git.branch || "Detached"} />
       <ReviewRow label="HEAD" value={git.headCommit || "Unknown"} />
-      <ReviewRow label="Dirty entries" value={dirtyCount === null ? "Unknown" : String(dirtyCount)} />
+      <ReviewRow label="Dirty entries" value={git.dirtyCount === undefined ? "Unknown" : String(git.dirtyCount)} />
       <ReviewRow label="Worktrees" value={worktreeValue} />
       <ReviewRow
         label="Selected worktree"
-        value={selectedWorktree === null ? "Unknown" : selectedWorktree ? "Linked" : "Main"}
+        value={git.isLinkedWorktree === undefined ? "Unknown" : git.isLinkedWorktree ? "Linked" : "Main"}
       />
     </>
   );

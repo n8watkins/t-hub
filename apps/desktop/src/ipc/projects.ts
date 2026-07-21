@@ -9,11 +9,6 @@ export interface RegisteredProject {
   gitMainRoot?: string;
   remoteUrl?: string;
   defaultBranch?: string;
-  branch?: string | null;
-  headCommit?: string | null;
-  dirtyCount?: number;
-  worktreeCount?: number;
-  isLinkedWorktree?: boolean;
   createdAt: number;
   updatedAt: number;
 }
