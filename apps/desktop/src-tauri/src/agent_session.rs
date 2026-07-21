@@ -32,6 +32,18 @@ pub struct AgentFollowup {
     pub replacement_assignment: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFollowupOutcome {
+    pub request_id: String,
+    pub captain_session_id: String,
+    pub ship_slug: String,
+    pub project_id: String,
+    pub agent_session_id: String,
+    pub message_seq: u64,
+    pub idempotent_replay: bool,
+    pub assignment_changed: bool,
+}
+
 impl AgentFollowup {
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
