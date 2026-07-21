@@ -69,7 +69,7 @@ T-Hub should then execute one reviewed transaction:
 2. Create or clone the codebase.
 3. Register the durable T-Hub Project with its canonical `rootPath`.
 4. Commission the Captain with a distinct Assignment.
-6. Offer an initial Workspace only when the Assignment already names a coherent workstream.
+5. Offer an initial Workspace only when the Assignment already names a coherent workstream.
 
 If a later step fails, T-Hub should preserve useful local work, report partial state clearly, and offer safe resume or rollback.
 It must never delete a pre-existing directory during rollback.

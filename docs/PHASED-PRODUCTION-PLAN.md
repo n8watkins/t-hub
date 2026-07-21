@@ -335,10 +335,10 @@ The earlier installed application reproduced xterm `loadCell` and `isWrapped` li
 Source commit `6870444` fixed the teardown race, and the packaged `3b83b9e` build completed cold rehydration with zero `loadCell`, `isWrapped`, or window errors.
 Source commit `35fbae2` also prevents a second packaged launch from creating a competing control server and duplicate PTY attachments.
 Source commit `3b83b9e` defers frontend resize commands until remote PTY attachment is confirmed, eliminating repetitive startup `no live terminal` diagnostics in packaged testing.
-Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction used by Captain creation and MCP.
-The transaction atomically reserves a new `.git` directory, initializes `main`, refuses any pre-existing `.git` entry, and removes only the `.git` directory it created when a later registration boundary fails.
-Source commit `2cf4a42` adds explicit creation of one absent empty-codebase leaf to the same transaction.
-It requires Git initialization, never replaces an existing path, never creates missing parents, and uses non-recursive rollback for the directory it owns.
+Historical source notes from the earlier registration design describe Git initialization inside the Captain creation transaction.
+The current contract supersedes that design: `register_project` records canonical `rootPath` and detected `vcsCapability` as `git` or `none`, while `initialize_git` is the separate explicit operation.
+Historical source commit `2cf4a42` also described creation of one absent empty-codebase leaf in that older transaction.
+The current flow creates only the explicitly named destination leaf, registers it as a non-Git Project, and never initializes Git implicitly.
 Diagnostic logs are bounded at startup.
 Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,388,493` bytes while preserving complete newest lines.
 Installed `0.3.75` replaces the global Board URL and iframe with a native read-only Board resolved from the focused terminal's durable Project and protected Powder binding.
@@ -807,11 +807,13 @@ Phase 7 remains active.
 Phase 7 item 8 depends on the Phase 2 unified worktree status service, whose durable ownership fields consume the Phase 3 B1 identity interfaces.
 The multiple-Captain exit gate also depends on Phase 3 B1 replacing the one-live-Captain-per-Project constraint with durable Assignment identity.
 Product-flow work may proceed only against stable shared contracts.
-Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 are implemented.
+Items 1 through 7, 9, and 11, plus the existing-codebase path selection in items 13 through 15, are represented in the current source.
+The current dialog does not yet implement the complete filesystem, Git, Powder, model, permission, or external-effect preflight promised by item 13, nor the one shared graphical-and-conversational transaction promised by item 14.
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
 Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.
 Packaged verification listed all 25 real boards from `n8desktop-wsl`, including `t-hub` with its one acceptance card, and preserved the selection in preflight.
-The current source adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf, preserves `vcsCapability: "none"` unless Git initialization is explicitly requested, and reports the exact filesystem effects before creation.
+The current source adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf and preserves `vcsCapability: "none"` unless Git initialization is explicitly requested.
+The current dialog review shows the explicit display name, selected root, assignment, harness, and permissions, and its existing-folder path shows Git capability metadata only after the picker reports it.
 Packaged cancel verification reviewed `/home/natkins/t-hub-cancel-proof-0-3-74`, closed the dialog, and confirmed that no directory was created.
 The current source retains the open template and clone gap: **Create new codebase** offers an explicitly named empty non-Git Project and states that template and clone starting points will be added later.
 The graphical flow currently sequences `register_project` and `commission_captain` in the frontend.
