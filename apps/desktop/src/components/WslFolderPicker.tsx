@@ -14,6 +14,7 @@ interface WslFolderPickerProps {
   onPathChange: (path: string) => void;
   onFolderMetadataChange?: (selection: WslFolderSelection) => void;
   metadataRefreshToken?: number;
+  listingRefreshToken?: number;
 }
 
 export interface WslFolderSelection {
@@ -43,12 +44,14 @@ export function WslFolderPicker({
   onPathChange,
   onFolderMetadataChange,
   metadataRefreshToken = 0,
+  listingRefreshToken = 0,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [listing, setListing] = useState<ListingState>({ kind: "idle" });
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [localListingRefreshToken, setLocalListingRefreshToken] = useState(0);
   const requestGeneration = useRef(0);
   const metadataGeneration = useRef(0);
   const navigationGeneration = useRef(0);
@@ -76,14 +79,16 @@ export function WslFolderPicker({
     const nextListing = priorKind
       ? { kind: "stale" as const, prior: priorKind }
       : { kind: "loading" as const };
+    const previousSelection = selectionRef.current?.path === path ? selectionRef.current : null;
     const initialSelection: WslFolderSelection = {
       path,
       listingStatus: nextListing.kind,
       listingPrior: nextListing.kind === "stale" ? nextListing.prior : undefined,
-      metadataStatus: "checking",
-      git: null,
-      worktreeCount: null,
-      worktrees: null,
+      metadataStatus: previousSelection?.metadataStatus ?? "checking",
+      metadataError: previousSelection?.metadataError,
+      git: previousSelection?.git ?? null,
+      worktreeCount: previousSelection?.worktreeCount ?? null,
+      worktrees: previousSelection?.worktrees ?? null,
     };
     selectionRef.current = initialSelection;
     setListing(() =>
@@ -123,7 +128,7 @@ export function WslFolderPicker({
     return () => {
       cancelled = true;
     };
-  }, [onFolderMetadataChange, path]);
+  }, [listingRefreshToken, localListingRefreshToken, onFolderMetadataChange, path]);
 
   useEffect(() => {
     if (!path || !onFolderMetadataChange) return;
@@ -289,9 +294,16 @@ export function WslFolderPicker({
             Loading folders...
           </p>
         ) : listing.kind === "error" ? (
-          <p className="px-2 py-3 text-xs text-red-300">
-            Could not list this folder: {listing.message}
-          </p>
+          <div className="px-2 py-3 text-xs text-red-300">
+            <p>Could not list this folder: {listing.message}</p>
+            <button
+              type="button"
+              className="mt-1 underline"
+              onClick={() => setLocalListingRefreshToken((current) => current + 1)}
+            >
+              Retry folder listing
+            </button>
+          </div>
         ) : listing.kind === "stale" ? (
           <>
             <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
