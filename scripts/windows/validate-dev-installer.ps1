@@ -221,7 +221,7 @@ Assert-Contract ($developmentConfig.identifier -ceq "com.t-hub.dev") "developmen
 $developmentEndpoints = $developmentConfig.plugins.updater.endpoints
 Assert-Contract ($developmentEndpoints.Count -eq 0) "development updater endpoints must remain disabled."
 
-$installerScript = Get-Content -LiteralPath $InstallerScriptPath -Raw
+$installerScript = (Get-Content -LiteralPath $InstallerScriptPath -Raw).Replace("`r`n", "`n").Replace("`r", "`n")
 $mainBinaryName = Get-UniqueNsisDefine $installerScript "MAINBINARYNAME"
 $mainBinarySourcePath = Get-UniqueNsisDefine $installerScript "MAINBINARYSRCPATH"
 $productName = Get-UniqueNsisDefine $installerScript "PRODUCTNAME"
@@ -232,7 +232,7 @@ Assert-Contract ($productName -ceq "T-Hub Dev") "installer product marker must b
 Assert-Contract ($bundleId -ceq "com.t-hub.dev") "installer bundle marker must be com.t-hub.dev."
 
 $resolvedScript = Resolve-NsisDefines $installerScript
-$activeLines = ($resolvedScript -split "`r?`n" | Where-Object { -not $_.TrimStart().StartsWith(";") }) -join "`n"
+$activeLines = ($resolvedScript -split "`n" | Where-Object { -not $_.TrimStart().StartsWith(";") }) -join "`n"
 $productionReference = '(?i)(?<![A-Za-z0-9_-])t-hub\.exe(?![A-Za-z0-9_.-])'
 Assert-Contract (-not ($activeLines -match $productionReference)) "installer contains a production t-hub.exe reference."
 $installSection = Get-UniqueNsisSection $resolvedScript "Install"

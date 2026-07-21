@@ -1,5 +1,17 @@
+param(
+  [ValidateSet("LF", "CRLF")]
+  [string]$LineEndingMode
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if (-not $LineEndingMode) {
+  foreach ($mode in @("LF", "CRLF")) {
+    & $PSCommandPath -LineEndingMode $mode
+  }
+  return
+}
 
 $validator = Join-Path $PSScriptRoot "validate-dev-installer.ps1"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -21,6 +33,28 @@ function Write-AsciiFixture {
     [string]$Content
   )
   [System.IO.File]::WriteAllBytes($Path, [System.Text.Encoding]::ASCII.GetBytes($Content))
+}
+
+function Write-NsisFixture {
+  param(
+    [string]$Path,
+    [string]$Content
+  )
+  $lineEnding = if ($LineEndingMode -ceq "CRLF") { "`r`n" } else { "`n" }
+  Write-AsciiFixture $Path ($Content -replace "`r`n|`r|`n", $lineEnding)
+}
+
+function ConvertTo-MixedLineEndings {
+  param([string]$Content)
+  $lines = $Content -split "`r`n|`r|`n"
+  $builder = New-Object System.Text.StringBuilder
+  for ($index = 0; $index -lt $lines.Count; $index++) {
+    [void]$builder.Append($lines[$index])
+    if ($index -lt $lines.Count - 1) {
+      [void]$builder.Append($(if ($index % 2 -eq 0) { "`r`n" } else { "`n" }))
+    }
+  }
+  return $builder.ToString()
 }
 
 function Invoke-Validator {
@@ -80,7 +114,7 @@ Section Uninstall
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
 SectionEnd
 '@
-  Set-Content -LiteralPath $validScriptPath -Value $validScript -Encoding UTF8
+  Write-NsisFixture $validScriptPath $validScript
   Write-AsciiFixture $installerPath "fixture installer"
   $binaryPrefix = "T-Hub Dev|com.t-hub.dev|t-hub-dev|.t-hub-dev|"
   Write-AsciiFixture $rawPath ($binaryPrefix + "__TAURI_BUNDLE_TYPE_VAR_UNK|raw")
@@ -96,8 +130,13 @@ SectionEnd
   $preInstallResult = (Invoke-Validator $validScriptPath $rawPath $extractedPath $null | Out-String) | ConvertFrom-Json
   Assert-True ($null -eq $preInstallResult.installedSha256) "pre-install validation must not invent an installed hash."
 
+  $mixedScriptPath = Join-Path $fixtureRoot "mixed-installer.nsi"
+  Write-AsciiFixture $mixedScriptPath (ConvertTo-MixedLineEndings $validScript)
+  $mixedResult = (Invoke-Validator $mixedScriptPath $rawPath $extractedPath $installedPath | Out-String) | ConvertFrom-Json
+  Assert-True ($mixedResult.expectedSha256 -ceq $mixedResult.extractedSha256) "mixed-line-ending installer script must validate."
+
   $oldFaultyScriptPath = Join-Path $fixtureRoot "old-faulty-installer.nsi"
-  Set-Content -LiteralPath $oldFaultyScriptPath -Value ($validScript.Replace('t-hub-dev', 't-hub')) -Encoding UTF8
+  Write-NsisFixture $oldFaultyScriptPath ($validScript.Replace('t-hub-dev', 't-hub'))
   Assert-ValidatorFails "old production-binary installer" {
     Invoke-Validator $oldFaultyScriptPath $rawPath $extractedPath $installedPath
   } "MAINBINARYNAME must be t-hub-dev"
@@ -107,7 +146,7 @@ SectionEnd
     '!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"',
     '!insertmacro CheckIfAppIsRunning "t-hub.exe" "${PRODUCTNAME}"'
   )
-  Set-Content -LiteralPath $productionTargetScriptPath -Value $productionTargetScript -Encoding UTF8
+  Write-NsisFixture $productionTargetScriptPath $productionTargetScript
   Assert-ValidatorFails "production process target" {
     Invoke-Validator $productionTargetScriptPath $rawPath $extractedPath $installedPath
   } "production t-hub.exe reference"
@@ -161,7 +200,7 @@ SectionEnd
     "Section Uninstall`n  !insertmacro CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"",
     "  !insertmacro CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"`nSection Uninstall"
   )
-  Set-Content -LiteralPath $misplacedChecksScriptPath -Value $misplacedChecksScript -Encoding UTF8
+  Write-NsisFixture $misplacedChecksScriptPath $misplacedChecksScript
   Assert-ValidatorFails "both process checks in install section" {
     Invoke-Validator $misplacedChecksScriptPath $rawPath $extractedPath $installedPath
   } "Uninstall section must contain exactly one"
@@ -171,7 +210,7 @@ SectionEnd
     "Section Install",
     "Section Install`n  KillProcessCurrentUser `"t-hub.exe`""
   )
-  Set-Content -LiteralPath $directKillScriptPath -Value $directKillScript -Encoding UTF8
+  Write-NsisFixture $directKillScriptPath $directKillScript
   Assert-ValidatorFails "direct production process kill" {
     Invoke-Validator $directKillScriptPath $rawPath $extractedPath $installedPath
   } "production t-hub.exe reference"
@@ -184,7 +223,7 @@ SectionEnd
     "Section Install",
     'Section Install' + "`n" + '  KillProcessCurrentUser "${PROCESSALIAS}"'
   )
-  Set-Content -LiteralPath $indirectKillScriptPath -Value $indirectKillScript -Encoding UTF8
+  Write-NsisFixture $indirectKillScriptPath $indirectKillScript
   Assert-ValidatorFails "indirect production process kill" {
     Invoke-Validator $indirectKillScriptPath $rawPath $extractedPath $installedPath
   } "production t-hub.exe reference"
@@ -200,7 +239,7 @@ SectionEnd
     '  Delete "$INSTDIR\${MAINBINARYNAME}.exe"',
     '  Delete "$INSTDIR\${MAINBINARYNAME}.exe"' + "`n" + '  Delete "$INSTDIR\t-hub.exe"'
   )
-  Set-Content -LiteralPath $extraProductionRefsScriptPath -Value $extraProductionRefsScript -Encoding UTF8
+  Write-NsisFixture $extraProductionRefsScriptPath $extraProductionRefsScript
   Assert-ValidatorFails "extra production executable references" {
     Invoke-Validator $extraProductionRefsScriptPath $rawPath $extractedPath $installedPath
   } "production t-hub.exe reference"
@@ -227,7 +266,7 @@ SectionEnd
     Assert-True ($workflow.Contains($requiredWorkflowContract)) "release workflow is missing '$requiredWorkflowContract'."
   }
 
-  Write-Host "PASS: Dev installer validator accepted the isolated fixture and rejected twelve unsafe fixtures."
+  Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected twelve unsafe fixtures."
 } finally {
   if (Test-Path -LiteralPath $fixtureRoot) {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force
