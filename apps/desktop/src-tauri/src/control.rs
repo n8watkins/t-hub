@@ -133,6 +133,8 @@ pub struct ControlResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "errorDetails", skip_serializing_if = "Option::is_none")]
+    pub error_details: Option<Value>,
     #[serde(rename = "errorKind", skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     /// True when `error` is a TRANSIENT, RETRYABLE control-plane condition rather
@@ -174,6 +176,7 @@ impl ControlResponse {
             ok: true,
             result: Some(result),
             error: None,
+            error_details: None,
             error_kind: None,
             retryable: false,
         }
@@ -183,11 +186,18 @@ impl ControlResponse {
         // built via `retryable_error` carries the reserved SOH prefix, which we strip
         // and hoist into the structured `retryable` flag.
         let raw = msg.into();
+        if let Some(operation) = raw
+            .strip_prefix("git_required code=git_required operation=")
+            .and_then(|value| value.strip_suffix(" capability=git action=initialize_git"))
+        {
+            return Self::git_required(operation);
+        }
         match raw.strip_prefix(RETRYABLE_ERROR_MARKER) {
             Some(clean) => Self {
                 ok: false,
                 result: None,
                 error: Some(clean.to_string()),
+                error_details: None,
                 error_kind: None,
                 retryable: true,
             },
@@ -195,9 +205,29 @@ impl ControlResponse {
                 ok: false,
                 result: None,
                 error: Some(raw),
+                error_details: None,
                 error_kind: None,
                 retryable: false,
             },
+        }
+    }
+
+    fn git_required(operation: &str) -> Self {
+        let message = format!(
+            "Git capability is required for {operation}; initialize Git with initialize_git"
+        );
+        Self {
+            ok: false,
+            result: None,
+            error: Some(message),
+            error_details: Some(json!({
+                "code": "git_required",
+                "operation": operation,
+                "capability": "git",
+                "action": "initialize_git",
+            })),
+            error_kind: Some("git_required".into()),
+            retryable: false,
         }
     }
 
@@ -208,6 +238,7 @@ impl ControlResponse {
             error: Some(format!(
                 "{operation} is retired; use the agent session operations instead"
             )),
+            error_details: None,
             error_kind: Some("powder_retired".to_string()),
             retryable: false,
         }

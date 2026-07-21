@@ -195,6 +195,8 @@ fn tool_error(error: &control_client::ControlCallError) -> Value {
         "structuredContent": {
             "message": &error.message,
             "retryable": error.retryable,
+            "kind": &error.kind,
+            "error": error.details,
         },
         "isError": true
     })
@@ -210,6 +212,8 @@ mod tests {
         let error = control_client::ControlCallError {
             message: "history_resume_failed: placement uncertain".into(),
             retryable: true,
+            kind: None,
+            details: None,
         };
 
         let result = tool_error(&error);
@@ -220,6 +224,34 @@ mod tests {
             result["structuredContent"]["message"],
             "history_resume_failed: placement uncertain"
         );
+    }
+
+    #[test]
+    fn tool_error_forwards_native_structured_details_without_reparsing_message() {
+        let details = json!({
+            "code": "git_required",
+            "operation": "dispatch_preflight",
+            "capability": "git",
+            "action": "initialize_git"
+        });
+        let error = control_client::ControlCallError {
+            message: "Git capability is required".into(),
+            retryable: false,
+            kind: Some("git_required".into()),
+            details: Some(details.clone()),
+        };
+
+        let result = tool_error(&error);
+
+        assert_eq!(result["structuredContent"]["error"], details);
+        assert_eq!(
+            result["structuredContent"]["message"],
+            "Git capability is required"
+        );
+        assert!(!result["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dispatch_preflight:"));
     }
 
     /// Drive the server with one or more request lines and collect the response
