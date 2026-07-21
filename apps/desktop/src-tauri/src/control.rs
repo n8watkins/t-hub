@@ -12090,6 +12090,23 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         }
     }
 
+    // A create-worktree request must prove its project/path authority and its
+    // registered Git capability before it reserves an idempotency slot.  This
+    // keeps both fresh and stale retries free of admission state changes when a
+    // non-Git Project or an unauthorized remote path is rejected.
+    if req.command == "create_worktree" {
+        match authorize_reprobe_create_worktree(ctx, &req.args, caller.as_ref(), trusted_internal) {
+            Ok(repo_root) => {
+                if let Err(error) =
+                    require_registered_git_capability(ctx, "create_worktree", &repo_root)
+                {
+                    return ControlResponse::err(error);
+                }
+            }
+            Err(error) => return ControlResponse::err(error),
+        }
+    }
+
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
     // spawn-class command makes it safely retryable across an ambiguous response
     // leg. We consult the outcome cache BEFORE the governor charges budget so a
@@ -12133,7 +12150,22 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             // future one - resolves against it. Only when reality shows NOTHING was
             // created do we fall through and apply fresh (the original truly died).
             BeginOutcome::FreshAfterReap => {
-                if let Some(outcome) = reprobe_reaped_request(ctx, &req.command, &req.args) {
+                let pre_probe = if req.command == "create_worktree" {
+                    authorize_reprobe_create_worktree(
+                        ctx,
+                        &req.args,
+                        caller.as_ref(),
+                        trusted_internal,
+                    )
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                let outcome = match pre_probe {
+                    Ok(_) => reprobe_reaped_request(ctx, &req.command, &req.args),
+                    Err(error) => Some(Err(error)),
+                };
+                if let Some(outcome) = outcome {
                     let outcome = ctx.requests.finish_reserved(
                         id,
                         request_reservation.expect("fresh reservation"),
@@ -12338,6 +12370,11 @@ fn reprobe_reaped_request(
             // an existing worktree read as absent (which would wrongly re-apply and
             // duplicate). A git failure (repo unreadable) yields an empty list ⇒ None
             // ⇒ proceed to a fresh apply, which re-runs the real git check anyway.
+            if let Err(error) =
+                require_registered_git_capability(ctx, "create_worktree", &repo_root)
+            {
+                return Some(Err(error));
+            }
             let want = std::fs::canonicalize(&worktree_path)
                 .unwrap_or_else(|_| std::path::PathBuf::from(&worktree_path));
             let exists = git::worktree_list(&repo_root)
@@ -12384,6 +12421,39 @@ fn reprobe_reaped_request(
         // Server-minted artifact id (see doc comment): nothing in args to probe by.
         _ => None,
     }
+}
+
+fn authorize_reprobe_create_worktree(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<String, String> {
+    let repo_root = arg_str(args, "repoRoot")
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("create_worktree requires a 'repoRoot' argument")?;
+    let worktree_path = arg_str(args, "worktreePath")
+        .or_else(|| arg_str(args, "worktree_path"))
+        .ok_or("create_worktree requires a 'worktreePath' argument")?;
+    if !ctx.peer_is_loopback {
+        let roots = files::remote_file_roots();
+        files::scoped_create_path(&repo_root, true, roots)?;
+        files::scoped_create_path(&worktree_path, true, roots)?;
+    }
+    let startup_command =
+        arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
+    let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
+    authorize_worktree_maintenance(
+        ctx,
+        caller,
+        trusted_internal,
+        args,
+        &repo_root,
+        &worktree_path,
+        startup_command.as_deref(),
+        spawned_by.as_deref(),
+    )
+    .map(|_| repo_root)
 }
 
 /// Build the response for a replayed (idempotent-duplicate) request. The stored
@@ -13590,7 +13660,6 @@ fn record_agent_delivery(
             )
         })?
         .repo_root;
-    require_registered_git_capability(ctx, "record_agent_delivery", &project_root)?;
     let authority = authorize_agent(
         ctx,
         &agent,
@@ -13598,6 +13667,12 @@ fn record_agent_delivery(
         trusted_internal,
         "record_agent_delivery",
     )?;
+    let gate_operation = if state == "integrated" {
+        "integration"
+    } else {
+        "delivery"
+    };
+    require_registered_git_capability(ctx, gate_operation, &project_root)?;
     if authority == AgentAuthority::Agent && !matches!(state.as_str(), "implemented" | "tested") {
         return Err(format!(
             "acl: an implementing agent may record only implemented or tested evidence, not '{state}'"
@@ -19136,7 +19211,6 @@ fn dispatch_crew_with_observer_inner(
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
-    require_registered_git_capability(ctx, "dispatch_crew", &project.repo_root)?;
     let (_, authority_generations, authority_epoch) =
         ctx.captains.snapshot_with_authority_generations();
     let dispatch_generation = authority_generations.scoped(
@@ -19152,6 +19226,7 @@ fn dispatch_crew_with_observer_inner(
         caller: caller.cloned(),
     };
     enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
+    require_registered_git_capability(ctx, "dispatch_crew", &project.repo_root)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
         format!(
@@ -23710,9 +23785,7 @@ fn resolve_admin_worktree_target(
     let mut matches = Vec::new();
     for project in &snapshot.projects {
         if project.vcs_capability.as_deref() == Some("none") {
-            if files::posix_form(&project.repo_root) == requested_path {
-                require_registered_git_capability(ctx, "admin_worktree", &project.repo_root)?;
-            }
+            require_registered_git_capability(ctx, "admin_worktree", &requested_path)?;
             continue;
         }
         let worktrees = git::worktree_list(&files::posix_form(&project.repo_root))?;
@@ -24564,6 +24637,19 @@ fn create_worktree(
         startup_command.as_deref(),
         spawned_by.as_deref(),
     )?;
+    let (repo_root, worktree_path) = if ctx.peer_is_loopback {
+        (repo_root, worktree_path)
+    } else {
+        let roots = files::remote_file_roots();
+        (
+            files::scoped_create_path(&repo_root, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+            files::scoped_create_path(&worktree_path, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
     require_registered_git_capability(ctx, "create_worktree", &repo_root)?;
     let result = create_worktree_authorized(
         ctx,
@@ -24598,19 +24684,33 @@ fn require_registered_git_capability(
     operation: &str,
     root: &str,
 ) -> Result<(), String> {
-    let identity = files::posix_form(root);
-    if let Some(project) = ctx
+    let identity = files::posix_form(root).trim_end_matches('/').to_string();
+    let mut candidates = ctx
         .captains
         .projects()
         .into_iter()
-        .find(|project| files::posix_form(&project.repo_root) == identity)
-    {
-        if project.vcs_capability.as_deref() == Some("none") {
-            return Err(format!(
-                "git_required code=git_required operation={operation} capability=git action=initialize_git"
-            ));
-        }
+        .filter_map(|project| {
+            let project_root = files::posix_form(&project.repo_root)
+                .trim_end_matches('/')
+                .to_string();
+            (identity == project_root || identity.starts_with(&format!("{project_root}/")))
+                .then_some((project_root.len(), project))
+        })
+        .collect::<Vec<_>>();
+    let Some(max_specificity) = candidates.iter().map(|(length, _)| *length).max() else {
         return Ok(());
+    };
+    candidates.retain(|(length, _)| *length == max_specificity);
+    if candidates.len() != 1 {
+        return Err(format!(
+            "{operation}: registered Project identity for '{}' is ambiguous; refusing Git capability resolution",
+            identity
+        ));
+    }
+    if candidates[0].1.vcs_capability.as_deref() == Some("none") {
+        return Err(format!(
+            "git_required code=git_required operation={operation} capability=git action=initialize_git"
+        ));
     }
     Ok(())
 }
@@ -25055,10 +25155,10 @@ fn remove_worktree(
                 .into_owned(),
         )
     };
+    require_registered_git_capability(ctx, "remove_worktree", &repo_root)?;
 
     // Preserve the remote path security boundary, then fail every authorized
     // caller before forwarding UI state or invoking Git.
-    require_registered_git_capability(ctx, "remove_worktree", &repo_root)?;
     git::require_worktree_removal_safety_service()?;
 
     let forward = json!({
@@ -25145,7 +25245,7 @@ fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("list_worktrees requires a 'cwd' argument")?;
     let cwd = if ctx.peer_is_loopback {
-        cwd
+        cwd.to_string()
     } else {
         files::scoped_create_path(&cwd, true, files::remote_file_roots())?
             .to_string_lossy()
@@ -26750,6 +26850,12 @@ fn dispatch_runtime_capacity(
     snapshot: &CaptainsSnapshot,
     project_id: &str,
 ) -> Result<crate::governor::RuntimeCapacity, String> {
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
+    require_registered_git_capability(ctx, "capacity", &project.repo_root)?;
     let live = live_session_evidence(ctx, snapshot, None)?;
     let active_directories = snapshot
         .agent_sessions
@@ -26757,12 +26863,6 @@ fn dispatch_runtime_capacity(
         .filter(|agent| agent_retains_lane_ownership(agent))
         .map(|agent| files::posix_form(&agent.directory))
         .collect::<BTreeSet<_>>();
-    let project = snapshot
-        .projects
-        .iter()
-        .find(|project| project.project_id == project_id)
-        .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
-    require_registered_git_capability(ctx, "capacity", &project.repo_root)?;
     let available_worktrees = git::worktree_list(&files::posix_form(&project.repo_root))
         .map_err(|error| format!("dispatch preflight: could not inspect worktrees: {error}"))?
         .into_iter()
@@ -30436,6 +30536,22 @@ mod tests {
         // local path.)
         let mut ctx = test_ctx("t");
         ctx.peer_is_loopback = false;
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/home/x/proj".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "remote-none".into(),
+                name: "Remote none".into(),
+                repo_root: "/home/x/proj".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let before = ctx.captains.snapshot();
         for cmd in ["create_worktree", "remove_worktree", "list_worktrees"] {
             let err = dispatch(
                 &ctx,
@@ -30447,7 +30563,12 @@ mod tests {
                 err.contains("disabled"),
                 "{cmd} should be gated for a remote peer; got: {err}"
             );
+            assert!(
+                !err.contains("git_required"),
+                "{cmd} disclosed registered capability before remote path authorization: {err}"
+            );
         }
+        assert_eq!(ctx.captains.snapshot().seq, before.seq);
         // git_info probes git at a peer-controlled cwd — same allowlist gate.
         let err = dispatch(&ctx, "git_info", &json!({"path": "/home/x/whatever"})).unwrap_err();
         assert!(
@@ -34792,6 +34913,91 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn registered_git_gate_uses_the_most_specific_project_independent_of_order() {
+        for (outer_capability, inner_capability, expected_error) in
+            [("none", "git", false), ("git", "none", true)]
+        {
+            for order in [["outer", "inner"], ["inner", "outer"]] {
+                let registry = CaptainsRegistry::new();
+                for project_id in order {
+                    let (root, capability) = if project_id == "outer" {
+                        ("/tmp/project-nesting", outer_capability)
+                    } else {
+                        ("/tmp/project-nesting/selected", inner_capability)
+                    };
+                    registry
+                        .upsert_project(ProjectRecord {
+                            root_path: Some(root.into()),
+                            vcs_capability: Some(capability.into()),
+                            git_main_root: None,
+                            project_id: project_id.into(),
+                            name: project_id.into(),
+                            repo_root: root.into(),
+                            remote_url: None,
+                            default_branch: None,
+                            powder: None,
+                            created_at: 1,
+                            updated_at: 1,
+                        })
+                        .unwrap();
+                }
+                let ctx = test_ctx("specific-git-gate").with_captains_registry(Arc::new(registry));
+                let result = require_registered_git_capability(
+                    &ctx,
+                    "list_worktrees",
+                    "/tmp/project-nesting/selected/worktree",
+                );
+                assert_eq!(result.is_err(), expected_error);
+            }
+        }
+    }
+
+    #[test]
+    fn registered_git_gate_fails_closed_for_equal_specificity_ambiguity() {
+        let registry = CaptainsRegistry::new();
+        {
+            let mut inner = registry.lock();
+            inner.projects = vec![
+                ProjectRecord {
+                    root_path: Some("/tmp/ambiguous-root".into()),
+                    vcs_capability: Some("none".into()),
+                    git_main_root: None,
+                    project_id: "ambiguous-a".into(),
+                    name: "Ambiguous A".into(),
+                    repo_root: "/tmp/ambiguous-root".into(),
+                    remote_url: None,
+                    default_branch: None,
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                ProjectRecord {
+                    root_path: Some("/tmp/ambiguous-root/".into()),
+                    vcs_capability: Some("git".into()),
+                    git_main_root: None,
+                    project_id: "ambiguous-b".into(),
+                    name: "Ambiguous B".into(),
+                    repo_root: "/tmp/ambiguous-root/".into(),
+                    remote_url: None,
+                    default_branch: None,
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ];
+        }
+        let ctx = test_ctx("ambiguous-git-gate").with_captains_registry(Arc::new(registry));
+        let error = require_registered_git_capability(
+            &ctx,
+            "list_worktrees",
+            "/tmp/ambiguous-root/selected",
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
+        assert!(!error.contains("git_required"));
     }
 
     #[test]
