@@ -22410,13 +22410,16 @@ fn current_delegating_supervisor(
         }
         crate::delegated_admin::DelegatingSupervisorRole::Captain => {
             let captain = grant.delegator.ship_slug.as_deref().and_then(|ship_slug| {
-                ctx.captains
+                let matches = ctx
+                    .captains
                     .snapshot()
                     .captains
                     .into_iter()
-                    .find(|captain| {
+                    .filter(|captain| {
                         captain.role == FleetRole::Captain && captain.ship_slug == ship_slug
                     })
+                    .collect::<Vec<_>>();
+                (matches.len() == 1).then(|| matches.into_iter().next().unwrap())
             });
             let current_identity = captain
                 .as_ref()
@@ -37341,6 +37344,70 @@ mod tests {
     }
 
     #[test]
+    fn ship_admin_grant_fails_closed_for_ambiguous_delegator_ship() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let ctx = test_ctx("delegated-admin-ambiguous");
+        ctx.captains
+            .claim_test("captain-admin", Some("alpha"), vec![])
+            .unwrap();
+        ctx.captains
+            .record_crew("captain-admin", "crew-admin")
+            .unwrap();
+        let admin_target = tmux_target("crew-admin");
+        create_test_tmux_session(&admin_target).unwrap();
+        let captain_identity = ctx.identity.mint(crate::identity::Role::Captain).unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "captain-admin")
+            .unwrap();
+        let admin_identity = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        ctx.identity
+            .bind_tile(&admin_identity.id, "crew-admin")
+            .unwrap();
+        let captain = resolve_identity(&ctx, &captain_identity.secret).unwrap();
+        let appointed = appoint_admin(
+            &ctx,
+            &json!({
+                "actorSessionId": "crew-admin",
+                "role": "shipAdmin",
+                "permittedOperations": ["inspectStatus"],
+            }),
+            Some(&captain),
+            false,
+        )
+        .unwrap();
+        let grant_id = appointed["grant"]["grantId"].as_str().unwrap();
+
+        let mut duplicate = ctx
+            .captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|record| record.terminal_id.as_deref() == Some("captain-admin"))
+            .unwrap();
+        duplicate.assignment_id = "ambiguous-assignment".into();
+        duplicate.terminal_id = Some("captain-duplicate".into());
+        ctx.captains.lock().captains.push(duplicate);
+
+        let admin = resolve_identity(&ctx, &admin_identity.secret).unwrap();
+        let denied = authorize_delegated_admin(
+            &ctx,
+            &admin,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            crate::delegated_admin::AdminTarget::Ship {
+                ship_slug: "alpha".into(),
+            },
+            crate::delegated_admin::AdminSafeguards::default(),
+        )
+        .unwrap_err();
+        assert!(denied.contains("supervisorInactive"), "{denied}");
+        assert!(matches!(
+            ctx.delegated_admin.get(grant_id).unwrap().state,
+            crate::delegated_admin::GrantState::Invalidated { .. }
+        ));
+        reap_test_tmux_session(&admin_target).unwrap();
+    }
+
+    #[test]
     fn ship_admin_executes_own_ship_operations_and_denies_foreign_or_reserved_targets() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -41550,7 +41617,7 @@ mod tests {
                 .unwrap();
         });
         let (captains, listed_tabs) = listed_rx
-            .recv_timeout(Duration::from_millis(250))
+            .recv_timeout(Duration::from_secs(2))
             .expect("Fleet readers must remain prompt during terminal effects");
         captains.unwrap();
         listed_tabs.unwrap();
@@ -43661,6 +43728,36 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("unsupported for generic Crew spawns"));
         assert!(ctx.identity.is_empty());
+    }
+
+    #[test]
+    fn requested_session_identity_is_bound_before_launch_and_prebind_failure_rolls_back() {
+        let mut ctx = test_ctx("identity-prebind");
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let (_, minted) =
+            spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal", Some("fa123456")).unwrap();
+        let minted = minted.unwrap();
+        assert_eq!(minted.session_tile.as_deref(), Some("fa123456"));
+        assert_eq!(
+            ctx.identity
+                .resolve(&minted.secret)
+                .and_then(|identity| identity.session_tile),
+            Some("fa123456".into())
+        );
+
+        let path = captains_tmp("identity-prebind-rollback");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        // mint_and_bind persists the pre-bound identity atomically in one write.
+        store.fail_persist_after(0);
+        let mut failing = test_ctx("identity-prebind-rollback").with_identity_store(store.clone());
+        failing.addr = "127.0.0.1:4242".to_string();
+        let error =
+            spawn_env_with_identity(&failing, &json!({}), "spawn_terminal", Some("fa654321"))
+                .unwrap_err();
+        assert!(error.contains("identity pre-binding persistence failed"));
+        assert!(store.is_empty());
+        assert!(crate::identity::IdentityStore::load(path.clone()).is_empty());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
