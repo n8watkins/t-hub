@@ -14,7 +14,7 @@ import {
   controlRequest,
   isRetryableControlError,
 } from "./controlClient";
-import nativeControlErrors from "./fixtures/native-control-error-bridge.json";
+import nativeControlErrors from "../../src-tauri/fixtures/native-control-error-bridge.json";
 
 beforeEach(() => {
   mocks.invoke.mockReset();
