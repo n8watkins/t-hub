@@ -91,6 +91,7 @@ or General authority.
 `scripts/captain/install-thub-codex.sh` builds the release MCP binary, atomically installs it at `~/.t-hub/bin/t-hub-mcp`, deploys the provisioner, and registers the server.
 `scripts/captain/ensure-thub-codex.sh` is the idempotent registration-only entry point and converges an uncustomized stale command path to the installed binary through `codex mcp remove` plus `codex mcp add`.
 An exact enabled legacy registration that inherits `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` is refused unchanged by default.
+For this exact legacy predicate, Codex JSON `transport.env` values of `null` and `{}` are equivalent empty environments; nonempty objects and every other JSON type remain customized and are refused unchanged.
 After inspecting that registration, run `scripts/captain/install-thub-codex.sh --migrate-legacy-registration` to replace only its root `env_vars` line with the canonical `T_HUB_CONTROL_FILE` and `T_HUB_SESSION_TOKEN` names.
 The migration option composes with `--repair-skills`, applies only to Codex, never invokes `codex mcp remove` or `codex mcp add`, and never persists an environment value.
 Migration preserves nested tool approval policy and every unrelated TOML byte, verifies the parsed before-and-after registration semantics, and rolls back the exact original bytes on verification failure unless a concurrent writer has changed the file.
