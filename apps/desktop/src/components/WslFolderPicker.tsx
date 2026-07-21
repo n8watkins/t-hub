@@ -94,11 +94,14 @@ export function WslFolderPicker({
     void gitInfo(path)
       .then(async (git) => {
         if (!git.isRepo) return { git, worktreeCount: 0 };
+        if (cancelled || generation !== requestGeneration.current) return null;
         const worktrees = await gitWorktreeList(path);
+        if (cancelled || generation !== requestGeneration.current) return null;
         return { git, worktreeCount: worktrees.length };
       })
-      .then(({ git, worktreeCount }) => {
-        if (cancelled || generation !== requestGeneration.current) return;
+      .then((result) => {
+        if (!result || cancelled || generation !== requestGeneration.current) return;
+        const { git, worktreeCount } = result;
         onFolderMetadataChange?.({ path, status: "ready", git, worktreeCount });
       })
       .catch((cause) => {
