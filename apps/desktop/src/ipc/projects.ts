@@ -57,6 +57,8 @@ export interface CaptainIdentity {
   projectId?: string;
   assignment?: string;
   harness?: "codex" | "claude";
+  conversationId?: string;
+  resumePoint?: string;
   workspaceTabIds: string[];
   crew: unknown[];
 }
@@ -79,13 +81,20 @@ export function captainBootstrap(input: {
   return controlRequest("captain_bootstrap", input) as Promise<CaptainBootstrap>;
 }
 
+export interface CaptainCheckpointResponse {
+  accepted: "captain_checkpoint";
+  audited: boolean;
+  captain: CaptainIdentity;
+  target: "captain" | "crew";
+}
+
 export function captainCheckpoint(input: {
   shipSlug?: string;
   captainSessionId?: string;
   conversationId: string;
   resumePoint: string;
-}): Promise<{ accepted: string }> {
-  return controlRequest("captain_checkpoint", input) as Promise<{ accepted: string }>;
+}): Promise<CaptainCheckpointResponse> {
+  return controlRequest("captain_checkpoint", input) as Promise<CaptainCheckpointResponse>;
 }
 
 export function commissionCaptain(input: {
