@@ -923,6 +923,7 @@ pub fn run() {
             files::write_text_file,
             files::wsl_folder_dialog_initial_path,
             files::wsl_folder_dialog_selection,
+            files::normalize_wsl_path,
             // --- feat/git-panel ---
             // Git awareness for the Files panel: branch/worktree info + commit.
             git::git_info,

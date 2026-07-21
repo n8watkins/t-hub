@@ -16,3 +16,7 @@ export async function pickWslFolder(initialPath: string): Promise<string | null>
     selectedPath: selected,
   });
 }
+
+export function normalizeWslPath(path: string): Promise<string> {
+  return invoke<string>("normalize_wsl_path", { path });
+}

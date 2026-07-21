@@ -344,25 +344,33 @@ pub(crate) fn to_host_path(path: &str) -> PathBuf {
     }
 }
 
-fn posix_to_wsl_unc(path: &str, distro: &str) -> Result<String, String> {
+fn normalize_posix_wsl_path(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
-    if !trimmed.starts_with('/') || trimmed.starts_with("//") || trimmed.contains('\0') {
+    if !trimmed.starts_with('/')
+        || trimmed.starts_with("//")
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
         return Err("Choose an absolute WSL folder path.".into());
     }
     let mut parts: Vec<&str> = Vec::new();
     for part in trimmed.split('/') {
         match part {
             "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
+            ".." => return Err("The WSL folder path cannot contain '..' traversal.".into()),
             value => parts.push(value),
         }
     }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn posix_to_wsl_unc(path: &str, distro: &str) -> Result<String, String> {
+    let normalized = normalize_posix_wsl_path(path)?;
+    let parts = normalized.trim_start_matches('/');
     let tail = if parts.is_empty() {
         String::new()
     } else {
-        format!("\\{}", parts.join("\\"))
+        format!("\\{}", parts.replace('/', "\\"))
     };
     Ok(format!("\\\\wsl.localhost\\{distro}{tail}"))
 }
@@ -407,6 +415,17 @@ pub fn wsl_folder_dialog_initial_path(path: String) -> Result<String, String> {
 #[tauri::command]
 pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, String> {
     wsl_unc_to_posix_for_distro(&selected_path, &configured_wsl_distro())
+}
+
+/// Normalize a manually entered POSIX or WSL UNC path through the same
+/// distro-aware bridge used by the Explorer picker.
+#[tauri::command]
+pub fn normalize_wsl_path(path: String) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') && !trimmed.starts_with("//") {
+        return normalize_posix_wsl_path(trimmed);
+    }
+    wsl_unc_to_posix_for_distro(trimmed, &configured_wsl_distro())
 }
 
 // ---------------------------------------------------------------------------
@@ -516,18 +535,31 @@ fn wsl_list_dir(dir: &str, show_ignored: bool) -> Result<Vec<DirEntry>, String> 
     // matches, so `|| true` keeps the pipeline alive. Already in `dir` via wsl.exe
     // --cd, so we operate on `.` (no `cd "$1"`).
     const SCRIPT_FILTER: &str = r#"
+set -o pipefail
+raw=$(mktemp) || exit 1
+trap 'rm -f "$raw"' EXIT
+if ! find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' >"$raw"; then
+  echo "wsl list_dir find failed" >&2
+  exit 1
+fi
 emit() {
-  find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
-    while IFS=$'\t' read -r f y; do
+  while IFS=$'\t' read -r f y; do
       g=0
       [ "$y" = d ] && [ -e "$f/.git" ] && g=1
       printf '%s\t%s\t%s\n' "$f" "$y" "$g"
-    done
+  done <"$raw"
 }
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  set +e
   ign=$(emit | while IFS=$'\t' read -r f y g; do
           [ "$y" = d ] && printf '%s/\n' "$f"
-        done | git check-ignore --stdin 2>/dev/null | sed 's#/$##' || true)
+        done | git check-ignore --stdin | sed 's#/$##')
+  check_status=$?
+  set -e
+  if [ "$check_status" -ne 0 ] && [ "$check_status" -ne 1 ]; then
+    echo "wsl list_dir git ignore check failed" >&2
+    exit "$check_status"
+  fi
   emit | while IFS=$'\t' read -r f y g; do
     if [ "$y" = d ]; then
       skip=
@@ -545,12 +577,18 @@ fi
 "#;
     // "Show ignored": no filtering — list every child (ignored dirs included).
     const SCRIPT_ALL: &str = r#"
-find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
-  while IFS=$'\t' read -r f y; do
+set -o pipefail
+raw=$(mktemp) || exit 1
+trap 'rm -f "$raw"' EXIT
+if ! find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' >"$raw"; then
+  echo "wsl list_dir find failed" >&2
+  exit 1
+fi
+while IFS=$'\t' read -r f y; do
     g=0
     [ "$y" = d ] && [ -e "$f/.git" ] && g=1
     printf '%s\t%s\t%s\n' "$f" "$y" "$g"
-  done
+done <"$raw"
 "#;
     let script = if show_ignored {
         SCRIPT_ALL
@@ -2219,6 +2257,20 @@ mod tests {
         )
         .is_err());
         assert!(posix_to_wsl_unc("C:\\Users\\natha", distro).is_err());
+        assert!(posix_to_wsl_unc("/home/natkins/../other", distro).is_err());
+        assert_eq!(
+            normalize_wsl_path(" /home/natkins/./project/ ".into()).unwrap(),
+            "/home/natkins/project"
+        );
+        assert_eq!(
+            normalize_wsl_path(
+                "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\project".into()
+            )
+            .unwrap(),
+            "/home/natkins/project"
+        );
+        assert!(normalize_wsl_path("\\\\wsl.localhost\\Debian\\home\\natkins".into()).is_err());
+        assert!(normalize_wsl_path("C:\\Users\\natha".into()).is_err());
     }
 
     #[test]

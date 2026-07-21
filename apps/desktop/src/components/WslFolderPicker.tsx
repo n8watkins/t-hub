@@ -1,11 +1,10 @@
-import { ChevronRight, Folder, FolderOpen, GitBranch, Home, MoveUp } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ChevronRight, Folder, FolderOpen, Home, MoveUp } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { listDir } from "../ipc/files";
-import { gitInfo, type GitInfo } from "../ipc/git";
 import type { DirEntry } from "../ipc/types";
-import { pickWslFolder } from "../ipc/wslFolderDialog";
+import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
 
 interface WslFolderPickerProps {
   path: string;
@@ -13,6 +12,14 @@ interface WslFolderPickerProps {
   recentPaths: Array<{ label: string; path: string }>;
   onPathChange: (path: string) => void;
 }
+
+type ListingState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "loaded-empty" }
+  | { kind: "loaded-populated" }
+  | { kind: "error"; message: string }
+  | { kind: "stale"; prior: "empty" | "populated" };
 
 export function WslFolderPicker({
   path,
@@ -22,38 +29,37 @@ export function WslFolderPicker({
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
-  const [selectedGit, setSelectedGit] = useState<GitInfo | null>(null);
-  const [listing, setListing] = useState<
-    | { kind: "idle" }
-    | { kind: "loading" }
-    | { kind: "loaded"; empty: boolean }
-    | { kind: "error"; message: string }
-    | { kind: "stale" }
-  >({ kind: "idle" });
+  const [listing, setListing] = useState<ListingState>({ kind: "idle" });
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestGeneration = useRef(0);
 
   useEffect(() => setManualPath(path), [path]);
 
   useEffect(() => {
     if (!path) return;
+    const generation = ++requestGeneration.current;
     let cancelled = false;
-    setListing((current) =>
-      entries.length > 0 && current.kind === "loaded"
-        ? { kind: "stale" }
-        : { kind: "loading" },
+    const priorKind = listing.kind === "loaded-empty"
+      ? "empty"
+      : listing.kind === "loaded-populated"
+        ? "populated"
+        : listing.kind === "stale"
+          ? listing.prior
+          : null;
+    setListing(() =>
+      priorKind ? { kind: "stale", prior: priorKind } : { kind: "loading" },
     );
     setError(null);
-    setSelectedGit(null);
     listDir(path)
       .then((nextEntries) => {
-        if (cancelled) return;
+        if (cancelled || generation !== requestGeneration.current) return;
         const directories = nextEntries.filter((entry) => entry.isDir);
         setEntries(directories);
-        setListing({ kind: "loaded", empty: directories.length === 0 });
+        setListing({ kind: directories.length === 0 ? "loaded-empty" : "loaded-populated" });
       })
       .catch((cause) => {
-        if (cancelled) return;
+        if (cancelled || generation !== requestGeneration.current) return;
         const message = cause instanceof Error ? cause.message : String(cause);
         setListing({ kind: "error", message });
         setError(message);
@@ -62,21 +68,18 @@ export function WslFolderPicker({
         // The explicit listing state prevents an error from being rendered as
         // the successful empty-folder state.
       });
-    void gitInfo(path)
-      .then((nextGit) => {
-        if (!cancelled) setSelectedGit(nextGit);
-      })
-      .catch(() => {
-        // Git status is supplementary; folder navigation remains available.
-      });
     return () => {
       cancelled = true;
     };
   }, [path]);
 
   const navigate = (nextPath: string) => {
-    const normalized = normalizePosixPath(nextPath);
-    if (normalized) onPathChange(normalized);
+    setError(null);
+    void normalizeWslPath(nextPath)
+      .then((normalized) => onPathChange(normalized))
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
   };
   const parent = parentPath(path);
   const breadcrumbs = pathBreadcrumbs(path);
@@ -176,17 +179,17 @@ export function WslFolderPicker({
           </p>
         ) : listing.kind === "error" ? (
           <p className="px-2 py-3 text-xs text-red-300">
-            Could not list this folder.
+            Could not list this folder: {listing.message}
           </p>
         ) : listing.kind === "stale" ? (
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
-            Folder listing is stale. Choose the folder again to refresh.
+            Refreshing this folder listing. Previous {listing.prior} results are stale.
           </p>
-        ) : listing.kind === "loaded" && listing.empty ? (
+        ) : listing.kind === "loaded-empty" ? (
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
             This folder is empty.
           </p>
-        ) : listing.kind === "loaded" ? (
+        ) : listing.kind === "loaded-populated" ? (
           entries.map((entry) => (
             <button
               key={entry.path}
@@ -197,24 +200,11 @@ export function WslFolderPicker({
             >
               <Folder size={13} aria-hidden="true" />
               <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-              {entry.isGitRepo && (
-                <span className="flex items-center gap-1" style={{ color: "var(--th-fg-muted)" }}>
-                  <GitBranch size={12} aria-hidden="true" />
-                  Git
-                </span>
-              )}
             </button>
           ))
         ) : null}
       </div>
 
-      {selectedGit && (
-        <p className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
-          {selectedGit.isRepo
-            ? `Git ${selectedGit.branch ?? "detached"}${selectedGit.dirtyCount ? ` · ${selectedGit.dirtyCount} changed` : " · clean"}`
-            : "This folder is not a Git repository."}
-        </p>
-      )}
       {error && <p className="text-xs text-red-300" role="alert">{error}</p>}
     </div>
   );
@@ -247,12 +237,12 @@ function ShortcutButton({
 
 export function normalizePosixPath(path: string): string | null {
   const trimmed = path.trim();
-  if (!trimmed.startsWith("/")) return null;
+  if (!trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.includes("\\")) return null;
   const parts = trimmed.split("/").filter((part) => part && part !== ".");
   const normalized: string[] = [];
   for (const part of parts) {
-    if (part === "..") normalized.pop();
-    else normalized.push(part);
+    if (part === "..") return null;
+    normalized.push(part);
   }
   return `/${normalized.join("/")}`;
 }
