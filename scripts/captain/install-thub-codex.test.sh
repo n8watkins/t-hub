@@ -124,6 +124,38 @@ else
   fail "explicit skill repair failed"
 fi
 
+MIGRATION_WORK="$WORK/migration"
+MIGRATION_HOME="$MIGRATION_WORK/home"
+MIGRATION_CODEX_HOME="$MIGRATION_WORK/codex-home"
+MIGRATION_CLAUDE_HOME="$MIGRATION_WORK/claude-home"
+MIGRATION_BIN_DIR="$MIGRATION_WORK/install/bin"
+MIGRATION_CAPTAIN_DIR="$MIGRATION_WORK/install/captain"
+mkdir -p "$MIGRATION_HOME" "$MIGRATION_CODEX_HOME" "$MIGRATION_CLAUDE_HOME"
+cat > "$MIGRATION_CODEX_HOME/config.toml" <<EOF
+[mcp_servers.t-hub]
+command = "$MIGRATION_BIN_DIR/t-hub-mcp"
+args = []
+env = {}
+env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]
+
+[mcp_servers.t-hub.tools.list_terminals]
+approval_mode = "approve"
+EOF
+if HOME="$MIGRATION_HOME" CODEX_HOME="$MIGRATION_CODEX_HOME" \
+  CLAUDE_HOME="$MIGRATION_CLAUDE_HOME" T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$MIGRATION_BIN_DIR" T_HUB_CAPTAIN_DIR="$MIGRATION_CAPTAIN_DIR" \
+  bash "$SCRIPT" --repair-skills --migrate-legacy-registration >/dev/null 2>&1 \
+  && CODEX_HOME="$MIGRATION_CODEX_HOME" codex mcp get t-hub --json | jq -e '
+    .transport.env_vars == ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]
+  ' >/dev/null 2>&1 \
+  && grep -Fq 'approval_mode = "approve"' "$MIGRATION_CODEX_HOME/config.toml" \
+  && jq -e --arg bin "$MIGRATION_BIN_DIR/t-hub-mcp" \
+    '.mcpServers["t-hub"].command == $bin' "$MIGRATION_HOME/.claude.json" >/dev/null; then
+  pass "installer composes skill repair with Codex-only legacy migration"
+else
+  fail "installer did not compose or isolate legacy migration"
+fi
+
 chmod 600 "$CODEX_HOME/skills/captain/scripts/check_environment.sh"
 if T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
   T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
@@ -268,28 +300,57 @@ POST_SKILL_CLAUDE_HOME="$POST_SKILL_WORK/claude-home"
 POST_SKILL_BIN_DIR="$POST_SKILL_WORK/install/bin"
 POST_SKILL_CAPTAIN_DIR="$POST_SKILL_WORK/install/captain"
 mkdir -p "$POST_SKILL_HOME" "$POST_SKILL_CODEX_HOME" "$POST_SKILL_CLAUDE_HOME" \
-  "$POST_SKILL_BIN_DIR" "$POST_SKILL_CAPTAIN_DIR"
+  "$POST_SKILL_BIN_DIR" "$POST_SKILL_CAPTAIN_DIR" "$POST_SKILL_WORK/wrapper-bin"
 printf 'old binary\n' > "$POST_SKILL_BIN_DIR/t-hub-mcp"
+cat > "$POST_SKILL_CODEX_HOME/config.toml" <<EOF
+[mcp_servers.t-hub]
+command = "$POST_SKILL_BIN_DIR/t-hub-mcp"
+args = []
+env = {}
+env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]
+
+[mcp_servers.t-hub.tools.list_terminals]
+approval_mode = "approve"
+EOF
+cp -p "$POST_SKILL_CODEX_HOME/config.toml" "$POST_SKILL_WORK/codex-before.toml"
+REAL_CODEX="$(command -v codex)"
+cat > "$POST_SKILL_WORK/wrapper-bin/codex" <<'EOF'
+#!/usr/bin/env bash
+if [ ! -f "$CONCURRENT_CACHE_ONCE" ]; then
+  : > "$CONCURRENT_CACHE_ONCE"
+  jq '.cachedMetadata.concurrent = "preserved"' "$CLAUDE_CONFIG" > "$CLAUDE_CONFIG.update"
+  mv "$CLAUDE_CONFIG.update" "$CLAUDE_CONFIG"
+fi
+exec "$REAL_CODEX" "$@"
+EOF
+chmod 700 "$POST_SKILL_WORK/wrapper-bin/codex"
 
 if HOME="$POST_SKILL_HOME" \
   CODEX_HOME="$POST_SKILL_CODEX_HOME" \
   CLAUDE_HOME="$POST_SKILL_CLAUDE_HOME" \
+  PATH="$POST_SKILL_WORK/wrapper-bin:$PATH" \
+  REAL_CODEX="$REAL_CODEX" \
+  CLAUDE_CONFIG="$POST_SKILL_HOME/.claude.json" \
+  CONCURRENT_CACHE_ONCE="$POST_SKILL_WORK/concurrent-cache-once" \
   T_HUB_MCP_SOURCE="$SOURCE" \
   T_HUB_BIN_DIR="$POST_SKILL_BIN_DIR" \
   T_HUB_CAPTAIN_DIR="$POST_SKILL_CAPTAIN_DIR" \
   T_HUB_SKILL_FAIL_AFTER_INSTALL=1 \
-  bash "$SCRIPT" >/dev/null 2>&1; then
+  bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1; then
   fail "injected post-skill failure unexpectedly succeeded"
 else
   pass "injected post-skill failure is reported"
 fi
 if [ "$(cat "$POST_SKILL_BIN_DIR/t-hub-mcp")" = "old binary" ] \
-  && [ ! -e "$POST_SKILL_CODEX_HOME/config.toml" ] \
-  && [ ! -e "$POST_SKILL_HOME/.claude.json" ] \
+  && cmp -s "$POST_SKILL_WORK/codex-before.toml" "$POST_SKILL_CODEX_HOME/config.toml" \
+  && jq -e '
+    .mcpServers["t-hub"] == null and
+    .cachedMetadata.concurrent == "preserved"
+  ' "$POST_SKILL_HOME/.claude.json" >/dev/null \
   && [ ! -e "$POST_SKILL_CODEX_HOME/skills/captain" ] \
   && [ ! -e "$POST_SKILL_CLAUDE_HOME/skills/captain" ] \
   && [ ! -e "$POST_SKILL_CLAUDE_HOME/commands/handoff.md" ]; then
-  pass "post-skill failure rolls back binary, configs, skills, and command"
+  pass "stage failure restores legacy Codex and t-hub node while preserving Claude cache"
 else
   fail "post-skill failure left a partial installation"
 fi

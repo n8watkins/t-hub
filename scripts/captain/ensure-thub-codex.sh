@@ -28,6 +28,14 @@
 # an isolated test.
 set -euo pipefail
 
+MIGRATE_LEGACY=false
+if [ "${1:-}" = "--migrate-legacy-registration" ] && [ "$#" -eq 1 ]; then
+  MIGRATE_LEGACY=true
+elif [ "$#" -ne 0 ]; then
+  echo "usage: ensure-thub-codex.sh [--migrate-legacy-registration]" >&2
+  exit 2
+fi
+
 BIN_DIR="${T_HUB_BIN_DIR:-${HOME}/.t-hub/bin}"
 BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
 
@@ -58,9 +66,46 @@ fi
 CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
 ENV_VARS_JSON='["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"]'
 ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]'
+LEGACY_ENV_VARS_JSON='["T_HUB_CONTROL_ADDR","T_HUB_CONTROL_TOKEN","T_HUB_SESSION_TOKEN"]'
 install -d -m 700 "$(dirname "$CONFIG")"
 exec 9>"${CONFIG}.t-hub.lock"
 flock -x 9
+
+BACKUP=""
+HAD_CONFIG=false
+EXPECTED_HASH=absent
+config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+refresh_expected_hash() {
+  if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
+}
+begin_config_transaction() {
+  if [ -f "$CONFIG" ]; then
+    HAD_CONFIG=true
+    BACKUP="$(mktemp "${CONFIG}.t-hub-backup.XXXXXX")"
+    cp -p "$CONFIG" "$BACKUP"
+    EXPECTED_HASH="$(config_hash)"
+  fi
+  trap rollback EXIT
+}
+rollback() {
+  current_hash=absent
+  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
+  if [ "$current_hash" != "$EXPECTED_HASH" ]; then
+    echo "ensure-thub-codex: config changed concurrently; refusing unsafe rollback" >&2
+    [ -z "$BACKUP" ] || rm -f "$BACKUP"
+    return
+  fi
+  if "$HAD_CONFIG"; then
+    cp -p "$BACKUP" "$CONFIG"
+  else
+    rm -f "$CONFIG"
+  fi
+  [ -z "$BACKUP" ] || rm -f "$BACKUP"
+}
+commit_config_transaction() {
+  trap - EXIT
+  [ -z "$BACKUP" ] || rm -f "$BACKUP"
+}
 
 has_exact_managed_table_shape() {
   awk '
@@ -92,6 +137,22 @@ has_exact_managed_table_shape() {
   ' "$CONFIG"
 }
 
+has_exact_legacy_root_shape() {
+  awk '
+    /^\[mcp_servers\.t-hub\]$/ {
+      if (found) bad = 1
+      found = 1
+      in_target = 1
+      next
+    }
+    /^\[/ { in_target = 0 }
+    in_target && /^[[:space:]]*($|#)/ { next }
+    in_target && /^[[:space:]]*(command|args|env|env_vars)[[:space:]]*=/ { next }
+    in_target { bad = 1 }
+    END { if (found != 1 || bad) exit 1 }
+  ' "$CONFIG"
+}
+
 # Read and mutate under the installer lock. Existing policy remains user-owned.
 CURRENT="$(codex mcp get t-hub --json 2>/dev/null || true)"
 CANONICAL_TRANSPORT=false
@@ -115,6 +176,97 @@ fi
 if "$CANONICAL_TRANSPORT"; then
   echo "ensure-thub-codex: refusing to report a disabled t-hub registration as ready" >&2
   echo "ensure-thub-codex: re-enable it in Codex policy before provisioning" >&2
+  exit 1
+fi
+
+LEGACY_REGISTRATION=false
+if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e \
+  --arg bin "$BIN" --argjson legacy_env_vars "$LEGACY_ENV_VARS_JSON" '
+  .enabled == true and .disabled_reason == null and
+  .transport.type == "stdio" and .transport.command == $bin and
+  .transport.args == [] and .transport.env == {} and
+  .transport.env_vars == $legacy_env_vars and .transport.cwd == null and
+  .enabled_tools == null and .disabled_tools == null and
+  .startup_timeout_sec == null and .tool_timeout_sec == null
+' >/dev/null; then
+  LEGACY_REGISTRATION=true
+fi
+if "$LEGACY_REGISTRATION" && ! has_exact_legacy_root_shape; then
+  LEGACY_REGISTRATION=false
+fi
+
+migrate_legacy_registration() {
+  source_hash="$(config_hash)"
+  env_line="$(awk '
+    /^\[mcp_servers\.t-hub\]$/ { in_target = 1; next }
+    /^\[/ { in_target = 0 }
+    in_target && /^[[:space:]]*env_vars[[:space:]]*=/ { print NR }
+  ' "$CONFIG")"
+  if [ -z "$env_line" ] || [[ "$env_line" == *$'\n'* ]] ||
+    ! sed -n "${env_line}p" "$CONFIG" | grep -Eq '^[[:space:]]*env_vars[[:space:]]*=[[:space:]]*\[[[:space:]]*"T_HUB_CONTROL_ADDR"[[:space:]]*,[[:space:]]*"T_HUB_CONTROL_TOKEN"[[:space:]]*,[[:space:]]*"T_HUB_SESSION_TOKEN"[[:space:]]*\][[:space:]]*(#.*)?$'; then
+    echo "ensure-thub-codex: legacy root env_vars declaration is not uniquely replaceable" >&2
+    return 1
+  fi
+
+  update="$(mktemp "${CONFIG}.t-hub-update.XXXXXX")"
+  {
+    if [ "$env_line" -gt 1 ]; then head -n "$((env_line - 1))" "$CONFIG"; fi
+    printf '%s\n' "$ENV_VARS_TOML"
+    tail -n "+$((env_line + 1))" "$CONFIG"
+  } > "$update"
+  chmod --reference="$CONFIG" "$update"
+
+  current_hash="$(config_hash)"
+  if [ "$current_hash" != "$source_hash" ]; then
+    rm -f "$update"
+    echo "ensure-thub-codex: config changed concurrently; refusing replacement" >&2
+    return 1
+  fi
+  mv -f "$update" "$CONFIG"
+  refresh_expected_hash
+
+  verified="$(codex mcp get t-hub --json 2>/dev/null || true)"
+  post_verification_hash="$(config_hash)"
+  if [ "$post_verification_hash" != "$EXPECTED_HASH" ]; then
+    echo "ensure-thub-codex: config changed concurrently during migration verification" >&2
+    return 1
+  fi
+  if ! printf '%s' "$verified" | jq -e --arg bin "$BIN" --argjson env_vars "$ENV_VARS_JSON" '
+    .enabled == true and .disabled_reason == null and
+    .transport.type == "stdio" and .transport.command == $bin and
+    .transport.args == [] and .transport.env == {} and
+    .transport.env_vars == $env_vars and .transport.cwd == null
+  ' >/dev/null; then
+    echo "ensure-thub-codex: migrated registration verification failed" >&2
+    return 1
+  fi
+  before_semantics="$(printf '%s' "$CURRENT" | jq -Sc 'del(.transport.env_vars)')"
+  after_semantics="$(printf '%s' "$verified" | jq -Sc 'del(.transport.env_vars)')"
+  if [ "$before_semantics" != "$after_semantics" ]; then
+    echo "ensure-thub-codex: migration changed registration semantics beyond env_vars" >&2
+    return 1
+  fi
+}
+
+if "$MIGRATE_LEGACY"; then
+  if ! "$LEGACY_REGISTRATION"; then
+    echo "ensure-thub-codex: refusing migration because t-hub is not the exact enabled legacy registration" >&2
+    exit 1
+  fi
+  if [ -L "$CONFIG" ]; then
+    echo "ensure-thub-codex: refusing to mutate symlinked config: $CONFIG" >&2
+    exit 1
+  fi
+  begin_config_transaction
+  if ! migrate_legacy_registration; then
+    exit 1
+  fi
+  commit_config_transaction
+  echo "ensure-thub-codex: migrated legacy t-hub capability pass-through ($BIN)"
+  exit 0
+fi
+if "$LEGACY_REGISTRATION"; then
+  echo "ensure-thub-codex: legacy t-hub registration requires --migrate-legacy-registration" >&2
   exit 1
 fi
 
@@ -157,35 +309,7 @@ if [ -n "$CURRENT" ] && ! "$LEGACY_MATCH" && ! printf '%s' "$CURRENT" | jq -e '
   exit 1
 fi
 
-BACKUP=""
-HAD_CONFIG=false
-EXPECTED_HASH=absent
-config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
-refresh_expected_hash() {
-  if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
-}
-if [ -f "$CONFIG" ]; then
-  HAD_CONFIG=true
-  BACKUP="$(mktemp "${CONFIG}.t-hub-backup.XXXXXX")"
-  cp -p "$CONFIG" "$BACKUP"
-  EXPECTED_HASH="$(config_hash)"
-fi
-rollback() {
-  current_hash=absent
-  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
-  if [ "$current_hash" != "$EXPECTED_HASH" ]; then
-    echo "ensure-thub-codex: config changed concurrently; refusing unsafe rollback" >&2
-    [ -z "$BACKUP" ] || rm -f "$BACKUP"
-    return
-  fi
-  if "$HAD_CONFIG"; then
-    cp -p "$BACKUP" "$CONFIG"
-  else
-    rm -f "$CONFIG"
-  fi
-  [ -z "$BACKUP" ] || rm -f "$BACKUP"
-}
-trap rollback EXIT
+begin_config_transaction
 
 insert_env_vars() {
   source_hash="$(config_hash)"
@@ -298,8 +422,7 @@ else
   fi
 fi
 
-trap - EXIT
-[ -z "$BACKUP" ] || rm -f "$BACKUP"
+commit_config_transaction
 if "$LEGACY_MATCH"; then
   echo "ensure-thub-codex: migrated t-hub capability pass-through ($BIN)"
 else

@@ -11,12 +11,22 @@ DEST="$BIN_DIR/t-hub-mcp"
 CODEX_CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
 CLAUDE_CONFIG="${HOME}/.claude.json"
 SKILL_ARGS=()
-if [ "${1:-}" = "--repair-skills" ] && [ "$#" -eq 1 ]; then
-  SKILL_ARGS=(--repair)
-elif [ "$#" -ne 0 ]; then
-  echo "usage: install-thub-codex.sh [--repair-skills]" >&2
-  exit 2
-fi
+CODEX_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repair-skills)
+      SKILL_ARGS=(--repair)
+      ;;
+    --migrate-legacy-registration)
+      CODEX_ARGS=(--migrate-legacy-registration)
+      ;;
+    *)
+      echo "usage: install-thub-codex.sh [--repair-skills] [--migrate-legacy-registration]" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 if [ -n "${T_HUB_MCP_SOURCE:-}" ]; then
   SOURCE="$T_HUB_MCP_SOURCE"
@@ -81,6 +91,13 @@ restore_file() {
 file_state() {
   if [ -f "$1" ]; then sha256sum "$1" | awk '{print $1}'; else printf 'absent\n'; fi
 }
+claude_node() {
+  if [ -f "$1" ]; then
+    jq -Sc '.mcpServers["t-hub"] // null' "$1"
+  else
+    printf 'null\n'
+  fi
+}
 restore_config() {
   local target="$1" name="$2" expected_name="$3"
   local expected current
@@ -92,6 +109,43 @@ restore_config() {
   fi
   restore_file "$target" "$name"
 }
+restore_claude_registration() {
+  if [ "$(cat "$TXN/claude-node-changed")" != true ]; then return; fi
+  if [ ! -f "$CLAUDE_CONFIG" ]; then
+    echo "install-thub-codex: Claude config disappeared; refusing unsafe registration rollback" >&2
+    return
+  fi
+  local current_node post_node before_node source_hash current_hash update
+  current_node="$(claude_node "$CLAUDE_CONFIG")"
+  post_node="$(cat "$TXN/post-claude-node")"
+  if [ "$current_node" != "$post_node" ]; then
+    echo "install-thub-codex: Claude t-hub registration changed concurrently; refusing unsafe rollback" >&2
+    return
+  fi
+  before_node="$(cat "$TXN/before-claude-node")"
+  source_hash="$(file_state "$CLAUDE_CONFIG")"
+  update="$(mktemp "${CLAUDE_CONFIG}.t-hub-rollback.XXXXXX")"
+  if [ "$before_node" = null ]; then
+    jq 'del(.mcpServers["t-hub"]) | if (.mcpServers // {}) == {} then del(.mcpServers) else . end' \
+      "$CLAUDE_CONFIG" > "$update"
+  else
+    jq --argjson before "$before_node" '.mcpServers["t-hub"] = $before' \
+      "$CLAUDE_CONFIG" > "$update"
+  fi
+  current_hash="$(file_state "$CLAUDE_CONFIG")"
+  if [ "$current_hash" != "$source_hash" ]; then
+    echo "install-thub-codex: Claude config changed during rollback; preserving latest file" >&2
+    rm -f "$update"
+    return
+  fi
+  if [ "$(cat "$TXN/previous-claude-config.state")" = absent ] \
+    && jq -e 'keys == []' "$update" >/dev/null; then
+    rm -f "$CLAUDE_CONFIG" "$update"
+  else
+    chmod --reference="$CLAUDE_CONFIG" "$update"
+    mv -f "$update" "$CLAUDE_CONFIG"
+  fi
+}
 
 backup_file "$DEST" previous-bin
 backup_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
@@ -99,13 +153,14 @@ backup_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
 backup_file "$CODEX_CONFIG" previous-codex-config
 backup_file "$CLAUDE_CONFIG" previous-claude-config
 file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
-file_state "$CLAUDE_CONFIG" > "$TXN/expected-claude-config"
+claude_node "$CLAUDE_CONFIG" > "$TXN/before-claude-node"
+printf 'false\n' > "$TXN/claude-node-changed"
 rollback() {
   restore_file "$DEST" previous-bin
   restore_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
   restore_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
   restore_config "$CODEX_CONFIG" previous-codex-config expected-codex-config
-  restore_config "$CLAUDE_CONFIG" previous-claude-config expected-claude-config
+  restore_claude_registration
   rm -rf "$TXN"
 }
 trap rollback EXIT
@@ -114,8 +169,11 @@ install -m 700 "$STAGED_BIN" "$DEST"
 install -m 700 "$STAGED_CODEX" "$CAPTAIN_DIR/ensure-thub-codex.sh"
 install -m 700 "$STAGED_CLAUDE" "$CAPTAIN_DIR/ensure-thub-claude.sh"
 T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-claude.sh"
-file_state "$CLAUDE_CONFIG" > "$TXN/expected-claude-config"
-T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-codex.sh"
+claude_node "$CLAUDE_CONFIG" > "$TXN/post-claude-node"
+if ! cmp -s "$TXN/before-claude-node" "$TXN/post-claude-node"; then
+  printf 'true\n' > "$TXN/claude-node-changed"
+fi
+T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-codex.sh" "${CODEX_ARGS[@]}"
 file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
 bash "$HERE/install-captain-skills.sh" "${SKILL_ARGS[@]}"
 

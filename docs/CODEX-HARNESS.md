@@ -90,9 +90,13 @@ or General authority.
 
 `scripts/captain/install-thub-codex.sh` builds the release MCP binary, atomically installs it at `~/.t-hub/bin/t-hub-mcp`, deploys the provisioner, and registers the server.
 `scripts/captain/ensure-thub-codex.sh` is the idempotent registration-only entry point and converges an uncustomized stale command path to the installed binary through `codex mcp remove` plus `codex mcp add`.
+An exact enabled legacy registration that inherits `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` is refused unchanged by default.
+After inspecting that registration, run `scripts/captain/install-thub-codex.sh --migrate-legacy-registration` to replace only its root `env_vars` line with the canonical `T_HUB_CONTROL_FILE` and `T_HUB_SESSION_TOKEN` names.
+The migration option composes with `--repair-skills`, applies only to Codex, never invokes `codex mcp remove` or `codex mcp add`, and never persists an environment value.
+Migration preserves nested tool approval policy and every unrelated TOML byte, verifies the parsed before-and-after registration semantics, and rolls back the exact original bytes on verification failure unless a concurrent writer has changed the file.
 When a Codex registration has tool allowlists, denylists, timeouts, environment, arguments, or another user-authored policy, provisioning preserves it if the command is already correct and otherwise refuses to repoint it.
 Claude registration follows the same preserve-or-refuse rule for custom arguments and environment.
-It never hand-writes `config.toml` - `codex mcp add` merges natively and preserves user `[hooks]`/`[hooks.state]` trust blocks byte-for-byte.
+Normal registration uses `codex mcp add` and preserves user `[hooks]`/`[hooks.state]` trust blocks byte-for-byte.
 Codex MCP registration is user-global (`$CODEX_HOME/config.toml`), not per-repo like Claude's `.mcp.json`; least-privilege still holds because the READ capability token is injected at the tmux session level and inherited by the `t-hub-mcp` child.
 Skill and command drift is refused by default.
 After inspecting the drift, run `scripts/captain/install-thub-codex.sh --repair-skills` to replace it intentionally, or run `scripts/captain/install-captain-skills.sh --repair` when only skills need repair.

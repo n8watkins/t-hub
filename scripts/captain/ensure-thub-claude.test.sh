@@ -93,5 +93,57 @@ else
   fail "injected add failure did not restore the prior config"
 fi
 
+mkdir -p "$WORK/concurrent-cache-bin"
+cat > "$WORK/concurrent-cache-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = add ]; then
+  "$REAL_CLAUDE" "$@" || exit $?
+  jq '.cachedMetadata.concurrent = "preserved"' "$CLAUDE_CONFIG" > "$CLAUDE_CONFIG.update"
+  mv "$CLAUDE_CONFIG.update" "$CLAUDE_CONFIG"
+  exit 31
+fi
+exec "$REAL_CLAUDE" "$@"
+EOF
+chmod 700 "$WORK/concurrent-cache-bin/claude"
+jq '.mcpServers["t-hub"] = {"type":"stdio","command":"/prior","args":[],"env":{}}' \
+  "$HOME/.claude.json" > "$WORK/before-concurrent-cache.json"
+mv "$WORK/before-concurrent-cache.json" "$HOME/.claude.json"
+if PATH="$WORK/concurrent-cache-bin:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  CLAUDE_CONFIG="$HOME/.claude.json" T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+  fail "concurrent-cache add failure unexpectedly succeeded"
+elif jq -e '
+  .mcpServers["t-hub"].command == "/prior" and
+  .cachedMetadata.concurrent == "preserved"
+' "$HOME/.claude.json" >/dev/null; then
+  pass "rollback restores only t-hub and preserves concurrent cached metadata"
+else
+  fail "rollback lost the prior t-hub node or concurrent cached metadata"
+fi
+
+mkdir -p "$WORK/concurrent-node-bin"
+cat > "$WORK/concurrent-node-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = add ]; then
+  "$REAL_CLAUDE" "$@" || exit $?
+  jq '.mcpServers["t-hub"].command = "/concurrent-owner"' "$CLAUDE_CONFIG" > "$CLAUDE_CONFIG.update"
+  mv "$CLAUDE_CONFIG.update" "$CLAUDE_CONFIG"
+  exit 32
+fi
+exec "$REAL_CLAUDE" "$@"
+EOF
+chmod 700 "$WORK/concurrent-node-bin/claude"
+jq '.mcpServers["t-hub"] = {"type":"stdio","command":"/prior","args":[],"env":{}}' \
+  "$HOME/.claude.json" > "$WORK/before-concurrent-node.json"
+mv "$WORK/before-concurrent-node.json" "$HOME/.claude.json"
+if PATH="$WORK/concurrent-node-bin:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  CLAUDE_CONFIG="$HOME/.claude.json" T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+  fail "concurrent-node add failure unexpectedly succeeded"
+elif jq -e '.mcpServers["t-hub"].command == "/concurrent-owner"' \
+  "$HOME/.claude.json" >/dev/null; then
+  pass "rollback refuses to overwrite a concurrent t-hub node change"
+else
+  fail "rollback overwrote the concurrent t-hub node"
+fi
+
 [ "$FAILED" -eq 0 ] && echo "ensure-thub-claude.test: PASS" || echo "ensure-thub-claude.test: FAIL" >&2
 exit "$FAILED"

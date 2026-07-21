@@ -47,7 +47,18 @@ fi
 BACKUP=""
 HAD_CONFIG=false
 EXPECTED_HASH=absent
+NODE_CHANGED=false
+BEFORE_NODE=null
+POST_NODE=null
+EXPECTED_NODE="$(jq -Scn --arg bin "$BIN" '{type:"stdio", command:$bin, args:[], env:{}}')"
 config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+config_node() {
+  if [ -f "$CONFIG" ]; then
+    jq -Sc '.mcpServers["t-hub"] // null' "$CONFIG"
+  else
+    printf 'null\n'
+  fi
+}
 refresh_expected_hash() {
   if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
 }
@@ -57,18 +68,45 @@ if [ -f "$CONFIG" ]; then
   cp -p "$CONFIG" "$BACKUP"
   EXPECTED_HASH="$(config_hash)"
 fi
+BEFORE_NODE="$(config_node)"
+record_expected_post_node() {
+  POST_NODE="$1"
+  current_node="$(config_node)"
+  if [ "$current_node" != "$BEFORE_NODE" ]; then NODE_CHANGED=true; fi
+}
 rollback() {
-  current_hash=absent
-  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
-  if [ "$current_hash" != "$EXPECTED_HASH" ]; then
-    echo "ensure-thub-claude: config changed concurrently; refusing unsafe rollback" >&2
+  if ! "$NODE_CHANGED"; then
     [ -z "$BACKUP" ] || rm -f "$BACKUP"
     return
   fi
-  if "$HAD_CONFIG"; then
-    cp -p "$BACKUP" "$CONFIG"
+  current_node="$(config_node 2>/dev/null || printf invalid)"
+  if [ "$current_node" != "$POST_NODE" ]; then
+    echo "ensure-thub-claude: t-hub registration changed concurrently; refusing unsafe rollback" >&2
+    [ -z "$BACKUP" ] || rm -f "$BACKUP"
+    return
+  fi
+  source_hash=absent
+  [ ! -f "$CONFIG" ] || source_hash="$(config_hash)"
+  update="$(mktemp "${CONFIG}.t-hub-rollback.XXXXXX")"
+  if [ "$BEFORE_NODE" = null ]; then
+    jq 'del(.mcpServers["t-hub"]) | if (.mcpServers // {}) == {} then del(.mcpServers) else . end' \
+      "$CONFIG" > "$update"
   else
-    rm -f "$CONFIG"
+    jq --argjson before "$BEFORE_NODE" '.mcpServers["t-hub"] = $before' "$CONFIG" > "$update"
+  fi
+  current_hash=absent
+  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
+  if [ "$current_hash" != "$source_hash" ]; then
+    echo "ensure-thub-claude: config changed concurrently during rollback; preserving latest file" >&2
+    rm -f "$update"
+    [ -z "$BACKUP" ] || rm -f "$BACKUP"
+    return
+  fi
+  if ! "$HAD_CONFIG" && jq -e 'keys == []' "$update" >/dev/null; then
+    rm -f "$CONFIG" "$update"
+  else
+    chmod --reference="$CONFIG" "$update" 2>/dev/null || chmod 600 "$update"
+    mv -f "$update" "$CONFIG"
   fi
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }
@@ -77,18 +115,22 @@ trap rollback EXIT
 if jq -e '.mcpServers["t-hub"] != null' "$CONFIG" >/dev/null 2>&1; then
   if claude mcp remove -s user t-hub >/dev/null 2>&1; then
     refresh_expected_hash
+    record_expected_post_node null
   else
     refresh_expected_hash
+    record_expected_post_node null
     echo "ensure-thub-claude: failed to remove stale t-hub registration" >&2
     exit 1
   fi
 fi
 if ! claude mcp add -s user t-hub -- "$BIN" >/dev/null; then
   refresh_expected_hash
+  record_expected_post_node "$EXPECTED_NODE"
   echo "ensure-thub-claude: 'claude mcp add' failed" >&2
   exit 1
 fi
 refresh_expected_hash
+record_expected_post_node "$EXPECTED_NODE"
 if ! jq -e --arg bin "$BIN" '
   .mcpServers["t-hub"] == {
     "type": "stdio", "command": $bin, "args": [], "env": {}
