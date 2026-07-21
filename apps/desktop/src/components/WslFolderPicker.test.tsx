@@ -127,6 +127,43 @@ describe("WslFolderPicker", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("permission denied");
   });
 
+  it("retries a same-path listing failure into a valid empty result", async () => {
+    vi.mocked(listDir).mockReset()
+      .mockRejectedValueOnce(new Error("transient listing failure"))
+      .mockResolvedValueOnce([]);
+    const onFolderMetadataChange = vi.fn();
+    render(
+      <WslFolderPicker
+        path="/home/retry-empty"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry folder listing" }));
+    expect(await screen.findByText("This folder is empty.")).toBeTruthy();
+    expect(gitInfo).toHaveBeenCalledTimes(1);
+    expect(listDir).toHaveBeenCalledTimes(2);
+    expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      listingStatus: "valid-empty",
+      metadataStatus: "ready",
+    }));
+  });
+
+  it("retries a same-path listing failure into a valid populated result", async () => {
+    vi.mocked(listDir).mockReset()
+      .mockRejectedValueOnce(new Error("transient listing failure"))
+      .mockResolvedValueOnce([
+        { name: "project", path: "/home/retry-populated/project", isDir: true, isGitRepo: false, size: 0 },
+      ]);
+    render(<WslFolderPicker path="/home/retry-populated" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry folder listing" }));
+    expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+    expect(listDir).toHaveBeenCalledTimes(2);
+  });
+
   it("does not let an older directory response replace the current folder", async () => {
     let resolveOld!: (entries: never[]) => void;
     let resolveNew!: (entries: never[]) => void;

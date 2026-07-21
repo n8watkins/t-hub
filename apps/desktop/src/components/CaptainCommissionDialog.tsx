@@ -42,6 +42,7 @@ export function CaptainCommissionDialog({
   const [newDestinationLeaf, setNewDestinationLeaf] = useState("");
   const [folderSelection, setFolderSelection] = useState<WslFolderSelection | null>(null);
   const [metadataRetry, setMetadataRetry] = useState(0);
+  const [listingRetry, setListingRetry] = useState(0);
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -81,6 +82,9 @@ export function CaptainCommissionDialog({
   }, []);
   const retryFolderMetadata = useCallback(() => {
     setMetadataRetry((current) => current + 1);
+  }, []);
+  const retryFolderListing = useCallback(() => {
+    setListingRetry((current) => current + 1);
   }, []);
 
   if (!open) return null;
@@ -246,6 +250,7 @@ export function CaptainCommissionDialog({
                   onPathChange={setRepoRoot}
                   onFolderMetadataChange={handleFolderMetadataChange}
                   metadataRefreshToken={metadataRetry}
+                  listingRefreshToken={listingRetry}
                 />
                 {wslHomeError && (
                   <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
@@ -359,6 +364,7 @@ export function CaptainCommissionDialog({
                   : newDisplayName
             }
             onRetryFolderMetadata={retryFolderMetadata}
+            onRetryFolderListing={retryFolderListing}
             repoRoot={repoRoot}
             assignment={assignment}
             harness={harness}
@@ -431,6 +437,7 @@ function ReviewSummary({
   folderSelection,
   displayName,
   onRetryFolderMetadata,
+  onRetryFolderListing,
   repoRoot,
   assignment,
   harness,
@@ -442,6 +449,7 @@ function ReviewSummary({
   folderSelection: WslFolderSelection | null;
   displayName: string;
   onRetryFolderMetadata: () => void;
+  onRetryFolderListing: () => void;
   repoRoot: string;
   assignment: string;
   harness: "codex" | "claude";
@@ -477,7 +485,11 @@ function ReviewSummary({
         <ReviewRow label="Codebase name" value={displayName.trim() || "Required"} />
         <ReviewRow label="Codebase" value={location} />
         {mode === "existing" && (
-          <ReviewRow label="Folder validation" value={folderValidationSummary(folderSelection, repoRoot)} />
+          <FolderValidationSummary
+            selection={folderSelection}
+            rootPath={repoRoot}
+            onRetry={onRetryFolderListing}
+          />
         )}
         {mode === "saved" && (
           <VersionControlSummary project={selected} />
@@ -502,12 +514,42 @@ function ReviewSummary({
   );
 }
 
-function folderValidationSummary(selection: WslFolderSelection | null, rootPath: string): string {
-  if (!selection || selection.path !== rootPath.trim()) return "Checking...";
-  if (selection.listingStatus === "loading") return "Checking...";
-  if (selection.listingStatus === "stale") return "Refreshing...";
-  if (selection.listingStatus === "error") return `Unavailable: ${selection.listingError ?? "directory listing failed"}`;
-  return selection.listingStatus === "valid-empty" ? "Valid empty folder" : "Valid folder";
+function FolderValidationSummary({
+  selection,
+  rootPath,
+  onRetry,
+}: {
+  selection: WslFolderSelection | null;
+  rootPath: string;
+  onRetry: () => void;
+}) {
+  if (!selection || selection.path !== rootPath.trim()) {
+    return <ReviewRow label="Folder validation" value="Checking..." />;
+  }
+  if (selection.listingStatus === "loading") {
+    return <ReviewRow label="Folder validation" value="Checking..." />;
+  }
+  if (selection.listingStatus === "stale") {
+    return <ReviewRow label="Folder validation" value="Refreshing..." />;
+  }
+  if (selection.listingStatus === "error") {
+    return (
+      <>
+        <ReviewRow label="Folder validation" value={`Unavailable: ${selection.listingError ?? "directory listing failed"}`} />
+        <dd className="col-start-2">
+          <button type="button" className="text-xs underline" onClick={onRetry}>
+            Retry folder listing
+          </button>
+        </dd>
+      </>
+    );
+  }
+  return (
+    <ReviewRow
+      label="Folder validation"
+      value={selection.listingStatus === "valid-empty" ? "Valid empty folder" : "Valid folder"}
+    />
+  );
 }
 
 function VersionControlSummary({
