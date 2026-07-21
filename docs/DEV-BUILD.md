@@ -113,6 +113,16 @@ The development build is split into compile and bundle stages so the unpatched r
 
 ```powershell
 cd apps/desktop
+$releaseDir = "src-tauri/target/release"
+@(
+  "$releaseDir/bundle/nsis",
+  "$releaseDir/nsis",
+  "$releaseDir/dev-installer-extracted",
+  "$releaseDir/dev-installer-evidence",
+  "$releaseDir/t-hub-dev.raw.exe"
+) | ForEach-Object {
+  if (Test-Path -LiteralPath $_) { Remove-Item -LiteralPath $_ -Recurse -Force }
+}
 pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json --no-bundle
 Copy-Item src-tauri/target/release/t-hub-dev.exe src-tauri/target/release/t-hub-dev.raw.exe
 pnpm tauri bundle -f devbuild --config src-tauri/tauri.dev.conf.json
@@ -143,7 +153,8 @@ Never install or distribute a development installer until the tracked validator 
 The validator derives hashes from the artifacts under test and does not contain a release-specific expected hash.
 The raw binary must contain exactly one canonical Tauri `__TAURI_BUNDLE_TYPE_VAR_UNK` marker.
 The installer-extracted and installed binaries must contain exactly one `__TAURI_BUNDLE_TYPE_VAR_NSS` marker and no unknown marker.
-The extracted and installed hashes must match each other, and both must differ from the unpatched raw hash.
+The validator constructs the expected binary by replacing only that same-length marker at its unique byte offset.
+The extracted and installed binaries must have the raw binary's exact length and must match the expected bytes and SHA-256 without any other alteration.
 
 Run the source configuration regression before building:
 
@@ -155,22 +166,37 @@ On Windows, extract the generated installer and run the pre-install validator:
 
 ```powershell
 $nsisDir = "apps/desktop/src-tauri/target/release/bundle/nsis"
-$installer = Get-ChildItem $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
-$installerScript = Get-ChildItem "apps/desktop/src-tauri/target/release/nsis" -Filter "installer.nsi" -Recurse | Select-Object -First 1
+$installers = @(Get-ChildItem $nsisDir -Filter "*-setup.exe")
+if ($installers.Count -ne 1) { throw "Expected exactly one installer" }
+$installer = $installers[0]
+$installerScripts = @(Get-ChildItem "apps/desktop/src-tauri/target/release/nsis" -Filter "installer.nsi" -Recurse)
+if ($installerScripts.Count -ne 1) { throw "Expected exactly one installer.nsi" }
+$installerScript = $installerScripts[0]
 $extractDir = "apps/desktop/src-tauri/target/release/dev-installer-extracted"
 New-Item -ItemType Directory -Force $extractDir | Out-Null
-7z x $installer.FullName "-o$extractDir" -y
-$extractedBinary = Get-ChildItem $extractDir -Filter "t-hub-dev.exe" -Recurse | Select-Object -First 1
+& 7z x $installer.FullName "-o$extractDir" -y
+if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
+$extractedBinaries = @(Get-ChildItem $extractDir -Filter "t-hub-dev.exe" -Recurse)
+if ($extractedBinaries.Count -ne 1) { throw "Expected exactly one extracted t-hub-dev.exe" }
+$extractedBinary = $extractedBinaries[0]
+$evidenceDir = "apps/desktop/src-tauri/target/release/dev-installer-evidence"
+New-Item -ItemType Directory -Force $evidenceDir | Out-Null
 & scripts/windows/validate-dev-installer.ps1 `
   -InstallerScriptPath $installerScript.FullName `
   -InstallerPath $installer.FullName `
   -RawBinaryPath "apps/desktop/src-tauri/target/release/t-hub-dev.raw.exe" `
-  -ExtractedBinaryPath $extractedBinary.FullName
+  -ExtractedBinaryPath $extractedBinary.FullName `
+  -ExpectedBinaryPath "$evidenceDir/t-hub-dev.expected.exe" |
+  Set-Content "$evidenceDir/dev-installer-validation.json" -Encoding utf8
+Copy-Item "apps/desktop/src-tauri/target/release/t-hub-dev.raw.exe" "$evidenceDir/t-hub-dev.raw.exe"
+Copy-Item $installerScript.FullName "$evidenceDir/installer.nsi"
+Copy-Item $extractedBinary.FullName "$evidenceDir/t-hub-dev.extracted.exe"
 ```
 
-The pre-install result must show production `t-hub`, development `t-hub-dev`, the canonical `UNK -> NSS` transformation, and separate raw, installer, and extracted SHA-256 values.
+The pre-install result must show production `t-hub`, development `t-hub-dev`, the canonical `UNK -> NSS` transformation, and raw, installer, expected, and extracted SHA-256 values.
 After installing into the development install directory, run the same command with `-InstalledBinaryPath "$env:LOCALAPPDATA\T-Hub Dev\t-hub-dev.exe"`.
 Record the raw binary, installer, extracted binary, and installed binary SHA-256 values with the build evidence.
+Archive the retained raw binary, generated `installer.nsi`, expected patched binary, extracted binary, and validation JSON together so the exact acceptance decision can be audited later.
 Do not substitute the post-bundle `target/release/t-hub-dev.exe` for the retained `t-hub-dev.raw.exe`, because Tauri patches the bundle marker during bundling.
 
 Run the Windows validator fixture suite whenever its contract changes:

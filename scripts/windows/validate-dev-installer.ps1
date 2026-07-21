@@ -9,6 +9,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$ExtractedBinaryPath,
   [string]$InstalledBinaryPath,
+  [string]$ExpectedBinaryPath,
   [string]$ProductionConfigPath,
   [string]$DevelopmentConfigPath,
   [string]$CargoManifestPath
@@ -87,6 +88,87 @@ function Get-Sha256 {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-BytesSha256 {
+  param([byte[]]$Bytes)
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return ([System.BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $sha256.Dispose()
+  }
+}
+
+function Find-ByteSequenceOffsets {
+  param(
+    [byte[]]$Bytes,
+    [byte[]]$Needle
+  )
+  $offsets = @()
+  for ($offset = 0; $offset -le $Bytes.Length - $Needle.Length; $offset++) {
+    $matches = $true
+    for ($index = 0; $index -lt $Needle.Length; $index++) {
+      if ($Bytes[$offset + $index] -ne $Needle[$index]) {
+        $matches = $false
+        break
+      }
+    }
+    if ($matches) {
+      $offsets += $offset
+      $offset += $Needle.Length - 1
+    }
+  }
+  return @($offsets)
+}
+
+function Get-UniqueNsisDefine {
+  param(
+    [string]$Script,
+    [string]$Name
+  )
+  $matches = [regex]::Matches($Script, "(?im)^\s*!define\s+$([regex]::Escape($Name))\s+`"([^`"]+)`"\s*$")
+  Assert-Contract ($matches.Count -eq 1) "installer.nsi must define $Name exactly once."
+  return $matches[0].Groups[1].Value
+}
+
+function Resolve-NsisDefines {
+  param([string]$Script)
+  $definitions = @{}
+  foreach ($match in [regex]::Matches($Script, '(?im)^\s*!define\s+([A-Za-z0-9_]+)\s+"([^"]*)"\s*$')) {
+    $name = $match.Groups[1].Value
+    if (-not $definitions.ContainsKey($name)) {
+      $definitions[$name] = $match.Groups[2].Value
+    }
+  }
+  $resolved = $Script
+  for ($pass = 0; $pass -lt 20; $pass++) {
+    $before = $resolved
+    foreach ($name in $definitions.Keys) {
+      $resolved = $resolved.Replace(('${' + $name + '}'), [string]$definitions[$name])
+    }
+    if ($resolved -ceq $before) {
+      return $resolved
+    }
+  }
+  throw "Dev installer validation failed: NSIS definitions did not resolve within 20 passes."
+}
+
+function Get-UniqueNsisSection {
+  param(
+    [string]$Script,
+    [string]$Name
+  )
+  $pattern = '(?ims)^\s*Section\s+(?:/o\s+)?(?:"([^"\r\n]+)"|([^\r\n]+))\s*$([\s\S]*?)^\s*SectionEnd\b'
+  $matches = @()
+  foreach ($match in [regex]::Matches($Script, $pattern)) {
+    $sectionName = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value.Trim() }
+    if ($sectionName -ceq $Name) {
+      $matches += $match
+    }
+  }
+  Assert-Contract ($matches.Count -eq 1) "installer.nsi must contain exactly one $Name section."
+  return $matches[0].Groups[3].Value
+}
+
 function Get-OptionalProperty {
   param(
     [object]$Object,
@@ -140,25 +222,43 @@ $developmentEndpoints = $developmentConfig.plugins.updater.endpoints
 Assert-Contract ($developmentEndpoints.Count -eq 0) "development updater endpoints must remain disabled."
 
 $installerScript = Get-Content -LiteralPath $InstallerScriptPath -Raw
-$mainBinaryMatches = [regex]::Matches($installerScript, '(?im)^\s*!define\s+MAINBINARYNAME\s+"([^"]+)"\s*$')
-Assert-Contract ($mainBinaryMatches.Count -eq 1) "installer.nsi must define MAINBINARYNAME exactly once."
-Assert-Contract ($mainBinaryMatches[0].Groups[1].Value -ceq "t-hub-dev") "installer MAINBINARYNAME must be t-hub-dev."
-$sourcePathMatches = [regex]::Matches($installerScript, '(?im)^\s*!define\s+MAINBINARYSRCPATH\s+"([^"]+)"\s*$')
-Assert-Contract ($sourcePathMatches.Count -eq 1) "installer.nsi must define MAINBINARYSRCPATH exactly once."
-Assert-Contract ($sourcePathMatches[0].Groups[1].Value -match '(?i)(^|[\\/])t-hub-dev\.exe$') "installer payload source must end in t-hub-dev.exe."
-Assert-Contract ($installerScript -match '(?im)^\s*!define\s+PRODUCTNAME\s+"T-Hub Dev"\s*$') "installer product marker must be T-Hub Dev."
-Assert-Contract ($installerScript -match '(?im)^\s*!define\s+BUNDLEID\s+"com\.t-hub\.dev"\s*$') "installer bundle marker must be com.t-hub.dev."
+$mainBinaryName = Get-UniqueNsisDefine $installerScript "MAINBINARYNAME"
+$mainBinarySourcePath = Get-UniqueNsisDefine $installerScript "MAINBINARYSRCPATH"
+$productName = Get-UniqueNsisDefine $installerScript "PRODUCTNAME"
+$bundleId = Get-UniqueNsisDefine $installerScript "BUNDLEID"
+Assert-Contract ($mainBinaryName -ceq "t-hub-dev") "installer MAINBINARYNAME must be t-hub-dev."
+Assert-Contract ($mainBinarySourcePath -match '(?i)(^|[\\/])t-hub-dev\.exe$') "installer payload source must end in t-hub-dev.exe."
+Assert-Contract ($productName -ceq "T-Hub Dev") "installer product marker must be T-Hub Dev."
+Assert-Contract ($bundleId -ceq "com.t-hub.dev") "installer bundle marker must be com.t-hub.dev."
 
-$resolvedScript = $installerScript.Replace('${MAINBINARYNAME}', "t-hub-dev")
-$processChecks = [regex]::Matches($resolvedScript, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*$')
-Assert-Contract ($processChecks.Count -eq 2) "installer and uninstaller must each call CheckIfAppIsRunning exactly once."
-foreach ($processCheck in $processChecks) {
-  Assert-Contract ($processCheck.Value -match '(?i)"t-hub-dev\.exe"') "every CheckIfAppIsRunning target must be t-hub-dev.exe."
+$resolvedScript = Resolve-NsisDefines $installerScript
+$activeLines = ($resolvedScript -split "`r?`n" | Where-Object { -not $_.TrimStart().StartsWith(";") }) -join "`n"
+$productionReference = '(?i)(?<![A-Za-z0-9_-])t-hub\.exe(?![A-Za-z0-9_.-])'
+Assert-Contract (-not ($activeLines -match $productionReference)) "installer contains a production t-hub.exe reference."
+$installSection = Get-UniqueNsisSection $resolvedScript "Install"
+$uninstallSection = Get-UniqueNsisSection $resolvedScript "Uninstall"
+$allProcessChecks = [regex]::Matches($resolvedScript, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*$')
+$installProcessChecks = [regex]::Matches($installSection, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*"t-hub-dev\.exe"[^\r\n]*$')
+$uninstallProcessChecks = [regex]::Matches($uninstallSection, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*"t-hub-dev\.exe"[^\r\n]*$')
+Assert-Contract ($allProcessChecks.Count -eq 2) "installer.nsi must contain exactly two CheckIfAppIsRunning calls."
+Assert-Contract ($installProcessChecks.Count -eq 1) "Install section must contain exactly one t-hub-dev.exe CheckIfAppIsRunning call."
+Assert-Contract ($uninstallProcessChecks.Count -eq 1) "Uninstall section must contain exactly one t-hub-dev.exe CheckIfAppIsRunning call."
+foreach ($processLine in [regex]::Matches($activeLines, '(?im)^.*(?:KillProcess|taskkill)[^\r\n]*$')) {
+  if ($processLine.Value -match '(?i)\.exe') {
+    Assert-Contract ($processLine.Value -match '(?i)(?<![A-Za-z0-9_-])t-hub-dev\.exe(?![A-Za-z0-9_.-])') "kill/process commands may target only t-hub-dev.exe."
+  }
 }
-Assert-Contract (-not ($resolvedScript -match '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*"t-hub\.exe"')) "installer must never target the production t-hub.exe process."
-Assert-Contract ($resolvedScript -match '(?im)^\s*File\s+"\$\{MAINBINARYSRCPATH\}"\s*$') "installer must copy the declared development main-binary payload."
-Assert-Contract ($resolvedScript -match '(?im)^\s*CreateShortCut\b[^\r\n]*\$INSTDIR\\t-hub-dev\.exe') "installer shortcuts must target t-hub-dev.exe."
-Assert-Contract ($resolvedScript -match '(?im)^\s*Delete\s+"\$INSTDIR\\t-hub-dev\.exe"\s*$') "uninstaller must delete t-hub-dev.exe."
+$mainPayloads = [regex]::Matches($installSection, '(?im)^\s*File\s+"[^"\r\n]*t-hub-dev\.exe"\s*$')
+Assert-Contract ($mainPayloads.Count -eq 1) "Install section must copy exactly one t-hub-dev.exe main payload."
+$shortcutLines = [regex]::Matches($resolvedScript, '(?im)^\s*CreateShortCut\b[^\r\n]*$')
+Assert-Contract ($shortcutLines.Count -gt 0) "installer must create at least one development shortcut."
+foreach ($shortcutLine in $shortcutLines) {
+  Assert-Contract ($shortcutLine.Value -match '(?i)\$INSTDIR\\t-hub-dev\.exe') "every executable shortcut must target t-hub-dev.exe."
+}
+$mainDeletes = [regex]::Matches($uninstallSection, '(?im)^\s*Delete\s+"\$INSTDIR\\t-hub-dev\.exe"\s*$')
+Assert-Contract ($mainDeletes.Count -eq 1) "Uninstall section must delete t-hub-dev.exe exactly once."
+$mainBinaryRegistryWrites = [regex]::Matches($installSection, '(?im)^\s*WriteRegStr\b[^\r\n]*"MainBinaryName"\s+"t-hub-dev\.exe"\s*$')
+Assert-Contract ($mainBinaryRegistryWrites.Count -eq 1) "Install section must write MainBinaryName as t-hub-dev.exe exactly once."
 
 foreach ($stateMarker in @("T-Hub Dev", "com.t-hub.dev", "t-hub-dev", ".t-hub-dev")) {
   Assert-Contract ((Get-AsciiMarkerCount -Path $RawBinaryPath -Marker $stateMarker) -gt 0) "raw development binary is missing marker '$stateMarker'."
@@ -166,7 +266,12 @@ foreach ($stateMarker in @("T-Hub Dev", "com.t-hub.dev", "t-hub-dev", ".t-hub-de
 
 $unknownMarker = "__TAURI_BUNDLE_TYPE_VAR_UNK"
 $nsisMarker = "__TAURI_BUNDLE_TYPE_VAR_NSS"
-Assert-MarkerCount -Path $RawBinaryPath -Marker $unknownMarker -Expected 1 -Label "raw development binary"
+$unknownBytes = [System.Text.Encoding]::ASCII.GetBytes($unknownMarker)
+$nsisBytes = [System.Text.Encoding]::ASCII.GetBytes($nsisMarker)
+Assert-Contract ($unknownBytes.Length -eq $nsisBytes.Length) "canonical Tauri bundle markers must have equal byte length."
+$rawBytes = [System.IO.File]::ReadAllBytes($RawBinaryPath)
+$unknownOffsets = @(Find-ByteSequenceOffsets -Bytes $rawBytes -Needle $unknownBytes)
+Assert-Contract ($unknownOffsets.Count -eq 1) "raw development binary must contain '$unknownMarker' exactly 1 time(s), found $($unknownOffsets.Count)."
 Assert-MarkerCount -Path $RawBinaryPath -Marker $nsisMarker -Expected 0 -Label "raw development binary"
 Assert-MarkerCount -Path $ExtractedBinaryPath -Marker $unknownMarker -Expected 0 -Label "installer-extracted development binary"
 Assert-MarkerCount -Path $ExtractedBinaryPath -Marker $nsisMarker -Expected 1 -Label "installer-extracted development binary"
@@ -174,15 +279,27 @@ Assert-MarkerCount -Path $ExtractedBinaryPath -Marker $nsisMarker -Expected 1 -L
 $rawHash = Get-Sha256 $RawBinaryPath
 $installerHash = Get-Sha256 $InstallerPath
 $extractedHash = Get-Sha256 $ExtractedBinaryPath
-Assert-Contract ($rawHash -cne $extractedHash) "installer-extracted hash must differ from the raw binary after canonical UNK-to-NSS patching."
+$expectedBytes = New-Object byte[] $rawBytes.Length
+[System.Array]::Copy($rawBytes, $expectedBytes, $rawBytes.Length)
+[System.Array]::Copy($nsisBytes, 0, $expectedBytes, $unknownOffsets[0], $nsisBytes.Length)
+$expectedHash = Get-BytesSha256 $expectedBytes
+$extractedLength = (Get-Item -LiteralPath $ExtractedBinaryPath).Length
+Assert-Contract ($extractedLength -eq $expectedBytes.Length) "installer-extracted binary must have the same byte length as the raw binary."
+Assert-Contract ($extractedHash -ceq $expectedHash) "installer-extracted binary must equal the exact canonical UNK-to-NSS patch of the raw binary."
+if ($ExpectedBinaryPath) {
+  $expectedParent = Split-Path -Parent $ExpectedBinaryPath
+  Assert-Contract ([string]::IsNullOrWhiteSpace($expectedParent) -or (Test-Path -LiteralPath $expectedParent -PathType Container)) "expected binary parent directory is missing."
+  [System.IO.File]::WriteAllBytes($ExpectedBinaryPath, $expectedBytes)
+}
 
 $installedHash = $null
 if ($InstalledBinaryPath) {
   Assert-MarkerCount -Path $InstalledBinaryPath -Marker $unknownMarker -Expected 0 -Label "installed development binary"
   Assert-MarkerCount -Path $InstalledBinaryPath -Marker $nsisMarker -Expected 1 -Label "installed development binary"
   $installedHash = Get-Sha256 $InstalledBinaryPath
-  Assert-Contract ($installedHash -ceq $extractedHash) "installed binary hash must equal the installer-extracted binary hash."
-  Assert-Contract ($installedHash -cne $rawHash) "installed binary hash must remain distinct from the raw binary hash."
+  $installedLength = (Get-Item -LiteralPath $InstalledBinaryPath).Length
+  Assert-Contract ($installedLength -eq $expectedBytes.Length) "installed binary must have the same byte length as the raw binary."
+  Assert-Contract ($installedHash -ceq $expectedHash) "installed binary must equal the exact canonical UNK-to-NSS patch of the raw binary."
 }
 
 [ordered]@{
@@ -190,6 +307,7 @@ if ($InstalledBinaryPath) {
   developmentMainBinary = $developmentBinaryName
   rawSha256 = $rawHash
   installerSha256 = $installerHash
+  expectedSha256 = $expectedHash
   extractedSha256 = $extractedHash
   installedSha256 = $installedHash
   bundleMarkerTransformation = "$unknownMarker -> $nsisMarker"
