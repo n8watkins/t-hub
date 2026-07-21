@@ -533,4 +533,14 @@ describe("WslFolderPicker", () => {
     await waitFor(() => expect(pickWslFolder).toHaveBeenCalled());
     expect(onPathChange).not.toHaveBeenCalled();
   });
+
+  it("shows an actionable Explorer rejection without changing the folder", async () => {
+    const onPathChange = vi.fn();
+    vi.mocked(pickWslFolder).mockRejectedValueOnce(new Error("Explorer bridge unavailable"));
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />);
+    fireEvent.click(screen.getByRole("button", { name: "Browse in Explorer" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Explorer bridge unavailable");
+    expect(onPathChange).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Browse in Explorer" })).toBeTruthy();
+  });
 });
