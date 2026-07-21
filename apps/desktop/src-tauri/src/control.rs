@@ -3515,7 +3515,11 @@ impl CaptainsRegistry {
                 || intent.created_at == 0
                 || !matches!(
                     intent.phase.as_str(),
-                    "intent_written" | "git_initialized" | "cleanup_pending" | "recovery_blocked"
+                    "intent_written"
+                        | "git_initialized"
+                        | "cleanup_pending"
+                        | "recovery_blocked"
+                        | "foreign_git"
                 )
             {
                 return Err(
@@ -5824,6 +5828,13 @@ impl CaptainsRegistry {
     fn recover_pending_git_initializations(&self) {
         let intents = self.pending_git_initializations();
         for intent in intents {
+            if intent.phase == "foreign_git" {
+                if git_init_fault("foreign_cleanup").is_err() {
+                    continue;
+                }
+                let _ = self.clear_git_initialization(&intent.operation_id);
+                continue;
+            }
             if let Err(error) = recover_git_initialization(self, &intent) {
                 let _ = self.update_git_initialization(
                     &intent.operation_id,
@@ -16221,7 +16232,7 @@ fn recover_git_initialization(
     registry: &CaptainsRegistry,
     intent: &GitInitIntent,
 ) -> Result<(), String> {
-    if intent.phase == "recovery_blocked" {
+    if matches!(intent.phase.as_str(), "recovery_blocked" | "foreign_git") {
         return Err(intent
             .recovery_error
             .clone()
@@ -16345,6 +16356,21 @@ fn initialize_git(
     }
 
     let _git_initialization = ctx.captains.git_initialization_guard();
+    let existing = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project_identity_matches(project, &root));
+    if let Some(project) = existing.as_ref() {
+        if project.name != name && project.vcs_capability.as_deref() == Some("git") {
+            return Err(
+                "initialize_git has a conflicting durable Project name for this root".into(),
+            );
+        }
+        if project.vcs_capability.as_deref() == Some("git") {
+            return serde_json::to_value(project).map_err(|error| error.to_string());
+        }
+    }
     let owner_identity = caller
         .map(|identity| identity.session_id.clone())
         .unwrap_or_else(|| "trusted-internal".into());
@@ -16365,11 +16391,14 @@ fn initialize_git(
     };
     git_init_fault("before_intent_write")?;
     let requested_operation_id = intent.operation_id.clone();
-    let intent = ctx.captains.begin_git_initialization(intent)?;
+    let mut intent = ctx.captains.begin_git_initialization(intent)?;
     let resumed = intent.operation_id != requested_operation_id;
 
     let git_dir = files::to_host_path(&root).join(".git");
-    if git_dir.try_exists().unwrap_or(false) {
+    let git_exists = git_dir
+        .try_exists()
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    if git_exists {
         if resumed {
             recover_git_initialization(&ctx.captains, &intent)
                 .map_err(|error| git_init_recovery_error(&intent, error))?;
@@ -16378,38 +16407,61 @@ fn initialize_git(
                 .projects()
                 .into_iter()
                 .find(|project| project.project_id == intent.project_id)
-                .ok_or("Git initialization recovery completed without a durable Project")?;
-            return serde_json::to_value(project).map_err(|error| error.to_string());
+                .ok_or_else(|| {
+                    git_init_recovery_error(&intent, "recovery completed without a durable Project")
+                })?;
+            return serde_json::to_value(project)
+                .map_err(|error| git_init_recovery_error(&intent, error));
         }
-        let _ = ctx.captains.clear_git_initialization(&intent.operation_id);
-        return Err(
-            "initialize_git refused a pre-existing .git entry; T-Hub will not claim foreign Git state"
-                .into(),
-        );
-    }
-
-    git_init_fault("after_intent_before_git_init")?;
-
-    if let Err(error) = git::initialize_repository(&root) {
-        if !git_dir.try_exists().unwrap_or(false) {
-            let _ = ctx.captains.clear_git_initialization(&intent.operation_id);
-        }
-        return Err(format!(
-            "initialize_git failed before durable Project creation: {error}"
+        ctx.captains
+            .update_git_initialization(&intent.operation_id, "foreign_git", None)
+            .map_err(|error| git_init_recovery_error(&intent, error))?;
+        intent.phase = "foreign_git".into();
+        ctx.captains
+            .clear_git_initialization(&intent.operation_id)
+            .map_err(|error| git_init_recovery_error(&intent, error))?;
+        return Err(git_init_recovery_error(
+            &intent,
+            "refused a pre-existing .git entry; T-Hub will not claim foreign Git state",
         ));
     }
-    git_init_fault("after_git_init_before_marker")?;
+
+    git_init_fault("after_intent_before_git_init")
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+
+    if let Err(error) = git::initialize_repository(&root) {
+        let git_exists_after = git_dir
+            .try_exists()
+            .map_err(|probe| git_init_recovery_error(&intent, probe))?;
+        if !git_exists_after {
+            ctx.captains
+                .clear_git_initialization(&intent.operation_id)
+                .map_err(|cleanup| git_init_recovery_error(&intent, cleanup))?;
+        }
+        return Err(git_init_recovery_error(
+            &intent,
+            format!("Git initialization failed before durable Project creation: {error}"),
+        ));
+    }
+    git_init_fault("after_git_init_before_marker")
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    let repository_fingerprint = git_init_repository_fingerprint(&root)
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
     let marker = GitInitMarker {
         version: GIT_INIT_INTENT_VERSION,
         operation_id: intent.operation_id.clone(),
         root_path: root.clone(),
         marker_nonce: intent.marker_nonce.clone(),
-        repository_fingerprint: git_init_repository_fingerprint(&root)?,
+        repository_fingerprint,
     };
-    write_git_init_marker(&root, &marker)?;
+    write_git_init_marker(&root, &marker)
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
     ctx.captains
-        .update_git_initialization(&intent.operation_id, "git_initialized", None)?;
-    git_init_fault("after_marker_before_project")?;
+        .update_git_initialization(&intent.operation_id, "git_initialized", None)
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    intent.phase = "git_initialized".into();
+    git_init_fault("after_marker_before_project")
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
 
     let info = git::git_info_cached(&root);
     let main_root = info
@@ -16436,31 +16488,38 @@ fn initialize_git(
         created_at: 0,
         updated_at: 0,
     });
-    let updated = ctx.captains.upsert_project(ProjectRecord {
-        project_id: project.project_id,
-        name: name.to_string(),
-        repo_root: root.clone(),
-        root_path: Some(root.clone()),
-        vcs_capability: Some("git".into()),
-        git_main_root: Some(main_root),
-        remote_url: project.remote_url.or(info.remote_url),
-        default_branch: project
-            .default_branch
-            .or(info.default_branch)
-            .or(main_branch)
-            .or_else(|| Some("main".into())),
-        powder: project.powder,
-        created_at: project.created_at,
-        updated_at: 0,
-    })?;
-    git_init_fault("after_project_before_clear")?;
+    let updated = ctx
+        .captains
+        .upsert_project(ProjectRecord {
+            project_id: project.project_id,
+            name: name.to_string(),
+            repo_root: root.clone(),
+            root_path: Some(root.clone()),
+            vcs_capability: Some("git".into()),
+            git_main_root: Some(main_root),
+            remote_url: project.remote_url.or(info.remote_url),
+            default_branch: project
+                .default_branch
+                .or(info.default_branch)
+                .or(main_branch)
+                .or_else(|| Some("main".into())),
+            powder: project.powder,
+            created_at: project.created_at,
+            updated_at: 0,
+        })
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    git_init_fault("after_project_before_clear")
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
     ctx.captains
-        .update_git_initialization(&intent.operation_id, "cleanup_pending", None)?;
-    git_init_fault("during_cleanup")?;
-    remove_git_init_marker(&root)?;
+        .update_git_initialization(&intent.operation_id, "cleanup_pending", None)
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    intent.phase = "cleanup_pending".into();
+    git_init_fault("during_cleanup").map_err(|error| git_init_recovery_error(&intent, error))?;
+    remove_git_init_marker(&root).map_err(|error| git_init_recovery_error(&intent, error))?;
     ctx.captains
-        .clear_git_initialization(&intent.operation_id)?;
-    serde_json::to_value(updated).map_err(|error| error.to_string())
+        .clear_git_initialization(&intent.operation_id)
+        .map_err(|error| git_init_recovery_error(&intent, error))?;
+    serde_json::to_value(updated).map_err(|error| git_init_recovery_error(&intent, error))
 }
 
 fn register_project(
@@ -42255,6 +42314,13 @@ mod tests {
             );
             clear_git_init_fault();
             assert!(response.is_err(), "fault {fault} did not fire");
+            assert!(
+                response
+                    .as_ref()
+                    .unwrap_err()
+                    .starts_with("git_init_recovery code=git_init_recovery operation="),
+                "fault {fault} returned a non-structured error: {response:?}"
+            );
 
             let restarted = CaptainsRegistry::load(registry_path.clone());
             assert_eq!(dir.join(".git").is_dir(), expects_git, "fault {fault}");
@@ -42289,6 +42355,108 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
             let _ = std::fs::remove_file(registry_path);
         }
+    }
+
+    #[test]
+    fn initialize_git_before_intent_fault_has_no_durable_or_filesystem_residue() {
+        let ctx = test_ctx("initialize-git-before-intent");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-before-intent-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        set_git_init_fault("before_intent_write");
+        let error = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "rootPath": dir.to_string_lossy(), "name": "Before Intent" }),
+        )
+        .unwrap_err();
+        clear_git_init_fault();
+        assert!(error.contains("before_intent_write"));
+        assert!(!dir.join(".git").exists());
+        assert!(ctx.captains.pending_git_initializations().is_empty());
+        assert!(ctx.captains.projects().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_git_concurrent_equivalent_requests_converge_to_one_transaction() {
+        let ctx = test_ctx("initialize-git-concurrent-equivalent");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-concurrent-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let joins = (0..2)
+            .map(|_| {
+                let ctx = ctx.clone();
+                let barrier = Arc::clone(&barrier);
+                let root = dir.to_string_lossy().to_string();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &ctx,
+                        "initialize_git",
+                        &json!({ "rootPath": root, "name": "Concurrent Git Project" }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok), "results: {results:?}");
+        assert_eq!(ctx.captains.projects().len(), 1);
+        assert!(ctx.captains.pending_git_initializations().is_empty());
+        assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_git_conflicting_names_refuse_before_a_second_mutation() {
+        let ctx = test_ctx("initialize-git-conflicting-names");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-conflicting-names-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let joins = ["First Git Project", "Conflicting Git Project"]
+            .into_iter()
+            .map(|name| {
+                let ctx = ctx.clone();
+                let barrier = Arc::clone(&barrier);
+                let root = dir.to_string_lossy().to_string();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &ctx,
+                        "initialize_git",
+                        &json!({ "rootPath": root, "name": name }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let errors = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("conflicting durable Project name"));
+        assert_eq!(ctx.captains.projects().len(), 1);
+        assert!(ctx.captains.pending_git_initializations().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -42361,6 +42529,71 @@ mod tests {
             .iter()
             .any(|project| project.name == "Foreign Project"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_git_foreign_git_clear_failure_survives_restart_without_ownership() {
+        let ctx = test_ctx("initialize-git-foreign-clear-failure");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-foreign-clear-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let registry_path = dir.with_extension("json");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/foreign-state"), "preserve").unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_registry = Arc::clone(&registry);
+        let hook_calls = Arc::clone(&calls);
+        registry.set_persist_hook(Box::new(move || {
+            if hook_calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                hook_registry.fail_next_persist("injected foreign intent clear failure");
+            }
+        }));
+        let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+
+        let error = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "rootPath": dir.to_string_lossy(), "name": "Foreign Clear Failure" }),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("git_init_recovery code=git_init_recovery operation="));
+        assert_eq!(registry.pending_git_initializations().len(), 1);
+        assert_eq!(
+            registry.pending_git_initializations()[0].phase,
+            "foreign_git"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/foreign-state")).unwrap(),
+            "preserve"
+        );
+
+        set_git_init_fault("foreign_cleanup");
+        let restarted = CaptainsRegistry::load(registry_path.clone());
+        clear_git_init_fault();
+        assert!(restarted.projects().is_empty());
+        assert_eq!(restarted.pending_git_initializations().len(), 1);
+        assert_eq!(
+            restarted.pending_git_initializations()[0].phase,
+            "foreign_git"
+        );
+        assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/foreign-state")).unwrap(),
+            "preserve"
+        );
+        let restarted_again = CaptainsRegistry::load(registry_path.clone());
+        assert!(restarted_again.projects().is_empty());
+        assert!(restarted_again.pending_git_initializations().is_empty());
+        assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/foreign-state")).unwrap(),
+            "preserve"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
