@@ -49036,6 +49036,7 @@ mod tests {
                 "commission_captain",
                 "dispatch_crew",
                 "start_agent",
+                "agent_followup",
             ]
         );
         assert!(!is_idempotent_command("list_tabs"));
