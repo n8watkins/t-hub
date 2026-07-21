@@ -1178,6 +1178,35 @@ const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
 const MAX_RETIRED_FLEET_TILES: usize = 4096;
 
+#[cfg(test)]
+static PROJECT_PROBE_COUNTS: std::sync::OnceLock<std::sync::Mutex<[usize; 6]>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn record_project_probe(kind: usize) {
+    let counts = PROJECT_PROBE_COUNTS.get_or_init(|| std::sync::Mutex::new([0; 6]));
+    counts.lock().unwrap()[kind] += 1;
+}
+
+#[cfg(not(test))]
+fn record_project_probe(_kind: usize) {}
+
+#[cfg(test)]
+fn reset_project_probe_counts() {
+    *PROJECT_PROBE_COUNTS
+        .get_or_init(|| std::sync::Mutex::new([0; 6]))
+        .lock()
+        .unwrap() = [0; 6];
+}
+
+#[cfg(test)]
+fn project_probe_counts() -> [usize; 6] {
+    *PROJECT_PROBE_COUNTS
+        .get_or_init(|| std::sync::Mutex::new([0; 6]))
+        .lock()
+        .unwrap()
+}
+
 fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
     format!(
         "assignment:{}:{}",
@@ -1703,6 +1732,32 @@ fn migrate_project_identities(snapshot: &mut CaptainsSnapshot) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// Parse the public Project-root identity before authorization or any filesystem,
+/// Git, or registry probe.
+/// `rootPath` is authoritative; `repoRoot` and `repo_root` are deprecated aliases.
+fn requested_project_root(args: &Value, command: &str) -> Result<String, String> {
+    let root_path = arg_str(args, "rootPath");
+    let repo_root = arg_str(args, "repoRoot").or_else(|| arg_str(args, "repo_root"));
+    let normalized_root_path = root_path
+        .as_deref()
+        .map(canonical_project_identity)
+        .transpose()?;
+    let normalized_repo_root = repo_root
+        .as_deref()
+        .map(canonical_project_identity)
+        .transpose()?;
+    if let (Some(root_path), Some(repo_root)) = (&normalized_root_path, &normalized_repo_root) {
+        if root_path != repo_root {
+            return Err(format!(
+                "{command} received conflicting rootPath and repoRoot values"
+            ));
+        }
+    }
+    normalized_root_path
+        .or(normalized_repo_root)
+        .ok_or_else(|| format!("{command} requires a 'rootPath' argument"))
 }
 
 /// A repository registered with T-Hub. Projects outlive terminals, Captain
@@ -3288,8 +3343,7 @@ impl CaptainsRegistry {
             .and_then(Value::as_array)
             .is_some_and(|releases| !releases.is_empty());
         if has_release_recovery
-            && (schema_version < CAPTAINS_SCHEMA_VERSION as u64
-                || releases_contain_unknown_fields(&document))
+            && (schema_version < 18 || releases_contain_unknown_fields(&document))
         {
             return Err(SnapshotReadError::IncompatibleRecovery {
                 path: path.to_path_buf(),
@@ -3814,11 +3868,9 @@ impl CaptainsRegistry {
                 }
             }
         }
-        if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION
-            && !snapshot.pending_dispatch_releases.is_empty()
-        {
+        if snapshot.schema_version < 18 && !snapshot.pending_dispatch_releases.is_empty() {
             return Err(
-                "captains registry release recovery requires schema version 13 or newer".into(),
+                "captains registry release recovery requires schema version 18 or newer".into(),
             );
         }
         for recovery in &snapshot.pending_dispatch_releases {
@@ -4778,6 +4830,7 @@ impl CaptainsRegistry {
     /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
     /// complete file or the new complete file, never a partial one.
     fn persist(&self, snap: CaptainsSnapshot) -> Result<(), String> {
+        record_project_probe(5);
         if let Some(reason) = &self.write_blocked {
             return Err(format!(
                 "captains registry is read-only until T-Hub is upgraded: {reason}"
@@ -15841,18 +15894,23 @@ fn initialize_git(
     require_exact_args(
         args,
         "initialize_git",
-        &["repoRoot", "repo_root", "projectId", "project_id", "name"],
+        &[
+            "rootPath",
+            "repoRoot",
+            "repo_root",
+            "projectId",
+            "project_id",
+            "name",
+        ],
     )?;
+    let requested_identity = requested_project_root(args, "initialize_git")?;
     require_socket_identity(caller, trusted_internal, "initialize_git")?;
-    let requested = arg_str(args, "repoRoot")
-        .or_else(|| arg_str(args, "repo_root"))
-        .ok_or("initialize_git requires a 'repoRoot' argument")?;
-    let root = canonical_project_root(&requested, false)?;
+    let root = canonical_project_root(&requested_identity, false)?;
     let existing = ctx
         .captains
         .projects()
         .into_iter()
-        .find(|project| files::posix_form(&project.repo_root) == root);
+        .find(|project| project_identity_matches(project, &requested_identity));
     enforce_project_authority(
         ctx,
         caller,
@@ -15919,6 +15977,7 @@ fn register_project(
         args,
         "register_project",
         &[
+            "rootPath",
             "repoRoot",
             "repo_root",
             "createDirectory",
@@ -15928,10 +15987,8 @@ fn register_project(
             "remote_url",
         ],
     )?;
+    let requested_root = requested_project_root(args, "register_project")?;
     require_socket_identity(caller, trusted_internal, "register_project")?;
-    let requested_root = arg_str(args, "repoRoot")
-        .or_else(|| arg_str(args, "repo_root"))
-        .ok_or("register_project requires a 'repoRoot' argument")?;
     let explicit_name = arg_str(args, "name")
         .filter(|value| !value.trim().is_empty())
         .ok_or("register_project requires a non-empty 'name'")?;
@@ -15940,21 +15997,35 @@ fn register_project(
         .or_else(|| args.get("create_directory"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let requested_identity = requested_root.clone();
+    let requested_existing = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project_identity_matches(project, &requested_identity));
+    enforce_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        requested_existing
+            .as_ref()
+            .map(|project| project.project_id.as_str()),
+    )?;
     let canonical_root = canonical_project_root(&requested_root, create_directory)?;
-    if create_directory {
-        let registered_project_id = ctx
-            .captains
+    let existing_before_probe = requested_existing.or_else(|| {
+        ctx.captains
             .projects()
             .into_iter()
-            .find(|project| files::posix_form(&project.repo_root) == canonical_root)
-            .map(|project| project.project_id);
-        enforce_project_authority(
-            ctx,
-            caller,
-            trusted_internal,
-            registered_project_id.as_deref(),
-        )?;
-    }
+            .find(|project| project_identity_matches(project, &canonical_root))
+    });
+    enforce_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        existing_before_probe
+            .as_ref()
+            .map(|project| project.project_id.as_str()),
+    )?;
     if create_directory && !ctx.peer_is_loopback {
         files::scoped_create_path(&canonical_root, true, files::remote_file_roots())?;
     }
@@ -15979,8 +16050,10 @@ fn register_project(
     let (worktrees, initialized_git) = if created_directory {
         (Vec::new(), false)
     } else {
+        record_project_probe(2);
         let git_info = git::git_info_cached(&canonical_root);
         let worktrees = if git_info.is_repo {
+            record_project_probe(3);
             git::worktree_list(&canonical_root)
                 .map_err(|e| format!("register_project: repository validation failed: {e}"))?
         } else {
@@ -15991,17 +16064,21 @@ fn register_project(
 
     let result = (|| {
         let main = worktrees.iter().find(|worktree| !worktree.is_linked);
-        let repo_root = main
-            .and_then(|worktree| git::git_info_cached(&worktree.path).worktree_root)
-            .map(|root| files::posix_form(&root))
-            .unwrap_or_else(|| canonical_root.clone());
+        let selected_root = canonical_root.clone();
+        record_project_probe(2);
+        let git_info = git::git_info_cached(&selected_root);
+        let git_main_root = main
+            .and_then(|worktree| {
+                record_project_probe(2);
+                git::git_info_cached(&worktree.path).worktree_root
+            })
+            .map(|root| files::posix_form(&root));
         let name = explicit_name;
         let existing = ctx
             .captains
             .projects()
             .into_iter()
-            .find(|project| project.repo_root == repo_root);
-        let git_info = git::git_info_cached(&repo_root);
+            .find(|project| project_identity_matches(project, &selected_root));
         enforce_project_authority(
             ctx,
             caller,
@@ -16014,10 +16091,10 @@ fn register_project(
                 .map(|project| project.project_id.clone())
                 .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
             name,
-            repo_root: repo_root.clone(),
-            root_path: Some(repo_root.clone()),
+            repo_root: selected_root.clone(),
+            root_path: Some(selected_root),
             vcs_capability: Some(if git_info.is_repo { "git" } else { "none" }.into()),
-            git_main_root: git_info.is_repo.then(|| repo_root.clone()),
+            git_main_root: git_info.is_repo.then_some(git_main_root).flatten(),
             remote_url: arg_str(args, "remoteUrl")
                 .or_else(|| arg_str(args, "remote_url"))
                 .or(git_info.remote_url)
@@ -16068,6 +16145,14 @@ fn canonical_project_identity(requested: &str) -> Result<String, String> {
     Ok(root)
 }
 
+fn project_identity_matches(project: &ProjectRecord, identity: &str) -> bool {
+    project
+        .root_path
+        .as_deref()
+        .or(Some(project.repo_root.as_str()))
+        .is_some_and(|root| files::posix_form(root) == identity)
+}
+
 /// Project identity is always the canonical POSIX root seen by WSL.
 /// Host-side `Path::is_absolute` and `canonicalize` are intentionally absent:
 /// they reject or rewrite valid WSL roots when the daemon runs on Windows.
@@ -16082,6 +16167,7 @@ fn canonical_project_root(requested: &str, allow_missing: bool) -> Result<String
     if root.is_empty() || !root.starts_with('/') || root.starts_with("//") || root.contains('\0') {
         return Err("register_project: rootPath must be an absolute WSL path".into());
     }
+    record_project_probe(0);
     let metadata = match std::fs::metadata(files::to_host_path(&root)) {
         Ok(metadata) => metadata,
         Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
@@ -16096,11 +16182,13 @@ fn canonical_project_root(requested: &str, allow_missing: bool) -> Result<String
     if !metadata.is_dir() {
         return Err("register_project: rootPath must refer to a directory".into());
     }
+    record_project_probe(1);
     files::canonical_posix_path(&root)
         .map_err(|error| format!("register_project: could not canonicalize root '{root}': {error}"))
 }
 
 fn create_new_project_directory(repo_root: &str) -> Result<(), String> {
+    record_project_probe(4);
     let path = repo_root.trim();
     if !path.starts_with('/')
         || path.starts_with("//")
@@ -32057,6 +32145,7 @@ mod tests {
 
     const SCHEMA_13_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-13.json");
     const SCHEMA_17_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-17.json");
+    const SCHEMA_18_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-18.json");
 
     /// A crew ref's tile ids, for concise assertions.
     fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
@@ -33993,6 +34082,103 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktree_project_identity_keeps_selected_root_separate_from_git_main_root() {
+        let registry = CaptainsRegistry::new();
+        let project = registry
+            .upsert_project(ProjectRecord {
+                root_path: Some("/home/natkins/project/.claude/worktrees/feature".into()),
+                vcs_capability: Some("git".into()),
+                git_main_root: Some("/home/natkins/project".into()),
+                project_id: "linked-project".into(),
+                name: "Linked Project".into(),
+                repo_root: "/home/natkins/project/.claude/worktrees/feature".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            project.root_path.as_deref(),
+            Some("/home/natkins/project/.claude/worktrees/feature")
+        );
+        assert_eq!(
+            project.git_main_root.as_deref(),
+            Some("/home/natkins/project")
+        );
+        assert_eq!(registry.projects()[0], project);
+    }
+
+    #[test]
+    fn distinct_linked_roots_do_not_dedupe_on_shared_git_main_root() {
+        let registry = CaptainsRegistry::new();
+        for (id, root) in [
+            ("linked-a", "/home/natkins/project/.claude/worktrees/a"),
+            ("linked-b", "/home/natkins/project/.claude/worktrees/b"),
+        ] {
+            registry
+                .upsert_project(ProjectRecord {
+                    root_path: Some(root.into()),
+                    vcs_capability: Some("git".into()),
+                    git_main_root: Some("/home/natkins/project".into()),
+                    project_id: id.into(),
+                    name: id.into(),
+                    repo_root: root.into(),
+                    remote_url: None,
+                    default_branch: Some("main".into()),
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        assert_eq!(registry.projects().len(), 2);
+        assert_eq!(
+            registry
+                .projects()
+                .iter()
+                .map(|project| project.root_path.clone().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn current_schema_migration_preserves_linked_worktree_identity_metadata() {
+        let path = captains_tmp("linked-migration");
+        std::fs::write(
+            &path,
+            json!({
+                "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                "seq": 1,
+                "captains": [],
+                "projects": [{
+                    "projectId": "linked-project",
+                    "name": "Linked Project",
+                    "repoRoot": "/home/natkins/project/.claude/worktrees/feature",
+                    "rootPath": "/home/natkins/project/.claude/worktrees/feature",
+                    "vcsCapability": "git",
+                    "gitMainRoot": "/home/natkins/project"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let project = CaptainsRegistry::load(path.clone()).projects()[0].clone();
+        assert_eq!(
+            project.root_path.as_deref(),
+            Some("/home/natkins/project/.claude/worktrees/feature")
+        );
+        assert_eq!(
+            project.git_main_root.as_deref(),
+            Some("/home/natkins/project")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn every_registered_git_only_gate_rejects_non_git_before_operation() {
         let ctx = test_ctx("git-gate-matrix");
         ctx.captains
@@ -34312,6 +34498,80 @@ mod tests {
         assert_eq!(snapshot.agent_checkpoints[0].cursor, 7);
         assert_eq!(snapshot.agent_events[0].kind, "checkpoint");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn schema_18_fixture_migrates_project_identity_and_pending_release_losslessly() {
+        let path = captains_tmp("schema-18-fixture-load");
+        std::fs::write(&path, SCHEMA_18_REGISTRY_FIXTURE).unwrap();
+        let original: Value = serde_json::from_str(SCHEMA_18_REGISTRY_FIXTURE).unwrap();
+        let mut diagnostic: CaptainsSnapshot = serde_json::from_value(original.clone()).unwrap();
+        migrate_project_identities(&mut diagnostic).unwrap();
+        if let Err(error) = CaptainsRegistry::validate_snapshot(&diagnostic) {
+            panic!("schema-v18 fixture validation failed: {error}");
+        }
+
+        let snapshot = CaptainsRegistry::read_snapshot(&path).unwrap();
+        assert_eq!(snapshot.schema_version, 18);
+        assert_eq!(snapshot.seq, original["seq"].as_u64().unwrap());
+        assert_eq!(
+            snapshot.projects[0].root_path.as_deref(),
+            Some("/sanitized/workspaces/aurora")
+        );
+        assert_eq!(
+            snapshot.projects[0].repo_root,
+            "/sanitized/workspaces/aurora"
+        );
+        assert_eq!(snapshot.projects[0].vcs_capability.as_deref(), Some("git"));
+        assert_eq!(
+            snapshot.projects[0].git_main_root.as_deref(),
+            Some("/sanitized/workspaces/aurora")
+        );
+        assert_eq!(
+            snapshot.captains[0].project_id.as_deref(),
+            Some("project-aurora")
+        );
+        assert_eq!(
+            snapshot.captains[0].crew[0].conversation_id.as_deref(),
+            Some("conversation-aurora-worker-18")
+        );
+        assert_eq!(
+            snapshot.agent_sessions[0].agent_session_id,
+            "agent-aurora-18"
+        );
+        assert_eq!(snapshot.agent_checkpoints[0].cursor, 7);
+        assert_eq!(snapshot.workspaces[1].id, "workspace-aurora");
+        assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
+
+        let registry = CaptainsRegistry::load(path.clone());
+        let _ = registry
+            .claim_test("schema-18-reload", Some("schema-18-reload"), vec![])
+            .unwrap();
+        let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], CAPTAINS_SCHEMA_VERSION);
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        let prefix = format!("{file_name}.migration-v{CAPTAINS_SCHEMA_VERSION}.");
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            SCHEMA_18_REGISTRY_FIXTURE
+        );
+
+        let reloaded = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            reloaded.projects[0].root_path.as_deref(),
+            Some("/sanitized/workspaces/aurora")
+        );
+        assert_eq!(reloaded.pending_dispatch_releases.len(), 1);
+        for backup in backups {
+            let _ = std::fs::remove_file(backup.path());
+        }
         let _ = std::fs::remove_file(path);
     }
 
@@ -41035,6 +41295,224 @@ mod tests {
             "authorization ran after filesystem mutation"
         );
         let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
+    fn unauthorized_project_root_requests_have_zero_probe_or_persistence_counts() {
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let caller = mint_session(
+            &identities,
+            crate::identity::Role::Captain,
+            "foreign-project-ship",
+            "foreign-project-captain",
+        );
+        let ctx = test_ctx("project-probe-order").with_identity_store(identities);
+        let existing =
+            std::env::temp_dir().join(format!("t-hub-unauthorized-existing-{}", now_ms()));
+        std::fs::create_dir_all(&existing).unwrap();
+        let missing = existing.join("missing");
+
+        for (command, root) in [
+            ("register_project", existing.clone()),
+            ("initialize_git", missing),
+        ] {
+            reset_project_probe_counts();
+            let args = if command == "register_project" {
+                json!({ "rootPath": root.to_string_lossy(), "name": "Denied Project", "createDirectory": true })
+            } else {
+                json!({ "rootPath": root.to_string_lossy(), "name": "Denied Project" })
+            };
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session("project-probe-order", &caller, command, args),
+            );
+            assert!(!response.ok, "{command} unexpectedly succeeded");
+            assert!(response
+                .error
+                .unwrap_or_default()
+                .contains("only General/Cortana"));
+            assert_eq!(
+                project_probe_counts(),
+                [0; 6],
+                "{command} probed before authority"
+            );
+            assert!(ctx.captains.projects().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(existing);
+    }
+
+    #[test]
+    fn project_root_identity_accepts_posix_and_all_supported_wsl_unc_spellings() {
+        let expected = "/home/natkins/projects/demo";
+        for spelling in [
+            expected,
+            "/home/natkins/projects/./demo/",
+            r#"\\wsl.localhost\Ubuntu-24.04\home\natkins\projects\demo"#,
+            r#"\\wsl$\Ubuntu-24.04\home\natkins\projects\demo"#,
+            r#"\\?\UNC\wsl.localhost\Ubuntu-24.04\home\natkins\projects\demo\."#,
+        ] {
+            assert_eq!(canonical_project_identity(spelling).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn project_root_identity_rejects_relative_traversal_foreign_and_unsafe_unc() {
+        for spelling in [
+            "relative/project",
+            "/tmp/../secret",
+            r#"\\wsl.localhost\Debian\home\natkins\project"#,
+            r#"\\server\share\project"#,
+        ] {
+            assert!(
+                canonical_project_identity(spelling).is_err(),
+                "accepted {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_root_aliases_fail_before_project_probes_or_mutation() {
+        let ctx = test_ctx("root-alias-conflict");
+        reset_project_probe_counts();
+        let response = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "rootPath": "/tmp/root-primary",
+                "repoRoot": "/tmp/root-conflict",
+                "name": "Conflicting Roots",
+                "createDirectory": true,
+            }),
+        )
+        .unwrap_err();
+        assert!(response.contains("conflicting rootPath and repoRoot"));
+        assert!(ctx.captains.projects().is_empty());
+        assert_eq!(project_probe_counts(), [0; 6]);
+        assert!(!std::path::Path::new("/tmp/root-primary").exists());
+        assert!(!std::path::Path::new("/tmp/root-conflict").exists());
+    }
+
+    #[test]
+    fn register_project_accepts_each_root_identity_contract_form() {
+        let forms = ["rootPath", "repoRoot", "repo_root"];
+        for (index, field) in forms.into_iter().enumerate() {
+            let ctx = test_ctx(&format!("root-alias-form-{field}"));
+            let dir = std::env::temp_dir().join(format!(
+                "t-hub-root-alias-form-{}-{}-{index}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut args = serde_json::Map::new();
+            args.insert(field.to_string(), json!(dir.to_string_lossy()));
+            args.insert("name".to_string(), json!(format!("Root Form {field}")));
+            let project = dispatch(&ctx, "register_project", &Value::Object(args)).unwrap();
+            assert_eq!(project["rootPath"], dir.to_string_lossy().to_string());
+            assert_eq!(project["repoRoot"], project["rootPath"]);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn initialize_git_conflicting_root_aliases_fail_before_probes() {
+        let ctx = test_ctx("initialize-root-alias-conflict");
+        reset_project_probe_counts();
+        let error = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({
+                "rootPath": "/tmp/initialize-root-primary",
+                "repo_root": "/tmp/initialize-root-conflict",
+                "name": "Conflicting Initialize Roots",
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("conflicting rootPath and repoRoot"));
+        assert_eq!(project_probe_counts(), [0; 6]);
+        assert!(ctx.captains.projects().is_empty());
+    }
+
+    #[test]
+    fn equal_root_aliases_register_using_authoritative_root_path() {
+        let ctx = test_ctx("root-alias-equal");
+        let dir = std::env::temp_dir().join(format!("t-hub-root-alias-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().to_string();
+        let response = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "rootPath": format!("{root}/./"),
+                "repoRoot": root,
+                "name": "Equal Roots",
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["rootPath"], response["repoRoot"]);
+        assert_eq!(response["rootPath"], dir.to_string_lossy().to_string());
+        assert_eq!(ctx.captains.projects().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn register_project_retains_linked_selection_and_separate_git_main_root() {
+        let (base, repo, linked) = scratch_repo_with_worktree();
+        let ctx = test_ctx("linked-project-registration");
+        let selected = linked.to_string_lossy().to_string();
+        let project = dispatch(
+            &ctx,
+            "register_project",
+            &json!({ "rootPath": selected, "name": "Linked Selection" }),
+        )
+        .unwrap();
+        assert_eq!(project["rootPath"], linked.to_string_lossy().to_string());
+        assert_eq!(project["repoRoot"], project["rootPath"]);
+        assert_eq!(project["gitMainRoot"], repo.to_string_lossy().to_string());
+        assert_ne!(project["rootPath"], project["gitMainRoot"]);
+        assert_eq!(ctx.captains.projects().len(), 1);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_symlink_equivalent_registrations_converge_to_one_project() {
+        let parent = std::env::temp_dir().join(format!("t-hub-project-race-{}", now_ms()));
+        let root = parent.join("root");
+        let alias = parent.join("alias");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let expected_root = root.to_string_lossy().to_string();
+        let ctx = Arc::new(test_ctx("project-registration-race"));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let joins = [root.clone(), alias]
+            .into_iter()
+            .map(|path| {
+                let ctx = Arc::clone(&ctx);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &ctx,
+                        "register_project",
+                        &json!({ "rootPath": path.to_string_lossy(), "name": "Raced Project" }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert!(results.iter().all(Result::is_ok), "results: {results:?}");
+        let projects = ctx.captains.projects();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(
+            projects[0].root_path.as_deref(),
+            Some(expected_root.as_str())
+        );
+        assert_eq!(
+            projects[0].repo_root,
+            projects[0].root_path.clone().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     #[test]

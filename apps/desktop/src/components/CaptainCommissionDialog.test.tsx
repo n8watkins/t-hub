@@ -80,7 +80,7 @@ describe("CaptainCommissionDialog", () => {
 
     await waitFor(() =>
       expect(registerProject).toHaveBeenCalledWith({
-        repoRoot: "/home/natkins/appturnity/monorepo-app",
+        rootPath: "/home/natkins/appturnity/monorepo-app",
         name: "Appturnity",
       }),
     );
