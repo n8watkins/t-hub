@@ -212,6 +212,7 @@ describe("CaptainCommissionDialog", () => {
     expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(5);
     expect(screen.queryByText("Clean")).toBeNull();
     expect(screen.queryByText("Main")).toBeNull();
+    expect(screen.queryByText("Detached")).toBeNull();
     expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
