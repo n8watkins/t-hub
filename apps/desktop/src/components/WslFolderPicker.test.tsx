@@ -45,7 +45,7 @@ describe("WslFolderPicker", () => {
     vi.mocked(pickWslFolder).mockResolvedValue(null);
   });
 
-  it("offers home, recent, breadcrumbs, parent, Git markers, and manual paths", async () => {
+  it("offers home, recent, breadcrumbs, parent, and manual paths", async () => {
     const onPathChange = vi.fn();
     render(
       <WslFolderPicker
@@ -86,7 +86,7 @@ describe("WslFolderPicker", () => {
     ]);
   });
 
-  it("keeps folder navigation available when Git status fails", async () => {
+  it("keeps folder navigation available without Git probing", async () => {
     render(
       <WslFolderPicker
         path="/home/me"
@@ -143,6 +143,59 @@ describe("WslFolderPicker", () => {
     resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
     expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
     expect(screen.queryByText(/old permission failure/)).toBeNull();
+  });
+
+  it("ignores an older normalization success after a newer success", async () => {
+    let resolveOld!: (path: string) => void;
+    let resolveNew!: (path: string) => void;
+    vi.mocked(normalizeWslPath)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const onPathChange = vi.fn();
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />);
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/old" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    resolveNew("/home/new");
+    await waitFor(() => expect(onPathChange).toHaveBeenCalledWith("/home/new"));
+    resolveOld("/home/old");
+    await Promise.resolve();
+    expect(onPathChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an older normalization error after a newer success", async () => {
+    let rejectOld!: (cause: Error) => void;
+    let resolveNew!: (path: string) => void;
+    vi.mocked(normalizeWslPath)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectOld = reject; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const onPathChange = vi.fn();
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />);
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/old" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    resolveNew("/home/new");
+    await waitFor(() => expect(onPathChange).toHaveBeenCalledWith("/home/new"));
+    rejectOld(new Error("old normalization failure"));
+    await Promise.resolve();
+    expect(screen.queryByText("old normalization failure")).toBeNull();
+  });
+
+  it("keeps the prior populated result while the newest normalization fails", async () => {
+    let rejectNew!: (cause: Error) => void;
+    vi.mocked(normalizeWslPath).mockImplementationOnce(
+      () => new Promise((_, reject) => { rejectNew = reject; }),
+    );
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), { target: { value: "/home/blocked" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    rejectNew(new Error("new normalization failure"));
+    expect((await screen.findByRole("alert")).textContent).toContain("new normalization failure");
+    expect(screen.getByRole("button", { name: "project" })).toBeTruthy();
+    expect(screen.queryByText(/Refreshing this folder listing/)).toBeNull();
   });
 
   it("shows manual path validation errors without changing the selected folder", async () => {

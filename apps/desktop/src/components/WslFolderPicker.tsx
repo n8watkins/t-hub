@@ -33,6 +33,12 @@ export function WslFolderPicker({
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestGeneration = useRef(0);
+  const navigationGeneration = useRef(0);
+
+  useEffect(() => () => {
+    navigationGeneration.current += 1;
+    requestGeneration.current += 1;
+  }, []);
 
   useEffect(() => setManualPath(path), [path]);
 
@@ -74,25 +80,32 @@ export function WslFolderPicker({
   }, [path]);
 
   const navigate = (nextPath: string) => {
+    const generation = ++navigationGeneration.current;
+    setPicking(false);
     setError(null);
     void normalizeWslPath(nextPath)
-      .then((normalized) => onPathChange(normalized))
+      .then((normalized) => {
+        if (generation === navigationGeneration.current) onPathChange(normalized);
+      })
       .catch((cause) => {
+        if (generation !== navigationGeneration.current) return;
         setError(cause instanceof Error ? cause.message : String(cause));
       });
   };
   const parent = parentPath(path);
   const breadcrumbs = pathBreadcrumbs(path);
   const browseInExplorer = async () => {
+    const generation = ++navigationGeneration.current;
     setPicking(true);
     setError(null);
     try {
       const selected = await pickWslFolder(path || home || "/");
-      if (selected) onPathChange(selected);
+      if (generation === navigationGeneration.current && selected) onPathChange(selected);
     } catch (cause) {
+      if (generation !== navigationGeneration.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setPicking(false);
+      if (generation === navigationGeneration.current) setPicking(false);
     }
   };
 
