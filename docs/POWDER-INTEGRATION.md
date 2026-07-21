@@ -13,9 +13,10 @@ Powder is the executable backlog and evidence ledger rather than the general Cap
 
 ## Product Terms
 
-A **codebase** is the Git checkout on disk that the user wants a Captain to manage.
+A **codebase** is the WSL folder identified by the Project `rootPath` that the user wants a Captain to manage.
 The current API and persisted registry call its durable T-Hub record a **project**.
-In normal use, one project represents one canonical Git repository checkout and its worktrees.
+In normal use, one Project represents one canonical selected root and may have `vcsCapability: "git"` or `vcsCapability: "none"`.
+Git Projects separately retain optional `gitMainRoot` metadata.
 A **Powder board** is the Powder repository namespace containing cards for that codebase.
 It is not another Git checkout.
 A **Captain Assignment** is one durable responsibility within a project.
@@ -39,7 +40,7 @@ After selecting an entry path, the intended creation flow is:
 
 1. Open **Create Captain**.
 2. Choose a saved codebase, browse WSL for an existing folder, or configure a new codebase.
-3. Let T-Hub detect the canonical main worktree, display name, remote, default branch, and existing worktrees.
+3. Let T-Hub canonicalize the selected `rootPath` and validate the explicit display name.
 4. Select or confirm the matching Powder board.
 5. Keep the protected Powder connection profile under **Advanced** unless more than one valid profile is available.
 6. Describe the Captain's assignment.
@@ -51,13 +52,13 @@ Commissioning creates a control-capability Captain runtime, starts the selected 
 The Captain remains visible through the Captains surface without forcing creation of an unrelated work Workspace.
 If any required preflight or startup step fails, commissioning fails closed and rolls back the incomplete Captain.
 
-For an existing or new unsaved codebase, the graphical flow calls `register_project` with the selected Powder binding and then calls `commission_captain`.
+For an existing or new unsaved codebase, the graphical flow calls `register_project` with only the authoritative `rootPath` and explicit display `name`, then calls `commission_captain`.
 These are separate backend transactions.
 A commissioning failure rolls back incomplete Captain state but preserves the useful Project, Git repository, and any codebase leaf owned by the earlier successful registration.
 The product still needs an explicit shared resume-or-rollback contract rather than whole-flow atomicity.
 
-Installed `0.3.86` implements the three entry choices, WSL browsing, Git inspection and explicit initialization, protected-profile discovery under **Advanced**, a bounded Powder board selector, current terminology, and a reviewed preflight summary.
-The new-codebase path still supports only an empty Git repository, Powder board creation is absent, and template, clone, and complete packaged success flows remain open.
+The current source implements the three entry choices, WSL browsing, optional Git capability, protected-profile discovery under **Advanced**, a bounded Powder board selector, current terminology, and a reviewed preflight summary.
+The new-codebase path supports an explicitly named empty non-Git Project, while template, clone, and complete packaged success flows remain open.
 
 ## Captain Options and Crew Flow
 
@@ -109,7 +110,7 @@ Crew creation is currently driven by the commissioned Captain through the T-Hub 
 
 ## Connection Profiles
 
-Projects persist only a Powder repository, connection profile name, and event cursor in `~/.t-hub/captains.json`.
+Projects persist canonical root identity, optional Git metadata, and Powder repository, connection profile name, and event cursor in `~/.t-hub/captains.json`.
 Endpoints and credentials are resolved from `~/.t-hub/powder-profiles.json`.
 On Unix, T-Hub refuses to read this file unless it is private, such as mode `0600`.
 
@@ -139,7 +140,8 @@ The `default` profile can be supplied without a file by setting `POWDER_API_BASE
 
 ## Lifecycle
 
-`register_project` validates an existing canonical main worktree or, only when explicitly requested, initializes Git in an existing folder or creates one absent empty-codebase leaf.
+`register_project` validates and persists an existing or explicitly created canonical `rootPath` without initializing Git.
+`initialize_git` is the separate explicit operation that adds Git capability and `gitMainRoot` metadata.
 It may also validate and persist the selected Powder binding.
 `bind_project_powder` maps that project to one Powder repository and one connection profile.
 `commission_captain` starts Codex or Claude with a control capability, claims a durable ship, and persists its project and assignment.

@@ -2,19 +2,19 @@
 
 This document defines the packaged Windows actual-dialog verification required before Package 1 is released for review.
 
-The test must use the packaged or installed Windows T-Hub application and the real Captain commission dialog.
+The deferred test must use the packaged or installed Windows T-Hub application and the real Captain commission dialog.
 
 The test must not replace the WSL picker, IPC transport, filesystem adapter, or control daemon with mocks.
 
 Set `T_HUB_DISTRO` to the distro under test and record the exact value in the test evidence.
 
-Register a populated non-Git WSL directory and verify that the dialog shows the selected absolute POSIX root, the explicit codebase name, and a non-Git capability.
+Register a populated non-Git WSL directory and verify that the dialog shows the selected canonical POSIX `rootPath`, the explicit display name, and `vcsCapability: "none"`.
 
 Commission a Captain from that registration and verify that no `.git` directory is created and that registration and commission use the same Project identity.
 
-Register an empty non-Git directory and verify that the picker reports a loaded empty state rather than a directory-list failure.
+Register an empty non-Git directory and verify that the picker reports a loaded-empty state rather than a directory-list failure.
 
-Register a valid Git directory and verify that the existing Project ID, Captain bindings, Git main-root metadata, and default branch survive restart and recovery.
+Register a valid Git directory and verify that the selected `rootPath`, separate `gitMainRoot`, existing Project ID, Captain bindings, and default branch survive restart and recovery.
 
 Exercise `/home/natkins/appturnity/monorepo-app` and verify that the Windows host does not reject the POSIX root as non-absolute.
 

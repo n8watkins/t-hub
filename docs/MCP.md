@@ -242,8 +242,8 @@ At boot the UI fetches `list_captains` and adds live commissioned Captains to th
 
 ### Agent-session operations
 
-`register_project` records the canonical Git repository and does not contact an
-external planning service.
+`register_project` records the canonical Project `rootPath` and optional `vcsCapability`.
+Its compatibility `repoRoot` and `repo_root` aliases mirror `rootPath` and registration does not initialize Git or contact an external planning service.
 `commission_captain` starts a project-aware Captain from the registered Project,
 assignment, and selected harness.
 `start_agent` starts one durable agent session in an existing Project checkout.

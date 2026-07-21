@@ -36,17 +36,18 @@ Captain creation must support three equally normal starting points.
 ### 1. Saved codebase
 
 The codebase is already registered as a T-Hub Project.
-The General or Cortana selects it, reviews Git and session status, provides an
+The General or Cortana selects it, reviews Project capability and session status, provides an
 Assignment and Harness, and commissions a Captain.
 More than one Captain may receive distinct Assignments in the same Project.
 
 ### 2. Existing codebase not yet saved
 
-The folder or Git repository already exists in WSL but is not registered in T-Hub.
-The General or Cortana browses to it, T-Hub detects the canonical main worktree and metadata, and the flow registers it before commissioning.
+The folder already exists in WSL but is not registered in T-Hub.
+The General or Cortana browses to it, T-Hub canonicalizes the selected `rootPath`, and the flow registers it before commissioning.
 
-If the selected folder is not a Git repository, the flow must offer an explicit choice to initialize Git or cancel.
-It must not silently initialize or rewrite version control.
+The registration records `vcsCapability: "git"` when Git metadata is present and `vcsCapability: "none"` otherwise.
+Registration and commissioning never initialize Git.
+Git initialization is a separate explicit operation.
 
 ### 3. Brand-new codebase
 
@@ -58,7 +59,7 @@ The healthy product flow collects:
 - Project name and WSL parent folder.
 - Starting source such as empty, template, or clone.
 - Initial stack or template options when relevant.
-- Git initialization and default branch.
+- Optional Git capability and default branch metadata.
 - Whether to create or connect an external remote.
 - Initial Captain Assignment and Harness.
 
@@ -66,16 +67,15 @@ T-Hub should then execute one reviewed transaction:
 
 1. Validate the destination and show planned filesystem and external changes.
 2. Create or clone the codebase.
-3. Initialize and validate the canonical Git main worktree.
-4. Register the durable T-Hub Project.
-5. Commission the Captain with a distinct Assignment.
+3. Register the durable T-Hub Project with its canonical `rootPath`.
+4. Commission the Captain with a distinct Assignment.
 6. Offer an initial Workspace only when the Assignment already names a coherent workstream.
 
 If a later step fails, T-Hub should preserve useful local work, report partial state clearly, and offer safe resume or rollback.
 It must never delete a pre-existing directory during rollback.
 
-Installed `0.3.86` supports saved-codebase selection, WSL folder browsing, explicit Git initialization for an existing non-repository folder, and one reviewed empty-codebase leaf transaction.
-Its **Create new codebase** path offers only **Starting point: Empty Git repository** and explicitly defers template and clone starting points.
+The current Captain flow supports saved-codebase selection, WSL folder browsing, populated and empty non-Git registration, and one reviewed empty-codebase leaf transaction.
+Its **Create new codebase** path creates an explicitly named destination leaf without initializing Git.
 The graphical flow currently sequences `register_project` and
 `commission_captain` in the frontend, while each backend operation owns only
 its own rollback boundary.
