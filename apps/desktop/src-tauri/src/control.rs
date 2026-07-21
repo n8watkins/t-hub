@@ -192,6 +192,16 @@ impl ControlResponse {
         {
             return Self::git_required(operation);
         }
+        if let Some(rest) = raw.strip_prefix("git_init_recovery code=git_init_recovery operation=")
+        {
+            let Some((operation, rest)) = rest.split_once(" phase=") else {
+                return Self::plain_error(raw);
+            };
+            let Some((phase, message)) = rest.split_once(" message=") else {
+                return Self::plain_error(raw);
+            };
+            return Self::git_init_recovery(operation, phase, message);
+        }
         match raw.strip_prefix(RETRYABLE_ERROR_MARKER) {
             Some(clean) => Self {
                 ok: false,
@@ -201,14 +211,18 @@ impl ControlResponse {
                 error_kind: None,
                 retryable: true,
             },
-            None => Self {
-                ok: false,
-                result: None,
-                error: Some(raw),
-                error_details: None,
-                error_kind: None,
-                retryable: false,
-            },
+            None => Self::plain_error(raw),
+        }
+    }
+
+    fn plain_error(message: String) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(message),
+            error_details: None,
+            error_kind: None,
+            retryable: false,
         }
     }
 
@@ -227,6 +241,21 @@ impl ControlResponse {
                 "action": "initialize_git",
             })),
             error_kind: Some("git_required".into()),
+            retryable: false,
+        }
+    }
+
+    fn git_init_recovery(operation: &str, phase: &str, message: &str) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(message.to_string()),
+            error_details: Some(json!({
+                "code": "git_init_recovery",
+                "operation": operation,
+                "phase": phase,
+            })),
+            error_kind: Some("git_init_recovery".into()),
             retryable: false,
         }
     }
@@ -1172,7 +1201,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 19;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 20;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -1181,7 +1210,7 @@ const MAX_RETIRED_FLEET_TILES: usize = 4096;
 #[cfg(test)]
 thread_local! {
     static PROJECT_PROBE_COUNTS: std::cell::RefCell<[usize; 6]> =
-        std::cell::RefCell::new([0; 6]);
+        const { std::cell::RefCell::new([0; 6]) };
 }
 
 #[cfg(test)]
@@ -2565,6 +2594,26 @@ pub struct PendingFleetOperation {
     pub payload: PendingFleetOperationPayload,
 }
 
+/// Durable transaction intent for explicit Git initialization.
+/// The intent remains on disk until the Project and ownership marker are both
+/// finalized, so a restart can finish or fail closed without guessing whether
+/// T-Hub created the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitInitIntent {
+    pub version: u32,
+    pub operation_id: String,
+    pub root_path: String,
+    pub name: String,
+    pub project_id: String,
+    pub owner_identity: String,
+    pub phase: String,
+    pub marker_nonce: String,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
+}
+
 #[derive(Debug)]
 struct CloseWorkspaceResult {
     removed_tile_ids: Vec<String>,
@@ -2632,6 +2681,10 @@ pub struct CaptainsSnapshot {
     /// Trusted post-bind release attempts whose remote outcome is ambiguous.
     #[serde(default)]
     pub pending_dispatch_releases: Vec<PendingDispatchRelease>,
+    /// Explicit Git initialization transactions awaiting safe finalization or
+    /// fail-closed recovery.
+    #[serde(default)]
+    pub pending_git_initializations: Vec<GitInitIntent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2873,6 +2926,7 @@ struct CaptainsInner {
     retired_fleet_tile_ids: Vec<String>,
     pending_dispatch_claims: Vec<PendingDispatchClaim>,
     pending_dispatch_releases: Vec<PendingDispatchRelease>,
+    pending_git_initializations: Vec<GitInitIntent>,
     /// Monotonic revision, bumped on every accepted mutation - the same
     /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
     /// monotonic across app restarts.
@@ -2898,6 +2952,7 @@ impl Default for CaptainsInner {
             retired_fleet_tile_ids: Vec::new(),
             pending_dispatch_claims: Vec::new(),
             pending_dispatch_releases: Vec::new(),
+            pending_git_initializations: Vec::new(),
             seq: 0,
             authority_generations: AuthorityGenerations::default(),
         }
@@ -2969,6 +3024,9 @@ pub struct CaptainsRegistry {
     /// Serializes multi-step Captain provisioning so project uniqueness checks,
     /// ship claims, and project binding cannot interleave across requests.
     provision: Mutex<()>,
+    /// Serializes the complete explicit Git initialization transaction, from
+    /// durable intent through marker cleanup, across equivalent callers.
+    git_initialization: Mutex<()>,
     /// Serializes every remote Powder operation and its final registry mutation
     /// for each Crew binding. This prevents cleanup or renewal from acting on a
     /// stale Active snapshot while completion is becoming durable. The guard is
@@ -3132,6 +3190,7 @@ impl CaptainsRegistry {
             authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
+            git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
             #[cfg(test)]
@@ -3172,6 +3231,7 @@ impl CaptainsRegistry {
                 retired_fleet_tile_ids: Vec::new(),
                 pending_dispatch_claims: Vec::new(),
                 pending_dispatch_releases: Vec::new(),
+                pending_git_initializations: Vec::new(),
             })
         } else {
             Self::read_snapshot(&path)
@@ -3278,6 +3338,7 @@ impl CaptainsRegistry {
                     retired_fleet_tile_ids: snap.retired_fleet_tile_ids,
                     pending_dispatch_claims: snap.pending_dispatch_claims,
                     pending_dispatch_releases: snap.pending_dispatch_releases,
+                    pending_git_initializations: snap.pending_git_initializations,
                     seq: snap.seq,
                     authority_generations: AuthorityGenerations::default(),
                 }
@@ -3288,11 +3349,12 @@ impl CaptainsRegistry {
         // redundantly on startup - the monotonic guard is correct from the first
         // write, not just after the first mutation.
         let loaded_seq = inner.seq;
-        Self {
+        let registry = Self {
             inner: Mutex::new(inner),
             authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
+            git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
             #[cfg(test)]
@@ -3308,7 +3370,9 @@ impl CaptainsRegistry {
             persist_hook: Mutex::new(None),
             #[cfg(test)]
             fail_next_persist: Mutex::new(None),
-        }
+        };
+        registry.recover_pending_git_initializations();
+        registry
     }
 
     fn read_snapshot(path: &Path) -> Result<CaptainsSnapshot, SnapshotReadError> {
@@ -3432,6 +3496,31 @@ impl CaptainsRegistry {
                         project.project_id
                     ));
                 }
+            }
+        }
+        let mut git_init_operations = std::collections::HashSet::new();
+        let mut git_init_roots = std::collections::HashSet::new();
+        for intent in &snapshot.pending_git_initializations {
+            if intent.version != GIT_INIT_INTENT_VERSION
+                || intent.operation_id.trim().is_empty()
+                || !git_init_operations.insert(intent.operation_id.as_str())
+                || intent.root_path.trim().is_empty()
+                || !git_init_roots.insert(intent.root_path.as_str())
+                || !intent.root_path.starts_with('/')
+                || intent.root_path.starts_with("//")
+                || intent.name.trim().is_empty()
+                || intent.project_id.trim().is_empty()
+                || intent.owner_identity.trim().is_empty()
+                || intent.marker_nonce.trim().is_empty()
+                || intent.created_at == 0
+                || !matches!(
+                    intent.phase.as_str(),
+                    "intent_written" | "git_initialized" | "cleanup_pending" | "recovery_blocked"
+                )
+            {
+                return Err(
+                    "captains registry contains an invalid Git initialization intent".into(),
+                );
             }
         }
         let mut agent_session_ids = std::collections::HashSet::new();
@@ -3983,6 +4072,7 @@ impl CaptainsRegistry {
             retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
+            pending_git_initializations: g.pending_git_initializations.clone(),
         }
     }
 
@@ -5018,6 +5108,7 @@ impl CaptainsRegistry {
             retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
             pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             pending_dispatch_releases: g.pending_dispatch_releases.clone(),
+            pending_git_initializations: g.pending_git_initializations.clone(),
         }
     }
 
@@ -5714,6 +5805,7 @@ impl CaptainsRegistry {
                 retired_fleet_tile_ids: g.retired_fleet_tile_ids.clone(),
                 pending_dispatch_claims: g.pending_dispatch_claims.clone(),
                 pending_dispatch_releases: g.pending_dispatch_releases.clone(),
+                pending_git_initializations: g.pending_git_initializations.clone(),
             },
             g.authority_generations.clone(),
             self.authority_epoch,
@@ -5723,6 +5815,85 @@ impl CaptainsRegistry {
     /// Return the durable project registry without exposing the registry lock.
     pub fn projects(&self) -> Vec<ProjectRecord> {
         self.lock().projects.clone()
+    }
+
+    pub fn pending_git_initializations(&self) -> Vec<GitInitIntent> {
+        self.lock().pending_git_initializations.clone()
+    }
+
+    fn recover_pending_git_initializations(&self) {
+        let intents = self.pending_git_initializations();
+        for intent in intents {
+            if let Err(error) = recover_git_initialization(self, &intent) {
+                let _ = self.update_git_initialization(
+                    &intent.operation_id,
+                    "recovery_blocked",
+                    Some(error),
+                );
+            }
+        }
+    }
+
+    fn git_initialization_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.git_initialization
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn begin_git_initialization(&self, intent: GitInitIntent) -> Result<GitInitIntent, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current
+            .pending_git_initializations
+            .iter()
+            .find(|candidate| candidate.root_path == intent.root_path)
+        {
+            if existing.name != intent.name || existing.owner_identity != intent.owner_identity {
+                return Err(
+                    "initialize_git has a conflicting durable transaction for this root".into(),
+                );
+            }
+            return Ok(existing.clone());
+        }
+        let previous = current.clone();
+        current.pending_git_initializations.push(intent.clone());
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(intent)
+    }
+
+    fn update_git_initialization(
+        &self,
+        operation_id: &str,
+        phase: &str,
+        recovery_error: Option<String>,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let intent = current
+            .pending_git_initializations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .ok_or_else(|| format!("unknown Git initialization operation '{operation_id}'"))?;
+        intent.phase = phase.to_string();
+        intent.recovery_error = recovery_error;
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn clear_git_initialization(&self, operation_id: &str) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        current
+            .pending_git_initializations
+            .retain(|intent| intent.operation_id != operation_id);
+        if current.pending_git_initializations.len() == previous.pending_git_initializations.len() {
+            return Ok(());
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
     }
 
     /// Register or update one canonical repository. Repository roots and project
@@ -15874,6 +16045,250 @@ fn powder_board_page(
     })
 }
 
+const GIT_INIT_INTENT_VERSION: u32 = 1;
+const GIT_INIT_MARKER_FILE: &str = "t-hub-git-init-marker.json";
+
+#[cfg(test)]
+thread_local! {
+    static GIT_INIT_FAULT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_git_init_fault(boundary: &str) {
+    GIT_INIT_FAULT.with(|fault| *fault.borrow_mut() = Some(boundary.to_string()));
+}
+
+#[cfg(test)]
+fn clear_git_init_fault() {
+    GIT_INIT_FAULT.with(|fault| *fault.borrow_mut() = None);
+}
+
+fn git_init_fault(boundary: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let matched = GIT_INIT_FAULT.with(|fault| {
+            fault
+                .borrow()
+                .as_deref()
+                .is_some_and(|configured| configured == boundary)
+        });
+        if matched {
+            return Err(format!("injected Git initialization fault at {boundary}"));
+        }
+    }
+    let _ = boundary;
+    Ok(())
+}
+
+fn git_init_recovery_error(intent: &GitInitIntent, message: impl std::fmt::Display) -> String {
+    format!(
+        "git_init_recovery code=git_init_recovery operation={} phase={} message={}",
+        intent.operation_id, intent.phase, message
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitInitMarker {
+    version: u32,
+    operation_id: String,
+    root_path: String,
+    marker_nonce: String,
+    repository_fingerprint: String,
+}
+
+fn git_init_marker_path(root: &str) -> std::path::PathBuf {
+    files::to_host_path(root)
+        .join(".git")
+        .join(GIT_INIT_MARKER_FILE)
+}
+
+fn git_init_repository_fingerprint(root: &str) -> Result<String, String> {
+    fn walk(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        entries: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<(), String> {
+        let mut children = std::fs::read_dir(current)
+            .map_err(|error| format!("could not inspect initialized Git state: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not inspect initialized Git state: {error}"))?;
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("could not fingerprint initialized Git state: {error}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == GIT_INIT_MARKER_FILE {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("could not inspect initialized Git state: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err("Git initialization recovery refused a symlink in .git".into());
+            }
+            if metadata.is_dir() {
+                entries.push((format!("dir:{relative}"), Vec::new()));
+                walk(root, &path, entries)?;
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("could not read initialized Git state: {error}"))?;
+                entries.push((format!("file:{relative}"), bytes));
+            } else {
+                return Err("Git initialization recovery refused an unusual .git entry".into());
+            }
+        }
+        Ok(())
+    }
+
+    let git_dir = files::to_host_path(root).join(".git");
+    let mut entries = Vec::new();
+    walk(&git_dir, &git_dir, &mut entries)?;
+    let mut digest = Sha256::new();
+    for (path, bytes) in entries {
+        digest.update(path.as_bytes());
+        digest.update([0]);
+        digest.update(bytes);
+        digest.update([0]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn write_git_init_marker(root: &str, marker: &GitInitMarker) -> Result<(), String> {
+    let path = git_init_marker_path(root);
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let body = serde_json::to_vec_pretty(marker)
+        .map_err(|error| format!("could not serialize Git initialization marker: {error}"))?;
+    std::fs::write(&temp, body)
+        .map_err(|error| format!("could not write Git initialization marker: {error}"))?;
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "could not publish Git initialization marker: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn read_git_init_marker(root: &str) -> Result<GitInitMarker, String> {
+    let path = git_init_marker_path(root);
+    let body = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Git initialization ownership marker is unavailable: {error}"))?;
+    serde_json::from_str(&body)
+        .map_err(|error| format!("Git initialization ownership marker is invalid: {error}"))
+}
+
+fn remove_git_init_marker(root: &str) -> Result<(), String> {
+    let path = git_init_marker_path(root);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove Git initialization marker: {error}"
+        )),
+    }
+}
+
+fn validate_git_init_ownership(root: &str, intent: &GitInitIntent) -> Result<(), String> {
+    let canonical = canonical_project_root(root, false)?;
+    if canonical != intent.root_path {
+        return Err("Git initialization recovery refused a swapped or symlinked root".into());
+    }
+    let marker = read_git_init_marker(root)?;
+    if marker.version != GIT_INIT_INTENT_VERSION
+        || marker.operation_id != intent.operation_id
+        || marker.root_path != intent.root_path
+        || marker.marker_nonce != intent.marker_nonce
+    {
+        return Err("Git initialization ownership marker does not match its durable intent".into());
+    }
+    let fingerprint = git_init_repository_fingerprint(root)?;
+    if fingerprint != marker.repository_fingerprint {
+        return Err(
+            "Git initialization recovery refused changed Git state or foreign repository data"
+                .into(),
+        );
+    }
+    if !git::git_info_cached(root).is_repo {
+        return Err("Git initialization recovery found an invalid Git repository".into());
+    }
+    Ok(())
+}
+
+fn recover_git_initialization(
+    registry: &CaptainsRegistry,
+    intent: &GitInitIntent,
+) -> Result<(), String> {
+    if intent.phase == "recovery_blocked" {
+        return Err(intent
+            .recovery_error
+            .clone()
+            .unwrap_or_else(|| "Git initialization recovery remains blocked".into()));
+    }
+    let git_dir = files::to_host_path(&intent.root_path).join(".git");
+    let git_exists = git_dir
+        .try_exists()
+        .map_err(|error| format!("could not inspect Git initialization recovery state: {error}"))?;
+    if intent.phase == "intent_written" {
+        if !git_exists {
+            return registry.clear_git_initialization(&intent.operation_id);
+        }
+        validate_git_init_ownership(&intent.root_path, intent)?;
+    } else if !git_exists {
+        return Err("Git initialization recovery found that its owned .git is missing".into());
+    } else if intent.phase != "cleanup_pending"
+        || git_init_marker_path(&intent.root_path)
+            .try_exists()
+            .unwrap_or(false)
+    {
+        validate_git_init_ownership(&intent.root_path, intent)?;
+    }
+    let existing = registry
+        .projects()
+        .into_iter()
+        .find(|project| project_identity_matches(project, &intent.root_path));
+    if let Some(project) = &existing {
+        if project.vcs_capability.as_deref() != Some("git")
+            || project.project_id != intent.project_id
+        {
+            return Err("Git initialization recovery found a conflicting durable Project".into());
+        }
+    } else {
+        let info = git::git_info_cached(&intent.root_path);
+        let main_root = info
+            .worktree_root
+            .as_deref()
+            .map(files::posix_form)
+            .unwrap_or_else(|| intent.root_path.clone());
+        registry.upsert_project(ProjectRecord {
+            project_id: intent.project_id.clone(),
+            name: intent.name.clone(),
+            repo_root: intent.root_path.clone(),
+            root_path: Some(intent.root_path.clone()),
+            vcs_capability: Some("git".into()),
+            git_main_root: Some(main_root),
+            remote_url: info.remote_url,
+            default_branch: info.default_branch.or_else(|| Some("main".into())),
+            powder: None,
+            created_at: intent.created_at,
+            updated_at: 0,
+        })?;
+    }
+    if intent.phase != "cleanup_pending" {
+        registry.update_git_initialization(&intent.operation_id, "cleanup_pending", None)?;
+    }
+    let marker_exists = git_init_marker_path(&intent.root_path)
+        .try_exists()
+        .unwrap_or(false);
+    if marker_exists {
+        validate_git_init_ownership(&intent.root_path, intent)?;
+        remove_git_init_marker(&intent.root_path)?;
+    }
+    registry.clear_git_initialization(&intent.operation_id)
+}
+
 /// Register an existing Git repository using its canonical main-worktree root.
 /// Re-registering the same root updates metadata while preserving its project id.
 fn initialize_git(
@@ -15923,64 +16338,129 @@ fn initialize_git(
     let name = arg_str(args, "name")
         .filter(|value| !value.trim().is_empty())
         .ok_or("initialize_git requires a non-empty 'name'")?;
-    git::initialize_repository(&root)
-        .map_err(|error| format!("initialize_git: Git initialization failed: {error}"))?;
-    let result = (|| {
-        record_project_probe(2);
-        let info = git::git_info_cached(&root);
-        let main_root = info
-            .worktree_root
-            .as_deref()
-            .map(files::posix_form)
-            .unwrap_or_else(|| root.clone());
-        record_project_probe(3);
-        let main_branch = git::worktree_list(&main_root).ok().and_then(|worktrees| {
-            worktrees
-                .into_iter()
-                .find(|worktree| !worktree.is_linked)
-                .and_then(|worktree| worktree.branch)
-        });
-        let project = existing.clone().unwrap_or(ProjectRecord {
-            root_path: None,
-            vcs_capability: None,
-            git_main_root: None,
-            project_id: format!("project-{}", uuid::Uuid::new_v4()),
-            name: name.to_string(),
-            repo_root: root.clone(),
-            remote_url: None,
-            default_branch: None,
-            powder: None,
-            created_at: 0,
-            updated_at: 0,
-        });
-        let updated = ctx.captains.upsert_project(ProjectRecord {
-            project_id: project.project_id,
-            name: name.to_string(),
-            repo_root: root.clone(),
-            root_path: Some(root.clone()),
-            vcs_capability: Some("git".into()),
-            git_main_root: Some(main_root),
-            remote_url: project.remote_url.or(info.remote_url),
-            default_branch: project
-                .default_branch
-                .or(info.default_branch)
-                .or(main_branch)
-                .or_else(|| Some("main".into())),
-            powder: project.powder,
-            created_at: project.created_at,
-            updated_at: 0,
-        })?;
-        serde_json::to_value(updated).map_err(|error| error.to_string())
-    })();
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => match git::rollback_initialized_repository(&root) {
-            Ok(()) => Err(format!("{error}; rolled back Git initialization")),
-            Err(rollback_error) => Err(format!(
-                "{error}; Git initialization rollback failed: {rollback_error}"
-            )),
-        },
+    if let Some(project) = existing.as_ref() {
+        if project.vcs_capability.as_deref() == Some("git") {
+            return serde_json::to_value(project).map_err(|error| error.to_string());
+        }
     }
+
+    let _git_initialization = ctx.captains.git_initialization_guard();
+    let owner_identity = caller
+        .map(|identity| identity.session_id.clone())
+        .unwrap_or_else(|| "trusted-internal".into());
+    let intent = GitInitIntent {
+        version: GIT_INIT_INTENT_VERSION,
+        operation_id: format!("git-init-{}", uuid::Uuid::new_v4()),
+        root_path: root.clone(),
+        name: name.to_string(),
+        project_id: existing
+            .as_ref()
+            .map(|project| project.project_id.clone())
+            .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
+        owner_identity,
+        phase: "intent_written".into(),
+        marker_nonce: uuid::Uuid::new_v4().to_string(),
+        created_at: now_ms(),
+        recovery_error: None,
+    };
+    git_init_fault("before_intent_write")?;
+    let requested_operation_id = intent.operation_id.clone();
+    let intent = ctx.captains.begin_git_initialization(intent)?;
+    let resumed = intent.operation_id != requested_operation_id;
+
+    let git_dir = files::to_host_path(&root).join(".git");
+    if git_dir.try_exists().unwrap_or(false) {
+        if resumed {
+            recover_git_initialization(&ctx.captains, &intent)
+                .map_err(|error| git_init_recovery_error(&intent, error))?;
+            let project = ctx
+                .captains
+                .projects()
+                .into_iter()
+                .find(|project| project.project_id == intent.project_id)
+                .ok_or("Git initialization recovery completed without a durable Project")?;
+            return serde_json::to_value(project).map_err(|error| error.to_string());
+        }
+        let _ = ctx.captains.clear_git_initialization(&intent.operation_id);
+        return Err(
+            "initialize_git refused a pre-existing .git entry; T-Hub will not claim foreign Git state"
+                .into(),
+        );
+    }
+
+    git_init_fault("after_intent_before_git_init")?;
+
+    if let Err(error) = git::initialize_repository(&root) {
+        if !git_dir.try_exists().unwrap_or(false) {
+            let _ = ctx.captains.clear_git_initialization(&intent.operation_id);
+        }
+        return Err(format!(
+            "initialize_git failed before durable Project creation: {error}"
+        ));
+    }
+    git_init_fault("after_git_init_before_marker")?;
+    let marker = GitInitMarker {
+        version: GIT_INIT_INTENT_VERSION,
+        operation_id: intent.operation_id.clone(),
+        root_path: root.clone(),
+        marker_nonce: intent.marker_nonce.clone(),
+        repository_fingerprint: git_init_repository_fingerprint(&root)?,
+    };
+    write_git_init_marker(&root, &marker)?;
+    ctx.captains
+        .update_git_initialization(&intent.operation_id, "git_initialized", None)?;
+    git_init_fault("after_marker_before_project")?;
+
+    let info = git::git_info_cached(&root);
+    let main_root = info
+        .worktree_root
+        .as_deref()
+        .map(files::posix_form)
+        .unwrap_or_else(|| root.clone());
+    let main_branch = git::worktree_list(&main_root).ok().and_then(|worktrees| {
+        worktrees
+            .into_iter()
+            .find(|worktree| !worktree.is_linked)
+            .and_then(|worktree| worktree.branch)
+    });
+    let project = existing.unwrap_or(ProjectRecord {
+        root_path: None,
+        vcs_capability: None,
+        git_main_root: None,
+        project_id: intent.project_id.clone(),
+        name: name.to_string(),
+        repo_root: root.clone(),
+        remote_url: None,
+        default_branch: None,
+        powder: None,
+        created_at: 0,
+        updated_at: 0,
+    });
+    let updated = ctx.captains.upsert_project(ProjectRecord {
+        project_id: project.project_id,
+        name: name.to_string(),
+        repo_root: root.clone(),
+        root_path: Some(root.clone()),
+        vcs_capability: Some("git".into()),
+        git_main_root: Some(main_root),
+        remote_url: project.remote_url.or(info.remote_url),
+        default_branch: project
+            .default_branch
+            .or(info.default_branch)
+            .or(main_branch)
+            .or_else(|| Some("main".into())),
+        powder: project.powder,
+        created_at: project.created_at,
+        updated_at: 0,
+    })?;
+    git_init_fault("after_project_before_clear")?;
+    ctx.captains
+        .update_git_initialization(&intent.operation_id, "cleanup_pending", None)?;
+    git_init_fault("during_cleanup")?;
+    remove_git_init_marker(&root)?;
+    ctx.captains
+        .clear_git_initialization(&intent.operation_id)?;
+    serde_json::to_value(updated).map_err(|error| error.to_string())
 }
 
 fn register_project(
@@ -29197,6 +29677,19 @@ mod tests {
     }
 
     #[test]
+    fn git_init_recovery_errors_are_structured_on_the_control_wire() {
+        let response = ControlResponse::err(
+            "git_init_recovery code=git_init_recovery operation=git-init-123 phase=recovery_blocked message=ownership marker changed",
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["errorKind"], "git_init_recovery");
+        assert_eq!(wire["errorDetails"]["operation"], "git-init-123");
+        assert_eq!(wire["errorDetails"]["phase"], "recovery_blocked");
+        assert_eq!(wire["error"], "ownership marker changed");
+        assert!(!wire.to_string().contains("git_init_recovery:"));
+    }
+
+    #[test]
     fn tmux_target_maps_id_and_is_idempotent() {
         assert_eq!(tmux_target("abc"), "th_abc");
         assert_eq!(tmux_target("th_abc"), "th_abc");
@@ -34414,6 +34907,7 @@ mod tests {
             retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
+            pending_git_initializations: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
@@ -34616,6 +35110,7 @@ mod tests {
             retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
+            pending_git_initializations: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
@@ -35022,6 +35517,7 @@ mod tests {
             retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
+            pending_git_initializations: vec![],
         };
         let backup_body = json!({
             "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
@@ -35123,6 +35619,7 @@ mod tests {
             retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
+            pending_git_initializations: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
         std::fs::write(&backup, serde_json::to_vec(&valid).unwrap()).unwrap();
@@ -41679,32 +42176,231 @@ mod tests {
     }
 
     #[test]
-    fn initialize_git_rolls_back_git_when_project_persistence_fails() {
-        let ctx = test_ctx("initialize-git-rollback");
+    fn initialize_git_recovers_durable_transaction_after_restart() {
+        let ctx = test_ctx("initialize-git-recovery");
         let dir = std::env::temp_dir().join(format!(
-            "t-hub-initialize-git-rollback-{}-{}",
+            "t-hub-initialize-git-recovery-{}-{}",
             std::process::id(),
             now_ms()
         ));
         let registry_path = dir.with_extension("json");
         std::fs::create_dir_all(&dir).unwrap();
         let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
-        registry.fail_next_persist("initialize Git persistence failure");
         let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+        set_git_init_fault("after_marker_before_project");
 
         let error = dispatch(
             &ctx,
             "initialize_git",
-            &json!({ "repoRoot": dir.to_string_lossy(), "name": "Rollback Project" }),
+            &json!({ "repoRoot": dir.to_string_lossy(), "name": "Recovery Project" }),
         )
         .unwrap_err();
+        clear_git_init_fault();
 
         assert!(
-            error.contains("initialize Git persistence failure"),
+            error.contains("injected Git initialization fault"),
             "got: {error}"
         );
-        assert!(!dir.join(".git").exists());
-        assert!(ctx.captains.projects().is_empty());
+        assert!(dir.join(".git").is_dir());
+        assert_eq!(registry.pending_git_initializations().len(), 1);
+        assert!(dir.join(".git/t-hub-git-init-marker.json").is_file());
+
+        let recovered = CaptainsRegistry::load(registry_path.clone());
+        let project = recovered
+            .projects()
+            .into_iter()
+            .find(|project| project.name == "Recovery Project")
+            .expect("restart should finalize the owned Git initialization");
+        assert_eq!(project.vcs_capability.as_deref(), Some("git"));
+        assert_eq!(
+            project.root_path.as_deref(),
+            project.repo_root.as_str().into()
+        );
+        assert!(recovered.pending_git_initializations().is_empty());
+        assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+
+        let recovered_again = CaptainsRegistry::load(registry_path.clone());
+        assert_eq!(recovered_again.projects(), recovered.projects());
+        assert!(recovered_again.pending_git_initializations().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn initialize_git_fault_boundaries_recover_deterministically() {
+        for (index, fault, expects_git, expects_project) in [
+            (0, "after_intent_before_git_init", false, false),
+            (1, "after_git_init_before_marker", true, false),
+            (2, "after_marker_before_project", true, true),
+            (3, "after_project_before_clear", true, true),
+            (4, "during_cleanup", true, true),
+        ] {
+            let ctx = test_ctx("initialize-git-fault");
+            let dir = std::env::temp_dir().join(format!(
+                "t-hub-initialize-git-fault-{index}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let registry_path = dir.with_extension("json");
+            std::fs::create_dir_all(&dir).unwrap();
+            let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+            let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+            set_git_init_fault(fault);
+
+            let response = dispatch(
+                &ctx,
+                "initialize_git",
+                &json!({ "rootPath": dir.to_string_lossy(), "name": "Fault Project" }),
+            );
+            clear_git_init_fault();
+            assert!(response.is_err(), "fault {fault} did not fire");
+
+            let restarted = CaptainsRegistry::load(registry_path.clone());
+            assert_eq!(dir.join(".git").is_dir(), expects_git, "fault {fault}");
+            assert_eq!(
+                restarted
+                    .projects()
+                    .iter()
+                    .any(|project| project.name == "Fault Project"),
+                expects_project,
+                "fault {fault}"
+            );
+            if fault == "after_git_init_before_marker" {
+                assert_eq!(restarted.pending_git_initializations().len(), 1);
+                assert!(
+                    restarted.pending_git_initializations()[0].phase.as_str() == "recovery_blocked"
+                );
+            } else {
+                assert!(
+                    restarted.pending_git_initializations().is_empty(),
+                    "fault {fault}"
+                );
+            }
+            let restarted_again = CaptainsRegistry::load(registry_path.clone());
+            assert_eq!(
+                restarted_again.projects(),
+                restarted.projects(),
+                "fault {fault} was not idempotent"
+            );
+            if expects_project {
+                assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+            }
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_file(registry_path);
+        }
+    }
+
+    #[test]
+    fn initialize_git_project_persistence_failure_leaves_recoverable_evidence() {
+        let ctx = test_ctx("initialize-git-project-persist-failure");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-project-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let registry_path = dir.with_extension("json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_registry = Arc::clone(&registry);
+        let hook_calls = Arc::clone(&calls);
+        registry.set_persist_hook(Box::new(move || {
+            if hook_calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                hook_registry.fail_next_persist("injected Project persistence failure");
+            }
+        }));
+        let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+
+        let response = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "rootPath": dir.to_string_lossy(), "name": "Persisted Recovery Project" }),
+        );
+        assert!(response
+            .unwrap_err()
+            .contains("injected Project persistence failure"));
+        assert!(dir.join(".git").is_dir());
+        assert!(dir.join(".git/t-hub-git-init-marker.json").is_file());
+
+        let restarted = CaptainsRegistry::load(registry_path.clone());
+        assert_eq!(restarted.projects().len(), 1);
+        assert_eq!(
+            restarted.projects()[0].vcs_capability.as_deref(),
+            Some("git")
+        );
+        assert!(restarted.pending_git_initializations().is_empty());
+        assert!(!dir.join(".git/t-hub-git-init-marker.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn initialize_git_refuses_foreign_or_tampered_git_state_without_deletion() {
+        let ctx = test_ctx("initialize-git-ownership");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-ownership-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/foreign"), "keep").unwrap();
+        let response = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "rootPath": dir.to_string_lossy(), "name": "Foreign Project" }),
+        );
+        assert!(response.unwrap_err().contains("pre-existing .git"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/foreign")).unwrap(),
+            "keep"
+        );
+        assert!(!ctx
+            .captains
+            .projects()
+            .iter()
+            .any(|project| project.name == "Foreign Project"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_git_tampered_marker_fails_closed_across_restart() {
+        let ctx = test_ctx("initialize-git-tampered-marker");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-tampered-marker-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let registry_path = dir.with_extension("json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+        set_git_init_fault("after_marker_before_project");
+        let _ = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "rootPath": dir.to_string_lossy(), "name": "Tampered Project" }),
+        );
+        clear_git_init_fault();
+
+        let marker_path = dir.join(".git/t-hub-git-init-marker.json");
+        let mut marker: GitInitMarker =
+            serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+        marker.marker_nonce = "foreign-nonce".into();
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let restarted = CaptainsRegistry::load(registry_path.clone());
+        assert!(restarted.projects().is_empty());
+        assert_eq!(restarted.pending_git_initializations().len(), 1);
+        assert_eq!(
+            restarted.pending_git_initializations()[0].phase,
+            "recovery_blocked"
+        );
+        assert!(marker_path.is_file());
+        let restarted_again = CaptainsRegistry::load(registry_path.clone());
+        assert!(restarted_again.projects().is_empty());
+        assert_eq!(restarted_again.pending_git_initializations().len(), 1);
+        assert!(marker_path.is_file());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_file(registry_path);
     }
@@ -47020,6 +47716,7 @@ mod tests {
             retired_fleet_tile_ids: vec![],
             pending_dispatch_claims: vec![],
             pending_dispatch_releases: vec![],
+            pending_git_initializations: vec![],
         })
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
