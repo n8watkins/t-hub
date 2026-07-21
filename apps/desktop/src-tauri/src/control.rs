@@ -41262,6 +41262,289 @@ mod tests {
     }
 
     #[test]
+    fn non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-non-git-captain-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let populated = base.join("populated");
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&populated).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(populated.join("README.txt"), b"non-Git fixture\n").unwrap();
+        let registry_path = base.join("captains.json");
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        for (project_id, name, root) in [
+            ("non-git-populated", "Populated non-Git", &populated),
+            ("non-git-empty", "Empty non-Git", &empty),
+        ] {
+            let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+            registry
+                .upsert_project(ProjectRecord {
+                    root_path: Some(root.clone()),
+                    vcs_capability: Some("none".into()),
+                    git_main_root: None,
+                    project_id: project_id.into(),
+                    name: name.into(),
+                    repo_root: root,
+                    remote_url: None,
+                    default_branch: None,
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "non-git-populated-tab".into(),
+                name: "Populated".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "non-git-empty-tab".into(),
+                name: "Empty".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            },
+        ]);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("non-git-captain")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 2.0)))
+            .with_apply_sink(sink);
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let mut terminal_ids = Vec::new();
+        for (project_id, ship_slug, tab_id) in [
+            (
+                "non-git-populated",
+                "non-git-populated-ship",
+                "non-git-populated-tab",
+            ),
+            ("non-git-empty", "non-git-empty-ship", "non-git-empty-tab"),
+        ] {
+            let result = dispatch(
+                &ctx,
+                "commission_captain",
+                &json!({
+                    "requestId": format!("commission-{project_id}"),
+                    "projectId": project_id,
+                    "assignment": format!("Maintain {project_id}"),
+                    "harness": "codex",
+                    "shipSlug": ship_slug,
+                    "workspaceTabIds": [tab_id],
+                    "testStartupCommand": harness_command,
+                    "testSkipPowderHealth": true,
+                }),
+            )
+            .unwrap();
+            assert_eq!(result["alreadyCommissioned"], false);
+            terminal_ids.push(
+                result["captain"]["terminalId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let checkpoint = dispatch(
+                &ctx,
+                "captain_checkpoint",
+                &json!({
+                    "shipSlug": ship_slug,
+                    "conversationId": format!("conversation-{project_id}"),
+                    "resumePoint": format!("resume-{project_id}"),
+                }),
+            )
+            .unwrap();
+            assert_eq!(checkpoint["accepted"], "captain_checkpoint");
+        }
+        assert_eq!(ctx.captains.projects().len(), 2);
+        assert_eq!(ctx.captains.snapshot().captains.len(), 2);
+        assert!(ctx.captains.snapshot().pending_fleet_operations.is_empty());
+        assert!(populated.join(".git").metadata().is_err());
+        assert!(empty.join(".git").metadata().is_err());
+
+        let restarted_registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let restarted = test_ctx("non-git-captain-restart")
+            .with_captains_registry(Arc::clone(&restarted_registry))
+            .with_tab_registry(Arc::clone(&tabs))
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 2.0)))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        for (project_id, ship_slug, terminal_id) in [
+            (
+                &"non-git-populated"[..],
+                "non-git-populated-ship",
+                &terminal_ids[0],
+            ),
+            (&"non-git-empty"[..], "non-git-empty-ship", &terminal_ids[1]),
+        ] {
+            let project = restarted
+                .captains
+                .projects()
+                .into_iter()
+                .find(|project| project.project_id == project_id)
+                .unwrap();
+            assert_eq!(project.vcs_capability.as_deref(), Some("none"));
+            assert_eq!(
+                project.root_path.as_deref(),
+                Some(project.repo_root.as_str())
+            );
+            let bootstrap = dispatch(
+                &restarted,
+                "captain_bootstrap",
+                &json!({ "captainSessionId": terminal_id }),
+            )
+            .unwrap();
+            assert_eq!(bootstrap["project"]["projectId"], project_id);
+            assert_eq!(bootstrap["project"]["vcsCapability"], "none");
+            assert_eq!(bootstrap["captain"]["shipSlug"], ship_slug);
+            assert_eq!(
+                bootstrap["captain"]["terminalId"].as_str(),
+                Some(terminal_id.as_str())
+            );
+            assert!(bootstrap["instructions"]
+                .as_str()
+                .unwrap()
+                .contains(project_id));
+        }
+        for (project_id, ship_slug, tab_id) in [
+            (
+                "non-git-populated",
+                "non-git-populated-ship",
+                "non-git-populated-tab",
+            ),
+            ("non-git-empty", "non-git-empty-ship", "non-git-empty-tab"),
+        ] {
+            let retry = dispatch(
+                &restarted,
+                "commission_captain",
+                &json!({
+                    "requestId": format!("retry-{project_id}"),
+                    "projectId": project_id,
+                    "assignment": format!("Maintain {project_id}"),
+                    "harness": "codex",
+                    "shipSlug": ship_slug,
+                    "workspaceTabIds": [tab_id],
+                    "testStartupCommand": harness_command,
+                    "testSkipPowderHealth": true,
+                }),
+            )
+            .unwrap();
+            assert_eq!(retry["alreadyCommissioned"], true);
+        }
+        assert_eq!(restarted.captains.projects().len(), 2);
+        assert_eq!(restarted.captains.snapshot().captains.len(), 2);
+        assert!(populated.join(".git").metadata().is_err());
+        assert!(empty.join(".git").metadata().is_err());
+        for terminal_id in terminal_ids {
+            let _ = dispatch(
+                &restarted,
+                "close_terminal",
+                &json!({ "sessionId": terminal_id }),
+            );
+        }
+        std::fs::remove_dir_all(&harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn non_git_captain_commission_persistence_failure_preserves_project_and_cleans_exactly() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-non-git-captain-failure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"non-Git\n").unwrap();
+        let registry_path = base.join("captains.json");
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        registry
+            .upsert_project(ProjectRecord {
+                root_path: Some(root.clone()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "non-git-failure".into(),
+                name: "Non-Git failure".into(),
+                repo_root: root.clone(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let tabs = Arc::new(TabRegistry::new());
+        tabs.replace(vec![
+            TabRecord {
+                id: "non-git-failure-tab".into(),
+                name: "Non-Git failure".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            },
+        ]);
+        let ctx = test_ctx("non-git-captain-failure")
+            .with_captains_registry(Arc::clone(&registry))
+            .with_tab_registry(tabs)
+            .with_governor(Arc::new(SpawnGovernor::new(128, 20.0, 2.0)))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let error = dispatch(
+            &ctx,
+            "commission_captain",
+            &json!({
+                "projectId": "non-git-failure",
+                "assignment": "Recover safely",
+                "harness": "codex",
+                "shipSlug": "non-git-failure-ship",
+                "workspaceTabIds": ["non-git-failure-tab"],
+                "testStartupCommand": harness_command,
+                "testSkipPowderHealth": true,
+                "testFailCommitPersist": true
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("commission binding persistence failure"),
+            "got: {error}"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains.is_empty());
+        assert!(snapshot.pending_fleet_operations.is_empty());
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.projects[0].vcs_capability.as_deref(), Some("none"));
+        assert!(std::path::Path::new(&root).join(".git").metadata().is_err());
+        let restarted = CaptainsRegistry::load(registry_path);
+        assert_eq!(restarted.projects().len(), 1);
+        assert_eq!(restarted.snapshot().captains.len(), 0);
+        assert_eq!(
+            restarted.projects()[0].vcs_capability.as_deref(),
+            Some("none")
+        );
+        assert!(std::path::Path::new(&root).join(".git").metadata().is_err());
+        std::fs::remove_dir_all(&harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn commission_binding_failure_never_projects_a_ghost_captain_or_placement() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let path = captains_tmp("commission-projection-rollback");
