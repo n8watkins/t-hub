@@ -1749,40 +1749,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_rebind_preserves_native_error_details_after_fresh_endpoint_response() {
-        let (fresh_addr, _captured) = scripted_server(vec![Some(
-            r#"{"ok":false,"error":"Git capability is required for delivery","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"delivery","capability":"git","action":"initialize_git"},"retryable":false}"#,
-        )]);
-        let dir = std::env::temp_dir().join(format!("th-mcp-error-restart-{}", epoch_ms()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("control.json");
-        std::fs::write(
-            &file,
-            format!(r#"{{"addr":"{fresh_addr}","token":"READ","pid":2}}"#),
-        )
-        .unwrap();
-        let discovery = Discovery {
-            addr: Some("127.0.0.1:9".into()),
-            token: Some("STALE".into()),
-            file: Some(file.clone()),
-            ..Default::default()
-        };
-
-        let error = resolve_and_call_with_deadline(
-            &discovery,
-            "delivery",
-            &Value::Null,
-            Duration::from_secs(1),
-            Duration::from_millis(100),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.kind.as_deref(), Some("git_required"));
-        assert_eq!(error.details.as_ref().unwrap()["operation"], "delivery");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn auth_recovery_preserves_native_error_details_from_reauthenticated_endpoint() {
         let (addr, _captured) = scripted_server(vec![
             Some(r#"{"ok":false,"error":"unauthorized: bad control token"}"#),
@@ -2435,6 +2401,55 @@ mod tests {
         assert_eq!(healed_requests.lock().unwrap()[0]["command"], "list_tabs");
         assert!(started.elapsed() >= Duration::from_millis(140));
         assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn bridge_rebind_preserves_native_error_details() {
+        *wedge_detector() = WedgeDetector::default();
+        let (healed_addr, _requests) = scripted_server(vec![Some(
+            r#"{"ok":false,"error":"Git capability is required for baseline","errorKind":"git_required","errorDetails":{"code":"git_required","operation":"baseline","capability":"git","action":"initialize_git"},"retryable":false}"#,
+        )]);
+        TEST_BRIDGE_RESULT.with(|slot| {
+            *slot.borrow_mut() = Some(ControlEndpoint {
+                addr: healed_addr,
+                token: "control".into(),
+            });
+        });
+        let discovery = Discovery {
+            addr: Some("127.0.0.1:9".into()),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let stale = ControlEndpoint {
+            addr: "127.0.0.1:9".into(),
+            token: "control".into(),
+        };
+        let error = maybe_heal_and_retry(
+            &discovery,
+            "baseline",
+            &Value::Null,
+            stale,
+            ControlCallError::from_message("control_timeout: stale endpoint".into()),
+            true,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(1),
+                attempt_timeout: Duration::from_millis(100),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind.as_deref(), Some("git_required"));
+        assert_eq!(
+            error.details.as_ref().unwrap(),
+            &json!({
+                "code": "git_required",
+                "operation": "baseline",
+                "capability": "git",
+                "action": "initialize_git"
+            })
+        );
+        assert!(!error.retryable);
     }
 
     #[test]
