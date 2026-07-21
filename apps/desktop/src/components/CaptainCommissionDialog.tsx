@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { ShipWheel, X } from "lucide-react";
 import {
   commissionCaptain,
@@ -6,7 +6,7 @@ import {
   registerProject,
   type RegisteredProject,
 } from "../ipc/projects";
-import { WslFolderPicker } from "./WslFolderPicker";
+import { WslFolderPicker, type WslFolderSelection } from "./WslFolderPicker";
 
 interface CaptainCommissionDialogProps {
   open: boolean;
@@ -31,6 +31,7 @@ export function CaptainCommissionDialog({
   const [newParent, setNewParent] = useState("");
   const [newDisplayName, setNewDisplayName] = useState("");
   const [newDestinationLeaf, setNewDestinationLeaf] = useState("");
+  const [folderSelection, setFolderSelection] = useState<WslFolderSelection | null>(null);
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -64,6 +65,10 @@ export function CaptainCommissionDialog({
     () => projects.find((project) => project.projectId === projectId),
     [projectId, projects],
   );
+
+  const handleFolderMetadataChange = useCallback((selection: WslFolderSelection) => {
+    setFolderSelection(selection);
+  }, []);
 
   if (!open) return null;
 
@@ -226,6 +231,7 @@ export function CaptainCommissionDialog({
                       path: project.rootPath ?? project.repoRoot,
                     }))}
                   onPathChange={setRepoRoot}
+                  onFolderMetadataChange={handleFolderMetadataChange}
                 />
                 {wslHomeError && (
                   <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
@@ -330,6 +336,7 @@ export function CaptainCommissionDialog({
           <ReviewSummary
             mode={mode}
             selected={selected}
+            folderSelection={folderSelection}
             repoRoot={repoRoot}
             assignment={assignment}
             harness={harness}
@@ -391,6 +398,7 @@ export function validateNewCodebaseDestination(parent: string, name: string): st
 function ReviewSummary({
   mode,
   selected,
+  folderSelection,
   repoRoot,
   assignment,
   harness,
@@ -399,6 +407,7 @@ function ReviewSummary({
 }: {
   mode: ProjectMode;
   selected?: RegisteredProject;
+  folderSelection: WslFolderSelection | null;
   repoRoot: string;
   assignment: string;
   harness: "codex" | "claude";
@@ -432,6 +441,11 @@ function ReviewSummary({
       <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <ReviewRow label="Source" value={source} />
         <ReviewRow label="Codebase" value={location} />
+        {mode === "existing" && (
+          <VersionControlSummary
+            selection={folderSelection?.path === repoRoot.trim() ? folderSelection : null}
+          />
+        )}
         {mode === "new" && (
           <>
             <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
@@ -443,6 +457,27 @@ function ReviewSummary({
         <ReviewRow label="Permissions" value="Unrestricted" />
       </dl>
     </section>
+  );
+}
+
+function VersionControlSummary({ selection }: { selection: WslFolderSelection | null }) {
+  if (!selection || selection.status === "loading") {
+    return <ReviewRow label="Version control" value="Checking..." />;
+  }
+  if (selection.status === "error") {
+    return <ReviewRow label="Version control" value={`Unavailable: ${selection.error ?? "unknown error"}`} />;
+  }
+  if (!selection.git?.isRepo) {
+    return <ReviewRow label="Version control" value="None" />;
+  }
+  return (
+    <>
+      <ReviewRow label="Version control" value="Git" />
+      <ReviewRow label="Remote" value={selection.git.remoteUrl || "None configured"} />
+      <ReviewRow label="Default branch" value={selection.git.defaultBranch || "Unknown"} />
+      <ReviewRow label="HEAD" value={selection.git.headCommit || "Unknown"} />
+      <ReviewRow label="Worktrees" value={String(selection.worktreeCount ?? 0)} />
+    </>
   );
 }
 

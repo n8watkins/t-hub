@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { listDir } from "../ipc/files";
+import { gitInfo, gitWorktreeList, type GitInfo } from "../ipc/git";
 import type { DirEntry } from "../ipc/types";
 import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
 
@@ -11,6 +12,15 @@ interface WslFolderPickerProps {
   home?: string;
   recentPaths: Array<{ label: string; path: string }>;
   onPathChange: (path: string) => void;
+  onFolderMetadataChange?: (selection: WslFolderSelection) => void;
+}
+
+export interface WslFolderSelection {
+  path: string;
+  status: "loading" | "ready" | "error";
+  git: GitInfo | null;
+  worktreeCount: number | null;
+  error?: string;
 }
 
 type ListingState =
@@ -26,6 +36,7 @@ export function WslFolderPicker({
   home,
   recentPaths,
   onPathChange,
+  onFolderMetadataChange,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -57,6 +68,12 @@ export function WslFolderPicker({
       priorKind ? { kind: "stale", prior: priorKind } : { kind: "loading" },
     );
     setError(null);
+    onFolderMetadataChange?.({
+      path,
+      status: "loading",
+      git: null,
+      worktreeCount: null,
+    });
     listDir(path)
       .then((nextEntries) => {
         if (cancelled || generation !== requestGeneration.current) return;
@@ -73,11 +90,32 @@ export function WslFolderPicker({
       .finally(() => {
         // The explicit listing state prevents an error from being rendered as
         // the successful empty-folder state.
+    });
+    void gitInfo(path)
+      .then(async (git) => {
+        if (!git.isRepo) return { git, worktreeCount: 0 };
+        const worktrees = await gitWorktreeList(path);
+        return { git, worktreeCount: worktrees.length };
+      })
+      .then(({ git, worktreeCount }) => {
+        if (cancelled || generation !== requestGeneration.current) return;
+        onFolderMetadataChange?.({ path, status: "ready", git, worktreeCount });
+      })
+      .catch((cause) => {
+        if (cancelled || generation !== requestGeneration.current) return;
+        const message = cause instanceof Error ? cause.message : String(cause);
+        onFolderMetadataChange?.({
+          path,
+          status: "error",
+          git: null,
+          worktreeCount: null,
+          error: message,
+        });
       });
     return () => {
       cancelled = true;
     };
-  }, [path]);
+  }, [onFolderMetadataChange, path]);
 
   const navigate = (nextPath: string) => {
     const generation = ++navigationGeneration.current;

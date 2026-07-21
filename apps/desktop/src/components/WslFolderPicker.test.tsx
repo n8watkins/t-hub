@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { listDir } from "../ipc/files";
+import { gitInfo, gitWorktreeList } from "../ipc/git";
 import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
 import {
   normalizePosixPath,
@@ -11,6 +12,7 @@ import {
 } from "./WslFolderPicker";
 
 vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
+vi.mock("../ipc/git", () => ({ gitInfo: vi.fn(), gitWorktreeList: vi.fn() }));
 vi.mock("../ipc/wslFolderDialog", () => ({
   normalizeWslPath: vi.fn(),
   pickWslFolder: vi.fn(),
@@ -19,6 +21,17 @@ vi.mock("../ipc/wslFolderDialog", () => ({
 describe("WslFolderPicker", () => {
   beforeEach(() => {
     vi.mocked(listDir).mockReset();
+    vi.mocked(gitInfo).mockReset().mockResolvedValue({
+      isRepo: false,
+      branch: null,
+      worktreeRoot: null,
+      isLinkedWorktree: false,
+      dirtyCount: 0,
+      headCommit: null,
+      remoteUrl: null,
+      defaultBranch: null,
+    });
+    vi.mocked(gitWorktreeList).mockReset().mockResolvedValue([]);
     vi.mocked(listDir).mockResolvedValue([
       {
         name: "project",
@@ -143,6 +156,155 @@ describe("WslFolderPicker", () => {
     resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
     expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
     expect(screen.queryByText(/old permission failure/)).toBeNull();
+  });
+
+  it("reports Git metadata and enumerates worktrees exactly once for a Git folder", async () => {
+    vi.mocked(gitInfo).mockResolvedValueOnce({
+      isRepo: true,
+      branch: "main",
+      worktreeRoot: "/home/me",
+      isLinkedWorktree: false,
+      dirtyCount: 0,
+      headCommit: "abc123",
+      remoteUrl: "https://example.test/repo.git",
+      defaultBranch: "main",
+    });
+    vi.mocked(gitWorktreeList).mockResolvedValueOnce([
+      { path: "/home/me", branch: "main", isLinked: false },
+      { path: "/home/me-linked", branch: "feature", isLinked: true },
+    ]);
+    const onFolderMetadataChange = vi.fn();
+    render(
+      <WslFolderPicker
+        path="/home/me"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith({
+      path: "/home/me",
+      status: "ready",
+      git: expect.objectContaining({ isRepo: true, headCommit: "abc123" }),
+      worktreeCount: 2,
+    }));
+    expect(gitInfo).toHaveBeenCalledTimes(1);
+    expect(gitWorktreeList).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports non-Git capability without enumerating worktrees", async () => {
+    const onFolderMetadataChange = vi.fn();
+    render(
+      <WslFolderPicker
+        path="/home/empty"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith({
+      path: "/home/empty",
+      status: "ready",
+      git: expect.objectContaining({ isRepo: false }),
+      worktreeCount: 0,
+    }));
+    expect(gitWorktreeList).not.toHaveBeenCalled();
+  });
+
+  it("ignores stale Git metadata after a newer folder selection", async () => {
+    let resolveOld!: (info: never) => void;
+    let resolveNew!: (info: never) => void;
+    vi.mocked(gitInfo)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const onFolderMetadataChange = vi.fn();
+    const view = render(
+      <WslFolderPicker
+        path="/home/old"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    view.rerender(
+      <WslFolderPicker
+        path="/home/new"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    resolveNew({
+      isRepo: false,
+      branch: null,
+      worktreeRoot: null,
+      isLinkedWorktree: false,
+      dirtyCount: 0,
+      headCommit: null,
+      remoteUrl: null,
+      defaultBranch: null,
+    } as never);
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      path: "/home/new",
+      status: "ready",
+      worktreeCount: 0,
+    })));
+    resolveOld({ isRepo: true } as never);
+    await Promise.resolve();
+    expect(onFolderMetadataChange).not.toHaveBeenLastCalledWith(expect.objectContaining({ path: "/home/old" }));
+    expect(gitWorktreeList).not.toHaveBeenCalled();
+  });
+
+  it("keeps the newer Git metadata when an older Git response arrives later", async () => {
+    let resolveOld!: (info: never) => void;
+    let resolveNew!: (info: never) => void;
+    vi.mocked(gitInfo)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    vi.mocked(gitWorktreeList).mockResolvedValueOnce([
+      { path: "/home/new", branch: "main", isLinked: false },
+    ]);
+    const onFolderMetadataChange = vi.fn();
+    const view = render(
+      <WslFolderPicker
+        path="/home/old"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    view.rerender(
+      <WslFolderPicker
+        path="/home/new"
+        recentPaths={[]}
+        onPathChange={vi.fn()}
+        onFolderMetadataChange={onFolderMetadataChange}
+      />,
+    );
+    const gitSelection = {
+      isRepo: true,
+      branch: "main",
+      worktreeRoot: "/home/new",
+      isLinkedWorktree: false,
+      dirtyCount: 0,
+      headCommit: "new-head",
+      remoteUrl: "https://example.test/new.git",
+      defaultBranch: "main",
+    };
+    resolveNew(gitSelection as never);
+    await waitFor(() => expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      path: "/home/new",
+      status: "ready",
+      worktreeCount: 1,
+    })));
+    resolveOld({ isRepo: true, headCommit: "old-head" } as never);
+    await Promise.resolve();
+    expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      path: "/home/new",
+      status: "ready",
+      worktreeCount: 1,
+    }));
+    expect(gitWorktreeList).toHaveBeenCalledTimes(1);
   });
 
   it("ignores an older normalization success after a newer success", async () => {
