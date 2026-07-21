@@ -211,6 +211,11 @@ mkdir "$MIGRATION_WRAPPER_DIR"
 mkdir -m 700 "$MIGRATION_STATE_DIR"
 cat > "$MIGRATION_WRAPPER_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = get ] && [ "${3:-}" = t-hub ] \
+  && [ "${4:-}" = --json ]; then
+  "$REAL_CODEX" "$@" | jq '.transport.env = {}'
+  exit "${PIPESTATUS[0]}"
+fi
 if [ "${1:-}" = mcp ] && { [ "${2:-}" = add ] || [ "${2:-}" = remove ]; }; then
   exit 97
 fi
@@ -221,7 +226,7 @@ if PATH="$MIGRATION_WRAPPER_DIR:$PATH" REAL_CODEX="$REAL_CODEX" \
   T_HUB_INSTALL_STATE_DIR="$MIGRATION_STATE_DIR" \
   T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
   && cmp -s "$LEGACY_EXPECTED" "$WORK/config.toml"; then
-  pass "explicit migration changes only env_vars without Codex add/remove"
+  pass "explicit migration accepts JSON empty-object env and changes only env_vars"
 else
   fail "explicit migration changed unrelated TOML or invoked Codex add/remove"
 fi
@@ -264,7 +269,8 @@ else
 fi
 if codex mcp get t-hub --json | jq -e --argjson expected "$EXPECTED_ENV_VARS" '
   .transport.env_vars == $expected and
-  .transport.env == {} and .transport.args == [] and .transport.cwd == null
+  (.transport.env == null or .transport.env == {}) and
+  .transport.args == [] and .transport.cwd == null
 ' >/dev/null; then
   pass "explicit legacy migration has the canonical JSON transport"
 else
@@ -283,6 +289,59 @@ if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/
 else
   fail "explicit migration rerun changed config.toml"
 fi
+
+NULL_LEGACY="$WORK/config.null-legacy.toml"
+NULL_LEGACY_EXPECTED="$WORK/config.null-legacy-expected.toml"
+cp -p "$LEGACY_SNAP" "$NULL_LEGACY"
+sed -i '/^env = {}$/d' "$NULL_LEGACY"
+cp -p "$NULL_LEGACY" "$NULL_LEGACY_EXPECTED"
+sed -i 's/env_vars = \["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"\]/env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]/' "$NULL_LEGACY_EXPECTED"
+cp -p "$NULL_LEGACY" "$WORK/config.toml"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  && cmp -s "$NULL_LEGACY_EXPECTED" "$WORK/config.toml" \
+  && codex mcp get t-hub --json | jq -e '.transport.env == null' >/dev/null; then
+  pass "legacy migration accepts JSON null as canonical empty environment"
+else
+  fail "legacy migration refused or changed the JSON-null empty environment"
+fi
+
+cp -p "$LEGACY_SNAP" "$WORK/config.toml"
+sed -i 's/^env = {}$/env = { INJECTED = "value" }/' "$WORK/config.toml"
+NONEMPTY_ENV_SNAP="$WORK/config.nonempty-env-snapshot.toml"
+cp -p "$WORK/config.toml" "$NONEMPTY_ENV_SNAP"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  || ! cmp -s "$NONEMPTY_ENV_SNAP" "$WORK/config.toml"; then
+  fail "legacy migration accepted or changed a nonempty environment"
+else
+  pass "legacy migration refuses a nonempty environment byte-for-byte"
+fi
+
+WRONG_ENV_WRAPPER_DIR="$WORK/wrong-env-wrapper-bin"
+mkdir "$WRONG_ENV_WRAPPER_DIR"
+cat > "$WRONG_ENV_WRAPPER_DIR/codex" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = get ] && [ "${3:-}" = t-hub ] \
+  && [ "${4:-}" = --json ]; then
+  "$REAL_CODEX" "$@" | jq '.transport.env = "wrong-type"'
+  exit "${PIPESTATUS[0]}"
+fi
+if [ "${1:-}" = mcp ] && { [ "${2:-}" = add ] || [ "${2:-}" = remove ]; }; then
+  exit 97
+fi
+exec "$REAL_CODEX" "$@"
+EOF
+chmod 700 "$WRONG_ENV_WRAPPER_DIR/codex"
+cp -p "$LEGACY_SNAP" "$WORK/config.toml"
+WRONG_ENV_SNAP="$WORK/config.wrong-env-snapshot.toml"
+cp -p "$WORK/config.toml" "$WRONG_ENV_SNAP"
+if PATH="$WRONG_ENV_WRAPPER_DIR:$PATH" REAL_CODEX="$REAL_CODEX" \
+  T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  || ! cmp -s "$WRONG_ENV_SNAP" "$WORK/config.toml"; then
+  fail "legacy migration accepted or changed a wrong-type environment"
+else
+  pass "legacy migration refuses a wrong-type environment byte-for-byte"
+fi
+
 cp -p "$LEGACY_SNAP" "$WORK/config.toml"
 sed -i "\|^command = \"$FAKE_BIN\"$|a required = true" "$WORK/config.toml"
 UNKNOWN_POLICY_SNAP="$WORK/config.unknown-policy-snapshot.toml"
