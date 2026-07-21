@@ -96,6 +96,13 @@ def publish(path: str, value: str) -> None:
         raise
 
 
+def discard(path: str) -> None:
+    path = os.path.abspath(path)
+    require_regular(path)
+    os.unlink(path)
+    fsync_directory(os.path.dirname(path))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -106,12 +113,16 @@ def main() -> int:
     publish_parser = subparsers.add_parser("publish")
     publish_parser.add_argument("--path", required=True)
     publish_parser.add_argument("--value", required=True)
+    discard_parser = subparsers.add_parser("discard")
+    discard_parser.add_argument("--path", required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "exchange":
             exchange(arguments.target, arguments.candidate, arguments.expected_sha)
-        else:
+        elif arguments.command == "publish":
             publish(arguments.path, arguments.value)
+        else:
+            discard(arguments.path)
     except (OSError, RuntimeError) as error:
         print(f"atomic-config: {error}", file=sys.stderr)
         return 1

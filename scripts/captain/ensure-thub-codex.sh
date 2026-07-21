@@ -38,6 +38,7 @@ fi
 
 BIN_DIR="${T_HUB_BIN_DIR:-${HOME}/.t-hub/bin}"
 BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
+ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$(cd "$(dirname "$0")" && pwd)/atomic-config.py}"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "ensure-thub-codex: codex not on PATH - install codex-cli first" >&2
@@ -75,6 +76,11 @@ BACKUP=""
 HAD_CONFIG=false
 EXPECTED_HASH=absent
 config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+publish_committed_state() {
+  if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
+  state="$(jq -cn --arg hash "$(config_hash)" '{presence:"present", hash:$hash}')"
+  python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/codex-state.json" --value "$state"
+}
 refresh_expected_hash() {
   if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
 }
@@ -96,7 +102,11 @@ rollback() {
     return
   fi
   if "$HAD_CONFIG"; then
-    cp -p "$BACKUP" "$CONFIG"
+    if ! python3 "$ATOMIC_HELPER" exchange --target "$CONFIG" --candidate "$BACKUP" \
+      --expected-sha "$EXPECTED_HASH"; then
+      echo "ensure-thub-codex: durable atomic rollback failed" >&2
+      return
+    fi
   else
     rm -f "$CONFIG"
   fi
@@ -171,6 +181,7 @@ if "$CANONICAL_TRANSPORT" && printf '%s' "$CURRENT" | jq -e '
   .enabled == true and .disabled_reason == null
 ' >/dev/null; then
   echo "ensure-thub-codex: t-hub already points at $BIN with capability pass-through; existing policy preserved"
+  publish_committed_state
   exit 0
 fi
 if "$CANONICAL_TRANSPORT"; then
@@ -216,13 +227,13 @@ migrate_legacy_registration() {
   } > "$update"
   chmod --reference="$CONFIG" "$update"
 
-  current_hash="$(config_hash)"
-  if [ "$current_hash" != "$source_hash" ]; then
+  if ! python3 "$ATOMIC_HELPER" exchange --target "$CONFIG" --candidate "$update" \
+    --expected-sha "$source_hash"; then
     rm -f "$update"
     echo "ensure-thub-codex: config changed concurrently; refusing replacement" >&2
     return 1
   fi
-  mv -f "$update" "$CONFIG"
+  python3 "$ATOMIC_HELPER" discard --path "$update"
   refresh_expected_hash
 
   verified="$(codex mcp get t-hub --json 2>/dev/null || true)"
@@ -261,6 +272,7 @@ if "$MIGRATE_LEGACY"; then
   if ! migrate_legacy_registration; then
     exit 1
   fi
+  publish_committed_state
   commit_config_transaction
   echo "ensure-thub-codex: migrated legacy t-hub capability pass-through ($BIN)"
   exit 0
@@ -422,6 +434,7 @@ else
   fi
 fi
 
+publish_committed_state
 commit_config_transaction
 if "$LEGACY_MATCH"; then
   echo "ensure-thub-codex: migrated t-hub capability pass-through ($BIN)"

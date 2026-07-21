@@ -155,6 +155,14 @@ if HOME="$MIGRATION_HOME" CODEX_HOME="$MIGRATION_CODEX_HOME" \
 else
   fail "installer did not compose or isolate legacy migration"
 fi
+if HOME="$MIGRATION_HOME" CODEX_HOME="$MIGRATION_CODEX_HOME" \
+  CLAUDE_HOME="$MIGRATION_CLAUDE_HOME" T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$MIGRATION_BIN_DIR" T_HUB_CAPTAIN_DIR="$MIGRATION_CAPTAIN_DIR" \
+  bash "$SCRIPT" --migrate-legacy-registration --repair-skills >/dev/null 2>&1; then
+  pass "installer accepts reverse migration and repair flag order"
+else
+  fail "installer rejected reverse migration and repair flag order"
+fi
 
 chmod 600 "$CODEX_HOME/skills/captain/scripts/check_environment.sh"
 if T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
@@ -247,6 +255,63 @@ if CODEX_HOME="$CONFLICT_CODEX_HOME" codex mcp get t-hub >/dev/null 2>&1; then
   fail "conflict registered an MCP server"
 else
   pass "conflict leaves Codex registration absent"
+fi
+
+ADOPTION_WORK="$WORK/adoption-races"
+mkdir -p "$ADOPTION_WORK/wrapper-bin"
+REAL_ATOMIC="$HERE/atomic-config.py"
+cat > "$ADOPTION_WORK/wrapper-bin/atomic-config" <<'EOF'
+#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+result = subprocess.run([sys.executable, os.environ["REAL_ATOMIC"], *sys.argv[1:]])
+if result.returncode:
+    raise SystemExit(result.returncode)
+if sys.argv[1] == "publish" and pathlib.Path(sys.argv[3]).name == f'{os.environ["RACE_KIND"]}-state.json':
+    config = pathlib.Path(os.environ["RACE_CONFIG"])
+    if os.environ["RACE_KIND"] == "claude":
+        value = json.loads(config.read_text())
+        value["mcpServers"]["t-hub"]["command"] = "/concurrent-owner"
+        config.write_text(json.dumps(value) + "\n")
+    else:
+        with config.open("a") as output:
+            output.write("# concurrent-codex-owner\n")
+EOF
+chmod 700 "$ADOPTION_WORK/wrapper-bin/atomic-config"
+
+CLAUDE_RACE="$ADOPTION_WORK/claude"
+mkdir -p "$CLAUDE_RACE/home" "$CLAUDE_RACE/codex" "$CLAUDE_RACE/claude" "$CLAUDE_RACE/bin" "$CLAUDE_RACE/captain"
+printf '{"mcpServers":{"t-hub":{"type":"stdio","command":"/prior","args":[],"env":{}}}}\n' > "$CLAUDE_RACE/home/.claude.json"
+if HOME="$CLAUDE_RACE/home" CODEX_HOME="$CLAUDE_RACE/codex" CLAUDE_HOME="$CLAUDE_RACE/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CLAUDE_RACE/bin" T_HUB_CAPTAIN_DIR="$CLAUDE_RACE/captain" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$ADOPTION_WORK/wrapper-bin/atomic-config" REAL_ATOMIC="$REAL_ATOMIC" \
+  RACE_KIND=claude RACE_CONFIG="$CLAUDE_RACE/home/.claude.json" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "Claude post-helper ownership race unexpectedly succeeded"
+elif jq -e '.mcpServers["t-hub"].command == "/concurrent-owner"' "$CLAUDE_RACE/home/.claude.json" >/dev/null; then
+  pass "Claude adoption mismatch preserves the concurrent t-hub owner"
+else
+  fail "Claude adoption mismatch overwrote the concurrent t-hub owner"
+fi
+
+CODEX_RACE="$ADOPTION_WORK/codex-race"
+mkdir -p "$CODEX_RACE/home" "$CODEX_RACE/codex" "$CODEX_RACE/claude" "$CODEX_RACE/bin" "$CODEX_RACE/captain"
+cat > "$CODEX_RACE/codex/config.toml" <<EOF
+[mcp_servers.t-hub]
+command = "$CODEX_RACE/bin/t-hub-mcp"
+args = []
+env = {}
+env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]
+EOF
+if HOME="$CODEX_RACE/home" CODEX_HOME="$CODEX_RACE/codex" CLAUDE_HOME="$CODEX_RACE/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CODEX_RACE/bin" T_HUB_CAPTAIN_DIR="$CODEX_RACE/captain" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$ADOPTION_WORK/wrapper-bin/atomic-config" REAL_ATOMIC="$REAL_ATOMIC" \
+  RACE_KIND=codex RACE_CONFIG="$CODEX_RACE/codex/config.toml" \
+  bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1; then
+  fail "Codex post-helper ownership race unexpectedly succeeded"
+elif grep -Fq 'env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]' "$CODEX_RACE/codex/config.toml" \
+  && grep -Fq '# concurrent-codex-owner' "$CODEX_RACE/codex/config.toml"; then
+  pass "Codex adoption mismatch preserves the concurrent unrelated edit"
+else
+  fail "Codex adoption mismatch overwrote the concurrent edit"
 fi
 
 ROLLBACK_WORK="$WORK/rollback"

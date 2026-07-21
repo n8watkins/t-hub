@@ -65,9 +65,13 @@ TXN="$(mktemp -d "$BIN_DIR/.t-hub-install.XXXXXX")"
 STAGED_BIN="$TXN/t-hub-mcp"
 STAGED_CODEX="$TXN/ensure-thub-codex.sh"
 STAGED_CLAUDE="$TXN/ensure-thub-claude.sh"
+STAGED_ATOMIC="$TXN/atomic-config.py"
+STATE_DIR="$TXN/helper-state"
+install -d -m 700 "$STATE_DIR"
 install -m 700 "$SOURCE" "$STAGED_BIN"
 install -m 700 "$HERE/ensure-thub-codex.sh" "$STAGED_CODEX"
 install -m 700 "$HERE/ensure-thub-claude.sh" "$STAGED_CLAUDE"
+install -m 700 "$HERE/atomic-config.py" "$STAGED_ATOMIC"
 "$STAGED_BIN" --list-tools >/dev/null
 
 backup_file() {
@@ -98,16 +102,32 @@ claude_node() {
     printf 'null\n'
   fi
 }
+claude_structure() {
+  if [ -f "$1" ]; then
+    jq -Sc '{parent_present:has("mcpServers"),key_present:(.mcpServers|has("t-hub")),value:.mcpServers["t-hub"]}' "$1"
+  else
+    printf '{"parent_present":false,"key_present":false,"value":null}\n'
+  fi
+}
 restore_config() {
   local target="$1" name="$2" expected_name="$3"
-  local expected current
+  local expected candidate
   expected="$(cat "$TXN/$expected_name")"
-  current="$(file_state "$target")"
-  if [ "$current" != "$expected" ]; then
+  if [ "$(cat "$TXN/$name.state")" = present ]; then
+    candidate="$(mktemp "${target}.t-hub-rollback.XXXXXX")"
+    cp -p "$TXN/$name" "$candidate"
+    if ! python3 "$CAPTAIN_DIR/atomic-config.py" exchange --target "$target" \
+      --candidate "$candidate" --expected-sha "$expected"; then
+      echo "install-thub-codex: $target changed concurrently; refusing unsafe rollback" >&2
+      rm -f "$candidate"
+      return
+    fi
+    rm -f "$candidate"
+  elif [ "$(file_state "$target")" = "$expected" ]; then
+    rm -f "$target"
+  else
     echo "install-thub-codex: $target changed concurrently; refusing unsafe rollback" >&2
-    return
   fi
-  restore_file "$target" "$name"
 }
 restore_claude_registration() {
   if [ "$(cat "$TXN/claude-node-changed")" != true ]; then return; fi
@@ -132,35 +152,42 @@ restore_claude_registration() {
     jq --argjson before "$before_node" '.mcpServers["t-hub"] = $before' \
       "$CLAUDE_CONFIG" > "$update"
   fi
-  current_hash="$(file_state "$CLAUDE_CONFIG")"
-  if [ "$current_hash" != "$source_hash" ]; then
+  remove_restored_config=false
+  if [ "$(cat "$TXN/previous-claude-config.state")" = absent ] \
+    && jq -e 'keys == []' "$update" >/dev/null; then
+    remove_restored_config=true
+  fi
+  if ! python3 "$CAPTAIN_DIR/atomic-config.py" exchange --target "$CLAUDE_CONFIG" \
+    --candidate "$update" --expected-sha "$source_hash"; then
     echo "install-thub-codex: Claude config changed during rollback; preserving latest file" >&2
     rm -f "$update"
     return
   fi
-  if [ "$(cat "$TXN/previous-claude-config.state")" = absent ] \
-    && jq -e 'keys == []' "$update" >/dev/null; then
-    rm -f "$CLAUDE_CONFIG" "$update"
+  if "$remove_restored_config"; then
+    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$CLAUDE_CONFIG"
+    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$update"
   else
-    chmod --reference="$CLAUDE_CONFIG" "$update"
-    mv -f "$update" "$CLAUDE_CONFIG"
+    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$update"
   fi
 }
 
 backup_file "$DEST" previous-bin
 backup_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
 backup_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
+backup_file "$CAPTAIN_DIR/atomic-config.py" previous-atomic
 backup_file "$CODEX_CONFIG" previous-codex-config
 backup_file "$CLAUDE_CONFIG" previous-claude-config
 file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
 claude_node "$CLAUDE_CONFIG" > "$TXN/before-claude-node"
 printf 'false\n' > "$TXN/claude-node-changed"
 rollback() {
+  set +e
   restore_file "$DEST" previous-bin
-  restore_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
-  restore_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
   restore_config "$CODEX_CONFIG" previous-codex-config expected-codex-config
   restore_claude_registration
+  restore_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
+  restore_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
+  restore_file "$CAPTAIN_DIR/atomic-config.py" previous-atomic
   rm -rf "$TXN"
 }
 trap rollback EXIT
@@ -168,12 +195,29 @@ trap rollback EXIT
 install -m 700 "$STAGED_BIN" "$DEST"
 install -m 700 "$STAGED_CODEX" "$CAPTAIN_DIR/ensure-thub-codex.sh"
 install -m 700 "$STAGED_CLAUDE" "$CAPTAIN_DIR/ensure-thub-claude.sh"
-T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-claude.sh"
+install -m 700 "$STAGED_ATOMIC" "$CAPTAIN_DIR/atomic-config.py"
+CHILD_ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$CAPTAIN_DIR/atomic-config.py}"
+T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$CHILD_ATOMIC_HELPER" "$CAPTAIN_DIR/ensure-thub-claude.sh"
+if [ ! -f "$STATE_DIR/claude-state.json" ] || ! jq -e --arg hash "$(file_state "$CLAUDE_CONFIG")" \
+  --argjson structure "$(claude_structure "$CLAUDE_CONFIG")" \
+  '.presence == "present" and .hash == $hash and .structure == $structure' \
+  "$STATE_DIR/claude-state.json" >/dev/null; then
+  echo "install-thub-codex: Claude helper poststate changed before adoption" >&2
+  exit 1
+fi
 claude_node "$CLAUDE_CONFIG" > "$TXN/post-claude-node"
 if ! cmp -s "$TXN/before-claude-node" "$TXN/post-claude-node"; then
   printf 'true\n' > "$TXN/claude-node-changed"
 fi
-T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-codex.sh" "${CODEX_ARGS[@]}"
+T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$CHILD_ATOMIC_HELPER" \
+  "$CAPTAIN_DIR/ensure-thub-codex.sh" "${CODEX_ARGS[@]}"
+if [ ! -f "$STATE_DIR/codex-state.json" ] || ! jq -e --arg hash "$(file_state "$CODEX_CONFIG")" \
+  '.presence == "present" and .hash == $hash' "$STATE_DIR/codex-state.json" >/dev/null; then
+  echo "install-thub-codex: Codex helper poststate changed before adoption" >&2
+  exit 1
+fi
 file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
 bash "$HERE/install-captain-skills.sh" "${SKILL_ARGS[@]}"
 

@@ -71,6 +71,13 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertEqual(target.read_text(), "hash\nnode\n")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
+    def test_discard_removes_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "state"
+            target.write_text("value")
+            subprocess.run([str(HELPER), "discard", "--path", str(target)], check=True)
+            self.assertFalse(target.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

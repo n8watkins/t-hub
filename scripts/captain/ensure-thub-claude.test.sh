@@ -78,17 +78,20 @@ fi
 mkdir -p "$WORK/fail-bin"
 cat > "$WORK/fail-bin/claude" <<EOF
 #!/usr/bin/env bash
-if [ "\${1:-}" = mcp ] && [ "\${2:-}" = remove ]; then exit 0; fi
+if [ "\${1:-}" = mcp ] && [ "\${2:-}" = remove ]; then exec "$REAL_CLAUDE" "\$@"; fi
 if [ "\${1:-}" = mcp ] && [ "\${2:-}" = add ]; then exit 23; fi
 exec "$REAL_CLAUDE" "\$@"
 EOF
 chmod 700 "$WORK/fail-bin/claude"
-jq '.mcpServers["t-hub"].command="/stale"' "$HOME/.claude.json" > "$WORK/before-failure.json"
+jq '.mcpServers["t-hub"].command="/stale" | .cachedMetadata.keep="yes"' "$HOME/.claude.json" > "$WORK/before-failure.json"
 cp "$WORK/before-failure.json" "$HOME/.claude.json"
 if PATH="$WORK/fail-bin:$PATH" T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
   fail "injected add failure unexpectedly succeeded"
-elif cmp -s "$WORK/before-failure.json" "$HOME/.claude.json"; then
-  pass "injected add failure restores the prior config"
+elif jq -e '
+  .mcpServers["t-hub"].command == "/stale" and
+  .cachedMetadata.keep == "yes"
+' "$HOME/.claude.json" >/dev/null; then
+  pass "remove-mutated/add-no-write failure restores prior node and metadata"
 else
   fail "injected add failure did not restore the prior config"
 fi
@@ -144,6 +147,54 @@ elif jq -e '.mcpServers["t-hub"].command == "/concurrent-owner"' \
 else
   fail "rollback overwrote the concurrent t-hub node"
 fi
+
+mkdir -p "$WORK/add-write-fail-bin"
+cat > "$WORK/add-write-fail-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = add ]; then
+  "$REAL_CLAUDE" "$@" || exit $?
+  exit 41
+fi
+exec "$REAL_CLAUDE" "$@"
+EOF
+chmod 700 "$WORK/add-write-fail-bin/claude"
+printf '{}\n' > "$HOME/.claude.json"
+if PATH="$WORK/add-write-fail-bin:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+  fail "absent-parent injected failure unexpectedly succeeded"
+elif jq -e 'has("mcpServers") | not' "$HOME/.claude.json" >/dev/null; then
+  pass "rollback restores absent mcpServers parent"
+else
+  fail "rollback did not restore absent mcpServers parent"
+fi
+printf '{"mcpServers":{}}\n' > "$HOME/.claude.json"
+if PATH="$WORK/add-write-fail-bin:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+  fail "empty-parent injected failure unexpectedly succeeded"
+elif jq -e '.mcpServers == {}' "$HOME/.claude.json" >/dev/null; then
+  pass "rollback preserves an explicitly empty mcpServers parent"
+else
+  fail "rollback did not preserve empty mcpServers parent"
+fi
+
+for malformed in \
+  '{"mcpServers":null}' \
+  '{"mcpServers":false}' \
+  '{"mcpServers":[]}' \
+  '{"mcpServers":"bad"}' \
+  '{"mcpServers":{"t-hub":null}}' \
+  '{"mcpServers":{"t-hub":false}}' \
+  '{"mcpServers":{"t-hub":[]}}' \
+  '{"mcpServers":{"t-hub":"bad"}}'; do
+  printf '%s\n' "$malformed" > "$HOME/.claude.json"
+  cp "$HOME/.claude.json" "$WORK/malformed-snapshot.json"
+  if T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+    fail "malformed Claude structure was accepted: $malformed"
+  elif ! cmp -s "$WORK/malformed-snapshot.json" "$HOME/.claude.json"; then
+    fail "malformed Claude structure changed on refusal: $malformed"
+  fi
+done
+pass "malformed parent and t-hub node structures are refused unchanged"
 
 [ "$FAILED" -eq 0 ] && echo "ensure-thub-claude.test: PASS" || echo "ensure-thub-claude.test: FAIL" >&2
 exit "$FAILED"

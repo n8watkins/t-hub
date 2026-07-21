@@ -243,6 +243,27 @@ if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/
 else
   fail "explicit migration rerun changed config.toml"
 fi
+cp -p "$LEGACY_SNAP" "$WORK/config.toml"
+sed -i "\|^command = \"$FAKE_BIN\"$|a required = true" "$WORK/config.toml"
+UNKNOWN_POLICY_SNAP="$WORK/config.unknown-policy-snapshot.toml"
+cp -p "$WORK/config.toml" "$UNKNOWN_POLICY_SNAP"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  || ! cmp -s "$UNKNOWN_POLICY_SNAP" "$WORK/config.toml"; then
+  fail "unknown root policy was migrated or changed"
+else
+  pass "unknown root policy is refused byte-for-byte"
+fi
+cp -p "$LEGACY_SNAP" "$WORK/config.toml"
+sed -i '/^env_vars = \["T_HUB_CONTROL_ADDR"/a env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]' "$WORK/config.toml"
+DUPLICATE_POLICY_SNAP="$WORK/config.duplicate-policy-snapshot.toml"
+cp -p "$WORK/config.toml" "$DUPLICATE_POLICY_SNAP"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
+  || ! cmp -s "$DUPLICATE_POLICY_SNAP" "$WORK/config.toml"; then
+  fail "duplicate root policy was migrated or changed"
+else
+  pass "duplicate root policy is refused byte-for-byte"
+fi
+cp -p "$LEGACY_EXPECTED" "$WORK/config.toml"
 
 # --- 7. verification failure restores exact original bytes ------------------
 sed -i 's/env_vars = \["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"\]/env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]/' "$WORK/config.toml"
