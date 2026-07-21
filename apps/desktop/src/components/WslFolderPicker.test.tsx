@@ -2,8 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { listDir } from "../ipc/files";
-import { gitInfo } from "../ipc/git";
-import { pickWslFolder } from "../ipc/wslFolderDialog";
+import { normalizeWslPath, pickWslFolder } from "../ipc/wslFolderDialog";
 import {
   normalizePosixPath,
   parentPath,
@@ -12,13 +11,14 @@ import {
 } from "./WslFolderPicker";
 
 vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
-vi.mock("../ipc/git", () => ({ gitInfo: vi.fn() }));
-vi.mock("../ipc/wslFolderDialog", () => ({ pickWslFolder: vi.fn() }));
+vi.mock("../ipc/wslFolderDialog", () => ({
+  normalizeWslPath: vi.fn(),
+  pickWslFolder: vi.fn(),
+}));
 
 describe("WslFolderPicker", () => {
   beforeEach(() => {
     vi.mocked(listDir).mockReset();
-    vi.mocked(gitInfo).mockReset();
     vi.mocked(listDir).mockResolvedValue([
       {
         name: "project",
@@ -35,12 +35,12 @@ describe("WslFolderPicker", () => {
         size: 4,
       },
     ]);
-    vi.mocked(gitInfo).mockResolvedValue({
-      isRepo: false,
-      branch: null,
-      worktreeRoot: null,
-      isLinkedWorktree: false,
-      dirtyCount: 0,
+    vi.mocked(normalizeWslPath).mockImplementation(async (path) => {
+      if (path.includes("..")) throw new Error("The WSL folder path cannot contain '..' traversal.");
+      if (path.includes("Debian") || /^[A-Za-z]:/.test(path)) {
+        throw new Error("Choose a folder inside the configured WSL distribution.");
+      }
+      return path.trim();
     });
     vi.mocked(pickWslFolder).mockResolvedValue(null);
   });
@@ -56,27 +56,26 @@ describe("WslFolderPicker", () => {
       />,
     );
 
-    expect(await screen.findByRole("button", { name: "project Git" })).toBeTruthy();
-    expect(screen.getByText("Git")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
     expect(screen.queryByText("notes.txt")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "project Git" }));
-    expect(onPathChange).toHaveBeenLastCalledWith("/home/me/project");
+    fireEvent.click(screen.getByRole("button", { name: "project" }));
+    await waitFor(() => expect(onPathChange).toHaveBeenLastCalledWith("/home/me/project"));
     fireEvent.click(screen.getByRole("button", { name: "Recent app" }));
-    expect(onPathChange).toHaveBeenLastCalledWith("/home/me/app");
+    await waitFor(() => expect(onPathChange).toHaveBeenLastCalledWith("/home/me/app"));
     fireEvent.click(screen.getByRole("button", { name: "Parent folder" }));
-    expect(onPathChange).toHaveBeenLastCalledWith("/home");
+    await waitFor(() => expect(onPathChange).toHaveBeenLastCalledWith("/home"));
 
     fireEvent.change(screen.getByLabelText("Manual WSL path"), {
       target: { value: "/home/me/../other/" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Go" }));
-    expect(onPathChange).toHaveBeenLastCalledWith("/home/other");
+    expect(screen.getByRole("alert").textContent).toContain("traversal");
     await waitFor(() => expect(listDir).toHaveBeenCalledWith("/home/me"));
   });
 
   it("normalizes POSIX navigation without accepting host paths", () => {
-    expect(normalizePosixPath(" /home/me/../app/ ")).toBe("/home/app");
+    expect(normalizePosixPath(" /home/me/../app/ ")).toBeNull();
     expect(normalizePosixPath("C:\\Users\\me")).toBeNull();
     expect(parentPath("/home/me/app")).toBe("/home/me");
     expect(parentPath("/")).toBeNull();
@@ -88,7 +87,6 @@ describe("WslFolderPicker", () => {
   });
 
   it("keeps folder navigation available when Git status fails", async () => {
-    vi.mocked(gitInfo).mockRejectedValue(new Error("git unavailable"));
     render(
       <WslFolderPicker
         path="/home/me"
@@ -97,8 +95,7 @@ describe("WslFolderPicker", () => {
       />,
     );
 
-    expect(await screen.findByRole("button", { name: "project Git" })).toBeTruthy();
-    expect(screen.queryByText("git unavailable")).toBeNull();
+    expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
   });
 
   it("distinguishes a true empty folder from a directory-list failure", async () => {
@@ -111,7 +108,7 @@ describe("WslFolderPicker", () => {
     unmount();
     vi.mocked(listDir).mockRejectedValueOnce(new Error("permission denied"));
     render(<WslFolderPicker path="/home/blocked" recentPaths={[]} onPathChange={vi.fn()} />);
-    expect(await screen.findByText("Could not list this folder.")).toBeTruthy();
+    expect(await screen.findByText("Could not list this folder: permission denied")).toBeTruthy();
     expect(screen.queryByText("This folder is empty.")).toBeNull();
     expect((await screen.findByRole("alert")).textContent).toContain("permission denied");
   });
@@ -130,6 +127,33 @@ describe("WslFolderPicker", () => {
     resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
     expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "old" })).toBeNull();
+  });
+
+  it("ignores an older listing error after a newer success", async () => {
+    let rejectOld!: (cause: Error) => void;
+    let resolveNew!: (entries: never[]) => void;
+    vi.mocked(listDir)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectOld = reject; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    const view = render(
+      <WslFolderPicker path="/home/old" recentPaths={[]} onPathChange={vi.fn()} />,
+    );
+    view.rerender(<WslFolderPicker path="/home/new" recentPaths={[]} onPathChange={vi.fn()} />);
+    rejectOld(new Error("old permission failure"));
+    resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
+    expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
+    expect(screen.queryByText(/old permission failure/)).toBeNull();
+  });
+
+  it("shows manual path validation errors without changing the selected folder", async () => {
+    const onPathChange = vi.fn();
+    render(<WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />);
+    fireEvent.change(screen.getByLabelText("Manual WSL path"), {
+      target: { value: "\\\\wsl.localhost\\Debian\\home\\me" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(onPathChange).not.toHaveBeenCalled();
   });
 
   it("opens Explorer and adopts only its validated WSL selection", async () => {
