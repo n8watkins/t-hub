@@ -93,6 +93,16 @@ New agent-session operations do not expose Powder mutation state.
 }
 ```
 
+Project commands use `th projects list`, `th projects register <rootPath> --name NAME`, and `th projects init <rootPath> --name NAME`.
+
+Project registration accepts Git and non-Git WSL roots without initializing Git.
+
+Git initialization is an explicit `projects init` operation.
+
+Git capability refusals retain the human `error.message` and expose `error.kind` as `git_required` with bounded `error.details` containing `operation`, `capability`, and `action`.
+
+The control wire carries the same refusal as `errorKind: "git_required"` and `errorDetails`, so MCP and CLI adapters do not parse JSON embedded in error strings.
+
 Missing arguments, extra positional arguments, and unknown flags are usage errors.
 An error suggestion should identify the specific corrective command when one is known.
 

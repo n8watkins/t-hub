@@ -53,7 +53,11 @@ pub enum ControlError {
     /// Discovery or connect failed — the app is not reachable (exit 3).
     AppDown(String),
     /// The app answered `ok:false` (exit 4, or 5 when the message is a gate).
-    Server { message: String, retryable: bool },
+    Server {
+        message: String,
+        retryable: bool,
+        details: Option<Value>,
+    },
     /// Malformed frame, or a handshake protocol-version mismatch (exit 6).
     Protocol(String),
 }
@@ -78,6 +82,8 @@ struct Response {
     error: Option<String>,
     #[serde(rename = "errorKind", default)]
     error_kind: Option<String>,
+    #[serde(rename = "errorDetails", default)]
+    error_details: Option<Value>,
     #[serde(default)]
     retryable: bool,
 }
@@ -199,9 +205,15 @@ fn call_with_deadline(
 
     match call_once(ep, command, args, deadline, attempt_timeout) {
         Ok(value) => Ok(value),
-        Err(CallFailure::Server { message, retryable }) => {
-            Err(ControlError::Server { message, retryable })
-        }
+        Err(CallFailure::Server {
+            message,
+            retryable,
+            details,
+        }) => Err(ControlError::Server {
+            message,
+            retryable,
+            details,
+        }),
         Err(CallFailure::Protocol(message)) => Err(ControlError::Protocol(message)),
         Err(first) => {
             if Instant::now() >= deadline {
@@ -213,9 +225,15 @@ fn call_with_deadline(
             }
             match call_once(&refreshed, command, args, deadline, attempt_timeout) {
                 Ok(value) => Ok(value),
-                Err(CallFailure::Server { message, retryable }) => {
-                    Err(ControlError::Server { message, retryable })
-                }
+                Err(CallFailure::Server {
+                    message,
+                    retryable,
+                    details,
+                }) => Err(ControlError::Server {
+                    message,
+                    retryable,
+                    details,
+                }),
                 Err(CallFailure::Protocol(message)) => Err(ControlError::Protocol(message)),
                 Err(second) if Instant::now() >= deadline || second.is_timeout() => {
                     Err(timeout_error(command, 2, second.stage(), overall))
@@ -245,7 +263,11 @@ fn refresh_endpoint(ep: &Endpoint) -> Result<Endpoint, ControlError> {
 enum CallFailure {
     Transport(&'static str),
     Timeout(&'static str),
-    Server { message: String, retryable: bool },
+    Server {
+        message: String,
+        retryable: bool,
+        details: Option<Value>,
+    },
     Protocol(String),
 }
 
@@ -274,8 +296,8 @@ impl CallFailure {
             CallFailure::Transport(stage) => ControlError::AppDown(format!(
                 "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
             )),
-            CallFailure::Server { message, retryable } => {
-                ControlError::Server { message, retryable }
+            CallFailure::Server { message, retryable, details } => {
+                ControlError::Server { message, retryable, details }
             }
             CallFailure::Protocol(message) => ControlError::Protocol(message),
         }
@@ -446,6 +468,7 @@ fn call_once(
                     .unwrap_or_else(|| "control command failed (no error message)".to_string()),
             },
             retryable: resp.retryable,
+            details: resp.error_details,
         })
     }
 }
@@ -615,6 +638,56 @@ mod tests {
             let _ = writer.flush();
         });
         addr
+    }
+
+    #[test]
+    fn raw_wire_error_details_survive_cli_control_adapter() {
+        let details = serde_json::json!({
+            "code": "git_required",
+            "operation": "baseline",
+            "capability": "git",
+            "action": "initialize_git"
+        });
+        let response = serde_json::to_vec(&serde_json::json!({
+            "ok": false,
+            "error": "Git capability is required for baseline",
+            "errorKind": "git_required",
+            "errorDetails": details,
+            "retryable": false
+        }))
+        .unwrap();
+        let mut response = response;
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let endpoint = Endpoint {
+            addr,
+            token: "control-token".into(),
+            handshake_path: PathBuf::from("/nonexistent/handshake.json"),
+            env_pinned: true,
+            discovery_elapsed: Duration::ZERO,
+        };
+
+        let error = call_with_deadline(
+            &endpoint,
+            "baseline",
+            &Value::Null,
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+
+        match error {
+            ControlError::Server {
+                message,
+                retryable,
+                details: actual,
+            } => {
+                assert_eq!(message, "Git capability is required for baseline");
+                assert!(!retryable);
+                assert_eq!(actual, Some(details));
+            }
+            other => panic!("expected structured server error, got {other:?}"),
+        }
     }
 
     fn exact_limit_response() -> Vec<u8> {

@@ -16,6 +16,7 @@ mod args;
 mod control;
 mod history;
 mod powder;
+mod projects;
 mod render;
 mod worktree;
 
@@ -45,11 +46,14 @@ mod exit {
 }
 
 /// A CLI failure carrying its stable exit code + a machine-friendly `kind`.
+#[derive(Debug)]
 struct CliError {
     code: u8,
     kind: &'static str,
     message: String,
     retryable: bool,
+    suggestion: Option<String>,
+    details: Option<Value>,
 }
 
 impl CliError {
@@ -59,6 +63,8 @@ impl CliError {
             kind: "usage",
             message: message.into(),
             retryable: false,
+            suggestion: None,
+            details: None,
         }
     }
 
@@ -68,6 +74,8 @@ impl CliError {
             kind: "gated",
             message: message.into(),
             retryable: false,
+            suggestion: None,
+            details: None,
         }
     }
 
@@ -77,6 +85,8 @@ impl CliError {
             kind: "powder_retired",
             message: message.into(),
             retryable: false,
+            suggestion: None,
+            details: None,
         }
     }
 
@@ -88,6 +98,8 @@ impl CliError {
             kind: "git_error",
             message: message.into(),
             retryable: false,
+            suggestion: None,
+            details: None,
         }
     }
 }
@@ -103,25 +115,45 @@ impl From<ControlError> for CliError {
                 kind: "app_down",
                 message: m,
                 retryable: false,
+                suggestion: None,
+                details: None,
             },
             ControlError::Protocol(m) => CliError {
                 code: exit::PROTOCOL,
                 kind: "protocol",
                 message: m,
                 retryable: false,
+                suggestion: None,
+                details: None,
             },
             ControlError::Server {
                 message: m,
                 retryable,
+                details,
             } => {
+                let structured_kind = details
+                    .as_ref()
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str);
                 if let Some(message) = m.strip_prefix("powder_retired:") {
                     CliError::powder_retired(message)
+                } else if structured_kind == Some("git_required") {
+                    CliError {
+                        code: exit::SERVER_ERROR,
+                        kind: "git_required",
+                        message: m,
+                        retryable,
+                        suggestion: Some("Run `th projects init <rootPath> --name NAME`".into()),
+                        details,
+                    }
                 } else if let Some(kind) = powder_mutation_error_kind(&m) {
                     CliError {
                         code: exit::SERVER_ERROR,
                         kind,
                         message: m,
                         retryable,
+                        suggestion: None,
+                        details,
                     }
                 } else if is_gated(&m) {
                     CliError {
@@ -129,6 +161,8 @@ impl From<ControlError> for CliError {
                         kind: "gated",
                         message: m,
                         retryable,
+                        suggestion: None,
+                        details,
                     }
                 } else {
                     CliError {
@@ -136,6 +170,8 @@ impl From<ControlError> for CliError {
                         kind: "server_error",
                         message: m,
                         retryable,
+                        suggestion: None,
+                        details,
                     }
                 }
             }
@@ -239,6 +275,7 @@ fn command_label(args: &[String]) -> String {
         Some("agents") => agents::command_label(&args[1..]),
         Some("history") => history::command_label(&args[1..]),
         Some("admin") => admin::command_label(&args[1..]),
+        Some("projects") => projects::command_label(&args[1..]),
         Some(c) => c.to_string(),
     }
 }
@@ -262,6 +299,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "agents" => agents::run(rest),
         "history" => history::run(rest),
         "admin" => admin::run(rest),
+        "projects" => projects::run(rest),
         other => Err(CliError::usage(format!(
             "unknown command '{other}'. Run `th --help` for the command list."
         ))),
@@ -577,6 +615,8 @@ fn cmd_worktree_prune(args: &[String]) -> Result<(), CliError> {
                     .unwrap_or("lease source unavailable")
             ),
             retryable: false,
+            suggestion: None,
+            details: None,
         });
     }
 
@@ -813,17 +853,27 @@ fn emit_json_ok(command: &str, data: Value) {
 /// Emit the stable failure envelope: `{ ok:false, command, data:null, error }`.
 /// The `error.code` matches the process exit code, so agents can read either.
 fn emit_json_err(command: &str, e: &CliError) {
+    let env = json_error_envelope(command, e);
+    println!("{}", serde_json::to_string_pretty(&env).unwrap_or_default());
+}
+
+fn json_error_envelope(command: &str, e: &CliError) -> Value {
     let mut error = json!({ "code": e.code, "kind": e.kind, "message": e.message });
     if e.retryable {
         error["retryable"] = Value::Bool(true);
     }
-    let env = json!({
+    if let Some(suggestion) = &e.suggestion {
+        error["suggestion"] = Value::String(suggestion.clone());
+    }
+    if let Some(details) = &e.details {
+        error["details"] = details.clone();
+    }
+    json!({
         "ok": false,
         "command": command,
         "data": Value::Null,
         "error": error,
-    });
-    println!("{}", serde_json::to_string_pretty(&env).unwrap_or_default());
+    })
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -963,6 +1013,9 @@ commands:\n\
   history focus <historyId> focus one exact active conversation\n\
   history resume <historyId> --request-id ID --confirm [--tab TAB] [--json]\n\
   admin                     manage durable Ship and Fleet Admin grants\n\
+  projects list              list registered Projects                  [--json]\n\
+  projects register <root>  register a Git or non-Git Project          --name NAME [--json]\n\
+  projects init <root>      initialize Git explicitly                  --name NAME [--json]\n\
 \n\
 flags:\n\
   --json        stable machine envelope: {{ok, command, data, error}} (read cmds)\n\
@@ -1018,6 +1071,7 @@ mod tests {
                     "Powder completion: Powder mutation state '{state}': bounded detail"
                 ),
                 retryable: false,
+                details: None,
             }
             .into();
             assert_eq!(error.code, exit::SERVER_ERROR);
@@ -1030,9 +1084,59 @@ mod tests {
         let error: CliError = ControlError::Server {
             message: "ordinary failure".into(),
             retryable: false,
+            details: None,
         }
         .into();
         assert_eq!(error.code, exit::SERVER_ERROR);
         assert_eq!(error.kind, "server_error");
+    }
+
+    #[test]
+    fn git_capability_errors_keep_a_stable_machine_kind() {
+        let error: CliError = ControlError::Server {
+            message: "Git capability is required".into(),
+            retryable: false,
+            details: Some(json!({
+                "code": "git_required",
+                "operation": "dispatch_preflight",
+                "capability": "git",
+                "action": "initialize_git"
+            })),
+        }
+        .into();
+        assert_eq!(error.code, exit::SERVER_ERROR);
+        assert_eq!(error.kind, "git_required");
+    }
+
+    #[test]
+    fn git_required_json_contract_is_structured_and_stable() {
+        let error = CliError {
+            code: exit::SERVER_ERROR,
+            kind: "git_required",
+            message: "Git capability is required for dispatch_preflight".into(),
+            retryable: false,
+            suggestion: Some("Run `th projects init <rootPath> --name NAME`".into()),
+            details: Some(json!({
+                "code": "git_required",
+                "operation": "dispatch_preflight",
+                "capability": "git",
+                "action": "initialize_git"
+            })),
+        };
+        let envelope = json_error_envelope("agents preflight", &error);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["command"], "agents preflight");
+        assert_eq!(envelope["data"], Value::Null);
+        assert_eq!(envelope["error"]["code"], 4);
+        assert_eq!(envelope["error"]["kind"], "git_required");
+        assert_eq!(
+            envelope["error"]["details"]["operation"],
+            "dispatch_preflight"
+        );
+        assert_eq!(
+            envelope["error"]["suggestion"],
+            "Run `th projects init <rootPath> --name NAME`"
+        );
+        assert!(!envelope.to_string().contains("git_required:"));
     }
 }
