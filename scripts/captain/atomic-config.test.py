@@ -396,6 +396,11 @@ class AtomicConfigTest(unittest.TestCase):
                             "digest": helper.canonical_json_digest(node),
                         }
                     },
+                    "post": {
+                        "presence": "present",
+                        "digest": helper.state_digest(str(target)),
+                        "description": helper.description(str(target)),
+                    },
                 }
                 state_path = recovery_dir / "claude-state.json"
                 state_path.write_text(json.dumps(state) + "\n")
@@ -419,6 +424,64 @@ class AtomicConfigTest(unittest.TestCase):
                         # The concurrent sibling keeps the parent non-empty; its
                         # bytes are never removed to recreate an empty snapshot.
                         self.assertIn("mcpServers", restored)
+
+    def test_claude_rollback_preserves_concurrent_metadata_drift(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            recovery_dir = root / "recovery"
+            recovery_dir.mkdir(mode=0o700)
+            before = root / "before.json"
+            before.write_text('{"mcpServers":{"t-hub":{"command":"/before"}}}\n')
+            before.chmod(0o640)
+            recovery = recovery_dir / "before.bin"
+            before_file = helper.capture(str(before), str(recovery))
+            target = root / "claude.json"
+            current = {
+                "cachedMetadata": {"concurrent": "preserved"},
+                "mcpServers": {
+                    "t-hub": {"command": "/owned"},
+                    "concurrent-sibling": {"keep": True},
+                },
+            }
+            target.write_text(json.dumps(current) + "\n")
+            target.chmod(0o600)
+            node = current["mcpServers"]["t-hub"]
+            post_description = helper.description(str(target))
+            state = {
+                "before_file": before_file,
+                "before": {
+                    "file_presence": "present",
+                    "parent": {"presence": True, "type": "object"},
+                    "key": {"presence": True, "type": "object", "digest": "unused"},
+                },
+                "post": {
+                    "presence": "present",
+                    "digest": helper.description_digest(post_description),
+                    "description": post_description,
+                },
+                "post_structure": {"key": {
+                    "presence": True,
+                    "type": "object",
+                    "digest": helper.canonical_json_digest(node),
+                }},
+            }
+            state_path = recovery_dir / "state.json"
+            state_path.write_text(json.dumps(state) + "\n")
+            state_path.chmod(0o600)
+            target.chmod(0o620)
+            os.setxattr(target, "user.t-hub-concurrent", b"metadata-owner")
+            subprocess.run(
+                [sys.executable, str(HELPER), "claude-rollback", "--target", str(target),
+                 "--state", str(state_path), "--recovery", str(recovery),
+                 "--journal", str(root / "journal")], check=True,
+            )
+            restored = json.loads(target.read_text())
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o620)
+            self.assertEqual(os.getxattr(target, "user.t-hub-concurrent"), b"metadata-owner")
+            self.assertEqual(restored["cachedMetadata"], {"concurrent": "preserved"})
+            self.assertEqual(restored["mcpServers"]["concurrent-sibling"], {"keep": True})
+            self.assertEqual(restored["mcpServers"]["t-hub"], {"command": "/before"})
 
     def test_claude_rollback_refuses_changed_owner_and_malformed_parent(self) -> None:
         helper = load_helper()

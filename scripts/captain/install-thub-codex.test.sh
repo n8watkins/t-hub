@@ -366,6 +366,97 @@ else
   fail "rerun remained wedged after killed Claude helper"
 fi
 
+CODEX_KILL="$ADOPTION_WORK/codex-kill"
+mkdir -p "$CODEX_KILL/home" "$CODEX_KILL/codex" "$CODEX_KILL/claude" \
+  "$CODEX_KILL/bin" "$CODEX_KILL/captain"
+printf 'original binary\n' > "$CODEX_KILL/bin/t-hub-mcp"
+cat > "$CODEX_KILL/codex/config.toml" <<EOF
+[mcp_servers.t-hub]
+command = "/stale"
+EOF
+cp -p "$CODEX_KILL/codex/config.toml" "$CODEX_KILL/codex-before.toml"
+cat > "$CODEX_KILL/atomic-kill-wrapper.py" <<'EOF'
+#!/usr/bin/env python3
+import json, os, pathlib, signal, subprocess, sys, time
+published = json.loads(sys.argv[-1]) if sys.argv[1] == "publish" else {}
+is_codex_state = any(pathlib.Path(value).name == "codex-state.json" for value in sys.argv[2:])
+if sys.argv[1] == "publish" and is_codex_state and published.get("status") == "committed":
+    os.kill(os.getppid(), signal.SIGKILL)
+    time.sleep(0.2)
+    raise SystemExit(137)
+raise SystemExit(subprocess.run([sys.executable, os.environ["REAL_ATOMIC"], *sys.argv[1:]]).returncode)
+EOF
+chmod 700 "$CODEX_KILL/atomic-kill-wrapper.py"
+if HOME="$CODEX_KILL/home" CODEX_HOME="$CODEX_KILL/codex" CLAUDE_HOME="$CODEX_KILL/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CODEX_KILL/bin" \
+  T_HUB_CAPTAIN_DIR="$CODEX_KILL/captain" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$CODEX_KILL/atomic-kill-wrapper.py" \
+  REAL_ATOMIC="$REAL_ATOMIC" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "killed Codex helper unexpectedly succeeded"
+elif [ ! -e "$CODEX_KILL/home/.t-hub/transactions/install-current" ] \
+  && [ "$(cat "$CODEX_KILL/bin/t-hub-mcp")" = "original binary" ] \
+  && cmp -s "$CODEX_KILL/codex-before.toml" "$CODEX_KILL/codex/config.toml"; then
+  pass "parent adopts and rolls back Codex before-only publication"
+else
+  fail "Codex before-only publication lost rollback evidence or left a missing binary"
+fi
+if HOME="$CODEX_KILL/home" CODEX_HOME="$CODEX_KILL/codex" CLAUDE_HOME="$CODEX_KILL/claude" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CODEX_KILL/bin" \
+  T_HUB_CAPTAIN_DIR="$CODEX_KILL/captain" bash "$SCRIPT" >/dev/null 2>&1; then
+  pass "rerun converges after killed Codex helper"
+else
+  fail "rerun remained wedged after killed Codex helper"
+fi
+
+FAILED_RECOVERY="$ADOPTION_WORK/failed-recovery"
+mkdir -p "$FAILED_RECOVERY/home" "$FAILED_RECOVERY/codex" "$FAILED_RECOVERY/claude" \
+  "$FAILED_RECOVERY/bin" "$FAILED_RECOVERY/captain" "$FAILED_RECOVERY/wrapper-bin"
+printf 'original binary\n' > "$FAILED_RECOVERY/bin/t-hub-mcp"
+printf '{"mcpServers":{"t-hub":{"type":"stdio","command":"/stale","args":[],"env":{}}}}\n' \
+  > "$FAILED_RECOVERY/home/.claude.json"
+cat > "$FAILED_RECOVERY/wrapper-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = mcp ] && [ "${2:-}" = remove ]; then
+  jq 'del(.mcpServers["t-hub"])' "$CLAUDE_RACE_CONFIG" > "$CLAUDE_RACE_CONFIG.removed"
+  mv "$CLAUDE_RACE_CONFIG.removed" "$CLAUDE_RACE_CONFIG"
+  kill -KILL "$PPID"
+  jq '.mcpServers["t-hub"] = {
+    type:"stdio",command:"/concurrent-custom",args:["--owned"],env:{OWNER:"other"}
+  }' "$CLAUDE_RACE_CONFIG" > "$CLAUDE_RACE_CONFIG.concurrent"
+  mv "$CLAUDE_RACE_CONFIG.concurrent" "$CLAUDE_RACE_CONFIG"
+  sleep 0.1
+  exit 0
+fi
+exit 97
+EOF
+chmod 700 "$FAILED_RECOVERY/wrapper-bin/claude"
+if HOME="$FAILED_RECOVERY/home" CODEX_HOME="$FAILED_RECOVERY/codex" \
+  CLAUDE_HOME="$FAILED_RECOVERY/claude" PATH="$FAILED_RECOVERY/wrapper-bin:$PATH" \
+  CLAUDE_RACE_CONFIG="$FAILED_RECOVERY/home/.claude.json" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$FAILED_RECOVERY/bin" \
+  T_HUB_CAPTAIN_DIR="$FAILED_RECOVERY/captain" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "killed stale-Claude replacement unexpectedly succeeded"
+fi
+FAILED_RECOVERY_TXN="$FAILED_RECOVERY/home/.t-hub/transactions/install-current"
+cp -a "$FAILED_RECOVERY_TXN" "$FAILED_RECOVERY/original-transaction"
+cp -p "$FAILED_RECOVERY/bin/t-hub-mcp" "$FAILED_RECOVERY/binary-before-rerun"
+cp -p "$FAILED_RECOVERY/home/.claude.json" "$FAILED_RECOVERY/claude-before-rerun.json"
+if HOME="$FAILED_RECOVERY/home" CODEX_HOME="$FAILED_RECOVERY/codex" \
+  CLAUDE_HOME="$FAILED_RECOVERY/claude" T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$FAILED_RECOVERY/bin" T_HUB_CAPTAIN_DIR="$FAILED_RECOVERY/captain" \
+  bash "$SCRIPT" >"$FAILED_RECOVERY/recovery.log" 2>&1; then
+  fail "failed ownership recovery unexpectedly started a new install"
+elif diff -r "$FAILED_RECOVERY/original-transaction" "$FAILED_RECOVERY_TXN" >/dev/null \
+  && cmp -s "$FAILED_RECOVERY/binary-before-rerun" "$FAILED_RECOVERY/bin/t-hub-mcp" \
+  && cmp -s "$FAILED_RECOVERY/claude-before-rerun.json" "$FAILED_RECOVERY/home/.claude.json" \
+  && grep -Fq 'original binary' "$FAILED_RECOVERY_TXN/recovery/binary.bin" \
+  && ! grep -Fq 'rolled back interrupted transaction' "$FAILED_RECOVERY/recovery.log"; then
+  pass "failed ownership recovery retains the original transaction and binary evidence"
+else
+  fail "failed ownership recovery destroyed evidence or began a partial new install"
+fi
+
 ROLLBACK_WORK="$WORK/rollback"
 ROLLBACK_HOME="$ROLLBACK_WORK/home"
 ROLLBACK_CODEX_HOME="$ROLLBACK_WORK/codex-home"
@@ -531,6 +622,36 @@ else
   fail "pre-existing managed target recovery wedged"
 fi
 
+SKILL_INTENT_WORK="$WORK/skill-intent-race"
+SKILL_INTENT_CODEX="$SKILL_INTENT_WORK/codex"
+SKILL_INTENT_CLAUDE="$SKILL_INTENT_WORK/claude"
+SKILL_INTENT_TXN="$SKILL_INTENT_WORK/transaction"
+mkdir -p "$SKILL_INTENT_CODEX" "$SKILL_INTENT_CLAUDE"
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_INTENT_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_INTENT_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_INTENT_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_INTENT_TXN" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  T_HUB_SKILL_CRASH_AFTER_TARGET_INTENT_INDEX=0 \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1; then
+  fail "pre-mutation skill SIGKILL unexpectedly succeeded"
+fi
+mkdir -p "$SKILL_INTENT_CODEX/skills/captain"
+printf 'concurrent writer\n' > "$SKILL_INTENT_CODEX/skills/captain/OWNER"
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_INTENT_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_INTENT_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_INTENT_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_INTENT_TXN" \
+  T_HUB_SKILL_RECOVER_ONLY=1 T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1; then
+  fail "skill recovery adopted a concurrent pre-mutation target"
+elif [ "$(cat "$SKILL_INTENT_CODEX/skills/captain/OWNER")" = "concurrent writer" ] \
+  && [ -d "$SKILL_INTENT_TXN" ]; then
+  pass "skill intent recovery preserves an unowned concurrent target and journal"
+else
+  fail "skill intent recovery deleted a concurrent target or its evidence"
+fi
+
 for crash_stage in binary codex-helper claude-helper atomic-helper claude-config codex-config skills; do
   CRASH_WORK="$WORK/crash-$crash_stage"
   CRASH_HOME="$CRASH_WORK/home"
@@ -613,6 +734,64 @@ if HOME="$PROVENANCE_HOME" CODEX_HOME="$PROVENANCE_CODEX" CLAUDE_HOME="$PROVENAN
   pass "matching provenance recovers the interrupted transaction"
 else
   fail "matching provenance did not recover"
+fi
+
+INTEGRATION_PROVENANCE="$WORK/integration-provenance"
+INTEGRATION_HOME="$INTEGRATION_PROVENANCE/home"
+INTEGRATION_CODEX="$INTEGRATION_PROVENANCE/codex"
+INTEGRATION_CLAUDE="$INTEGRATION_PROVENANCE/claude"
+INTEGRATION_BIN="$INTEGRATION_PROVENANCE/install/bin"
+INTEGRATION_CAPTAIN="$INTEGRATION_PROVENANCE/install/captain"
+INTEGRATION_SKILLS="$INTEGRATION_PROVENANCE/source-skills"
+INTEGRATION_CODEX_SKILLS="$INTEGRATION_PROVENANCE/dest/codex-skills"
+INTEGRATION_CLAUDE_SKILLS="$INTEGRATION_PROVENANCE/dest/claude-skills"
+INTEGRATION_CLAUDE_COMMANDS="$INTEGRATION_PROVENANCE/dest/claude-commands"
+mkdir -p "$INTEGRATION_HOME" "$INTEGRATION_CODEX" "$INTEGRATION_CLAUDE"
+cp -a "$HERE/../../skills" "$INTEGRATION_SKILLS"
+ln -s SKILL.md "$INTEGRATION_SKILLS/captain/provenance-link"
+HOME="$INTEGRATION_HOME" CODEX_HOME="$INTEGRATION_CODEX" CLAUDE_HOME="$INTEGRATION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$INTEGRATION_BIN" \
+  T_HUB_CAPTAIN_DIR="$INTEGRATION_CAPTAIN" T_HUB_SKILLS_SOURCE="$INTEGRATION_SKILLS" \
+  T_HUB_CODEX_SKILLS_DIR="$INTEGRATION_CODEX_SKILLS" \
+  T_HUB_CLAUDE_SKILLS_DIR="$INTEGRATION_CLAUDE_SKILLS" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$INTEGRATION_CLAUDE_COMMANDS" \
+  T_HUB_INSTALL_CRASH_AFTER_STAGE=binary bash "$SCRIPT" >/dev/null 2>&1 || true
+ln -sfn ../shipmate/SKILL.md "$INTEGRATION_SKILLS/captain/provenance-link"
+if HOME="$INTEGRATION_HOME" CODEX_HOME="$INTEGRATION_CODEX" CLAUDE_HOME="$INTEGRATION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$INTEGRATION_BIN" \
+  T_HUB_CAPTAIN_DIR="$INTEGRATION_CAPTAIN" T_HUB_SKILLS_SOURCE="$INTEGRATION_SKILLS" \
+  T_HUB_CODEX_SKILLS_DIR="$INTEGRATION_CODEX_SKILLS" \
+  T_HUB_CLAUDE_SKILLS_DIR="$INTEGRATION_CLAUDE_SKILLS" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$INTEGRATION_CLAUDE_COMMANDS" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "changed skill-source symlink adopted an interrupted transaction"
+elif [ -d "$INTEGRATION_HOME/.t-hub/transactions/install-current" ]; then
+  pass "integration provenance binds the actual skill tree including symlinks"
+else
+  fail "skill-source provenance mismatch destroyed recovery state"
+fi
+ln -sfn SKILL.md "$INTEGRATION_SKILLS/captain/provenance-link"
+if HOME="$INTEGRATION_HOME" CODEX_HOME="$INTEGRATION_CODEX" CLAUDE_HOME="$INTEGRATION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$INTEGRATION_BIN" \
+  T_HUB_CAPTAIN_DIR="$INTEGRATION_CAPTAIN" T_HUB_SKILLS_SOURCE="$INTEGRATION_SKILLS" \
+  T_HUB_CODEX_SKILLS_DIR="$INTEGRATION_PROVENANCE/dest/other-codex-skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$INTEGRATION_CLAUDE_SKILLS" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$INTEGRATION_CLAUDE_COMMANDS" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "changed skill destination adopted an interrupted transaction"
+elif [ -d "$INTEGRATION_HOME/.t-hub/transactions/install-current" ]; then
+  pass "integration provenance binds overridden skill destinations"
+else
+  fail "destination provenance mismatch destroyed recovery state"
+fi
+if HOME="$INTEGRATION_HOME" CODEX_HOME="$INTEGRATION_CODEX" CLAUDE_HOME="$INTEGRATION_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$INTEGRATION_BIN" \
+  T_HUB_CAPTAIN_DIR="$INTEGRATION_CAPTAIN" T_HUB_SKILLS_SOURCE="$INTEGRATION_SKILLS" \
+  T_HUB_CODEX_SKILLS_DIR="$INTEGRATION_CODEX_SKILLS" \
+  T_HUB_CLAUDE_SKILLS_DIR="$INTEGRATION_CLAUDE_SKILLS" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$INTEGRATION_CLAUDE_COMMANDS" bash "$SCRIPT" >/dev/null 2>&1 \
+  && [ ! -e "$INTEGRATION_HOME/.t-hub/transactions/install-current" ]; then
+  pass "matching integration provenance recovers after strict refusals"
+else
+  fail "matching integration provenance did not recover"
 fi
 
 OPTION_WORK="$WORK/provenance-option"
