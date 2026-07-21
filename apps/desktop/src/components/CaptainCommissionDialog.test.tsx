@@ -32,6 +32,7 @@ vi.mock("./WslFolderPicker", () => ({
 
 describe("CaptainCommissionDialog", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.mocked(listProjects).mockResolvedValue({
       projects: [],
       count: 0,
