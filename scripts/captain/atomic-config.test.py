@@ -290,6 +290,49 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(recovery.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(pathlib.Path(f"{recovery}.metadata").stat().st_mode), 0o600)
 
+    def test_hard_links_are_refused_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "config"
+            linked = root / "linked"
+            candidate = root / "candidate"
+            target.write_bytes(b"before\n")
+            os.link(target, linked)
+            candidate.write_bytes(b"after\n")
+            result = subprocess.run(
+                [sys.executable, str(HELPER), "exchange", "--target", str(target),
+                 "--candidate", str(candidate), "--expected-sha", digest(b"before\n")],
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_bytes(), b"before\n")
+            self.assertEqual(linked.read_bytes(), b"before\n")
+
+    def test_same_digest_path_swap_after_prepare_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "config"
+            replacement = root / "replacement"
+            candidate = root / "candidate"
+            journal = root / "journal"
+            target.write_bytes(b"same\n")
+            replacement.write_bytes(b"same\n")
+            candidate.write_bytes(b"after\n")
+            environment = os.environ.copy()
+            environment["T_HUB_ATOMIC_CRASH_AT"] = "prepared"
+            subprocess.run(
+                [sys.executable, str(HELPER), "exchange", "--target", str(target),
+                 "--candidate", str(candidate), "--expected-sha", digest(b"same\n"),
+                 "--journal", str(journal)], env=environment, check=False,
+            )
+            os.replace(replacement, target)
+            result = subprocess.run(
+                [sys.executable, str(HELPER), "recover", "--journal", str(journal)], check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_bytes(), b"same\n")
+            self.assertTrue(journal.exists())
+
     def test_mismatched_prestate_is_restored_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

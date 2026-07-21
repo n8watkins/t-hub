@@ -70,6 +70,18 @@ def require_regular(path: str) -> os.stat_result:
     return metadata
 
 
+def require_single_link(path: str) -> os.stat_result:
+    metadata = require_regular(path)
+    if metadata.st_nlink != 1:
+        raise AtomicError(f"refusing hard-linked path: {path}")
+    return metadata
+
+
+def identity(path: str) -> Dict[str, int]:
+    metadata = os.lstat(path)
+    return {"device": metadata.st_dev, "inode": metadata.st_ino}
+
+
 def xattrs(path: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for name in sorted(os.listxattr(path, follow_symlinks=False)):
@@ -249,6 +261,15 @@ def recover_exchange(journal: str, cleanup: bool = True) -> str:
     target_digest = inspect_digest(target)
     candidate_digest = inspect_digest(candidate)
     phase = intent["phase"]
+    if phase == "prepared":
+        live_identities = (identity(target), identity(candidate))
+        original_identities = (
+            intent["recovery"].get("target_identity"),
+            intent["recovery"].get("candidate_identity"),
+        )
+        swapped_identities = (original_identities[1], original_identities[0])
+        if live_identities != original_identities and live_identities != swapped_identities:
+            raise AtomicError("prepared exchange path identity changed")
 
     if phase in {"verified", "committed"}:
         if target_digest != desired:
@@ -316,6 +337,11 @@ def recover_create(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     desired = intent["desired"]["digest"]
     target_digest = inspect_digest(target)
     candidate_digest = inspect_digest(candidate)
+    if intent["phase"] == "prepared" and target_digest is None and (
+        candidate_digest is None
+        or identity(candidate) != intent["recovery"].get("candidate_identity")
+    ):
+        raise AtomicError("prepared create path identity changed")
     if target_digest == desired and candidate_digest is None:
         if intent["phase"] != "committed":
             set_phase(journal, intent, "committed")
@@ -336,6 +362,11 @@ def recover_delete(journal: str, intent: Dict[str, Any], cleanup: bool) -> str:
     expected = intent["expected"]["digest"]
     target_digest = inspect_digest(target)
     recovery_digest = inspect_digest(recovery)
+    if intent["phase"] == "prepared" and recovery_digest is None and (
+        target_digest is None
+        or identity(target) != intent["recovery"].get("target_identity")
+    ):
+        raise AtomicError("prepared delete path identity changed")
     if target_digest is None and recovery_digest == expected:
         if intent["phase"] != "committed":
             set_phase(journal, intent, "committed")
@@ -359,6 +390,8 @@ def create(target: str, candidate: str, journal: str) -> None:
         raise AtomicError("target and candidate must share a directory")
     if os.path.lexists(target):
         raise AtomicError("create target is not absent")
+    require_single_link(candidate)
+    candidate_identity = identity(candidate)
     desired_description = description(candidate)
     desired_digest = description_digest(desired_description)
     fsync_file(candidate)
@@ -374,10 +407,12 @@ def create(target: str, candidate: str, journal: str) -> None:
         "expected": {"digest": "absent"},
         "desired": {"digest": desired_digest, "description": desired_description},
         "phase": "prepared",
-        "recovery": {"prestate": "absent"},
+        "recovery": {"prestate": "absent", "candidate_identity": candidate_identity},
     }
     write_json(os.path.join(journal, "intent.json"), intent)
     crash("prepared")
+    if os.path.lexists(target) or identity(candidate) != candidate_identity:
+        raise AtomicError("create path identity changed after prepare")
     os.rename(candidate, target)
     fsync_file(target)
     fsync_directory(os.path.dirname(target))
@@ -392,6 +427,8 @@ def create(target: str, candidate: str, journal: str) -> None:
 def delete(target: str, expected: str, journal: str) -> None:
     target = os.path.abspath(target)
     journal = os.path.abspath(journal)
+    require_single_link(target)
+    target_identity = identity(target)
     actual = state_digest(target)
     if actual != expected:
         raise AtomicError("delete target prestate changed")
@@ -411,10 +448,15 @@ def delete(target: str, expected: str, journal: str) -> None:
         "expected": {"digest": expected},
         "desired": {"digest": "absent"},
         "phase": "prepared",
-        "recovery": {"displaced_prestate": "candidate-after-rename"},
+        "recovery": {
+            "displaced_prestate": "candidate-after-rename",
+            "target_identity": target_identity,
+        },
     }
     write_json(os.path.join(journal, "intent.json"), intent)
     crash("prepared")
+    if identity(target) != target_identity or os.path.lexists(recovery):
+        raise AtomicError("delete path identity changed after prepare")
     os.rename(target, recovery)
     fsync_file(recovery)
     fsync_directory(os.path.dirname(target))
@@ -427,7 +469,13 @@ def delete(target: str, expected: str, journal: str) -> None:
     remove_journal(journal)
 
 
-def exchange(target: str, candidate: str, expected: str, journal: str) -> None:
+def exchange(
+    target: str,
+    candidate: str,
+    expected: str,
+    journal: str,
+    preserve_candidate_metadata: bool = False,
+) -> None:
     target = os.path.abspath(target)
     candidate = os.path.abspath(candidate)
     journal = os.path.abspath(journal)
@@ -437,15 +485,18 @@ def exchange(target: str, candidate: str, expected: str, journal: str) -> None:
         raise AtomicError("target and candidate must share a directory")
     if os.path.commonpath([journal, target]) == target:
         raise AtomicError("journal cannot be nested below the target")
-    target_metadata = require_regular(target)
-    require_regular(candidate)
+    target_metadata = require_single_link(target)
+    require_single_link(candidate)
+    target_identity = identity(target)
+    candidate_identity = identity(candidate)
     before = description(target)
     before_digest = description_digest(before)
     # Backward compatibility for callers that supplied the old content-only
     # hash.  New callers publish the complete state digest.
     if expected not in {before_digest, before["content_sha256"]}:
         raise AtomicError("target prestate changed before prepare")
-    copy_metadata(target, candidate, target_metadata)
+    if not preserve_candidate_metadata:
+        copy_metadata(target, candidate, target_metadata)
     fsync_file(candidate)
     desired_description = description(candidate)
     desired_digest = description_digest(desired_description)
@@ -460,13 +511,20 @@ def exchange(target: str, candidate: str, expected: str, journal: str) -> None:
         "expected": {"digest": before_digest, "description": before},
         "desired": {"digest": desired_digest, "description": desired_description},
         "phase": "prepared",
-        "recovery": {"displaced_prestate": "candidate-after-exchange"},
+        "recovery": {
+            "displaced_prestate": "candidate-after-exchange",
+            "target_identity": target_identity,
+            "candidate_identity": candidate_identity,
+        },
     }
     write_json(os.path.join(journal, "intent.json"), intent)
     fsync_file(target)
     fsync_file(candidate)
     fsync_directory(os.path.dirname(target))
     crash("prepared")
+
+    if identity(target) != target_identity or identity(candidate) != candidate_identity:
+        raise AtomicError("path identity changed after prepare")
 
     durable_exchange(target, candidate)
     crash("exchanged-before-phase")
@@ -521,7 +579,7 @@ def capture(source: str, recovery: str) -> Dict[str, Any]:
     recovery = os.path.abspath(recovery)
     restricted_directory(os.path.dirname(recovery), False)
     if os.path.lexists(source):
-        require_regular(source)
+        require_single_link(source)
         descriptor_value = description(source)
         input_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         output_descriptor, temporary = tempfile.mkstemp(
@@ -619,6 +677,99 @@ def materialize(recovery: str, candidate: str) -> None:
         raise
 
 
+def inherit_metadata(source: str, candidate: str) -> None:
+    metadata = require_regular(source)
+    require_regular(candidate)
+    copy_metadata(source, candidate, metadata)
+    fsync_file(candidate)
+    fsync_directory(os.path.dirname(candidate))
+
+
+def canonical_json_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def claude_rollback(target: str, state_path: str, recovery: str, journal: str) -> None:
+    target = os.path.abspath(target)
+    require_regular(target)
+    with open(state_path, "r", encoding="utf-8") as source:
+        state = json.load(source)
+    with open(target, "r", encoding="utf-8") as source:
+        current = json.load(source)
+    if not isinstance(current, dict):
+        raise AtomicError("refusing non-object Claude config")
+    parent = current.get("mcpServers", None)
+    if "mcpServers" not in current or not isinstance(parent, dict):
+        raise AtomicError("Claude mcpServers ownership boundary disappeared")
+    post_key = state["post_structure"]["key"]
+    key_present = "t-hub" in parent
+    if key_present != post_key["presence"]:
+        raise AtomicError("Claude t-hub ownership changed after helper return")
+    if key_present:
+        current_digest = canonical_json_digest(parent["t-hub"])
+        if current_digest != post_key["digest"]:
+            raise AtomicError("Claude t-hub owner changed after helper return")
+
+    before = state["before"]
+    before_file = state["before_file"]
+    before_document: Dict[str, Any] = {}
+    if before_file["presence"] == "present":
+        require_regular(recovery)
+        with open(recovery, "r", encoding="utf-8") as source:
+            before_document = json.load(source)
+        if not isinstance(before_document, dict):
+            raise AtomicError("recovery Claude config is not an object")
+    if before["key"]["presence"]:
+        before_parent = before_document.get("mcpServers")
+        if not isinstance(before_parent, dict) or "t-hub" not in before_parent:
+            raise AtomicError("Claude recovery key contradicts its descriptor")
+        parent["t-hub"] = before_parent["t-hub"]
+    else:
+        parent.pop("t-hub", None)
+        if not before["parent"]["presence"] and not parent:
+            current.pop("mcpServers", None)
+
+    expected = state_digest(target)
+    if before_file["presence"] == "absent" and not current:
+        delete(target, expected, journal)
+        return
+    candidate_descriptor, candidate = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.t-hub-rollback.", dir=os.path.dirname(target)
+    )
+    try:
+        with os.fdopen(candidate_descriptor, "w", encoding="utf-8") as output:
+            json.dump(current, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        exchange(target, candidate, expected, journal)
+    except BaseException:
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        raise
+    # After exchange this contains the displaced poststate.
+    discard(candidate)
+
+
+def purge(path: str) -> None:
+    path = os.path.abspath(path)
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode):
+        raise AtomicError(f"refusing symlink during purge: {path}")
+    if stat.S_ISREG(metadata.st_mode):
+        discard(path)
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise AtomicError(f"refusing special path during purge: {path}")
+    for name in os.listdir(path):
+        purge(os.path.join(path, name))
+    os.rmdir(path)
+    fsync_directory(os.path.dirname(path))
+
+
 def discard(path: str) -> None:
     path = os.path.abspath(path)
     require_regular(path)
@@ -641,11 +792,13 @@ def main() -> int:
     exchange_parser.add_argument("--expected-sha")
     exchange_parser.add_argument("--expected-digest")
     exchange_parser.add_argument("--journal")
+    exchange_parser.add_argument("--preserve-candidate-metadata", action="store_true")
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--target", required=True)
     install_parser.add_argument("--candidate", required=True)
     install_parser.add_argument("--expected-digest", required=True)
     install_parser.add_argument("--journal", required=True)
+    install_parser.add_argument("--preserve-candidate-metadata", action="store_true")
     delete_parser = subparsers.add_parser("delete")
     delete_parser.add_argument("--target", required=True)
     delete_parser.add_argument("--expected-digest", required=True)
@@ -661,6 +814,18 @@ def main() -> int:
     materialize_parser = subparsers.add_parser("materialize")
     materialize_parser.add_argument("--recovery", required=True)
     materialize_parser.add_argument("--candidate", required=True)
+    inherit_parser = subparsers.add_parser("inherit-metadata")
+    inherit_parser.add_argument("--source", required=True)
+    inherit_parser.add_argument("--candidate", required=True)
+    claude_rollback_parser = subparsers.add_parser("claude-rollback")
+    claude_rollback_parser.add_argument("--target", required=True)
+    claude_rollback_parser.add_argument("--state", required=True)
+    claude_rollback_parser.add_argument("--recovery", required=True)
+    claude_rollback_parser.add_argument("--journal", required=True)
+    purge_parser = subparsers.add_parser("purge")
+    purge_parser.add_argument("--path", required=True)
+    sync_parser = subparsers.add_parser("sync-directory")
+    sync_parser.add_argument("--path", required=True)
     publish_parser = subparsers.add_parser("publish")
     publish_parser.add_argument("--path", required=True)
     publish_parser.add_argument("--value", required=True)
@@ -677,6 +842,7 @@ def main() -> int:
                 arguments.candidate,
                 expected,
                 arguments.journal or default_journal(arguments.candidate),
+                arguments.preserve_candidate_metadata,
             )
         elif arguments.command == "install":
             if arguments.expected_digest == "absent":
@@ -687,6 +853,7 @@ def main() -> int:
                     arguments.candidate,
                     arguments.expected_digest,
                     arguments.journal,
+                    arguments.preserve_candidate_metadata,
                 )
         elif arguments.command == "delete":
             delete(arguments.target, arguments.expected_digest, arguments.journal)
@@ -699,6 +866,16 @@ def main() -> int:
             print(json.dumps(capture(arguments.source, arguments.recovery), sort_keys=True))
         elif arguments.command == "materialize":
             materialize(arguments.recovery, arguments.candidate)
+        elif arguments.command == "inherit-metadata":
+            inherit_metadata(arguments.source, arguments.candidate)
+        elif arguments.command == "claude-rollback":
+            claude_rollback(
+                arguments.target, arguments.state, arguments.recovery, arguments.journal
+            )
+        elif arguments.command == "purge":
+            purge(arguments.path)
+        elif arguments.command == "sync-directory":
+            fsync_directory(os.path.abspath(arguments.path))
         elif arguments.command == "publish":
             publish(arguments.path, arguments.value)
         else:

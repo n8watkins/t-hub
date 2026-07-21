@@ -37,10 +37,11 @@ if jq -e '
   .status == "committed" and
   .before.file_presence == "absent" and
   .before.parent == {presence:false,type:"absent"} and
-  .before.key == {presence:false,type:"absent"} and
+  .before.key == {presence:false,type:"absent",digest:"absent"} and
   .post_structure.file_presence == "present" and
   .post_structure.parent == {presence:true,type:"object"} and
-  .post_structure.key == {presence:true,type:"object"} and
+  .post_structure.key.presence == true and .post_structure.key.type == "object" and
+  (.post_structure.key.digest | type) == "string" and
   (.before_file | has("value") | not) and
   (.before | has("value") | not) and
   (.post_structure | has("value") | not)

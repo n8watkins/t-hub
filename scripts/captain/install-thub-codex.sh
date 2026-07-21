@@ -61,168 +61,232 @@ bash "$HERE/install-captain-skills.sh" --check "${SKILL_ARGS[@]}"
 install -d -m 700 "$BIN_DIR" "$CAPTAIN_DIR"
 exec 8>"$CAPTAIN_DIR/install.lock"
 flock -x 8
-TXN="$(mktemp -d "$BIN_DIR/.t-hub-install.XXXXXX")"
-STAGED_BIN="$TXN/t-hub-mcp"
-STAGED_CODEX="$TXN/ensure-thub-codex.sh"
-STAGED_CLAUDE="$TXN/ensure-thub-claude.sh"
-STAGED_ATOMIC="$TXN/atomic-config.py"
-STATE_DIR="$TXN/helper-state"
-install -d -m 700 "$STATE_DIR"
-install -m 700 "$SOURCE" "$STAGED_BIN"
-install -m 700 "$HERE/ensure-thub-codex.sh" "$STAGED_CODEX"
-install -m 700 "$HERE/ensure-thub-claude.sh" "$STAGED_CLAUDE"
-install -m 700 "$HERE/atomic-config.py" "$STAGED_ATOMIC"
-"$STAGED_BIN" --list-tools >/dev/null
 
-backup_file() {
-  local source="$1" name="$2"
-  if [ -f "$source" ]; then
-    cp -p "$source" "$TXN/$name"
-    printf 'present' > "$TXN/$name.state"
-  else
-    printf 'absent' > "$TXN/$name.state"
-  fi
-}
-restore_file() {
-  local target="$1" name="$2"
-  if [ "$(cat "$TXN/$name.state")" = present ]; then
-    install -d -m 700 "$(dirname "$target")"
-    cp -p "$TXN/$name" "$target"
-  else
-    rm -f "$target"
-  fi
-}
-file_state() {
-  if [ -f "$1" ]; then sha256sum "$1" | awk '{print $1}'; else printf 'absent\n'; fi
-}
-claude_node() {
-  if [ -f "$1" ]; then
-    jq -Sc '.mcpServers["t-hub"] // null' "$1"
-  else
-    printf 'null\n'
-  fi
-}
-claude_structure() {
-  if [ -f "$1" ]; then
-    jq -Sc '{parent_present:has("mcpServers"),key_present:(.mcpServers|has("t-hub")),value:.mcpServers["t-hub"]}' "$1"
-  else
-    printf '{"parent_present":false,"key_present":false,"value":null}\n'
-  fi
-}
-restore_config() {
-  local target="$1" name="$2" expected_name="$3"
-  local expected candidate
-  expected="$(cat "$TXN/$expected_name")"
-  if [ "$(cat "$TXN/$name.state")" = present ]; then
-    candidate="$(mktemp "${target}.t-hub-rollback.XXXXXX")"
-    cp -p "$TXN/$name" "$candidate"
-    if ! python3 "$CAPTAIN_DIR/atomic-config.py" exchange --target "$target" \
-      --candidate "$candidate" --expected-sha "$expected"; then
-      echo "install-thub-codex: $target changed concurrently; refusing unsafe rollback" >&2
-      rm -f "$candidate"
-      return
-    fi
-    rm -f "$candidate"
-  elif [ "$(file_state "$target")" = "$expected" ]; then
-    rm -f "$target"
-  else
-    echo "install-thub-codex: $target changed concurrently; refusing unsafe rollback" >&2
-  fi
-}
-restore_claude_registration() {
-  if [ "$(cat "$TXN/claude-node-changed")" != true ]; then return; fi
-  if [ ! -f "$CLAUDE_CONFIG" ]; then
-    echo "install-thub-codex: Claude config disappeared; refusing unsafe registration rollback" >&2
-    return
-  fi
-  local current_node post_node before_node source_hash current_hash update
-  current_node="$(claude_node "$CLAUDE_CONFIG")"
-  post_node="$(cat "$TXN/post-claude-node")"
-  if [ "$current_node" != "$post_node" ]; then
-    echo "install-thub-codex: Claude t-hub registration changed concurrently; refusing unsafe rollback" >&2
-    return
-  fi
-  before_node="$(cat "$TXN/before-claude-node")"
-  source_hash="$(file_state "$CLAUDE_CONFIG")"
-  update="$(mktemp "${CLAUDE_CONFIG}.t-hub-rollback.XXXXXX")"
-  if [ "$before_node" = null ]; then
-    jq 'del(.mcpServers["t-hub"]) | if (.mcpServers // {}) == {} then del(.mcpServers) else . end' \
-      "$CLAUDE_CONFIG" > "$update"
-  else
-    jq --argjson before "$before_node" '.mcpServers["t-hub"] = $before' \
-      "$CLAUDE_CONFIG" > "$update"
-  fi
-  remove_restored_config=false
-  if [ "$(cat "$TXN/previous-claude-config.state")" = absent ] \
-    && jq -e 'keys == []' "$update" >/dev/null; then
-    remove_restored_config=true
-  fi
-  if ! python3 "$CAPTAIN_DIR/atomic-config.py" exchange --target "$CLAUDE_CONFIG" \
-    --candidate "$update" --expected-sha "$source_hash"; then
-    echo "install-thub-codex: Claude config changed during rollback; preserving latest file" >&2
-    rm -f "$update"
-    return
-  fi
-  if "$remove_restored_config"; then
-    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$CLAUDE_CONFIG"
-    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$update"
-  else
-    python3 "$CAPTAIN_DIR/atomic-config.py" discard --path "$update"
-  fi
-}
-
-backup_file "$DEST" previous-bin
-backup_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
-backup_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
-backup_file "$CAPTAIN_DIR/atomic-config.py" previous-atomic
-backup_file "$CODEX_CONFIG" previous-codex-config
-backup_file "$CLAUDE_CONFIG" previous-claude-config
-file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
-claude_node "$CLAUDE_CONFIG" > "$TXN/before-claude-node"
-printf 'false\n' > "$TXN/claude-node-changed"
-rollback() {
-  set +e
-  restore_file "$DEST" previous-bin
-  restore_config "$CODEX_CONFIG" previous-codex-config expected-codex-config
-  restore_claude_registration
-  restore_file "$CAPTAIN_DIR/ensure-thub-codex.sh" previous-codex
-  restore_file "$CAPTAIN_DIR/ensure-thub-claude.sh" previous-claude
-  restore_file "$CAPTAIN_DIR/atomic-config.py" previous-atomic
-  rm -rf "$TXN"
-}
-trap rollback EXIT
-
-install -m 700 "$STAGED_BIN" "$DEST"
-install -m 700 "$STAGED_CODEX" "$CAPTAIN_DIR/ensure-thub-codex.sh"
-install -m 700 "$STAGED_CLAUDE" "$CAPTAIN_DIR/ensure-thub-claude.sh"
-install -m 700 "$STAGED_ATOMIC" "$CAPTAIN_DIR/atomic-config.py"
-CHILD_ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$CAPTAIN_DIR/atomic-config.py}"
-T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" \
-  T_HUB_ATOMIC_CONFIG_HELPER="$CHILD_ATOMIC_HELPER" "$CAPTAIN_DIR/ensure-thub-claude.sh"
-if [ ! -f "$STATE_DIR/claude-state.json" ] || ! jq -e --arg hash "$(file_state "$CLAUDE_CONFIG")" \
-  --argjson structure "$(claude_structure "$CLAUDE_CONFIG")" \
-  '.presence == "present" and .hash == $hash and .structure == $structure' \
-  "$STATE_DIR/claude-state.json" >/dev/null; then
-  echo "install-thub-codex: Claude helper poststate changed before adoption" >&2
+ATOMIC_SOURCE="$HERE/atomic-config.py"
+TRANSACTION_ROOT="${T_HUB_TRANSACTION_ROOT:-${HOME}/.t-hub/transactions}"
+TXN="$TRANSACTION_ROOT/install-current"
+install -d -m 700 "$TRANSACTION_ROOT"
+if [ "$(stat -c %u "$TRANSACTION_ROOT")" != "$(id -u)" ] \
+  || [ "$(stat -c %a "$TRANSACTION_ROOT")" != 700 ]; then
+  echo "install-thub-codex: transaction root must be current-user owned with mode 0700" >&2
   exit 1
 fi
-claude_node "$CLAUDE_CONFIG" > "$TXN/post-claude-node"
-if ! cmp -s "$TXN/before-claude-node" "$TXN/post-claude-node"; then
-  printf 'true\n' > "$TXN/claude-node-changed"
+
+describe_digest() {
+  if [ -f "$1" ]; then
+    python3 "$ATOMIC_SOURCE" describe --path "$1" | jq -r .digest
+  else
+    printf 'absent\n'
+  fi
+}
+
+publish_manifest_status() {
+  local status="$1"
+  manifest="$(jq --arg status "$status" '.status=$status' "$TXN/manifest.json")"
+  python3 "$ATOMIC_SOURCE" publish --path "$TXN/manifest.json" --value "$manifest"
+}
+
+write_stage() {
+  local name="$1" value="$2"
+  python3 "$ATOMIC_SOURCE" publish --path "$TXN/stages/$name.json" --value "$value"
+}
+
+recover_atomic_ops() {
+  local op
+  for op in "$TXN"/ops/* "$CODEX_CONFIG".t-hub-*.journal "$CLAUDE_CONFIG".t-hub-*.journal; do
+    [ -d "$op" ] || continue
+    python3 "$ATOMIC_SOURCE" recover --journal "$op" >/dev/null
+  done
+}
+
+rollback_file_stage() {
+  local name="$1" stage target live desired before_presence before_digest recovery candidate
+  [ -f "$TXN/stages/$name.json" ] || return 0
+  stage="$(cat "$TXN/stages/$name.json")"
+  target="$(printf '%s' "$stage" | jq -r .target)"
+  desired="$(printf '%s' "$stage" | jq -r .desired.digest)"
+  before_presence="$(printf '%s' "$stage" | jq -r .before.presence)"
+  before_digest="$(printf '%s' "$stage" | jq -r .before.digest)"
+  live="$(describe_digest "$target")"
+  if [ "$live" = "$before_digest" ]; then return 0; fi
+  if [ "$live" != "$desired" ]; then
+    echo "install-thub-codex: $target left helper ownership; recovery refused" >&2
+    return 1
+  fi
+  if [ "$before_presence" = absent ]; then
+    python3 "$ATOMIC_SOURCE" delete --target "$target" --expected-digest "$live" \
+      --journal "$TXN/ops/rollback-$name"
+  else
+    recovery="$(printf '%s' "$stage" | jq -r --arg fallback "$TXN/recovery/$name.bin" '.recovery // $fallback')"
+    candidate="$(mktemp "$(dirname "$target")/.t-hub-rollback.XXXXXX")"
+    python3 "$ATOMIC_SOURCE" discard --path "$candidate"
+    python3 "$ATOMIC_SOURCE" materialize --recovery "$recovery" --candidate "$candidate"
+    python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
+      --expected-digest "$live" --preserve-candidate-metadata \
+      --journal "$TXN/ops/rollback-$name"
+    python3 "$ATOMIC_SOURCE" discard --path "$candidate"
+  fi
+}
+
+rollback_transaction() {
+  set +e
+  recover_atomic_ops || return 1
+  if [ -d "$TXN/skills" ]; then
+    T_HUB_SKILL_TRANSACTION_DIR="$TXN/skills" T_HUB_SKILL_RECOVER_ONLY=1 \
+      T_HUB_ATOMIC_CONFIG_HELPER="$ATOMIC_SOURCE" \
+      bash "$HERE/install-captain-skills.sh" || return 1
+  fi
+  if [ -f "$TXN/stages/codex-config.json" ]; then
+    rollback_file_stage codex-config || return 1
+  fi
+  if [ -f "$TXN/helper-state/claude-state.json" ]; then
+    live="$(describe_digest "$CLAUDE_CONFIG")"
+    post="$(jq -r .post.digest "$TXN/helper-state/claude-state.json")"
+    before="$(jq -r .before_file.digest "$TXN/helper-state/claude-state.json")"
+    if [ "$live" != "$before" ]; then
+      if ! python3 "$ATOMIC_SOURCE" claude-rollback --target "$CLAUDE_CONFIG" \
+        --state "$TXN/helper-state/claude-state.json" \
+        --recovery "$TXN/helper-state/claude-before.bin" \
+        --journal "$TXN/ops/rollback-claude-config"; then
+        return 1
+      fi
+    fi
+  fi
+  rollback_file_stage atomic-helper || return 1
+  rollback_file_stage claude-helper || return 1
+  rollback_file_stage codex-helper || return 1
+  rollback_file_stage binary || return 1
+  python3 "$ATOMIC_SOURCE" purge --path "$TXN"
+}
+
+recover_previous_transaction() {
+  [ -d "$TXN" ] || return 0
+  if [ ! -f "$TXN/manifest.json" ]; then
+    echo "install-thub-codex: incomplete transaction has no valid manifest" >&2
+    return 1
+  fi
+  status="$(jq -r .status "$TXN/manifest.json")"
+  if ! jq -e --arg source "$(readlink -f "$SOURCE")" \
+    --arg source_digest "$(sha256sum "$SOURCE" | awk '{print $1}')" \
+    --arg dest "$DEST" --arg captain_dir "$CAPTAIN_DIR" \
+    --arg codex_config "$CODEX_CONFIG" --arg claude_config "$CLAUDE_CONFIG" '
+      .source == $source and .source_digest == $source_digest and
+      .dest == $dest and .captain_dir == $captain_dir and
+      .codex_config == $codex_config and .claude_config == $claude_config
+    ' "$TXN/manifest.json" >/dev/null; then
+    echo "install-thub-codex: interrupted transaction provenance does not match this invocation" >&2
+    return 1
+  fi
+  recover_atomic_ops
+  if [ "$status" = claude-running ] || [ "$status" = codex-running ]; then
+    echo "install-thub-codex: helper stopped before publishing its post boundary; recovery refused" >&2
+    return 1
+  fi
+  if [ "$status" = skills-running ] || [ "$status" = skills-applied ]; then
+    repair="$(jq -r .repair_skills "$TXN/manifest.json")"
+    recovery_args=()
+    [ "$repair" != true ] || recovery_args=(--repair)
+    T_HUB_SKILL_TRANSACTION_DIR="$TXN/skills" \
+      T_HUB_ATOMIC_CONFIG_HELPER="$ATOMIC_SOURCE" \
+      bash "$HERE/install-captain-skills.sh" "${recovery_args[@]}"
+    python3 "$ATOMIC_SOURCE" purge --path "$TXN"
+    echo "install-thub-codex: completed interrupted skills stage"
+    return 0
+  fi
+  rollback_transaction
+  echo "install-thub-codex: rolled back interrupted transaction"
+}
+
+recover_previous_transaction
+
+install -d -m 700 "$TXN" "$TXN/stages" "$TXN/recovery" "$TXN/ops" "$TXN/helper-state"
+repair_skills=false
+[ "${SKILL_ARGS[*]:-}" != --repair ] || repair_skills=true
+manifest="$(jq -cn --arg status active --argjson repair "$repair_skills" \
+  --arg source "$(readlink -f "$SOURCE")" \
+  --arg source_digest "$(sha256sum "$SOURCE" | awk '{print $1}')" \
+  --arg dest "$DEST" --arg captain_dir "$CAPTAIN_DIR" \
+  --arg codex_config "$CODEX_CONFIG" --arg claude_config "$CLAUDE_CONFIG" \
+  '{version:1,status:$status,repair_skills:$repair,source:$source,
+    source_digest:$source_digest,dest:$dest,captain_dir:$captain_dir,
+    codex_config:$codex_config,claude_config:$claude_config}')"
+python3 "$ATOMIC_SOURCE" publish --path "$TXN/manifest.json" --value "$manifest"
+
+install_file_stage() {
+  local source="$1" target="$2" name="$3" before candidate desired stage
+  install -d -m 700 "$(dirname "$target")"
+  before="$(python3 "$ATOMIC_SOURCE" capture --source "$target" \
+    --recovery "$TXN/recovery/$name.bin")"
+  candidate="$(mktemp "$(dirname "$target")/.t-hub-stage.XXXXXX")"
+  install -m 700 "$source" "$candidate"
+  desired="$(python3 "$ATOMIC_SOURCE" describe --path "$candidate")"
+  stage="$(jq -cn --arg target "$target" --argjson before "$before" \
+    --argjson desired "$desired" \
+    '{status:"prepared",target:$target,before:$before,desired:$desired}')"
+  write_stage "$name" "$stage"
+  python3 "$ATOMIC_SOURCE" install --target "$target" --candidate "$candidate" \
+    --expected-digest "$(printf '%s' "$before" | jq -r .digest)" \
+    --preserve-candidate-metadata \
+    --journal "$TXN/ops/$name"
+  if [ -f "$candidate" ]; then python3 "$ATOMIC_SOURCE" discard --path "$candidate"; fi
+  stage="$(printf '%s' "$stage" | jq '.status="applied"')"
+  write_stage "$name" "$stage"
+  if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = "$name" ]; then kill -KILL "$$"; fi
+}
+
+rollback_on_exit() {
+  code=$?
+  trap - EXIT
+  if [ "$code" -ne 0 ] && ! rollback_transaction; then
+    echo "install-thub-codex: rollback safely refused; rerun for deterministic recovery" >&2
+  fi
+  exit "$code"
+}
+trap rollback_on_exit EXIT
+
+install_file_stage "$SOURCE" "$DEST" binary
+install_file_stage "$HERE/ensure-thub-codex.sh" "$CAPTAIN_DIR/ensure-thub-codex.sh" codex-helper
+install_file_stage "$HERE/ensure-thub-claude.sh" "$CAPTAIN_DIR/ensure-thub-claude.sh" claude-helper
+install_file_stage "$HERE/atomic-config.py" "$CAPTAIN_DIR/atomic-config.py" atomic-helper
+"$DEST" --list-tools >/dev/null
+
+CHILD_ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$CAPTAIN_DIR/atomic-config.py}"
+publish_manifest_status claude-running
+T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$TXN/helper-state" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$CHILD_ATOMIC_HELPER" "$CAPTAIN_DIR/ensure-thub-claude.sh"
+if [ "$(describe_digest "$CLAUDE_CONFIG")" != \
+  "$(jq -r .post.digest "$TXN/helper-state/claude-state.json")" ]; then
+  echo "install-thub-codex: Claude helper poststate changed before validation" >&2
+  exit 1
 fi
-T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" \
+publish_manifest_status claude-applied
+if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = claude-config ]; then kill -KILL "$$"; fi
+
+publish_manifest_status codex-running
+T_HUB_MCP_BIN="$DEST" T_HUB_INSTALL_STATE_DIR="$TXN/helper-state" \
   T_HUB_ATOMIC_CONFIG_HELPER="$CHILD_ATOMIC_HELPER" \
   "$CAPTAIN_DIR/ensure-thub-codex.sh" "${CODEX_ARGS[@]}"
-if [ ! -f "$STATE_DIR/codex-state.json" ] || ! jq -e --arg hash "$(file_state "$CODEX_CONFIG")" \
-  '.presence == "present" and .hash == $hash' "$STATE_DIR/codex-state.json" >/dev/null; then
-  echo "install-thub-codex: Codex helper poststate changed before adoption" >&2
+if [ "$(describe_digest "$CODEX_CONFIG")" != \
+  "$(jq -r .post.digest "$TXN/helper-state/codex-state.json")" ]; then
+  echo "install-thub-codex: Codex helper poststate changed before validation" >&2
   exit 1
 fi
-file_state "$CODEX_CONFIG" > "$TXN/expected-codex-config"
-bash "$HERE/install-captain-skills.sh" "${SKILL_ARGS[@]}"
+codex_stage="$(jq --arg recovery "$TXN/helper-state/codex-before.bin" \
+  '{status:"applied",target:.target,before:.before,desired:.post,recovery:$recovery}' \
+  "$TXN/helper-state/codex-state.json")"
+write_stage codex-config "$codex_stage"
+publish_manifest_status codex-applied
+if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = codex-config ]; then kill -KILL "$$"; fi
+
+publish_manifest_status skills-running
+T_HUB_SKILL_TRANSACTION_DIR="$TXN/skills" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$ATOMIC_SOURCE" \
+  bash "$HERE/install-captain-skills.sh" "${SKILL_ARGS[@]}"
+publish_manifest_status skills-applied
+if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = skills ]; then kill -KILL "$$"; fi
 
 trap - EXIT
-rm -rf "$TXN"
+python3 "$ATOMIC_SOURCE" purge --path "$TXN"
 
 echo "install-thub-codex: installed $DEST"
 echo "install-thub-codex: start new Codex and Claude sessions to load the updated integration"

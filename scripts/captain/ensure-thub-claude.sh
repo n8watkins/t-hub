@@ -7,19 +7,24 @@ BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
 CONFIG="${HOME}/.claude.json"
 ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$(cd "$(dirname "$0")" && pwd)/atomic-config.py}"
 
-BEFORE_DESCRIPTOR='{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent"}}'
+BEFORE_DESCRIPTOR='{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent","digest":"absent"}}'
 BEFORE_FILE_DESCRIPTOR='{"presence":"absent","digest":"absent","recovery":null}'
 claude_descriptor() {
   if [ ! -f "$CONFIG" ]; then
-    printf '%s\n' '{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent"}}'
+    printf '%s\n' '{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent","digest":"absent"}}'
     return
   fi
-  jq -Sc '{
+  node_digest=absent
+  if jq -e '(.mcpServers|type)=="object" and (.mcpServers|has("t-hub"))' "$CONFIG" >/dev/null; then
+    node_digest="$(jq -Sc '.mcpServers["t-hub"]' "$CONFIG" | sha256sum | awk '{print $1}')"
+  fi
+  jq -Sc --arg node_digest "$node_digest" '{
     file_presence:"present",
     parent:{presence:has("mcpServers"),type:(if has("mcpServers") then (.mcpServers|type) else "absent" end)},
     key:{
       presence:(if (.mcpServers|type)=="object" then (.mcpServers|has("t-hub")) else false end),
-      type:(if (.mcpServers|type)=="object" and (.mcpServers|has("t-hub")) then (.mcpServers["t-hub"]|type) else "absent" end)
+      type:(if (.mcpServers|type)=="object" and (.mcpServers|has("t-hub")) then (.mcpServers["t-hub"]|type) else "absent" end),
+      digest:$node_digest
     }
   }' "$CONFIG"
 }

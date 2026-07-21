@@ -420,6 +420,125 @@ else
   fail "post-skill failure left a partial installation"
 fi
 
+SKILL_KILL_WORK="$WORK/skill-kill"
+SKILL_KILL_CODEX="$SKILL_KILL_WORK/codex"
+SKILL_KILL_CLAUDE="$SKILL_KILL_WORK/claude"
+SKILL_KILL_TXN="$SKILL_KILL_WORK/transaction"
+mkdir -p "$SKILL_KILL_CODEX" "$SKILL_KILL_CLAUDE"
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_KILL_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_KILL_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_KILL_TXN" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  T_HUB_SKILL_CRASH_AFTER_INDEX=3 \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1; then
+  fail "mid-copy skill SIGKILL unexpectedly succeeded"
+elif [ -d "$SKILL_KILL_TXN" ]; then
+  pass "mid-copy skill SIGKILL leaves a durable recovery journal"
+else
+  fail "mid-copy skill SIGKILL lost its recovery journal"
+fi
+if T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$SKILL_KILL_CLAUDE/skills" \
+  T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_KILL_CLAUDE/commands" \
+  T_HUB_SKILL_TRANSACTION_DIR="$SKILL_KILL_TXN" \
+  T_HUB_ATOMIC_CONFIG_HELPER="$HERE/atomic-config.py" \
+  bash "$HERE/install-captain-skills.sh" >/dev/null 2>&1 \
+  && T_HUB_CODEX_SKILLS_DIR="$SKILL_KILL_CODEX/skills" \
+    T_HUB_CLAUDE_SKILLS_DIR="$SKILL_KILL_CLAUDE/skills" \
+    T_HUB_CLAUDE_COMMANDS_DIR="$SKILL_KILL_CLAUDE/commands" \
+    bash "$HERE/install-captain-skills.sh" --verify >/dev/null 2>&1 \
+  && [ ! -e "$SKILL_KILL_TXN" ]; then
+  pass "rerun recovers and completes every skill after mid-copy SIGKILL"
+else
+  fail "mid-copy skill recovery did not converge cleanly"
+fi
+
+for crash_stage in binary codex-helper claude-helper atomic-helper claude-config codex-config skills; do
+  CRASH_WORK="$WORK/crash-$crash_stage"
+  CRASH_HOME="$CRASH_WORK/home"
+  CRASH_CODEX="$CRASH_WORK/codex"
+  CRASH_CLAUDE="$CRASH_WORK/claude"
+  CRASH_BIN="$CRASH_WORK/install/bin"
+  CRASH_CAPTAIN="$CRASH_WORK/install/captain"
+  mkdir -p "$CRASH_HOME" "$CRASH_CODEX" "$CRASH_CLAUDE"
+  if HOME="$CRASH_HOME" CODEX_HOME="$CRASH_CODEX" CLAUDE_HOME="$CRASH_CLAUDE" \
+    T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CRASH_BIN" \
+    T_HUB_CAPTAIN_DIR="$CRASH_CAPTAIN" \
+    T_HUB_INSTALL_CRASH_AFTER_STAGE="$crash_stage" \
+    bash "$SCRIPT" >/dev/null 2>&1; then
+    fail "whole-installer SIGKILL unexpectedly succeeded at $crash_stage"
+    continue
+  fi
+  if HOME="$CRASH_HOME" CODEX_HOME="$CRASH_CODEX" CLAUDE_HOME="$CRASH_CLAUDE" \
+    T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$CRASH_BIN" \
+    T_HUB_CAPTAIN_DIR="$CRASH_CAPTAIN" \
+    bash "$SCRIPT" >/dev/null 2>&1 \
+    && [ ! -e "$CRASH_HOME/.t-hub/transactions/install-current" ] \
+    && CODEX_HOME="$CRASH_CODEX" codex mcp get t-hub --json 2>/dev/null \
+      | jq -e --arg bin "$CRASH_BIN/t-hub-mcp" '.transport.command == $bin' >/dev/null \
+    && jq -e --arg bin "$CRASH_BIN/t-hub-mcp" \
+      '.mcpServers["t-hub"].command == $bin' "$CRASH_HOME/.claude.json" >/dev/null \
+    && T_HUB_CODEX_SKILLS_DIR="$CRASH_CODEX/skills" \
+      T_HUB_CLAUDE_SKILLS_DIR="$CRASH_CLAUDE/skills" \
+      bash "$HERE/install-captain-skills.sh" --verify >/dev/null 2>&1; then
+    pass "rerun recovers whole-installer SIGKILL after $crash_stage"
+  else
+    fail "whole-installer recovery failed after $crash_stage"
+  fi
+done
+
+SERIAL_WORK="$WORK/serialization"
+SERIAL_HOME="$SERIAL_WORK/home"
+SERIAL_CODEX="$SERIAL_WORK/codex"
+SERIAL_CLAUDE="$SERIAL_WORK/claude"
+SERIAL_BIN="$SERIAL_WORK/install/bin"
+SERIAL_CAPTAIN="$SERIAL_WORK/install/captain"
+SERIAL_WRAPPER="$SERIAL_WORK/wrapper"
+mkdir -p "$SERIAL_HOME" "$SERIAL_CODEX" "$SERIAL_CLAUDE" "$SERIAL_WRAPPER"
+cat > "$SERIAL_WRAPPER/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ ! -e "$SERIAL_MARKER" ]; then
+  : > "$SERIAL_MARKER"
+  sleep 2
+fi
+exec "$REAL_CLAUDE" "$@"
+EOF
+chmod 700 "$SERIAL_WRAPPER/claude"
+REAL_CLAUDE="$(command -v claude)"
+HOME="$SERIAL_HOME" CODEX_HOME="$SERIAL_CODEX" CLAUDE_HOME="$SERIAL_CLAUDE" \
+  PATH="$SERIAL_WRAPPER:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  SERIAL_MARKER="$SERIAL_WORK/inside-lock" T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$SERIAL_BIN" T_HUB_CAPTAIN_DIR="$SERIAL_CAPTAIN" \
+  bash "$SCRIPT" >/dev/null 2>&1 &
+first_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -e "$SERIAL_WORK/inside-lock" ] && break
+  sleep 0.1
+done
+HOME="$SERIAL_HOME" CODEX_HOME="$SERIAL_CODEX" CLAUDE_HOME="$SERIAL_CLAUDE" \
+  PATH="$SERIAL_WRAPPER:$PATH" REAL_CLAUDE="$REAL_CLAUDE" \
+  SERIAL_MARKER="$SERIAL_WORK/inside-lock" T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$SERIAL_BIN" T_HUB_CAPTAIN_DIR="$SERIAL_CAPTAIN" \
+  bash "$SCRIPT" >/dev/null 2>&1 &
+second_pid=$!
+sleep 0.3
+if kill -0 "$second_pid" 2>/dev/null; then
+  pass "concurrent installer waits on the persistent install lock"
+else
+  fail "concurrent installer bypassed serialization"
+fi
+wait "$first_pid"
+first_result=$?
+wait "$second_pid"
+second_result=$?
+if [ "$first_result" -eq 0 ] && [ "$second_result" -eq 0 ] \
+  && [ ! -e "$SERIAL_HOME/.t-hub/transactions/install-current" ]; then
+  pass "serialized installers both converge without transaction residue"
+else
+  fail "serialized installers did not converge cleanly"
+fi
+
 if [ "$FAILED" -eq 0 ]; then
   echo "install-thub-codex.test: PASS"
 else

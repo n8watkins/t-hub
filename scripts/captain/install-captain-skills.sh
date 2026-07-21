@@ -10,6 +10,8 @@ CLAUDE_SKILLS="${T_HUB_CLAUDE_SKILLS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/skills
 CLAUDE_COMMANDS="${T_HUB_CLAUDE_COMMANDS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/commands}"
 MODE=install
 REPAIR=false
+ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$HERE/atomic-config.py}"
+SKILL_TXN="${T_HUB_SKILL_TRANSACTION_DIR:-}"
 for arg in "$@"; do
   case "$arg" in
     --check) MODE=check ;;
@@ -54,6 +56,54 @@ file_hash() {
 recorded_hash() {
   sed -n 's/^source-sha256=//p' "$1"
 }
+
+recover_skill_transaction() {
+  local entry index target backup sidecar_backup original_target original_sidecar temp
+  [ -n "$SKILL_TXN" ] && [ -d "$SKILL_TXN" ] || return 0
+  for ((index = 6; index >= 0; index--)); do
+    entry="$SKILL_TXN/entries/$index.json"
+    [ -f "$entry" ] || continue
+    target="$(jq -r .target "$entry")"
+    backup="$(jq -r .backup "$entry")"
+    sidecar_backup="$(jq -r .sidecar_backup "$entry")"
+    temp="$(jq -r .temp "$entry")"
+    original_target="$(jq -r .original_target "$entry")"
+    original_sidecar="$(jq -r .original_sidecar "$entry")"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      python3 "$ATOMIC_HELPER" purge --path "$target"
+    fi
+    if [ "$original_target" = true ]; then
+      [ -e "$backup" ] || [ -L "$backup" ] || {
+        echo "install-captain-skills: missing durable target backup: $target" >&2
+        return 1
+      }
+      mv "$backup" "$target"
+      python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+    fi
+    if [ "$(jq -r .kind "$entry")" = command ]; then
+      if [ -e "$target.t-hub-managed" ]; then
+        python3 "$ATOMIC_HELPER" purge --path "$target.t-hub-managed"
+      fi
+      if [ "$original_sidecar" = true ]; then
+        [ -e "$sidecar_backup" ] || {
+          echo "install-captain-skills: missing durable marker backup: $target" >&2
+          return 1
+        }
+        mv "$sidecar_backup" "$target.t-hub-managed"
+        python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
+      fi
+    fi
+    if [ -e "$temp" ] || [ -L "$temp" ]; then
+      python3 "$ATOMIC_HELPER" purge --path "$temp"
+    fi
+  done
+  python3 "$ATOMIC_HELPER" purge --path "$SKILL_TXN"
+}
+
+# A killed prior installer leaves this restricted journal in place.  Restore
+# every recorded target before checking ownership or beginning a fresh copy.
+recover_skill_transaction
+if [ "${T_HUB_SKILL_RECOVER_ONLY:-0}" = 1 ]; then exit 0; fi
 
 SOURCES=(
   "$SOURCE_ROOT/captain"
@@ -157,6 +207,10 @@ SIDECAR_BACKUPS=()
 INSTALLED=0
 rollback() {
   local index
+  if [ -n "$SKILL_TXN" ] && [ -d "$SKILL_TXN" ]; then
+    recover_skill_transaction
+    return
+  fi
   for ((index = INSTALLED - 1; index >= 0; index--)); do
     rm -rf "${TARGETS[$index]}"
     if [ -e "${BACKUPS[$index]}" ] || [ -L "${BACKUPS[$index]}" ]; then
@@ -200,6 +254,28 @@ for index in "${!SOURCES[@]}"; do
   SIDECAR_BACKUPS[$index]="$target_root/.$name.marker.previous.$$"
 done
 
+if [ -n "$SKILL_TXN" ]; then
+  install -d -m 700 "$SKILL_TXN" "$SKILL_TXN/entries"
+  python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/state.json" \
+    --value '{"version":1,"status":"running"}'
+  for index in "${!TARGETS[@]}"; do
+    target="${TARGETS[$index]}"
+    original_target=false
+    original_sidecar=false
+    if [ -e "$target" ] || [ -L "$target" ]; then original_target=true; fi
+    if [ "${KINDS[$index]}" = command ] && [ -e "$target.t-hub-managed" ]; then
+      original_sidecar=true
+    fi
+    entry="$(jq -cn --arg target "$target" --arg temp "${TEMPS[$index]}" \
+      --arg backup "${BACKUPS[$index]}" --arg sidecar_backup "${SIDECAR_BACKUPS[$index]}" \
+      --arg kind "${KINDS[$index]}" --argjson original_target "$original_target" \
+      --argjson original_sidecar "$original_sidecar" \
+      '{target:$target,temp:$temp,backup:$backup,sidecar_backup:$sidecar_backup,
+        kind:$kind,original_target:$original_target,original_sidecar:$original_sidecar}')"
+    python3 "$ATOMIC_HELPER" publish --path "$SKILL_TXN/entries/$index.json" --value "$entry"
+  done
+fi
+
 for index in "${!TARGETS[@]}"; do
   target="${TARGETS[$index]}"
   backup="${BACKUPS[$index]}"
@@ -207,15 +283,20 @@ for index in "${!TARGETS[@]}"; do
   INSTALLED=$((index + 1))
   if [ -e "$target" ] || [ -L "$target" ]; then
     mv "$target" "$backup"
+    python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
   fi
   if [ "${KINDS[$index]}" = command ] && [ -e "$target.t-hub-managed" ]; then
     mv "$target.t-hub-managed" "${SIDECAR_BACKUPS[$index]}"
+    python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
   fi
   mv "${TEMPS[$index]}" "$target"
+  python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
   if [ "${KINDS[$index]}" = command ]; then
     printf 'managed by T-Hub\nhash-version=2\nsource-sha256=%s\n' \
       "$(file_hash "${SOURCES[$index]}")" > "$target.t-hub-managed"
+    python3 "$ATOMIC_HELPER" sync-directory --path "$(dirname "$target")"
   fi
+  if [ "${T_HUB_SKILL_CRASH_AFTER_INDEX:-}" = "$index" ]; then kill -KILL "$$"; fi
 done
 
 if [ "${T_HUB_SKILL_FAIL_AFTER_INSTALL:-0}" = 1 ]; then
@@ -240,4 +321,7 @@ done
 for backup in "${SIDECAR_BACKUPS[@]}"; do
   rm -f "$backup"
 done
+if [ -n "$SKILL_TXN" ] && [ -d "$SKILL_TXN" ]; then
+  python3 "$ATOMIC_HELPER" purge --path "$SKILL_TXN"
+fi
 echo "install-captain-skills: installed Captain, Shipmate, and Handoff for Codex and Claude"
