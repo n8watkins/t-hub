@@ -1386,6 +1386,48 @@ pub(crate) fn posix_form(path: &str) -> String {
     }
 }
 
+/// Resolve an existing Project root in the filesystem that owns it.
+/// Windows must resolve WSL roots inside WSL instead of using host
+/// `std::fs::canonicalize` over the UNC bridge.
+pub(crate) fn canonical_posix_path(path: &str) -> Result<String, String> {
+    let posix = posix_form(path);
+    #[cfg(windows)]
+    {
+        resolve_real_posix(&posix)
+            .map(|resolved| resolved.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("could not resolve WSL path '{posix}'"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(&posix)
+            .map(|resolved| resolved.to_string_lossy().into_owned())
+            .map_err(|error| format!("could not resolve path '{posix}': {error}"))
+    }
+}
+
+pub(crate) fn validate_configured_wsl_path(path: &str) -> Result<(), String> {
+    let replaced = path.trim().replace('/', "\\");
+    let normalized = strip_ascii_case_prefix(&replaced, "\\\\?\\UNC\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .unwrap_or(replaced);
+    let Some(without_leading) = normalized.strip_prefix("\\\\") else {
+        return Ok(());
+    };
+    let mut parts = without_leading.split('\\');
+    let server = parts.next().unwrap_or_default();
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return Err("rootPath must be a WSL path".into());
+    }
+    let distro = parts.next().unwrap_or_default();
+    if !distro.eq_ignore_ascii_case(&configured_wsl_distro()) {
+        return Err(format!(
+            "rootPath belongs to WSL distribution '{distro}', expected '{}'",
+            configured_wsl_distro()
+        ));
+    }
+    Ok(())
+}
+
 fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
     if !enforce {
         return Ok(normalize(path));
@@ -2177,6 +2219,15 @@ mod tests {
         )
         .is_err());
         assert!(posix_to_wsl_unc("C:\\Users\\natha", distro).is_err());
+    }
+
+    #[test]
+    fn configured_wsl_identity_rejects_foreign_distro_but_accepts_posix() {
+        assert!(validate_configured_wsl_path("/home/natkins/project").is_ok());
+        assert!(
+            validate_configured_wsl_path("\\\\wsl.localhost\\Debian\\home\\natkins\\project")
+                .is_err()
+        );
     }
 
     #[test]

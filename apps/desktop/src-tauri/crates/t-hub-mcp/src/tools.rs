@@ -400,11 +400,22 @@ fn schema_register_project() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "repoRoot": { "type": "string", "description": "Path inside an existing Git repository, or an existing folder when initializeGit is explicitly true; T-Hub resolves its canonical main worktree." },
-            "createDirectory": { "type": "boolean", "description": "Explicitly create repoRoot as one absent leaf for a new empty codebase. Requires initializeGit: true and never replaces an existing path." },
-            "initializeGit": { "type": "boolean", "description": "Explicitly initialize Git with main as the default branch when repoRoot is not already a repository. Defaults to false and never replaces an existing .git entry." },
-            "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
+            "repoRoot": { "type": "string", "description": "Existing POSIX WSL Project root, whether Git-enabled or not." },
+            "createDirectory": { "type": "boolean", "description": "Explicitly create repoRoot as one absent leaf for a new empty non-Git codebase." },
+            "name": { "type": "string", "minLength": 1, "description": "Required explicit Project display name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
+        },
+        "required": ["repoRoot", "name"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_initialize_git() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repoRoot": { "type": "string", "description": "Existing POSIX WSL Project root to initialize." },
+            "name": { "type": "string", "minLength": 1, "description": "Required when the Project is not already registered." }
         },
         "required": ["repoRoot"],
         "additionalProperties": false
@@ -1336,8 +1347,14 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "register_project",
             tier: Tier::Organization,
-            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf.",
+            summary: "Register an existing Git or non-Git WSL Project, or explicitly create one absent empty-codebase leaf.",
             input_schema: schema_register_project,
+        },
+        ToolDef {
+            name: "initialize_git",
+            tier: Tier::Organization,
+            summary: "Explicitly initialize Git for an existing Project root.",
+            input_schema: schema_initialize_git,
         },
         ToolDef {
             name: "watch_fleet",
@@ -1731,19 +1748,18 @@ mod tests {
             1000
         );
 
-        for name in ["register_project", "bind_project_powder"] {
+        for name in ["register_project", "initialize_git", "bind_project_powder"] {
             let tool = find(name).unwrap();
             assert_eq!(tool.tier, Tier::Organization);
             assert_eq!(tool.to_mcp()["annotations"]["confirmationRequired"], false);
         }
         assert_eq!(
             (find("register_project").unwrap().input_schema)()["required"],
-            json!(["repoRoot"])
+            json!(["repoRoot", "name"])
         );
         assert_eq!(
-            (find("register_project").unwrap().input_schema)()["properties"]["initializeGit"]
-                ["type"],
-            "boolean"
+            (find("register_project").unwrap().input_schema)()["properties"]["name"]["minLength"],
+            1
         );
         assert_eq!(
             (find("register_project").unwrap().input_schema)()["properties"]["createDirectory"]
