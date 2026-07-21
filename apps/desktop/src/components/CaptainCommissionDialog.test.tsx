@@ -2,17 +2,12 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { commissionCaptain, listProjects, registerProject } from "../ipc/projects";
-import { gitInfo, gitWorktreeList } from "../ipc/git";
 import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 vi.mock("../ipc/projects", () => ({
   commissionCaptain: vi.fn(),
   listProjects: vi.fn(),
   registerProject: vi.fn(),
-}));
-vi.mock("../ipc/git", () => ({
-  gitInfo: vi.fn(),
-  gitWorktreeList: vi.fn(),
 }));
 vi.mock("./WslFolderPicker", () => ({
   WslFolderPicker: ({
@@ -39,14 +34,6 @@ describe("CaptainCommissionDialog", () => {
       seq: 0,
       wslHome: "/home/natkins",
     });
-    vi.mocked(gitInfo).mockResolvedValue({
-      isRepo: false,
-      branch: null,
-      worktreeRoot: null,
-      isLinkedWorktree: false,
-      dirtyCount: 0,
-    });
-    vi.mocked(gitWorktreeList).mockResolvedValue([]);
     vi.mocked(registerProject).mockResolvedValue({
       projectId: "project-none",
       name: "Appturnity",
@@ -86,8 +73,40 @@ describe("CaptainCommissionDialog", () => {
       }),
     );
     expect(vi.mocked(registerProject).mock.calls[0][0]).not.toHaveProperty("initializeGit");
+    expect(screen.queryByText(/Git/i)).toBeNull();
     await waitFor(() => expect(commissionCaptain).toHaveBeenCalled());
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps display name separate from the new destination leaf", async () => {
+    vi.mocked(registerProject).mockResolvedValueOnce({
+      projectId: "new-project",
+      name: "Marketing Site",
+      rootPath: "/home/natkins/marketing-site",
+      repoRoot: "/home/natkins/marketing-site",
+      vcsCapability: "none",
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Create new codebase" }));
+    fireEvent.change(await screen.findByLabelText("New codebase name"), {
+      target: { value: "Marketing Site" },
+    });
+    fireEvent.change(screen.getByLabelText("Destination folder name"), {
+      target: { value: "marketing-site" },
+    });
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Set up the site" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    await waitFor(() =>
+      expect(registerProject).toHaveBeenCalledWith({
+        rootPath: "/home/natkins/marketing-site",
+        name: "Marketing Site",
+        createDirectory: true,
+      }),
+    );
   });
 
   it("requires an explicit non-empty codebase name", async () => {
