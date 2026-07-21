@@ -123,6 +123,8 @@ describe("WslFolderPicker", () => {
     render(<WslFolderPicker path="/home/blocked" recentPaths={[]} onPathChange={vi.fn()} />);
     expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
     expect(screen.getByText("permission denied", { exact: false })).toBeTruthy();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Retry folder listing" })).toHaveLength(1);
     expect(screen.queryByText("This folder is empty.")).toBeNull();
     expect((await screen.findByRole("alert")).textContent).toContain("permission denied");
   });
@@ -141,8 +143,11 @@ describe("WslFolderPicker", () => {
       />,
     );
     expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Retry folder listing" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Retry folder listing" }));
     expect(await screen.findByText("This folder is empty.")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
     expect(gitInfo).toHaveBeenCalledTimes(1);
     expect(listDir).toHaveBeenCalledTimes(2);
     expect(onFolderMetadataChange).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -159,8 +164,11 @@ describe("WslFolderPicker", () => {
       ]);
     render(<WslFolderPicker path="/home/retry-populated" recentPaths={[]} onPathChange={vi.fn()} />);
     expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Retry folder listing" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Retry folder listing" }));
     expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
     expect(listDir).toHaveBeenCalledTimes(2);
   });
 
