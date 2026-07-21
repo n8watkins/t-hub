@@ -336,7 +336,6 @@ describe("CaptainCommissionDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Codebase name is required");
     expect(registerProject).not.toHaveBeenCalled();
-    });
   });
 
   it("reports registration failure without attempting commission", async () => {
