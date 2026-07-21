@@ -116,7 +116,7 @@ SectionEnd
 '@
   Write-NsisFixture $validScriptPath $validScript
   Write-AsciiFixture $installerPath "fixture installer"
-  $binaryPrefix = "T-Hub Dev|com.t-hub.dev|t-hub-dev|.t-hub-dev|"
+  $binaryPrefix = "T-Hub Dev|t-hub-dev|.t-hub-dev|t-hub-dev.db|__TAURI_BUNDLE_TYPE_VAR_NSS|"
   Write-AsciiFixture $rawPath ($binaryPrefix + "__TAURI_BUNDLE_TYPE_VAR_UNK|raw")
   Write-AsciiFixture $extractedPath ($binaryPrefix + "__TAURI_BUNDLE_TYPE_VAR_NSS|raw")
   Copy-Item -LiteralPath $extractedPath -Destination $installedPath
@@ -150,6 +150,16 @@ SectionEnd
   Assert-ValidatorFails "production process target" {
     Invoke-Validator $productionTargetScriptPath $rawPath $extractedPath $installedPath
   } "production t-hub.exe reference"
+
+  $wrongBundleIdScriptPath = Join-Path $fixtureRoot "wrong-bundle-id.nsi"
+  $wrongBundleIdScript = $validScript.Replace(
+    '!define BUNDLEID "com.t-hub.dev"',
+    '!define BUNDLEID "com.t-hub.app"'
+  )
+  Write-NsisFixture $wrongBundleIdScriptPath $wrongBundleIdScript
+  Assert-ValidatorFails "wrong generated NSI bundle ID" {
+    Invoke-Validator $wrongBundleIdScriptPath $rawPath $extractedPath $installedPath
+  } "installer bundle marker must be com.t-hub.dev"
 
   $duplicateRawPath = Join-Path $fixtureRoot "duplicate-marker.exe"
   Write-AsciiFixture $duplicateRawPath ($binaryPrefix + "__TAURI_BUNDLE_TYPE_VAR_UNK|__TAURI_BUNDLE_TYPE_VAR_UNK")
@@ -266,7 +276,7 @@ SectionEnd
     Assert-True ($workflow.Contains($requiredWorkflowContract)) "release workflow is missing '$requiredWorkflowContract'."
   }
 
-  Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected twelve unsafe fixtures."
+  Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected thirteen unsafe fixtures."
 } finally {
   if (Test-Path -LiteralPath $fixtureRoot) {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force

@@ -152,7 +152,7 @@ Install the T-Hub Dev Windows build for those checks.
 Never install or distribute a development installer until the tracked validator accepts its generated NSIS script and extracted payload.
 The validator derives hashes from the artifacts under test and does not contain a release-specific expected hash.
 The raw binary must contain exactly one canonical Tauri `__TAURI_BUNDLE_TYPE_VAR_UNK` marker.
-The installer-extracted and installed binaries must contain exactly one `__TAURI_BUNDLE_TYPE_VAR_NSS` marker and no unknown marker.
+The raw binary may already contain pinned `__TAURI_BUNDLE_TYPE_VAR_NSS` markers, while the installer-extracted and installed binaries must contain no unknown marker.
 The validator constructs the expected binary by replacing only that same-length marker at its unique byte offset.
 The extracted and installed binaries must have the raw binary's exact length and must match the expected bytes and SHA-256 without any other alteration.
 

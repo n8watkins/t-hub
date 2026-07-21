@@ -260,7 +260,7 @@ Assert-Contract ($mainDeletes.Count -eq 1) "Uninstall section must delete t-hub-
 $mainBinaryRegistryWrites = [regex]::Matches($installSection, '(?im)^\s*WriteRegStr\b[^\r\n]*"MainBinaryName"\s+"t-hub-dev\.exe"\s*$')
 Assert-Contract ($mainBinaryRegistryWrites.Count -eq 1) "Install section must write MainBinaryName as t-hub-dev.exe exactly once."
 
-foreach ($stateMarker in @("T-Hub Dev", "com.t-hub.dev", "t-hub-dev", ".t-hub-dev")) {
+foreach ($stateMarker in @("T-Hub Dev", "t-hub-dev", ".t-hub-dev", "t-hub-dev.db")) {
   Assert-Contract ((Get-AsciiMarkerCount -Path $RawBinaryPath -Marker $stateMarker) -gt 0) "raw development binary is missing marker '$stateMarker'."
 }
 
@@ -272,9 +272,7 @@ Assert-Contract ($unknownBytes.Length -eq $nsisBytes.Length) "canonical Tauri bu
 $rawBytes = [System.IO.File]::ReadAllBytes($RawBinaryPath)
 $unknownOffsets = @(Find-ByteSequenceOffsets -Bytes $rawBytes -Needle $unknownBytes)
 Assert-Contract ($unknownOffsets.Count -eq 1) "raw development binary must contain '$unknownMarker' exactly 1 time(s), found $($unknownOffsets.Count)."
-Assert-MarkerCount -Path $RawBinaryPath -Marker $nsisMarker -Expected 0 -Label "raw development binary"
 Assert-MarkerCount -Path $ExtractedBinaryPath -Marker $unknownMarker -Expected 0 -Label "installer-extracted development binary"
-Assert-MarkerCount -Path $ExtractedBinaryPath -Marker $nsisMarker -Expected 1 -Label "installer-extracted development binary"
 
 $rawHash = Get-Sha256 $RawBinaryPath
 $installerHash = Get-Sha256 $InstallerPath
@@ -295,7 +293,6 @@ if ($ExpectedBinaryPath) {
 $installedHash = $null
 if ($InstalledBinaryPath) {
   Assert-MarkerCount -Path $InstalledBinaryPath -Marker $unknownMarker -Expected 0 -Label "installed development binary"
-  Assert-MarkerCount -Path $InstalledBinaryPath -Marker $nsisMarker -Expected 1 -Label "installed development binary"
   $installedHash = Get-Sha256 $InstalledBinaryPath
   $installedLength = (Get-Item -LiteralPath $InstalledBinaryPath).Length
   Assert-Contract ($installedLength -eq $expectedBytes.Length) "installed binary must have the same byte length as the raw binary."
