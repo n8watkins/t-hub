@@ -112,6 +112,10 @@ describe("CaptainCommissionDialog", () => {
       metadataStatus: "ready",
       git: {
         isRepo: true,
+        branch: "feature",
+        worktreeRoot: "/home/natkins/appturnity/monorepo-app",
+        dirtyCount: 2,
+        isLinkedWorktree: true,
         remoteUrl: "https://example.test/app.git",
         defaultBranch: "main",
         headCommit: "abc123",
@@ -131,6 +135,8 @@ describe("CaptainCommissionDialog", () => {
     expect(screen.getByText("https://example.test/app.git")).toBeTruthy();
     expect(screen.getByText("abc123")).toBeTruthy();
     expect(screen.getByText("3")).toBeTruthy();
+    expect(screen.getByText("feature")).toBeTruthy();
+    expect(screen.getByText("Linked")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Assignment"), {
       target: { value: "Run the project" },
     });
@@ -193,11 +199,6 @@ describe("CaptainCommissionDialog", () => {
         gitMainRoot: "/home/me/git-app",
         remoteUrl: "https://example.test/git.git",
         defaultBranch: "main",
-        branch: "feature",
-        headCommit: "saved-head",
-        dirtyCount: 2,
-        worktreeCount: 2,
-        isLinkedWorktree: true,
         createdAt: 1,
         updatedAt: 1,
       }],
@@ -208,10 +209,9 @@ describe("CaptainCommissionDialog", () => {
     render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
     expect(await screen.findByText("Git")).toBeTruthy();
     expect(screen.getByText("https://example.test/git.git")).toBeTruthy();
-    expect(screen.getByText("feature")).toBeTruthy();
-    expect(screen.getByText("saved-head")).toBeTruthy();
-    expect(screen.getAllByText("2").length).toBeGreaterThan(0);
-    expect(screen.getByText("Linked")).toBeTruthy();
+    expect(screen.getAllByText("Unknown").length).toBeGreaterThanOrEqual(5);
+    expect(screen.queryByText("Clean")).toBeNull();
+    expect(screen.queryByText("Main")).toBeNull();
     expect((screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
