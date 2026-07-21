@@ -426,6 +426,102 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertFalse(journal.exists())
 
+    def test_delete_restores_same_inode_content_and_metadata_races(self) -> None:
+        helper = load_helper()
+        for unlink_only in (False, True):
+            for mutation in ("content", "metadata"):
+                with self.subTest(unlink_only=unlink_only, mutation=mutation), \
+                    tempfile.TemporaryDirectory() as directory:
+                    root = pathlib.Path(directory)
+                    target = root / "target"
+                    journal = root / "journal"
+                    target.write_bytes(b"expected\n")
+                    target.chmod(0o640)
+                    expected = helper.state_digest(str(target))
+                    original_identity = helper.identity(str(target))
+                    real_rename = helper.os.rename
+                    raced = False
+
+                    def racing_rename(source, destination, *args, **kwargs):
+                        nonlocal raced
+                        if os.fspath(source) == str(target) and not raced:
+                            raced = True
+                            if mutation == "content":
+                                target.write_bytes(b"concurrent content\n")
+                            else:
+                                target.chmod(0o600)
+                        return real_rename(source, destination, *args, **kwargs)
+
+                    helper.os.rename = racing_rename
+                    try:
+                        with self.assertRaises(helper.AtomicError):
+                            helper.delete(
+                                str(target), expected, str(journal), unlink_only=unlink_only
+                            )
+                    finally:
+                        helper.os.rename = real_rename
+                    self.assertEqual(helper.identity(str(target)), original_identity)
+                    if mutation == "content":
+                        self.assertEqual(target.read_bytes(), b"concurrent content\n")
+                    else:
+                        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                    self.assertFalse(journal.exists())
+                    self.assertEqual(list(root.glob("target.t-hub-delete.*")), [])
+
+    def test_delete_mismatch_restoration_is_crash_recoverable_for_both_policies(self) -> None:
+        helper = load_helper()
+        for unlink_only in (False, True):
+            for crash_point in ("mismatch-before-restore", "restored-before-phase"):
+                with self.subTest(unlink_only=unlink_only, crash_point=crash_point), \
+                    tempfile.TemporaryDirectory() as directory:
+                    root = pathlib.Path(directory)
+                    target = root / "target"
+                    journal = root / "journal"
+                    target.write_bytes(b"expected\n")
+                    target.chmod(0o640)
+                    expected_identity = helper.identity(str(target))
+                    command = [
+                        sys.executable, str(HELPER), "delete", "--target", str(target),
+                        "--expected-digest", helper.state_digest(str(target)),
+                        "--journal", str(journal),
+                    ]
+                    if unlink_only:
+                        command.append("--unlink-only")
+                    environment = os.environ.copy()
+                    environment["T_HUB_ATOMIC_CRASH_AT"] = "renamed-before-phase"
+                    result = subprocess.run(command, env=environment, check=False)
+                    self.assertEqual(result.returncode, 89)
+                    intent = json.loads((journal / "intent.json").read_text())
+                    recovery = pathlib.Path(intent["candidate"])
+                    if crash_point == "mismatch-before-restore":
+                        recovery.write_bytes(b"concurrent content\n")
+                    else:
+                        recovery.chmod(0o600)
+                    environment["T_HUB_ATOMIC_CRASH_AT"] = crash_point
+                    result = subprocess.run(
+                        [sys.executable, str(HELPER), "recover", "--journal", str(journal)],
+                        env=environment, check=False,
+                    )
+                    self.assertEqual(result.returncode, 89)
+                    if crash_point == "mismatch-before-restore":
+                        self.assertFalse(target.exists())
+                        self.assertTrue(recovery.exists())
+                    else:
+                        self.assertTrue(target.exists())
+                        self.assertFalse(recovery.exists())
+                    outcome = subprocess.check_output(
+                        [sys.executable, str(HELPER), "recover", "--journal", str(journal)],
+                        text=True,
+                    ).strip()
+                    self.assertEqual(outcome, "restored")
+                    self.assertEqual(helper.identity(str(target)), expected_identity)
+                    if crash_point == "mismatch-before-restore":
+                        self.assertEqual(target.read_bytes(), b"concurrent content\n")
+                    else:
+                        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+                    self.assertFalse(journal.exists())
+                    self.assertEqual(list(root.glob("target.t-hub-delete.*")), [])
+
     def test_capture_materialize_preserves_exact_metadata_in_restricted_recovery(self) -> None:
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:
