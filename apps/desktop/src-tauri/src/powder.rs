@@ -3188,6 +3188,53 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
+
+    /// Retain the bound listener for the full test and accept/close every
+    /// connection.  This makes an unreachable endpoint deterministic under
+    /// parallel tests: no later fixture can claim the address after setup.
+    struct OwnedTransportFailure {
+        addr: std::net::SocketAddr,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OwnedTransportFailure {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_thread = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stop_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for OwnedTransportFailure {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("owned transport fixture joins");
+            }
+        }
+    }
 
     fn test_client(addr: std::net::SocketAddr) -> Client {
         Client::new(ProfileConfig {
@@ -4979,9 +5026,8 @@ mod tests {
 
     #[test]
     fn transport_errors_are_endpoint_free_and_keep_unreachable_classification() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let transport_failure = OwnedTransportFailure::start();
+        let addr = transport_failure.addr;
         let endpoint =
             format!("http://{addr}/gateway/path-token?access_token=query-token#fragment-token");
         let client = Client::new(ProfileConfig {

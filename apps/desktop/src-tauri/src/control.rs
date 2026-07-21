@@ -44086,9 +44086,8 @@ mod tests {
 
     #[test]
     fn project_board_snapshot_never_exposes_protected_endpoint_material() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let transport_failure = OwnedTransportFailure::start();
+        let addr = transport_failure.addr;
         let profile = format!("board-public-url-{}", uuid::Uuid::new_v4().simple());
         let profiles = PowderProfileEnv::install(&profile, addr);
         let endpoint =
@@ -50027,6 +50026,54 @@ mod tests {
     const LOOPBACK_POWDER_HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
     const LOOPBACK_POWDER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+    /// A deterministic transport-failure endpoint for tests that need a live
+    /// address which cannot be claimed by another parallel test.  Ownership of
+    /// the listener is retained until drop; every connection is accepted and
+    /// closed, so clients observe EOF instead of accidentally reaching a later
+    /// server that reused a released ephemeral port.
+    struct OwnedTransportFailure {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl OwnedTransportFailure {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stop_thread.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for OwnedTransportFailure {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("owned transport fixture joins");
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Default)]
     struct LoopbackPowderState {
         completed: bool,
@@ -53193,9 +53240,8 @@ mod tests {
 
     #[test]
     fn dispatch_release_recovery_matching_endpoint_transport_failure_never_leaks_secrets() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let transport_failure = OwnedTransportFailure::start();
+        let addr = transport_failure.addr;
         let profile = format!("release-transport-secret-{}", uuid::Uuid::new_v4().simple());
         let profiles = PowderProfileEnv::install(&profile, addr);
         let endpoint =
