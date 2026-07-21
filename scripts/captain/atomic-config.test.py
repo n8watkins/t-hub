@@ -28,6 +28,89 @@ def digest(value: bytes) -> str:
 
 
 class AtomicConfigTest(unittest.TestCase):
+    def test_release_unlinks_running_executable_without_truncation(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            executable = pathlib.Path(directory) / "running"
+            executable.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            executable.chmod(0o700)
+            process = subprocess.Popen([str(executable), "120"])
+            try:
+                metadata = executable.stat()
+                expected_digest = helper.state_digest(str(executable))
+                helper.release(
+                    str(executable),
+                    expected_digest,
+                    {"device": metadata.st_dev, "inode": metadata.st_ino},
+                )
+                self.assertFalse(executable.exists())
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_unlink_only_delete_recovers_running_executable_after_crash(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            executable = root / "running"
+            journal = root / "journal"
+            executable.write_bytes(pathlib.Path("/bin/sleep").read_bytes())
+            executable.chmod(0o700)
+            process = subprocess.Popen([str(executable), "120"])
+            try:
+                expected_digest = helper.state_digest(str(executable))
+                environment = os.environ.copy()
+                environment["T_HUB_ATOMIC_CRASH_AT"] = "renamed-before-phase"
+                result = subprocess.run(
+                    [sys.executable, str(HELPER), "delete", "--target", str(executable),
+                     "--expected-digest", expected_digest, "--journal", str(journal),
+                     "--unlink-only"], env=environment, check=False,
+                )
+                self.assertEqual(result.returncode, 89)
+                intent = json.loads((journal / "intent.json").read_text())
+                recovery = pathlib.Path(intent["candidate"])
+                self.assertTrue(recovery.exists())
+                held = subprocess.check_output(
+                    [sys.executable, str(HELPER), "recover", "--journal", str(journal),
+                     "--keep-journal"], text=True,
+                ).strip()
+                self.assertEqual(held, "committed")
+                self.assertTrue(recovery.exists())
+                self.assertTrue(journal.exists())
+                recovered = subprocess.check_output(
+                    [sys.executable, str(HELPER), "recover", "--journal", str(journal)],
+                    text=True,
+                ).strip()
+                self.assertEqual(recovered, "committed")
+                self.assertFalse(recovery.exists())
+                self.assertFalse(journal.exists())
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
+    def test_release_refuses_digest_and_inode_replacement_races(self) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "stage"
+            replacement = root / "replacement"
+            target.write_bytes(b"owned\n")
+            expected_digest = helper.state_digest(str(target))
+            metadata = target.stat()
+            expected_identity = {"device": metadata.st_dev, "inode": metadata.st_ino}
+            target.write_bytes(b"changed\n")
+            with self.assertRaises(helper.AtomicError):
+                helper.release(str(target), expected_digest, expected_identity)
+            self.assertEqual(target.read_bytes(), b"changed\n")
+            target.write_bytes(b"owned\n")
+            replacement.write_bytes(b"owned\n")
+            os.replace(replacement, target)
+            with self.assertRaises(helper.AtomicError):
+                helper.release(str(target), expected_digest, expected_identity)
+            self.assertEqual(target.read_bytes(), b"owned\n")
+
     def test_exchange_preserves_displaced_bytes_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

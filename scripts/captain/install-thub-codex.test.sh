@@ -74,6 +74,95 @@ else
   fail "deployed Claude provisioner is missing or not executable"
 fi
 
+BUSY_EXEC_WORK="$WORK/busy-executable"
+BUSY_EXEC_HOME="$BUSY_EXEC_WORK/home"
+BUSY_EXEC_CODEX="$BUSY_EXEC_WORK/codex"
+BUSY_EXEC_CLAUDE="$BUSY_EXEC_WORK/claude"
+BUSY_EXEC_BIN="$BUSY_EXEC_WORK/install/bin"
+BUSY_EXEC_CAPTAIN="$BUSY_EXEC_WORK/install/captain"
+mkdir -p "$BUSY_EXEC_HOME" "$BUSY_EXEC_CODEX" "$BUSY_EXEC_CLAUDE" \
+  "$BUSY_EXEC_BIN" "$BUSY_EXEC_CAPTAIN"
+cp -p /bin/sleep "$BUSY_EXEC_BIN/t-hub-mcp"
+"$BUSY_EXEC_BIN/t-hub-mcp" 120 &
+busy_exec_pid=$!
+if HOME="$BUSY_EXEC_HOME" CODEX_HOME="$BUSY_EXEC_CODEX" CLAUDE_HOME="$BUSY_EXEC_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_EXEC_BIN" \
+  T_HUB_CAPTAIN_DIR="$BUSY_EXEC_CAPTAIN" bash "$SCRIPT" \
+  >"$BUSY_EXEC_WORK/install.log" 2>&1; then
+  pass "installer replaces a running executable without truncating its displaced inode"
+else
+  fail "running displaced executable caused ETXTBSY during install"
+  sed 's/^/    /' "$BUSY_EXEC_WORK/install.log" >&2
+fi
+kill "$busy_exec_pid" 2>/dev/null || true
+wait "$busy_exec_pid" 2>/dev/null || true
+
+BUSY_CRASH_WORK="$WORK/busy-executable-crash"
+BUSY_CRASH_HOME="$BUSY_CRASH_WORK/home"
+BUSY_CRASH_CODEX="$BUSY_CRASH_WORK/codex"
+BUSY_CRASH_CLAUDE="$BUSY_CRASH_WORK/claude"
+BUSY_CRASH_BIN="$BUSY_CRASH_WORK/install/bin"
+BUSY_CRASH_CAPTAIN="$BUSY_CRASH_WORK/install/captain"
+mkdir -p "$BUSY_CRASH_HOME" "$BUSY_CRASH_CODEX" "$BUSY_CRASH_CLAUDE" \
+  "$BUSY_CRASH_BIN" "$BUSY_CRASH_CAPTAIN"
+cp -p /bin/sleep "$BUSY_CRASH_BIN/t-hub-mcp"
+"$BUSY_CRASH_BIN/t-hub-mcp" 120 &
+busy_crash_pid=$!
+HOME="$BUSY_CRASH_HOME" CODEX_HOME="$BUSY_CRASH_CODEX" CLAUDE_HOME="$BUSY_CRASH_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_CRASH_BIN" \
+  T_HUB_CAPTAIN_DIR="$BUSY_CRASH_CAPTAIN" T_HUB_INSTALL_CRASH_AFTER_STAGE=binary \
+  bash "$SCRIPT" >/dev/null 2>&1 || true
+if HOME="$BUSY_CRASH_HOME" CODEX_HOME="$BUSY_CRASH_CODEX" CLAUDE_HOME="$BUSY_CRASH_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_CRASH_BIN" \
+  T_HUB_CAPTAIN_DIR="$BUSY_CRASH_CAPTAIN" bash "$SCRIPT" \
+  >"$BUSY_CRASH_WORK/recovery.log" 2>&1 \
+  && kill -0 "$busy_crash_pid" 2>/dev/null \
+  && [ ! -e "$BUSY_CRASH_HOME/.t-hub/transactions/install-current" ] \
+  && ! find "$BUSY_CRASH_BIN" -maxdepth 1 -name '.t-hub-stage.*' | grep -q .; then
+  pass "SIGKILL recovery converges while the displaced executable inode remains active"
+else
+  fail "SIGKILL recovery leaked or truncated an active displaced executable"
+  sed 's/^/    /' "$BUSY_CRASH_WORK/recovery.log" >&2
+fi
+kill "$busy_crash_pid" 2>/dev/null || true
+wait "$busy_crash_pid" 2>/dev/null || true
+
+BUSY_ATOMIC_WORK="$WORK/busy-executable-atomic-crash"
+BUSY_ATOMIC_HOME="$BUSY_ATOMIC_WORK/home"
+BUSY_ATOMIC_CODEX="$BUSY_ATOMIC_WORK/codex"
+BUSY_ATOMIC_CLAUDE="$BUSY_ATOMIC_WORK/claude"
+BUSY_ATOMIC_BIN="$BUSY_ATOMIC_WORK/install/bin"
+BUSY_ATOMIC_CAPTAIN="$BUSY_ATOMIC_WORK/install/captain"
+mkdir -p "$BUSY_ATOMIC_HOME" "$BUSY_ATOMIC_CODEX" "$BUSY_ATOMIC_CLAUDE" \
+  "$BUSY_ATOMIC_BIN" "$BUSY_ATOMIC_CAPTAIN"
+cp -p /bin/sleep "$BUSY_ATOMIC_BIN/t-hub-mcp"
+busy_atomic_before="$(sha256sum "$BUSY_ATOMIC_BIN/t-hub-mcp" | awk '{print $1}')"
+"$BUSY_ATOMIC_BIN/t-hub-mcp" 120 &
+busy_atomic_pid=$!
+if HOME="$BUSY_ATOMIC_HOME" CODEX_HOME="$BUSY_ATOMIC_CODEX" CLAUDE_HOME="$BUSY_ATOMIC_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_ATOMIC_BIN" \
+  T_HUB_CAPTAIN_DIR="$BUSY_ATOMIC_CAPTAIN" T_HUB_ATOMIC_CRASH_AT=committed \
+  T_HUB_ATOMIC_CRASH_ONCE_FILE="$BUSY_ATOMIC_WORK/crashed-once" \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "atomic committed-phase crash unexpectedly succeeded"
+elif kill -0 "$busy_atomic_pid" 2>/dev/null \
+  && [ "$(sha256sum "$BUSY_ATOMIC_BIN/t-hub-mcp" | awk '{print $1}')" = "$busy_atomic_before" ] \
+  && [ ! -e "$BUSY_ATOMIC_HOME/.t-hub/transactions/install-current" ] \
+  && ! find "$BUSY_ATOMIC_BIN" -maxdepth 1 -name '.t-hub-stage.*' | grep -q .; then
+  pass "committed-phase recovery releases a live displaced inode before journal cleanup"
+else
+  fail "committed-phase recovery lost evidence or leaked a live displaced stage"
+fi
+if HOME="$BUSY_ATOMIC_HOME" CODEX_HOME="$BUSY_ATOMIC_CODEX" CLAUDE_HOME="$BUSY_ATOMIC_CLAUDE" \
+  T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BUSY_ATOMIC_BIN" \
+  T_HUB_CAPTAIN_DIR="$BUSY_ATOMIC_CAPTAIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  pass "rerun converges after active-inode atomic recovery"
+else
+  fail "rerun failed after active-inode atomic recovery"
+fi
+kill "$busy_atomic_pid" 2>/dev/null || true
+wait "$busy_atomic_pid" 2>/dev/null || true
+
 for skill in \
   "$CODEX_HOME/skills/captain/SKILL.md" \
   "$CODEX_HOME/skills/shipmate/SKILL.md" \
