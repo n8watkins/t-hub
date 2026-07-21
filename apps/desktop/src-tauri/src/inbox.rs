@@ -11,9 +11,9 @@
 //!   agent cooperating).
 //! - It carries a per-recipient monotonic `seq`, per-recipient FIFO within a
 //!   priority class, and EMERGENCY ordered ahead of STATUS/DECISION but still seq'd.
-//! - It implements the three-state receipt machine: `enqueued -> delivered ->
-//!   processed`. Only `processed` (a cooperative ack on DRAIN, never on enqueue)
-//!   retires a record.
+//! - It implements the receipt machine: optional transaction-local `held`, then
+//!   `enqueued -> delivered -> processed`. Only `processed` (a cooperative ack on
+//!   DRAIN, never on enqueue) retires a record.
 //!
 //! - It does NOT enforce ACLs. Who may enqueue to whom is Phase 3 - this module
 //!   stamps the `sender` it is handed and never authorizes it.
@@ -72,12 +72,16 @@ pub enum Priority {
     Emergency,
 }
 
-/// The three receipt states (§2.4). Transitions are strictly forward:
-/// `Enqueued -> Delivered -> Processed`. A transient in-flight marker lives on the
-/// queue index, NOT here, so this enum stays a clean persisted lifecycle.
+/// The receipt states (§2.4). Normal delivery transitions are strictly forward:
+/// `Held -> Enqueued -> Delivered -> Processed`. A transient in-flight marker lives
+/// on the queue index, NOT here, so this enum stays a clean persisted lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ReceiptState {
+    /// Persisted as part of a multi-store operation but not yet eligible for
+    /// delivery. Activation moves it to `Enqueued` only after every required
+    /// durable mutation has committed.
+    Held,
     /// Durable; the sender ACK means "persisted", NOT "received" (§2.4).
     Enqueued,
     /// Bytes written to the PTY at-most-once; the durable `delivered` marker guards
@@ -200,8 +204,8 @@ pub struct EnqueueOutcome {
     pub duplicate: bool,
 }
 
-/// Why an enqueue was refused. Phase 2 only refuses on overflow (D5 backpressure);
-/// there is no ACL refusal here (Phase 3).
+/// Why an enqueue or activation was refused. Authorization remains outside this
+/// transport store; it reports capacity, request conflicts, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueError {
     /// The recipient's queue is at its bounded depth. Surfaced as an attributed
@@ -426,7 +430,16 @@ impl Inbox {
         body: &str,
         enter: bool,
     ) -> Result<EnqueueOutcome, EnqueueError> {
-        self.enqueue_once(recipient, sender, priority, body, enter, None)
+        self.enqueue_once(
+            recipient,
+            sender,
+            priority,
+            body,
+            enter,
+            None,
+            None,
+            ReceiptState::Enqueued,
+        )
     }
 
     /// Enqueue exactly once for a stable producer request id. The idempotency
@@ -441,7 +454,41 @@ impl Inbox {
         enter: bool,
         request_id: &str,
     ) -> Result<EnqueueOutcome, EnqueueError> {
-        self.enqueue_once(recipient, sender, priority, body, enter, Some(request_id))
+        self.enqueue_once(
+            recipient,
+            sender,
+            priority,
+            body,
+            enter,
+            Some(request_id),
+            None,
+            ReceiptState::Enqueued,
+        )
+    }
+
+    /// Persist an idempotent message in a non-deliverable state. The semantic
+    /// signature is supplied by the typed operation and must cover every field
+    /// whose meaning is immutable for the request id.
+    pub fn prepare_idempotent(
+        &self,
+        recipient: &str,
+        sender: &str,
+        priority: Priority,
+        body: &str,
+        enter: bool,
+        request_id: &str,
+        semantic_signature: &str,
+    ) -> Result<EnqueueOutcome, EnqueueError> {
+        self.enqueue_once(
+            recipient,
+            sender,
+            priority,
+            body,
+            enter,
+            Some(request_id),
+            Some(semantic_signature),
+            ReceiptState::Held,
+        )
     }
 
     fn enqueue_once(
@@ -452,15 +499,14 @@ impl Inbox {
         body: &str,
         enter: bool,
         request_id: Option<&str>,
+        semantic_signature: Option<&str>,
+        initial_state: ReceiptState,
     ) -> Result<EnqueueOutcome, EnqueueError> {
         let mut queues = self.lock();
-        let q = queues
-            .entry(recipient.to_string())
-            .or_insert_with(|| RecipientQueue {
-                recipient: recipient.to_string(),
-                ..Default::default()
-            });
         let signature = request_id.map(|_| {
+            if let Some(signature) = semantic_signature {
+                return signature.to_string();
+            }
             let value = serde_json::json!({
                 "sender": sender,
                 "priority": priority,
@@ -470,8 +516,13 @@ impl Inbox {
             format!("{:x}", Sha256::digest(value.to_string()))
         });
         if let (Some(request_id), Some(signature)) = (request_id, signature.as_deref()) {
-            if let Some(receipt) = q.idempotency.get(request_id) {
-                return if receipt.signature == signature {
+            if let Some((existing_recipient, receipt)) = queues.iter().find_map(|(key, queue)| {
+                queue
+                    .idempotency
+                    .get(request_id)
+                    .map(|receipt| (key, receipt))
+            }) {
+                return if existing_recipient == recipient && receipt.signature == signature {
                     Ok(EnqueueOutcome {
                         seq: receipt.seq,
                         duplicate: true,
@@ -483,6 +534,12 @@ impl Inbox {
                 };
             }
         }
+        let q = queues
+            .entry(recipient.to_string())
+            .or_insert_with(|| RecipientQueue {
+                recipient: recipient.to_string(),
+                ..Default::default()
+            });
         if priority != Priority::Emergency && q.open_records() >= self.max_depth {
             return Err(EnqueueError::Overflow {
                 recipient: recipient.to_string(),
@@ -499,7 +556,7 @@ impl Inbox {
             priority,
             body: body.to_string(),
             enter,
-            state: ReceiptState::Enqueued,
+            state: initial_state,
             enqueued_at: now_ms(),
             delivered_at: None,
             processed_at: None,
@@ -526,9 +583,62 @@ impl Inbox {
             }
         }
         drop(queues);
-        self.emit(recipient, &record, "enqueued");
+        if initial_state == ReceiptState::Enqueued {
+            self.emit(recipient, &record, "enqueued");
+        }
         Ok(EnqueueOutcome {
             seq,
+            duplicate: false,
+        })
+    }
+
+    /// Make a prepared message deliverable after the enclosing durable operation
+    /// has committed. A persistence failure restores `Held` in memory and on the
+    /// next retry the same request can safely attempt activation again.
+    pub fn activate_prepared(
+        &self,
+        recipient: &str,
+        request_id: &str,
+    ) -> Result<EnqueueOutcome, EnqueueError> {
+        let mut queues = self.lock();
+        let q = queues
+            .get_mut(recipient)
+            .ok_or_else(|| EnqueueError::IdempotencyConflict {
+                request_id: request_id.to_string(),
+            })?;
+        let receipt = q.idempotency.get(request_id).cloned().ok_or_else(|| {
+            EnqueueError::IdempotencyConflict {
+                request_id: request_id.to_string(),
+            }
+        })?;
+        let record = q
+            .find_mut(receipt.seq)
+            .ok_or_else(|| EnqueueError::IdempotencyConflict {
+                request_id: request_id.to_string(),
+            })?;
+        if record.state != ReceiptState::Held {
+            return Ok(EnqueueOutcome {
+                seq: receipt.seq,
+                duplicate: true,
+            });
+        }
+        record.state = ReceiptState::Enqueued;
+        let activated = record.clone();
+        if let Some(dir) = &self.dir {
+            if let Err(error) = write_segment(dir, q) {
+                if let Some(record) = q.find_mut(receipt.seq) {
+                    record.state = ReceiptState::Held;
+                }
+                return Err(EnqueueError::Persistence {
+                    recipient: recipient.to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        drop(queues);
+        self.emit(recipient, &activated, "enqueued");
+        Ok(EnqueueOutcome {
+            seq: receipt.seq,
             duplicate: false,
         })
     }
@@ -618,7 +728,7 @@ impl Inbox {
         let outcome = match q.find_mut(seq).map(|r| r.state) {
             None => AckOutcome::Unknown { seq },
             Some(ReceiptState::Processed) => AckOutcome::AlreadyProcessed { seq },
-            Some(ReceiptState::Enqueued) => AckOutcome::NotDelivered { seq },
+            Some(ReceiptState::Held | ReceiptState::Enqueued) => AckOutcome::NotDelivered { seq },
             Some(ReceiptState::Delivered) => {
                 if let Some(rec) = q.find_mut(seq) {
                     rec.state = ReceiptState::Processed;
@@ -686,7 +796,7 @@ fn depth_of(q: &RecipientQueue) -> QueueDepth {
     let mut oldest_enqueued: Option<u64> = None;
     for r in &q.records {
         match r.state {
-            ReceiptState::Enqueued => {
+            ReceiptState::Held | ReceiptState::Enqueued => {
                 enqueued += 1;
                 oldest_enqueued = Some(match oldest_enqueued {
                     Some(t) => t.min(r.enqueued_at),
@@ -945,6 +1055,61 @@ mod tests {
             ),
             Err(EnqueueError::IdempotencyConflict { .. })
         ));
+        assert!(matches!(
+            restored.enqueue_idempotent(
+                "agent-2",
+                "captain:captain-1",
+                Priority::Standard,
+                "continue",
+                true,
+                "followup-1",
+            ),
+            Err(EnqueueError::IdempotencyConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn prepared_message_stays_held_across_restart_until_activation() {
+        let (inbox, dir) = temp_inbox();
+        let prepared = inbox
+            .prepare_idempotent(
+                "agent-1",
+                "captain:captain-1",
+                Priority::Standard,
+                "new scope",
+                true,
+                "followup-held",
+                "semantic-digest-one",
+            )
+            .unwrap();
+        assert_eq!(prepared.seq, 0);
+        assert_eq!(inbox.drain_one("agent-1", |_| Ok(())), DrainOutcome::Empty);
+        drop(inbox);
+
+        let restored = Inbox::open(dir);
+        assert_eq!(
+            restored.drain_one("agent-1", |_| Ok(())),
+            DrainOutcome::Empty
+        );
+        assert!(matches!(
+            restored.prepare_idempotent(
+                "agent-1",
+                "captain:captain-1",
+                Priority::Standard,
+                "new scope",
+                true,
+                "followup-held",
+                "semantic-digest-two",
+            ),
+            Err(EnqueueError::IdempotencyConflict { .. })
+        ));
+        restored
+            .activate_prepared("agent-1", "followup-held")
+            .unwrap();
+        assert_eq!(
+            restored.drain_one("agent-1", |_| Ok(())),
+            DrainOutcome::Delivered { seq: 0 }
+        );
     }
 
     #[test]

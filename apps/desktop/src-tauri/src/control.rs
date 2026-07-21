@@ -12169,6 +12169,23 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         }
     }
 
+    // Authorization must precede idempotency-cache lookup. Otherwise a caller
+    // outside the owning ship could replay an owner's cached success or reserve
+    // the owner's requestId with a cached refusal.
+    if req.command == "agent_followup" {
+        let followup = match parse_agent_followup(&req.args) {
+            Ok(followup) => followup,
+            Err(error) => {
+                return ControlResponse::err(agent_followup_error("invalid_request", error));
+            }
+        };
+        if let Err(error) =
+            authorize_agent_followup(ctx, &followup, caller.as_ref(), trusted_internal)
+        {
+            return ControlResponse::err(error);
+        }
+    }
+
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
     // spawn-class command makes it safely retryable across an ambiguous response
     // leg. We consult the outcome cache BEFORE the governor charges budget so a
@@ -12183,7 +12200,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     let mut request_reservation = None;
     let mut request_signature_value = None;
     if let Some(id) = &request_id {
-        let signature = request_signature(&req.command, &req.args);
+        let signature = request_signature_for_caller(&req.command, &req.args, caller.as_ref());
         let (begin, reservation) = ctx.requests.begin_bound_with_reservation(id, &signature);
         request_reservation = reservation;
         request_signature_value = Some(signature);
@@ -12388,6 +12405,26 @@ fn is_idempotent_command(command: &str) -> bool {
 
 fn request_signature(command: &str, args: &Value) -> String {
     let normalized = json!({ "command": command, "args": args });
+    format!("{:x}", sha2::Sha256::digest(normalized.to_string()))
+}
+
+fn request_signature_for_caller(
+    command: &str,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> String {
+    if command != "agent_followup" {
+        return request_signature(command, args);
+    }
+    let normalized = json!({
+        "command": command,
+        "args": args,
+        "caller": caller.map(|identity| json!({
+            "identityId": identity.session_id,
+            "tile": identity.tile,
+            "shipSlug": identity.ship_slug,
+        })),
+    });
     format!("{:x}", sha2::Sha256::digest(normalized.to_string()))
 }
 
@@ -13441,38 +13478,12 @@ fn parse_agent_followup(args: &Value) -> Result<crate::agent_session::AgentFollo
     Ok(followup)
 }
 
-/// Deliver an owned agent a durable follow-up without terminal injection. The
-/// inbox is keyed by durable agentSessionId, and its request receipt provides the
-/// restart-safe idempotency boundary. Assignment metadata changes only through
-/// the explicit replacementAssignment field.
-fn agent_followup(
-    ctx: &ControlContext,
-    args: &Value,
-    caller: Option<&ResolvedIdentity>,
-    trusted_internal: bool,
-) -> Result<Value, String> {
-    let followup = parse_agent_followup(args)
-        .map_err(|error| agent_followup_error("invalid_request", error))?;
-    let outcome = apply_agent_followup(ctx, &followup, caller, trusted_internal)?;
-    Ok(json!({
-        "accepted": "agent_followup",
-        "requestId": outcome.request_id,
-        "captainSessionId": outcome.captain_session_id,
-        "shipSlug": outcome.ship_slug,
-        "projectId": outcome.project_id,
-        "agentSessionId": outcome.agent_session_id,
-        "messageSeq": outcome.message_seq,
-        "idempotentReplay": outcome.idempotent_replay,
-        "assignmentChanged": outcome.assignment_changed,
-    }))
-}
-
-fn apply_agent_followup(
+fn authorize_agent_followup(
     ctx: &ControlContext,
     followup: &crate::agent_session::AgentFollowup,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
-) -> Result<crate::agent_session::AgentFollowupOutcome, String> {
+) -> Result<AgentSessionRecord, String> {
     let snapshot = ctx.captains.snapshot();
     let captain = snapshot
         .captains
@@ -13540,17 +13551,54 @@ fn apply_agent_followup(
             ),
         ));
     }
+    Ok(agent)
+}
+
+/// Deliver an owned agent a durable follow-up without terminal injection. The
+/// inbox is keyed by durable agentSessionId, and its request receipt provides the
+/// restart-safe idempotency boundary. Assignment metadata changes only through
+/// the explicit replacementAssignment field.
+fn agent_followup(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let followup = parse_agent_followup(args)
+        .map_err(|error| agent_followup_error("invalid_request", error))?;
+    let outcome = apply_agent_followup(ctx, &followup, caller, trusted_internal)?;
+    Ok(json!({
+        "accepted": "agent_followup",
+        "requestId": outcome.request_id,
+        "captainSessionId": outcome.captain_session_id,
+        "shipSlug": outcome.ship_slug,
+        "projectId": outcome.project_id,
+        "agentSessionId": outcome.agent_session_id,
+        "messageSeq": outcome.message_seq,
+        "idempotentReplay": outcome.idempotent_replay,
+        "assignmentChanged": outcome.assignment_changed,
+    }))
+}
+
+fn apply_agent_followup(
+    ctx: &ControlContext,
+    followup: &crate::agent_session::AgentFollowup,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<crate::agent_session::AgentFollowupOutcome, String> {
+    let agent = authorize_agent_followup(ctx, followup, caller, trusted_internal)?;
 
     let sender = format!("captain:{}", followup.captain_session_id);
-    let enqueue = ctx
+    let prepared = ctx
         .inbox
-        .enqueue_idempotent(
+        .prepare_idempotent(
             &followup.agent_session_id,
             &sender,
             crate::inbox::Priority::Standard,
             &followup.message,
             true,
             &followup.request_id,
+            &followup.semantic_digest(),
         )
         .map_err(|error| match error {
             crate::inbox::EnqueueError::IdempotencyConflict { .. } => {
@@ -13572,14 +13620,28 @@ fn apply_agent_followup(
             .replace_agent_assignment(&followup.agent_session_id, replacement)
             .map_err(|error| agent_followup_error("persistence_failed", error))?;
     }
+    let activated = ctx
+        .inbox
+        .activate_prepared(&followup.agent_session_id, &followup.request_id)
+        .map_err(|error| match error {
+            crate::inbox::EnqueueError::IdempotencyConflict { .. } => {
+                agent_followup_error("request_conflict", error)
+            }
+            crate::inbox::EnqueueError::Persistence { .. } => {
+                agent_followup_error("persistence_failed", error)
+            }
+            crate::inbox::EnqueueError::Overflow { .. } => {
+                agent_followup_error("inbox_overflow", error)
+            }
+        })?;
     Ok(crate::agent_session::AgentFollowupOutcome {
         request_id: followup.request_id.clone(),
         captain_session_id: followup.captain_session_id.clone(),
         ship_slug: followup.ship_slug.clone(),
         project_id: followup.project_id.clone(),
         agent_session_id: followup.agent_session_id.clone(),
-        message_seq: enqueue.seq,
-        idempotent_replay: enqueue.duplicate,
+        message_seq: activated.seq,
+        idempotent_replay: prepared.duplicate,
         assignment_changed,
     })
 }
@@ -36952,12 +37014,45 @@ mod tests {
     fn authenticated_agent_followup_is_owned_durable_idempotent_and_scope_explicit() {
         let ctx = test_ctx("agent-followup");
         seed_starting_agent(&ctx, "followup-agent");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
+                project_id: "foreign-project".into(),
+                name: "Foreign Project".into(),
+                repo_root: "/tmp/foreign-project".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("foreign-captain", Some("foreign-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context(
+                "foreign-ship",
+                "foreign-project",
+                "Foreign Assignment",
+                "codex",
+            )
+            .unwrap();
         let captain_identity = ctx
             .identity
             .mint_for(crate::identity::Role::Captain, Some("capacity-ship".into()))
             .unwrap();
         ctx.identity
             .bind_tile(&captain_identity.id, "capacity-captain")
+            .unwrap();
+        let foreign_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("foreign-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&foreign_identity.id, "foreign-captain")
             .unwrap();
         let call = |request_id: &str, message: &str, replacement: Option<&str>| {
             let mut args = json!({
@@ -36999,10 +37094,56 @@ mod tests {
         assert!(replay.ok, "got: {:?}", replay.error);
         assert_eq!(replay.result.as_ref().unwrap()["idempotentReplay"], true);
         assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 1);
+        let foreign_replay = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup",
+                &foreign_identity.secret,
+                "agent_followup",
+                json!({
+                    "requestId": "followup-1",
+                    "captainSessionId": "capacity-captain",
+                    "shipSlug": "capacity-ship",
+                    "projectId": "capacity-project",
+                    "agentSessionId": "followup-agent",
+                    "message": "Continue the bounded repair."
+                }),
+            ),
+        );
+        assert!(!foreign_replay.ok, "foreign Captain replayed owner success");
+        assert_eq!(foreign_replay.error_kind.as_deref(), Some("unauthorized"));
+
+        let foreign_squat = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup",
+                &foreign_identity.secret,
+                "agent_followup",
+                json!({
+                    "requestId": "followup-squat",
+                    "captainSessionId": "capacity-captain",
+                    "shipSlug": "capacity-ship",
+                    "projectId": "capacity-project",
+                    "agentSessionId": "followup-agent",
+                    "message": "Owner must still be able to send this."
+                }),
+            ),
+        );
+        assert!(!foreign_squat.ok);
+        let owner_after_squat = call(
+            "followup-squat",
+            "Owner must still be able to send this.",
+            None,
+        );
+        assert!(
+            owner_after_squat.ok,
+            "foreign Captain poisoned owner requestId: {:?}",
+            owner_after_squat.error
+        );
         let conflict = call("followup-1", "Changed retry payload.", None);
         assert!(!conflict.ok);
         assert_eq!(conflict.error_kind.as_deref(), Some("request_conflict"));
-        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 1);
+        assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 2);
 
         let replacement = call(
             "followup-2",
@@ -37080,6 +37221,82 @@ mod tests {
             "agent_followup"
         );
         assert_eq!(ctx.inbox.depth("followup-agent").enqueued, 0);
+    }
+
+    #[test]
+    fn agent_followup_assignment_persist_failure_never_makes_new_scope_deliverable() {
+        let path = captains_tmp("agent-followup-assignment-failure");
+        let registry = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("agent-followup-assignment-failure")
+            .with_captains_registry(Arc::clone(&registry));
+        seed_starting_agent(&ctx, "followup-agent");
+        let captain_identity = ctx
+            .identity
+            .mint_for(crate::identity::Role::Captain, Some("capacity-ship".into()))
+            .unwrap();
+        ctx.identity
+            .bind_tile(&captain_identity.id, "capacity-captain")
+            .unwrap();
+        registry.fail_next_persist("injected Assignment persistence failure");
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup-assignment-failure",
+                &captain_identity.secret,
+                "agent_followup",
+                json!({
+                    "requestId": "followup-failed-assignment",
+                    "captainSessionId": "capacity-captain",
+                    "shipSlug": "capacity-ship",
+                    "projectId": "capacity-project",
+                    "agentSessionId": "followup-agent",
+                    "message": "Act on the replacement Assignment only.",
+                    "replacementAssignment": "Replacement Assignment"
+                }),
+            ),
+        );
+        assert!(!response.ok);
+        assert_eq!(response.error_kind.as_deref(), Some("persistence_failed"));
+        assert_eq!(
+            registry.snapshot().agent_sessions[0].assignment,
+            "Pending durable start"
+        );
+        assert_eq!(
+            ctx.inbox.drain_one("followup-agent", |_| Ok(())),
+            crate::inbox::DrainOutcome::Empty,
+            "failed Assignment persistence exposed a deliverable wrong-scope instruction"
+        );
+
+        let retry = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "agent-followup-assignment-failure",
+                &captain_identity.secret,
+                "agent_followup",
+                json!({
+                    "requestId": "followup-failed-assignment",
+                    "captainSessionId": "capacity-captain",
+                    "shipSlug": "capacity-ship",
+                    "projectId": "capacity-project",
+                    "agentSessionId": "followup-agent",
+                    "message": "Act on the replacement Assignment only.",
+                    "replacementAssignment": "Replacement Assignment"
+                }),
+            ),
+        );
+        assert!(retry.ok, "retry did not converge: {:?}", retry.error);
+        assert_eq!(
+            registry.snapshot().agent_sessions[0].assignment,
+            "Replacement Assignment"
+        );
+        assert_eq!(
+            ctx.inbox.drain_one("followup-agent", |_| Ok(())),
+            crate::inbox::DrainOutcome::Delivered { seq: 0 }
+        );
+
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

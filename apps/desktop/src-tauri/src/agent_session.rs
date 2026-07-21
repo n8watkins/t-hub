@@ -87,6 +87,22 @@ impl AgentFollowup {
         }
         Ok(())
     }
+
+    /// Stable digest of the complete immutable operation meaning. The durable
+    /// inbox binds requestId to this value rather than only to terminal-delivery
+    /// fields, so scope changes cannot masquerade as transport retries.
+    pub fn semantic_digest(&self) -> String {
+        let value = serde_json::json!({
+            "requestId": self.request_id,
+            "captainSessionId": self.captain_session_id,
+            "shipSlug": self.ship_slug,
+            "projectId": self.project_id,
+            "agentSessionId": self.agent_session_id,
+            "message": self.message,
+            "replacementAssignment": self.replacement_assignment,
+        });
+        format!("{:x}", Sha256::digest(value.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1659,6 +1675,11 @@ mod tests {
         followup.request_id = "followup:one".into();
         followup.replacement_assignment = Some(String::new());
         assert!(followup.validate().is_err());
+
+        followup.replacement_assignment = None;
+        let original = followup.semantic_digest();
+        followup.replacement_assignment = Some("Changed Assignment".into());
+        assert_ne!(followup.semantic_digest(), original);
     }
 
     #[test]
