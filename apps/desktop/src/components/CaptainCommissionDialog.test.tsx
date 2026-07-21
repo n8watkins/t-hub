@@ -448,6 +448,7 @@ describe("CaptainCommissionDialog", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Captain creation failed for existing codebase");
     expect(alert.textContent).not.toContain("was registered");
+    expect(alert.textContent).toContain("retry after capacity is released");
     expect(registerProject).not.toHaveBeenCalled();
   });
 });

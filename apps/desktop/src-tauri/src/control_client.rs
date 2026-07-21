@@ -1040,47 +1040,29 @@ mod tests {
 
     #[test]
     fn native_control_response_errors_survive_the_tauri_bridge_losslessly() {
-        let cases = [
-            (
-                "register_project",
-                "registration_validation",
-                json!({"code": "invalid_root", "operation": "register_project"}),
-                "The selected folder is not a valid project root",
-            ),
-            (
-                "commission_captain",
-                "capacity",
-                json!({"code": "capacity", "operation": "commission_captain"}),
-                "Captain capacity is unavailable",
-            ),
-            (
-                "commission_captain",
-                "commission_failed",
-                json!({"code": "commission_failed", "operation": "commission_captain"}),
-                "Captain creation failed",
-            ),
-            (
-                "list_dir",
-                "listing_error",
-                json!({"code": "listing_error", "operation": "list_dir"}),
-                "Could not list this folder",
-            ),
-            (
-                "register_project",
-                "validation_error",
-                json!({"code": "unauthorized", "operation": "register_project"}),
-                "The selected folder is not authorized",
-            ),
-        ];
-
-        for (command, kind, details, message) in cases {
-            let response = json!({
+        let fixture: Value =
+            serde_json::from_str(include_str!("../fixtures/native-control-error-bridge.json"))
+                .unwrap();
+        for response in fixture.as_object().unwrap().values() {
+            let command = response
+                .get("details")
+                .and_then(|details| details["operation"].as_str())
+                .unwrap_or("register_project");
+            let kind = response.get("kind").and_then(Value::as_str);
+            let details = response.get("details").cloned();
+            let message = response["message"].as_str().unwrap();
+            let expected_retryable = response["retryable"].as_bool().unwrap();
+            let mut response = json!({
                 "ok": false,
                 "error": message,
-                "retryable": false,
-                "errorKind": kind,
-                "errorDetails": details,
+                "retryable": expected_retryable,
             });
+            if let Some(kind) = kind {
+                response["errorKind"] = json!(kind);
+            }
+            if let Some(details) = details.as_ref() {
+                response["errorDetails"] = details.clone();
+            }
             let endpoint = test_endpoint(
                 raw_response_server(format!("{response}\n").into_bytes()),
                 None,
@@ -1095,18 +1077,20 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(error.message, message);
-            assert!(!error.retryable);
-            assert_eq!(error.kind.as_deref(), Some(kind));
-            assert_eq!(error.details, Some(details.clone()));
-            assert_eq!(
-                serde_json::to_value(&error).unwrap(),
-                json!({
-                    "message": message,
-                    "retryable": false,
-                    "kind": kind,
-                    "details": details,
-                })
-            );
+            assert_eq!(error.retryable, expected_retryable);
+            assert_eq!(error.kind.as_deref(), kind);
+            assert_eq!(error.details, details);
+            let mut expected = json!({
+                "message": message,
+                "retryable": expected_retryable,
+            });
+            if let Some(kind) = kind {
+                expected["kind"] = json!(kind);
+            }
+            if let Some(details) = details {
+                expected["details"] = details;
+            }
+            assert_eq!(serde_json::to_value(&error).unwrap(), expected);
         }
     }
 

@@ -492,14 +492,17 @@ function formatRegistrationFailure(cause: unknown): string {
 
 function formatCommissionFailure(cause: unknown, project: RegisteredProject, registered: boolean): string {
   const failure = structuredFailure(cause);
-  if (!registered) {
-    return `Captain creation failed for existing codebase "${project.name}": ${failureEvidence(failure)} Retry Captain creation.`;
-  }
   const normalized = `${failure.kind ?? ""} ${failure.message}`.toLowerCase();
   const action = normalized.includes("capacity")
     ? "Captain capacity is unavailable; retry after capacity is released."
+    : "Retry Captain creation to commission the existing codebase.";
+  if (!registered) {
+    return `Captain creation failed for existing codebase "${project.name}": ${failureEvidence(failure)} ${action}`;
+  }
+  const registeredAction = normalized.includes("capacity")
+    ? "Captain capacity is unavailable; retry after capacity is released."
     : "Retry Captain creation to commission the registered Project.";
-  return `Codebase "${project.name}" was registered as Project ${project.projectId}, but Captain creation failed: ${failureEvidence(failure)} ${action}`;
+  return `Codebase "${project.name}" was registered as Project ${project.projectId}, but Captain creation failed: ${failureEvidence(failure)} ${registeredAction}`;
 }
 
 function previewNewCodebaseDestination(parent: string, name: string): string {
