@@ -19,6 +19,8 @@ trap 'rm -rf "$WORK"' EXIT
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 BIN="$WORK/t-hub-mcp"
+STATE_DIR="$WORK/helper-state"
+mkdir -m 700 "$STATE_DIR"
 cat > "$BIN" <<'EOF'
 #!/usr/bin/env bash
 [ "${1:-}" = --list-tools ] && printf '[]\n' && exit 0
@@ -26,10 +28,28 @@ exit 1
 EOF
 chmod 700 "$BIN"
 
-if T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+if T_HUB_MCP_BIN="$BIN" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" "$SCRIPT" >/dev/null 2>&1; then
   pass "first run exits 0"
 else
   fail "first run exited non-zero"
+fi
+if jq -e '
+  .status == "committed" and
+  .before.file_presence == "absent" and
+  .before.parent == {presence:false,type:"absent"} and
+  .before.key == {presence:false,type:"absent"} and
+  .post_structure.file_presence == "present" and
+  .post_structure.parent == {presence:true,type:"object"} and
+  .post_structure.key == {presence:true,type:"object"} and
+  (.before_file | has("value") | not) and
+  (.before | has("value") | not) and
+  (.post_structure | has("value") | not)
+' "$STATE_DIR/claude-state.json" >/dev/null \
+  && [ "$(stat -c %a "$STATE_DIR")" = 700 ] \
+  && [ "$(stat -c %a "$STATE_DIR/claude-state.json")" = 600 ]; then
+  pass "helper publishes presence-aware Claude boundaries without node values"
+else
+  fail "helper Claude ownership descriptor leaks values or loses presence semantics"
 fi
 if jq -e --arg bin "$BIN" '.mcpServers["t-hub"] == {"type":"stdio","command":$bin,"args":[],"env":{}}' "$HOME/.claude.json" >/dev/null; then
   pass "user registration has the complete expected shape"

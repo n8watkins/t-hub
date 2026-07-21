@@ -7,7 +7,6 @@ recover operation resolves every durable phase without guessing ownership.
 """
 
 import argparse
-import base64
 import ctypes
 import errno
 import hashlib
@@ -73,9 +72,9 @@ def require_regular(path: str) -> os.stat_result:
 def xattrs(path: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for name in sorted(os.listxattr(path, follow_symlinks=False)):
-        result[name] = base64.b64encode(
+        result[name] = hashlib.sha256(
             os.getxattr(path, name, follow_symlinks=False)
-        ).decode("ascii")
+        ).hexdigest()
     return result
 
 
@@ -393,6 +392,53 @@ def publish(path: str, value: str) -> None:
         raise
 
 
+def capture(source: str, recovery: str) -> Dict[str, Any]:
+    source = os.path.abspath(source)
+    recovery = os.path.abspath(recovery)
+    restricted_directory(os.path.dirname(recovery), False)
+    if os.path.lexists(source):
+        require_regular(source)
+        descriptor_value = description(source)
+        input_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        output_descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(recovery)}.", dir=os.path.dirname(recovery)
+        )
+        try:
+            os.fchmod(output_descriptor, 0o600)
+            with os.fdopen(input_descriptor, "rb") as input_file, os.fdopen(
+                output_descriptor, "wb"
+            ) as output_file:
+                for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                    output_file.write(chunk)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temporary, recovery)
+            fsync_directory(os.path.dirname(recovery))
+        except BaseException:
+            try:
+                os.close(input_descriptor)
+            except OSError:
+                pass
+            try:
+                os.close(output_descriptor)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+        return {
+            "presence": "present",
+            "digest": description_digest(descriptor_value),
+            "description": descriptor_value,
+            "recovery": os.path.basename(recovery),
+        }
+    if os.path.exists(recovery):
+        discard(recovery)
+    return {"presence": "absent", "digest": "absent", "recovery": None}
+
+
 def discard(path: str) -> None:
     path = os.path.abspath(path)
     require_regular(path)
@@ -420,6 +466,9 @@ def main() -> int:
     recover_parser.add_argument("--keep-journal", action="store_true")
     describe_parser = subparsers.add_parser("describe")
     describe_parser.add_argument("--path", required=True)
+    capture_parser = subparsers.add_parser("capture")
+    capture_parser.add_argument("--source", required=True)
+    capture_parser.add_argument("--recovery", required=True)
     publish_parser = subparsers.add_parser("publish")
     publish_parser.add_argument("--path", required=True)
     publish_parser.add_argument("--value", required=True)
@@ -442,6 +491,8 @@ def main() -> int:
         elif arguments.command == "describe":
             value = description(os.path.abspath(arguments.path))
             print(json.dumps({"digest": description_digest(value), "description": value}, sort_keys=True))
+        elif arguments.command == "capture":
+            print(json.dumps(capture(arguments.source, arguments.recovery), sort_keys=True))
         elif arguments.command == "publish":
             publish(arguments.path, arguments.value)
         else:

@@ -7,11 +7,43 @@ BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
 CONFIG="${HOME}/.claude.json"
 ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$(cd "$(dirname "$0")" && pwd)/atomic-config.py}"
 
+BEFORE_DESCRIPTOR='{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent"}}'
+BEFORE_FILE_DESCRIPTOR='{"presence":"absent","digest":"absent","recovery":null}'
+claude_descriptor() {
+  if [ ! -f "$CONFIG" ]; then
+    printf '%s\n' '{"file_presence":"absent","parent":{"presence":false,"type":"absent"},"key":{"presence":false,"type":"absent"}}'
+    return
+  fi
+  jq -Sc '{
+    file_presence:"present",
+    parent:{presence:has("mcpServers"),type:(if has("mcpServers") then (.mcpServers|type) else "absent" end)},
+    key:{
+      presence:(if (.mcpServers|type)=="object" then (.mcpServers|has("t-hub")) else false end),
+      type:(if (.mcpServers|type)=="object" and (.mcpServers|has("t-hub")) then (.mcpServers["t-hub"]|type) else "absent" end)
+    }
+  }' "$CONFIG"
+}
+publish_before_state() {
+  if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
+  BEFORE_FILE_DESCRIPTOR="$(python3 "$ATOMIC_HELPER" capture \
+    --source "$CONFIG" --recovery "$T_HUB_INSTALL_STATE_DIR/claude-before.bin")"
+  BEFORE_DESCRIPTOR="$(claude_descriptor)"
+  state="$(jq -cn --arg target "$CONFIG" --argjson file "$BEFORE_FILE_DESCRIPTOR" \
+    --argjson before "$BEFORE_DESCRIPTOR" \
+    '{version:1,target:$target,status:"before",before_file:$file,before:$before}')"
+  python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/claude-state.json" --value "$state"
+}
 publish_committed_state() {
   if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
-  hash="$(sha256sum "$CONFIG" | awk '{print $1}')"
-  structure="$(jq -Sc '{parent_present:has("mcpServers"),key_present:(.mcpServers|has("t-hub")),value:.mcpServers["t-hub"]}' "$CONFIG")"
-  state="$(jq -cn --arg hash "$hash" --argjson structure "$structure" '{presence:"present",hash:$hash,structure:$structure}')"
+  post="$(python3 "$ATOMIC_HELPER" describe --path "$CONFIG")"
+  post="$(printf '%s' "$post" | jq -c '{presence:"present",digest:.digest,description:.description}')"
+  structure="$(claude_descriptor)"
+  # Retain only the recovery filename and fingerprint in the descriptor.  Exact
+  # rollback bytes remain solely in the restricted recovery file.
+  state="$(jq -cn --arg target "$CONFIG" --argjson file "$BEFORE_FILE_DESCRIPTOR" \
+    --argjson before "$BEFORE_DESCRIPTOR" --argjson post "$post" \
+    --argjson structure "$structure" \
+    '{version:1,target:$target,status:"committed",before_file:$file,before:$before,post:$post,post_structure:$structure}')"
   python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/claude-state.json" --value "$state"
 }
 
@@ -49,6 +81,9 @@ if [ -f "$CONFIG" ] && jq -e '
   echo "ensure-thub-claude: refusing malformed non-object t-hub registration" >&2
   exit 1
 fi
+
+# Persist the exact helper-owned boundary while the Claude config lock is held.
+publish_before_state
 
 if [ -f "$CONFIG" ] && jq -e --arg bin "$BIN" '
   .mcpServers["t-hub"].type == "stdio" and

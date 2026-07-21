@@ -206,7 +206,9 @@ export T_HUB_CONTROL_ADDR="legacy-secret-address"
 export T_HUB_CONTROL_TOKEN="legacy-secret-control"
 export T_HUB_SESSION_TOKEN="legacy-secret-session"
 MIGRATION_WRAPPER_DIR="$WORK/migration-wrapper-bin"
+MIGRATION_STATE_DIR="$WORK/migration-helper-state"
 mkdir "$MIGRATION_WRAPPER_DIR"
+mkdir -m 700 "$MIGRATION_STATE_DIR"
 cat > "$MIGRATION_WRAPPER_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = mcp ] && { [ "${2:-}" = add ] || [ "${2:-}" = remove ]; }; then
@@ -216,11 +218,26 @@ exec "$REAL_CODEX" "$@"
 EOF
 chmod 700 "$MIGRATION_WRAPPER_DIR/codex"
 if PATH="$MIGRATION_WRAPPER_DIR:$PATH" REAL_CODEX="$REAL_CODEX" \
+  T_HUB_INSTALL_STATE_DIR="$MIGRATION_STATE_DIR" \
   T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" --migrate-legacy-registration >/dev/null 2>&1 \
   && cmp -s "$LEGACY_EXPECTED" "$WORK/config.toml"; then
   pass "explicit migration changes only env_vars without Codex add/remove"
 else
   fail "explicit migration changed unrelated TOML or invoked Codex add/remove"
+fi
+LEGACY_BEFORE_DIGEST="$(python3 "$HERE/atomic-config.py" describe --path "$LEGACY_SNAP" | jq -r .digest)"
+LEGACY_POST_DIGEST="$(python3 "$HERE/atomic-config.py" describe --path "$WORK/config.toml" | jq -r .digest)"
+if jq -e --arg before "$LEGACY_BEFORE_DIGEST" --arg post "$LEGACY_POST_DIGEST" '
+  .status == "committed" and .before.digest == $before and .post.digest == $post and
+  .before.recovery == "codex-before.bin"
+' "$MIGRATION_STATE_DIR/codex-state.json" >/dev/null \
+  && cmp -s "$LEGACY_SNAP" "$MIGRATION_STATE_DIR/codex-before.bin" \
+  && [ "$(stat -c %a "$MIGRATION_STATE_DIR")" = 700 ] \
+  && [ "$(stat -c %a "$MIGRATION_STATE_DIR/codex-before.bin")" = 600 ] \
+  && ! grep -Rq 'legacy-secret-' "$MIGRATION_STATE_DIR/codex-state.json"; then
+  pass "helper publishes exact under-lock Codex before/post ownership without secret values"
+else
+  fail "helper Codex ownership boundary is incomplete or secret-bearing"
 fi
 if codex mcp get t-hub --json | jq -e --argjson expected "$EXPECTED_ENV_VARS" '
   .transport.env_vars == $expected and

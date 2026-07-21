@@ -75,10 +75,27 @@ flock -x 9
 BACKUP=""
 HAD_CONFIG=false
 EXPECTED_HASH=absent
+BEFORE_DESCRIPTOR='{"presence":"absent","digest":"absent","recovery":null}'
 config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+publish_before_state() {
+  if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
+  BEFORE_DESCRIPTOR="$(python3 "$ATOMIC_HELPER" capture \
+    --source "$CONFIG" --recovery "$T_HUB_INSTALL_STATE_DIR/codex-before.bin")"
+  state="$(jq -cn --arg target "$CONFIG" --argjson before "$BEFORE_DESCRIPTOR" \
+    '{version:1,target:$target,status:"before",before:$before}')"
+  python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/codex-state.json" --value "$state"
+}
 publish_committed_state() {
   if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
-  state="$(jq -cn --arg hash "$(config_hash)" '{presence:"present", hash:$hash}')"
+  if [ -f "$CONFIG" ]; then
+    post="$(python3 "$ATOMIC_HELPER" describe --path "$CONFIG")"
+    post="$(printf '%s' "$post" | jq -c '{presence:"present",digest:.digest,description:.description}')"
+  else
+    post='{"presence":"absent","digest":"absent"}'
+  fi
+  state="$(jq -cn --arg target "$CONFIG" --argjson before "$BEFORE_DESCRIPTOR" \
+    --argjson post "$post" \
+    '{version:1,target:$target,status:"committed",before:$before,post:$post}')"
   python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/codex-state.json" --value "$state"
 }
 refresh_expected_hash() {
@@ -116,6 +133,10 @@ commit_config_transaction() {
   trap - EXIT
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }
+
+# This exact under-lock boundary is durable before any registration command can
+# mutate the file.  The caller must never infer or adopt an earlier snapshot.
+publish_before_state
 
 has_exact_managed_table_shape() {
   awk '
