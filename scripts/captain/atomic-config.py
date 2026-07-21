@@ -54,6 +54,21 @@ def require_regular(path: str) -> os.stat_result:
     return metadata
 
 
+def copy_metadata(source: str, destination: str, metadata: os.stat_result) -> None:
+    os.chmod(destination, stat.S_IMODE(metadata.st_mode), follow_symlinks=False)
+    os.chown(destination, metadata.st_uid, metadata.st_gid, follow_symlinks=False)
+    source_names = set(os.listxattr(source, follow_symlinks=False))
+    for name in set(os.listxattr(destination, follow_symlinks=False)) - source_names:
+        os.removexattr(destination, name, follow_symlinks=False)
+    for name in source_names:
+        os.setxattr(
+            destination,
+            name,
+            os.getxattr(source, name, follow_symlinks=False),
+            follow_symlinks=False,
+        )
+
+
 def exchange(target: str, candidate: str, expected_sha: str) -> None:
     target = os.path.abspath(target)
     candidate = os.path.abspath(candidate)
@@ -61,11 +76,7 @@ def exchange(target: str, candidate: str, expected_sha: str) -> None:
         raise RuntimeError("target and candidate must share a directory")
     target_metadata = require_regular(target)
     require_regular(candidate)
-    os.chmod(candidate, stat.S_IMODE(target_metadata.st_mode), follow_symlinks=False)
-    try:
-        os.chown(candidate, target_metadata.st_uid, target_metadata.st_gid, follow_symlinks=False)
-    except PermissionError:
-        pass
+    copy_metadata(target, candidate, target_metadata)
     with open(candidate, "rb") as staged:
         os.fsync(staged.fileno())
     rename_exchange(target, candidate)

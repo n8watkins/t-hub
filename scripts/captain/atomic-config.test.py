@@ -5,6 +5,7 @@ import os
 import pathlib
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -25,13 +26,17 @@ class AtomicConfigTest(unittest.TestCase):
             target.write_bytes(b"before\n")
             candidate.write_bytes(b"after\n")
             target.chmod(0o640)
+            os.setxattr(target, "user.t-hub-test", b"label")
             subprocess.run(
-                [str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"before\n")],
+                [sys.executable, str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"before\n")],
                 check=True,
             )
             self.assertEqual(target.read_bytes(), b"after\n")
             self.assertEqual(candidate.read_bytes(), b"before\n")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+            self.assertEqual(target.stat().st_uid, candidate.stat().st_uid)
+            self.assertEqual(target.stat().st_gid, candidate.stat().st_gid)
+            self.assertEqual(os.getxattr(target, "user.t-hub-test"), b"label")
 
     def test_mismatched_prestate_is_restored_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -41,7 +46,7 @@ class AtomicConfigTest(unittest.TestCase):
             target.write_bytes(b"concurrent-writer\n")
             candidate.write_bytes(b"migration\n")
             result = subprocess.run(
-                [str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"old-prestate\n")],
+                [sys.executable, str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"old-prestate\n")],
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -58,7 +63,7 @@ class AtomicConfigTest(unittest.TestCase):
             candidate.write_bytes(b"candidate\n")
             target.symlink_to(real.name)
             result = subprocess.run(
-                [str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"real\n")],
+                [sys.executable, str(HELPER), "exchange", "--target", str(target), "--candidate", str(candidate), "--expected-sha", digest(b"real\n")],
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
@@ -67,7 +72,7 @@ class AtomicConfigTest(unittest.TestCase):
     def test_publish_is_restricted_and_complete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory) / "state"
-            subprocess.run([str(HELPER), "publish", "--path", str(target), "--value", "hash\nnode\n"], check=True)
+            subprocess.run([sys.executable, str(HELPER), "publish", "--path", str(target), "--value", "hash\nnode\n"], check=True)
             self.assertEqual(target.read_text(), "hash\nnode\n")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
@@ -75,7 +80,7 @@ class AtomicConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = pathlib.Path(directory) / "state"
             target.write_text("value")
-            subprocess.run([str(HELPER), "discard", "--path", str(target)], check=True)
+            subprocess.run([sys.executable, str(HELPER), "discard", "--path", str(target)], check=True)
             self.assertFalse(target.exists())
 
 
