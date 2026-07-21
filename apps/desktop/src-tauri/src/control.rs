@@ -1141,7 +1141,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 18;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 19;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -1652,6 +1652,28 @@ fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
+fn migrate_project_identities(snapshot: &mut CaptainsSnapshot) -> Result<(), String> {
+    for project in &mut snapshot.projects {
+        let source = project.root_path.as_deref().unwrap_or(&project.repo_root);
+        let root = canonical_project_identity(source)?;
+        project.repo_root = root.clone();
+        project.root_path = Some(root.clone());
+        if project.vcs_capability.is_none() {
+            project.vcs_capability = Some(if snapshot.schema_version < CAPTAINS_SCHEMA_VERSION {
+                "git".into()
+            } else {
+                "none".into()
+            });
+        }
+        if project.vcs_capability.as_deref() == Some("git") && project.git_main_root.is_none() {
+            project.git_main_root = Some(root);
+        } else if let Some(main_root) = project.git_main_root.as_ref() {
+            project.git_main_root = Some(canonical_project_identity(main_root)?);
+        }
+    }
+    Ok(())
+}
+
 /// A repository registered with T-Hub. Projects outlive terminals, Captain
 /// conversations, and individual ships.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1659,7 +1681,18 @@ fn is_zero_i64(value: &i64) -> bool {
 pub struct ProjectRecord {
     pub project_id: String,
     pub name: String,
+    #[serde(default)]
     pub repo_root: String,
+    /// Canonical POSIX Project identity. `repoRoot` remains a read-compatible
+    /// wire alias while this field becomes the persisted source of truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path: Option<String>,
+    /// Git capability is explicit: `git` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcs_capability: Option<String>,
+    /// Canonical Git main-worktree root, present only for Git Projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_main_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3231,7 +3264,7 @@ impl CaptainsRegistry {
                 path: path.to_path_buf(),
             });
         }
-        let snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
+        let mut snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
             if has_release_recovery {
                 SnapshotReadError::IncompatibleRecovery {
                     path: path.to_path_buf(),
@@ -3246,6 +3279,15 @@ impl CaptainsRegistry {
                 version: snapshot.schema_version,
             });
         }
+        migrate_project_identities(&mut snapshot).map_err(|error| {
+            if has_release_recovery {
+                SnapshotReadError::IncompatibleRecovery {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                SnapshotReadError::Invalid(error)
+            }
+        })?;
         Self::validate_snapshot(&snapshot).map_err(|error| {
             if has_release_recovery {
                 SnapshotReadError::IncompatibleRecovery {
@@ -3269,12 +3311,28 @@ impl CaptainsRegistry {
             {
                 return Err("captains registry contains an empty or duplicate projectId".into());
             }
-            if project.repo_root.trim().is_empty() || !roots.insert(project.repo_root.as_str()) {
+            let identity = project.root_path.as_deref().unwrap_or(&project.repo_root);
+            if identity.trim().is_empty() || !roots.insert(identity) {
                 return Err("captains registry contains an empty or duplicate repoRoot".into());
             }
-            if !std::path::Path::new(&project.repo_root).is_absolute() {
+            if !identity.starts_with('/') || identity.starts_with("//") {
                 return Err(format!(
-                    "project '{}' has a non-absolute repoRoot",
+                    "project '{}' has a non-absolute rootPath",
+                    project.project_id
+                ));
+            }
+            if !matches!(
+                project.vcs_capability.as_deref(),
+                Some("git") | Some("none")
+            ) {
+                return Err(format!(
+                    "project '{}' has an invalid vcsCapability",
+                    project.project_id
+                ));
+            }
+            if project.vcs_capability.as_deref() == Some("git") && project.git_main_root.is_none() {
+                return Err(format!(
+                    "project '{}' is Git-enabled but has no gitMainRoot",
                     project.project_id
                 ));
             }
@@ -5599,15 +5657,40 @@ impl CaptainsRegistry {
     pub fn upsert_project(&self, mut project: ProjectRecord) -> Result<ProjectRecord, String> {
         project.project_id = project.project_id.trim().to_string();
         project.name = project.name.trim().to_string();
-        project.repo_root = project.repo_root.trim_end_matches(['/', '\\']).to_string();
+        let identity_source = project.root_path.as_deref().unwrap_or(&project.repo_root);
+        let identity = canonical_project_identity(identity_source)?;
+        project.repo_root = identity.clone();
+        project.root_path = Some(identity.clone());
+        if project.vcs_capability.is_none() {
+            let detected = git::git_info_cached(&identity);
+            project.vcs_capability = Some(if project.git_main_root.is_some() || detected.is_repo {
+                "git".into()
+            } else {
+                "none".into()
+            });
+            if project.vcs_capability.as_deref() == Some("git") && project.git_main_root.is_none() {
+                project.git_main_root = detected
+                    .worktree_root
+                    .map(|root| files::posix_form(&root))
+                    .or_else(|| Some(identity.clone()));
+            }
+        }
+        if let Some(main_root) = project.git_main_root.as_deref() {
+            project.git_main_root = Some(canonical_project_identity(main_root)?);
+        } else if project.vcs_capability.as_deref() == Some("git") {
+            project.git_main_root = Some(identity.clone());
+        }
         if project.project_id.is_empty() {
             return Err("projectId must not be empty".into());
         }
         if project.name.is_empty() {
             return Err("project name must not be empty".into());
         }
-        if project.repo_root.is_empty() || !std::path::Path::new(&project.repo_root).is_absolute() {
-            return Err("repoRoot must be an absolute path".into());
+        if !matches!(
+            project.vcs_capability.as_deref(),
+            Some("git") | Some("none")
+        ) {
+            return Err("vcsCapability must be 'git' or 'none'".into());
         }
         if let Some(powder) = project.powder.as_mut() {
             powder.connection_profile = powder.connection_profile.trim().to_string();
@@ -5624,10 +5707,12 @@ impl CaptainsRegistry {
             .projects
             .iter()
             .position(|p| p.project_id == project.project_id);
-        let by_root = g
-            .projects
-            .iter()
-            .position(|p| p.repo_root == project.repo_root);
+        let by_root = g.projects.iter().position(|p| {
+            p.root_path
+                .as_deref()
+                .or(Some(p.repo_root.as_str()))
+                .is_some_and(|root| files::posix_form(root) == identity)
+        });
         if let (Some(id_index), Some(root_index)) = (by_id, by_root) {
             if id_index != root_index {
                 return Err(
@@ -5636,7 +5721,7 @@ impl CaptainsRegistry {
             }
         }
         if let Some(index) = by_id {
-            if g.projects[index].repo_root != project.repo_root {
+            if files::posix_form(&g.projects[index].repo_root) != identity {
                 return Err(format!(
                     "projectId '{}' is already bound to '{}'",
                     project.project_id, g.projects[index].repo_root
@@ -9956,7 +10041,7 @@ fn required_tier(command: &str) -> CommandTier {
         }
         "focus_session" | "history_focus" | "history_list" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
-        | "archive_recent_project" | "register_project" | "bind_project_powder"
+        | "archive_recent_project" | "register_project" | "initialize_git" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "agent_checkpoint" | "report_workspace_tabs" | "watch_fleet"
         | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
         | "rebind_control"
@@ -12295,6 +12380,7 @@ fn dispatch_with_caller(
         // the sidebar; filesystem-mutating like the worktree ops above.
         "archive_recent_project" => archive_recent_project(ctx, args, caller, trusted_internal),
         "register_project" => register_project(ctx, args, caller, trusted_internal),
+        "initialize_git" => initialize_git(ctx, args, caller, trusted_internal),
         "bind_project_powder" => bind_project_powder(ctx, args, caller, trusted_internal),
         // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
         // UI's pin action and an MCP captain's self-registration both land here,
@@ -12848,6 +12934,7 @@ fn dispatch_preflight(
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("dispatch_preflight: unknown projectId '{project_id}'"))?;
     let repo_root = files::posix_form(&project.repo_root);
+    require_registered_git_capability(ctx, "dispatch_preflight", &project.repo_root)?;
     git::require_commit_ancestor(&repo_root, &source_commit, &source_commit)
         .map_err(|error| format!("dispatch_preflight: sourceCommit rejected: {error}"))?;
     let dependencies = requested_lanes
@@ -13234,6 +13321,19 @@ fn record_agent_delivery(
         .ok_or_else(|| {
             format!("record_agent_delivery: agent '{agent_session_id}' was not found")
         })?;
+    let project_root = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.project_id == agent.project_id)
+        .ok_or_else(|| {
+            format!(
+                "record_agent_delivery: Project '{}' was not found",
+                agent.project_id
+            )
+        })?
+        .repo_root;
+    require_registered_git_capability(ctx, "record_agent_delivery", &project_root)?;
     let authority = authorize_agent(
         ctx,
         &agent,
@@ -15701,6 +15801,83 @@ fn powder_board_page(
 
 /// Register an existing Git repository using its canonical main-worktree root.
 /// Re-registering the same root updates metadata while preserving its project id.
+fn initialize_git(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "initialize_git",
+        &["repoRoot", "repo_root", "projectId", "project_id", "name"],
+    )?;
+    require_socket_identity(caller, trusted_internal, "initialize_git")?;
+    let requested = arg_str(args, "repoRoot")
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("initialize_git requires a 'repoRoot' argument")?;
+    let root = canonical_project_root(&requested, false)?;
+    let existing = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| files::posix_form(&project.repo_root) == root);
+    enforce_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        existing.as_ref().map(|project| project.project_id.as_str()),
+    )?;
+    git::initialize_repository(&root)
+        .map_err(|error| format!("initialize_git: Git initialization failed: {error}"))?;
+    let main_root = git::git_info_cached(&root)
+        .worktree_root
+        .map(|root| files::posix_form(&root))
+        .unwrap_or(root.clone());
+    let main_branch = git::worktree_list(&main_root).ok().and_then(|worktrees| {
+        worktrees
+            .into_iter()
+            .find(|worktree| !worktree.is_linked)
+            .and_then(|worktree| worktree.branch)
+    });
+    let name = arg_str(args, "name")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| existing.as_ref().map(|project| project.name.clone()))
+        .ok_or("initialize_git requires a non-empty 'name' for a new Project")?;
+    let project = existing.unwrap_or(ProjectRecord {
+        root_path: None,
+        vcs_capability: None,
+        git_main_root: None,
+        project_id: format!("project-{}", uuid::Uuid::new_v4()),
+        name: name.clone(),
+        repo_root: main_root.clone(),
+        remote_url: None,
+        default_branch: None,
+        powder: None,
+        created_at: 0,
+        updated_at: 0,
+    });
+    let info = git::git_info_cached(&main_root);
+    let updated = ctx.captains.upsert_project(ProjectRecord {
+        project_id: project.project_id,
+        name: name.to_string(),
+        repo_root: main_root.clone(),
+        root_path: Some(main_root.clone()),
+        vcs_capability: Some("git".into()),
+        git_main_root: Some(main_root),
+        remote_url: project.remote_url.or(info.remote_url),
+        default_branch: project
+            .default_branch
+            .or(info.default_branch)
+            .or(main_branch)
+            .or_else(|| Some("main".into())),
+        powder: project.powder,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+    })?;
+    serde_json::to_value(updated).map_err(|error| error.to_string())
+}
+
 fn register_project(
     ctx: &ControlContext,
     args: &Value,
@@ -15715,8 +15892,6 @@ fn register_project(
             "repo_root",
             "createDirectory",
             "create_directory",
-            "initializeGit",
-            "initialize_git",
             "name",
             "remoteUrl",
             "remote_url",
@@ -15726,18 +15901,16 @@ fn register_project(
     let requested_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("register_project requires a 'repoRoot' argument")?;
-    let initialize_git = args
-        .get("initializeGit")
-        .or_else(|| args.get("initialize_git"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let explicit_name = arg_str(args, "name")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("register_project requires a non-empty 'name'")?;
     let create_directory = args
         .get("createDirectory")
         .or_else(|| args.get("create_directory"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let canonical_root = canonical_project_root(&requested_root, create_directory)?;
-    if create_directory || initialize_git {
+    if create_directory {
         let registered_project_id = ctx
             .captains
             .projects()
@@ -15760,58 +15933,29 @@ fn register_project(
     } else {
         false
     };
-    let (worktrees, initialized_git) = if created_directory && initialize_git {
-        if let Err(error) = git::initialize_repository(&canonical_root) {
-            return Err(rollback_project_creation_error(
+    let canonical_root = if created_directory {
+        files::canonical_posix_path(&canonical_root).map_err(|error| {
+            rollback_project_creation_error(
                 &canonical_root,
                 false,
                 true,
-                format!("register_project: Git initialization failed: {error}"),
-            ));
-        }
-        let worktrees = match git::worktree_list(&canonical_root) {
-            Ok(worktrees) => worktrees,
-            Err(error) => {
-                return Err(rollback_project_creation_error(
-                    &canonical_root,
-                    true,
-                    true,
-                    format!("register_project: initialized repository validation failed: {error}"),
-                ));
-            }
-        };
-        (worktrees, true)
-    } else if created_directory {
+                format!("register_project: created root could not be canonicalized: {error}"),
+            )
+        })?
+    } else {
+        canonical_root
+    };
+    let (worktrees, initialized_git) = if created_directory {
         (Vec::new(), false)
     } else {
         let git_info = git::git_info_cached(&canonical_root);
-        let mut worktrees = if git_info.is_repo {
+        let worktrees = if git_info.is_repo {
             git::worktree_list(&canonical_root)
                 .map_err(|e| format!("register_project: repository validation failed: {e}"))?
         } else {
             Vec::new()
         };
-        let initialized_git = if !git_info.is_repo && initialize_git {
-            git::initialize_repository(&canonical_root)
-                .map_err(|error| format!("register_project: Git initialization failed: {error}"))?;
-            worktrees = match git::worktree_list(&canonical_root) {
-                Ok(worktrees) => worktrees,
-                Err(error) => {
-                    return Err(rollback_initialized_git_error(
-                        &canonical_root,
-                        format!(
-                            "register_project: initialized repository validation failed: {error}"
-                        ),
-                    ));
-                }
-            };
-            true
-        } else if git_info.is_repo {
-            false
-        } else {
-            false
-        };
-        (worktrees, initialized_git)
+        (worktrees, false)
     };
 
     let result = (|| {
@@ -15820,14 +15964,7 @@ fn register_project(
             .and_then(|worktree| git::git_info_cached(&worktree.path).worktree_root)
             .map(|root| files::posix_form(&root))
             .unwrap_or_else(|| canonical_root.clone());
-        let name = arg_str(args, "name")
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::path::Path::new(&repo_root)
-                    .file_name()
-                    .map(|value| value.to_string_lossy().into_owned())
-            })
-            .ok_or("register_project: could not derive a project name")?;
+        let name = explicit_name;
         let existing = ctx
             .captains
             .projects()
@@ -15846,7 +15983,10 @@ fn register_project(
                 .map(|project| project.project_id.clone())
                 .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
             name,
-            repo_root,
+            repo_root: repo_root.clone(),
+            root_path: Some(repo_root.clone()),
+            vcs_capability: Some(if git_info.is_repo { "git" } else { "none" }.into()),
+            git_main_root: git_info.is_repo.then(|| repo_root.clone()),
             remote_url: arg_str(args, "remoteUrl")
                 .or_else(|| arg_str(args, "remote_url"))
                 .or(git_info.remote_url)
@@ -15884,11 +16024,26 @@ fn register_project(
     result
 }
 
+fn canonical_project_identity(requested: &str) -> Result<String, String> {
+    let raw = requested.trim();
+    files::validate_configured_wsl_path(raw)?;
+    if raw.split(['/', '\\']).any(|part| part == "..") {
+        return Err("path traversal is not allowed".into());
+    }
+    let root = files::posix_form(raw);
+    if root.is_empty() || !root.starts_with('/') || root.starts_with("//") || root.contains('\0') {
+        return Err("rootPath must be an absolute WSL path".into());
+    }
+    Ok(root)
+}
+
 /// Project identity is always the canonical POSIX root seen by WSL.
 /// Host-side `Path::is_absolute` and `canonicalize` are intentionally absent:
 /// they reject or rewrite valid WSL roots when the daemon runs on Windows.
 fn canonical_project_root(requested: &str, allow_missing: bool) -> Result<String, String> {
     let raw = requested.trim();
+    files::validate_configured_wsl_path(raw)
+        .map_err(|error| format!("register_project: {error}"))?;
     if raw.split(['/', '\\']).any(|part| part == "..") {
         return Err("register_project: path traversal is not allowed".into());
     }
@@ -15910,7 +16065,8 @@ fn canonical_project_root(requested: &str, allow_missing: bool) -> Result<String
     if !metadata.is_dir() {
         return Err("register_project: rootPath must refer to a directory".into());
     }
-    Ok(root)
+    files::canonical_posix_path(&root)
+        .map_err(|error| format!("register_project: could not canonicalize root '{root}': {error}"))
 }
 
 fn create_new_project_directory(repo_root: &str) -> Result<(), String> {
@@ -18306,6 +18462,7 @@ fn dispatch_crew_with_observer_inner(
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
+    require_registered_git_capability(ctx, "dispatch_crew", &project.repo_root)?;
     let (_, authority_generations, authority_epoch) =
         ctx.captains.snapshot_with_authority_generations();
     let dispatch_generation = authority_generations.scoped(
@@ -22872,12 +23029,18 @@ fn resolve_admin_worktree_target(
     requested_path: &str,
 ) -> Result<ResolvedAdminExecutionTarget, String> {
     let requested_path = files::posix_form(requested_path.trim());
-    if requested_path.is_empty() || !Path::new(&requested_path).is_absolute() {
+    if requested_path.is_empty() || !requested_path.starts_with('/') {
         return Err("execute_admin_operation worktree path must be absolute".into());
     }
     let snapshot = ctx.captains.snapshot();
     let mut matches = Vec::new();
     for project in &snapshot.projects {
+        if project.vcs_capability.as_deref() == Some("none") {
+            if files::posix_form(&project.repo_root) == requested_path {
+                require_registered_git_capability(ctx, "admin_worktree", &project.repo_root)?;
+            }
+            continue;
+        }
         let worktrees = git::worktree_list(&files::posix_form(&project.repo_root))?;
         if let Some(worktree) = worktrees
             .into_iter()
@@ -23706,7 +23869,6 @@ fn create_worktree(
     let worktree_path = arg_str(args, "worktreePath")
         .or_else(|| arg_str(args, "worktree_path"))
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
-    require_git_capability("create_worktree", &repo_root)?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
     // The command the worktree terminal execs into, same contract + exec path as
@@ -23728,6 +23890,7 @@ fn create_worktree(
         startup_command.as_deref(),
         spawned_by.as_deref(),
     )?;
+    require_registered_git_capability(ctx, "create_worktree", &repo_root)?;
     let result = create_worktree_authorized(
         ctx,
         args,
@@ -23744,21 +23907,38 @@ fn create_worktree(
 }
 
 /// Stable capability failure shared by Git-only control operations.
-/// The JSON envelope is part of the error contract so adapters do not parse
-/// locale-dependent Git output.
+/// The fields are deliberately stable so adapters do not parse locale-dependent
+/// Git output or receive JSON encoded inside an error string.
 fn require_git_capability(operation: &str, root: &str) -> Result<(), String> {
     let posix_root = files::posix_form(root);
     if git::git_info_cached(&posix_root).is_repo {
         return Ok(());
     }
-    Err(json!({
-        "code": "git_required",
-        "operation": operation,
-        "capability": "git",
-        "message": "This operation requires a Git-enabled Project.",
-        "action": "Initialize Git explicitly, then retry the operation."
-    })
-    .to_string())
+    Err(format!(
+        "git_required code=git_required operation={operation} capability=git action=initialize_git"
+    ))
+}
+
+fn require_registered_git_capability(
+    ctx: &ControlContext,
+    operation: &str,
+    root: &str,
+) -> Result<(), String> {
+    let identity = files::posix_form(root);
+    if let Some(project) = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| files::posix_form(&project.repo_root) == identity)
+    {
+        if project.vcs_capability.as_deref() == Some("none") {
+            return Err(format!(
+                "git_required code=git_required operation={operation} capability=git action=initialize_git"
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24019,17 +24199,11 @@ fn authorize_worktree_maintenance(
     if active_admin_grant.is_none() && caller_is_apex(Some(caller), false) {
         return Ok(None);
     }
-    let repo_worktrees = git::worktree_list(&files::posix_form(repo_root))?;
     let snapshot = ctx.captains.snapshot();
     let project = snapshot
         .projects
         .iter()
-        .find(|project| {
-            let registered_root = files::posix_form(&project.repo_root);
-            repo_worktrees
-                .iter()
-                .any(|worktree| files::posix_form(&worktree.path) == registered_root)
-        })
+        .find(|project| files::posix_form(&project.repo_root) == files::posix_form(repo_root))
         .ok_or("acl: create_worktree repository is not a registered Project")?;
 
     if active_admin_grant.is_none() && caller.fleet_role == Some(FleetRole::Captain) {
@@ -24210,6 +24384,7 @@ fn remove_worktree(
 
     // Preserve the remote path security boundary, then fail every authorized
     // caller before forwarding UI state or invoking Git.
+    require_registered_git_capability(ctx, "remove_worktree", &repo_root)?;
     git::require_worktree_removal_safety_service()?;
 
     let forward = json!({
@@ -24302,7 +24477,7 @@ fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             .to_string_lossy()
             .into_owned()
     };
-    require_git_capability("list_worktrees", &cwd)?;
+    require_registered_git_capability(ctx, "list_worktrees", &cwd)?;
     let list = git::worktree_list(&cwd)?;
     Ok(json!({ "worktrees": list }))
 }
@@ -25913,6 +26088,7 @@ fn dispatch_runtime_capacity(
         .iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("dispatch preflight: unknown projectId '{project_id}'"))?;
+    require_registered_git_capability(ctx, "capacity", &project.repo_root)?;
     let available_worktrees = git::worktree_list(&files::posix_form(&project.repo_root))
         .map_err(|error| format!("dispatch preflight: could not inspect worktrees: {error}"))?
         .into_iter()
@@ -26083,6 +26259,7 @@ fn start_agent(
         .find(|project| project.project_id == project_id)
         .cloned()
         .ok_or_else(|| format!("start_agent: unknown projectId '{project_id}'"))?;
+    require_registered_git_capability(ctx, "start_agent", &project.repo_root)?;
     let checkout = validate_crew_checkout(&project, Some(directory))
         .map_err(|error| error.replacen("dispatch_crew", "start_agent", 1))?;
     let worktree = git::worktree_list(&files::posix_form(&project.repo_root))
@@ -27840,6 +28017,9 @@ mod tests {
     ) {
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "capacity-project".into(),
                 name: "Capacity Project".into(),
                 repo_root: "/tmp/capacity-project".into(),
@@ -29130,6 +29310,9 @@ mod tests {
         let distro = checkout_test_distro();
         let durable_root = extended_wsl_unc(&repo, &distro);
         let project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-wsl-worktree".into(),
             name: "WSL Worktree".into(),
             repo_root: durable_root.clone(),
@@ -29158,6 +29341,9 @@ mod tests {
         let (base, repo, worktree) = scratch_repo_with_worktree();
         let distro = checkout_test_distro();
         let project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-same-distro".into(),
             name: "Same Distro".into(),
             repo_root: extended_wsl_unc(&repo, &distro),
@@ -29189,6 +29375,9 @@ mod tests {
             "Debian"
         };
         let mut project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-foreign-distro".into(),
             name: "Foreign Distro".into(),
             repo_root: extended_wsl_unc(&repo, &configured),
@@ -29226,6 +29415,9 @@ mod tests {
         std::fs::create_dir(&ordinary).expect("ordinary checkout fixture");
         let distro = checkout_test_distro();
         let project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-wsl-rejections".into(),
             name: "WSL Rejections".into(),
             repo_root: extended_wsl_unc(&repo, &distro),
@@ -29780,6 +29972,9 @@ mod tests {
             let captains = Arc::new(CaptainsRegistry::new());
             captains
                 .upsert_project(ProjectRecord {
+                    root_path: None,
+                    vcs_capability: None,
+                    git_main_root: None,
                     project_id: "project-a".into(),
                     name: "Project A".into(),
                     repo_root: "/tmp/project-a".into(),
@@ -31907,6 +32102,9 @@ mod tests {
         let registry = CaptainsRegistry::load(path.clone());
         registry
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-alpha".into(),
                 name: "Alpha Project".into(),
                 repo_root: "/tmp/project-alpha".into(),
@@ -32524,6 +32722,9 @@ mod tests {
         let path = captains_tmp("multiple-captains-one-project");
         let reg = CaptainsRegistry::load(path.clone());
         reg.upsert_project(ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-shared".into(),
             name: "Shared".into(),
             repo_root: dispatch_test_repo_root(),
@@ -32787,6 +32988,9 @@ mod tests {
         for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
             registry
                 .upsert_project(ProjectRecord {
+                    root_path: None,
+                    vcs_capability: None,
+                    git_main_root: None,
                     project_id: project_id.into(),
                     name: name.into(),
                     repo_root: format!("/tmp/{project_id}"),
@@ -32877,6 +33081,9 @@ mod tests {
         for (project_id, name) in [("project-a", "A"), ("project-b", "B")] {
             captains
                 .upsert_project(ProjectRecord {
+                    root_path: None,
+                    vcs_capability: None,
+                    git_main_root: None,
                     project_id: project_id.into(),
                     name: name.into(),
                     repo_root: format!("/tmp/{project_id}"),
@@ -33277,6 +33484,9 @@ mod tests {
         let initial = CaptainsRegistry::load(path.clone());
         initial
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-a".into(),
                 name: "Project A".into(),
                 repo_root: "/tmp/project-a".into(),
@@ -33364,6 +33574,9 @@ mod tests {
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-a".into(),
                 name: "Project A".into(),
                 repo_root: "/tmp/project-a".into(),
@@ -33652,6 +33865,9 @@ mod tests {
     fn concurrent_distinct_ship_claims_create_distinct_project_captains() {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.upsert_project(ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-one".into(),
             name: "One".into(),
             repo_root: "/tmp".into(),
@@ -33698,6 +33914,91 @@ mod tests {
             .collect::<Vec<_>>();
         ship_slugs.sort_unstable();
         assert_eq!(ship_slugs, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn concurrent_equivalent_project_registrations_dedupe_canonical_identity() {
+        let reg = Arc::new(CaptainsRegistry::new());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let roots = [
+            "/tmp/t-hub-equivalent/./root",
+            "/tmp/t-hub-equivalent/root/",
+        ];
+        let joins = roots
+            .into_iter()
+            .enumerate()
+            .map(|(index, root)| {
+                let reg = Arc::clone(&reg);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reg.upsert_project(ProjectRecord {
+                        root_path: Some(root.into()),
+                        vcs_capability: Some("none".into()),
+                        git_main_root: None,
+                        project_id: format!("project-{index}"),
+                        name: format!("Project {index}"),
+                        repo_root: root.into(),
+                        remote_url: None,
+                        default_branch: None,
+                        powder: None,
+                        created_at: 0,
+                        updated_at: 0,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for join in joins {
+            join.join().unwrap().unwrap();
+        }
+        let projects = reg.projects();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(
+            projects[0].root_path.as_deref(),
+            Some("/tmp/t-hub-equivalent/root")
+        );
+        assert_eq!(projects[0].vcs_capability.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn every_registered_git_only_gate_rejects_non_git_before_operation() {
+        let ctx = test_ctx("git-gate-matrix");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                root_path: Some("/tmp/non-git-gate".into()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                project_id: "non-git-project".into(),
+                name: "Non-Git Project".into(),
+                repo_root: "/tmp/non-git-gate".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        for operation in [
+            "dispatch_preflight",
+            "baseline",
+            "integration",
+            "delivery",
+            "capacity",
+            "create_worktree",
+            "remove_worktree",
+            "list_worktrees",
+            "admin_worktree",
+        ] {
+            let error = require_registered_git_capability(&ctx, operation, "/tmp/non-git-gate")
+                .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "git_required code=git_required operation={operation} capability=git action=initialize_git"
+                )
+            );
+        }
     }
 
     #[test]
@@ -33907,6 +34208,15 @@ mod tests {
         assert_eq!(
             snapshot.projects[0].remote_url.as_deref(),
             Some("https://example.invalid/aurora.git")
+        );
+        assert_eq!(
+            snapshot.projects[0].root_path.as_deref(),
+            Some("/sanitized/workspaces/aurora")
+        );
+        assert_eq!(snapshot.projects[0].vcs_capability.as_deref(), Some("git"));
+        assert_eq!(
+            snapshot.projects[0].git_main_root.as_deref(),
+            Some("/sanitized/workspaces/aurora")
         );
 
         let loaded = CaptainsRegistry::load(path.clone());
@@ -34750,6 +35060,9 @@ mod tests {
         let ctx = test_ctx("secret");
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-1".into(),
                 name: "Project".into(),
                 repo_root: "/tmp/project-1".into(),
@@ -34881,6 +35194,9 @@ mod tests {
         let divergent_result = exact_head(&worktree);
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-delivery".into(),
                 name: "Delivery".into(),
                 repo_root: repo_path,
@@ -36549,6 +36865,9 @@ mod tests {
         }
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-six".into(),
                 name: "Six Lane Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -36638,6 +36957,9 @@ mod tests {
 
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-dependency".into(),
                 name: "Dependency Project".into(),
                 repo_root: repo_path,
@@ -36790,6 +37112,9 @@ mod tests {
         let checkout = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-atomic-start".into(),
                 name: "Atomic Start Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -36898,6 +37223,9 @@ mod tests {
         let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-start".into(),
                 name: "Start Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -36967,6 +37295,9 @@ mod tests {
         let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-reserved-start".into(),
                 name: "Reserved Start Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -37045,6 +37376,9 @@ mod tests {
         let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-start-success".into(),
                 name: "Start Success Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -37138,6 +37472,9 @@ mod tests {
         let repo = worktree.to_string_lossy().to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-fleet-admin".into(),
                 name: "Fleet Admin Project".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -37939,6 +38276,9 @@ mod tests {
         let admin_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-alpha".into(),
                 name: "Alpha".into(),
                 repo_root: "/tmp/project-alpha".into(),
@@ -38029,6 +38369,9 @@ mod tests {
         let (base, repo_root, _existing_worktree) = scratch_repo_with_worktree();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-alpha".into(),
                 name: "Alpha".into(),
                 repo_root: repo_root.to_string_lossy().to_string(),
@@ -39588,6 +39931,9 @@ mod tests {
         }]);
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-ordered-provisioning".into(),
                 name: "Ordered Provisioning".into(),
                 repo_root: "/tmp".into(),
@@ -39760,6 +40106,9 @@ mod tests {
         ]);
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-e2e".into(),
                 name: "Commission E2E".into(),
                 repo_root: "/tmp".into(),
@@ -39842,6 +40191,9 @@ mod tests {
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-commission-fail".into(),
                 name: "Commission Failure".into(),
                 repo_root: "/tmp".into(),
@@ -39935,6 +40287,9 @@ mod tests {
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-commission-crash".into(),
                 name: "Commission Crash".into(),
                 repo_root: "/tmp".into(),
@@ -40078,6 +40433,9 @@ mod tests {
             state: ClaimState::Active,
         };
         let project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-e2e".into(),
             name: "T-Hub".into(),
             repo_root: canonical_repo_root.into(),
@@ -40141,6 +40499,9 @@ mod tests {
         let ctx = test_ctx("secret");
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-unbound".into(),
                 name: "Unbound".into(),
                 repo_root: "/tmp".into(),
@@ -40172,6 +40533,9 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".into();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-attach".into(),
                 name: "Attach Project".into(),
                 repo_root: "/tmp".into(),
@@ -40314,6 +40678,9 @@ mod tests {
         let captains = Arc::new(CaptainsRegistry::load(path.clone()));
         captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-attach-rollback".into(),
                 name: "Attach Rollback".into(),
                 repo_root: "/tmp/attach-rollback".into(),
@@ -40528,6 +40895,9 @@ mod tests {
         let registry = Arc::new(CaptainsRegistry::new());
         registry
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "rollback-project".into(),
                 name: "Rollback Project".into(),
                 repo_root: "/tmp".into(),
@@ -40618,8 +40988,8 @@ mod tests {
                 "register_project",
                 json!({
                     "repoRoot": requested.to_string_lossy(),
+                    "name": "Scoped Project",
                     "createDirectory": true,
-                    "initializeGit": true,
                 }),
             ),
         );
@@ -40648,7 +41018,7 @@ mod tests {
         let project = dispatch(
             &ctx,
             "register_project",
-            &json!({"repoRoot": dir.to_string_lossy()}),
+            &json!({"repoRoot": dir.to_string_lossy(), "name": "Non Git Project"}),
         )
         .unwrap();
         assert_eq!(project["repoRoot"], dir.to_string_lossy().to_string());
@@ -40657,7 +41027,7 @@ mod tests {
     }
 
     #[test]
-    fn register_project_initializes_git_only_when_explicitly_requested() {
+    fn initialize_git_is_separate_from_register_project() {
         let ctx = test_ctx("secret");
         let dir = std::env::temp_dir().join(format!(
             "t-hub-register-init-{}-{}",
@@ -40669,8 +41039,8 @@ mod tests {
 
         let project = dispatch(
             &ctx,
-            "register_project",
-            &json!({"repoRoot": dir.to_string_lossy(), "initializeGit": true}),
+            "initialize_git",
+            &json!({"repoRoot": dir.to_string_lossy(), "name": "Initialized Project"}),
         )
         .unwrap();
 
@@ -40681,42 +41051,6 @@ mod tests {
             std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
             "preserve me"
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn register_project_rolls_back_initialized_git_after_later_failure() {
-        let ctx = test_ctx("secret");
-        let dir = std::env::temp_dir().join(format!(
-            "t-hub-register-init-rollback-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("keep.txt"), "preserve me").unwrap();
-
-        let error = dispatch(
-            &ctx,
-            "register_project",
-            &json!({
-                "repoRoot": dir.to_string_lossy(),
-                "initializeGit": true,
-                "powderRepository": " "
-            }),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.contains("rolled back the Git repository"),
-            "got: {error}"
-        );
-        assert!(!dir.join(".git").exists());
-        assert_eq!(
-            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
-            "preserve me"
-        );
-        assert!(ctx.captains.projects().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -40731,22 +41065,18 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/owner"), "pre-existing").unwrap();
 
-        let error = dispatch(
+        let project = dispatch(
             &ctx,
             "register_project",
-            &json!({"repoRoot": dir.to_string_lossy(), "initializeGit": true}),
+            &json!({"repoRoot": dir.to_string_lossy(), "name": "Existing Git Project"}),
         )
-        .unwrap_err();
-
-        assert!(
-            error.contains("already contains a .git entry"),
-            "got: {error}"
-        );
+        .unwrap();
+        assert_eq!(project["vcsCapability"], "none");
         assert_eq!(
             std::fs::read_to_string(dir.join(".git/owner")).unwrap(),
             "pre-existing"
         );
-        assert!(ctx.captains.projects().is_empty());
+        assert_eq!(ctx.captains.projects().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -40768,15 +41098,14 @@ mod tests {
                 "repoRoot": destination.to_string_lossy(),
                 "name": "Fresh Codebase",
                 "createDirectory": true,
-                "initializeGit": true
             }),
         )
         .unwrap();
 
         assert_eq!(project["name"], "Fresh Codebase");
         assert_eq!(project["repoRoot"], destination.to_string_lossy().as_ref());
-        assert_eq!(project["defaultBranch"], "main");
-        assert!(destination.join(".git").is_dir());
+        assert!(project["defaultBranch"].is_null());
+        assert!(!destination.join(".git").exists());
         let _ = std::fs::remove_dir_all(parent);
     }
 
@@ -40798,7 +41127,7 @@ mod tests {
             &json!({
                 "repoRoot": destination.to_string_lossy(),
                 "createDirectory": true,
-                "initializeGit": true
+                "name": "Existing Destination"
             }),
         )
         .unwrap_err();
@@ -40810,39 +41139,6 @@ mod tests {
         );
         assert!(ctx.captains.projects().is_empty());
         let _ = std::fs::remove_dir_all(parent);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn register_project_new_codebase_rolls_back_owned_leaf_after_later_failure() {
-        let ctx = test_ctx("secret");
-        let parent = std::env::temp_dir().join(format!(
-            "t-hub-register-new-rollback-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir(&parent).unwrap();
-        let destination = parent.join("rolled-back");
-
-        let error = dispatch(
-            &ctx,
-            "register_project",
-            &json!({
-                "repoRoot": destination.to_string_lossy(),
-                "createDirectory": true,
-                "initializeGit": true,
-                "powderRepository": " "
-            }),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.contains("rolled back the new directory"),
-            "got: {error}"
-        );
-        assert!(!destination.exists());
-        assert!(ctx.captains.projects().is_empty());
-        let _ = std::fs::remove_dir(parent);
     }
 
     #[test]
@@ -40860,7 +41156,8 @@ mod tests {
             "register_project",
             &json!({
                 "repoRoot": destination.to_string_lossy(),
-                "createDirectory": true
+                "createDirectory": true,
+                "name": "Missing Init"
             }),
         )
         .unwrap();
@@ -40878,7 +41175,7 @@ mod tests {
             &json!({
                 "repoRoot": trailing_slash,
                 "createDirectory": true,
-                "initializeGit": true
+                "name": "Trailing Path"
             }),
         )
         .unwrap();
@@ -40886,7 +41183,7 @@ mod tests {
             initialized["repoRoot"],
             parent.join("ambiguous").to_string_lossy().to_string()
         );
-        assert!(parent.join("ambiguous/.git").is_dir());
+        assert!(!parent.join("ambiguous/.git").exists());
 
         let missing_parent = parent.join("missing").join("child");
         let error = dispatch(
@@ -40895,7 +41192,7 @@ mod tests {
             &json!({
                 "repoRoot": missing_parent.to_string_lossy(),
                 "createDirectory": true,
-                "initializeGit": true
+                "name": "Missing Parent"
             }),
         )
         .unwrap_err();
@@ -40924,6 +41221,9 @@ mod tests {
         let ctx = test_ctx("secret");
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-board".into(),
                 name: "Board Project".into(),
                 repo_root: "/tmp/registered-board-project".into(),
@@ -40984,6 +41284,9 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         ctx.captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-cwd".into(),
                 name: "Cwd Project".into(),
                 repo_root: root_text,
@@ -42553,6 +42856,9 @@ mod tests {
         let captains = Arc::new(CaptainsRegistry::new());
         captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "lease-project".into(),
                 name: "Lease Project".into(),
                 repo_root: "/tmp/lease-project".into(),
@@ -42852,6 +43158,9 @@ mod tests {
             let project_id = format!("project-{index}");
             registry
                 .upsert_project(ProjectRecord {
+                    root_path: None,
+                    vcs_capability: None,
+                    git_main_root: None,
                     project_id: project_id.clone(),
                     name: project_id.clone(),
                     repo_root: format!("/repo-{index}"),
@@ -46075,6 +46384,9 @@ mod tests {
         let reg = CaptainsRegistry::load(path.clone());
         let project = reg
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-thub".into(),
                 name: "T-Hub".into(),
                 repo_root: "/home/test/t-hub".into(),
@@ -46533,6 +46845,9 @@ mod tests {
         let project = ctx
             .captains
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-events".into(),
                 name: "Events".into(),
                 repo_root: "/tmp/events".into(),
@@ -46594,6 +46909,9 @@ mod tests {
     fn powder_event_cursor_waits_for_a_project_captain() {
         let ctx = test_ctx("secret");
         let project = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-waiting-events".into(),
             name: "Waiting Events".into(),
             repo_root: "/tmp/waiting-events".into(),
@@ -46727,6 +47045,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let reg = CaptainsRegistry::load(path.clone());
         reg.upsert_project(ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-crew".into(),
             name: "Crew Project".into(),
             repo_root: "/tmp/crew-project".into(),
@@ -46804,6 +47125,9 @@ mod tests {
         });
         registry
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-powder-lifecycle".into(),
                 name: "Powder Lifecycle".into(),
                 repo_root: "/tmp/powder-lifecycle".into(),
@@ -47672,6 +47996,9 @@ mod tests {
         });
         registry
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-dispatch-attestation".into(),
                 name: "Dispatch Attestation".into(),
                 repo_root: dispatch_test_repo_root(),
@@ -56199,6 +56526,9 @@ mod tests {
 
         registry
             .upsert_project(ProjectRecord {
+                root_path: None,
+                vcs_capability: None,
+                git_main_root: None,
                 project_id: "project-unrelated".into(),
                 name: "Unrelated Project".into(),
                 repo_root: "/tmp/powder-unrelated-project".into(),
@@ -58524,6 +58854,9 @@ mod tests {
     fn project_registry_rejects_split_identity_and_invalid_powder_binding() {
         let reg = CaptainsRegistry::new();
         let base = ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
             project_id: "project-one".into(),
             name: "One".into(),
             repo_root: "/repo/one".into(),
