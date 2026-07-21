@@ -121,7 +121,8 @@ describe("WslFolderPicker", () => {
     unmount();
     vi.mocked(listDir).mockRejectedValueOnce(new Error("permission denied"));
     render(<WslFolderPicker path="/home/blocked" recentPaths={[]} onPathChange={vi.fn()} />);
-    expect(await screen.findByText("Could not list this folder: permission denied")).toBeTruthy();
+    expect(await screen.findByText("Could not list this folder:", { exact: false })).toBeTruthy();
+    expect(screen.getByText("permission denied", { exact: false })).toBeTruthy();
     expect(screen.queryByText("This folder is empty.")).toBeNull();
     expect((await screen.findByRole("alert")).textContent).toContain("permission denied");
   });
@@ -140,6 +141,41 @@ describe("WslFolderPicker", () => {
     resolveNew([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
     expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "old" })).toBeNull();
+  });
+
+  it("retains populated results as disabled stale entries during refresh", async () => {
+    let resolveRefresh!: (entries: never[]) => void;
+    vi.mocked(listDir).mockReset()
+      .mockResolvedValueOnce([
+        { name: "old", path: "/home/old/old", isDir: true, isGitRepo: false, size: 0 },
+      ] as never[])
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+    const onPathChange = vi.fn();
+    const view = render(<WslFolderPicker path="/home/old" recentPaths={[]} onPathChange={onPathChange} />);
+    const oldEntry = await screen.findByRole("button", { name: "old" });
+    view.rerender(<WslFolderPicker path="/home/new" recentPaths={[]} onPathChange={onPathChange} />);
+    expect(await screen.findByText("Refreshing this folder listing.", { exact: false })).toBeTruthy();
+    expect(screen.getByText(/Review only; select after refresh completes/)).toBeTruthy();
+    expect((oldEntry as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(oldEntry);
+    expect(onPathChange).not.toHaveBeenCalled();
+    resolveRefresh([{ name: "new", path: "/home/new/new", isDir: true, isGitRepo: false, size: 0 }] as never[]);
+    expect(await screen.findByRole("button", { name: "new" })).toBeTruthy();
+  });
+
+  it("distinguishes a stale empty result while refresh is active", async () => {
+    let resolveRefresh!: (entries: never[]) => void;
+    vi.mocked(listDir).mockReset()
+      .mockResolvedValueOnce([])
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+    const view = render(<WslFolderPicker path="/home/empty" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByText("This folder is empty.")).toBeTruthy();
+    view.rerender(<WslFolderPicker path="/home/new" recentPaths={[]} onPathChange={vi.fn()} />);
+    expect(await screen.findByText("Previous empty results are stale.", { exact: false })).toBeTruthy();
+    expect(screen.queryByText("Choose a WSL folder.")).toBeNull();
+    expect(screen.queryByText("This folder is empty.")).toBeNull();
+    resolveRefresh([]);
+    expect(await screen.findByText("This folder is empty.")).toBeTruthy();
   });
 
   it("ignores an older listing error after a newer success", async () => {

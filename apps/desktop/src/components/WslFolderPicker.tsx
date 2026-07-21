@@ -233,9 +233,24 @@ export function WslFolderPicker({
             Could not list this folder: {listing.message}
           </p>
         ) : listing.kind === "stale" ? (
-          <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
-            Refreshing this folder listing. Previous {listing.prior} results are stale.
-          </p>
+          <>
+            <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+              Refreshing this folder listing. Previous {listing.prior} results are stale.
+              {listing.prior === "populated" && " Review only; select after refresh completes."}
+            </p>
+            {listing.prior === "populated" && entries.map((entry) => (
+              <button
+                key={entry.path}
+                type="button"
+                disabled
+                aria-disabled="true"
+                className="flex w-full items-center gap-2 border-b px-2 py-1.5 text-left text-xs opacity-60 last:border-b-0"
+                style={{ borderColor: "var(--th-border)" }}
+              >
+                <Folder size={13} aria-hidden="true" />
+                <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+              </button>
+            ))}
         ) : listing.kind === "loaded-empty" ? (
           <p className="px-2 py-3 text-xs" style={{ color: "var(--th-fg-muted)" }}>
             This folder is empty.
