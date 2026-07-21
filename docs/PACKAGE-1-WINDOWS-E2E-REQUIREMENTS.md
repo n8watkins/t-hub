@@ -8,13 +8,13 @@ The test must not replace the WSL picker, IPC transport, filesystem adapter, or 
 
 Set `T_HUB_DISTRO` to the distro under test and record the exact value in the test evidence.
 
-Register a populated non-Git WSL directory and verify that the dialog shows the selected canonical POSIX `rootPath`, the explicit display name, and `vcsCapability: "none"`.
+Register a populated non-Git WSL directory and verify that the dialog ReviewSummary shows the selected canonical POSIX `rootPath`, the explicit display name, and `Version control: None` for `vcsCapability: "none"`.
 
 Commission a Captain from that registration and verify that no `.git` directory is created and that registration and commission use the same Project identity.
 
 Register an empty non-Git directory and verify that the picker reports a loaded-empty state rather than a directory-list failure.
 
-Register a valid Git directory and verify that the selected `rootPath`, separate `gitMainRoot`, existing Project ID, Captain bindings, and default branch survive restart and recovery.
+Register a valid Git directory and verify that the dialog ReviewSummary shows `Version control: Git`, remote, default branch, HEAD, and worktree count, while the selected `rootPath`, separate `gitMainRoot`, existing Project ID, Captain bindings, and default branch survive restart and recovery.
 
 Exercise `/home/natkins/appturnity/monorepo-app` and verify that the Windows host does not reject the POSIX root as non-absolute.
 

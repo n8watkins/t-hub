@@ -129,6 +129,27 @@ describe("CaptainCommissionDialog", () => {
     }));
   });
 
+  it("uses authoritative rootPath in the saved-codebase review", async () => {
+    vi.mocked(listProjects).mockResolvedValueOnce({
+      projects: [{
+        projectId: "saved-project",
+        name: "Canonical App",
+        rootPath: "/home/me/canonical-app",
+        repoRoot: "/compatibility/wrong-root",
+        vcsCapability: "none",
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      count: 1,
+      seq: 1,
+      wslHome: "/home/me",
+    });
+    render(<CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />);
+    expect(await screen.findByText("/home/me/canonical-app")).toBeTruthy();
+    expect(screen.queryByText("/compatibility/wrong-root")).toBeNull();
+    expect(screen.getByText("Canonical App")).toBeTruthy();
+  });
+
   it("keeps display name separate from the new destination leaf", async () => {
     vi.mocked(registerProject).mockResolvedValueOnce({
       projectId: "new-project",

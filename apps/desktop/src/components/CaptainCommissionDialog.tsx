@@ -337,6 +337,13 @@ export function CaptainCommissionDialog({
             mode={mode}
             selected={selected}
             folderSelection={folderSelection}
+            displayName={
+              mode === "saved"
+                ? selected?.name ?? ""
+                : mode === "existing"
+                  ? projectName
+                  : newDisplayName
+            }
             repoRoot={repoRoot}
             assignment={assignment}
             harness={harness}
@@ -399,6 +406,7 @@ function ReviewSummary({
   mode,
   selected,
   folderSelection,
+  displayName,
   repoRoot,
   assignment,
   harness,
@@ -408,6 +416,7 @@ function ReviewSummary({
   mode: ProjectMode;
   selected?: RegisteredProject;
   folderSelection: WslFolderSelection | null;
+  displayName: string;
   repoRoot: string;
   assignment: string;
   harness: "codex" | "claude";
@@ -423,7 +432,7 @@ function ReviewSummary({
   const location =
     mode === "saved"
       ? selected
-        ? `${selected.name} · ${selected.repoRoot}`
+        ? `${selected.name} · ${selected.rootPath}`
         : "Select a codebase"
       : mode === "existing"
         ? repoRoot.trim() || "Choose a WSL folder"
@@ -440,6 +449,7 @@ function ReviewSummary({
       </h3>
       <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <ReviewRow label="Source" value={source} />
+        <ReviewRow label="Codebase name" value={displayName.trim() || "Required"} />
         <ReviewRow label="Codebase" value={location} />
         {mode === "existing" && (
           <VersionControlSummary
