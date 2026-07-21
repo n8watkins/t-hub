@@ -1368,7 +1368,22 @@ fn host_of_resolved(real_posix: &Path) -> PathBuf {
 /// This is platform-neutral because Windows Project roots cross into WSL tmux
 /// even when focused tests exercise that boundary on Linux.
 pub(crate) fn posix_form(path: &str) -> String {
-    wsl_path_to_posix(path).unwrap_or_else(|| path.to_string())
+    let raw = wsl_path_to_posix(path).unwrap_or_else(|| path.to_string());
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    if raw.starts_with('/') {
+        format!("/{}", parts.join("/"))
+    } else {
+        raw
+    }
 }
 
 fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {

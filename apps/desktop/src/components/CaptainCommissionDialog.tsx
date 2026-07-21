@@ -33,7 +33,6 @@ export function CaptainCommissionDialog({
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
   const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
   const [folderWorktrees, setFolderWorktrees] = useState<WorktreeInfo[]>([]);
-  const [initializeGit, setInitializeGit] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -78,15 +77,18 @@ export function CaptainCommissionDialog({
     let cancelled = false;
     setFolderGit(null);
     setFolderWorktrees([]);
-    setInitializeGit(false);
     void gitInfo(repoRoot)
       .then((info) => {
-        if (!cancelled) setFolderGit(info);
-      })
-      .catch(() => undefined);
-    void gitWorktreeList(repoRoot)
-      .then((worktrees) => {
-        if (!cancelled) setFolderWorktrees(worktrees);
+        if (!cancelled) {
+          setFolderGit(info);
+          if (info.isRepo) {
+            void gitWorktreeList(repoRoot)
+              .then((worktrees) => {
+                if (!cancelled) setFolderWorktrees(worktrees);
+              })
+              .catch(() => undefined);
+          }
+        }
       })
       .catch(() => undefined);
     return () => {
@@ -102,12 +104,8 @@ export function CaptainCommissionDialog({
       return;
     }
     if (mode === "existing") {
-      if (folderGit === null) {
-        setError("Wait for Git inspection to finish before creating the Captain.");
-        return;
-      }
-      if (!folderGit.isRepo && !initializeGit) {
-        setError("Initialize Git explicitly or choose a folder that is already a Git repository.");
+      if (!projectName.trim()) {
+        setError("Codebase name is required.");
         return;
       }
     }
@@ -126,18 +124,15 @@ export function CaptainCommissionDialog({
       let project: RegisteredProject;
       if (mode === "existing") {
         if (!repoRoot.trim()) throw new Error("WSL folder is required.");
-        if (!folderGit) throw new Error("Git inspection is incomplete.");
         project = await registerProject({
           repoRoot: repoRoot.trim(),
-          name: projectName.trim() || undefined,
-          ...(folderGit.isRepo ? {} : { initializeGit: true }),
+          name: projectName.trim(),
         });
       } else if (mode === "new") {
         project = await registerProject({
           repoRoot: newCodebaseDestination!,
           name: newName.trim(),
           createDirectory: true,
-          initializeGit: true,
         });
       } else {
         if (!selected) throw new Error("Select a saved codebase.");
@@ -272,7 +267,7 @@ export function CaptainCommissionDialog({
                   onChange={(event) => setProjectName(event.target.value)}
                   className={inputClass}
                   style={fieldStyle}
-                  placeholder="Derived from folder"
+                  placeholder="Enter a codebase name"
                 />
               </Field>
             </div>
@@ -307,32 +302,12 @@ export function CaptainCommissionDialog({
                 </output>
               </Field>
               <div className="rounded border border-blue-400/30 bg-blue-400/10 px-3 py-2 text-xs sm:col-span-2">
-                <span className="block font-medium">Starting point: Empty Git repository</span>
+                <span className="block font-medium">Starting point: Empty codebase</span>
                 <span style={{ color: "var(--th-fg-muted)" }}>
                   Template and clone starting points will be added later.
                 </span>
               </div>
             </div>
-          )}
-
-          {mode === "existing" && folderGit && !folderGit.isRepo && (
-            <label
-              className="flex items-start gap-2 rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs"
-            >
-              <input
-                type="checkbox"
-                aria-label="Initialize Git repository"
-                checked={initializeGit}
-                onChange={(event) => setInitializeGit(event.target.checked)}
-                className="mt-0.5"
-              />
-              <span>
-                <span className="block font-medium">Initialize Git repository</span>
-                <span style={{ color: "var(--th-fg-muted)" }}>
-                  Creates only a .git directory in this existing folder and uses main as the default branch.
-                </span>
-              </span>
-            </label>
           )}
 
           <Field label="Assignment">
@@ -379,7 +354,6 @@ export function CaptainCommissionDialog({
             harness={harness}
             folderGit={folderGit}
             folderWorktrees={folderWorktrees}
-            initializeGit={initializeGit}
             newParent={newParent}
             newName={newName}
           />
@@ -443,7 +417,6 @@ function ReviewSummary({
   harness,
   folderGit,
   folderWorktrees,
-  initializeGit,
   newParent,
   newName,
 }: {
@@ -454,7 +427,6 @@ function ReviewSummary({
   harness: "codex" | "claude";
   folderGit: GitInfo | null;
   folderWorktrees: WorktreeInfo[];
-  initializeGit: boolean;
   newParent: string;
   newName: string;
 }) {
@@ -492,9 +464,7 @@ function ReviewSummary({
               value={
                 folderGit.isRepo
                   ? `${folderGit.branch ?? "Detached HEAD"} · ${folderGit.dirtyCount ? `${folderGit.dirtyCount} changed` : "clean"} · ${folderGit.isLinkedWorktree ? "linked worktree" : "main worktree"}`
-                  : initializeGit
-                    ? "Initialize with main as the default branch"
-                    : "Not a Git repository - initialization not authorized"
+                    : "Not a Git repository - Git operations unavailable"
               }
             />
             {folderGit.isRepo && (
@@ -521,7 +491,6 @@ function ReviewSummary({
         )}
         {mode === "new" && (
           <>
-            <ReviewRow label="Git" value="Initialize with main as the default branch" />
             <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
             <ReviewRow label="External effects" value="No remote service calls" />
           </>
