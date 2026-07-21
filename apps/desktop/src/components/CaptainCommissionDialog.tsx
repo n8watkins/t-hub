@@ -252,7 +252,7 @@ export function CaptainCommissionDialog({
                     .sort((a, b) => b.updatedAt - a.updatedAt)
                     .map((project) => ({
                       label: project.name,
-                      path: project.repoRoot,
+                      path: project.rootPath ?? project.repoRoot,
                     }))}
                   onPathChange={setRepoRoot}
                 />
@@ -281,7 +281,7 @@ export function CaptainCommissionDialog({
                     .sort((a, b) => b.updatedAt - a.updatedAt)
                     .map((project) => ({
                       label: project.name,
-                      path: project.repoRoot,
+                      path: project.rootPath ?? project.repoRoot,
                     }))}
                   onPathChange={setNewParent}
                 />
