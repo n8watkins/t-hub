@@ -1738,36 +1738,24 @@ mod tests {
         assert_eq!(rename_schema["properties"]["displayName"]["maxLength"], 120);
     }
 
-    #[cfg(any())]
     #[test]
     fn project_tools_expose_read_and_audited_mutation_tiers() {
         let list = find("list_projects").unwrap();
         assert_eq!(list.tier, Tier::Read);
         assert_eq!((list.input_schema)(), schema_empty());
 
-        let boards = find("list_powder_boards").unwrap();
-        assert_eq!(boards.tier, Tier::Read);
-        assert_eq!(
-            (boards.input_schema)()["properties"]["limit"]["maximum"],
-            500
-        );
-        assert_eq!((boards.input_schema)()["additionalProperties"], false);
-        let snapshot = find("project_board_snapshot").unwrap();
-        assert_eq!(snapshot.tier, Tier::Read);
-        assert_eq!((snapshot.input_schema)()["required"], json!(["terminalId"]));
-        assert_eq!(
-            (snapshot.input_schema)()["properties"]["limit"]["maximum"],
-            1000
-        );
-
-        for name in ["register_project", "initialize_git", "bind_project_powder"] {
+        for name in ["register_project", "initialize_git"] {
             let tool = find(name).unwrap();
             assert_eq!(tool.tier, Tier::Organization);
             assert_eq!(tool.to_mcp()["annotations"]["confirmationRequired"], false);
         }
         assert_eq!(
-            (find("register_project").unwrap().input_schema)()["required"],
-            json!(["repoRoot", "name"])
+            (find("register_project").unwrap().input_schema)()["anyOf"],
+            json!([
+                { "required": ["rootPath", "name"] },
+                { "required": ["repoRoot", "name"] },
+                { "required": ["repo_root", "name"] }
+            ])
         );
         assert_eq!(
             (find("register_project").unwrap().input_schema)()["properties"]["name"]["minLength"],
@@ -1777,78 +1765,6 @@ mod tests {
             (find("register_project").unwrap().input_schema)()["properties"]["createDirectory"]
                 ["type"],
             "boolean"
-        );
-        assert_eq!(
-            (find("bind_project_powder").unwrap().input_schema)()["required"],
-            json!(["projectId", "repository"])
-        );
-
-        let bootstrap = find("captain_bootstrap").unwrap();
-        assert_eq!(bootstrap.tier, Tier::Read);
-        assert_eq!(
-            bootstrap.to_mcp()["annotations"]["confirmationRequired"],
-            false
-        );
-        assert_eq!(
-            (bootstrap.input_schema)()["anyOf"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-
-        let commission = find("commission_captain").unwrap();
-        assert_eq!(commission.tier, Tier::ProcessChanging);
-        assert_eq!(
-            commission.to_mcp()["annotations"]["confirmationRequired"],
-            true
-        );
-        assert_eq!(
-            (commission.input_schema)()["required"],
-            json!(["projectId", "assignment"])
-        );
-
-        let attach = find("attach_captain").unwrap();
-        assert_eq!(attach.tier, Tier::ProcessChanging);
-        assert_eq!(
-            (attach.input_schema)()["required"],
-            json!(["captainSessionId", "projectId", "assignment"])
-        );
-
-        let status = find("powder_status").unwrap();
-        assert_eq!(status.tier, Tier::Read);
-        assert_eq!((status.input_schema)()["required"], json!(["projectId"]));
-
-        let dispatch = find("dispatch_crew").unwrap();
-        assert_eq!(dispatch.tier, Tier::ProcessChanging);
-        assert_eq!(
-            (dispatch.input_schema)()["required"],
-            json!(["cardId", "task"])
-        );
-        assert_eq!(
-            (dispatch.input_schema)()["anyOf"].as_array().unwrap().len(),
-            2
-        );
-        assert_eq!(
-            (dispatch.input_schema)()["properties"]["workspaceTabId"]["type"],
-            "string"
-        );
-
-        let checkpoint = find("captain_checkpoint").unwrap();
-        assert_eq!(checkpoint.tier, Tier::Organization);
-        assert_eq!(
-            (checkpoint.input_schema)()["allOf"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-
-        let heartbeat = find("heartbeat_crew_powder").unwrap();
-        assert_eq!(heartbeat.tier, Tier::ProcessChanging);
-        assert_eq!(
-            (heartbeat.input_schema)()["required"],
-            json!(["crewSessionId"])
         );
     }
 

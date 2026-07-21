@@ -1179,13 +1179,14 @@ const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
 const MAX_RETIRED_FLEET_TILES: usize = 4096;
 
 #[cfg(test)]
-static PROJECT_PROBE_COUNTS: std::sync::OnceLock<std::sync::Mutex<[usize; 6]>> =
-    std::sync::OnceLock::new();
+thread_local! {
+    static PROJECT_PROBE_COUNTS: std::cell::RefCell<[usize; 6]> =
+        std::cell::RefCell::new([0; 6]);
+}
 
 #[cfg(test)]
 fn record_project_probe(kind: usize) {
-    let counts = PROJECT_PROBE_COUNTS.get_or_init(|| std::sync::Mutex::new([0; 6]));
-    counts.lock().unwrap()[kind] += 1;
+    PROJECT_PROBE_COUNTS.with(|counts| counts.borrow_mut()[kind] += 1);
 }
 
 #[cfg(not(test))]
@@ -1193,18 +1194,12 @@ fn record_project_probe(_kind: usize) {}
 
 #[cfg(test)]
 fn reset_project_probe_counts() {
-    *PROJECT_PROBE_COUNTS
-        .get_or_init(|| std::sync::Mutex::new([0; 6]))
-        .lock()
-        .unwrap() = [0; 6];
+    PROJECT_PROBE_COUNTS.with(|counts| *counts.borrow_mut() = [0; 6]);
 }
 
 #[cfg(test)]
 fn project_probe_counts() -> [usize; 6] {
-    *PROJECT_PROBE_COUNTS
-        .get_or_init(|| std::sync::Mutex::new([0; 6]))
-        .lock()
-        .unwrap()
+    PROJECT_PROBE_COUNTS.with(|counts| *counts.borrow())
 }
 
 fn assignment_id_for(project_id: Option<&str>, ship_slug: &str) -> String {
@@ -1738,26 +1733,21 @@ fn migrate_project_identities(snapshot: &mut CaptainsSnapshot) -> Result<(), Str
 /// Git, or registry probe.
 /// `rootPath` is authoritative; `repoRoot` and `repo_root` are deprecated aliases.
 fn requested_project_root(args: &Value, command: &str) -> Result<String, String> {
-    let root_path = arg_str(args, "rootPath");
-    let repo_root = arg_str(args, "repoRoot").or_else(|| arg_str(args, "repo_root"));
-    let normalized_root_path = root_path
-        .as_deref()
-        .map(canonical_project_identity)
-        .transpose()?;
-    let normalized_repo_root = repo_root
-        .as_deref()
-        .map(canonical_project_identity)
-        .transpose()?;
-    if let (Some(root_path), Some(repo_root)) = (&normalized_root_path, &normalized_repo_root) {
-        if root_path != repo_root {
+    let mut identities = Vec::new();
+    for field in ["rootPath", "repoRoot", "repo_root"] {
+        if let Some(value) = arg_str(args, field) {
+            identities.push((field, canonical_project_identity(&value)?));
+        }
+    }
+    if let Some((_, first)) = identities.first() {
+        if identities.iter().any(|(_, identity)| identity != first) {
             return Err(format!(
                 "{command} received conflicting rootPath and repoRoot values"
             ));
         }
+        return Ok(first.clone());
     }
-    normalized_root_path
-        .or(normalized_repo_root)
-        .ok_or_else(|| format!("{command} requires a 'rootPath' argument"))
+    Err(format!("{command} requires a 'rootPath' argument"))
 }
 
 /// A repository registered with T-Hub. Projects outlive terminals, Captain
@@ -5746,6 +5736,7 @@ impl CaptainsRegistry {
         project.repo_root = identity.clone();
         project.root_path = Some(identity.clone());
         if project.vcs_capability.is_none() {
+            record_project_probe(2);
             let detected = git::git_info_cached(&identity);
             project.vcs_capability = Some(if project.git_main_root.is_some() || detected.is_repo {
                 "git".into()
@@ -15905,7 +15896,6 @@ fn initialize_git(
     )?;
     let requested_identity = requested_project_root(args, "initialize_git")?;
     require_socket_identity(caller, trusted_internal, "initialize_git")?;
-    let root = canonical_project_root(&requested_identity, false)?;
     let existing = ctx
         .captains
         .projects()
@@ -15917,54 +15907,80 @@ fn initialize_git(
         trusted_internal,
         existing.as_ref().map(|project| project.project_id.as_str()),
     )?;
-    git::initialize_repository(&root)
-        .map_err(|error| format!("initialize_git: Git initialization failed: {error}"))?;
-    let main_root = git::git_info_cached(&root)
-        .worktree_root
-        .map(|root| files::posix_form(&root))
-        .unwrap_or(root.clone());
-    let main_branch = git::worktree_list(&main_root).ok().and_then(|worktrees| {
-        worktrees
+    let root = canonical_project_root(&requested_identity, false)?;
+    let existing = existing.or_else(|| {
+        ctx.captains
+            .projects()
             .into_iter()
-            .find(|worktree| !worktree.is_linked)
-            .and_then(|worktree| worktree.branch)
+            .find(|project| project_identity_matches(project, &root))
     });
+    enforce_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        existing.as_ref().map(|project| project.project_id.as_str()),
+    )?;
     let name = arg_str(args, "name")
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| existing.as_ref().map(|project| project.name.clone()))
-        .ok_or("initialize_git requires a non-empty 'name' for a new Project")?;
-    let project = existing.unwrap_or(ProjectRecord {
-        root_path: None,
-        vcs_capability: None,
-        git_main_root: None,
-        project_id: format!("project-{}", uuid::Uuid::new_v4()),
-        name: name.clone(),
-        repo_root: main_root.clone(),
-        remote_url: None,
-        default_branch: None,
-        powder: None,
-        created_at: 0,
-        updated_at: 0,
-    });
-    let info = git::git_info_cached(&main_root);
-    let updated = ctx.captains.upsert_project(ProjectRecord {
-        project_id: project.project_id,
-        name: name.to_string(),
-        repo_root: main_root.clone(),
-        root_path: Some(main_root.clone()),
-        vcs_capability: Some("git".into()),
-        git_main_root: Some(main_root),
-        remote_url: project.remote_url.or(info.remote_url),
-        default_branch: project
-            .default_branch
-            .or(info.default_branch)
-            .or(main_branch)
-            .or_else(|| Some("main".into())),
-        powder: project.powder,
-        created_at: project.created_at,
-        updated_at: project.updated_at,
-    })?;
-    serde_json::to_value(updated).map_err(|error| error.to_string())
+        .ok_or("initialize_git requires a non-empty 'name'")?;
+    git::initialize_repository(&root)
+        .map_err(|error| format!("initialize_git: Git initialization failed: {error}"))?;
+    let result = (|| {
+        record_project_probe(2);
+        let info = git::git_info_cached(&root);
+        let main_root = info
+            .worktree_root
+            .as_deref()
+            .map(files::posix_form)
+            .unwrap_or_else(|| root.clone());
+        record_project_probe(3);
+        let main_branch = git::worktree_list(&main_root).ok().and_then(|worktrees| {
+            worktrees
+                .into_iter()
+                .find(|worktree| !worktree.is_linked)
+                .and_then(|worktree| worktree.branch)
+        });
+        let project = existing.clone().unwrap_or(ProjectRecord {
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
+            project_id: format!("project-{}", uuid::Uuid::new_v4()),
+            name: name.to_string(),
+            repo_root: root.clone(),
+            remote_url: None,
+            default_branch: None,
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        });
+        let updated = ctx.captains.upsert_project(ProjectRecord {
+            project_id: project.project_id,
+            name: name.to_string(),
+            repo_root: root.clone(),
+            root_path: Some(root.clone()),
+            vcs_capability: Some("git".into()),
+            git_main_root: Some(main_root),
+            remote_url: project.remote_url.or(info.remote_url),
+            default_branch: project
+                .default_branch
+                .or(info.default_branch)
+                .or(main_branch)
+                .or_else(|| Some("main".into())),
+            powder: project.powder,
+            created_at: project.created_at,
+            updated_at: 0,
+        })?;
+        serde_json::to_value(updated).map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match git::rollback_initialized_repository(&root) {
+            Ok(()) => Err(format!("{error}; rolled back Git initialization")),
+            Err(rollback_error) => Err(format!(
+                "{error}; Git initialization rollback failed: {rollback_error}"
+            )),
+        },
+    }
 }
 
 fn register_project(
@@ -41433,6 +41449,97 @@ mod tests {
     }
 
     #[test]
+    fn every_root_alias_conflict_is_rejected_before_dispatch_probes() {
+        let conflicts = [
+            json!({
+                "rootPath": "/tmp/root-primary",
+                "repoRoot": "/tmp/root-conflict",
+                "name": "Conflicting Roots",
+            }),
+            json!({
+                "repoRoot": "/tmp/repo-root-primary",
+                "repo_root": "/tmp/repo-root-conflict",
+                "name": "Conflicting Roots",
+            }),
+            json!({
+                "rootPath": "/tmp/three-field-primary",
+                "repoRoot": "/tmp/three-field-primary",
+                "repo_root": "/tmp/three-field-conflict",
+                "name": "Conflicting Roots",
+            }),
+        ];
+        for command in ["register_project", "initialize_git"] {
+            for mut args in conflicts.clone() {
+                if command == "register_project" {
+                    args["createDirectory"] = json!(true);
+                }
+                let ctx = test_ctx(&format!("root-alias-conflict-{command}"));
+                reset_project_probe_counts();
+                let error = dispatch(&ctx, command, &args).unwrap_err();
+                assert!(
+                    error.contains("conflicting rootPath and repoRoot"),
+                    "{command}: {error}"
+                );
+                assert_eq!(
+                    project_probe_counts(),
+                    [0; 6],
+                    "{command} performed a probe before alias validation"
+                );
+                assert!(ctx.captains.projects().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn all_equal_root_aliases_dispatch_without_duplicate_identity() {
+        let register_ctx = test_ctx("root-alias-all-equal-register");
+        let register_dir = std::env::temp_dir().join(format!(
+            "t-hub-root-alias-all-equal-register-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&register_dir).unwrap();
+        let register_root = register_dir.to_string_lossy().to_string();
+        let registered = dispatch(
+            &register_ctx,
+            "register_project",
+            &json!({
+                "rootPath": format!("{register_root}/./"),
+                "repoRoot": register_root,
+                "repo_root": format!("{}/", register_dir.to_string_lossy()),
+                "name": "All Equal Roots",
+            }),
+        )
+        .unwrap();
+        assert_eq!(registered["rootPath"], registered["repoRoot"]);
+        assert_eq!(register_ctx.captains.projects().len(), 1);
+        let _ = std::fs::remove_dir_all(register_dir);
+
+        let initialize_ctx = test_ctx("root-alias-all-equal-initialize");
+        let initialize_dir = std::env::temp_dir().join(format!(
+            "t-hub-root-alias-all-equal-initialize-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&initialize_dir).unwrap();
+        let initialize_root = initialize_dir.to_string_lossy().to_string();
+        let initialized = dispatch(
+            &initialize_ctx,
+            "initialize_git",
+            &json!({
+                "rootPath": format!("{initialize_root}/./"),
+                "repoRoot": initialize_root,
+                "repo_root": format!("{}/", initialize_dir.to_string_lossy()),
+                "name": "All Equal Initialized Roots",
+            }),
+        )
+        .unwrap();
+        assert_eq!(initialized["rootPath"], initialized["repoRoot"]);
+        assert_eq!(initialize_ctx.captains.projects().len(), 1);
+        let _ = std::fs::remove_dir_all(initialize_dir);
+    }
+
+    #[test]
     fn equal_root_aliases_register_using_authoritative_root_path() {
         let ctx = test_ctx("root-alias-equal");
         let dir = std::env::temp_dir().join(format!("t-hub-root-alias-{}", now_ms()));
@@ -41561,6 +41668,37 @@ mod tests {
             "preserve me"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initialize_git_rolls_back_git_when_project_persistence_fails() {
+        let ctx = test_ctx("initialize-git-rollback");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-initialize-git-rollback-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let registry_path = dir.with_extension("json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        registry.fail_next_persist("initialize Git persistence failure");
+        let ctx = ctx.with_captains_registry(Arc::clone(&registry));
+
+        let error = dispatch(
+            &ctx,
+            "initialize_git",
+            &json!({ "repoRoot": dir.to_string_lossy(), "name": "Rollback Project" }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("initialize Git persistence failure"),
+            "got: {error}"
+        );
+        assert!(!dir.join(".git").exists());
+        assert!(ctx.captains.projects().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
