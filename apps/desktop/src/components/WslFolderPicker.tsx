@@ -13,7 +13,6 @@ interface WslFolderPickerProps {
   recentPaths: Array<{ label: string; path: string }>;
   onPathChange: (path: string) => void;
   onFolderMetadataChange?: (selection: WslFolderSelection) => void;
-  refreshToken?: number;
   metadataRefreshToken?: number;
 }
 
@@ -43,7 +42,6 @@ export function WslFolderPicker({
   recentPaths,
   onPathChange,
   onFolderMetadataChange,
-  refreshToken = 0,
   metadataRefreshToken = 0,
 }: WslFolderPickerProps) {
   const [manualPath, setManualPath] = useState(path);
@@ -125,10 +123,10 @@ export function WslFolderPicker({
     return () => {
       cancelled = true;
     };
-  }, [onFolderMetadataChange, path, refreshToken]);
+  }, [onFolderMetadataChange, path]);
 
   useEffect(() => {
-    if (!path) return;
+    if (!path || !onFolderMetadataChange) return;
     const generation = ++metadataGeneration.current;
     let cancelled = false;
     const updateSelection = (patch: Partial<WslFolderSelection>) => {
