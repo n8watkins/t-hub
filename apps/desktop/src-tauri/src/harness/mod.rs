@@ -842,33 +842,139 @@ struct ResolvedLaunchExecutable {
 fn resolve_launch_executable(
     candidate: &str,
 ) -> Result<ResolvedLaunchExecutable, LaunchAttestationError> {
+    resolve_launch_executable_with_shell(candidate, None)
+}
+
+/// Interactive bash and dash report job-control setup failures when their stdin
+/// is not a terminal, including on GitHub-hosted runners. Accept only those two
+/// complete, content-free diagnostics. Startup-file errors and arbitrary shell
+/// output still fail closed instead of being ignored or surfaced to callers.
+fn valid_launch_resolution_stderr(shell_kind: &str, stderr: &[u8]) -> bool {
+    if !matches!(shell_kind, "bash" | "dash" | "fish" | "sh" | "zsh") {
+        return false;
+    }
+    if stderr.is_empty() {
+        return true;
+    }
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    match shell_kind {
+        "bash" => {
+            let Some(stderr) = stderr.strip_suffix('\n') else {
+                return false;
+            };
+            let mut lines = stderr.lines();
+            let Some(first) = lines.next() else {
+                return false;
+            };
+            if lines.next() != Some("bash: no job control in this shell") || lines.next().is_some()
+            {
+                return false;
+            }
+            let Some(first) = first.strip_prefix("bash: cannot set terminal process group (")
+            else {
+                return false;
+            };
+            let Some((process_group, reason)) = first.split_once("): ") else {
+                return false;
+            };
+            process_group.parse::<i64>().is_ok()
+                && matches!(
+                    reason,
+                    "Inappropriate ioctl for device" | "No such device or address"
+                )
+        }
+        "dash" | "sh" => {
+            stderr == "t-hub-shell-bridge: 0: can't access tty; job control turned off\n"
+        }
+        "fish" | "zsh" => false,
+        _ => false,
+    }
+}
+
+fn resolve_launch_executable_with_shell(
+    candidate: &str,
+    login_shell_override: Option<&str>,
+) -> Result<ResolvedLaunchExecutable, LaunchAttestationError> {
+    // The pane launches through `${SHELL} -ilc`, so a non-interactive `-lc`
+    // probe can observe the wrong PATH (notably when zsh configures tools in
+    // `.zshrc`). The bridge below uses that same shell mode only to classify a
+    // command and resolve its absolute external path. It rejects functions,
+    // aliases, relative paths, and unsupported shell languages, then hands the
+    // path to an absolute POSIX shell that never executes the provider. Resetting
+    // PATH inside the attestation probe also prevents user PATH shims from
+    // intercepting readlink/stat/head. The optional override is a race-free test
+    // seam; production passes an empty second script argument on Unix and WSL.
     const SCRIPT: &str = r#"
 set -eu
 candidate=$1
+[ "$#" -eq 2 ]
 [ -n "$candidate" ]
 [ "${#candidate}" -le 4096 ]
-login_shell=${SHELL:-/bin/sh}
+login_shell=${2:-${SHELL:-/bin/sh}}
 case "$login_shell" in /*) ;; *) exit 50;; esac
-resolved=$("$login_shell" -ilc 'command -v -- "$1"' t-hub-provider-resolution "$candidate")
+[ -f "$login_shell" ]
+[ -x "$login_shell" ]
+shell_kind=${login_shell##*/}
+probe='set -eu
+resolved=$1
+shell_kind=$2
+[ "$#" -eq 2 ]
+[ -n "$resolved" ]
+[ "${#resolved}" -le 4096 ]
 case "$resolved" in /*) ;; *) exit 51;; esac
+case "$shell_kind" in bash|dash|fish|sh|zsh) ;; *) exit 52;; esac
+PATH=/usr/bin:/bin
+export PATH
 canonical=$(readlink -f "$resolved")
-case "$canonical" in /*) ;; *) exit 52;; esac
+case "$canonical" in /*) ;; *) exit 53;; esac
 [ -f "$canonical" ]
 [ -x "$canonical" ]
-[ "$(printf '%s\n' "$canonical" | wc -l | tr -d ' ')" -eq 1 ]
-set -- $(stat -Lc '%d %i' "$canonical")
+[ "$(printf "%s\n" "$canonical" | wc -l | tr -d " ")" -eq 1 ]
+set -- $(stat -Lc "%d %i" "$canonical")
 [ "$#" -eq 2 ]
-case "$1:$2" in *[!0-9:]*) exit 53;; esac
+case "$1:$2" in *[!0-9:]*) exit 54;; esac
 device=$1
 inode=$2
 shebang=
-if LC_ALL=C head -c 2 "$canonical" | grep -q '^#!'; then
+if LC_ALL=C head -c 2 "$canonical" | grep -q "^#!"; then
     shebang=$(LC_ALL=C head -n 1 "$canonical")
     shebang=${shebang#\#!}
     [ "${#shebang}" -le 1024 ]
-    [ "$(printf '%s\n' "$shebang" | wc -l | tr -d ' ')" -eq 1 ]
+    [ "$(printf "%s\n" "$shebang" | wc -l | tr -d " ")" -eq 1 ]
 fi
-printf 'THLE1\n%s\n%s\n%s\n%s\n' "$canonical" "$device" "$inode" "$shebang"
+printf "THLE2\n%s\n%s\n%s\n%s\n%s\n" "$shell_kind" "$canonical" "$device" "$inode" "$shebang"'
+case "$shell_kind" in
+  bash|dash|sh|zsh)
+    bridge='candidate=$3
+case "$candidate" in
+  /*) resolved=$candidate;;
+  */*) exit 70;;
+  *)
+    resolved=$(command -v -- "$candidate") || exit 70
+    case "$resolved" in /*) ;; *) exit 70;; esac;;
+esac
+exec /bin/sh -c "$1" "$2" "$resolved" "$4"'
+    "$login_shell" -ilc "$bridge" t-hub-shell-bridge "$probe" t-hub-provider-resolution "$candidate" "$shell_kind";;
+  fish)
+    bridge='set candidate $argv[3]
+set resolved $candidate
+if not string match -q "/*" -- $candidate
+    if string match -q "*/*" -- $candidate
+        exit 70
+    end
+    test (type -t -- $candidate) = file
+    or exit 70
+    set resolved (command -v -- $candidate)
+    or exit 70
+    string match -q "/*" -- $resolved
+    or exit 70
+end
+exec /bin/sh -c $argv[1] $argv[2] $resolved $argv[4]'
+    "$login_shell" -ilc "$bridge" "$probe" t-hub-provider-resolution "$candidate" "$shell_kind";;
+  *) exit 55;;
+esac
 "#;
     if candidate.is_empty() || candidate.len() > 4096 || candidate.contains(['\0', '\n', '\r']) {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
@@ -885,7 +991,8 @@ printf 'THLE1\n%s\n%s\n%s\n%s\n' "$canonical" "$device" "$inode" "$shebang"
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-provider-provenance")
-            .arg(candidate);
+            .arg(candidate)
+            .arg(login_shell_override.unwrap_or_default());
         command.creation_flags(0x0800_0000);
         command
     };
@@ -896,16 +1003,18 @@ printf 'THLE1\n%s\n%s\n%s\n%s\n' "$canonical" "$device" "$inode" "$shebang"
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-provider-provenance")
-            .arg(candidate);
+            .arg(candidate)
+            .arg(login_shell_override.unwrap_or_default());
         command
     };
-    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
-        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
-    if !output.status.success() || !output.stderr.is_empty() || output.stdout.len() > 6144 {
+    let output =
+        crate::bounded_exec::output_with_timeout_and_limit(command, Duration::from_secs(2), 8192)
+            .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    if !output.status.success() {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
-    let mut fields = output.stdout.splitn(6, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THLE1".as_slice()) {
+    let mut fields = output.stdout.splitn(7, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THLE2".as_slice()) {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
     let text = |field: Option<&[u8]>| {
@@ -913,13 +1022,16 @@ printf 'THLE1\n%s\n%s\n%s\n%s\n' "$canonical" "$device" "$inode" "$shebang"
             .map(str::to_string)
             .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)
     };
+    let shell_kind = text(fields.next())?;
     let path = text(fields.next())?;
     let device = parse_ascii_number(fields.next())
         .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
     let inode = parse_ascii_number(fields.next())
         .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
     let shebang = text(fields.next())?;
-    if fields.next() != Some(b"".as_slice())
+    if !valid_launch_resolution_stderr(&shell_kind, &output.stderr)
+        || fields.next() != Some(b"".as_slice())
+        || !matches!(shell_kind.as_str(), "bash" | "dash" | "fish" | "sh" | "zsh")
         || !path.starts_with('/')
         || path.contains(['\0', '\n', '\r'])
         || device == 0
@@ -1778,6 +1890,143 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn launch_resolution_accepts_only_exact_non_tty_shell_diagnostics() {
+        assert!(valid_launch_resolution_stderr("bash", b""));
+        assert!(valid_launch_resolution_stderr(
+            "bash",
+            b"bash: cannot set terminal process group (42): Inappropriate ioctl for device\nbash: no job control in this shell\n"
+        ));
+        assert!(valid_launch_resolution_stderr(
+            "bash",
+            b"bash: cannot set terminal process group (-1): No such device or address\nbash: no job control in this shell\n"
+        ));
+        assert!(valid_launch_resolution_stderr(
+            "dash",
+            b"t-hub-shell-bridge: 0: can't access tty; job control turned off\n"
+        ));
+        assert!(!valid_launch_resolution_stderr(
+            "bash",
+            b"bash: cannot set terminal process group (42): Inappropriate ioctl for device\nbash: no job control in this shell\nstartup leaked a secret\n"
+        ));
+        assert!(!valid_launch_resolution_stderr(
+            "bash",
+            b"bash: cannot set terminal process group (not-a-pid): Inappropriate ioctl for device\nbash: no job control in this shell\n"
+        ));
+        assert!(!valid_launch_resolution_stderr(
+            "zsh",
+            b"unexpected startup output\n"
+        ));
+        assert!(!valid_launch_resolution_stderr("nu", b""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_resolution_handles_ci_bash_and_available_login_shells() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-login-shell-resolution-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let provider = root.join("codex");
+        std::fs::copy("/bin/sleep", &provider).unwrap();
+        let provider = provider.to_str().unwrap();
+
+        let mut tested = Vec::new();
+        for shell in [
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/bin/dash",
+            "/usr/bin/dash",
+            "/bin/sh",
+            "/usr/bin/fish",
+            "/bin/fish",
+        ] {
+            if !std::path::Path::new(shell).is_file()
+                || tested.iter().any(|seen: &&str| {
+                    std::fs::canonicalize(seen).ok() == std::fs::canonicalize(shell).ok()
+                })
+            {
+                continue;
+            }
+            resolve_launch_executable_with_shell(provider, Some(shell)).unwrap();
+            tested.push(shell);
+        }
+        assert!(tested.iter().any(|shell| shell.ends_with("/bash")));
+        assert!(tested
+            .iter()
+            .any(|shell| shell.ends_with("/sh") || shell.ends_with("/dash")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_resolution_rejects_aliases_and_functions_without_executing_provider() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-login-shell-shadow-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let provider_dir = root.join("provider");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let runtime = root.join("node");
+        std::fs::copy("/bin/sleep", &runtime).unwrap();
+        let marker = root.join("provider-executed");
+        let provider = provider_dir.join("codex");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!{}\ntouch {}\n",
+                runtime.display(),
+                sh_single_quote(marker.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        make_executable(&provider);
+
+        let rc = root.join("bashrc");
+        let shell = root.join("bash");
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -ilc ] || exit 90\nshift\nbridge=$1\nshift\nexec /bin/bash --noprofile --rcfile {} -ic \"$bridge\" \"$@\"\n",
+                sh_single_quote(rc.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        make_executable(&shell);
+        let path_setup = format!(
+            "export PATH={}:\"$PATH\"\n",
+            sh_single_quote(provider_dir.to_str().unwrap())
+        );
+
+        std::fs::write(&rc, format!("{path_setup}codex() {{ :; }}\n")).unwrap();
+        assert_eq!(
+            resolve_launch_executable_with_shell("codex", Some(shell.to_str().unwrap()))
+                .map(|_| ()),
+            Err(LaunchAttestationError::UntrustedLaunchCommand)
+        );
+
+        std::fs::write(&rc, format!("{path_setup}alias codex=/bin/true\n")).unwrap();
+        assert_eq!(
+            resolve_launch_executable_with_shell("codex", Some(shell.to_str().unwrap()))
+                .map(|_| ()),
+            Err(LaunchAttestationError::UntrustedLaunchCommand)
+        );
+
+        std::fs::write(&rc, path_setup).unwrap();
+        let resolved =
+            resolve_launch_executable_with_shell("codex", Some(shell.to_str().unwrap())).unwrap();
+        assert_eq!(resolved.identity.path, provider.to_str().unwrap());
+        assert!(!marker.exists(), "the provider command must never execute");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
