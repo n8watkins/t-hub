@@ -16,7 +16,7 @@ const PROBE_BACKOFF_MS: [u64; MAX_PROBE_ATTEMPTS - 1] = [40, 120, 300];
 const WSL_MAPPING_TTL_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedRunIdentity {
     pub run_id: String,
     pub process_group_id: u32,

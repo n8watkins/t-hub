@@ -17,7 +17,7 @@ fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PreviewTargetId(String);
 
@@ -33,12 +33,38 @@ impl PreviewTargetId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de> Deserialize<'de> for PreviewTargetId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewScope {
     pub project_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PreviewScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawScope {
+            project_id: String,
+            workspace_id: Option<String>,
+        }
+
+        let raw = RawScope::deserialize(deserializer)?;
+        Self::new(raw.project_id, raw.workspace_id).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PreviewScope {
@@ -76,7 +102,7 @@ pub enum PreviewPackageManager {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum PreviewTargetKind {
     PackageScript {
         package_manager: PreviewPackageManager,
@@ -88,7 +114,7 @@ pub enum PreviewTargetKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewTarget {
     pub id: PreviewTargetId,
     pub label: String,
@@ -100,7 +126,7 @@ pub struct PreviewTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewTargetRef {
     pub scope: PreviewScope,
     pub target_id: PreviewTargetId,
@@ -140,7 +166,7 @@ pub enum PreviewOperationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewStatus {
     pub scope: PreviewScope,
     pub state: PreviewState,
@@ -170,7 +196,7 @@ impl PreviewStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewOperationResult {
     pub operation: PreviewOperation,
     pub outcome: PreviewOperationOutcome,
@@ -200,6 +226,20 @@ mod tests {
             PreviewScope::new("a", Some("b".into())).unwrap()
         );
         assert!(PreviewScope::new("project/escape", None).is_err());
+    }
+
+    #[test]
+    fn deserialization_enforces_identifier_and_exact_scope_shape() {
+        assert!(serde_json::from_str::<PreviewTargetId>(r#""../outside""#).is_err());
+        assert!(serde_json::from_value::<PreviewScope>(serde_json::json!({
+            "projectId": "project/escape"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<PreviewScope>(serde_json::json!({
+            "projectId": "project-1",
+            "unexpected": true
+        }))
+        .is_err());
     }
 
     #[test]

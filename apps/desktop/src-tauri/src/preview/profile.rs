@@ -2,29 +2,36 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::endpoint::ManagedRunIdentity;
-use super::model::{PreviewOperation, PreviewScope, PreviewStatus, PreviewTarget, PreviewTargetId};
+use super::model::{
+    PreviewOperation, PreviewScope, PreviewStatus, PreviewTarget, PreviewTargetId,
+    PreviewTargetKind, PreviewTargetRef, PreviewTargetSource,
+};
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 const IDEMPOTENCY_JOURNAL_CAP: usize = 256;
+const MAX_PROFILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROJECTS: usize = 4096;
+const MAX_ACCEPTED_TARGETS: usize = 256;
+const MAX_TEXT_BYTES: usize = 4096;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SelectedPreviewTarget {
     pub target_id: PreviewTargetId,
     pub discovery_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectPreviewProfile {
     pub canonical_root_fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,7 +52,7 @@ pub enum PreviewIntentPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewIntent {
     pub request_id: String,
     pub scope: PreviewScope,
@@ -71,7 +78,7 @@ pub struct PreviewIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewProfilesV1 {
     pub schema_version: u32,
     #[serde(default)]
@@ -290,14 +297,288 @@ fn valid_phase_transition(from: PreviewIntentPhase, to: PreviewIntentPhase) -> b
         )
 }
 
+impl PreviewProfilesV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != PROFILE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported Preview profiles schemaVersion {}; expected {PROFILE_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.projects.len() > MAX_PROJECTS {
+            return Err("Preview profiles exceed the project bound".into());
+        }
+        if self.idempotency_journal.len() > IDEMPOTENCY_JOURNAL_CAP {
+            return Err("Preview profiles exceed the idempotency journal bound".into());
+        }
+        for (project_id, profile) in &self.projects {
+            PreviewScope::new(project_id, None)?;
+            validate_fingerprint(
+                &profile.canonical_root_fingerprint,
+                "canonical root fingerprint",
+            )?;
+            if let Some(selected) = &profile.selected_target {
+                validate_selection(selected)?;
+            }
+            for (workspace_id, selected) in &profile.workspace_overrides {
+                PreviewScope::new(project_id, Some(workspace_id.clone()))?;
+                validate_selection(selected)?;
+            }
+            if profile.accepted_config_targets.len() > MAX_ACCEPTED_TARGETS {
+                return Err("Preview profile exceeds the accepted target bound".into());
+            }
+            for target in &profile.accepted_config_targets {
+                validate_accepted_target(target)?;
+            }
+        }
+        let mut request_ids = std::collections::HashSet::new();
+        for intent in &self.idempotency_journal {
+            if !request_ids.insert(intent.request_id.as_str()) {
+                return Err("Preview idempotency journal contains a duplicate request id".into());
+            }
+            validate_intent(intent)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_selection(selected: &SelectedPreviewTarget) -> Result<(), String> {
+    validate_fingerprint(
+        &selected.discovery_fingerprint,
+        "selected target discovery fingerprint",
+    )
+}
+
+fn validate_accepted_target(target: &PreviewTarget) -> Result<(), String> {
+    if target.source != PreviewTargetSource::Config {
+        return Err("persisted accepted Preview targets must come from config".into());
+    }
+    if target.label.trim().is_empty() || target.label.len() > 200 {
+        return Err("persisted Preview target label must contain 1 to 200 bytes".into());
+    }
+    validate_relative_path(&target.relative_root, true)?;
+    match &target.kind {
+        PreviewTargetKind::PackageScript { script, .. }
+            if matches!(script.as_str(), "dev" | "preview" | "start") =>
+        {
+            Ok(())
+        }
+        PreviewTargetKind::PackageScript { .. } => {
+            Err("persisted Preview package script is unsupported".into())
+        }
+        PreviewTargetKind::StaticSite { entrypoint } => validate_relative_path(entrypoint, false),
+    }
+}
+
+fn validate_intent(intent: &PreviewIntent) -> Result<(), String> {
+    validate_bounded_text(&intent.request_id, "Preview request id", 160, false)?;
+    if !matches!(
+        intent.operation,
+        PreviewOperation::Select
+            | PreviewOperation::Start
+            | PreviewOperation::Stop
+            | PreviewOperation::Restart
+            | PreviewOperation::Open
+            | PreviewOperation::Refresh
+    ) {
+        return Err("Preview operation cannot be stored in the idempotency journal".into());
+    }
+    if intent.target_id.is_some() != intent.discovery_fingerprint.is_some() {
+        return Err("Preview intent target and discovery fingerprint must be paired".into());
+    }
+    if let Some(fingerprint) = intent.discovery_fingerprint.as_deref() {
+        validate_fingerprint(fingerprint, "intent discovery fingerprint")?;
+    }
+    if matches!(
+        intent.operation,
+        PreviewOperation::Select | PreviewOperation::Start | PreviewOperation::Restart
+    ) && intent.target_id.is_none()
+    {
+        return Err("Preview intent operation requires a target reference".into());
+    }
+    if matches!(
+        intent.operation,
+        PreviewOperation::Start | PreviewOperation::Restart
+    ) && intent.run_id.is_none()
+    {
+        return Err("Preview start intent requires a run id".into());
+    }
+    if let Some(run_id) = intent.run_id.as_deref() {
+        validate_bounded_text(run_id, "Preview run id", 160, false)?;
+    }
+    if let Some(managed_run) = &intent.managed_run {
+        managed_run.validate()?;
+        if intent.run_id.as_deref() != Some(managed_run.run_id.as_str()) {
+            return Err("persisted managed Preview identity does not match its run id".into());
+        }
+        if intent.phase == PreviewIntentPhase::Prepared {
+            return Err("prepared Preview intent cannot contain a managed run".into());
+        }
+        if !matches!(
+            intent.operation,
+            PreviewOperation::Start | PreviewOperation::Restart
+        ) {
+            return Err("managed Preview identity belongs to a non-start operation".into());
+        }
+    }
+    if intent.expected_stop_run.is_some() != intent.expected_stop_target.is_some() {
+        return Err("Preview expected-stop identity and target must be paired".into());
+    }
+    if let Some(expected) = &intent.expected_stop_run {
+        if !matches!(
+            intent.operation,
+            PreviewOperation::Start | PreviewOperation::Stop | PreviewOperation::Restart
+        ) {
+            return Err(
+                "Preview expected-stop identity belongs to an unsupported operation".into(),
+            );
+        }
+        expected.validate()?;
+        if intent.operation == PreviewOperation::Stop
+            && intent.run_id.as_deref() != Some(expected.run_id.as_str())
+        {
+            return Err("Preview stop intent does not match its expected run".into());
+        }
+    }
+    if let Some(target) = &intent.expected_stop_target {
+        validate_target_ref(target)?;
+        if target.scope != intent.scope {
+            return Err("Preview expected-stop target belongs to another scope".into());
+        }
+    }
+    if let Some(status) = &intent.observed_status {
+        validate_status(status)?;
+        if status.scope != intent.scope {
+            return Err("persisted Preview status belongs to another scope".into());
+        }
+    }
+    if let Some(detail) = intent.detail.as_deref() {
+        validate_bounded_text(detail, "Preview intent detail", MAX_TEXT_BYTES, true)?;
+    }
+    match intent.phase {
+        PreviewIntentPhase::Prepared
+            if intent.managed_run.is_some()
+                || intent.observed_status.is_some()
+                || intent.detail.is_some() =>
+        {
+            return Err("prepared Preview intent contains observed effect data".into());
+        }
+        PreviewIntentPhase::EffectObserved | PreviewIntentPhase::Committed
+            if intent.observed_status.is_none() =>
+        {
+            return Err("observed Preview intent has no durable status".into());
+        }
+        PreviewIntentPhase::RecoveryBlocked
+            if intent.detail.as_deref().is_none_or(str::is_empty) =>
+        {
+            return Err("blocked Preview recovery has no detail".into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_target_ref(target: &PreviewTargetRef) -> Result<(), String> {
+    validate_fingerprint(
+        &target.discovery_fingerprint,
+        "Preview target discovery fingerprint",
+    )
+}
+
+fn validate_status(status: &PreviewStatus) -> Result<(), String> {
+    if let Some(run_id) = status.run_id.as_deref() {
+        validate_bounded_text(run_id, "Preview status run id", 160, false)?;
+    }
+    if let Some(url) = status.preview_url.as_deref() {
+        validate_bounded_text(url, "Preview URL", MAX_TEXT_BYTES, false)?;
+    }
+    if let Some(reason) = status.reason.as_deref() {
+        validate_bounded_text(reason, "Preview status reason", MAX_TEXT_BYTES, true)?;
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(value: &str, field: &str) -> Result<(), String> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return Err(format!("{field} must be a sha256 fingerprint"));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "{field} must contain 64 lowercase hexadecimal digits"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_path(value: &str, allow_empty: bool) -> Result<(), String> {
+    if (!allow_empty && value.is_empty()) || value.contains('\\') || Path::new(value).is_absolute()
+    {
+        return Err("persisted Preview path must be canonical-root-relative".into());
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(part) => parts.push(
+                part.to_str()
+                    .ok_or_else(|| "persisted Preview path must be valid UTF-8".to_string())?,
+            ),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err("persisted Preview path must be canonical-root-relative".into());
+            }
+        }
+    }
+    if parts.join("/") != value {
+        return Err("persisted Preview path is not normalized".into());
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    value: &str,
+    field: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if (!allow_empty && value.is_empty()) || value.len() > max_bytes {
+        return Err(format!("{field} exceeds its length bound"));
+    }
+    Ok(())
+}
+
 fn load_profiles(path: &Path) -> Result<PreviewProfilesV1, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(PreviewProfilesV1::default())
         }
         Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_PROFILE_BYTES {
+        return Err(format!(
+            "Preview profiles {} are not regular or exceed the size bound",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROFILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_PROFILE_BYTES {
+        return Err(format!(
+            "Preview profiles {} exceed the size bound",
+            path.display()
+        ));
+    }
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("corrupt Preview profiles {}: {error}", path.display()))?;
     let version = value
@@ -311,16 +592,14 @@ fn load_profiles(path: &Path) -> Result<PreviewProfilesV1, String> {
     }
     let profiles: PreviewProfilesV1 = serde_json::from_value(value)
         .map_err(|error| format!("invalid Preview profiles {}: {error}", path.display()))?;
-    if profiles.idempotency_journal.len() > IDEMPOTENCY_JOURNAL_CAP {
-        return Err(format!(
-            "Preview profiles {} exceed the idempotency journal bound",
-            path.display()
-        ));
-    }
+    profiles
+        .validate()
+        .map_err(|error| format!("invalid Preview profiles {}: {error}", path.display()))?;
     Ok(profiles)
 }
 
 fn persist_profiles(path: &Path, state: &PreviewProfilesV1) -> Result<(), String> {
+    state.validate()?;
     let parent = path
         .parent()
         .ok_or_else(|| "Preview profiles path has no parent".to_string())?;
@@ -466,6 +745,57 @@ mod tests {
     }
 
     #[test]
+    fn unknown_fields_and_invalid_persisted_identifiers_fail_closed() {
+        let unknown = temp_path("unknown-field");
+        let unknown_bytes =
+            br#"{"schemaVersion":1,"projects":{},"idempotencyJournal":[],"extra":true}"#;
+        fs::write(&unknown, unknown_bytes).unwrap();
+        assert!(PreviewProfileStore::open(&unknown).is_err());
+        assert_eq!(fs::read(&unknown).unwrap(), unknown_bytes);
+
+        let invalid_scope = temp_path("invalid-scope");
+        let mut profiles = PreviewProfilesV1::default();
+        profiles
+            .idempotency_journal
+            .push_back(prepared("invalid-scope-request"));
+        let mut value = serde_json::to_value(&profiles).unwrap();
+        value["idempotencyJournal"][0]["scope"]["projectId"] =
+            serde_json::Value::String("../outside".into());
+        let invalid_scope_bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&invalid_scope, &invalid_scope_bytes).unwrap();
+        assert!(PreviewProfileStore::open(&invalid_scope).is_err());
+        assert_eq!(fs::read(&invalid_scope).unwrap(), invalid_scope_bytes);
+    }
+
+    #[test]
+    fn oversized_profile_file_fails_before_json_parsing() {
+        let path = temp_path("oversized-file");
+        let bytes = vec![b' '; MAX_PROFILE_BYTES as usize + 1];
+        fs::write(&path, &bytes).unwrap();
+        let error = PreviewProfileStore::open(&path).err().unwrap();
+        assert!(error.contains("size bound"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_PROFILE_BYTES + 1);
+    }
+
+    #[test]
+    fn duplicate_request_ids_and_invalid_fingerprints_fail_closed() {
+        let duplicate = temp_path("duplicate-request");
+        let mut profiles = PreviewProfilesV1::default();
+        profiles.idempotency_journal.push_back(prepared("same"));
+        profiles.idempotency_journal.push_back(prepared("same"));
+        fs::write(&duplicate, serde_json::to_vec(&profiles).unwrap()).unwrap();
+        assert!(PreviewProfileStore::open(&duplicate).is_err());
+
+        let invalid_fingerprint = temp_path("invalid-fingerprint");
+        let mut profiles = PreviewProfilesV1::default();
+        let mut intent = prepared("bad-fingerprint");
+        intent.discovery_fingerprint = Some("sha256:not-a-digest".into());
+        profiles.idempotency_journal.push_back(intent);
+        fs::write(&invalid_fingerprint, serde_json::to_vec(&profiles).unwrap()).unwrap();
+        assert!(PreviewProfileStore::open(&invalid_fingerprint).is_err());
+    }
+
+    #[test]
     fn oversized_journal_fails_closed_without_dropping_incomplete_intents() {
         let path = temp_path("oversized");
         let mut profiles = PreviewProfilesV1::default();
@@ -504,14 +834,26 @@ mod tests {
             .advance_intent(
                 "recover-me",
                 PreviewIntentPhase::EffectObserved,
-                None,
+                Some(PreviewStatus::stopped(
+                    PreviewScope::new("project-1", None).unwrap(),
+                    2,
+                )),
                 None,
                 2,
             )
             .unwrap();
         assert_eq!(store.recoverable_intents().len(), 1);
         store
-            .advance_intent("recover-me", PreviewIntentPhase::Committed, None, None, 3)
+            .advance_intent(
+                "recover-me",
+                PreviewIntentPhase::Committed,
+                Some(PreviewStatus::stopped(
+                    PreviewScope::new("project-1", None).unwrap(),
+                    3,
+                )),
+                None,
+                3,
+            )
             .unwrap();
         assert!(store.recoverable_intents().is_empty());
         assert!(store
