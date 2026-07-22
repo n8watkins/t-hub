@@ -2951,41 +2951,24 @@ mod tests {
         format!("th_test_{ts}")
     }
 
-    struct TestSession {
-        name: String,
-    }
-
-    impl TestSession {
-        fn new() -> Self {
-            let name = unique_name();
-            let _ = kill_session(&name);
-            Self { name }
-        }
-    }
-
-    impl Drop for TestSession {
-        fn drop(&mut self) {
-            let _ = kill_session(&self.name);
-        }
-    }
-
     /// Keep the shared test tmux server alive for a case that needs several
     /// independent probes or session operations. The initial anchor creation
     /// retries across another case removing the server's final session.
     struct TmuxTestServerAnchor {
-        _session: TestSession,
+        name: String,
     }
 
     impl TmuxTestServerAnchor {
         fn acquire() -> Self {
-            let session = TestSession::new();
+            let name = unique_name();
+            let _ = kill_session(&name);
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
-                match new_session_with_env(&session.name, "/tmp", None, &[]) {
-                    Ok(()) => return Self { _session: session },
+                match new_session_with_env(&name, "/tmp", None, &[]) {
+                    Ok(()) => return Self { name },
                     Err(error) if error.message == "server exited unexpectedly" => {
-                        match session_liveness(&session.name) {
-                            SessionLiveness::Alive => return Self { _session: session },
+                        match session_liveness(&name) {
+                            SessionLiveness::Alive => return Self { name },
                             SessionLiveness::Gone if std::time::Instant::now() < deadline => {
                                 std::thread::sleep(Duration::from_millis(10));
                             }
@@ -2997,6 +2980,42 @@ mod tests {
                     Err(error) => panic!("tmux test anchor could not start: {error}"),
                 }
             }
+        }
+    }
+
+    impl Drop for TmuxTestServerAnchor {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.name);
+        }
+    }
+
+    struct TestSession {
+        name: String,
+        _lifecycle_lock: std::sync::MutexGuard<'static, ()>,
+        _server_anchor: TmuxTestServerAnchor,
+    }
+
+    impl TestSession {
+        fn new() -> Self {
+            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+            let lifecycle_lock = LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let server_anchor = TmuxTestServerAnchor::acquire();
+            let name = unique_name();
+            let _ = kill_session(&name);
+            Self {
+                name,
+                _lifecycle_lock: lifecycle_lock,
+                _server_anchor: server_anchor,
+            }
+        }
+    }
+
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.name);
         }
     }
 
@@ -3119,7 +3138,6 @@ while True:
             eprintln!("managed cgroup retirement test skipped: {error}");
             return;
         }
-        let _server_anchor = TmuxTestServerAnchor::acquire();
         let fixture = tempfile::tempdir().unwrap();
         let survivor = fixture.path().join("managed-child.pid");
         let workload = fixture.path().join("continuous-fork.py");
@@ -3195,7 +3213,6 @@ while True:
         if !tmux_available() || managed_runtime_preflight().is_err() {
             return;
         }
-        let _server_anchor = TmuxTestServerAnchor::acquire();
         let session = TestSession::new();
         let launch = prepare_managed_runtime_launch().unwrap();
         let owner = new_prepared_managed_session_with_env(
