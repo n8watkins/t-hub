@@ -38,6 +38,7 @@ pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -151,6 +152,47 @@ struct ProcessIdentity {
     start_ticks: u64,
 }
 
+pub const HARNESS_PROCESS_IDENTITY_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProcessAncestor {
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessExecutableIdentity {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Credential-safe, durable identity for the exact provider process accepted
+/// inside one managed terminal generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProcessIdentity {
+    pub version: u32,
+    pub provider: String,
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub executable: HarnessExecutableIdentity,
+    pub argv_sha256: String,
+    pub process_group_id: u32,
+    pub process_session_id: u32,
+    pub tmux_session_id: u64,
+    pub tmux_session_created: u64,
+    pub tmux_window_id: u64,
+    pub tmux_pane_id: u64,
+    pub pane_pid: u32,
+    pub pane_start_ticks: u64,
+    pub ancestry: Vec<HarnessProcessAncestor>,
+    pub cgroup_path: String,
+    pub session_token_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProcessEvidence {
     terminal: TerminalGeneration,
@@ -262,6 +304,9 @@ pub enum LaunchAttestationError {
     TerminalChanged,
     ProcessChanged,
     AncestryChanged,
+    HarnessMissing,
+    CgroupChanged,
+    SessionTokenMissing,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -283,6 +328,11 @@ impl std::fmt::Display for LaunchAttestationError {
             Self::ProcessChanged => "the provider-native process changed during launch acceptance",
             Self::AncestryChanged => {
                 "the provider-native process ancestry changed during launch acceptance"
+            }
+            Self::HarnessMissing => "the provider-native Harness process is not an ancestor",
+            Self::CgroupChanged => "the provider-native process left its managed cgroup",
+            Self::SessionTokenMissing => {
+                "the provider-native process lacks its scoped session identity"
             }
         };
         f.write_str(message)
@@ -566,6 +616,327 @@ cat "$cmdline"
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     parse_process_evidence(&output.stdout)
+}
+
+struct ScopedProcessDetails {
+    pid: u32,
+    parent_pid: u32,
+    start_ticks: u64,
+    process_group_id: u32,
+    process_session_id: u32,
+    executable_path: String,
+    executable_device: u64,
+    executable_inode: u64,
+    cgroup_path: String,
+    session_token: Option<String>,
+    argv: Vec<String>,
+}
+
+fn observe_scoped_process(pid: u32) -> Result<ScopedProcessDetails, LaunchAttestationError> {
+    const SCRIPT: &str = r#"
+set -eu
+pid=$1
+case "$pid" in ''|*[!0-9]*|0) exit 31;; esac
+stat_before=$(cat "/proc/$pid/stat")
+rest=${stat_before##*) }
+set -- $rest
+[ "$#" -ge 20 ]
+parent_pid=$2
+process_group_id=$3
+process_session_id=$4
+start_ticks=${20}
+case "$parent_pid:$process_group_id:$process_session_id:$start_ticks" in *[!0-9:]*) exit 32;; esac
+executable_path=$(readlink -f "/proc/$pid/exe")
+[ -n "$executable_path" ]
+case "$executable_path" in *' (deleted)') exit 33;; esac
+[ "$(printf '%s\n' "$executable_path" | wc -l | tr -d ' ')" -eq 1 ]
+set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+[ "$#" -eq 2 ]
+executable_device=$1
+executable_inode=$2
+case "$executable_device:$executable_inode" in *[!0-9:]*) exit 34;; esac
+cgroup=$(cat "/proc/$pid/cgroup")
+case "$cgroup" in 0::/*) ;; *) exit 35;; esac
+[ "$(printf '%s\n' "$cgroup" | wc -l | tr -d ' ')" -eq 1 ]
+cgroup_path=${cgroup#0::}
+token_line=$(tr '\0' '\n' < "/proc/$pid/environ" | awk 'BEGIN { found=0 } /^T_HUB_SESSION_TOKEN=/ { if (found) exit 42; found=1; value=substr($0, length("T_HUB_SESSION_TOKEN=") + 1) } END { if (found) printf "%s", value }')
+[ "${#token_line}" -le 4096 ]
+cmdline="/proc/$pid/cmdline"
+size=$(wc -c < "$cmdline" | tr -d ' ')
+case "$size" in ''|*[!0-9]*|0) exit 36;; esac
+[ "$size" -le 65536 ]
+stat_after=$(cat "/proc/$pid/stat")
+[ "$stat_after" = "$stat_before" ]
+set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+[ "$#" -eq 2 ]
+[ "$1" = "$executable_device" ]
+[ "$2" = "$executable_inode" ]
+printf 'THPI1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$pid" "$parent_pid" "$start_ticks" "$process_group_id" "$process_session_id" \
+    "$executable_device" "$executable_inode" "$executable_path" "$cgroup_path" "$token_line"
+cat "$cmdline"
+"#;
+
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("wsl.exe");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-scoped-harness-attestation")
+            .arg(pid.to_string());
+        command.creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(unix)]
+    let command = {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-scoped-harness-attestation")
+            .arg(pid.to_string());
+        command
+    };
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    parse_scoped_process_details(&output.stdout)
+}
+
+fn parse_scoped_process_details(
+    bytes: &[u8],
+) -> Result<ScopedProcessDetails, LaunchAttestationError> {
+    let mut fields = bytes.splitn(12, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPI1".as_slice()) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let number = |field| {
+        u32::try_from(parse_ascii_number(field)?)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)
+    };
+    let pid = number(fields.next())?;
+    let parent_pid = number(fields.next())?;
+    let start_ticks = parse_ascii_number(fields.next())?;
+    let process_group_id = number(fields.next())?;
+    let process_session_id = number(fields.next())?;
+    let executable_device = parse_ascii_number(fields.next())?;
+    let executable_inode = parse_ascii_number(fields.next())?;
+    let text = |field: Option<&[u8]>| {
+        std::str::from_utf8(field.ok_or(LaunchAttestationError::UnreadableEvidence)?)
+            .map(str::to_string)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)
+    };
+    let executable_path = text(fields.next())?;
+    let cgroup_path = text(fields.next())?;
+    let token = text(fields.next())?;
+    let cmdline = fields
+        .next()
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    if pid == 0
+        || start_ticks == 0
+        || process_group_id == 0
+        || process_session_id == 0
+        || executable_device == 0
+        || executable_inode == 0
+        || !executable_path.starts_with('/')
+        || executable_path.contains('\0')
+        || !cgroup_path.starts_with('/')
+        || cgroup_path.contains('\0')
+        || token.len() > 4096
+        || cmdline.is_empty()
+        || cmdline.len() > 65_536
+        || !cmdline.ends_with(&[0])
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let argv = cmdline[..cmdline.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|argument| {
+            std::str::from_utf8(argument)
+                .map(str::to_string)
+                .map_err(|_| LaunchAttestationError::UnreadableEvidence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if argv.is_empty() || argv.len() > 256 || argv.iter().any(|arg| arg.len() > 16_384) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(ScopedProcessDetails {
+        pid,
+        parent_pid,
+        start_ticks,
+        process_group_id,
+        process_session_id,
+        executable_path,
+        executable_device,
+        executable_inode,
+        cgroup_path,
+        session_token: (!token.is_empty()).then_some(token),
+        argv,
+    })
+}
+
+fn framed_sha256(label: &[u8], values: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(label);
+    for value in values {
+        let value = value.as_ref();
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let compared_len = left.len().max(right.len());
+    for index in 0..compared_len {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+/// Observe the exact provider process in the foreground ancestry and return
+/// only bounded, credential-safe evidence suitable for durable recovery.
+pub fn observe_scoped_harness_process(
+    tmux_target: &str,
+    expected_provider: Harness,
+    identity_id: &str,
+    expected_session_token: &str,
+    expected_cgroup_path: &str,
+    pane_start_ticks: u64,
+) -> Result<HarnessProcessIdentity, LaunchAttestationError> {
+    if identity_id.is_empty()
+        || expected_session_token.is_empty()
+        || !expected_cgroup_path.starts_with('/')
+        || pane_start_ticks == 0
+    {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let foreground = observe_harness_process(tmux_target)?;
+    let mut details = Vec::with_capacity(foreground.ancestry.len());
+    for identity in &foreground.ancestry {
+        let process = observe_scoped_process(identity.pid)?;
+        if process.pid != identity.pid || process.start_ticks != identity.start_ticks {
+            return Err(LaunchAttestationError::ProcessChanged);
+        }
+        details.push(process);
+    }
+    for (index, process) in details.iter().enumerate() {
+        if index + 1 < details.len() && process.parent_pid != details[index + 1].pid {
+            return Err(LaunchAttestationError::AncestryChanged);
+        }
+        if process.cgroup_path != expected_cgroup_path {
+            return Err(LaunchAttestationError::CgroupChanged);
+        }
+    }
+    let harness_index = details
+        .iter()
+        .position(|process| {
+            process_provider(&process.argv)
+                .is_some_and(|(provider, _)| provider == expected_provider)
+        })
+        .ok_or(LaunchAttestationError::HarnessMissing)?;
+    let process = &details[harness_index];
+    let token = process
+        .session_token
+        .as_deref()
+        .filter(|token| constant_time_eq(token.as_bytes(), expected_session_token.as_bytes()))
+        .ok_or(LaunchAttestationError::SessionTokenMissing)?;
+    let ancestry = details[harness_index..]
+        .iter()
+        .map(|process| HarnessProcessAncestor {
+            pid: process.pid,
+            start_ticks: process.start_ticks,
+        })
+        .collect::<Vec<_>>();
+    Ok(HarnessProcessIdentity {
+        version: HARNESS_PROCESS_IDENTITY_VERSION,
+        provider: expected_provider.as_provider().into(),
+        pid: process.pid,
+        start_ticks: process.start_ticks,
+        executable: HarnessExecutableIdentity {
+            path: process.executable_path.clone(),
+            device: process.executable_device,
+            inode: process.executable_inode,
+        },
+        argv_sha256: framed_sha256(
+            b"t-hub:harness-argv:v1\0",
+            process.argv.iter().map(String::as_bytes),
+        ),
+        process_group_id: process.process_group_id,
+        process_session_id: process.process_session_id,
+        tmux_session_id: foreground.terminal.session_id,
+        tmux_session_created: foreground.terminal.session_created,
+        tmux_window_id: foreground.terminal.window_id,
+        tmux_pane_id: foreground.terminal.pane_id,
+        pane_pid: foreground.terminal.pane_pid,
+        pane_start_ticks,
+        ancestry,
+        cgroup_path: expected_cgroup_path.into(),
+        session_token_sha256: framed_sha256(
+            b"t-hub:harness-session-token:v1\0",
+            [identity_id.as_bytes(), token.as_bytes()],
+        ),
+    })
+}
+
+pub fn valid_harness_process_identity(identity: &HarnessProcessIdentity) -> bool {
+    let valid_digest = |value: &str| {
+        value.len() == 71
+            && value.starts_with("sha256:")
+            && value[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    identity.version == HARNESS_PROCESS_IDENTITY_VERSION
+        && matches!(identity.provider.as_str(), "codex" | "claude")
+        && identity.pid > 0
+        && identity.start_ticks > 0
+        && identity.executable.path.starts_with('/')
+        && !identity.executable.path.contains('\0')
+        && !identity.executable.path.contains(['\n', '\r'])
+        && identity.executable.device > 0
+        && identity.executable.inode > 0
+        && valid_digest(&identity.argv_sha256)
+        && identity.process_group_id > 0
+        && identity.process_session_id > 0
+        && identity.tmux_session_created > 0
+        && identity.pane_pid > 0
+        && identity.pane_start_ticks > 0
+        && !identity.ancestry.is_empty()
+        && identity.ancestry.len() <= 64
+        && identity
+            .ancestry
+            .iter()
+            .enumerate()
+            .all(|(index, ancestor)| {
+                ancestor.pid > 0
+                    && ancestor.start_ticks > 0
+                    && identity.ancestry[..index]
+                        .iter()
+                        .all(|seen| seen.pid != ancestor.pid)
+            })
+        && identity.ancestry.first().is_some_and(|ancestor| {
+            ancestor.pid == identity.pid && ancestor.start_ticks == identity.start_ticks
+        })
+        && identity.ancestry.last().is_some_and(|ancestor| {
+            ancestor.pid == identity.pane_pid && ancestor.start_ticks == identity.pane_start_ticks
+        })
+        && identity.cgroup_path.starts_with('/')
+        && !identity.cgroup_path.contains('\0')
+        && !identity.cgroup_path.contains(['\n', '\r'])
+        && valid_digest(&identity.session_token_sha256)
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {

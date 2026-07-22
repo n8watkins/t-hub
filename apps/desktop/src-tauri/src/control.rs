@@ -1237,7 +1237,9 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// owner token and converts all pre-owner Cortana generations into durable,
 /// authority-revoked quarantine records that are never automatically signaled.
 /// It also records the generated unit and nonce before any launch effect.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 25;
+/// v26 binds every newly observed managed launch to one credential-safe,
+/// provider-native Harness process identity before singleton publication.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 26;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3449,6 +3451,13 @@ impl CaptainsRegistry {
             .is_some();
         let has_cortana_managed_owner = document.pointer("/cortana/owner").is_some();
         let has_cortana_managed_launch = document.pointer("/cortana/managedLaunch").is_some();
+        let has_cortana_harness_process = document
+            .pointer("/cortana/managedLaunch/harnessProcess")
+            .is_some();
+        let has_v2_cortana_managed_launch = document
+            .pointer("/cortana/managedLaunch/version")
+            .and_then(Value::as_u64)
+            == Some(2);
         let has_cortana_legacy_quarantine = document.pointer("/cortana/legacyQuarantine").is_some()
             || document
                 .pointer("/cortana/recovery/kind")
@@ -3477,6 +3486,11 @@ impl CaptainsRegistry {
             });
         }
         if has_cortana_managed_launch && schema_version < 25 {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        if (has_cortana_harness_process || has_v2_cortana_managed_launch) && schema_version < 26 {
             return Err(SnapshotReadError::IncompatibleRecovery {
                 path: path.to_path_buf(),
             });
@@ -4103,16 +4117,32 @@ impl CaptainsRegistry {
                             );
                         }
                     }
-                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => {
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => {
                         let owner = durable
                             .owner
                             .as_ref()
-                            .ok_or("observed Cortana launch has no durable managed owner")?;
+                            .ok_or("owner-observed Cortana launch has no durable managed owner")?;
                         if durable.terminal_id.as_deref() != Some(launch.terminal_id.as_str())
                             || owner.unit_name != launch.unit_name
                             || owner.launch_nonce != launch.launch_nonce
                         {
                             return Err("observed Cortana launch and owner binding disagree".into());
+                        }
+                        if let Some(process) = launch.harness_process.as_ref() {
+                            if process.provider != launch.harness
+                                || process.tmux_session_id != owner.tmux.tmux_session_id
+                                || process.tmux_session_created != owner.tmux.tmux_session_created
+                                || process.tmux_window_id != owner.tmux.tmux_window_id
+                                || process.tmux_pane_id != owner.tmux.tmux_pane_id
+                                || process.pane_pid != owner.tmux.pane_pid
+                                || process.pane_start_ticks != owner.tmux.pane_start_ticks
+                                || process.cgroup_path != owner.cgroup_path
+                            {
+                                return Err(
+                                    "observed Cortana Harness process and owner disagree".into()
+                                );
+                            }
                         }
                     }
                 }
@@ -5832,7 +5862,7 @@ impl CaptainsRegistry {
                 .expect("owner synthesized above");
             current.cortana.managed_launch =
                 Some(crate::cortana_reconcile::CortanaManagedLaunchIntent {
-                    version: 1,
+                    version: 2,
                     operation_id: operation_id.to_string(),
                     terminal_id: terminal_id.to_string(),
                     tmux_target: tmux_target(terminal_id),
@@ -5843,6 +5873,7 @@ impl CaptainsRegistry {
                     launch_nonce: owner.launch_nonce.clone(),
                     tools: owner.tools.clone(),
                     phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                    harness_process: Some(synthetic_cortana_harness_process(owner, harness)),
                 });
         }
         let launch = current
@@ -5850,7 +5881,9 @@ impl CaptainsRegistry {
             .managed_launch
             .as_ref()
             .ok_or("cannot commit Cortana without an observed managed launch")?;
-        if launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        if launch.version != 2
+            || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            || launch.harness_process.is_none()
             || launch.operation_id != operation_id
             || launch.identity_id != identity_id
             || launch.generation != generation
@@ -5928,6 +5961,7 @@ impl CaptainsRegistry {
                 Err("a different Cortana runtime owner is already durable".into())
             };
         }
+        let launch_version = launch.version;
         let previous = current.clone();
         current.cortana.owner = Some(owner);
         current.cortana.terminal_id = Some(terminal_id.to_string());
@@ -5936,7 +5970,90 @@ impl CaptainsRegistry {
             .managed_launch
             .as_mut()
             .expect("checked above")
-            .phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed;
+            .phase = if launch_version == 1 {
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        } else {
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+        };
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    fn record_cortana_harness_process(
+        &self,
+        operation_id: &str,
+        terminal_id: &str,
+        process: crate::harness::HarnessProcessIdentity,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        if operation_id.trim().is_empty()
+            || terminal_id.trim().is_empty()
+            || !crate::harness::valid_harness_process_identity(&process)
+        {
+            return Err("cannot record invalid Cortana Harness process evidence".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_ref()
+            .ok_or("Cortana Harness process has no durable managed launch")?;
+        if launch.operation_id != operation_id
+            || launch.terminal_id != terminal_id
+            || !matches!(
+                launch.phase,
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            )
+        {
+            return Err("Cortana Harness process does not match its managed launch".into());
+        }
+        let owner = current
+            .cortana
+            .owner
+            .as_ref()
+            .ok_or("Cortana Harness process has no durable managed owner")?;
+        if process.provider != launch.harness
+            || process.tmux_session_id != owner.tmux.tmux_session_id
+            || process.tmux_session_created != owner.tmux.tmux_session_created
+            || process.tmux_window_id != owner.tmux.tmux_window_id
+            || process.tmux_pane_id != owner.tmux.tmux_pane_id
+            || process.pane_pid != owner.tmux.pane_pid
+            || process.pane_start_ticks != owner.tmux.pane_start_ticks
+            || process.cgroup_path != owner.cgroup_path
+        {
+            return Err("Cortana Harness process does not match its managed owner".into());
+        }
+        if !matches!(launch.version, 1 | 2) {
+            return Err("Cortana Harness process has an unsupported launch version".into());
+        }
+        if launch.version == 2
+            && launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        {
+            return if launch.harness_process.as_ref() == Some(&process) {
+                Ok(current.cortana.clone())
+            } else {
+                Err("a different Cortana Harness process is already durable".into())
+            };
+        }
+        if launch.version == 2
+            && launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+            || launch.version == 1
+                && launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        {
+            return Err("Cortana Harness process cannot attest this launch phase".into());
+        }
+        let previous = current.clone();
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_mut()
+            .expect("checked above");
+        launch.version = 2;
+        launch.phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed;
+        launch.harness_process = Some(process);
         current.seq = current.seq.saturating_add(1);
         let result = current.cortana.clone();
         self.commit_mutation(current, previous)?;
@@ -5954,7 +6071,7 @@ impl CaptainsRegistry {
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         let tools = durable_cortana_tools(&launch.tools);
         let intent = crate::cortana_reconcile::CortanaManagedLaunchIntent {
-            version: 1,
+            version: 2,
             operation_id: operation_id.to_string(),
             terminal_id: terminal_id.to_string(),
             tmux_target: tmux_target(terminal_id),
@@ -5965,6 +6082,7 @@ impl CaptainsRegistry {
             launch_nonce: launch.launch_nonce.clone(),
             tools,
             phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
+            harness_process: None,
         };
         if !valid_cortana_managed_launch(&intent) {
             return Err("cannot prepare an invalid Cortana managed launch".into());
@@ -6012,7 +6130,11 @@ impl CaptainsRegistry {
         }
         let previous = current.clone();
         current.cortana.managed_launch = None;
-        if expected.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed {
+        if matches!(
+            expected.phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        ) {
             current.cortana.owner = None;
             current.cortana.terminal_id = None;
         }
@@ -18573,7 +18695,28 @@ fn valid_cortana_managed_launch(
     let valid_tool = |tool: &crate::cortana_reconcile::CortanaExecutableIdentity, path: &str| {
         tool.path == path && tool.device > 0 && tool.inode > 0
     };
-    launch.version == 1
+    let phase_valid = match launch.version {
+        1 => {
+            launch.harness_process.is_none()
+                && matches!(
+                    launch.phase,
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+                        | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+                )
+        }
+        2 => match launch.phase {
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+            | crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved => {
+                launch.harness_process.is_none()
+            }
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => launch
+                .harness_process
+                .as_ref()
+                .is_some_and(crate::harness::valid_harness_process_identity),
+        },
+        _ => false,
+    };
+    phase_valid
         && !launch.operation_id.trim().is_empty()
         && exact_cortana_tmux_target(&launch.terminal_id)
             .is_ok_and(|target| target == launch.tmux_target)
@@ -18633,6 +18776,39 @@ fn synthetic_cortana_managed_owner() -> crate::cortana_reconcile::CortanaManaged
             },
         },
         tmux,
+    }
+}
+
+#[cfg(test)]
+fn synthetic_cortana_harness_process(
+    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
+    harness: &str,
+) -> crate::harness::HarnessProcessIdentity {
+    crate::harness::HarnessProcessIdentity {
+        version: crate::harness::HARNESS_PROCESS_IDENTITY_VERSION,
+        provider: harness.into(),
+        pid: owner.tmux.pane_pid,
+        start_ticks: owner.tmux.pane_start_ticks,
+        executable: crate::harness::HarnessExecutableIdentity {
+            path: "/bin/sleep".into(),
+            device: 1,
+            inode: 1,
+        },
+        argv_sha256: format!("sha256:{}", "a".repeat(64)),
+        process_group_id: owner.tmux.pane_process_group_id,
+        process_session_id: owner.tmux.pane_process_session_id,
+        tmux_session_id: owner.tmux.tmux_session_id,
+        tmux_session_created: owner.tmux.tmux_session_created,
+        tmux_window_id: owner.tmux.tmux_window_id,
+        tmux_pane_id: owner.tmux.tmux_pane_id,
+        pane_pid: owner.tmux.pane_pid,
+        pane_start_ticks: owner.tmux.pane_start_ticks,
+        ancestry: vec![crate::harness::HarnessProcessAncestor {
+            pid: owner.tmux.pane_pid,
+            start_ticks: owner.tmux.pane_start_ticks,
+        }],
+        cgroup_path: owner.cgroup_path.clone(),
+        session_token_sha256: format!("sha256:{}", "b".repeat(64)),
     }
 }
 
@@ -19021,7 +19197,6 @@ fn exact_observed_cortana_candidate<'a>(
                 && candidate.generation == launch.generation
                 && candidate.harness == launch.harness
                 && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
-                && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
                 && candidate.identity_bound_to_terminal
                 && candidate.canonical_control_file
                 && candidate.rotating_control_env_scrubbed
@@ -19032,6 +19207,109 @@ fn exact_observed_cortana_candidate<'a>(
                         && same_cortana_tmux_generation(effect, &owner.tmux)
                 })
         })
+}
+
+fn observe_cortana_harness_process(
+    ctx: &ControlContext,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
+) -> Result<crate::harness::HarnessProcessIdentity, String> {
+    let identity = ctx.identity.get(&launch.identity_id).ok_or_else(|| {
+        format!(
+            "reconcile_cortana: managed launch identity '{}' is unavailable or revoked",
+            launch.identity_id
+        )
+    })?;
+    if identity.role != crate::identity::Role::Cortana
+        || identity.session_tile.as_deref() != Some(launch.terminal_id.as_str())
+    {
+        return Err(
+            "reconcile_cortana: managed launch identity is not exactly bound to its terminal"
+                .into(),
+        );
+    }
+    let harness = match launch.harness.as_str() {
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        _ => return Err("reconcile_cortana: managed launch Harness is unsupported".into()),
+    };
+    crate::harness::observe_scoped_harness_process(
+        &launch.tmux_target,
+        harness,
+        &launch.identity_id,
+        &identity.secret,
+        &owner.cgroup_path,
+        owner.tmux.pane_start_ticks,
+    )
+    .map_err(|error| {
+        format!("reconcile_cortana: managed Harness process attestation failed: {error}")
+    })
+}
+
+fn attest_cortana_managed_harness(
+    ctx: &ControlContext,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+    let launch = durable
+        .managed_launch
+        .as_ref()
+        .ok_or("reconcile_cortana: Harness attestation lost its managed launch")?;
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("reconcile_cortana: Harness attestation lost its managed owner")?;
+    tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
+        .map_err(|error| {
+            format!("reconcile_cortana: managed launch owner is unverifiable: {error}")
+        })?;
+    let mut current = durable.clone();
+    if launch.harness_process.is_none() {
+        let observed = observe_cortana_harness_process(ctx, launch, owner)?;
+        current = ctx.captains.record_cortana_harness_process(
+            &launch.operation_id,
+            &launch.terminal_id,
+            observed,
+        )?;
+    }
+    let current_launch = current
+        .managed_launch
+        .as_ref()
+        .ok_or("reconcile_cortana: attested managed launch disappeared")?;
+    let expected = current_launch
+        .harness_process
+        .as_ref()
+        .ok_or("reconcile_cortana: managed launch remains unattested")?;
+    let observed = observe_cortana_harness_process(ctx, current_launch, owner)?;
+    if &observed != expected {
+        return Err(
+            "reconcile_cortana: managed Harness process identity changed after attestation".into(),
+        );
+    }
+    Ok(current)
+}
+
+fn revalidate_cortana_managed_harness(
+    ctx: &ControlContext,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<(), String> {
+    let launch = durable
+        .managed_launch
+        .as_ref()
+        .ok_or("reconcile_cortana: final Harness validation lost its managed launch")?;
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("reconcile_cortana: final Harness validation lost its managed owner")?;
+    let expected = launch
+        .harness_process
+        .as_ref()
+        .ok_or("reconcile_cortana: observed launch has no Harness process attestation")?;
+    let observed = observe_cortana_harness_process(ctx, launch, owner)?;
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err("reconcile_cortana: managed Harness process identity changed before commit".into())
+    }
 }
 
 fn finalize_observed_cortana_launch(
@@ -19080,6 +19358,7 @@ fn finalize_observed_cortana_launch(
         .map_err(|error| {
             format!("reconcile_cortana: observed launch owner is unverifiable: {error}")
         })?;
+    revalidate_cortana_managed_harness(ctx, durable)?;
     let candidate = exact_observed_cortana_candidate(candidates, launch, owner).ok_or(
         "reconcile_cortana: observed launch runtime evidence is missing, extra, or mismatched",
     )?;
@@ -19452,6 +19731,7 @@ fn reconcile_cortana_inner(
                     &launch.terminal_id,
                     durable_cortana_owner(owner),
                 )?;
+                durable = attest_cortana_managed_harness(ctx, &durable)?;
             }
             (
                 crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
@@ -19477,15 +19757,15 @@ fn reconcile_cortana_inner(
                 durable = ctx.captains.cortana_identity();
             }
             (
-                crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
                 tmux::SessionLiveness::Alive,
             ) => {
-                if durable.owner.is_none() {
-                    return Err("reconcile_cortana: observed launch lost its durable owner".into());
-                }
+                durable = attest_cortana_managed_harness(ctx, &durable)?;
             }
             (
-                crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
                 tmux::SessionLiveness::Gone,
             ) => {
                 let owner = durable
@@ -20095,17 +20375,19 @@ fn reconcile_cortana_inner(
             "reconcile_cortana: managed runtime owner could not be made durable: {error}"
         ));
     }
-    let observed_launch = ctx
+    let owner_observed_launch = ctx
         .captains
         .cortana_identity()
         .managed_launch
-        .expect("managed launch was just observed");
+        .expect("managed launch owner was just observed");
     if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
-        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+        cleanup_cortana_managed_launch(ctx, &owner_observed_launch, Some(&owner)).map_err(
+            |cleanup| {
             format!(
                 "reconcile_cortana: harness startup failed: {error}; {cleanup}; observed WAL retained"
             )
-        })?;
+        },
+        )?;
         if replacement.is_none() {
             rollback_cortana_identity_binding(
                 ctx,
@@ -20118,7 +20400,35 @@ fn reconcile_cortana_inner(
             "reconcile_cortana: harness startup failed and the replacement was retired: {error}"
         ));
     }
-    let spawned_candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
+    let owner_observed = ctx.captains.cortana_identity();
+    let attested = match attest_cortana_managed_harness(ctx, &owner_observed) {
+        Ok(attested) => attested,
+        Err(error) => {
+            cleanup_cortana_managed_launch(ctx, &owner_observed_launch, Some(&owner)).map_err(
+                |cleanup| {
+                    format!(
+                        "reconcile_cortana: Harness process attestation failed: {error}; {cleanup}; owner-observed WAL retained"
+                    )
+                },
+            )?;
+            if replacement.is_none() {
+                rollback_cortana_identity_binding(
+                    ctx,
+                    &identity,
+                    previous_tile.as_deref(),
+                    newly_minted,
+                )?;
+            }
+            return Err(format!(
+                "reconcile_cortana: Harness process attestation failed and the replacement was retired: {error}"
+            ));
+        }
+    };
+    let observed_launch = attested
+        .managed_launch
+        .clone()
+        .expect("managed launch Harness was just attested");
+    let spawned_candidates = discover_cortana_runtimes(ctx, &home, &attested)?;
     let candidate = spawned_candidates
         .iter()
         .find(|candidate| candidate.terminal_id == terminal_id)
@@ -20145,7 +20455,6 @@ fn reconcile_cortana_inner(
             && candidate.generation == plan.next_generation
             && candidate.harness == harness.as_provider()
             && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
-            && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
             && candidate.identity_bound_to_terminal
             && candidate.canonical_control_file
             && candidate.rotating_control_env_scrubbed
@@ -20180,6 +20489,16 @@ fn reconcile_cortana_inner(
         })?;
         return Err(format!(
             "reconcile_cortana: managed runtime ownership changed before authority publication: {error}"
+        ));
+    }
+    if let Err(error) = revalidate_cortana_managed_harness(ctx, &attested) {
+        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: managed Harness changed before authority publication: {error}; {cleanup}; observed WAL retained"
+            )
+        })?;
+        return Err(format!(
+            "reconcile_cortana: managed Harness changed before authority publication: {error}"
         ));
     }
     let provider_session_id = candidate.provider_session_id.clone();
@@ -31218,6 +31537,107 @@ mod tests {
         (bin_dir, command)
     }
 
+    #[cfg(unix)]
+    fn compile_scoped_attestation_harness() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let directory = std::env::temp_dir().join(format!(
+            "t-hub-scoped-harness-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("harness.c");
+        let executable = directory.join("codex");
+        std::fs::write(
+            &source,
+            r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+
+static void wait_marker(const char *path) {
+    while (access(path, F_OK) != 0) usleep(10000);
+}
+
+int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "changed") == 0) {
+        for (;;) sleep(1);
+    }
+    if (argc < 3) return 2;
+    signal(SIGTTOU, SIG_IGN);
+    if (setpgid(0, 0) != 0 && errno != EACCES && getpgrp() != getpid()) return 8;
+    if (tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) return 9;
+    const char *mode = argv[1];
+    const char *marker = argv[2];
+    wait_marker(marker);
+    if (strcmp(mode, "exit") == 0) {
+        tcsetpgrp(STDIN_FILENO, getpgid(getppid()));
+        return 0;
+    }
+    if (strcmp(mode, "exec-executable") == 0) {
+        if (argc < 4) return 10;
+        execl(argv[3], "codex", "changed", (char *)0);
+        return 3;
+    }
+    if (strcmp(mode, "exec-argv") == 0) {
+        execl(argv[0], "codex", "changed", (char *)0);
+        return 4;
+    }
+    if (strcmp(mode, "tool") == 0 || strcmp(mode, "exit-tool") == 0) {
+        pid_t child = fork();
+        if (child < 0) return 5;
+        if (child == 0) {
+            signal(SIGHUP, SIG_IGN);
+            setpgid(0, 0);
+            execl("/bin/sleep", "tool-child", "60", (char *)0);
+            _exit(6);
+        }
+        setpgid(child, child);
+        if (tcsetpgrp(STDIN_FILENO, child) != 0) return 7;
+        if (strcmp(mode, "exit-tool") == 0) _exit(0);
+        int status = 0;
+        waitpid(child, &status, 0);
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+        return status;
+    }
+    if (strcmp(mode, "foreign") == 0) {
+        if (argc < 4) return 11;
+        pid_t child = fork();
+        if (child < 0) return 12;
+        if (child == 0) {
+            setpgid(0, 0);
+            execl(argv[3], "codex", "changed", (char *)0);
+            _exit(13);
+        }
+        setpgid(child, child);
+        if (tcsetpgrp(STDIN_FILENO, child) != 0) return 14;
+        int status = 0;
+        waitpid(child, &status, 0);
+        tcsetpgrp(STDIN_FILENO, getpgrp());
+        return status;
+    }
+    for (;;) sleep(1);
+}
+"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new("cc")
+            .args(["-O2", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            std::fs::remove_dir_all(&directory).ok();
+            return None;
+        }
+        Some((directory, executable))
+    }
+
     /// Tear down a real tmux fixture and prove the named session is absent.
     ///
     /// tmux can remove its final session successfully and then return
@@ -37938,7 +38358,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_launch_recovery_requires_schema_v25_and_exact_shape() {
+    fn managed_launch_recovery_requires_schema_v25_v26_and_exact_shape() {
         let path = captains_tmp("managed-launch-schema");
         let launch = json!({
             "version": 1,
@@ -37993,6 +38413,14 @@ mod tests {
                 Err(SnapshotReadError::IncompatibleRecovery { .. })
             ));
         }
+
+        let mut v2 = launch.clone();
+        v2["version"] = json!(2);
+        std::fs::write(&path, document(25, v2).to_string()).unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
 
         let mut mismatched = document(CAPTAINS_SCHEMA_VERSION, launch);
         mismatched["cortana"]["recovery"]["operation_id"] = json!("other-operation");
@@ -45597,11 +46025,173 @@ mod tests {
         assert!(observed.owner.is_some());
         assert_eq!(
             observed.managed_launch.as_ref().unwrap().phase,
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
         );
         let reloaded = powder_lifecycle_registry(Some(path.clone())).cortana_identity();
         assert_eq!(reloaded, observed);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_children() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let Some((fixture_dir, executable)) = compile_scoped_attestation_harness() else {
+            eprintln!("scoped Harness attestation: cc is unavailable - skipping");
+            return;
+        };
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let token = format!("scoped-token-{}", uuid::Uuid::new_v4().simple());
+        let identity_id = format!("scoped-identity-{}", uuid::Uuid::new_v4().simple());
+        let fake_dir = fixture_dir.join("fake");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let fake = fake_dir.join("codex");
+        std::fs::copy(&executable, &fake).unwrap();
+
+        let start = |mode: &str, with_process_token: bool| {
+            let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let target = tmux_target(&terminal_id);
+            let marker = fixture_dir.join(format!("{mode}-{terminal_id}.marker"));
+            let prefix = if with_process_token {
+                String::new()
+            } else {
+                format!("env -u {} ", crate::identity::SESSION_TOKEN_ENV)
+            };
+            let command = format!(
+                "{prefix}{} {mode} {} {}",
+                executable.display(),
+                marker.display(),
+                fake.display()
+            );
+            let launch = tmux::prepare_managed_runtime_launch().unwrap();
+            let owner = tmux::new_prepared_managed_session_with_env(
+                &target,
+                fixture_dir.to_str().unwrap(),
+                Some(&command),
+                &[(crate::identity::SESSION_TOKEN_ENV.into(), token.clone())],
+                &launch,
+            )
+            .unwrap();
+            (target, marker, owner)
+        };
+        let observe = |target: &str, owner: &tmux::ManagedRuntimeOwnerToken| {
+            crate::harness::observe_scoped_harness_process(
+                target,
+                Harness::Codex,
+                &identity_id,
+                &token,
+                &owner.cgroup_path,
+                owner.tmux.pane_start_ticks,
+            )
+        };
+        let wait_observed = |target: &str, owner: &tmux::ManagedRuntimeOwnerToken| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match observe(target, owner) {
+                    Ok(observed) => break observed,
+                    Err(error) => assert!(
+                        Instant::now() < deadline,
+                        "Harness was not observed: {error:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let wait_changed =
+            |target: &str,
+             owner: &tmux::ManagedRuntimeOwnerToken,
+             baseline: &crate::harness::HarnessProcessIdentity| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match observe(target, owner) {
+                        Ok(observed) if &observed != baseline => break Ok(observed),
+                        Err(error) => break Err(error),
+                        _ => {}
+                    }
+                    assert!(Instant::now() < deadline, "Harness identity did not change");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+
+        for mode in ["exec-executable", "exec-argv"] {
+            let (target, marker, owner) = start(mode, true);
+            let baseline = wait_observed(&target, &owner);
+            let durable_wire = serde_json::to_string(&baseline).unwrap();
+            assert!(!durable_wire.contains(&token));
+            assert!(baseline.argv_sha256.starts_with("sha256:"));
+            assert!(baseline.session_token_sha256.starts_with("sha256:"));
+            std::fs::write(&marker, b"go").unwrap();
+            let changed = wait_changed(&target, &owner, &baseline).unwrap();
+            assert_eq!(changed.pid, baseline.pid);
+            assert_eq!(changed.start_ticks, baseline.start_ticks);
+            if mode == "exec-executable" {
+                assert_ne!(changed.executable, baseline.executable);
+            } else {
+                assert_eq!(changed.executable, baseline.executable);
+                assert_ne!(changed.argv_sha256, baseline.argv_sha256);
+            }
+            tmux::retire_managed_runtime(&target, &owner).unwrap();
+        }
+
+        let (target, marker, owner) = start("foreign", true);
+        let baseline = wait_observed(&target, &owner);
+        std::fs::write(&marker, b"go").unwrap();
+        let replacement = wait_changed(&target, &owner, &baseline).unwrap();
+        assert_ne!(replacement.pid, baseline.pid);
+        assert_eq!(
+            replacement.ancestry.get(1).map(|item| item.pid),
+            Some(baseline.pid)
+        );
+        assert_ne!(replacement.executable.path, baseline.executable.path);
+        assert_ne!(replacement.executable.inode, baseline.executable.inode);
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+        let (target, marker, owner) = start("tool", true);
+        let baseline = wait_observed(&target, &owner);
+        std::fs::write(&marker, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tmux::observe_session_effect_identity(&target)
+            .is_ok_and(|effect| effect.foreground_pid == baseline.pid)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "tool child never became foreground"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(observe(&target, &owner).unwrap(), baseline);
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+        let (target, marker, owner) = start("exit-tool", true);
+        let baseline = wait_observed(&target, &owner);
+        std::fs::write(&marker, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{}", baseline.pid)).exists() {
+            assert!(Instant::now() < deadline, "Harness did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(observe(&target, &owner).is_err());
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+        let (target, marker, owner) = start("stable", false);
+        assert_eq!(
+            tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV).unwrap(),
+            Some(token.clone())
+        );
+        let foreground_pid = tmux::observe_session_effect_identity(&target)
+            .unwrap()
+            .foreground_pid;
+        let environment = std::fs::read(format!("/proc/{foreground_pid}/environ")).unwrap();
+        assert!(!environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"T_HUB_SESSION_TOKEN=")));
+        assert!(observe(&target, &owner).is_err());
+        std::fs::write(marker, b"go").unwrap();
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+        std::fs::remove_dir_all(fixture_dir).ok();
     }
 
     #[test]
@@ -45826,6 +46416,7 @@ mod tests {
             launch_nonce: launch.launch_nonce.clone(),
             tools: durable_cortana_tools(&launch.tools),
             phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+            harness_process: None,
         };
         let mut snapshot = fixture["captainsSnapshot"].clone();
         let cortana = snapshot.get_mut("cortana").unwrap();
@@ -45873,6 +46464,26 @@ mod tests {
             tile_ids: vec![],
         }]);
         let ctx = Arc::new(ctx);
+        let captured = captains.cortana_identity();
+        assert_eq!(captured.managed_launch.as_ref().unwrap().version, 1);
+        assert!(captured
+            .managed_launch
+            .as_ref()
+            .unwrap()
+            .harness_process
+            .is_none());
+        let enriched = attest_cortana_managed_harness(&ctx, &captured).unwrap();
+        let enriched_launch = enriched.managed_launch.as_ref().unwrap();
+        assert_eq!(enriched_launch.version, 2);
+        assert_eq!(
+            enriched_launch.phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        );
+        assert!(enriched_launch.harness_process.is_some());
+        assert_eq!(
+            CaptainsRegistry::load(registry_path.clone()).cortana_identity(),
+            enriched
+        );
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let results = std::thread::scope(|scope| {
             let first = {
@@ -46022,7 +46633,7 @@ mod tests {
         assert!(observed.owner.is_some());
         assert_eq!(
             observed.managed_launch.as_ref().unwrap().phase,
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
         );
         assert_eq!(
             powder_lifecycle_registry(Some(path.clone())).cortana_identity(),
