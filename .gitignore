@@ -9,6 +9,8 @@ node_modules
 # Build output
 dist/
 dist-ssr/
+playwright-report/
+test-results/
 *.local
 
 # Local convenience symlink to the bundled Claude Code binary (machine-specific
