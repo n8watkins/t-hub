@@ -169,7 +169,7 @@ pub struct HarnessExecutableIdentity {
     pub inode: u64,
 }
 
-pub const EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION: u32 = 1;
+pub const EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION: u32 = 2;
 
 /// Sanitized identity of the configured provider entry point resolved before
 /// any managed launch effect. Script launches bind both the runtime and the
@@ -183,6 +183,8 @@ pub struct ExpectedHarnessLaunchProvenance {
     pub executable: HarnessExecutableIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_script: Option<HarnessExecutableIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_child_executable: Option<HarnessExecutableIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv_layout_sha256: Option<String>,
 }
@@ -947,6 +949,90 @@ fn argv_layout_sha256(arguments: &[String]) -> String {
     framed_sha256(b"t-hub:harness-argv-layout:v1\0", fields)
 }
 
+#[cfg(unix)]
+fn resolve_trusted_script_child(
+    entry: &HarnessExecutableIdentity,
+    expected_provider: Harness,
+) -> Result<Option<HarnessExecutableIdentity>, LaunchAttestationError> {
+    if expected_provider != Harness::Codex {
+        return Ok(None);
+    }
+    let entry_path = std::path::Path::new(&entry.path);
+    if entry_path.file_name().and_then(|name| name.to_str()) != Some("codex.js")
+        || entry_path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("bin")
+    {
+        return Ok(None);
+    }
+    let package_root = entry_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+    if package_root.file_name().and_then(|name| name.to_str()) != Some("codex")
+        || package_root
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            != Some("@openai")
+    {
+        return Ok(None);
+    }
+    let (platform_package, target_triple, executable_name) =
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux" | "android", "x86_64") => {
+                ("codex-linux-x64", "x86_64-unknown-linux-musl", "codex")
+            }
+            ("linux" | "android", "aarch64") => {
+                ("codex-linux-arm64", "aarch64-unknown-linux-musl", "codex")
+            }
+            ("macos", "x86_64") => ("codex-darwin-x64", "x86_64-apple-darwin", "codex"),
+            ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin", "codex"),
+            _ => return Ok(None),
+        };
+    let namespace_root = package_root
+        .parent()
+        .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+    let candidates = [
+        namespace_root
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join(executable_name),
+        package_root
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join(executable_name),
+    ];
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let resolved = resolve_launch_executable(
+            candidate
+                .to_str()
+                .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?,
+        )?;
+        if resolved.shebang.is_some() {
+            return Err(LaunchAttestationError::UntrustedLaunchCommand);
+        }
+        return Ok(Some(resolved.identity));
+    }
+    Ok(None)
+}
+
+#[cfg(not(unix))]
+fn resolve_trusted_script_child(
+    _entry: &HarnessExecutableIdentity,
+    _expected_provider: Harness,
+) -> Result<Option<HarnessExecutableIdentity>, LaunchAttestationError> {
+    Ok(None)
+}
+
 pub fn resolve_expected_harness_launch_provenance(
     command: &str,
     expected_provider: Harness,
@@ -977,6 +1063,7 @@ pub fn resolve_expected_harness_launch_provenance(
             kind: "direct".into(),
             executable: entry.identity,
             entry_script: None,
+            trusted_child_executable: None,
             argv_layout_sha256: None,
         });
     };
@@ -1006,12 +1093,15 @@ pub fn resolve_expected_harness_launch_provenance(
     if runtime.shebang.is_some() {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
+    let trusted_child_executable =
+        resolve_trusted_script_child(&entry.identity, expected_provider)?;
     Ok(ExpectedHarnessLaunchProvenance {
         version: EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
         provider: expected_provider.as_provider().into(),
         kind: "script".into(),
         executable: runtime.identity,
         entry_script: Some(entry.identity),
+        trusted_child_executable,
         argv_layout_sha256: Some(argv_layout_sha256(&argv[1..])),
     })
 }
@@ -1033,13 +1123,25 @@ pub fn valid_expected_harness_launch_provenance(
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
-    expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+    matches!(
+        expected.version,
+        1 | EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+    ) && (expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+        || expected.trusted_child_executable.is_none())
         && matches!(expected.provider.as_str(), "codex" | "claude")
         && valid_executable(&expected.executable)
         && match expected.kind.as_str() {
-            "direct" => expected.entry_script.is_none() && expected.argv_layout_sha256.is_none(),
+            "direct" => {
+                expected.entry_script.is_none()
+                    && expected.trusted_child_executable.is_none()
+                    && expected.argv_layout_sha256.is_none()
+            }
             "script" => {
                 expected.entry_script.as_ref().is_some_and(valid_executable)
+                    && expected
+                        .trusted_child_executable
+                        .as_ref()
+                        .is_none_or(valid_executable)
                     && expected
                         .argv_layout_sha256
                         .as_deref()
@@ -1075,6 +1177,15 @@ fn scoped_process_matches_expected_launch(
         }
         _ => Err(LaunchAttestationError::ExpectedProvenanceMismatch),
     }
+}
+
+fn scoped_process_matches_executable(
+    process: &ScopedProcessDetails,
+    expected: &HarnessExecutableIdentity,
+) -> bool {
+    process.executable_path == expected.path
+        && process.executable_device == expected.device
+        && process.executable_inode == expected.inode
 }
 
 /// Observe the exact provider process in the foreground ancestry and return
@@ -1121,11 +1232,26 @@ pub fn observe_scoped_harness_process(
             break;
         }
     }
-    let harness_index = harness_index.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?;
-    if details[..harness_index].iter().any(|process| {
-        process_provider(&process.argv).is_some_and(|(provider, _)| provider == expected_provider)
-    }) {
-        return Err(LaunchAttestationError::ExpectedProvenanceMismatch);
+    let wrapper_index = harness_index.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?;
+    let mut harness_index = wrapper_index;
+    if let Some((index, process)) =
+        details[..wrapper_index]
+            .iter()
+            .enumerate()
+            .find(|(_, process)| {
+                process_provider(&process.argv)
+                    .is_some_and(|(provider, _)| provider == expected_provider)
+            })
+    {
+        if expected_launch.kind != "script"
+            || !expected_launch
+                .trusted_child_executable
+                .as_ref()
+                .is_some_and(|expected| scoped_process_matches_executable(process, expected))
+        {
+            return Err(LaunchAttestationError::ExpectedProvenanceMismatch);
+        }
+        harness_index = index;
     }
     let process = &details[harness_index];
     let token = process

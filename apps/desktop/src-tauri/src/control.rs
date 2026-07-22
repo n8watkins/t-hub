@@ -1241,7 +1241,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// provider-native Harness process identity before singleton publication.
 /// v27 binds the independently resolved provider entry point in Prepared before
 /// any managed effect and requires the first live observation to match it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 27;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 28;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3467,6 +3467,15 @@ impl CaptainsRegistry {
             .pointer("/cortana/managedLaunch/version")
             .and_then(Value::as_u64)
             == Some(3);
+        let has_v4_cortana_managed_launch = document
+            .pointer("/cortana/managedLaunch/version")
+            .and_then(Value::as_u64)
+            == Some(4);
+        let has_trusted_harness_child = document
+            .pointer(
+                "/cortana/managedLaunch/expectedHarnessLaunchProvenance/trustedChildExecutable",
+            )
+            .is_some();
         let has_cortana_legacy_quarantine = document.pointer("/cortana/legacyQuarantine").is_some()
             || document
                 .pointer("/cortana/recovery/kind")
@@ -3507,6 +3516,11 @@ impl CaptainsRegistry {
         if (has_cortana_expected_harness_launch || has_v3_cortana_managed_launch)
             && schema_version < 27
         {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        if (has_trusted_harness_child || has_v4_cortana_managed_launch) && schema_version < 28 {
             return Err(SnapshotReadError::IncompatibleRecovery {
                 path: path.to_path_buf(),
             });
@@ -5878,7 +5892,7 @@ impl CaptainsRegistry {
                 .expect("owner synthesized above");
             current.cortana.managed_launch =
                 Some(crate::cortana_reconcile::CortanaManagedLaunchIntent {
-                    version: 3,
+                    version: 4,
                     operation_id: operation_id.to_string(),
                     terminal_id: terminal_id.to_string(),
                     tmux_target: tmux_target(terminal_id),
@@ -5900,7 +5914,7 @@ impl CaptainsRegistry {
             .managed_launch
             .as_ref()
             .ok_or("cannot commit Cortana without an observed managed launch")?;
-        if launch.version != 3
+        if launch.version != 4
             || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
             || launch
                 .expected_harness_launch_provenance
@@ -6029,14 +6043,33 @@ impl CaptainsRegistry {
         {
             return Err("expected Cortana Harness provenance does not match its launch".into());
         }
-        if launch.version == 3 {
+        if launch.version == 4 {
             return if launch.expected_harness_launch_provenance.as_ref() == Some(&expected) {
                 Ok(current.cortana.clone())
             } else {
                 Err("different expected Cortana Harness provenance is already durable".into())
             };
         }
-        if !matches!(launch.version, 1 | 2) || launch.expected_harness_launch_provenance.is_some() {
+        if launch.version == 3
+            && launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .is_none_or(|legacy| {
+                    legacy.provider != expected.provider
+                        || legacy.kind != expected.kind
+                        || legacy.executable != expected.executable
+                        || legacy.entry_script != expected.entry_script
+                        || legacy.argv_layout_sha256 != expected.argv_layout_sha256
+                })
+        {
+            return Err(
+                "expected Cortana Harness provenance changed while enriching its trusted child"
+                    .into(),
+            );
+        }
+        if !matches!(launch.version, 1 | 2 | 3)
+            || (launch.version != 3 && launch.expected_harness_launch_provenance.is_some())
+        {
             return Err("expected Cortana Harness provenance cannot enrich this launch".into());
         }
         let previous = current.clone();
@@ -6045,7 +6078,7 @@ impl CaptainsRegistry {
             .managed_launch
             .as_mut()
             .expect("checked above");
-        launch.version = 3;
+        launch.version = 4;
         if launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
             && launch.harness_process.is_none()
         {
@@ -6103,7 +6136,7 @@ impl CaptainsRegistry {
         {
             return Err("Cortana Harness process does not match its managed owner".into());
         }
-        if launch.version != 3 {
+        if launch.version != 4 {
             return Err("Cortana Harness process has an unsupported launch version".into());
         }
         if launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
@@ -6148,7 +6181,7 @@ impl CaptainsRegistry {
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         let tools = durable_cortana_tools(&launch.tools);
         let intent = crate::cortana_reconcile::CortanaManagedLaunchIntent {
-            version: 3,
+            version: 4,
             operation_id: operation_id.to_string(),
             terminal_id: terminal_id.to_string(),
             tmux_target: tmux_target(terminal_id),
@@ -18802,6 +18835,28 @@ fn valid_cortana_managed_launch(
                 .as_ref()
                 .is_some_and(|expected| {
                     expected.provider == launch.harness
+                        && expected.version == 1
+                        && crate::harness::valid_expected_harness_launch_provenance(expected)
+                })
+                && match launch.phase {
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved => {
+                        launch.harness_process.is_none()
+                    }
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => launch
+                        .harness_process
+                        .as_ref()
+                        .is_some_and(crate::harness::valid_harness_process_identity),
+                }
+        }
+        4 => {
+            launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .is_some_and(|expected| {
+                    expected.provider == launch.harness
+                        && expected.version
+                            == crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
                         && crate::harness::valid_expected_harness_launch_provenance(expected)
                 })
                 && match launch.phase {
@@ -18927,6 +18982,7 @@ fn synthetic_cortana_expected_harness_launch(
             inode: 1,
         },
         entry_script: None,
+        trusted_child_executable: None,
         argv_layout_sha256: None,
     }
 }
@@ -19894,7 +19950,16 @@ fn reconcile_cortana_inner(
     if let Some(launch) = durable
         .managed_launch
         .as_ref()
-        .filter(|launch| launch.expected_harness_launch_provenance.is_none())
+        .filter(|launch| {
+            launch.version < 4
+                || launch
+                    .expected_harness_launch_provenance
+                    .as_ref()
+                    .is_none_or(|expected| {
+                        expected.version
+                            < crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+                    })
+        })
         .cloned()
     {
         let harness = match launch.harness.as_str() {
@@ -31864,6 +31929,29 @@ int main(int argc, char **argv) {
         Some((directory, executable))
     }
 
+    #[cfg(unix)]
+    fn test_codex_package_paths(
+        node_modules: &std::path::Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let (platform_package, target_triple) = match (std::env::consts::OS, std::env::consts::ARCH)
+        {
+            ("linux" | "android", "x86_64") => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+            ("linux" | "android", "aarch64") => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+            ("macos", "x86_64") => ("codex-darwin-x64", "x86_64-apple-darwin"),
+            ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+            _ => return None,
+        };
+        Some((
+            node_modules.join("@openai/codex/bin/codex.js"),
+            node_modules
+                .join("@openai")
+                .join(platform_package)
+                .join("vendor")
+                .join(target_triple)
+                .join("bin/codex"),
+        ))
+    }
+
     /// Tear down a real tmux fixture and prove the named session is absent.
     ///
     /// tmux can remove its final session successfully and then return
@@ -38584,7 +38672,7 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn managed_launch_recovery_requires_schema_v25_v26_v27_and_exact_shape() {
+    fn managed_launch_recovery_requires_schema_v25_v26_v27_v28_and_exact_shape() {
         let path = captains_tmp("managed-launch-schema");
         let launch = json!({
             "version": 1,
@@ -38665,9 +38753,8 @@ int main(int argc, char **argv) {
             CaptainsRegistry::read_snapshot(&path),
             Err(SnapshotReadError::IncompatibleRecovery { .. })
         ));
-        let current_document = document(CAPTAINS_SCHEMA_VERSION, v3);
-        let current_snapshot: CaptainsSnapshot =
-            serde_json::from_value(current_document.clone()).unwrap();
+        let v3_document = document(27, v3.clone());
+        let current_snapshot: CaptainsSnapshot = serde_json::from_value(v3_document).unwrap();
         let decoded_launch = current_snapshot.cortana.managed_launch.as_ref().unwrap();
         assert!(crate::harness::valid_expected_harness_launch_provenance(
             decoded_launch
@@ -38685,6 +38772,7 @@ int main(int argc, char **argv) {
             "{decoded_launch:?}"
         );
         let mut valid_current_snapshot = powder_lifecycle_registry(None).snapshot();
+        valid_current_snapshot.schema_version = 27;
         valid_current_snapshot.cortana = current_snapshot.cortana;
         std::fs::write(
             &path,
@@ -38693,6 +38781,33 @@ int main(int argc, char **argv) {
         .unwrap();
         let current = CaptainsRegistry::read_snapshot(&path);
         assert!(current.is_ok(), "{current:?}");
+
+        let mut v3_with_child = v3.clone();
+        v3_with_child["expectedHarnessLaunchProvenance"]["version"] = json!(2);
+        v3_with_child["expectedHarnessLaunchProvenance"]["trustedChildExecutable"] = json!({
+            "path": "/usr/local/lib/codex/native/codex",
+            "device": 1,
+            "inode": 5
+        });
+        std::fs::write(&path, document(27, v3_with_child).to_string()).unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+
+        let mut v4 = v3;
+        v4["version"] = json!(4);
+        v4["expectedHarnessLaunchProvenance"]["version"] = json!(2);
+        std::fs::write(&path, document(27, v4.clone()).to_string()).unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+        let v4_document = document(CAPTAINS_SCHEMA_VERSION, v4);
+        let v4_snapshot: CaptainsSnapshot = serde_json::from_value(v4_document).unwrap();
+        assert!(valid_cortana_managed_launch(
+            v4_snapshot.cortana.managed_launch.as_ref().unwrap()
+        ));
 
         let mut mismatched = document(CAPTAINS_SCHEMA_VERSION, launch);
         mismatched["cortana"]["recovery"]["operation_id"] = json!("other-operation");
@@ -46306,6 +46421,96 @@ int main(int argc, char **argv) {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn schema27_launch_enrichment_preserves_bound_entry_identity() {
+        let path = captains_tmp("cortana-schema27-provenance-enrichment");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry(Some(path.clone()));
+        registry
+            .begin_cortana_recovery("schema27-operation")
+            .unwrap();
+        let owner = synthetic_cortana_managed_owner();
+        let launch = tmux::ManagedRuntimeLaunchSpec {
+            unit_name: owner.unit_name.clone(),
+            launch_nonce: owner.launch_nonce.clone(),
+            tools: tmux::ManagedSystemTools {
+                python: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.python.path.clone(),
+                    device: owner.tools.python.device,
+                    inode: owner.tools.python.inode,
+                },
+                systemctl: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.systemctl.path.clone(),
+                    device: owner.tools.systemctl.device,
+                    inode: owner.tools.systemctl.inode,
+                },
+                systemd_run: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.systemd_run.path.clone(),
+                    device: owner.tools.systemd_run.device,
+                    inode: owner.tools.systemd_run.inode,
+                },
+            },
+        };
+        let expected = synthetic_cortana_expected_harness_launch("codex");
+        registry
+            .prepare_cortana_managed_launch(
+                "schema27-operation",
+                "a1b2c3d4",
+                "schema27-identity",
+                1,
+                "codex",
+                &launch,
+                expected.clone(),
+            )
+            .unwrap();
+        let mut snapshot = registry.snapshot();
+        snapshot.schema_version = 27;
+        let legacy_launch = snapshot.cortana.managed_launch.as_mut().unwrap();
+        legacy_launch.version = 3;
+        legacy_launch
+            .expected_harness_launch_provenance
+            .as_mut()
+            .unwrap()
+            .version = 1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        let legacy = CaptainsRegistry::load(path.clone());
+        let mut changed = expected.clone();
+        changed.executable.inode += 1;
+        assert!(legacy
+            .record_cortana_expected_harness_launch_provenance(
+                "schema27-operation",
+                "a1b2c3d4",
+                changed,
+            )
+            .unwrap_err()
+            .contains("changed while enriching"));
+        assert_eq!(legacy.cortana_identity().managed_launch.unwrap().version, 3);
+
+        let enriched = legacy
+            .record_cortana_expected_harness_launch_provenance(
+                "schema27-operation",
+                "a1b2c3d4",
+                expected,
+            )
+            .unwrap();
+        let enriched_launch = enriched.managed_launch.as_ref().unwrap();
+        assert_eq!(enriched_launch.version, 4);
+        assert_eq!(
+            enriched_launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .unwrap()
+                .version,
+            crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+        );
+        assert_eq!(
+            CaptainsRegistry::load(path.clone()).cortana_identity(),
+            enriched
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_children() {
@@ -46494,6 +46699,86 @@ int main(int argc, char **argv) {
             .is_ok_and(|output| output.status.success())
         {
             use std::os::unix::fs::PermissionsExt;
+
+            let package_modules = fixture_dir.join("production-node-modules");
+            let Some((package_script, package_native)) = test_codex_package_paths(&package_modules)
+            else {
+                return;
+            };
+            std::fs::create_dir_all(package_script.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(package_native.parent().unwrap()).unwrap();
+            std::fs::copy(&executable, &package_native).unwrap();
+            let tool_marker = fixture_dir.join("production-native-tool.marker");
+            let package_source = format!(
+                "#!/usr/bin/env node\nconst {{ spawn }} = require('child_process');\nspawn({}, ['tool', {}], {{ stdio: 'inherit' }});\nsetInterval(() => {{}}, 1000);\n",
+                serde_json::to_string(&package_native).unwrap(),
+                serde_json::to_string(&tool_marker).unwrap(),
+            );
+            std::fs::write(&package_script, package_source).unwrap();
+            let mut permissions = std::fs::metadata(&package_script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&package_script, permissions).unwrap();
+            let package_launcher = package_modules.join(".bin/codex");
+            std::fs::create_dir_all(package_launcher.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&package_script, &package_launcher).unwrap();
+            let package_command = package_launcher.display().to_string();
+            let package_expected = crate::harness::resolve_expected_harness_launch_provenance(
+                &package_command,
+                Harness::Codex,
+            )
+            .unwrap();
+            assert!(package_expected.trusted_child_executable.is_some());
+            let pane = crate::commands::pane_command(None, Some(&package_command));
+            let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let package_target = tmux_target(&terminal_id);
+            let launch = tmux::prepare_managed_runtime_launch().unwrap();
+            let package_owner = tmux::new_prepared_managed_session_with_env(
+                &package_target,
+                fixture_dir.to_str().unwrap(),
+                pane.as_deref(),
+                &[(crate::identity::SESSION_TOKEN_ENV.into(), token.clone())],
+                &launch,
+            )
+            .unwrap();
+            let observe_package = || {
+                crate::harness::observe_scoped_harness_process(
+                    &package_target,
+                    Harness::Codex,
+                    &package_expected,
+                    &identity_id,
+                    &token,
+                    &package_owner.cgroup_path,
+                    package_owner.tmux.pane_start_ticks,
+                )
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let package_baseline = loop {
+                match observe_package() {
+                    Ok(observed) => break observed,
+                    Err(error) => assert!(
+                        Instant::now() < deadline,
+                        "bound native Codex child was not observed: {error:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(
+                Some(&package_baseline.executable),
+                package_expected.trusted_child_executable.as_ref()
+            );
+            std::fs::write(&tool_marker, b"go").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tmux::observe_session_effect_identity(&package_target)
+                .is_ok_and(|effect| effect.foreground_pid == package_baseline.pid)
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "ordinary tool child did not become foreground"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(observe_package().unwrap(), package_baseline);
+            tmux::retire_managed_runtime(&package_target, &package_owner).unwrap();
 
             let script_dir = fixture_dir.join("node-provider");
             std::fs::create_dir_all(&script_dir).unwrap();
@@ -46743,12 +47028,17 @@ int main(int argc, char **argv) {
             tile_ids: Vec::new(),
         }]);
         let home = fixture_dir.join("home");
-        let script_dir = fixture_dir.join("node-provider");
+        let node_modules = fixture_dir.join("node_modules");
+        let Some((script, trusted_native)) = test_codex_package_paths(&node_modules) else {
+            return;
+        };
+        let script_dir = script.parent().unwrap();
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::create_dir_all(script_dir).unwrap();
+        std::fs::create_dir_all(trusted_native.parent().unwrap()).unwrap();
+        std::fs::copy(&executable, &trusted_native).unwrap();
         let fake = script_dir.join("foreign-codex");
         std::fs::copy(&executable, &fake).unwrap();
-        let script = script_dir.join("codex");
         let child_marker = script_dir.join("child-start");
         let source = format!(
             "#!/usr/bin/env node\nconst {{ spawn }} = require('child_process');\nspawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});\nsetInterval(() => {{}}, 1000);\n",
@@ -46760,16 +47050,20 @@ int main(int argc, char **argv) {
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
+        let launcher = node_modules.join(".bin/codex");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&script, &launcher).unwrap();
 
         let operation_id = "cortana-node-child-provider-operation";
         let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
         ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
         ctx.captains.begin_cortana_recovery(operation_id).unwrap();
-        let command = script.display().to_string();
+        let command = launcher.display().to_string();
         let expected =
             crate::harness::resolve_expected_harness_launch_provenance(&command, Harness::Codex)
                 .unwrap();
+        assert!(expected.trusted_child_executable.is_some());
         let launch = tmux::prepare_managed_runtime_launch().unwrap();
         ctx.captains
             .prepare_cortana_managed_launch(
@@ -47323,7 +47617,7 @@ int main(int argc, char **argv) {
         );
         let enriched = attest_cortana_managed_harness(&ctx, &provenance_enriched).unwrap();
         let enriched_launch = enriched.managed_launch.as_ref().unwrap();
-        assert_eq!(enriched_launch.version, 3);
+        assert_eq!(enriched_launch.version, 4);
         assert_eq!(
             enriched_launch.phase,
             crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
