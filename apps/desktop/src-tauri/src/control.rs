@@ -54359,6 +54359,7 @@ mod tests {
             "task": format!("Reject authority replacement at {boundary}"),
             "harness": "codex",
             "testHarnessCommand": provider.command,
+            "testCodexUnobservedCommand": ":",
         });
         let completion = Arc::new(AtomicBool::new(false));
         let mut worker =
@@ -54605,6 +54606,7 @@ mod tests {
             "task": format!("Recover ambiguous trusted release at {phase}"),
             "harness": "codex",
             "testHarnessCommand": provider.command,
+            "testCodexUnobservedCommand": ":",
         });
         let completion = Arc::new(AtomicBool::new(false));
         let mut worker =
