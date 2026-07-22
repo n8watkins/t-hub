@@ -11,6 +11,7 @@ const HEADER_SELECTOR = `${TILE_SELECTOR} .th-tile-header`;
 const TAB_NAMES = ["Terminal", "Files", "Preview"];
 const STATUS_SEQUENCE = ["working", "needsPermission", "completed", "failed"];
 const mockedPages = new WeakSet<Page>();
+const browserErrors = new WeakMap<Page, string[]>();
 
 type MeasuredItem = {
   kind: string;
@@ -34,9 +35,15 @@ type HeaderMetrics = {
   overlaps: string[][];
 };
 
-async function installGitMock(page: Page): Promise<void> {
+async function installTauriMock(page: Page): Promise<void> {
   if (mockedPages.has(page)) return;
   mockedPages.add(page);
+  const errors: string[] = [];
+  browserErrors.set(page, errors);
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+  page.on("pageerror", (error) => errors.push(error.message));
   await page.addInitScript(() => {
     let callbackId = 1;
     const host = window as typeof window & Record<string, unknown>;
@@ -77,7 +84,39 @@ async function installGitMock(page: Page): Promise<void> {
               sources: [],
             };
           }
+          if (args?.command === "list_tabs") {
+            return { seq: 0, activeTabId: null, tabs: [] };
+          }
+          if (args?.command === "list_captains") {
+            return { seq: 0, captains: [] };
+          }
           if (args?.command === "recent_sessions") return [];
+        }
+        if (command === "list_terminals") {
+          return (host.__BROWSER_TERMINALS__ as unknown[] | undefined) ?? [];
+        }
+        if (command === "report_workspace_tabs") {
+          return { seq: 0, stale: false };
+        }
+        if (command === "discover_run_targets") {
+          return {
+            state: "ready",
+            targets: [],
+            message: null,
+          };
+        }
+        if (command === "dev_server_snapshot") {
+          return {
+            terminalId: String(args?.terminalId ?? "browser-terminal"),
+            runId: null,
+            revision: 0,
+            state: "idle",
+            target: null,
+            exitCode: null,
+            reason: null,
+            previewUrl: null,
+            observedAt: 0,
+          };
         }
         if (command === "plugin:event|listen") return callbackId;
         throw {
@@ -106,8 +145,19 @@ async function installGitMock(page: Page): Promise<void> {
   });
 }
 
+async function assertNoBrowserErrors(page: Page): Promise<void> {
+  expect(browserErrors.get(page) ?? []).toEqual([]);
+  await expect(page.locator('[role="alert"]').filter({ visible: true })).toHaveCount(0);
+  await expect(page.getByText("Retry", { exact: true })).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("[object Object]");
+}
+
+test.afterEach(async ({ page }) => {
+  await assertNoBrowserErrors(page);
+});
+
 async function seedTiles(page: Page, count: number): Promise<void> {
-  await installGitMock(page);
+  await installTauriMock(page);
   await page.goto("/");
   await expect(page.locator("body")).not.toHaveText("");
 
@@ -146,6 +196,9 @@ async function seedTiles(page: Page, count: number): Promise<void> {
           },
         ]),
       );
+      (
+        window as typeof window & { __BROWSER_TERMINALS__?: unknown[] }
+      ).__BROWSER_TERMINALS__ = Object.values(terminals);
       const names = Object.fromEntries(
         ids.map((id, index) => [
           id,
@@ -491,11 +544,6 @@ test("settles 20 rendered resize cycles during active output without churn", asy
   page,
 }, testInfo) => {
   await seedTiles(page, 1);
-  const consoleErrors: string[] = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
-  });
-  page.on("pageerror", (error) => consoleErrors.push(error.message));
 
   await page.locator('[data-tile-id="header001"]').evaluate((tile) => {
     const output = document.createElement("div");
@@ -558,7 +606,6 @@ test("settles 20 rendered resize cycles during active output without churn", asy
   });
   expect(mutationCounts.header).toBe(0);
   expect(mutationCounts.output).toBeGreaterThanOrEqual(step);
-  expect(consoleErrors).toEqual([]);
   await screenshot(page, testInfo, "resize-final.png");
 });
 
@@ -576,6 +623,7 @@ async function verifyScale(
     await seedTiles(page, 16);
     expect(await page.evaluate(() => window.devicePixelRatio)).toBe(scale);
     await assertHeadersAreUsable(page, 16);
+    await assertNoBrowserErrors(page);
     await screenshot(page, testInfo, `scale-${String(scale).replace(".", "-")}.png`);
   } finally {
     await context.close();
