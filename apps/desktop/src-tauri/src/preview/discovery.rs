@@ -2,8 +2,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use cap_fs_ext::{
+    ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
+};
+use cap_std::fs::{Dir as CapDir, File as CapFile, OpenOptions as CapOpenOptions};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -63,33 +68,29 @@ impl PreviewDiscoveryCache {
 pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| format!("canonicalize Preview root {}: {error}", root.display()))?;
-    if !canonical_root.is_dir() {
-        return Err("Preview root must be a directory".into());
-    }
+    let root_directory = open_root(&canonical_root)?;
 
     let mut fingerprint = Sha256::new();
     let root_identity = canonical_root.to_string_lossy().replace('\\', "/");
     let canonical_root_fingerprint = format!("sha256:{:x}", Sha256::digest(root_identity));
-    let root_manifest_path = canonical_root.join("package.json");
     let root_manifest =
-        read_optional_bounded(&root_manifest_path, &canonical_root, &mut fingerprint)?;
-    let config_path = canonical_root.join(".t-hub/preview.json");
-    let config = read_optional_bounded(&config_path, &canonical_root, &mut fingerprint)?;
+        read_relative_optional(&root_directory, Path::new("package.json"), &mut fingerprint)?;
+    let config = read_relative_optional(
+        &root_directory,
+        Path::new(".t-hub/preview.json"),
+        &mut fingerprint,
+    )?;
     for lock_file in LOCK_FILES {
-        let _ = read_optional_bounded(
-            &canonical_root.join(lock_file),
-            &canonical_root,
-            &mut fingerprint,
-        )?;
+        let _ = read_relative_optional(&root_directory, Path::new(lock_file), &mut fingerprint)?;
     }
 
     let mut workspace_patterns = Vec::new();
     if let Some(bytes) = root_manifest.as_deref() {
         workspace_patterns.extend(package_workspace_patterns(bytes)?);
     }
-    if let Some(bytes) = read_optional_bounded(
-        &canonical_root.join("pnpm-workspace.yaml"),
-        &canonical_root,
+    if let Some(bytes) = read_relative_optional(
+        &root_directory,
+        Path::new("pnpm-workspace.yaml"),
         &mut fingerprint,
     )? {
         workspace_patterns.extend(pnpm_workspace_patterns(&bytes)?);
@@ -100,43 +101,54 @@ pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
         return Err("Preview workspace discovery exceeds its pattern bound".into());
     }
 
-    let mut manifest_roots = vec![(canonical_root.clone(), PreviewTargetSource::Root)];
+    let mut manifest_roots = vec![DiscoveryDirectory {
+        relative: String::new(),
+        source: PreviewTargetSource::Root,
+        directory: root_directory
+            .try_clone()
+            .map_err(|error| format!("clone Preview root handle: {error}"))?,
+    }];
     if !workspace_patterns.is_empty() {
-        for directory in bounded_directories(&canonical_root)? {
-            let relative = relative_slash(&canonical_root, &directory)?;
+        for mut directory in bounded_directories(&root_directory)? {
             if workspace_patterns
                 .iter()
-                .any(|pattern| glob_matches(pattern, &relative))
-                && directory.join("package.json").is_file()
+                .any(|pattern| glob_matches(pattern, &directory.relative))
+                && regular_file_exists(&directory.directory, Path::new("package.json"))?
             {
-                manifest_roots.push((directory, PreviewTargetSource::WorkspaceManifest));
+                directory.source = PreviewTargetSource::WorkspaceManifest;
+                manifest_roots.push(directory);
             }
         }
     }
-    manifest_roots.sort_by(|left, right| left.0.cmp(&right.0));
-    manifest_roots.dedup_by(|left, right| left.0 == right.0);
+    manifest_roots.sort_by(|left, right| left.relative.cmp(&right.relative));
+    manifest_roots.dedup_by(|left, right| left.relative == right.relative);
 
     let mut targets = Vec::new();
-    for (manifest_root, source) in manifest_roots {
-        let manifest_path = manifest_root.join("package.json");
-        let bytes = if manifest_path == root_manifest_path {
+    for manifest_root in manifest_roots {
+        let bytes = if manifest_root.relative.is_empty() {
             root_manifest.clone()
         } else {
-            read_optional_bounded(&manifest_path, &canonical_root, &mut fingerprint)?
+            read_in_directory_optional(
+                &manifest_root.directory,
+                Path::new("package.json"),
+                &joined_relative(&manifest_root.relative, "package.json"),
+                &mut fingerprint,
+            )?
         };
         let Some(bytes) = bytes else { continue };
         let package = parse_package_manifest(&bytes)?;
-        let relative_root = relative_slash(&canonical_root, &manifest_root)?;
-        if manifest_root != canonical_root {
+        let relative_root = manifest_root.relative.clone();
+        if !relative_root.is_empty() {
             for lock_file in LOCK_FILES {
-                let _ = read_optional_bounded(
-                    &manifest_root.join(lock_file),
-                    &canonical_root,
+                let _ = read_in_directory_optional(
+                    &manifest_root.directory,
+                    Path::new(lock_file),
+                    &joined_relative(&relative_root, lock_file),
                     &mut fingerprint,
                 )?;
             }
         }
-        let manager = package_manager(&manifest_root, &canonical_root);
+        let manager = package_manager(&manifest_root.directory, &root_directory)?;
         for script in PACKAGE_SCRIPTS {
             if package.scripts.contains(script) {
                 push_target(
@@ -144,7 +156,7 @@ pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
                     PreviewTarget {
                         id: target_id(&relative_root, script)?,
                         label: target_label(package.name.as_deref(), &relative_root, script),
-                        source,
+                        source: manifest_root.source,
                         relative_root: relative_root.clone(),
                         kind: PreviewTargetKind::PackageScript {
                             package_manager: manager,
@@ -159,7 +171,7 @@ pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
 
     if let Some(bytes) = config {
         for configured in parse_config(&bytes)? {
-            let target = accept_config_target(&canonical_root, configured, &mut fingerprint)?;
+            let target = accept_config_target(&root_directory, configured, &mut fingerprint)?;
             push_target(&mut targets, target)?;
         }
     }
@@ -272,28 +284,38 @@ fn validate_pattern(value: &str) -> Result<String, String> {
     Ok(normalized.trim_end_matches('/').to_string())
 }
 
-fn bounded_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
+struct DiscoveryDirectory {
+    relative: String,
+    source: PreviewTargetSource,
+    directory: CapDir,
+}
+
+fn bounded_directories(root: &CapDir) -> Result<Vec<DiscoveryDirectory>, String> {
     let mut result = Vec::new();
-    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut pending = vec![(
+        root.try_clone()
+            .map_err(|error| format!("clone Preview root handle: {error}"))?,
+        String::new(),
+        0usize,
+    )];
     let mut visited = 0usize;
-    while let Some((directory, depth)) = pending.pop() {
+    while let Some((directory, relative, depth)) = pending.pop() {
         if depth >= MAX_DEPTH {
             continue;
         }
         let mut children = Vec::new();
-        for entry in fs::read_dir(&directory)
-            .map_err(|error| format!("read directory {}: {error}", directory.display()))?
+        for entry in directory
+            .entries()
+            .map_err(|error| format!("read Preview directory {relative:?}: {error}"))?
         {
             if children.len() >= MAX_DIRECTORY_ENTRIES {
                 return Err(format!(
-                    "Preview workspace discovery exceeded the entry bound in {}",
-                    directory.display()
+                    "Preview workspace discovery exceeded the entry bound in {relative:?}"
                 ));
             }
-            children.push(
-                entry
-                    .map_err(|error| format!("read directory {}: {error}", directory.display()))?,
-            );
+            children.push(entry.map_err(|error| {
+                format!("read Preview directory entry in {relative:?}: {error}")
+            })?);
         }
         children.sort_by_key(|entry| entry.file_name());
         for child in children.into_iter().rev() {
@@ -301,22 +323,31 @@ fn bounded_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
             if matches!(name.to_str(), Some(".git" | "node_modules" | "target")) {
                 continue;
             }
-            if path_is_link_or_reparse(&child.path())? {
+            let Ok(opened) = directory.open_dir_nofollow(&name) else {
                 continue;
-            }
-            let metadata = child
-                .metadata()
-                .map_err(|error| format!("inspect {}: {error}", child.path().display()))?;
-            if !metadata.is_dir() {
+            };
+            let metadata = opened
+                .dir_metadata()
+                .map_err(|error| format!("inspect Preview directory entry {name:?}: {error}"))?;
+            if cap_metadata_has_reparse_point(&metadata) {
                 continue;
             }
             visited += 1;
             if visited > MAX_VISITED_DIRECTORIES {
                 return Err("Preview workspace discovery exceeded its directory bound".into());
             }
-            let canonical = confined_canonical(root, &child.path())?;
-            result.push(canonical.clone());
-            pending.push((canonical, depth + 1));
+            let name = name
+                .to_str()
+                .ok_or_else(|| "Preview paths must be valid UTF-8".to_string())?;
+            let child_relative = joined_relative(&relative, name);
+            result.push(DiscoveryDirectory {
+                relative: child_relative.clone(),
+                source: PreviewTargetSource::WorkspaceManifest,
+                directory: opened
+                    .try_clone()
+                    .map_err(|error| format!("clone Preview directory handle: {error}"))?,
+            });
+            pending.push((opened, child_relative, depth + 1));
         }
     }
     Ok(result)
@@ -426,7 +457,7 @@ fn parse_config(bytes: &[u8]) -> Result<Vec<ConfiguredTarget>, String> {
 }
 
 fn accept_config_target(
-    root: &Path,
+    root: &CapDir,
     configured: ConfiguredTarget,
     fingerprint: &mut Sha256,
 ) -> Result<PreviewTarget, String> {
@@ -467,8 +498,7 @@ fn accept_config_target(
         return Err("configured Preview target label must contain 1 to 200 bytes".into());
     }
     let relative_root = normalize_relative(&relative_root)?;
-    let target_root = confined_canonical(root, &root.join(&relative_root))?;
-    let relative_root = relative_slash(root, &target_root)?;
+    let target_root = open_relative_directory(root, Path::new(&relative_root))?;
     let kind = match kind {
         ConfiguredTargetKind::PackageScript {
             package_manager,
@@ -477,8 +507,12 @@ fn accept_config_target(
             if !PACKAGE_SCRIPTS.contains(&script.as_str()) {
                 return Err("configured package script must be dev, preview, or start".into());
             }
-            let manifest =
-                read_required_bounded(&target_root.join("package.json"), root, fingerprint)?;
+            let manifest = read_in_directory_required(
+                &target_root,
+                Path::new("package.json"),
+                &joined_relative(&relative_root, "package.json"),
+                fingerprint,
+            )?;
             if !parse_package_manifest(&manifest)?.scripts.contains(&script) {
                 return Err(format!(
                     "configured package script {script:?} does not exist"
@@ -491,14 +525,13 @@ fn accept_config_target(
         }
         ConfiguredTargetKind::StaticSite { entrypoint } => {
             let entrypoint = normalize_relative(&entrypoint)?;
-            let entry = confined_canonical(root, &target_root.join(&entrypoint))?;
-            if !entry.is_file() {
-                return Err("configured static Preview entrypoint must be a file".into());
-            }
-            fingerprint_metadata(root, &entry, fingerprint)?;
-            PreviewTargetKind::StaticSite {
-                entrypoint: relative_slash(&target_root, &entry)?,
-            }
+            fingerprint_relative_file(
+                &target_root,
+                Path::new(&entrypoint),
+                &joined_relative(&relative_root, &entrypoint),
+                fingerprint,
+            )?;
+            PreviewTargetKind::StaticSite { entrypoint }
         }
     };
     Ok(PreviewTarget {
@@ -535,19 +568,21 @@ fn push_target(targets: &mut Vec<PreviewTarget>, target: PreviewTarget) -> Resul
     Ok(())
 }
 
-fn package_manager(path: &Path, root: &Path) -> PreviewPackageManager {
+fn package_manager(path: &CapDir, root: &CapDir) -> Result<PreviewPackageManager, String> {
     for directory in [path, root] {
-        if directory.join("pnpm-lock.yaml").is_file() {
-            return PreviewPackageManager::Pnpm;
+        if regular_file_exists(directory, Path::new("pnpm-lock.yaml"))? {
+            return Ok(PreviewPackageManager::Pnpm);
         }
-        if directory.join("yarn.lock").is_file() {
-            return PreviewPackageManager::Yarn;
+        if regular_file_exists(directory, Path::new("yarn.lock"))? {
+            return Ok(PreviewPackageManager::Yarn);
         }
-        if directory.join("bun.lockb").is_file() || directory.join("bun.lock").is_file() {
-            return PreviewPackageManager::Bun;
+        if regular_file_exists(directory, Path::new("bun.lockb"))?
+            || regular_file_exists(directory, Path::new("bun.lock"))?
+        {
+            return Ok(PreviewPackageManager::Bun);
         }
     }
-    PreviewPackageManager::Npm
+    Ok(PreviewPackageManager::Npm)
 }
 
 fn target_id(relative_root: &str, script: &str) -> Result<PreviewTargetId, String> {
@@ -597,113 +632,199 @@ fn normalize_relative(value: &str) -> Result<String, String> {
     Ok(normalized.trim_matches('/').to_string())
 }
 
-fn confined_canonical(root: &Path, candidate: &Path) -> Result<PathBuf, String> {
-    reject_symlink_components(root, candidate)?;
-    let canonical = fs::canonicalize(candidate)
-        .map_err(|error| format!("canonicalize {}: {error}", candidate.display()))?;
-    if !canonical.starts_with(root) {
-        return Err(format!(
-            "Preview path escapes canonical root: {}",
-            candidate.display()
-        ));
-    }
-    Ok(canonical)
+fn nofollow_options(maybe_dir: bool) -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(maybe_dir);
+    options
 }
 
-fn reject_symlink_components(root: &Path, candidate: &Path) -> Result<(), String> {
-    let relative = candidate
-        .strip_prefix(root)
-        .map_err(|_| "Preview path is outside the canonical root".to_string())?;
-    let mut current = root.to_path_buf();
+fn cap_metadata_has_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::OsMetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn open_root(root: &Path) -> Result<CapDir, String> {
+    let file = CapFile::open_ambient_with(root, &nofollow_options(true), ambient_authority())
+        .map_err(|error| format!("open Preview root {}: {error}", root.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect Preview root {}: {error}", root.display()))?;
+    if !metadata.is_dir() || cap_metadata_has_reparse_point(&metadata) {
+        return Err("Preview root must be a regular directory".into());
+    }
+    Ok(CapDir::from_std_file(file.into_std()))
+}
+
+fn open_relative_directory(root: &CapDir, relative: &Path) -> Result<CapDir, String> {
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| format!("clone Preview root handle: {error}"))?;
     for component in relative.components() {
-        current.push(component);
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|error| format!("inspect {}: {error}", current.display()))?;
-        if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::CurDir => continue,
+            _ => return Err("Preview paths must be canonical-root-relative".into()),
+        };
+        directory = directory
+            .open_dir_nofollow(name)
+            .map_err(|error| format!("open Preview directory {}: {error}", relative.display()))?;
+        let metadata = directory.dir_metadata().map_err(|error| {
+            format!("inspect Preview directory {}: {error}", relative.display())
+        })?;
+        if cap_metadata_has_reparse_point(&metadata) {
             return Err(format!(
-                "Preview path contains a symlink: {}",
-                current.display()
+                "Preview path contains a reparse point: {}",
+                relative.display()
             ));
         }
     }
-    Ok(())
+    Ok(directory)
 }
 
-fn relative_slash(root: &Path, path: &Path) -> Result<String, String> {
-    path.strip_prefix(root)
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .map_err(|_| format!("{} is outside Preview root", path.display()))
-}
-
-fn read_optional_bounded(
-    path: &Path,
-    root: &Path,
+fn read_relative_optional(
+    root: &CapDir,
+    relative: &Path,
     fingerprint: &mut Sha256,
 ) -> Result<Option<Vec<u8>>, String> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_required_bounded(path, root, fingerprint).map(Some),
+    let display = relative.to_string_lossy().replace('\\', "/");
+    let Some(name) = relative.file_name() else {
+        return Err("Preview file path must include a file name".into());
+    };
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let directory = match open_relative_directory(root, parent) {
+        Ok(directory) => directory,
+        Err(error) if error.contains("No such file") => {
+            fingerprint_missing(&display, fingerprint);
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    read_in_directory_optional(&directory, name.as_ref(), &display, fingerprint)
+}
+
+fn read_in_directory_optional(
+    directory: &CapDir,
+    name: &Path,
+    display: &str,
+    fingerprint: &mut Sha256,
+) -> Result<Option<Vec<u8>>, String> {
+    match directory.open_with(name, &nofollow_options(false)) {
+        Ok(file) => read_opened_bounded(file, display, fingerprint).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fingerprint.update(b"missing\0");
-            fingerprint.update(relative_slash(root, path)?.as_bytes());
+            fingerprint_missing(display, fingerprint);
             Ok(None)
         }
-        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        Err(error) => Err(format!("open Preview file {display}: {error}")),
     }
 }
 
-fn path_is_link_or_reparse(path: &Path) -> Result<bool, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    Ok(metadata.file_type().is_symlink() || metadata_is_reparse(&metadata))
-}
-
-#[cfg(windows)]
-fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn metadata_is_reparse(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
-fn read_required_bounded(
-    path: &Path,
-    root: &Path,
+fn read_in_directory_required(
+    directory: &CapDir,
+    name: &Path,
+    display: &str,
     fingerprint: &mut Sha256,
 ) -> Result<Vec<u8>, String> {
-    let canonical = confined_canonical(root, path)?;
-    let metadata = fs::metadata(&canonical)
-        .map_err(|error| format!("inspect {}: {error}", canonical.display()))?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+    let file = directory
+        .open_with(name, &nofollow_options(false))
+        .map_err(|error| format!("open Preview file {display}: {error}"))?;
+    read_opened_bounded(file, display, fingerprint)
+}
+
+fn read_opened_bounded(
+    file: CapFile,
+    display: &str,
+    fingerprint: &mut Sha256,
+) -> Result<Vec<u8>, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect Preview file {display}: {error}"))?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_FILE_BYTES
+        || cap_metadata_has_reparse_point(&metadata)
+    {
         return Err(format!(
-            "Preview file is absent or too large: {}",
-            path.display()
+            "Preview file is not regular or exceeds its size bound: {display}"
         ));
     }
-    let bytes =
-        fs::read(&canonical).map_err(|error| format!("read {}: {error}", canonical.display()))?;
-    fingerprint.update(relative_slash(root, &canonical)?.as_bytes());
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read Preview file {display}: {error}"))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("Preview file exceeds its size bound: {display}"));
+    }
+    fingerprint.update(display.as_bytes());
     fingerprint.update((bytes.len() as u64).to_le_bytes());
     fingerprint.update(&bytes);
     Ok(bytes)
 }
 
-fn fingerprint_metadata(root: &Path, path: &Path, fingerprint: &mut Sha256) -> Result<(), String> {
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("inspect {}: {error}", path.display()))?;
-    fingerprint.update(relative_slash(root, path)?.as_bytes());
+fn fingerprint_relative_file(
+    root: &CapDir,
+    relative: &Path,
+    display: &str,
+    fingerprint: &mut Sha256,
+) -> Result<(), String> {
+    let Some(name) = relative.file_name() else {
+        return Err("configured static Preview entrypoint must be a file".into());
+    };
+    let directory =
+        open_relative_directory(root, relative.parent().unwrap_or_else(|| Path::new("")))?;
+    let file = directory
+        .open_with(name, &nofollow_options(false))
+        .map_err(|error| format!("open configured static Preview entrypoint {display}: {error}"))?;
+    let metadata = file.metadata().map_err(|error| {
+        format!("inspect configured static Preview entrypoint {display}: {error}")
+    })?;
+    if !metadata.is_file() || cap_metadata_has_reparse_point(&metadata) {
+        return Err("configured static Preview entrypoint must be a regular file".into());
+    }
+    fingerprint.update(display.as_bytes());
     fingerprint.update(metadata.len().to_le_bytes());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        fingerprint.update(metadata.mtime().to_le_bytes());
-        fingerprint.update(metadata.mtime_nsec().to_le_bytes());
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(elapsed) = modified.into_std().duration_since(std::time::UNIX_EPOCH) {
+            fingerprint.update(elapsed.as_secs().to_le_bytes());
+            fingerprint.update(elapsed.subsec_nanos().to_le_bytes());
+        }
     }
     Ok(())
+}
+
+fn regular_file_exists(directory: &CapDir, name: &Path) -> Result<bool, String> {
+    match directory.open_with(name, &nofollow_options(false)) {
+        Ok(file) => {
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("inspect Preview file {}: {error}", name.display()))?;
+            Ok(metadata.is_file() && !cap_metadata_has_reparse_point(&metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("open Preview file {}: {error}", name.display())),
+    }
+}
+
+fn fingerprint_missing(display: &str, fingerprint: &mut Sha256) {
+    fingerprint.update(b"missing\0");
+    fingerprint.update(display.as_bytes());
+}
+
+fn joined_relative(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
 }
 
 #[cfg(test)]
@@ -830,5 +951,34 @@ mod tests {
         )
         .unwrap();
         assert!(discover(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_handle_cannot_be_rebound_to_an_outside_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture("retained-handle");
+        let outside = fixture("retained-handle-outside");
+        fs::create_dir(root.join("site")).unwrap();
+        fs::write(root.join("site/index.html"), "inside").unwrap();
+        fs::write(outside.join("index.html"), "outside").unwrap();
+
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let root_handle = open_root(&canonical_root).unwrap();
+        let site_handle = open_relative_directory(&root_handle, Path::new("site")).unwrap();
+        fs::rename(root.join("site"), root.join("original-site")).unwrap();
+        symlink(&outside, root.join("site")).unwrap();
+
+        let mut fingerprint = Sha256::new();
+        let bytes = read_in_directory_required(
+            &site_handle,
+            Path::new("index.html"),
+            "site/index.html",
+            &mut fingerprint,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"inside");
+        assert!(open_relative_directory(&root_handle, Path::new("site")).is_err());
     }
 }
