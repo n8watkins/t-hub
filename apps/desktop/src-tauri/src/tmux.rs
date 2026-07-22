@@ -2305,7 +2305,22 @@ pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
         }
         let identity = observe_session_effect_identity(name)?;
         match kill_session_tree_exact(name, identity) {
-            Ok(()) => break,
+            Ok(()) => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    match session_liveness(name) {
+                        SessionLiveness::Gone => return Ok(()),
+                        SessionLiveness::Unknown => break,
+                        SessionLiveness::Alive => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+                last_error = Some(TmuxError {
+                    op: "kill-session-tree",
+                    code: None,
+                    message: "verified pane tree remained alive after pidfd retirement".into(),
+                });
+                break;
+            }
             Err(error) => {
                 last_error = Some(error);
                 if session_liveness(name) != SessionLiveness::Alive {
