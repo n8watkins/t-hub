@@ -1239,7 +1239,9 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// It also records the generated unit and nonce before any launch effect.
 /// v26 binds every newly observed managed launch to one credential-safe,
 /// provider-native Harness process identity before singleton publication.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 26;
+/// v27 binds the independently resolved provider entry point in Prepared before
+/// any managed effect and requires the first live observation to match it.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 27;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3458,6 +3460,13 @@ impl CaptainsRegistry {
             .pointer("/cortana/managedLaunch/version")
             .and_then(Value::as_u64)
             == Some(2);
+        let has_cortana_expected_harness_launch = document
+            .pointer("/cortana/managedLaunch/expectedHarnessLaunchProvenance")
+            .is_some();
+        let has_v3_cortana_managed_launch = document
+            .pointer("/cortana/managedLaunch/version")
+            .and_then(Value::as_u64)
+            == Some(3);
         let has_cortana_legacy_quarantine = document.pointer("/cortana/legacyQuarantine").is_some()
             || document
                 .pointer("/cortana/recovery/kind")
@@ -3491,6 +3500,13 @@ impl CaptainsRegistry {
             });
         }
         if (has_cortana_harness_process || has_v2_cortana_managed_launch) && schema_version < 26 {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        if (has_cortana_expected_harness_launch || has_v3_cortana_managed_launch)
+            && schema_version < 27
+        {
             return Err(SnapshotReadError::IncompatibleRecovery {
                 path: path.to_path_buf(),
             });
@@ -5862,7 +5878,7 @@ impl CaptainsRegistry {
                 .expect("owner synthesized above");
             current.cortana.managed_launch =
                 Some(crate::cortana_reconcile::CortanaManagedLaunchIntent {
-                    version: 2,
+                    version: 3,
                     operation_id: operation_id.to_string(),
                     terminal_id: terminal_id.to_string(),
                     tmux_target: tmux_target(terminal_id),
@@ -5873,6 +5889,9 @@ impl CaptainsRegistry {
                     launch_nonce: owner.launch_nonce.clone(),
                     tools: owner.tools.clone(),
                     phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                    expected_harness_launch_provenance: Some(
+                        synthetic_cortana_expected_harness_launch(harness),
+                    ),
                     harness_process: Some(synthetic_cortana_harness_process(owner, harness)),
                 });
         }
@@ -5881,8 +5900,12 @@ impl CaptainsRegistry {
             .managed_launch
             .as_ref()
             .ok_or("cannot commit Cortana without an observed managed launch")?;
-        if launch.version != 2
+        if launch.version != 3
             || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            || launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .is_none_or(|expected| expected.provider != launch.harness)
             || launch.harness_process.is_none()
             || launch.operation_id != operation_id
             || launch.identity_id != identity_id
@@ -5981,6 +6004,60 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    fn record_cortana_expected_harness_launch_provenance(
+        &self,
+        operation_id: &str,
+        terminal_id: &str,
+        expected: crate::harness::ExpectedHarnessLaunchProvenance,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        if operation_id.trim().is_empty()
+            || terminal_id.trim().is_empty()
+            || !crate::harness::valid_expected_harness_launch_provenance(&expected)
+        {
+            return Err("cannot record invalid expected Cortana Harness launch provenance".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_ref()
+            .ok_or("expected Cortana Harness provenance has no durable managed launch")?;
+        if launch.operation_id != operation_id
+            || launch.terminal_id != terminal_id
+            || launch.harness != expected.provider
+        {
+            return Err("expected Cortana Harness provenance does not match its launch".into());
+        }
+        if launch.version == 3 {
+            return if launch.expected_harness_launch_provenance.as_ref() == Some(&expected) {
+                Ok(current.cortana.clone())
+            } else {
+                Err("different expected Cortana Harness provenance is already durable".into())
+            };
+        }
+        if !matches!(launch.version, 1 | 2) || launch.expected_harness_launch_provenance.is_some() {
+            return Err("expected Cortana Harness provenance cannot enrich this launch".into());
+        }
+        let previous = current.clone();
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_mut()
+            .expect("checked above");
+        launch.version = 3;
+        if launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            && launch.harness_process.is_none()
+        {
+            launch.phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved;
+        }
+        launch.expected_harness_launch_provenance = Some(expected);
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
     fn record_cortana_harness_process(
         &self,
         operation_id: &str,
@@ -6026,11 +6103,11 @@ impl CaptainsRegistry {
         {
             return Err("Cortana Harness process does not match its managed owner".into());
         }
-        if !matches!(launch.version, 1 | 2) {
+        if launch.version != 3 {
             return Err("Cortana Harness process has an unsupported launch version".into());
         }
-        if launch.version == 2
-            && launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        if launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            && launch.harness_process.is_some()
         {
             return if launch.harness_process.as_ref() == Some(&process) {
                 Ok(current.cortana.clone())
@@ -6038,11 +6115,11 @@ impl CaptainsRegistry {
                 Err("a different Cortana Harness process is already durable".into())
             };
         }
-        if launch.version == 2
-            && launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
-            || launch.version == 1
-                && launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
-        {
+        if !matches!(
+            launch.phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        ) {
             return Err("Cortana Harness process cannot attest this launch phase".into());
         }
         let previous = current.clone();
@@ -6051,7 +6128,6 @@ impl CaptainsRegistry {
             .managed_launch
             .as_mut()
             .expect("checked above");
-        launch.version = 2;
         launch.phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed;
         launch.harness_process = Some(process);
         current.seq = current.seq.saturating_add(1);
@@ -6068,10 +6144,11 @@ impl CaptainsRegistry {
         generation: u64,
         harness: &str,
         launch: &tmux::ManagedRuntimeLaunchSpec,
+        expected_harness_launch_provenance: crate::harness::ExpectedHarnessLaunchProvenance,
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         let tools = durable_cortana_tools(&launch.tools);
         let intent = crate::cortana_reconcile::CortanaManagedLaunchIntent {
-            version: 2,
+            version: 3,
             operation_id: operation_id.to_string(),
             terminal_id: terminal_id.to_string(),
             tmux_target: tmux_target(terminal_id),
@@ -6082,6 +6159,7 @@ impl CaptainsRegistry {
             launch_nonce: launch.launch_nonce.clone(),
             tools,
             phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
+            expected_harness_launch_provenance: Some(expected_harness_launch_provenance),
             harness_process: None,
         };
         if !valid_cortana_managed_launch(&intent) {
@@ -18697,23 +18775,46 @@ fn valid_cortana_managed_launch(
     };
     let phase_valid = match launch.version {
         1 => {
-            launch.harness_process.is_none()
+            launch.expected_harness_launch_provenance.is_none()
+                && launch.harness_process.is_none()
                 && matches!(
                     launch.phase,
                     crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
                         | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
                 )
         }
-        2 => match launch.phase {
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
-            | crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved => {
-                launch.harness_process.is_none()
-            }
-            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => launch
-                .harness_process
+        2 => {
+            launch.expected_harness_launch_provenance.is_none()
+                && match launch.phase {
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved => {
+                        launch.harness_process.is_none()
+                    }
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => launch
+                        .harness_process
+                        .as_ref()
+                        .is_some_and(crate::harness::valid_harness_process_identity),
+                }
+        }
+        3 => {
+            launch
+                .expected_harness_launch_provenance
                 .as_ref()
-                .is_some_and(crate::harness::valid_harness_process_identity),
-        },
+                .is_some_and(|expected| {
+                    expected.provider == launch.harness
+                        && crate::harness::valid_expected_harness_launch_provenance(expected)
+                })
+                && match launch.phase {
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved => {
+                        launch.harness_process.is_none()
+                    }
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => launch
+                        .harness_process
+                        .as_ref()
+                        .is_some_and(crate::harness::valid_harness_process_identity),
+                }
+        }
         _ => false,
     };
     phase_valid
@@ -18809,6 +18910,24 @@ fn synthetic_cortana_harness_process(
         }],
         cgroup_path: owner.cgroup_path.clone(),
         session_token_sha256: format!("sha256:{}", "b".repeat(64)),
+    }
+}
+
+#[cfg(test)]
+fn synthetic_cortana_expected_harness_launch(
+    harness: &str,
+) -> crate::harness::ExpectedHarnessLaunchProvenance {
+    crate::harness::ExpectedHarnessLaunchProvenance {
+        version: crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
+        provider: harness.into(),
+        kind: "direct".into(),
+        executable: crate::harness::HarnessExecutableIdentity {
+            path: "/bin/sleep".into(),
+            device: 1,
+            inode: 1,
+        },
+        entry_script: None,
+        argv_layout_sha256: None,
     }
 }
 
@@ -19233,9 +19352,14 @@ fn observe_cortana_harness_process(
         "claude" => Harness::Claude,
         _ => return Err("reconcile_cortana: managed launch Harness is unsupported".into()),
     };
+    let expected = launch
+        .expected_harness_launch_provenance
+        .as_ref()
+        .ok_or("reconcile_cortana: managed launch has no expected Harness provenance")?;
     crate::harness::observe_scoped_harness_process(
         &launch.tmux_target,
         harness,
+        expected,
         &launch.identity_id,
         &identity.secret,
         &owner.cgroup_path,
@@ -19244,6 +19368,39 @@ fn observe_cortana_harness_process(
     .map_err(|error| {
         format!("reconcile_cortana: managed Harness process attestation failed: {error}")
     })
+}
+
+fn cortana_startup_command(
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+    args: &Value,
+    harness: Harness,
+) -> String {
+    let anchor = durable
+        .provider_session_id
+        .as_deref()
+        .or(durable.conversation_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let command = anchor.map_or_else(
+        || {
+            harness.adapter().fresh_argv_with_permissions(
+                "You are Cortana, T-Hub's singleton supervisor. Restore the durable fleet checkpoint, delegate administrative execution, and preserve ship boundaries.",
+                PermMode::Default,
+            )
+        },
+        |provider_session_id| {
+            harness
+                .adapter()
+                .resume_argv_with_permissions(provider_session_id, PermMode::Default)
+        },
+    );
+    #[cfg(test)]
+    return arg_str(args, "testStartupCommand").unwrap_or(command);
+    #[cfg(not(test))]
+    {
+        let _ = args;
+        command
+    }
 }
 
 fn attest_cortana_managed_harness(
@@ -19310,6 +19467,25 @@ fn revalidate_cortana_managed_harness(
     } else {
         Err("reconcile_cortana: managed Harness process identity changed before commit".into())
     }
+}
+
+fn revalidate_cortana_managed_authority(
+    ctx: &ControlContext,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<(), String> {
+    let launch = durable
+        .managed_launch
+        .as_ref()
+        .ok_or("reconcile_cortana: final authority validation lost its managed launch")?;
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("reconcile_cortana: final authority validation lost its managed owner")?;
+    tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
+        .map_err(|error| {
+            format!("reconcile_cortana: managed owner changed before commit: {error}")
+        })?;
+    revalidate_cortana_managed_harness(ctx, durable)
 }
 
 fn finalize_observed_cortana_launch(
@@ -19380,7 +19556,17 @@ fn finalize_observed_cortana_launch(
     if claims.is_empty() {
         claim_cortana_runtime(ctx, candidate)?;
     }
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("cortana_after_claim");
+    revalidate_cortana_managed_authority(ctx, durable).map_err(|error| {
+        format!(
+            "{error}; observed WAL and Fleet claim retained after post-claim validation failure"
+        )
+    })?;
     let provider_session_id = candidate.provider_session_id.clone();
+    revalidate_cortana_managed_authority(ctx, durable).map_err(|error| {
+        format!("{error}; observed WAL and Fleet claim retained before Healthy commit")
+    })?;
     let committed = ctx.captains.commit_cortana_runtime(
         operation_id,
         &launch.identity_id,
@@ -19705,6 +19891,39 @@ fn reconcile_cortana_inner(
     }
     std::fs::create_dir_all(files::to_host_path(&home))
         .map_err(|error| format!("reconcile_cortana: could not create '{home}': {error}"))?;
+    if let Some(launch) = durable
+        .managed_launch
+        .as_ref()
+        .filter(|launch| launch.expected_harness_launch_provenance.is_none())
+        .cloned()
+    {
+        let harness = match launch.harness.as_str() {
+            "codex" => Harness::Codex,
+            "claude" => Harness::Claude,
+            _ => {
+                return Err(
+                    "reconcile_cortana: legacy managed launch declares an unsupported Harness"
+                        .into(),
+                )
+            }
+        };
+        let command = cortana_startup_command(&durable, args, harness);
+        let expected = crate::harness::resolve_expected_harness_launch_provenance(
+            &command, harness,
+        )
+        .map_err(|error| {
+            format!(
+                "reconcile_cortana: configured Harness provenance cannot enrich the retained managed launch: {error}"
+            )
+        })?;
+        durable = ctx
+            .captains
+            .record_cortana_expected_harness_launch_provenance(
+                operation_id,
+                &launch.terminal_id,
+                expected,
+            )?;
+    }
     if let Some(launch) = durable.managed_launch.clone() {
         if launch.operation_id != operation_id {
             return Err(
@@ -20201,28 +20420,19 @@ fn reconcile_cortana_inner(
         return Err("reconcile_cortana: changing the durable harness requires an explicit administrative update".into());
     }
     let harness = Harness::from_provider(&harness_name);
-    let anchor = durable
-        .provider_session_id
-        .as_deref()
-        .or(durable.conversation_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let startup_command = anchor.map_or_else(
-        || {
-            harness.adapter().fresh_argv_with_permissions(
-                "You are Cortana, T-Hub's singleton supervisor. Restore the durable fleet checkpoint, delegate administrative execution, and preserve ship boundaries.",
-                PermMode::Default,
-            )
-        },
-        |provider_session_id| {
-            harness
-                .adapter()
-                .resume_argv_with_permissions(provider_session_id, PermMode::Default)
-        },
-    );
+    let startup_command = cortana_startup_command(&durable, args, harness);
+    let expected_harness_launch_provenance =
+        crate::harness::resolve_expected_harness_launch_provenance(&startup_command, harness)
+            .map_err(|error| {
+                format!(
+                    "reconcile_cortana: configured Harness launch provenance is untrusted: {error}"
+                )
+            })?;
     #[cfg(test)]
-    let startup_command =
-        arg_str(args, "testStartupCommand").unwrap_or_else(|| startup_command.clone());
+    let effect_startup_command =
+        arg_str(args, "testEffectStartupCommand").unwrap_or_else(|| startup_command.clone());
+    #[cfg(not(test))]
+    let effect_startup_command = startup_command.clone();
 
     let (identity, newly_minted) = if let Some((_, _, _, _, _, replacement_identity_id)) =
         &replacement
@@ -20312,7 +20522,7 @@ fn reconcile_cortana_inner(
     let spawn_args = json!({
         "cwd": home,
         "name": "Cortana",
-        "startupCommand": startup_command,
+        "startupCommand": effect_startup_command,
         "tabId": CAPTAIN_WORKSPACE_ID,
     });
     let mut elevation = elevation_env(ctx, &spawn_args);
@@ -20329,7 +20539,7 @@ fn reconcile_cortana_inner(
         PROVIDER_SESSION_ENV.to_string(),
         pending_provider_marker(&harness_name),
     ));
-    let pane = crate::commands::pane_command(None, Some(&startup_command));
+    let pane = crate::commands::pane_command(None, Some(&effect_startup_command));
     let tmux_cwd = files::posix_form(&home);
     let launch = tmux::prepare_managed_runtime_launch().map_err(|error| {
         format!("reconcile_cortana: managed launch preparation failed: {error}")
@@ -20341,6 +20551,7 @@ fn reconcile_cortana_inner(
         plan.next_generation,
         harness.as_provider(),
         &launch,
+        expected_harness_launch_provenance,
     )?;
     let prepared_launch = ctx
         .captains
@@ -20520,6 +20731,16 @@ fn reconcile_cortana_inner(
             "reconcile_cortana: replacement Fleet claim failed and the runtime was retired: {error}"
         ));
     }
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("cortana_after_claim");
+    revalidate_cortana_managed_authority(ctx, &attested).map_err(|error| {
+        format!(
+            "{error}; observed WAL and Fleet claim retained after post-claim validation failure"
+        )
+    })?;
+    revalidate_cortana_managed_authority(ctx, &attested).map_err(|error| {
+        format!("{error}; observed WAL and Fleet claim retained before Healthy commit")
+    })?;
     let durable = ctx.captains.commit_cortana_runtime(
         operation_id,
         &identity.id,
@@ -20536,7 +20757,7 @@ fn reconcile_cortana_inner(
             "tmuxSession": tmux_session,
             "cwd": home,
             "name": "Cortana",
-            "startupCommand": startup_command,
+            "startupCommand": effect_startup_command,
             "tabId": CAPTAIN_WORKSPACE_ID,
             "placed": true,
             "audited": true,
@@ -31573,6 +31794,11 @@ int main(int argc, char **argv) {
     if (tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) return 9;
     const char *mode = argv[1];
     const char *marker = argv[2];
+    if (strcmp(mode, "foreign-first") == 0) {
+        if (argc < 4) return 15;
+        execl(argv[3], "codex", "changed", (char *)0);
+        return 16;
+    }
     wait_marker(marker);
     if (strcmp(mode, "exit") == 0) {
         tcsetpgrp(STDIN_FILENO, getpgid(getppid()));
@@ -38358,13 +38584,13 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn managed_launch_recovery_requires_schema_v25_v26_and_exact_shape() {
+    fn managed_launch_recovery_requires_schema_v25_v26_v27_and_exact_shape() {
         let path = captains_tmp("managed-launch-schema");
         let launch = json!({
             "version": 1,
             "operationId": "launch-operation",
             "terminalId": "a1b2c3d4",
-            "tmuxTarget": "=th_a1b2c3d4:",
+            "tmuxTarget": "th_a1b2c3d4",
             "identityId": "cortana-identity",
             "generation": 1,
             "harness": "codex",
@@ -38421,6 +38647,52 @@ int main(int argc, char **argv) {
             CaptainsRegistry::read_snapshot(&path),
             Err(SnapshotReadError::IncompatibleRecovery { .. })
         ));
+
+        let mut v3 = launch.clone();
+        v3["version"] = json!(3);
+        v3["expectedHarnessLaunchProvenance"] = json!({
+            "version": 1,
+            "provider": "codex",
+            "kind": "direct",
+            "executable": {
+                "path": "/usr/local/bin/codex",
+                "device": 1,
+                "inode": 4
+            }
+        });
+        std::fs::write(&path, document(26, v3.clone()).to_string()).unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+        let current_document = document(CAPTAINS_SCHEMA_VERSION, v3);
+        let current_snapshot: CaptainsSnapshot =
+            serde_json::from_value(current_document.clone()).unwrap();
+        let decoded_launch = current_snapshot.cortana.managed_launch.as_ref().unwrap();
+        assert!(crate::harness::valid_expected_harness_launch_provenance(
+            decoded_launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .unwrap()
+        ));
+        assert_eq!(
+            exact_cortana_tmux_target(&decoded_launch.terminal_id).unwrap(),
+            decoded_launch.tmux_target
+        );
+        assert!(valid_cortana_python_tool(&decoded_launch.tools.python));
+        assert!(
+            valid_cortana_managed_launch(decoded_launch),
+            "{decoded_launch:?}"
+        );
+        let mut valid_current_snapshot = powder_lifecycle_registry(None).snapshot();
+        valid_current_snapshot.cortana = current_snapshot.cortana;
+        std::fs::write(
+            &path,
+            serde_json::to_string(&valid_current_snapshot).unwrap(),
+        )
+        .unwrap();
+        let current = CaptainsRegistry::read_snapshot(&path);
+        assert!(current.is_ok(), "{current:?}");
 
         let mut mismatched = document(CAPTAINS_SCHEMA_VERSION, launch);
         mismatched["cortana"]["recovery"]["operation_id"] = json!("other-operation");
@@ -45985,6 +46257,7 @@ int main(int argc, char **argv) {
                 1,
                 "codex",
                 &launch,
+                synthetic_cortana_expected_harness_launch("codex"),
             )
             .is_err());
         assert!(registry.cortana_identity().managed_launch.is_none());
@@ -45997,6 +46270,7 @@ int main(int argc, char **argv) {
                 1,
                 "codex",
                 &launch,
+                synthetic_cortana_expected_harness_launch("codex"),
             )
             .unwrap();
         assert!(prepared.owner.is_none());
@@ -46049,6 +46323,11 @@ int main(int argc, char **argv) {
         std::fs::create_dir_all(&fake_dir).unwrap();
         let fake = fake_dir.join("codex");
         std::fs::copy(&executable, &fake).unwrap();
+        let expected = crate::harness::resolve_expected_harness_launch_provenance(
+            &format!("{} hold", executable.display()),
+            Harness::Codex,
+        )
+        .unwrap();
 
         let start = |mode: &str, with_process_token: bool| {
             let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
@@ -46080,6 +46359,7 @@ int main(int argc, char **argv) {
             crate::harness::observe_scoped_harness_process(
                 target,
                 Harness::Codex,
+                &expected,
                 &identity_id,
                 &token,
                 &owner.cgroup_path,
@@ -46115,6 +46395,24 @@ int main(int argc, char **argv) {
                 }
             };
 
+        let (target, _, owner) = start("foreign-first", true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match observe(&target, &owner) {
+                Err(crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => break,
+                Err(_) => {}
+                Ok(observed) => panic!(
+                    "foreign same-name provider was trusted on first observation: {observed:?}"
+                ),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreign first provider never reached a stable rejected state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+
         for mode in ["exec-executable", "exec-argv"] {
             let (target, marker, owner) = start(mode, true);
             let baseline = wait_observed(&target, &owner);
@@ -46123,12 +46421,15 @@ int main(int argc, char **argv) {
             assert!(baseline.argv_sha256.starts_with("sha256:"));
             assert!(baseline.session_token_sha256.starts_with("sha256:"));
             std::fs::write(&marker, b"go").unwrap();
-            let changed = wait_changed(&target, &owner, &baseline).unwrap();
-            assert_eq!(changed.pid, baseline.pid);
-            assert_eq!(changed.start_ticks, baseline.start_ticks);
             if mode == "exec-executable" {
-                assert_ne!(changed.executable, baseline.executable);
+                assert_eq!(
+                    wait_changed(&target, &owner, &baseline).unwrap_err(),
+                    crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch
+                );
             } else {
+                let changed = wait_changed(&target, &owner, &baseline).unwrap();
+                assert_eq!(changed.pid, baseline.pid);
+                assert_eq!(changed.start_ticks, baseline.start_ticks);
                 assert_eq!(changed.executable, baseline.executable);
                 assert_ne!(changed.argv_sha256, baseline.argv_sha256);
             }
@@ -46138,14 +46439,10 @@ int main(int argc, char **argv) {
         let (target, marker, owner) = start("foreign", true);
         let baseline = wait_observed(&target, &owner);
         std::fs::write(&marker, b"go").unwrap();
-        let replacement = wait_changed(&target, &owner, &baseline).unwrap();
-        assert_ne!(replacement.pid, baseline.pid);
         assert_eq!(
-            replacement.ancestry.get(1).map(|item| item.pid),
-            Some(baseline.pid)
+            wait_changed(&target, &owner, &baseline).unwrap_err(),
+            crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch
         );
-        assert_ne!(replacement.executable.path, baseline.executable.path);
-        assert_ne!(replacement.executable.inode, baseline.executable.inode);
         tmux::retire_managed_runtime(&target, &owner).unwrap();
 
         let (target, marker, owner) = start("tool", true);
@@ -46191,7 +46488,244 @@ int main(int argc, char **argv) {
         std::fs::write(marker, b"go").unwrap();
         tmux::retire_managed_runtime(&target, &owner).unwrap();
 
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script_dir = fixture_dir.join("node-provider");
+            std::fs::create_dir_all(&script_dir).unwrap();
+            let script = script_dir.join("codex");
+            std::fs::write(
+                &script,
+                "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            let script_command = script.display().to_string();
+            let script_expected = crate::harness::resolve_expected_harness_launch_provenance(
+                &script_command,
+                Harness::Codex,
+            )
+            .unwrap();
+            let pane = crate::commands::pane_command(None, Some(&script_command));
+            let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let target = tmux_target(&terminal_id);
+            let launch = tmux::prepare_managed_runtime_launch().unwrap();
+            let owner = tmux::new_prepared_managed_session_with_env(
+                &target,
+                fixture_dir.to_str().unwrap(),
+                pane.as_deref(),
+                &[(crate::identity::SESSION_TOKEN_ENV.into(), token.clone())],
+                &launch,
+            )
+            .unwrap();
+            let observe_script = || {
+                crate::harness::observe_scoped_harness_process(
+                    &target,
+                    Harness::Codex,
+                    &script_expected,
+                    &identity_id,
+                    &token,
+                    &owner.cgroup_path,
+                    owner.tmux.pane_start_ticks,
+                )
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let observed = loop {
+                match observe_script() {
+                    Ok(observed) => break observed,
+                    Err(error) => assert!(
+                        Instant::now() < deadline,
+                        "Node provider was not observed: {error:?}"
+                    ),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(observed.executable, script_expected.executable);
+            let replacement = script_dir.join("replacement");
+            std::fs::write(
+                &replacement,
+                "#!/usr/bin/env node\nsetInterval(() => {}, 2000);\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&replacement).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&replacement, permissions).unwrap();
+            std::fs::rename(&replacement, &script).unwrap();
+            assert_eq!(
+                observe_script().unwrap_err(),
+                crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch
+            );
+            tmux::retire_managed_runtime(&target, &owner).unwrap();
+        }
+
         std::fs::remove_dir_all(fixture_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_launch_rejects_foreign_same_name_provider_on_first_observation() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-first-provider-provenance").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4257".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-first-provider-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (expected_dir, expected_command) = test_harness_command("codex");
+        let (foreign_dir, foreign_command) = test_harness_command("codex");
+
+        let error = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-first-provider-operation",
+                "testOrchestratorHome": home,
+                "testStartupCommand": expected_command,
+                "testEffectStartupCommand": foreign_command,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("prepared launch provenance"), "{error}");
+        assert!(!matches!(
+            ctx.captains.cortana_identity().recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+
+        std::fs::remove_dir_all(expected_dir).unwrap();
+        std::fs::remove_dir_all(foreign_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_claim_process_change_retains_wal_and_claim_without_publishing_healthy() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut context = test_ctx("cortana-post-claim-revalidation").with_apply_sink(sink);
+        context.addr = "127.0.0.1:4258".into();
+        let ctx = Arc::new(context);
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-post-claim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_dir, command) = test_harness_command("codex");
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "cortana_after_claim",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let worker_ctx = Arc::clone(&ctx);
+        let worker_home = home.clone();
+        let worker_command = command.clone();
+        let worker = std::thread::spawn(move || {
+            dispatch(
+                &worker_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": "cortana-post-claim-operation",
+                    "testOrchestratorHome": worker_home,
+                    "testStartupCommand": worker_command,
+                }),
+            )
+        });
+        let reached = reached_rx.recv_timeout(TEST_ASYNC_FIXTURE_TIMEOUT);
+        if reached.is_err() && worker.is_finished() {
+            panic!(
+                "Cortana exited before its post-claim boundary: {:?}",
+                worker.join().unwrap()
+            );
+        }
+        assert_eq!(
+            reached.expect("Cortana did not reach its post-claim boundary"),
+            "cortana_after_claim"
+        );
+        let claimed = ctx.captains.cortana_identity();
+        assert!(claimed.managed_launch.is_some());
+        assert!(ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        let harness_pid = claimed
+            .managed_launch
+            .as_ref()
+            .and_then(|launch| launch.harness_process.as_ref())
+            .map(|process| process.pid)
+            .unwrap();
+        let kill = std::process::Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(harness_pid.to_string())
+            .output()
+            .unwrap();
+        assert!(kill.status.success(), "{kill:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{harness_pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "provider process did not exit after claim"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        resume_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("WAL and Fleet claim retained"), "{error}");
+        let retained = ctx.captains.cortana_identity();
+        assert!(retained.managed_launch.is_some());
+        assert!(!matches!(
+            retained.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert!(ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        let launch = retained.managed_launch.as_ref().unwrap();
+        let owner = retained.owner.as_ref().unwrap();
+        tmux::retire_managed_runtime(&launch.tmux_target, &tmux_cortana_owner(owner)).unwrap();
+        std::fs::remove_dir_all(harness_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -46416,6 +46950,7 @@ int main(int argc, char **argv) {
             launch_nonce: launch.launch_nonce.clone(),
             tools: durable_cortana_tools(&launch.tools),
             phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+            expected_harness_launch_provenance: None,
             harness_process: None,
         };
         let mut snapshot = fixture["captainsSnapshot"].clone();
@@ -46464,17 +46999,90 @@ int main(int argc, char **argv) {
             tile_ids: vec![],
         }]);
         let ctx = Arc::new(ctx);
+        let changed_registry_path = captains_tmp("captured-observed-changed-provider");
+        std::fs::copy(&registry_path, &changed_registry_path).unwrap();
+        let changed_captains = Arc::new(CaptainsRegistry::load(changed_registry_path.clone()));
+        let changed_sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut changed_ctx = test_ctx("captured-observed-changed-provider")
+            .with_captains_registry(changed_captains.clone())
+            .with_identity_store(identities.clone())
+            .with_apply_sink(changed_sink);
+        changed_ctx.addr = spawn_ctx.addr.clone();
+        changed_ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let (changed_harness_dir, changed_harness_command) = test_harness_command("codex");
+        let changed_error = dispatch(
+            &changed_ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "rotated-request-must-not-replace-captured-operation",
+                "testOrchestratorHome": home,
+                "testStartupCommand": changed_harness_command,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            changed_error.contains("prepared launch provenance"),
+            "{changed_error}"
+        );
+        let changed_durable = changed_captains.cortana_identity();
+        assert!(changed_durable.managed_launch.is_some());
+        assert!(!matches!(
+            changed_durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert!(!changed_captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        std::fs::remove_dir_all(changed_harness_dir).unwrap();
+        std::fs::remove_file(changed_registry_path).unwrap();
         let captured = captains.cortana_identity();
         assert_eq!(captured.managed_launch.as_ref().unwrap().version, 1);
         assert!(captured
             .managed_launch
             .as_ref()
             .unwrap()
+            .expected_harness_launch_provenance
+            .is_none());
+        assert!(captured
+            .managed_launch
+            .as_ref()
+            .unwrap()
             .harness_process
             .is_none());
-        let enriched = attest_cortana_managed_harness(&ctx, &captured).unwrap();
+        let expected = crate::harness::resolve_expected_harness_launch_provenance(
+            &harness_command,
+            Harness::Codex,
+        )
+        .unwrap();
+        let provenance_enriched = captains
+            .record_cortana_expected_harness_launch_provenance(
+                &operation_id,
+                &replacement_terminal,
+                expected.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance_enriched
+                .managed_launch
+                .as_ref()
+                .and_then(|launch| launch.expected_harness_launch_provenance.as_ref()),
+            Some(&expected)
+        );
+        assert_eq!(
+            CaptainsRegistry::load(registry_path.clone()).cortana_identity(),
+            provenance_enriched
+        );
+        let enriched = attest_cortana_managed_harness(&ctx, &provenance_enriched).unwrap();
         let enriched_launch = enriched.managed_launch.as_ref().unwrap();
-        assert_eq!(enriched_launch.version, 2);
+        assert_eq!(enriched_launch.version, 3);
         assert_eq!(
             enriched_launch.phase,
             crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
@@ -46601,6 +47209,7 @@ int main(int argc, char **argv) {
                 1,
                 "codex",
                 &launch,
+                synthetic_cortana_expected_harness_launch("codex"),
             )
             .unwrap();
         let target = tmux_target("wal00002");
@@ -46672,6 +47281,7 @@ int main(int argc, char **argv) {
                 1,
                 "codex",
                 &launch,
+                synthetic_cortana_expected_harness_launch("codex"),
             )
             .unwrap();
         let durable_launch = prepared.managed_launch.unwrap();
@@ -46750,6 +47360,12 @@ int main(int argc, char **argv) {
             let identity = identities.mint(crate::identity::Role::Cortana).unwrap();
             identities.bind_tile(&identity.id, &terminal_id).unwrap();
             captains.begin_cortana_recovery(&old_operation).unwrap();
+            let (harness_bin_dir, harness_command) = test_harness_command("codex");
+            let expected = crate::harness::resolve_expected_harness_launch_provenance(
+                &harness_command,
+                Harness::Codex,
+            )
+            .unwrap();
             let launch = tmux::prepare_managed_runtime_launch().unwrap();
             captains
                 .prepare_cortana_managed_launch(
@@ -46759,6 +47375,7 @@ int main(int argc, char **argv) {
                     1,
                     "codex",
                     &launch,
+                    expected,
                 )
                 .unwrap();
 
@@ -46768,7 +47385,6 @@ int main(int argc, char **argv) {
                 uuid::Uuid::new_v4().simple()
             ));
             std::fs::create_dir_all(&home).unwrap();
-            let (harness_bin_dir, harness_command) = test_harness_command("codex");
             let spawn_args = json!({
                 "cwd": home,
                 "name": "Cortana",

@@ -120,6 +120,8 @@ pub struct CortanaManagedLaunchIntent {
     pub tools: CortanaManagedSystemTools,
     pub phase: CortanaManagedLaunchPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_harness_launch_provenance: Option<crate::harness::ExpectedHarnessLaunchProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_process: Option<crate::harness::HarnessProcessIdentity>,
 }
 

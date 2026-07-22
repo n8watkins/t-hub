@@ -169,6 +169,24 @@ pub struct HarnessExecutableIdentity {
     pub inode: u64,
 }
 
+pub const EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION: u32 = 1;
+
+/// Sanitized identity of the configured provider entry point resolved before
+/// any managed launch effect. Script launches bind both the runtime and the
+/// exact entry script while retaining only a value-free argv layout digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectedHarnessLaunchProvenance {
+    pub version: u32,
+    pub provider: String,
+    pub kind: String,
+    pub executable: HarnessExecutableIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_script: Option<HarnessExecutableIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv_layout_sha256: Option<String>,
+}
+
 /// Credential-safe, durable identity for the exact provider process accepted
 /// inside one managed terminal generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +323,8 @@ pub enum LaunchAttestationError {
     ProcessChanged,
     AncestryChanged,
     HarnessMissing,
+    ExpectedProvenanceMismatch,
+    UntrustedLaunchCommand,
     CgroupChanged,
     SessionTokenMissing,
 }
@@ -330,6 +350,12 @@ impl std::fmt::Display for LaunchAttestationError {
                 "the provider-native process ancestry changed during launch acceptance"
             }
             Self::HarnessMissing => "the provider-native Harness process is not an ancestor",
+            Self::ExpectedProvenanceMismatch => {
+                "the provider-native process does not match its prepared launch provenance"
+            }
+            Self::UntrustedLaunchCommand => {
+                "the configured provider launch command has an untrusted shape"
+            }
             Self::CgroupChanged => "the provider-native process left its managed cgroup",
             Self::SessionTokenMissing => {
                 "the provider-native process lacks its scoped session identity"
@@ -806,11 +832,257 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+struct ResolvedLaunchExecutable {
+    identity: HarnessExecutableIdentity,
+    shebang: Option<String>,
+}
+
+fn resolve_launch_executable(
+    candidate: &str,
+) -> Result<ResolvedLaunchExecutable, LaunchAttestationError> {
+    const SCRIPT: &str = r#"
+set -eu
+candidate=$1
+[ -n "$candidate" ]
+[ "${#candidate}" -le 4096 ]
+login_shell=${SHELL:-/bin/sh}
+case "$login_shell" in /*) ;; *) exit 50;; esac
+resolved=$("$login_shell" -ilc 'command -v -- "$1"' t-hub-provider-resolution "$candidate")
+case "$resolved" in /*) ;; *) exit 51;; esac
+canonical=$(readlink -f "$resolved")
+case "$canonical" in /*) ;; *) exit 52;; esac
+[ -f "$canonical" ]
+[ -x "$canonical" ]
+[ "$(printf '%s\n' "$canonical" | wc -l | tr -d ' ')" -eq 1 ]
+set -- $(stat -Lc '%d %i' "$canonical")
+[ "$#" -eq 2 ]
+case "$1:$2" in *[!0-9:]*) exit 53;; esac
+device=$1
+inode=$2
+shebang=
+if LC_ALL=C head -c 2 "$canonical" | grep -q '^#!'; then
+    shebang=$(LC_ALL=C head -n 1 "$canonical")
+    shebang=${shebang#\#!}
+    [ "${#shebang}" -le 1024 ]
+    [ "$(printf '%s\n' "$shebang" | wc -l | tr -d ' ')" -eq 1 ]
+fi
+printf 'THLE1\n%s\n%s\n%s\n%s\n' "$canonical" "$device" "$inode" "$shebang"
+"#;
+    if candidate.is_empty() || candidate.len() > 4096 || candidate.contains(['\0', '\n', '\r']) {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("wsl.exe");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-provider-provenance")
+            .arg(candidate);
+        command.creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(unix)]
+    let command = {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-provider-provenance")
+            .arg(candidate);
+        command
+    };
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    if !output.status.success() || !output.stderr.is_empty() || output.stdout.len() > 6144 {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    let mut fields = output.stdout.splitn(6, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THLE1".as_slice()) {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    let text = |field: Option<&[u8]>| {
+        std::str::from_utf8(field.ok_or(LaunchAttestationError::UntrustedLaunchCommand)?)
+            .map(str::to_string)
+            .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)
+    };
+    let path = text(fields.next())?;
+    let device = parse_ascii_number(fields.next())
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let inode = parse_ascii_number(fields.next())
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let shebang = text(fields.next())?;
+    if fields.next() != Some(b"".as_slice())
+        || !path.starts_with('/')
+        || path.contains(['\0', '\n', '\r'])
+        || device == 0
+        || inode == 0
+    {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    Ok(ResolvedLaunchExecutable {
+        identity: HarnessExecutableIdentity {
+            path,
+            device,
+            inode,
+        },
+        shebang: (!shebang.is_empty()).then_some(shebang),
+    })
+}
+
+fn argv_layout_sha256(arguments: &[String]) -> String {
+    let fields = arguments.iter().map(|argument| {
+        if let Some(flag) = argument.strip_prefix('-') {
+            let flag = flag.split_once('=').map_or(flag, |(name, _)| name);
+            format!("flag:{flag}")
+        } else {
+            "value".to_string()
+        }
+    });
+    framed_sha256(b"t-hub:harness-argv-layout:v1\0", fields)
+}
+
+pub fn resolve_expected_harness_launch_provenance(
+    command: &str,
+    expected_provider: Harness,
+) -> Result<ExpectedHarnessLaunchProvenance, LaunchAttestationError> {
+    if command.is_empty() || command.len() > 65_536 || command.contains('\0') {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    let mut argv =
+        shell_words::split(command).map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    if argv.first().is_some_and(|argument| argument == "exec") {
+        argv.remove(0);
+    }
+    let executable_argument = argv
+        .first()
+        .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+    if provider_executable(executable_name(executable_argument)) != Some(expected_provider)
+        || argv
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "&&" | "||" | ";" | "|" | "&"))
+    {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    let entry = resolve_launch_executable(executable_argument)?;
+    let Some(shebang) = entry.shebang.as_deref() else {
+        return Ok(ExpectedHarnessLaunchProvenance {
+            version: EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
+            provider: expected_provider.as_provider().into(),
+            kind: "direct".into(),
+            executable: entry.identity,
+            entry_script: None,
+            argv_layout_sha256: None,
+        });
+    };
+    let shebang_argv =
+        shell_words::split(shebang).map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let runtime_argument = match shebang_argv.as_slice() {
+        [environment, runtime]
+            if executable_name(environment) == "env"
+                && matches!(
+                    executable_name(runtime).to_ascii_lowercase().as_str(),
+                    "node" | "nodejs" | "bun" | "deno"
+                ) =>
+        {
+            runtime
+        }
+        [runtime]
+            if matches!(
+                executable_name(runtime).to_ascii_lowercase().as_str(),
+                "node" | "nodejs" | "bun" | "deno"
+            ) =>
+        {
+            runtime
+        }
+        _ => return Err(LaunchAttestationError::UntrustedLaunchCommand),
+    };
+    let runtime = resolve_launch_executable(runtime_argument)?;
+    if runtime.shebang.is_some() {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    Ok(ExpectedHarnessLaunchProvenance {
+        version: EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
+        provider: expected_provider.as_provider().into(),
+        kind: "script".into(),
+        executable: runtime.identity,
+        entry_script: Some(entry.identity),
+        argv_layout_sha256: Some(argv_layout_sha256(&argv[1..])),
+    })
+}
+
+pub fn valid_expected_harness_launch_provenance(
+    expected: &ExpectedHarnessLaunchProvenance,
+) -> bool {
+    let valid_executable = |executable: &HarnessExecutableIdentity| {
+        executable.path.starts_with('/')
+            && executable.path.len() <= 4096
+            && !executable.path.contains(['\0', '\n', '\r'])
+            && executable.device > 0
+            && executable.inode > 0
+    };
+    let valid_digest = |value: &str| {
+        value.len() == 71
+            && value.starts_with("sha256:")
+            && value[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+        && matches!(expected.provider.as_str(), "codex" | "claude")
+        && valid_executable(&expected.executable)
+        && match expected.kind.as_str() {
+            "direct" => expected.entry_script.is_none() && expected.argv_layout_sha256.is_none(),
+            "script" => {
+                expected.entry_script.as_ref().is_some_and(valid_executable)
+                    && expected
+                        .argv_layout_sha256
+                        .as_deref()
+                        .is_some_and(valid_digest)
+            }
+            _ => false,
+        }
+}
+
+fn scoped_process_matches_expected_launch(
+    process: &ScopedProcessDetails,
+    expected: &ExpectedHarnessLaunchProvenance,
+) -> Result<bool, LaunchAttestationError> {
+    if process.executable_path != expected.executable.path
+        || process.executable_device != expected.executable.device
+        || process.executable_inode != expected.executable.inode
+    {
+        return Ok(false);
+    }
+    match expected.kind.as_str() {
+        "direct" => Ok(expected.entry_script.is_none() && expected.argv_layout_sha256.is_none()),
+        "script" => {
+            let observed_entry = process
+                .argv
+                .get(1)
+                .ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)
+                .and_then(|entry| resolve_launch_executable(entry))?;
+            let observed_layout = argv_layout_sha256(&process.argv[2..]);
+            Ok(
+                expected.entry_script.as_ref() == Some(&observed_entry.identity)
+                    && expected.argv_layout_sha256.as_deref() == Some(observed_layout.as_str()),
+            )
+        }
+        _ => Err(LaunchAttestationError::ExpectedProvenanceMismatch),
+    }
+}
+
 /// Observe the exact provider process in the foreground ancestry and return
 /// only bounded, credential-safe evidence suitable for durable recovery.
 pub fn observe_scoped_harness_process(
     tmux_target: &str,
     expected_provider: Harness,
+    expected_launch: &ExpectedHarnessLaunchProvenance,
     identity_id: &str,
     expected_session_token: &str,
     expected_cgroup_path: &str,
@@ -820,6 +1092,8 @@ pub fn observe_scoped_harness_process(
         || expected_session_token.is_empty()
         || !expected_cgroup_path.starts_with('/')
         || pane_start_ticks == 0
+        || !valid_expected_harness_launch_provenance(expected_launch)
+        || expected_launch.provider != expected_provider.as_provider()
     {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
@@ -840,13 +1114,22 @@ pub fn observe_scoped_harness_process(
             return Err(LaunchAttestationError::CgroupChanged);
         }
     }
-    let harness_index = details
-        .iter()
-        .position(|process| {
+    let mut harness_index = None;
+    for (index, process) in details.iter().enumerate() {
+        if scoped_process_matches_expected_launch(process, expected_launch)? {
+            harness_index = Some(index);
+            break;
+        }
+    }
+    let harness_index = harness_index.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?;
+    if expected_launch.kind == "direct"
+        && details[..harness_index].iter().any(|process| {
             process_provider(&process.argv)
                 .is_some_and(|(provider, _)| provider == expected_provider)
         })
-        .ok_or(LaunchAttestationError::HarnessMissing)?;
+    {
+        return Err(LaunchAttestationError::ExpectedProvenanceMismatch);
+    }
     let process = &details[harness_index];
     let token = process
         .session_token
@@ -1249,6 +1532,163 @@ pub(crate) fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_launch_provenance_binds_direct_symlink_runtime_entry_and_layout() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-launch-provenance-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let direct_dir = root.join("direct");
+        let link_dir = root.join("link");
+        let script_dir = root.join("script");
+        let runtime_dir = root.join("runtime");
+        for directory in [&direct_dir, &link_dir, &script_dir, &runtime_dir] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        let direct = direct_dir.join("codex");
+        std::fs::copy("/bin/sleep", &direct).unwrap();
+        let direct_expected = resolve_expected_harness_launch_provenance(
+            &format!("{} 60", direct.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(direct_expected.kind, "direct");
+        assert!(direct_expected.entry_script.is_none());
+
+        let linked = link_dir.join("codex");
+        symlink(&direct, &linked).unwrap();
+        let symlink_expected = resolve_expected_harness_launch_provenance(
+            &format!("{} 60", linked.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(symlink_expected, direct_expected);
+
+        let replacement = direct_dir.join("replacement");
+        std::fs::copy("/bin/true", &replacement).unwrap();
+        std::fs::rename(&replacement, &direct).unwrap();
+        let replaced_direct = resolve_expected_harness_launch_provenance(
+            &format!("{} 60", direct.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            replaced_direct.executable.path,
+            direct_expected.executable.path
+        );
+        assert_ne!(
+            replaced_direct.executable.inode,
+            direct_expected.executable.inode
+        );
+
+        let runtime = runtime_dir.join("node");
+        std::fs::copy("/bin/sleep", &runtime).unwrap();
+        let script = script_dir.join("codex");
+        std::fs::write(&script, format!("#!{}\nprovider body\n", runtime.display())).unwrap();
+        make_executable(&script);
+        let script_expected = resolve_expected_harness_launch_provenance(
+            &format!("{} --mode alpha prompt", script.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        let same_layout = resolve_expected_harness_launch_provenance(
+            &format!("{} --mode beta secret", script.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(script_expected.kind, "script");
+        assert_eq!(
+            script_expected.argv_layout_sha256,
+            same_layout.argv_layout_sha256
+        );
+        assert_ne!(
+            script_expected.argv_layout_sha256,
+            resolve_expected_harness_launch_provenance(
+                &format!("{} --other beta secret", script.display()),
+                Harness::Codex,
+            )
+            .unwrap()
+            .argv_layout_sha256
+        );
+
+        let script_replacement = script_dir.join("replacement");
+        std::fs::write(
+            &script_replacement,
+            format!("#!{}\nreplacement body\n", runtime.display()),
+        )
+        .unwrap();
+        make_executable(&script_replacement);
+        std::fs::rename(&script_replacement, &script).unwrap();
+        let replaced_script = resolve_expected_harness_launch_provenance(
+            &format!("{} --mode alpha prompt", script.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            replaced_script.entry_script.as_ref().unwrap().path,
+            script_expected.entry_script.as_ref().unwrap().path
+        );
+        assert_ne!(
+            replaced_script.entry_script.as_ref().unwrap().inode,
+            script_expected.entry_script.as_ref().unwrap().inode
+        );
+
+        let runtime_replacement = runtime_dir.join("replacement");
+        std::fs::copy("/bin/true", &runtime_replacement).unwrap();
+        std::fs::rename(&runtime_replacement, &runtime).unwrap();
+        let replaced_runtime = resolve_expected_harness_launch_provenance(
+            &format!("{} --mode alpha prompt", script.display()),
+            Harness::Codex,
+        )
+        .unwrap();
+        assert_eq!(
+            replaced_runtime.executable.path,
+            script_expected.executable.path
+        );
+        assert_ne!(
+            replaced_runtime.executable.inode,
+            script_expected.executable.inode
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_launch_provenance_rejects_wrong_provider_and_arbitrary_shebangs() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-untrusted-launch-provenance-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("codex");
+        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+        make_executable(&script);
+        assert_eq!(
+            resolve_expected_harness_launch_provenance(script.to_str().unwrap(), Harness::Codex),
+            Err(LaunchAttestationError::UntrustedLaunchCommand)
+        );
+        assert_eq!(
+            resolve_expected_harness_launch_provenance("claude", Harness::Codex),
+            Err(LaunchAttestationError::UntrustedLaunchCommand)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn shell_evidence() -> HarnessProcessEvidence {
         HarnessProcessEvidence::test_after_exec(42, 900, 100, &["zsh"])
