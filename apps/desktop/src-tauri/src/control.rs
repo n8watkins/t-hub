@@ -6090,7 +6090,7 @@ impl CaptainsRegistry {
                     unit_name: owner.unit_name.clone(),
                     launch_nonce: owner.launch_nonce.clone(),
                     tools: owner.tools.clone(),
-                    phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                    phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed,
                     expected_harness_launch_provenance: Some(
                         synthetic_cortana_expected_harness_launch(harness),
                     ),
@@ -6525,7 +6525,28 @@ impl CaptainsRegistry {
         {
             return Err("Cortana owner changed before gone-owner recovery".into());
         }
+        let terminal_id = current
+            .cortana
+            .terminal_id
+            .clone()
+            .ok_or("gone Cortana owner has no durable terminal")?;
+        if current.captains.iter().any(|claim| {
+            claim.role == FleetRole::Cortana
+                && claim.state == ClaimState::Active
+                && claim.terminal_id.as_deref() != Some(terminal_id.as_str())
+        }) {
+            return Err("Cortana Fleet authority changed before gone-owner recovery".into());
+        }
         let previous = current.clone();
+        let now = now_ms();
+        for claim in current.captains.iter_mut().filter(|claim| {
+            claim.role == FleetRole::Cortana
+                && claim.state == ClaimState::Active
+                && claim.terminal_id.as_deref() == Some(terminal_id.as_str())
+        }) {
+            claim.state = ClaimState::Orphaned { since: now };
+            claim.terminal_id = None;
+        }
         current.cortana.owner = None;
         current.cortana.active_harness_attestation = None;
         current.cortana.active_harness_attestation_recovery = None;
@@ -20202,7 +20223,7 @@ fn finalize_observed_cortana_launch(
     let claims = snapshot
         .captains
         .iter()
-        .filter(|claim| claim.role == FleetRole::Cortana)
+        .filter(|claim| claim.role == FleetRole::Cortana && claim.state == ClaimState::Active)
         .collect::<Vec<_>>();
     if claims.len() > 1
         || claims
@@ -20223,6 +20244,14 @@ fn finalize_observed_cortana_launch(
             .record_cortana_claimed_launch(operation_id, &launch.terminal_id)?;
         return Err(CORTANA_ATTESTATION_REQUIRED.into());
     }
+    let action = if durable.identity_id.is_none()
+        && durable.generation == 0
+        && durable.legacy_quarantine.is_none()
+    {
+        crate::cortana_reconcile::CortanaReconcileAction::Create
+    } else {
+        crate::cortana_reconcile::CortanaReconcileAction::Recover
+    };
     let provider_session_id = candidate.provider_session_id.clone();
     let committed = ctx.captains.commit_cortana_runtime(
         operation_id,
@@ -20240,7 +20269,7 @@ fn finalize_observed_cortana_launch(
     let _ = captains_sync_apply(ctx);
     Ok(cortana_reconcile_response(
         operation_id,
-        crate::cortana_reconcile::CortanaReconcileAction::Recover,
+        action,
         committed,
         quarantined,
         Vec::new(),
@@ -21287,6 +21316,16 @@ fn reconcile_cortana_inner(
     }
 
     if let Some(candidate) = plan.authoritative.as_ref() {
+        if durable.identity_id.is_none()
+            && durable.terminal_id.is_none()
+            && durable.generation == 0
+            && plan.action == crate::cortana_reconcile::CortanaReconcileAction::Adopt
+        {
+            return Err(
+                "reconcile_cortana: generation-zero runtime predates managed ownership and was preserved"
+                    .into(),
+            );
+        }
         let same_incumbent = plan.action == crate::cortana_reconcile::CortanaReconcileAction::Keep
             && durable.identity_id.as_deref() == candidate.identity_id.as_deref()
             && durable.terminal_id.as_deref() == Some(candidate.terminal_id.as_str())
@@ -48760,7 +48799,7 @@ int main(int argc, char **argv) {
         )
         .unwrap_err();
         assert!(
-            changed_error.contains("prepared launch provenance"),
+            changed_error.contains("managed launch changed after outside-lock observation"),
             "{changed_error}"
         );
         let changed_durable = changed_captains.cortana_identity();
