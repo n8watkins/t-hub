@@ -48364,6 +48364,98 @@ int main(int argc, char **argv) {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cortana_ancestry_observation_uses_one_deadline_outside_admission() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut context = test_ctx("cortana-ancestry-deadline").with_apply_sink(sink);
+        context.addr = "127.0.0.1:4260".into();
+        context.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-ancestry-deadline-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_dir, command) = test_harness_command("codex");
+        dispatch(
+            &context,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-ancestry-deadline-setup",
+                "testOrchestratorHome": home,
+                "testStartupCommand": command,
+            }),
+        )
+        .unwrap();
+        let active = context.captains.cortana_identity();
+        assert!(matches!(
+            active.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        let terminal_id = active.terminal_id.clone().unwrap();
+        let owner = active.owner.clone().unwrap();
+
+        // Keep this retry observation-only after an uncertain result. That
+        // makes the elapsed bound measure the shared observation deadline,
+        // without allowing a replacement spawn to enter the result path.
+        context.apply_sink = None;
+        let ctx = Arc::new(context);
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let worker_ctx = Arc::clone(&ctx);
+        let worker_home = home.clone();
+        let worker_command = command.clone();
+        let worker = std::thread::spawn(move || {
+            crate::harness::stall_next_scoped_ancestry_batch_for_current_thread(reached_tx);
+            let started = Instant::now();
+            let result = dispatch(
+                &worker_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": "cortana-ancestry-deadline-revalidate",
+                    "testOrchestratorHome": worker_home,
+                    "testStartupCommand": worker_command,
+                }),
+            );
+            (result, started.elapsed())
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Cortana did not reach the late ancestry observation boundary");
+        let admission = ctx
+            .dispatch_admission
+            .try_lock()
+            .expect("late ancestry observation held dispatch admission");
+        drop(admission);
+
+        let (result, elapsed) = worker.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(!error.trim().is_empty());
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "one-second aggregate observation deadline took {elapsed:?}"
+        );
+        assert!(
+            ctx.dispatch_admission.try_lock().is_ok(),
+            "dispatch admission remained unavailable after observation timeout"
+        );
+
+        tmux::retire_managed_runtime(&tmux_target(&terminal_id), &tmux_cortana_owner(&owner))
+            .unwrap();
+        std::fs::remove_dir_all(harness_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn captured_packaged_observed_launch_requires_its_wal_before_generic_planning() {
         let fixture: Value =

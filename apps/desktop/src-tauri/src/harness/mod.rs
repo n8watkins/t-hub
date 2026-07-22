@@ -837,6 +837,8 @@ fn observe_scoped_processes_until(
     if identities.is_empty() || identities.len() > 64 {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
+    #[cfg(test)]
+    pause_scoped_ancestry_batch_until_deadline(deadline);
     const SCRIPT: &str = r#"
 set -eu
 count=$1
@@ -974,6 +976,38 @@ done
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     Ok(observed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCOPED_ANCESTRY_DEADLINE_STALL: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn stall_next_scoped_ancestry_batch_for_current_thread(
+    reached: std::sync::mpsc::Sender<()>,
+) {
+    SCOPED_ANCESTRY_DEADLINE_STALL.with(|slot| {
+        let previous = slot.borrow_mut().replace(reached);
+        assert!(
+            previous.is_none(),
+            "scoped ancestry stall already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn pause_scoped_ancestry_batch_until_deadline(deadline: Instant) {
+    let reached = SCOPED_ANCESTRY_DEADLINE_STALL.with(|slot| slot.borrow_mut().take());
+    if let Some(reached) = reached {
+        reached
+            .send(())
+            .expect("scoped ancestry stall receiver dropped");
+        let (hold_open, wait) = std::sync::mpsc::channel::<()>();
+        let _hold_open = hold_open;
+        let _ = wait.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
 }
 
 fn framed_sha256(label: &[u8], values: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
