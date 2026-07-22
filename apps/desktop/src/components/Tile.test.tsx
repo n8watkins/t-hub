@@ -131,10 +131,10 @@ describe("Tile Preview entry point", () => {
   it("offers one Preview tab and no separate Dev tab", () => {
     const header = renderTile("cap00001");
 
-    const preview = within(header).getByTitle("Preview view");
+    const preview = within(header).getByTitle("Preview");
     expect(preview.querySelector(".lucide-eye")).toBeTruthy();
     expect(preview.querySelector(".lucide-play")).toBeNull();
-    expect(within(header).queryByTitle("Run + Preview view")).toBeNull();
+    expect(within(header).queryByTitle("Run + Preview")).toBeNull();
     expect(within(header).queryByTitle("Dev view")).toBeNull();
   });
 });
@@ -152,7 +152,7 @@ describe("Tile responsive header controls", () => {
       const button = within(header).getByRole("button", {
         name: tab.label,
       });
-      expect(button.getAttribute("title")).toBe(`${tab.label} view`);
+      expect(button.getAttribute("title")).toBe(tab.label);
       expect(button.getAttribute("aria-pressed")).toBe(tab.pressed);
       expect(button.classList.contains("h-6")).toBe(true);
       expect(button.querySelector(".th-tab-icon")?.getAttribute("aria-hidden")).toBe(

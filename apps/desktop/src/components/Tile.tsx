@@ -941,7 +941,7 @@ export function Tile({
                     : "transparent",
                   fontWeight: selected ? 600 : 400,
                 }}
-                title={`${t.label} view`}
+                title={t.label}
                 aria-label={t.label}
                 aria-pressed={selected}
               >
