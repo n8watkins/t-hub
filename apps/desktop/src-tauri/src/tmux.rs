@@ -2969,6 +2969,37 @@ mod tests {
         }
     }
 
+    /// Keep the shared test tmux server alive for a case that needs several
+    /// independent probes or session operations. The initial anchor creation
+    /// retries across another case removing the server's final session.
+    struct TmuxTestServerAnchor {
+        _session: TestSession,
+    }
+
+    impl TmuxTestServerAnchor {
+        fn acquire() -> Self {
+            let session = TestSession::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match new_session_with_env(&session.name, "/tmp", None, &[]) {
+                    Ok(()) => return Self { _session: session },
+                    Err(error) if error.message == "server exited unexpectedly" => {
+                        match session_liveness(&session.name) {
+                            SessionLiveness::Alive => return Self { _session: session },
+                            SessionLiveness::Gone if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            liveness => panic!(
+                                "tmux test anchor could not start after server teardown ({liveness:?}): {error}"
+                            ),
+                        }
+                    }
+                    Err(error) => panic!("tmux test anchor could not start: {error}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn pane_generation_parser_accepts_fresh_tmux_zero_ids() {
         assert_eq!(
@@ -3163,6 +3194,7 @@ while True:
         if !tmux_available() || managed_runtime_preflight().is_err() {
             return;
         }
+        let _server_anchor = TmuxTestServerAnchor::acquire();
         let session = TestSession::new();
         let launch = prepare_managed_runtime_launch().unwrap();
         let owner = new_prepared_managed_session_with_env(
@@ -3701,6 +3733,7 @@ while True:
             );
             return;
         }
+        let _server_anchor = TmuxTestServerAnchor::acquire();
         // Reads the window-size option's current mode ("latest" / "manual") off a
         // live session. `show-options -w -t <name> window-size` prints
         // `window-size <mode>`; we return just the mode token.

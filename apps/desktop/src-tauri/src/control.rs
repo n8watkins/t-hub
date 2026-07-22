@@ -40839,6 +40839,7 @@ mod tests {
 
     #[test]
     fn fresh_history_resume_acquires_capacity_and_cancels_its_new_reservation_on_refusal() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let temp = tempfile::tempdir().unwrap();
         let codex_root = temp.path().join("codex/2026/07/20");
         let project_cwd = temp.path().join("project");
