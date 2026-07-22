@@ -16,7 +16,9 @@ use super::profile::{
     PreviewIntent, PreviewIntentPhase, PreviewProfileStore, ProjectPreviewProfile,
     SelectedPreviewTarget,
 };
-use super::runtime::{ManagedPreviewProcess, PreviewRuntime, RuntimeObservation};
+use super::runtime::{
+    ManagedPreviewProcess, PreviewRuntime, RuntimeObservation, RuntimeRediscovery,
+};
 
 #[derive(Clone)]
 struct ActiveRun {
@@ -69,7 +71,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         }
         let discovery = self.discovery.discover(root)?;
         let _ = resolve_target(&discovery, target_ref)?;
-        self.prepare_intent(request_id, PreviewOperation::Select, target_ref, None)?;
+        self.prepare_intent(request_id, PreviewOperation::Select, target_ref, None, None)?;
 
         let selected = SelectedPreviewTarget {
             target_id: target_ref.target_id.clone(),
@@ -149,11 +151,18 @@ impl<R: PreviewRuntime> PreviewService<R> {
         };
         let target = resolve_target(&discovery, &target_ref)?.clone();
         let run_id = Uuid::new_v4().to_string();
+        let expected_stop = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(scope)
+            .map(|active| active.process.clone());
         self.prepare_intent(
             request_id,
             PreviewOperation::Start,
             &target_ref,
             Some(&run_id),
+            expected_stop.as_ref(),
         )?;
         self.start_locked(
             &discovery,
@@ -192,10 +201,11 @@ impl<R: PreviewRuntime> PreviewService<R> {
             request_id,
             PreviewOperation::Stop,
             scope,
-            target_ref.as_ref().map(|target| &target.target_id),
+            target_ref.as_ref(),
             active
                 .as_ref()
                 .map(|run| run.process.identity.run_id.as_str()),
+            active.as_ref().map(|run| &run.process),
         )?;
         let Some(active) = active else {
             let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
@@ -294,14 +304,14 @@ impl<R: PreviewRuntime> PreviewService<R> {
             return Err("Preview restart was cancelled before spawning".into());
         }
         let discovery = self.discovery.discover(root)?;
-        let target_ref = match self
+        let active = self
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(scope)
-            .map(|run| run.process.target.clone())
-        {
-            Some(target_ref) => target_ref,
+            .cloned();
+        let target_ref = match active.as_ref() {
+            Some(active) => active.process.target.clone(),
             None => self.selected_ref(scope, &discovery)?,
         };
         let target = resolve_target(&discovery, &target_ref)?.clone();
@@ -311,13 +321,8 @@ impl<R: PreviewRuntime> PreviewService<R> {
             PreviewOperation::Restart,
             &target_ref,
             Some(&run_id),
+            active.as_ref().map(|active| &active.process),
         )?;
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(scope)
-            .cloned();
         if let Some(active) = active {
             match self.runtime.observe(&active.process)? {
                 RuntimeObservation::Running { .. } => {
@@ -359,7 +364,14 @@ impl<R: PreviewRuntime> PreviewService<R> {
         {
             return Ok(replayed);
         }
-        self.prepare_optional_intent(request_id, PreviewOperation::Refresh, scope, None, None)?;
+        self.prepare_optional_intent(
+            request_id,
+            PreviewOperation::Refresh,
+            scope,
+            None,
+            None,
+            None,
+        )?;
         let status = self.status_locked(scope, cancellation)?;
         self.commit_intent(request_id, status.clone())?;
         Ok(result(
@@ -384,13 +396,19 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .unwrap_or_else(|error| error.into_inner())
             .get(scope)
             .cloned();
-        let target_id = active.as_ref().map(|run| &run.process.target.target_id);
         if let Some(replayed) =
             self.replay_optional(request_id, PreviewOperation::Open, scope, None)?
         {
             return Ok(replayed);
         }
-        self.prepare_optional_intent(request_id, PreviewOperation::Open, scope, target_id, None)?;
+        self.prepare_optional_intent(
+            request_id,
+            PreviewOperation::Open,
+            scope,
+            active.as_ref().map(|run| &run.process.target),
+            None,
+            None,
+        )?;
         let status = self.status_locked(scope, &ProbeCancellation::default())?;
         let Some(url) = status.preview_url.as_deref() else {
             self.commit_intent(request_id, status.clone())?;
@@ -419,32 +437,6 @@ impl<R: PreviewRuntime> PreviewService<R> {
         for intent in self.profiles.recoverable_intents() {
             let scope_lock = self.scope_lock(&intent.scope);
             let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
-            if intent.phase == PreviewIntentPhase::EffectObserved {
-                let Some(status) = intent.observed_status.clone() else {
-                    self.block_intent(&intent.request_id, "observed intent has no status")?;
-                    continue;
-                };
-                self.profiles.advance_intent(
-                    &intent.request_id,
-                    PreviewIntentPhase::Committed,
-                    Some(status.clone()),
-                    Some("recovered observed effect without replay".into()),
-                    self.runtime.now_ms(),
-                )?;
-                recovered.push(result(
-                    intent.operation,
-                    PreviewOperationOutcome::Recovered,
-                    &intent.request_id,
-                    status,
-                ));
-                continue;
-            }
-            let active = self
-                .active
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(&intent.scope)
-                .cloned();
             if intent.operation == PreviewOperation::Select {
                 let selected_matches = self
                     .profiles
@@ -477,7 +469,19 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 }
                 continue;
             }
-            if intent.operation == PreviewOperation::Refresh {
+            if matches!(
+                intent.operation,
+                PreviewOperation::Refresh | PreviewOperation::Open
+            ) {
+                if intent.operation == PreviewOperation::Open
+                    && intent.phase == PreviewIntentPhase::Prepared
+                {
+                    self.block_intent(
+                        &intent.request_id,
+                        "prepared open effect cannot be proven after restart",
+                    )?;
+                    continue;
+                }
                 let status = self.status_locked(&intent.scope, &ProbeCancellation::default())?;
                 self.commit_intent(&intent.request_id, status.clone())?;
                 recovered.push(result(
@@ -488,62 +492,218 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 ));
                 continue;
             }
-            let Some(active) = active else {
-                if intent.operation == PreviewOperation::Stop {
-                    let status =
-                        PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
-                    self.commit_intent(&intent.request_id, status.clone())?;
-                    recovered.push(result(
-                        intent.operation,
-                        PreviewOperationOutcome::Recovered,
-                        &intent.request_id,
-                        status,
-                    ));
-                    continue;
-                }
-                self.block_intent(
+            if let Some(status) = self.recover_process_intent(&intent)? {
+                recovered.push(result(
+                    intent.operation,
+                    PreviewOperationOutcome::Recovered,
                     &intent.request_id,
-                    "prepared effect cannot be proven after restart",
-                )?;
-                continue;
-            };
-            if intent.run_id.as_deref() != Some(active.process.identity.run_id.as_str()) {
-                self.block_intent(
-                    &intent.request_id,
-                    "prepared intent no longer identifies the active run",
-                )?;
-                continue;
+                    status,
+                ));
             }
-            match self.runtime.observe(&active.process)? {
-                RuntimeObservation::Running { .. } => {
-                    if let Err(error) = self.runtime.stop(&active.process) {
-                        self.block_intent(&intent.request_id, &error)?;
-                        continue;
-                    }
-                }
-                RuntimeObservation::Exited { .. } => {}
-                RuntimeObservation::OwnershipLost => {
-                    self.block_intent(
-                        &intent.request_id,
-                        "recovery refused a reused or foreign process",
-                    )?;
-                    continue;
-                }
-            }
-            self.active
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&intent.scope);
-            let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
-            self.commit_intent(&intent.request_id, status.clone())?;
-            recovered.push(result(
-                intent.operation,
-                PreviewOperationOutcome::Recovered,
-                &intent.request_id,
-                status,
-            ));
         }
         Ok(recovered)
+    }
+
+    fn recover_process_intent(
+        &self,
+        intent: &PreviewIntent,
+    ) -> Result<Option<PreviewStatus>, String> {
+        if intent.operation == PreviewOperation::Stop && intent.expected_stop_run.is_none() {
+            let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+            self.commit_intent(&intent.request_id, status.clone())?;
+            return Ok(Some(status));
+        }
+        let target = match intent_target_ref(intent) {
+            Ok(target) => target,
+            Err(error) => {
+                self.block_intent(&intent.request_id, &error)?;
+                return Ok(None);
+            }
+        };
+        if intent.operation == PreviewOperation::Stop {
+            let expected = intent.expected_stop_run.as_ref().expect("checked above");
+            let expected_target = intent.expected_stop_target.as_ref().unwrap_or(&target);
+            return self.recover_stop_identity(intent, expected_target, expected);
+        }
+        if !matches!(
+            intent.operation,
+            PreviewOperation::Start | PreviewOperation::Restart
+        ) {
+            self.block_intent(&intent.request_id, "unsupported Preview recovery operation")?;
+            return Ok(None);
+        }
+        let Some(run_id) = intent.run_id.as_deref() else {
+            self.block_intent(&intent.request_id, "prepared start has no durable run id")?;
+            return Ok(None);
+        };
+        match self.runtime.rediscover(
+            &intent.scope,
+            &target,
+            run_id,
+            intent.managed_run.as_ref(),
+        )? {
+            RuntimeRediscovery::Exact(process) => {
+                if !valid_rediscovered_process(
+                    &process,
+                    &target,
+                    run_id,
+                    intent.managed_run.as_ref(),
+                ) {
+                    self.block_intent(
+                        &intent.request_id,
+                        "rediscovered Preview process failed exact identity validation",
+                    )?;
+                    return Ok(None);
+                }
+                match self.runtime.observe(&process)? {
+                    RuntimeObservation::OwnershipLost => {
+                        self.block_intent(
+                            &intent.request_id,
+                            "rediscovered Preview process lost exact ownership",
+                        )?;
+                        Ok(None)
+                    }
+                    RuntimeObservation::Running { .. } | RuntimeObservation::Exited { .. } => {
+                        self.active
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(
+                                intent.scope.clone(),
+                                ActiveRun {
+                                    process,
+                                    state: PreviewState::Starting,
+                                    preview_url: None,
+                                    reason: None,
+                                },
+                            );
+                        let status =
+                            self.status_locked(&intent.scope, &ProbeCancellation::default())?;
+                        self.commit_intent(&intent.request_id, status.clone())?;
+                        Ok(Some(status))
+                    }
+                }
+            }
+            RuntimeRediscovery::Absent => {
+                if let Some(expected) = intent.expected_stop_run.as_ref() {
+                    let Some(expected_target) = intent.expected_stop_target.as_ref() else {
+                        self.block_intent(
+                            &intent.request_id,
+                            "expected stop identity has no durable target reference",
+                        )?;
+                        return Ok(None);
+                    };
+                    if intent.operation == PreviewOperation::Start && expected_target == &target {
+                        match self.runtime.rediscover(
+                            &intent.scope,
+                            expected_target,
+                            &expected.run_id,
+                            Some(expected),
+                        )? {
+                            RuntimeRediscovery::Exact(process)
+                                if valid_rediscovered_process(
+                                    &process,
+                                    expected_target,
+                                    &expected.run_id,
+                                    Some(expected),
+                                ) =>
+                            {
+                                self.active
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(
+                                        intent.scope.clone(),
+                                        ActiveRun {
+                                            process,
+                                            state: PreviewState::Starting,
+                                            preview_url: None,
+                                            reason: None,
+                                        },
+                                    );
+                                let status = self
+                                    .status_locked(&intent.scope, &ProbeCancellation::default())?;
+                                self.commit_intent(&intent.request_id, status.clone())?;
+                                return Ok(Some(status));
+                            }
+                            RuntimeRediscovery::Absent => {}
+                            RuntimeRediscovery::Exact(_)
+                            | RuntimeRediscovery::Ambiguous
+                            | RuntimeRediscovery::Foreign => {
+                                self.block_intent(
+                                    &intent.request_id,
+                                    "existing Preview run rediscovery was ambiguous or foreign",
+                                )?;
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        return self.recover_stop_identity(intent, expected_target, expected);
+                    }
+                }
+                let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+                self.commit_intent(&intent.request_id, status.clone())?;
+                Ok(Some(status))
+            }
+            RuntimeRediscovery::Ambiguous | RuntimeRediscovery::Foreign => {
+                self.block_intent(
+                    &intent.request_id,
+                    "Preview runtime rediscovery was ambiguous or foreign",
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn recover_stop_identity(
+        &self,
+        intent: &PreviewIntent,
+        target: &PreviewTargetRef,
+        expected: &super::endpoint::ManagedRunIdentity,
+    ) -> Result<Option<PreviewStatus>, String> {
+        match self
+            .runtime
+            .rediscover(&intent.scope, target, &expected.run_id, Some(expected))?
+        {
+            RuntimeRediscovery::Exact(process) => {
+                if !valid_rediscovered_process(&process, target, &expected.run_id, Some(expected)) {
+                    self.block_intent(
+                        &intent.request_id,
+                        "rediscovered stop process failed exact identity validation",
+                    )?;
+                    return Ok(None);
+                }
+                match self.runtime.observe(&process)? {
+                    RuntimeObservation::Running { .. } => {
+                        if let Err(error) = self.runtime.stop(&process) {
+                            self.block_intent(&intent.request_id, &error)?;
+                            return Ok(None);
+                        }
+                    }
+                    RuntimeObservation::Exited { .. } => {}
+                    RuntimeObservation::OwnershipLost => {
+                        self.block_intent(
+                            &intent.request_id,
+                            "recovery refused a reused or foreign process",
+                        )?;
+                        return Ok(None);
+                    }
+                }
+            }
+            RuntimeRediscovery::Absent => {}
+            RuntimeRediscovery::Ambiguous | RuntimeRediscovery::Foreign => {
+                self.block_intent(
+                    &intent.request_id,
+                    "Preview stop rediscovery was ambiguous or foreign",
+                )?;
+                return Ok(None);
+            }
+        }
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&intent.scope);
+        let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+        self.commit_intent(&intent.request_id, status.clone())?;
+        Ok(Some(status))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -627,6 +787,24 @@ impl<R: PreviewRuntime> PreviewService<R> {
             let detail = "Preview runtime returned an invalid managed process identity";
             self.block_intent(request_id, detail)?;
             return Err(detail.into());
+        }
+        let starting = PreviewStatus {
+            scope: scope.clone(),
+            state: PreviewState::Starting,
+            target_id: Some(target_ref.target_id.clone()),
+            run_id: Some(process.identity.run_id.clone()),
+            preview_url: None,
+            reason: None,
+            observed_at_ms: self.runtime.now_ms(),
+        };
+        if let Err(error) = self.profiles.observe_managed_run(
+            request_id,
+            process.identity.clone(),
+            starting,
+            self.runtime.now_ms(),
+        ) {
+            let _ = self.runtime.stop(&process);
+            return Err(error);
         }
         self.active
             .lock()
@@ -795,13 +973,15 @@ impl<R: PreviewRuntime> PreviewService<R> {
         operation: PreviewOperation,
         target_ref: &PreviewTargetRef,
         run_id: Option<&str>,
+        expected_stop: Option<&ManagedPreviewProcess>,
     ) -> Result<(), String> {
         self.prepare_optional_intent(
             request_id,
             operation,
             &target_ref.scope,
-            Some(&target_ref.target_id),
+            Some(target_ref),
             run_id,
+            expected_stop,
         )
     }
 
@@ -810,15 +990,20 @@ impl<R: PreviewRuntime> PreviewService<R> {
         request_id: &str,
         operation: PreviewOperation,
         scope: &PreviewScope,
-        target_id: Option<&PreviewTargetId>,
+        target_ref: Option<&PreviewTargetRef>,
         run_id: Option<&str>,
+        expected_stop: Option<&ManagedPreviewProcess>,
     ) -> Result<(), String> {
         self.profiles.record_intent(PreviewIntent {
             request_id: request_id.into(),
             scope: scope.clone(),
             operation,
-            target_id: target_id.cloned(),
+            target_id: target_ref.map(|target| target.target_id.clone()),
+            discovery_fingerprint: target_ref.map(|target| target.discovery_fingerprint.clone()),
             run_id: run_id.map(str::to_string),
+            managed_run: None,
+            expected_stop_run: expected_stop.map(|process| process.identity.clone()),
+            expected_stop_target: expected_stop.map(|process| process.target.clone()),
             phase: PreviewIntentPhase::Prepared,
             observed_status: None,
             detail: None,
@@ -855,6 +1040,32 @@ impl<R: PreviewRuntime> PreviewService<R> {
         )?;
         Ok(())
     }
+}
+
+fn intent_target_ref(intent: &PreviewIntent) -> Result<PreviewTargetRef, String> {
+    Ok(PreviewTargetRef {
+        scope: intent.scope.clone(),
+        target_id: intent
+            .target_id
+            .clone()
+            .ok_or_else(|| "Preview recovery intent has no target id".to_string())?,
+        discovery_fingerprint: intent
+            .discovery_fingerprint
+            .clone()
+            .ok_or_else(|| "Preview recovery intent has no discovery fingerprint".to_string())?,
+    })
+}
+
+fn valid_rediscovered_process(
+    process: &ManagedPreviewProcess,
+    target: &PreviewTargetRef,
+    run_id: &str,
+    expected: Option<&super::endpoint::ManagedRunIdentity>,
+) -> bool {
+    process.identity.validate().is_ok()
+        && process.identity.run_id == run_id
+        && process.target == *target
+        && expected.is_none_or(|expected| expected == &process.identity)
 }
 
 fn resolve_target<'a>(
@@ -933,12 +1144,20 @@ mod tests {
         spawn_count: AtomicUsize,
         stop_count: AtomicUsize,
         observations: Mutex<HashMap<String, RuntimeObservation>>,
+        processes: Mutex<HashMap<String, ManagedPreviewProcess>>,
         opened: Mutex<Vec<String>>,
         fail_spawn: AtomicBool,
         endpoint_error: Mutex<Option<EndpointError>>,
+        ambiguous_rediscovery: AtomicBool,
     }
 
     impl FakeRuntime {
+        fn restart_facade(&self) -> Self {
+            Self {
+                state: Arc::clone(&self.state),
+            }
+        }
+
         fn spawn_count(&self) -> usize {
             self.state.spawn_count.load(Ordering::Relaxed)
         }
@@ -985,6 +1204,11 @@ mod tests {
                     output: process.output.clone(),
                 },
             );
+            self.state
+                .processes
+                .lock()
+                .unwrap()
+                .insert(run_id.into(), process.clone());
             Ok(process)
         }
 
@@ -997,6 +1221,28 @@ mod tests {
                 .get(&process.identity.run_id)
                 .cloned()
                 .unwrap_or(RuntimeObservation::OwnershipLost))
+        }
+
+        fn rediscover(
+            &self,
+            scope: &PreviewScope,
+            target: &PreviewTargetRef,
+            run_id: &str,
+            expected: Option<&ManagedRunIdentity>,
+        ) -> Result<RuntimeRediscovery, String> {
+            if self.state.ambiguous_rediscovery.load(Ordering::Relaxed) {
+                return Ok(RuntimeRediscovery::Ambiguous);
+            }
+            let Some(process) = self.state.processes.lock().unwrap().get(run_id).cloned() else {
+                return Ok(RuntimeRediscovery::Absent);
+            };
+            if process.target.scope != *scope
+                || process.target != *target
+                || expected.is_some_and(|identity| identity != &process.identity)
+            {
+                return Ok(RuntimeRediscovery::Foreign);
+            }
+            Ok(RuntimeRediscovery::Exact(process))
         }
 
         fn stop(&self, process: &ManagedPreviewProcess) -> Result<(), String> {
@@ -1053,6 +1299,7 @@ mod tests {
         scope: PreviewScope,
         target_ref: PreviewTargetRef,
         runtime: FakeRuntime,
+        profile_path: PathBuf,
         profiles: Arc<PreviewProfileStore>,
         service: PreviewService<FakeRuntime>,
     }
@@ -1069,8 +1316,8 @@ mod tests {
             r#"{"name":"app","scripts":{"dev":"vite"}}"#,
         )
         .unwrap();
-        let profiles =
-            Arc::new(PreviewProfileStore::open(root.join("state/preview-profiles.json")).unwrap());
+        let profile_path = root.join("state/preview-profiles.json");
+        let profiles = Arc::new(PreviewProfileStore::open(&profile_path).unwrap());
         let runtime = FakeRuntime::default();
         let service = PreviewService::new(runtime.clone(), Arc::clone(&profiles));
         let discovery = service.discover(&root).unwrap();
@@ -1086,6 +1333,7 @@ mod tests {
             scope,
             target_ref,
             runtime,
+            profile_path,
             profiles,
             service,
         }
@@ -1106,6 +1354,16 @@ mod tests {
             .unwrap();
         assert_eq!(first.outcome, PreviewOperationOutcome::Applied);
         assert_eq!(first.status.state, PreviewState::Running);
+        assert_eq!(
+            fixture
+                .profiles
+                .intent("start-1")
+                .unwrap()
+                .managed_run
+                .as_ref()
+                .map(|identity| identity.run_id.as_str()),
+            first.status.run_id.as_deref()
+        );
         fs::write(fixture.root.join("package.json"), "not json").unwrap();
         let replayed = fixture
             .service
@@ -1163,6 +1421,7 @@ mod tests {
             scope,
             target_ref: _,
             runtime,
+            profile_path: _,
             profiles: _,
             service,
         } = fixture("serialized");
@@ -1330,39 +1589,60 @@ mod tests {
     }
 
     #[test]
-    fn recovery_cleans_exact_known_run_without_spawning() {
+    fn fresh_service_rediscovers_spawned_prepared_run_by_durable_identity() {
         let fixture = fixture("recover-known");
-        let started = fixture
-            .service
-            .start(
-                &fixture.root,
-                &fixture.scope,
-                None,
-                "start",
-                &ProbeCancellation::default(),
-            )
-            .unwrap();
-        let run_id = started.status.run_id.unwrap();
+        let run_id = "prepared-run";
         fixture
             .profiles
             .record_intent(PreviewIntent {
-                request_id: "crashed-restart".into(),
+                request_id: "crashed-start".into(),
                 scope: fixture.scope.clone(),
-                operation: PreviewOperation::Restart,
+                operation: PreviewOperation::Start,
                 target_id: Some(fixture.target_ref.target_id.clone()),
-                run_id: Some(run_id),
+                discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
+                run_id: Some(run_id.into()),
+                managed_run: None,
+                expected_stop_run: None,
+                expected_stop_target: None,
                 phase: PreviewIntentPhase::Prepared,
                 observed_status: None,
                 detail: None,
                 updated_at_ms: 1,
             })
             .unwrap();
-        let recovered = fixture.service.recover_incomplete().unwrap();
+        let discovery = fixture.service.discover(&fixture.root).unwrap();
+        fixture
+            .runtime
+            .spawn(
+                &fixture.scope,
+                &discovery.canonical_root,
+                &discovery.targets[0],
+                &fixture.target_ref,
+                run_id,
+            )
+            .unwrap();
+
+        let restarted_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let restarted = PreviewService::new(
+            fixture.runtime.restart_facade(),
+            Arc::clone(&restarted_profiles),
+        );
+        let recovered = restarted.recover_incomplete().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].outcome, PreviewOperationOutcome::Recovered);
-        assert_eq!(recovered[0].status.state, PreviewState::Stopped);
+        assert_eq!(recovered[0].status.state, PreviewState::Running);
+        assert_eq!(recovered[0].status.run_id.as_deref(), Some(run_id));
+        assert_eq!(
+            restarted.status(&fixture.scope).unwrap().state,
+            PreviewState::Running
+        );
         assert_eq!(fixture.runtime.spawn_count(), 1);
-        assert_eq!(fixture.runtime.stop_count(), 1);
+        assert_eq!(fixture.runtime.stop_count(), 0);
+        assert_eq!(
+            restarted_profiles.intent("crashed-start").unwrap().phase,
+            PreviewIntentPhase::Committed
+        );
     }
 
     #[test]
@@ -1375,17 +1655,66 @@ mod tests {
                 scope: fixture.scope.clone(),
                 operation: PreviewOperation::Start,
                 target_id: Some(fixture.target_ref.target_id.clone()),
+                discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
                 run_id: Some("lost-run".into()),
+                managed_run: None,
+                expected_stop_run: None,
+                expected_stop_target: None,
                 phase: PreviewIntentPhase::Prepared,
                 observed_status: None,
                 detail: None,
                 updated_at_ms: 1,
             })
             .unwrap();
-        assert!(fixture.service.recover_incomplete().unwrap().is_empty());
+        let recovered = fixture.service.recover_incomplete().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status.state, PreviewState::Stopped);
         assert_eq!(fixture.runtime.spawn_count(), 0);
         assert_eq!(
             fixture.profiles.intent("crashed-start").unwrap().phase,
+            PreviewIntentPhase::Committed
+        );
+    }
+
+    #[test]
+    fn fresh_service_blocks_ambiguous_process_rediscovery() {
+        let fixture = fixture("recover-ambiguous");
+        fixture
+            .profiles
+            .record_intent(PreviewIntent {
+                request_id: "ambiguous-start".into(),
+                scope: fixture.scope.clone(),
+                operation: PreviewOperation::Start,
+                target_id: Some(fixture.target_ref.target_id.clone()),
+                discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
+                run_id: Some("ambiguous-run".into()),
+                managed_run: None,
+                expected_stop_run: None,
+                expected_stop_target: None,
+                phase: PreviewIntentPhase::Prepared,
+                observed_status: None,
+                detail: None,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        fixture
+            .runtime
+            .state
+            .ambiguous_rediscovery
+            .store(true, Ordering::Relaxed);
+        let restarted_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let restarted = PreviewService::new(
+            fixture.runtime.restart_facade(),
+            Arc::clone(&restarted_profiles),
+        );
+        assert!(restarted.recover_incomplete().unwrap().is_empty());
+        assert_eq!(
+            restarted.status(&fixture.scope).unwrap().state,
+            PreviewState::Stopped
+        );
+        assert_eq!(
+            restarted_profiles.intent("ambiguous-start").unwrap().phase,
             PreviewIntentPhase::RecoveryBlocked
         );
     }

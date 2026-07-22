@@ -23,6 +23,18 @@ pub struct ManagedRunIdentity {
     pub process_group_started_at: u64,
 }
 
+impl ManagedRunIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.run_id.is_empty() || self.run_id.len() > 160 {
+            return Err("managed Preview run id must contain 1 to 160 bytes".into());
+        }
+        if self.process_group_id == 0 || self.process_group_started_at == 0 {
+            return Err("managed Preview process identity must be nonzero".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerOwnership {
     pub process_group_id: u32,

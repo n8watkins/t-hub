@@ -19,6 +19,14 @@ pub enum RuntimeObservation {
     OwnershipLost,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeRediscovery {
+    Exact(ManagedPreviewProcess),
+    Absent,
+    Ambiguous,
+    Foreign,
+}
+
 pub trait PreviewRuntime: Send + Sync {
     /// Spawn one backend-selected typed target. Implementations derive the
     /// executable, arguments, environment, and working directory themselves.
@@ -32,6 +40,16 @@ pub trait PreviewRuntime: Send + Sync {
     ) -> Result<ManagedPreviewProcess, String>;
 
     fn observe(&self, process: &ManagedPreviewProcess) -> Result<RuntimeObservation, String>;
+
+    /// Rediscover a process through a backend-owned durable run marker.
+    /// `expected` is present once exact OS identity was observed durably.
+    fn rediscover(
+        &self,
+        scope: &PreviewScope,
+        target: &PreviewTargetRef,
+        run_id: &str,
+        expected: Option<&ManagedRunIdentity>,
+    ) -> Result<RuntimeRediscovery, String>;
 
     /// Stop only when the exact process-group identity still belongs to this
     /// managed run. Implementations must reject PID/group reuse.

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use super::endpoint::ManagedRunIdentity;
 use super::model::{PreviewOperation, PreviewScope, PreviewStatus, PreviewTarget, PreviewTargetId};
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -52,7 +53,15 @@ pub struct PreviewIntent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<PreviewTargetId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_run: Option<ManagedRunIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stop_run: Option<ManagedRunIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stop_target: Option<super::model::PreviewTargetRef>,
     pub phase: PreviewIntentPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_status: Option<PreviewStatus>,
@@ -152,7 +161,10 @@ impl PreviewProfileStore {
             if existing.scope != intent.scope
                 || existing.operation != intent.operation
                 || existing.target_id != intent.target_id
+                || existing.discovery_fingerprint != intent.discovery_fingerprint
                 || existing.run_id != intent.run_id
+                || existing.expected_stop_run != intent.expected_stop_run
+                || existing.expected_stop_target != intent.expected_stop_target
             {
                 return Err("request id is already bound to a different Preview operation".into());
             }
@@ -204,6 +216,37 @@ impl PreviewProfileStore {
         intent.phase = phase;
         intent.observed_status = observed_status;
         intent.detail = detail;
+        intent.updated_at_ms = updated_at_ms;
+        let result = intent.clone();
+        persist_profiles(&self.path, &next)?;
+        *guard = next;
+        Ok(result)
+    }
+
+    pub fn observe_managed_run(
+        &self,
+        request_id: &str,
+        managed_run: ManagedRunIdentity,
+        observed_status: PreviewStatus,
+        updated_at_ms: u64,
+    ) -> Result<PreviewIntent, String> {
+        managed_run.validate()?;
+        let mut guard = self.state.lock();
+        let mut next = guard.clone();
+        let intent = next
+            .idempotency_journal
+            .iter_mut()
+            .find(|entry| entry.request_id == request_id)
+            .ok_or_else(|| "unknown Preview request id".to_string())?;
+        if intent.run_id.as_deref() != Some(managed_run.run_id.as_str()) {
+            return Err("managed Preview identity does not match prepared run id".into());
+        }
+        if !valid_phase_transition(intent.phase, PreviewIntentPhase::EffectObserved) {
+            return Err("Preview intent cannot observe a managed run in this phase".into());
+        }
+        intent.phase = PreviewIntentPhase::EffectObserved;
+        intent.managed_run = Some(managed_run);
+        intent.observed_status = Some(observed_status);
         intent.updated_at_ms = updated_at_ms;
         let result = intent.clone();
         persist_profiles(&self.path, &next)?;
@@ -373,7 +416,11 @@ mod tests {
             scope: PreviewScope::new("project-1", None).unwrap(),
             operation: PreviewOperation::Start,
             target_id: Some(PreviewTargetId::parse("root:dev").unwrap()),
+            discovery_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
             run_id: Some("run-1".into()),
+            managed_run: None,
+            expected_stop_run: None,
+            expected_stop_target: None,
             phase: PreviewIntentPhase::Prepared,
             observed_status: None,
             detail: None,
