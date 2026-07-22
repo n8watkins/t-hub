@@ -28,8 +28,35 @@ pub struct CortanaRuntimeCandidate {
     pub identity_bound_to_terminal: bool,
     pub canonical_control_file: bool,
     pub rotating_control_env_scrubbed: bool,
+    /// An older T-Hub injected one rotating endpoint directly into Cortana.
+    /// This is retirement-only evidence: both values must be non-empty and
+    /// demonstrably different from the current listener, and the stable
+    /// discovery file must be absent. It must never authorize adoption.
+    pub stale_legacy_control_env: bool,
+    /// The runtime presented a non-empty per-session bearer which no longer
+    /// resolves in the current durable identity store.
+    pub unresolved_session_bearer: bool,
     pub current_control_capability: bool,
     pub trusted_cortana_identity: bool,
+}
+
+pub const LEGACY_ORPHAN_PROVENANCE_VERSION: u32 = 1;
+
+/// One-use evidence recovered while upgrading to captains schema v22.
+///
+/// The record can only be derived from an exact healthy schema-v18 durable
+/// Cortana binding. It authorizes preparing a transaction for that one terminal;
+/// it does not authorize adopting the old runtime or any replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaLegacyOrphanProvenance {
+    pub version: u32,
+    pub source_schema_version: u32,
+    pub identity_id: String,
+    pub terminal_id: String,
+    pub generation: u64,
+    pub harness: String,
+    pub healthy_operation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -42,6 +69,8 @@ pub struct CortanaDurableIdentity {
     pub provider_session_id: Option<String>,
     pub conversation_id: Option<String>,
     pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_orphan_provenance: Option<CortanaLegacyOrphanProvenance>,
     #[serde(default)]
     pub recovery: CortanaRecoveryState,
 }
@@ -417,6 +446,8 @@ mod tests {
             identity_bound_to_terminal: true,
             canonical_control_file: true,
             rotating_control_env_scrubbed: true,
+            stale_legacy_control_env: false,
+            unresolved_session_bearer: false,
             current_control_capability: true,
             trusted_cortana_identity: true,
         }
@@ -431,6 +462,7 @@ mod tests {
             provider_session_id: Some("thread-1".into()),
             conversation_id: Some("conversation-1".into()),
             checkpoint: Some("checkpoint-1".into()),
+            legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {
                 operation_id: "startup-3".into(),
                 verified_at: 10,

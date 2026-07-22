@@ -1493,6 +1493,7 @@ fn continuity_control_fixture() -> (
         provider_session_id: None,
         conversation_id: None,
         checkpoint: None,
+        legacy_orphan_provenance: None,
         recovery: control::CortanaRecoveryState::Healthy {
             operation_id: "continuity-e2e".into(),
             verified_at: 1,
