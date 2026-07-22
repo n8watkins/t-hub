@@ -45991,7 +45991,7 @@ int main(int argc, char **argv) {
         });
         let mut ctx = test_ctx("cortana-no-spawn-rate")
             .with_apply_sink(sink)
-            .with_governor(Arc::new(SpawnGovernor::new(64, 20.0, 1.0)));
+            .with_governor(Arc::new(SpawnGovernor::new(64, 0.0, 1.0)));
         ctx.addr = "127.0.0.1:4249".into();
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
