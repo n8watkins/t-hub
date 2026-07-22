@@ -45188,6 +45188,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn prepared_cortana_cleanup_preserves_wal_and_active_unknown_generation() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("cortana-prepared-cleanup-active");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry(Some(path.clone()));
+        registry.begin_cortana_recovery("wal-active").unwrap();
+        let launch = tmux::prepare_managed_runtime_launch().unwrap();
+        let prepared = registry
+            .prepare_cortana_managed_launch(
+                "wal-active",
+                "wal00003",
+                "identity-wal-active",
+                1,
+                "codex",
+                &launch,
+            )
+            .unwrap();
+        let durable_launch = prepared.managed_launch.unwrap();
+        let target = tmux_target("wal00003");
+        let owner = tmux::new_prepared_managed_session_with_env(
+            &target,
+            "/tmp",
+            Some("sleep 60"),
+            &[],
+            &launch,
+        )
+        .unwrap();
+        let mut sibling = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let sibling_pid = sibling.id();
+        let ctx = test_ctx("wal-active-control").with_captains_registry(registry.clone());
+
+        let error = cleanup_cortana_managed_launch(&ctx, &durable_launch, None).unwrap_err();
+
+        assert!(error.contains("populated, reused, or unverifiable"));
+        assert_eq!(
+            registry.cortana_identity().managed_launch.as_ref(),
+            Some(&durable_launch)
+        );
+        tmux::revalidate_managed_runtime_owner(&target, &owner).unwrap();
+        assert!(std::path::Path::new(&format!("/proc/{sibling_pid}")).exists());
+
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+        cleanup_cortana_managed_launch(&ctx, &durable_launch, None).unwrap();
+        assert!(registry.cortana_identity().managed_launch.is_none());
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn retained_managed_launch_operation_survives_reload_and_rotated_dispatch_ids() {
         if tmux::managed_runtime_preflight().is_err() {
             return;

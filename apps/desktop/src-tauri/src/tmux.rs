@@ -1512,16 +1512,19 @@ def validate_tools(raw):
         refuse(110)
     return {"python": python, "systemctl": systemctl, "systemdRun": systemd_run}
 
-def bounded_systemctl(systemctl, unit):
+def bounded_systemctl(systemctl, unit, include_load_state=False):
     def limit_output():
         resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536))
     stdout = tempfile.TemporaryFile()
     stderr = tempfile.TemporaryFile()
     try:
+        arguments = [systemctl, "--user", "show", "--no-pager", unit,
+                     "--property=Id", "--property=InvocationID", "--property=ControlGroup",
+                     "--property=ActiveState", "--property=SubState"]
+        if include_load_state:
+            arguments.append("--property=LoadState")
         result = subprocess.run(
-            [systemctl, "--user", "show", "--no-pager", unit,
-             "--property=Id", "--property=InvocationID", "--property=ControlGroup",
-             "--property=ActiveState", "--property=SubState"],
+            arguments,
             stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
             timeout=5, check=False, preexec_fn=limit_output)
     except (OSError, subprocess.TimeoutExpired):
@@ -1538,17 +1541,35 @@ def bounded_systemctl(systemctl, unit):
     except UnicodeDecodeError:
         refuse(84)
 
-def systemd_properties(systemctl, unit):
-    output = bounded_systemctl(systemctl, unit)
+def systemd_properties(systemctl, unit, include_load_state=False):
+    output = bounded_systemctl(systemctl, unit, include_load_state)
     props = {}
     for line in output.splitlines():
         key, separator, value = line.partition("=")
         if not separator or key in props:
             refuse(85)
         props[key] = value
-    if set(props) != {"Id", "InvocationID", "ControlGroup", "ActiveState", "SubState"}:
+    expected = {"Id", "InvocationID", "ControlGroup", "ActiveState", "SubState"}
+    if include_load_state:
+        expected.add("LoadState")
+    if set(props) != expected:
         refuse(86)
     return props
+
+def prepared_converged(unit, path, props, directory_exists):
+    required = {"Id", "InvocationID", "ControlGroup", "ActiveState", "SubState", "LoadState"}
+    if (not isinstance(props, dict) or set(props) != required or
+        props["Id"] != unit or directory_exists or
+        props["ControlGroup"] not in ("", path)):
+        return False
+    if props["LoadState"] == "not-found":
+        return (props["ActiveState"] == "inactive" and props["SubState"] == "dead" and
+                props["InvocationID"] == "" and props["ControlGroup"] == "")
+    if props["LoadState"] != "loaded":
+        return False
+    return (props["ActiveState"] == "inactive" and props["SubState"] == "dead" and
+            (props["InvocationID"] == "" or
+             re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"]) is not None))
 
 def exact_cgroup_path(unit, path):
     uid = os.getuid()
@@ -1702,6 +1723,15 @@ if mode == "preflight" and len(sys.argv) == 3:
     if props["ActiveState"] != "active":
         refuse(73)
     raise SystemExit(0)
+if mode == "validate-prepared-state" and len(sys.argv) == 5:
+    unit = sys.argv[2]
+    if (not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit) or
+        sys.argv[4] not in ("0", "1")):
+        refuse(128)
+    path = f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}"
+    if prepared_converged(unit, path, json.loads(sys.argv[3]), sys.argv[4] == "1"):
+        raise SystemExit(0)
+    refuse(129)
 if mode == "retire-prepared" and len(sys.argv) == 3:
     prepared = json.loads(sys.argv[2])
     tools = validate_tools(prepared.get("tools"))
@@ -1711,43 +1741,11 @@ if mode == "retire-prepared" and len(sys.argv) == 3:
         nonce != unit[6:-6]):
         refuse(119)
     path = f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}"
-    props = systemd_properties(tools["systemctl"]["path"], unit)
+    props = systemd_properties(tools["systemctl"]["path"], unit, True)
     directory_path = "/sys/fs/cgroup" + path
-    if props["ActiveState"] != "active":
-        if (props["Id"] == unit and
-            (props["InvocationID"] == "" or
-             re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"])) and
-            props["ControlGroup"] in ("", path) and not os.path.exists(directory_path)):
-            raise SystemExit(0)
-        refuse(120)
-    if (props["Id"] != unit or props["SubState"] != "running" or
-        props["ControlGroup"] != path or
-        not re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"])):
-        refuse(121)
-    directory = None
-    try:
-        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
-            if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
-                refuse(122)
-        write_control(directory, "cgroup.freeze", b"1")
-        deadline = time.monotonic() + 5
-        while event_value(directory, "frozen") != 1:
-            if time.monotonic() >= deadline:
-                refuse(123)
-            time.sleep(0.005)
-        write_control(directory, "cgroup.kill", b"1")
-        deadline = time.monotonic() + 5
-        while event_value(directory, "populated", True) != 0:
-            if time.monotonic() >= deadline:
-                refuse(124)
-            time.sleep(0.005)
-    except (FileNotFoundError, PermissionError, OSError):
-        refuse(125)
-    finally:
-        if directory is not None:
-            os.close(directory)
-    raise SystemExit(0)
+    if prepared_converged(unit, path, props, os.path.exists(directory_path)):
+        raise SystemExit(0)
+    refuse(120)
 if mode == "observe" and len(sys.argv) == 6:
     tools = validate_tools(json.loads(sys.argv[2]))
     print(json.dumps(observe(tools, sys.argv[3], sys.argv[4], int(sys.argv[5])), separators=(",", ":")))
@@ -3157,6 +3155,150 @@ while True:
 
         retire_prepared_managed_runtime(&launch).unwrap();
         retire_prepared_managed_runtime(&launch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_cleanup_refuses_active_unit_without_signaling_it_or_a_sibling() {
+        if !tmux_available() || managed_runtime_preflight().is_err() {
+            return;
+        }
+        let session = TestSession::new();
+        let launch = prepare_managed_runtime_launch().unwrap();
+        let owner = new_prepared_managed_session_with_env(
+            &session.name,
+            "/tmp",
+            Some("sleep 60"),
+            &[],
+            &launch,
+        )
+        .unwrap();
+        let mut sibling = Command::new("sleep").arg("60").spawn().unwrap();
+        let sibling_pid = sibling.id();
+
+        let error = retire_prepared_managed_runtime(&launch).unwrap_err();
+
+        assert_eq!(error.op, "retire-prepared-managed-runtime");
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Alive);
+        revalidate_managed_runtime_owner(&session.name, &owner).unwrap();
+        assert!(std::path::Path::new(&format!("/proc/{sibling_pid}")).exists());
+
+        retire_managed_runtime(&session.name, &owner).unwrap();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_cleanup_state_contract_rejects_every_ambiguous_shape() {
+        use std::os::unix::fs::MetadataExt;
+
+        let python = trusted_python_identity().unwrap();
+        let unit = "t-hub-0123456789abcdef0123456789abcdef.scope";
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let path = format!(
+            "/user.slice/user-{}.slice/user@{}.service/app.slice/{unit}",
+            uid, uid
+        );
+        let invoke = |properties: serde_json::Value, directory_exists: bool| {
+            let mut command = managed_cgroup_effect_command(&python).unwrap();
+            command.args([
+                "validate-prepared-state",
+                unit,
+                &properties.to_string(),
+                if directory_exists { "1" } else { "0" },
+            ]);
+            output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+                .unwrap()
+                .status
+                .success()
+        };
+        let inactive = serde_json::json!({
+            "Id": unit,
+            "InvocationID": "0123456789abcdef0123456789abcdef",
+            "ControlGroup": path,
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "LoadState": "loaded",
+        });
+        assert!(invoke(inactive.clone(), false));
+        assert!(invoke(
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "",
+                "ControlGroup": "",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "LoadState": "not-found",
+            }),
+            false,
+        ));
+
+        for active_state in [
+            "active",
+            "activating",
+            "deactivating",
+            "reloading",
+            "failed",
+            "maintenance",
+            "unknown",
+        ] {
+            let mut ambiguous = inactive.clone();
+            ambiguous["ActiveState"] = active_state.into();
+            assert!(!invoke(ambiguous, false), "accepted {active_state}");
+        }
+        for ambiguous in [
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "",
+                "ControlGroup": "",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "LoadState": "masked",
+            }),
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "",
+                "ControlGroup": "",
+                "ActiveState": "inactive",
+                "SubState": "failed",
+                "LoadState": "loaded",
+            }),
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "0123456789abcdef0123456789abcdef",
+                "ControlGroup": "",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "LoadState": "not-found",
+            }),
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "malformed",
+                "ControlGroup": path,
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "LoadState": "loaded",
+            }),
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "",
+                "ControlGroup": "/user.slice/foreign.scope",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "LoadState": "loaded",
+            }),
+            serde_json::json!({
+                "Id": unit,
+                "InvocationID": "",
+                "ControlGroup": "",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            }),
+        ] {
+            assert!(!invoke(ambiguous, false));
+        }
+        assert!(!invoke(inactive, true));
     }
 
     #[cfg(unix)]
