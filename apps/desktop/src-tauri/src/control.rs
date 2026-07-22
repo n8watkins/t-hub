@@ -20652,14 +20652,48 @@ fn managed_process_from_observation(
     durable: &crate::cortana_reconcile::CortanaDurableIdentity,
 ) -> Result<crate::harness::HarnessProcessIdentity, String> {
     let observed = observation.ok_or(CORTANA_ATTESTATION_REQUIRED)?;
-    if observed.durable_basis != *durable {
-        return Err("Cortana managed launch changed after outside-lock observation".into());
-    }
     let evidence = observed
         .managed_result
         .as_ref()
         .ok_or(CORTANA_ATTESTATION_REQUIRED)?
         .clone()?;
+    if observed.durable_basis != *durable {
+        let mut advanced_basis = observed.durable_basis.clone();
+        let prior_phase = advanced_basis
+            .managed_launch
+            .as_ref()
+            .map(|launch| launch.phase);
+        let current_launch = durable.managed_launch.as_ref();
+        if let (Some(advanced_launch), Some(current_launch)) =
+            (advanced_basis.managed_launch.as_mut(), current_launch)
+        {
+            advanced_launch.phase = current_launch.phase;
+            advanced_launch.harness_process = current_launch.harness_process.clone();
+        }
+        let current_phase = current_launch.map(|launch| launch.phase);
+        let phase_advanced = matches!(
+            (prior_phase, current_phase),
+            (
+                Some(crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved),
+                Some(crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed)
+                    | Some(crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed)
+            ) | (
+                Some(crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed),
+                Some(crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed)
+            )
+        );
+        let process_advanced_exactly = current_launch
+            .and_then(|launch| launch.harness_process.as_ref())
+            .is_some_and(|process| process == &evidence.process);
+        if phase_advanced
+            && process_advanced_exactly
+            && advanced_basis == *durable
+            && durable.owner.as_ref() == Some(&evidence.owner)
+        {
+            return Err(CORTANA_ATTESTATION_REQUIRED.into());
+        }
+        return Err("Cortana managed launch changed after outside-lock observation".into());
+    }
     if durable.owner.as_ref() != Some(&evidence.owner) {
         return Err("Cortana managed owner evidence changed before commit".into());
     }
@@ -20883,13 +20917,13 @@ fn reconcile_cortana_inner(
                 "reconcile_cortana: configured Harness provenance cannot enrich the retained managed launch: {error}"
             )
         })?;
-        durable = ctx
-            .captains
+        ctx.captains
             .record_cortana_expected_harness_launch_provenance(
                 operation_id,
                 &launch.terminal_id,
                 expected,
             )?;
+        return Err(CORTANA_ATTESTATION_REQUIRED.into());
     }
     if let Some(launch) = durable.managed_launch.clone() {
         if launch.operation_id != operation_id {
@@ -20957,7 +20991,9 @@ fn reconcile_cortana_inner(
                     observation,
                 )
                 .map_err(|error| {
-                    if post_claim {
+                    if error == CORTANA_ATTESTATION_REQUIRED {
+                        error
+                    } else if post_claim {
                         format!(
                             "reconcile_cortana: post-claim Harness revalidation failed; WAL and Fleet claim retained: {error}"
                         )
@@ -46943,6 +46979,17 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn cortana_attestation_transition_retries_are_bounded() {
+        let ctx = test_ctx("cortana-transition-budget");
+        let error = reconcile_cortana_with_transition_count(&ctx, &json!({}), true, 7)
+            .expect_err("an exhausted attestation transition budget must fail closed");
+        assert!(
+            error.contains("did not advance after 6 transitions"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn copied_cortana_bearer_on_a_second_terminal_fails_closed_without_quarantine() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
@@ -49030,7 +49077,7 @@ int main(int argc, char **argv) {
         )
         .unwrap_err();
         assert!(
-            changed_error.contains("managed launch changed after outside-lock observation"),
+            changed_error.contains("managed Harness process attestation failed"),
             "{changed_error}"
         );
         let changed_durable = changed_captains.cortana_identity();
