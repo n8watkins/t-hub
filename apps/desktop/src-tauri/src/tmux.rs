@@ -69,6 +69,27 @@ pub fn socket() -> &'static str {
     &SOCKET_NAME
 }
 
+fn validate_socket_name(value: &str) -> Result<&str, TmuxError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.as_bytes()[0].is_ascii_alphanumeric()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(TmuxError {
+            op: "validate-socket",
+            code: None,
+            message: "configured tmux socket name is outside the safe socket-name contract".into(),
+        });
+    }
+    Ok(value)
+}
+
+pub(crate) fn validated_socket_name() -> Result<&'static str, TmuxError> {
+    validate_socket_name(socket())
+}
+
 /// tmux per-window scrollback cap for NEW sessions. The default 2000 is why you
 /// couldn't scroll up far. `history-limit` is per-window and FIXED at window
 /// creation, so we set it GLOBALLY (`-g`) before `new-session` — new terminals keep
@@ -104,7 +125,7 @@ pub(crate) struct PaneGeneration {
 ///
 /// Both process start tokens and the process-group/session ownership are needed:
 /// numeric PIDs and a tmux session name can be reused independently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionEffectIdentity {
     pub(crate) tmux_session_id: u64,
     pub(crate) tmux_session_created: u64,
@@ -150,7 +171,8 @@ impl From<TmuxError> for String {
 /// tmux lives inside WSL, so on Windows every control command is routed through
 /// `wsl.exe -e tmux …`; on Unix (including the WSL dev build) tmux is invoked
 /// directly. Both then carry `-L t-hub` plus the caller's args.
-fn tmux(args: &[&str]) -> Command {
+fn tmux(args: &[&str]) -> Result<Command, TmuxError> {
+    let socket = validated_socket_name()?;
     #[cfg(windows)]
     let mut cmd = {
         use std::os::windows::process::CommandExt;
@@ -171,9 +193,9 @@ fn tmux(args: &[&str]) -> Command {
     };
     #[cfg(unix)]
     let mut cmd = Command::new("tmux");
-    cmd.arg("-L").arg(socket());
+    cmd.arg("-L").arg(socket);
     cmd.args(args);
-    cmd
+    Ok(cmd)
 }
 
 /// True when stderr indicates the server simply isn't running yet. This is the
@@ -241,7 +263,7 @@ fn tmux_cmd_timeout() -> Duration {
 /// failures into a structured [`TmuxError`]. Bounded by [`tmux_cmd_timeout`] so a
 /// wedged server surfaces as an error instead of parking the caller forever.
 fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxError> {
-    let output = output_with_timeout(tmux(args), tmux_cmd_timeout()).map_err(|e| TmuxError {
+    let output = output_with_timeout(tmux(args)?, tmux_cmd_timeout()).map_err(|e| TmuxError {
         op,
         code: None,
         message: format!("failed to spawn tmux: {e}"),
@@ -702,7 +724,10 @@ pub enum SessionLiveness {
 /// — the whole point of the three-state split: a stalled control plane must never
 /// make a live session read as gone.
 pub fn session_liveness(name: &str) -> SessionLiveness {
-    match output_with_timeout(tmux(&["has-session", "-t", name]), tmux_cmd_timeout()) {
+    let Ok(command) = tmux(&["has-session", "-t", name]) else {
+        return SessionLiveness::Unknown;
+    };
+    match output_with_timeout(command, tmux_cmd_timeout()) {
         Ok(o) if o.status.success() => SessionLiveness::Alive,
         Ok(_) => SessionLiveness::Gone,
         Err(_) => SessionLiveness::Unknown,
@@ -787,10 +812,9 @@ pub fn has_session(name: &str) -> bool {
 /// purpose. Best-effort — the session already exists and is streaming, so we
 /// never fail an attach over this.
 pub fn reassert_window_size_latest(name: &str) {
-    let _ = output_with_timeout(
-        tmux(&["set-option", "-t", name, "window-size", "latest"]),
-        tmux_cmd_timeout(),
-    );
+    if let Ok(command) = tmux(&["set-option", "-t", name, "window-size", "latest"]) {
+        let _ = output_with_timeout(command, tmux_cmd_timeout());
+    }
 }
 
 /// Perform bounded, non-destructive maintenance on one exact live session.
@@ -841,7 +865,7 @@ pub fn maintain_session(name: &str) -> Result<(), TmuxError> {
 /// kept for tests, which spawn plain shells and don't need the tree sweep.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn kill_session(name: &str) -> Result<(), TmuxError> {
-    let output = output_with_timeout(tmux(&["kill-session", "-t", name]), tmux_cmd_timeout())
+    let output = output_with_timeout(tmux(&["kill-session", "-t", name])?, tmux_cmd_timeout())
         .map_err(|e| TmuxError {
             op: "kill-session",
             code: None,
@@ -880,115 +904,194 @@ fn exact_effect_target(name: &str) -> Result<(), TmuxError> {
     Ok(())
 }
 
-fn session_effect_identity_script(name: &str) -> String {
-    format!(
-        r#"set -eu
-pane=$(tmux -L {socket} list-panes -t '{name}' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}')
-case "$pane" in *$'\n'*) exit 30;; esac
-IFS='|' read -r tmux_session_id tmux_session_created tmux_window_id tmux_pane_id pane_pid extra <<EOF
-$pane
-EOF
-[ -z "${{extra:-}}" ]
-pane_stat=$(cat "/proc/$pane_pid/stat")
-rest=${{pane_stat##*) }}
-set -- $rest
-[ "$#" -ge 20 ]
-pane_process_group_id=$3
-pane_process_session_id=$4
-pane_start_ticks=${{20}}
-foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
-case "$pane_process_group_id:$pane_process_session_id:$pane_start_ticks:$foreground_pid" in ''|*[!0-9:]*) exit 32;; esac
-foreground_stat=$(cat "/proc/$foreground_pid/stat")
-rest=${{foreground_stat##*) }}
-set -- $rest
-[ "$#" -ge 20 ]
-foreground_process_group_id=$3
-foreground_process_session_id=$4
-foreground_start_ticks=${{20}}
-case "$foreground_process_group_id:$foreground_process_session_id:$foreground_start_ticks" in ''|*[!0-9:]*) exit 33;; esac
-[ "$foreground_pid" = "$foreground_process_group_id" ]
-[ "$foreground_process_session_id" = "$pane_process_session_id" ]
-pane_after=$(tmux -L {socket} list-panes -t '{name}' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}')
-[ "$pane_after" = "$pane" ]
-pane_stat_after=$(cat "/proc/$pane_pid/stat")
-rest=${{pane_stat_after##*) }}
-set -- $rest
-[ "${{20}}" = "$pane_start_ticks" ]
-foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
-[ "$foreground_after" = "$foreground_pid" ]
-foreground_stat_after=$(cat "/proc/$foreground_pid/stat")
-rest=${{foreground_stat_after##*) }}
-set -- $rest
-[ "$3:$4:${{20}}" = "$foreground_process_group_id:$foreground_process_session_id:$foreground_start_ticks" ]
-printf 'THSE1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-  "$tmux_session_id" "$tmux_session_created" "$tmux_window_id" "$tmux_pane_id" \
-  "$pane_pid" "$pane_start_ticks" "$pane_process_group_id" "$pane_process_session_id" \
-  "$foreground_pid" "$foreground_start_ticks" "$foreground_process_group_id" "$foreground_process_session_id"
-"#,
-        socket = socket(),
-        name = name,
-    )
-}
+const EXACT_SESSION_EFFECT_PY: &str = r##"
+import json, os, re, signal, subprocess, sys
 
-fn parse_session_effect_identity(value: &str) -> Option<SessionEffectIdentity> {
-    let mut fields = value.trim().split('|');
-    if fields.next()? != "THSE1" {
-        return None;
-    }
-    let parse_prefixed = |value: Option<&str>, prefix: char| {
-        value
-            .and_then(|value| value.strip_prefix(prefix))
-            .and_then(|value| value.parse::<u64>().ok())
-    };
-    let parse_u64 = |value: Option<&str>| value.and_then(|value| value.parse::<u64>().ok());
-    let parse_u32 = |value: Option<&str>| {
-        value
-            .and_then(|value| value.parse::<u64>().ok())
-            .and_then(|value| u32::try_from(value).ok())
-    };
-    let identity = SessionEffectIdentity {
-        tmux_session_id: parse_prefixed(fields.next(), '$')?,
-        tmux_session_created: parse_u64(fields.next())?,
-        tmux_window_id: parse_prefixed(fields.next(), '@')?,
-        tmux_pane_id: parse_prefixed(fields.next(), '%')?,
-        pane_pid: parse_u32(fields.next())?,
-        pane_start_ticks: parse_u64(fields.next())?,
-        pane_process_group_id: parse_u32(fields.next())?,
-        pane_process_session_id: parse_u32(fields.next())?,
-        foreground_pid: parse_u32(fields.next())?,
-        foreground_start_ticks: parse_u64(fields.next())?,
-        foreground_process_group_id: parse_u32(fields.next())?,
-        foreground_process_session_id: parse_u32(fields.next())?,
-    };
-    if fields.next().is_some()
-        || identity.tmux_session_created == 0
-        || identity.pane_pid == 0
-        || identity.pane_start_ticks == 0
-        || identity.pane_process_group_id == 0
-        || identity.pane_process_session_id == 0
-        || identity.foreground_pid == 0
-        || identity.foreground_start_ticks == 0
-        || identity.foreground_process_group_id != identity.foreground_pid
-        || identity.foreground_process_session_id != identity.pane_process_session_id
+def refuse(code):
+    raise SystemExit(code)
+
+def proc_stat(pid):
+    try:
+        raw = open(f"/proc/{pid}/stat", "r", encoding="ascii").read()
+        fields = raw.rsplit(") ", 1)[1].split()
+        if len(fields) < 20:
+            refuse(40)
+        return {
+            "pid": int(pid), "ppid": int(fields[1]), "pgrp": int(fields[2]),
+            "sid": int(fields[3]), "tpgid": int(fields[5]), "start": int(fields[19]),
+        }
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+        refuse(41)
+
+def prefixed(value, prefix):
+    if not value.startswith(prefix):
+        refuse(42)
+    return int(value[1:])
+
+def observe(socket_name, target):
+    try:
+        result = subprocess.run(
+            ["tmux", "-L", socket_name, "list-panes", "-t", target, "-F",
+             "#{session_id}|#{session_created}|#{window_id}|#{pane_id}|#{pane_pid}"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        refuse(43)
+    lines = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or result.stderr or len(lines) != 1:
+        refuse(44)
+    parts = lines[0].split("|")
+    if len(parts) != 5:
+        refuse(45)
+    try:
+        pane_pid = int(parts[4])
+        pane = proc_stat(pane_pid)
+        foreground_pid = pane["tpgid"]
+        foreground = proc_stat(foreground_pid)
+        identity = {
+            "tmux_session_id": prefixed(parts[0], "$"),
+            "tmux_session_created": int(parts[1]),
+            "tmux_window_id": prefixed(parts[2], "@"),
+            "tmux_pane_id": prefixed(parts[3], "%"),
+            "pane_pid": pane_pid,
+            "pane_start_ticks": pane["start"],
+            "pane_process_group_id": pane["pgrp"],
+            "pane_process_session_id": pane["sid"],
+            "foreground_pid": foreground_pid,
+            "foreground_start_ticks": foreground["start"],
+            "foreground_process_group_id": foreground["pgrp"],
+            "foreground_process_session_id": foreground["sid"],
+        }
+    except (ValueError, IndexError):
+        refuse(46)
+    if (identity["tmux_session_created"] <= 0 or pane_pid <= 0 or
+        foreground_pid <= 0 or foreground["pgrp"] != foreground_pid or
+        foreground["sid"] != pane["sid"]):
+        refuse(47)
+    return identity
+
+def scan_owned_tree(root_pid, required_sid):
+    owned, depths, stats, pending = [], {}, {}, [(root_pid, 0)]
+    while pending:
+        pid, depth = pending.pop()
+        if pid in depths or len(owned) >= 512:
+            refuse(48)
+        item = proc_stat(pid)
+        if item["sid"] != required_sid:
+            refuse(49)
+        depths[pid] = depth
+        stats[pid] = item
+        owned.append(pid)
+        try:
+            raw_children = open(
+                f"/proc/{pid}/task/{pid}/children", "r", encoding="ascii").read()
+            children = [] if not raw_children.strip() else [
+                int(value) for value in raw_children.split()]
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            refuse(66)
+        pending.extend((child, depth + 1) for child in children)
+    return owned, depths, stats
+
+def same_stat(left, right):
+    return all(left[key] == right[key] for key in ("pid", "ppid", "pgrp", "sid", "start"))
+
+mode, socket_name, target = sys.argv[1:4]
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", socket_name):
+    refuse(50)
+if not re.fullmatch(r"[A-Za-z0-9_=-]{1,128}", target):
+    refuse(51)
+first = observe(socket_name, target)
+if mode == "observe":
+    print(json.dumps(first, separators=(",", ":")))
+    raise SystemExit(0)
+if mode != "kill" or len(sys.argv) != 5:
+    refuse(52)
+try:
+    expected = json.loads(sys.argv[4])
+except (TypeError, ValueError):
+    refuse(53)
+if first != expected:
+    refuse(54)
+
+owned, depths, stats = scan_owned_tree(first["pane_pid"], first["pane_process_session_id"])
+if first["foreground_pid"] not in stats:
+    refuse(55)
+pidfds = {}
+try:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        refuse(56)
+    for pid in owned:
+        try:
+            pidfds[pid] = os.pidfd_open(pid, 0)
+        except (OSError, PermissionError, ProcessLookupError):
+            refuse(57)
+    for pid in owned:
+        if not same_stat(stats[pid], proc_stat(pid)):
+            refuse(58)
+    second_owned, _, second_stats = scan_owned_tree(
+        first["pane_pid"], first["pane_process_session_id"])
+    if set(second_owned) != set(owned):
+        refuse(59)
+    for pid in owned:
+        if not same_stat(stats[pid], second_stats[pid]):
+            refuse(60)
+    if observe(socket_name, target) != expected:
+        refuse(61)
+    for pid in owned:
+        try:
+            signal.pidfd_send_signal(pidfds[pid], 0, None, 0)
+        except (OSError, PermissionError, ProcessLookupError):
+            refuse(62)
+    final_owned, _, final_stats = scan_owned_tree(
+        first["pane_pid"], first["pane_process_session_id"])
+    if set(final_owned) != set(owned):
+        refuse(63)
+    for pid in owned:
+        if not same_stat(stats[pid], final_stats[pid]):
+            refuse(64)
+    if observe(socket_name, target) != expected:
+        refuse(65)
+    for pid in sorted(owned, key=lambda value: (depths[value], value), reverse=True):
+        signal.pidfd_send_signal(pidfds[pid], signal.SIGKILL, None, 0)
+finally:
+    for descriptor in pidfds.values():
+        os.close(descriptor)
+"##;
+
+fn exact_effect_command() -> Command {
+    #[cfg(windows)]
     {
-        return None;
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("wsl.exe");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg("python3")
+            .arg("-c")
+            .arg(EXACT_SESSION_EFFECT_PY);
+        command.creation_flags(0x0800_0000);
+        command
     }
-    Some(identity)
+    #[cfg(unix)]
+    {
+        let mut command = Command::new("python3");
+        command.arg("-c").arg(EXACT_SESSION_EFFECT_PY);
+        command
+    }
 }
 
 pub(crate) fn observe_session_effect_identity(
     name: &str,
 ) -> Result<SessionEffectIdentity, TmuxError> {
     exact_effect_target(name)?;
-    let script = session_effect_identity_script(name);
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
-            TmuxError {
-                op: "observe-session-effect",
-                code: None,
-                message: format!("failed to inspect exact session effect identity: {error}"),
-            }
-        })?;
+    let socket = validated_socket_name()?;
+    let mut command = exact_effect_command();
+    command.args(["observe", socket, name]);
+    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
+        op: "observe-session-effect",
+        code: None,
+        message: format!("failed to inspect exact session effect identity: {error}"),
+    })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "observe-session-effect",
@@ -996,13 +1099,23 @@ pub(crate) fn observe_session_effect_identity(
             message: "exact session effect identity is unavailable or ambiguous".into(),
         });
     }
-    parse_session_effect_identity(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-        TmuxError {
-            op: "observe-session-effect",
-            code: None,
-            message: "exact session effect identity is malformed".into(),
-        }
+    serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
+        op: "observe-session-effect",
+        code: None,
+        message: "exact session effect identity is malformed".into(),
     })
+}
+
+#[cfg(test)]
+type ExactEffectHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static BEFORE_EXACT_EFFECT_HOOK: LazyLock<std::sync::Mutex<Option<(String, ExactEffectHook)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) fn set_before_exact_effect_hook(target: &str, hook: ExactEffectHook) {
+    *BEFORE_EXACT_EFFECT_HOOK.lock().unwrap() = Some((target.to_string(), hook));
 }
 
 /// Retire only the exact process generation recorded before the durable prepare.
@@ -1022,45 +1135,29 @@ pub(crate) fn kill_session_tree_exact(
             message: "exact session effect identity changed before retirement".into(),
         });
     }
-    let expected_line = format!(
-        "THSE1|${}|{}|@{}|%{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        expected.tmux_session_id,
-        expected.tmux_session_created,
-        expected.tmux_window_id,
-        expected.tmux_pane_id,
-        expected.pane_pid,
-        expected.pane_start_ticks,
-        expected.pane_process_group_id,
-        expected.pane_process_session_id,
-        expected.foreground_pid,
-        expected.foreground_start_ticks,
-        expected.foreground_process_group_id,
-        expected.foreground_process_session_id,
-    );
-    let script = format!(
-        r#"set -eu
-observed=$({observe})
-[ "$observed" = '{expected_line}' ]
-kill -9 -- -{foreground_group} 2>/dev/null || true
-if [ '{pane_group}' != '{foreground_group}' ]; then
-  kill -9 -- -{pane_group} 2>/dev/null || true
-fi
-kill -9 {pane_pid} 2>/dev/null || true
-"#,
-        observe = session_effect_identity_script(name),
-        expected_line = expected_line,
-        foreground_group = expected.foreground_process_group_id,
-        pane_group = expected.pane_process_group_id,
-        pane_pid = expected.pane_pid,
-    );
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
-            TmuxError {
-                op: "kill-session-tree-exact",
-                code: None,
-                message: format!("failed to retire exact session process identity: {error}"),
-            }
-        })?;
+    #[cfg(test)]
+    let hook = {
+        let mut pending = BEFORE_EXACT_EFFECT_HOOK.lock().unwrap();
+        (pending.as_ref().map(|(target, _)| target.as_str()) == Some(name))
+            .then(|| pending.take().expect("matching exact effect hook").1)
+    };
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook();
+    }
+    let socket = validated_socket_name()?;
+    let encoded = serde_json::to_string(&expected).map_err(|_| TmuxError {
+        op: "kill-session-tree-exact",
+        code: None,
+        message: "exact session effect identity could not be encoded".into(),
+    })?;
+    let mut command = exact_effect_command();
+    command.args(["kill", socket, name, &encoded]);
+    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
+        op: "kill-session-tree-exact",
+        code: None,
+        message: format!("failed to retire exact session process identity: {error}"),
+    })?;
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
@@ -1072,61 +1169,42 @@ kill -9 {pane_pid} 2>/dev/null || true
     }
 }
 
-/// Like [`kill_session`] but GUARANTEES the pane process tree dies. `tmux
-/// kill-session` only SIGHUPs the pane process group, so a `claude` that
-/// ignores/handles SIGHUP survives and leaks (the orphan growth behind the
-/// ~4.5 GB). So we first enumerate THIS session's pane pids and SIGKILL each pid
-/// plus FOUR levels of descendants — the pane is a login shell (`zsh -ilc 'claude
-/// …'`), so the depths are L0=shell, L1=claude, L2=claude's node/MCP children,
-/// L3=their children — STRICTLY scoped to the named session's pid subtree (never a
-/// `pkill`-by-name, and never a process-GROUP kill, either of which could reach
-/// another workspace), then kill the session. Runs through the same `bash -lc`
-/// helper as [`pane_info`] (on Windows `wsl.exe -e bash`) so the single-quoted tmux
-/// `#{...}` format survives the round-trip (a bare `#` is eaten as a shell comment
-/// under wsl.exe). Best-effort: a daemonized escapee (its own setsid) survives any
-/// signal-based reap, as it would under tmux too. Idempotent — an already-gone /
-/// no-server session is success; but a REAL kill-session failure now propagates
-/// (no blanket `exit 0`) so a genuine reap failure surfaces instead of silently
-/// leaking.
+/// Kill one exact verified pane tree through pidfds.
+///
+/// An already-gone session is idempotent success. Every live process must remain
+/// in the verified pane process session and exact ancestry through pidfd capture,
+/// final rescan, and child-first signaling.
 pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
-    // Each kill in the loop is `2>/dev/null` (a dead/raced pid is fine), but the
-    // FINAL `kill-session` is NOT suppressed and is the LAST command, so the
-    // script's exit status == kill-session's: 0 on success, non-zero+stderr on a
-    // real failure (which the caller surfaces), and the already-gone case is
-    // absorbed below.
-    let script = format!(
-        "for pid in $(tmux -L {sock} list-panes -t '{name}' -F '#{{pane_pid}}' 2>/dev/null); do \
-l1=$(pgrep -P \"$pid\" 2>/dev/null); \
-l2=$(for k in $l1; do pgrep -P \"$k\" 2>/dev/null; done); \
-l3=$(for k in $l2; do pgrep -P \"$k\" 2>/dev/null; done); \
-kill -9 $pid $l1 $l2 $l3 2>/dev/null; \
-done; \
-tmux -L {sock} kill-session -t '{name}'",
-        sock = socket(),
-        name = name,
-    );
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
-            TmuxError {
-                op: "kill-session-tree",
-                code: None,
-                message: format!("failed to spawn tmux: {e}"),
+    let mut last_error = None;
+    for _ in 0..5 {
+        if session_liveness(name) == SessionLiveness::Gone {
+            return Ok(());
+        }
+        let identity = observe_session_effect_identity(name)?;
+        match kill_session_tree_exact(name, identity) {
+            Ok(()) => break,
+            Err(error) => {
+                last_error = Some(error);
+                if session_liveness(name) != SessionLiveness::Alive {
+                    break;
+                }
+                std::thread::yield_now();
             }
-        })?;
-    if output.status.success() {
-        return Ok(());
+        }
     }
-    // Idempotent success when the session is simply already gone (is_already_gone
-    // already subsumes the no-server case). A genuine failure falls through to Err.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if is_already_gone(&stderr) {
-        return Ok(());
+    match session_liveness(name) {
+        SessionLiveness::Gone => Ok(()),
+        SessionLiveness::Alive => Err(last_error.unwrap_or(TmuxError {
+            op: "kill-session-tree",
+            code: None,
+            message: "verified pane tree remained alive after pidfd retirement".into(),
+        })),
+        SessionLiveness::Unknown => Err(TmuxError {
+            op: "kill-session-tree",
+            code: None,
+            message: "pane liveness is indeterminate after pidfd retirement".into(),
+        }),
     }
-    Err(TmuxError {
-        op: "kill-session-tree",
-        code: output.status.code(),
-        message: stderr.trim().to_string(),
-    })
 }
 
 /// List all session names on the `t-hub` socket.
@@ -1146,7 +1224,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     // name is everything before the first colon. This needs no format argument
     // and survives the wsl.exe round-trip intact.
     let output =
-        output_with_timeout(tmux(&["list-sessions"]), tmux_cmd_timeout()).map_err(|e| {
+        output_with_timeout(tmux(&["list-sessions"])?, tmux_cmd_timeout()).map_err(|e| {
             TmuxError {
                 op: "list-sessions",
                 code: None,
@@ -1214,9 +1292,8 @@ pub struct ActiveCodexRollout {
 /// exact runtime join without guessing from cwd, timestamps, or display text.
 /// This is called only when History is requested, never from a background poll.
 fn active_codex_rollouts_script() -> String {
-    format!(
-        "set -o pipefail; pane_count=0; result_count=0; \
-tmux -L {sock} list-panes -a -F '#{{session_name}}|#{{pane_pid}}' \
+    "set -o pipefail; socket=$1; pane_count=0; result_count=0; \
+tmux -L \"$socket\" list-panes -a -F '#{session_name}|#{pane_pid}' \
 | while IFS='|' read -r session root; do \
 pane_count=$((pane_count + 1)); \
 if [ \"$pane_count\" -gt 512 ]; then echo 'active-codex-rollouts: pane bound exceeded' >&2; exit 70; fi; \
@@ -1240,21 +1317,22 @@ echo 'active-codex-rollouts: fd inspection failed' >&2; exit 75; fi; \
 case \"$target\" in */.codex/sessions/*/rollout-*.jsonl) \
 result_count=$((result_count + 1)); \
 if [ \"$result_count\" -gt 512 ]; then echo 'active-codex-rollouts: result bound exceeded' >&2; exit 78; fi; \
-printf '%s|%s\\n' \"$session\" \"$target\";; esac; done; done; done | sort -u",
-        sock = socket()
-    )
+printf '%s|%s\\n' \"$session\" \"$target\";; esac; done; done; done | sort -u"
+        .to_string()
 }
 
 pub fn active_codex_rollouts() -> Result<Vec<ActiveCodexRollout>, TmuxError> {
     let script = active_codex_rollouts_script();
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
-            TmuxError {
-                op: "active-codex-rollouts",
-                code: None,
-                message: format!("failed to inspect Codex runtime identity: {e}"),
-            }
-        })?;
+    let socket = validated_socket_name()?;
+    let output = output_with_timeout(
+        pane_info_command_with_args(&script, &[socket]),
+        tmux_cmd_timeout(),
+    )
+    .map_err(|e| TmuxError {
+        op: "active-codex-rollouts",
+        code: None,
+        message: format!("failed to inspect Codex runtime identity: {e}"),
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_no_server(&stderr) || stderr.contains("error connecting to") {
@@ -1321,9 +1399,9 @@ pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
     // inspecting only its immediate children misses launchers such as
     // shell -> node -> native codex. Best-effort: no foreground pid / no match
     // leaves the original command intact.
-    let script = format!(
-        "tmux -L {sock} list-panes -a -F \
-'#{{session_name}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_pid}}' \
+    let socket = validated_socket_name()?;
+    let script = "socket=$1; tmux -L \"$socket\" list-panes -a -F \
+'#{session_name}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}' \
 | while IFS='|' read -r s cmd path pid; do eff=\"$cmd\"; \
 case \"$cmd\" in node|bun|deno|python|python3) \
 for kid in $(pgrep -P \"$pid\" 2>/dev/null); do \
@@ -1334,17 +1412,16 @@ fgpid=$(ps -o tpgid= -p \"$pid\" 2>/dev/null | tr -d ' '); \
 case \"$fgpid\" in ''|*[!0-9]*|0) fgpid=\"$pid\";; esac; \
 line=$(tr '\\0' ' ' < /proc/$fgpid/cmdline 2>/dev/null); \
 case \"$line\" in *codex*) eff=codex;; *claude*) eff=claude;; esac;; esac; \
-printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
-        sock = socket()
-    );
-    let output =
-        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
-            TmuxError {
-                op: "list-panes",
-                code: None,
-                message: format!("failed to spawn tmux: {e}"),
-            }
-        })?;
+printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done";
+    let output = output_with_timeout(
+        pane_info_command_with_args(script, &[socket]),
+        tmux_cmd_timeout(),
+    )
+    .map_err(|e| TmuxError {
+        op: "list-panes",
+        code: None,
+        message: format!("failed to spawn tmux: {e}"),
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_no_server(&stderr) || stderr.contains("error connecting to") {
@@ -1378,7 +1455,7 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
     Ok(out)
 }
 
-/// Build the `bash -lc <script>` command used by [`pane_info`]. On Windows this
+/// Build the `bash -lc <script> <args...>` command used by [`pane_info`]. On Windows this
 /// goes through `wsl.exe` (CREATE_NO_WINDOW so no console flashes); on Unix it
 /// runs `bash -lc` directly. The single-quoted tmux format inside `script` is what
 /// protects `#{...}` from being eaten as a shell comment.
@@ -1392,24 +1469,31 @@ printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
 /// That empty cwd/title is exactly what made the sidebar fall back to the raw 8-char
 /// id and the tile header go blank. `-e` makes the real bash run; the data is clean.
 #[cfg(windows)]
-fn pane_info_command(script: &str) -> Command {
+fn pane_info_command_with_args(script: &str, args: &[&str]) -> Command {
     use std::os::windows::process::CommandExt;
-    let mut c = Command::new("wsl.exe");
-    c.arg("--cd")
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("--cd")
         .arg("~")
         .arg("-e")
         .arg("bash")
         .arg("-lc")
-        .arg(script);
-    c.creation_flags(0x0800_0000);
-    c
+        .arg(script)
+        .arg("t-hub-script")
+        .args(args);
+    command.creation_flags(0x0800_0000);
+    command
 }
 
 #[cfg(unix)]
-fn pane_info_command(script: &str) -> Command {
-    let mut c = Command::new("bash");
-    c.arg("-lc").arg(script);
-    c
+fn pane_info_command_with_args(script: &str, args: &[&str]) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(script)
+        .arg("t-hub-script")
+        .args(args);
+    command
 }
 
 /// Capture the visible pane of `name` as **plain text** (no ANSI escapes),
@@ -1516,14 +1600,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pane_scans_use_bash_for_pipefail_semantics() {
-        let command = pane_info_command("set -o pipefail; printf ok");
+        let command = pane_info_command_with_args("set -o pipefail; printf '%s' \"$1\"", &["ok"]);
         assert_eq!(command.get_program(), "bash");
         assert_eq!(
             command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-            vec!["-lc", "set -o pipefail; printf ok"]
+            vec![
+                "-lc",
+                "set -o pipefail; printf '%s' \"$1\"",
+                "t-hub-script",
+                "ok"
+            ]
         );
     }
 
@@ -1534,6 +1623,83 @@ mod tests {
         assert!(script.contains("process depth bound exceeded"));
         assert!(script.contains("for parent in $frontier"));
         assert!(script.contains("result bound exceeded"));
+    }
+
+    #[test]
+    fn socket_name_validation_rejects_shell_and_option_shapes_without_effect() {
+        let marker = std::env::temp_dir().join(format!(
+            "t-hub-hostile-socket-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let marker_text = marker.to_string_lossy();
+        let hostile = vec![
+            "has space".to_string(),
+            "has'quote".to_string(),
+            "has\"quote".to_string(),
+            "semi;colon".to_string(),
+            format!("$(touch {marker_text})"),
+            format!("`touch {marker_text}`"),
+            "line\nbreak".to_string(),
+            "-option-like".to_string(),
+        ];
+        for value in hostile {
+            let error = validate_socket_name(&value).unwrap_err();
+            assert_eq!(error.op, "validate-socket");
+            assert!(!error.message.contains(&value));
+        }
+        assert!(!marker.exists());
+        assert_eq!(
+            validate_socket_name("t-hub.dev_01").unwrap(),
+            "t-hub.dev_01"
+        );
+    }
+
+    #[test]
+    fn hostile_socket_environment_subprocess_helper() {
+        if std::env::var("T_HUB_HOSTILE_SOCKET_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        let error = list_sessions().unwrap_err();
+        assert_eq!(error.op, "validate-socket");
+        assert!(!error.message.contains(socket()));
+    }
+
+    #[test]
+    fn hostile_socket_environment_fails_closed_before_process_effect() {
+        let marker = std::env::temp_dir().join(format!(
+            "t-hub-hostile-socket-env-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let marker_text = marker.to_string_lossy();
+        let hostile = [
+            "has space".to_string(),
+            "has'quote".to_string(),
+            "has\"quote".to_string(),
+            "semi;colon".to_string(),
+            format!("$(touch {marker_text})"),
+            format!("`touch {marker_text}`"),
+            "line\nbreak".to_string(),
+            "-option-like".to_string(),
+        ];
+        let test_binary = std::env::current_exe().unwrap();
+        for value in hostile {
+            let output = Command::new(&test_binary)
+                .args([
+                    "--exact",
+                    "tmux::tests::hostile_socket_environment_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("T_HUB_HOSTILE_SOCKET_HELPER", "1")
+                .env("T_HUB_TMUX_SOCKET", value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!marker.exists());
+        }
     }
 
     /// True when a real `tmux` binary is reachable for the tests below. These
@@ -1611,6 +1777,32 @@ mod tests {
         );
         assert!(parse_pane_generation("$0|0|@0|%0|456").is_none());
         assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
+    }
+
+    #[test]
+    fn pidfd_effect_refuses_same_pane_replacement_at_final_seam() {
+        if !tmux_available() {
+            eprintln!("pidfd effect seam test skipped: tmux unavailable");
+            return;
+        }
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", Some("sleep 60"), &[]).unwrap();
+        let expected = observe_session_effect_identity(&session.name).unwrap();
+        let hook_target = session.name.clone();
+        set_before_exact_effect_hook(
+            &session.name,
+            Box::new(move || {
+                respawn_pane_exact(&hook_target, "/tmp", "sleep 60").unwrap();
+            }),
+        );
+
+        let error = kill_session_tree_exact(&session.name, expected).unwrap_err();
+        assert_eq!(error.op, "kill-session-tree-exact");
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Alive);
+        assert_ne!(
+            observe_session_effect_identity(&session.name).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -1893,7 +2085,7 @@ mod tests {
         // `window-size <mode>`; we return just the mode token.
         fn window_size_mode(name: &str) -> String {
             let out = output_with_timeout(
-                tmux(&["show-options", "-w", "-t", name, "window-size"]),
+                tmux(&["show-options", "-w", "-t", name, "window-size"]).unwrap(),
                 tmux_cmd_timeout(),
             )
             .expect("show-options should run");

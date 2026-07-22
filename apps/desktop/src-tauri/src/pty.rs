@@ -193,6 +193,7 @@ pub fn spawn_attach_client(
     cols: u16,
     rows: u16,
 ) -> Result<PtySession, String> {
+    tmux::validated_socket_name().map_err(|error| error.to_string())?;
     let size = PtySize {
         rows,
         cols,
@@ -492,6 +493,7 @@ pub fn stream_attach_to_sink(
     keepalive: Duration,
     on_stream_end: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<PtyStreamHandle, String> {
+    tmux::validated_socket_name().map_err(|error| error.to_string())?;
     let size = PtySize {
         rows,
         cols,

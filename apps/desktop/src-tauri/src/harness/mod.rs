@@ -529,6 +529,8 @@ printf 'THPA3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
 cat "$cmdline"
 "#;
 
+    let tmux_socket = crate::tmux::validated_socket_name()
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     #[cfg(windows)]
     let command = {
         use std::os::windows::process::CommandExt;
@@ -541,7 +543,7 @@ cat "$cmdline"
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-permission-attestation")
-            .arg(crate::tmux::socket())
+            .arg(tmux_socket)
             .arg(tmux_target);
         command.creation_flags(0x0800_0000);
         command
@@ -553,7 +555,7 @@ cat "$cmdline"
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-permission-attestation")
-            .arg(crate::tmux::socket())
+            .arg(tmux_socket)
             .arg(tmux_target);
         command
     };
