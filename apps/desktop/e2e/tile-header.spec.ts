@@ -42,16 +42,44 @@ async function installGitMock(page: Page): Promise<void> {
     const host = window as typeof window & Record<string, unknown>;
     host.__TAURI_INTERNALS__ = {
       invoke: async (command: string, args?: Record<string, unknown>) => {
-        if (command === "control_request" && args?.command === "git_info") {
-          return {
-            isRepo: true,
-            branch: "feature/an-exceptionally-long-dirty-worktree-branch-name",
-            worktreeRoot: "/home/natkins/projects/repository",
-            isLinkedWorktree: true,
-            dirtyCount: 27,
-            headCommit: "0123456789abcdef",
-          };
+        if (command === "control_request") {
+          if (args?.command === "git_info") {
+            return {
+              isRepo: true,
+              branch: "feature/an-exceptionally-long-dirty-worktree-branch-name",
+              worktreeRoot: "/home/natkins/projects/repository",
+              isLinkedWorktree: true,
+              dirtyCount: 27,
+              headCommit: "0123456789abcdef",
+            };
+          }
+          if (args?.command === "reconcile_cortana") {
+            const request = args.args as Record<string, unknown> | undefined;
+            return {
+              operationId: String(request?.operationId ?? "browser-fixture"),
+              action: "keep",
+              healthy: true,
+              terminalId: "browser-cortana",
+              identityId: "browser-cortana-identity",
+              generation: 1,
+              degradedReason: null,
+            };
+          }
+          if (args?.command === "history_list") {
+            return {
+              schemaVersion: 1,
+              generatedAt: new Date(0).toISOString(),
+              revision: "browser-fixture",
+              entries: [],
+              count: 0,
+              total: 0,
+              truncated: false,
+              sources: [],
+            };
+          }
+          if (args?.command === "recent_sessions") return [];
         }
+        if (command === "plugin:event|listen") return callbackId;
         throw {
           message: `Browser fixture does not implement ${command}`,
           retryable: false,
@@ -70,6 +98,10 @@ async function installGitMock(page: Page): Promise<void> {
         delete host[`_${id}`];
       },
       convertFileSrc: (path: string) => path,
+      metadata: {
+        currentWindow: { label: "main" },
+        currentWebview: { windowLabel: "main", label: "main" },
+      },
     };
   });
 }
