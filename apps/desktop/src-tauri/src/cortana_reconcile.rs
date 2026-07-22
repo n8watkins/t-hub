@@ -92,6 +92,7 @@ pub struct CortanaExecutableIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CortanaManagedSystemTools {
+    pub python: CortanaExecutableIdentity,
     pub systemctl: CortanaExecutableIdentity,
     pub systemd_run: CortanaExecutableIdentity,
 }

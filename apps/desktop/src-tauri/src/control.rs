@@ -4065,6 +4065,34 @@ impl CaptainsRegistry {
                 return Err("durable Cortana has an invalid managed launch intent".into());
             }
             if let Some(launch) = durable.managed_launch.as_ref() {
+                let recovery_operation_id = match &durable.recovery {
+                    crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+                        operation_id,
+                        ..
+                    }
+                    | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                        operation_id,
+                        ..
+                    }
+                    | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+                        operation_id,
+                        ..
+                    }
+                    | crate::cortana_reconcile::CortanaRecoveryState::Degraded {
+                        operation_id,
+                        ..
+                    }
+                    | crate::cortana_reconcile::CortanaRecoveryState::Healthy {
+                        operation_id,
+                        ..
+                    } => Some(operation_id.as_str()),
+                    crate::cortana_reconcile::CortanaRecoveryState::Uninitialized => None,
+                };
+                if recovery_operation_id != Some(launch.operation_id.as_str()) {
+                    return Err(
+                        "durable Cortana managed launch and recovery operation disagree".into(),
+                    );
+                }
                 match launch.phase {
                     crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared => {
                         if durable.owner.is_some()
@@ -5452,6 +5480,15 @@ impl CaptainsRegistry {
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
+        if let Some(launch) = current.cortana.managed_launch.as_ref() {
+            if launch.operation_id == operation_id {
+                return Ok(current.cortana.clone());
+            }
+            return Err(format!(
+                "reconcile_cortana operation '{}' owns the durable managed launch",
+                launch.operation_id
+            ));
+        }
         if let crate::cortana_reconcile::CortanaRecoveryState::Recovering {
             operation_id: active,
             ..
@@ -5669,6 +5706,14 @@ impl CaptainsRegistry {
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
+        if let Some(launch) = current.cortana.managed_launch.as_ref() {
+            if launch.operation_id != operation_id {
+                return Err(
+                    "degraded Cortana operation does not match the durable managed launch".into(),
+                );
+            }
+            return Ok(());
+        }
         if matches!(
             &current.cortana.recovery,
             crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
@@ -18366,6 +18411,21 @@ fn valid_cortana_effect_identity(
         && identity.foreground_process_session_id == identity.pane_process_session_id
 }
 
+fn valid_cortana_python_tool(tool: &crate::cortana_reconcile::CortanaExecutableIdentity) -> bool {
+    (tool.path == "/usr/bin/python3"
+        || tool
+            .path
+            .strip_prefix("/usr/bin/python3.")
+            .is_some_and(|version| {
+                !version.is_empty()
+                    && version
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            }))
+        && tool.device > 0
+        && tool.inode > 0
+}
+
 fn valid_cortana_managed_owner(owner: &crate::cortana_reconcile::CortanaManagedOwnerToken) -> bool {
     let lowercase_hex_32 = |value: &str| {
         value.len() == 32
@@ -18404,6 +18464,7 @@ fn valid_cortana_managed_owner(owner: &crate::cortana_reconcile::CortanaManagedO
         && owner.launcher_start_ticks > 0
         && owner.launcher_pid == owner.tmux.pane_pid
         && owner.launcher_start_ticks == owner.tmux.pane_start_ticks
+        && valid_cortana_python_tool(&owner.tools.python)
         && valid_tool(&owner.tools.systemctl, "/systemctl")
         && valid_tool(&owner.tools.systemd_run, "/systemd-run")
         && valid_cortana_effect_identity(&owner.tmux)
@@ -18429,6 +18490,7 @@ fn valid_cortana_managed_launch(
         && matches!(launch.harness.as_str(), "codex" | "claude")
         && nonce_valid
         && launch.unit_name == format!("t-hub-{}.scope", launch.launch_nonce)
+        && valid_cortana_python_tool(&launch.tools.python)
         && valid_tool(&launch.tools.systemctl, "/usr/bin/systemctl")
         && valid_tool(&launch.tools.systemd_run, "/usr/bin/systemd-run")
 }
@@ -18462,6 +18524,11 @@ fn synthetic_cortana_managed_owner() -> crate::cortana_reconcile::CortanaManaged
         launcher_start_ticks: tmux.pane_start_ticks,
         launch_nonce: "a".repeat(32),
         tools: crate::cortana_reconcile::CortanaManagedSystemTools {
+            python: crate::cortana_reconcile::CortanaExecutableIdentity {
+                path: "/usr/bin/python3.12".into(),
+                device: 1,
+                inode: 3,
+            },
             systemctl: crate::cortana_reconcile::CortanaExecutableIdentity {
                 path: "/usr/bin/systemctl".into(),
                 device: 1,
@@ -18544,6 +18611,7 @@ fn durable_cortana_tools(
         }
     };
     crate::cortana_reconcile::CortanaManagedSystemTools {
+        python: durable_tool(&tools.python),
         systemctl: durable_tool(&tools.systemctl),
         systemd_run: durable_tool(&tools.systemd_run),
     }
@@ -18563,6 +18631,7 @@ fn tmux_cortana_launch(
         unit_name: launch.unit_name.clone(),
         launch_nonce: launch.launch_nonce.clone(),
         tools: tmux::ManagedSystemTools {
+            python: tmux_tool(&launch.tools.python),
             systemctl: tmux_tool(&launch.tools.systemctl),
             systemd_run: tmux_tool(&launch.tools.systemd_run),
         },
@@ -18604,6 +18673,7 @@ fn tmux_cortana_owner(
         launcher_start_ticks: owner.launcher_start_ticks,
         launch_nonce: owner.launch_nonce.clone(),
         tools: tmux::ManagedSystemTools {
+            python: tmux_tool(&owner.tools.python),
             systemctl: tmux_tool(&owner.tools.systemctl),
             systemd_run: tmux_tool(&owner.tools.systemd_run),
         },
@@ -18959,17 +19029,23 @@ fn reconcile_cortana(
         let _identity_transaction = ctx.tabs.identity_transaction();
         let _provision = ctx.captains.provision_guard();
         let existing = ctx.captains.cortana_identity();
-        operation_id = match &existing.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. }
-            | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
-                operation_id,
-                ..
+        operation_id = if let Some(launch) = existing.managed_launch.as_ref() {
+            launch.operation_id.clone()
+        } else {
+            match &existing.recovery {
+                crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+                    operation_id, ..
+                }
+                | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                    operation_id,
+                    ..
+                }
+                | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+                    operation_id,
+                    ..
+                } => operation_id.clone(),
+                _ => requested_operation_id,
             }
-            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                operation_id,
-                ..
-            } => operation_id.clone(),
-            _ => requested_operation_id,
         };
         let durable = ctx.captains.begin_cortana_recovery(&operation_id)?;
         let result = reconcile_cortana_inner(ctx, args, &operation_id, durable, false);
@@ -37601,6 +37677,7 @@ mod tests {
             "unitName": format!("t-hub-{}.scope", "a".repeat(32)),
             "launchNonce": "a".repeat(32),
             "tools": {
+                "python": {"path": "/usr/bin/python3.12", "device": 1, "inode": 3},
                 "systemctl": {"path": "/usr/bin/systemctl", "device": 1, "inode": 1},
                 "systemdRun": {"path": "/usr/bin/systemd-run", "device": 1, "inode": 2}
             },
@@ -37629,13 +37706,23 @@ mod tests {
             Err(SnapshotReadError::IncompatibleRecovery { .. })
         ));
 
-        let mut malformed = launch;
-        malformed["tools"]["systemctl"]["path"] = json!("/tmp/systemctl");
-        std::fs::write(
-            &path,
-            document(CAPTAINS_SCHEMA_VERSION, malformed).to_string(),
-        )
-        .unwrap();
+        for (tool, path_value) in [("python", "/tmp/python3"), ("systemctl", "/tmp/systemctl")] {
+            let mut malformed = launch.clone();
+            malformed["tools"][tool]["path"] = json!(path_value);
+            std::fs::write(
+                &path,
+                document(CAPTAINS_SCHEMA_VERSION, malformed).to_string(),
+            )
+            .unwrap();
+            assert!(matches!(
+                CaptainsRegistry::read_snapshot(&path),
+                Err(SnapshotReadError::IncompatibleRecovery { .. })
+            ));
+        }
+
+        let mut mismatched = document(CAPTAINS_SCHEMA_VERSION, launch);
+        mismatched["cortana"]["recovery"]["operation_id"] = json!("other-operation");
+        std::fs::write(&path, mismatched.to_string()).unwrap();
         assert!(matches!(
             CaptainsRegistry::read_snapshot(&path),
             Err(SnapshotReadError::IncompatibleRecovery { .. })
@@ -44953,6 +45040,11 @@ mod tests {
             unit_name: owner.unit_name.clone(),
             launch_nonce: owner.launch_nonce.clone(),
             tools: tmux::ManagedSystemTools {
+                python: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.python.path.clone(),
+                    device: owner.tools.python.device,
+                    inode: owner.tools.python.inode,
+                },
                 systemctl: tmux::ManagedExecutableIdentity {
                     path: owner.tools.systemctl.path.clone(),
                     device: owner.tools.systemctl.device,
@@ -45091,6 +45183,193 @@ mod tests {
         assert!(cleaned.owner.is_none());
         assert!(cleaned.terminal_id.is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_managed_launch_operation_survives_reload_and_rotated_dispatch_ids() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+
+        for observed_before_error in [false, true] {
+            let tag = if observed_before_error {
+                "observed"
+            } else {
+                "prepared"
+            };
+            let registry_path = captains_tmp(&format!("cortana-wal-operation-{tag}"));
+            let identity_path = captains_tmp(&format!("cortana-wal-operation-{tag}-identities"));
+            let _ = std::fs::remove_file(&registry_path);
+            let _ = std::fs::remove_file(&identity_path);
+            let captains = powder_lifecycle_registry(Some(registry_path.clone()));
+            let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+            let sink = Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            });
+            let mut ctx = test_ctx(&format!("cortana-wal-operation-{tag}"))
+                .with_captains_registry(captains.clone())
+                .with_identity_store(identities.clone())
+                .with_apply_sink(sink);
+            ctx.addr = "127.0.0.1:4242".into();
+            ctx.tab_registry().replace(vec![TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            }]);
+
+            let old_operation = format!("retained-{tag}-operation");
+            let rotated_operation = format!("rotated-{tag}-request");
+            let fresh_operation = format!("fresh-{tag}-request");
+            let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let identity = identities.mint(crate::identity::Role::Cortana).unwrap();
+            identities.bind_tile(&identity.id, &terminal_id).unwrap();
+            captains.begin_cortana_recovery(&old_operation).unwrap();
+            let launch = tmux::prepare_managed_runtime_launch().unwrap();
+            captains
+                .prepare_cortana_managed_launch(
+                    &old_operation,
+                    &terminal_id,
+                    &identity.id,
+                    1,
+                    "codex",
+                    &launch,
+                )
+                .unwrap();
+
+            let home = std::env::temp_dir().join(format!(
+                "t-hub-cortana-wal-operation-{tag}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let (harness_bin_dir, harness_command) = test_harness_command("codex");
+            let spawn_args = json!({
+                "cwd": home,
+                "name": "Cortana",
+                "startupCommand": harness_command,
+                "tabId": CAPTAIN_WORKSPACE_ID,
+            });
+            let mut elevation = elevation_env(&ctx, &spawn_args);
+            elevation.push((
+                crate::identity::SESSION_TOKEN_ENV.to_string(),
+                identity.secret.clone(),
+            ));
+            elevation.push((CORTANA_GENERATION_ENV.to_string(), "1".into()));
+            elevation.push((
+                PROVIDER_SESSION_ENV.to_string(),
+                pending_provider_marker("codex"),
+            ));
+            let pane = crate::commands::pane_command(None, Some(&harness_command));
+            let (_, target, owner) = spawn_managed_tmux_terminal_with_id(
+                &terminal_id,
+                home.to_str().unwrap(),
+                pane.as_deref(),
+                &elevation,
+                &launch,
+            )
+            .unwrap();
+            wait_for_harness_started(&terminal_id, "codex").unwrap();
+            if observed_before_error {
+                captains
+                    .record_cortana_runtime_owner(
+                        &old_operation,
+                        &terminal_id,
+                        durable_cortana_owner(owner),
+                    )
+                    .unwrap();
+            }
+
+            let application_error = dispatch(
+                &ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": old_operation,
+                    "testOrchestratorHome": "relative-home-is-invalid",
+                    "testStartupCommand": harness_command,
+                }),
+            )
+            .unwrap_err();
+            assert!(application_error.contains("orchestrator home must be an absolute POSIX path"));
+            let retained = captains.cortana_identity();
+            assert_eq!(
+                retained
+                    .managed_launch
+                    .as_ref()
+                    .map(|launch| launch.operation_id.as_str()),
+                Some(old_operation.as_str())
+            );
+            assert!(matches!(
+                retained.recovery,
+                crate::cortana_reconcile::CortanaRecoveryState::Recovering {
+                    ref operation_id,
+                    ..
+                } if operation_id == &old_operation
+            ));
+            drop(ctx);
+            drop(captains);
+
+            let restarted = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+            let sink = Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            });
+            let mut restarted_ctx = test_ctx(&format!("cortana-wal-operation-{tag}-restart"))
+                .with_captains_registry(restarted.clone())
+                .with_identity_store(identities.clone())
+                .with_apply_sink(sink);
+            restarted_ctx.addr = "127.0.0.1:4242".into();
+            restarted_ctx.tab_registry().replace(vec![TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![],
+            }]);
+            let recovered = dispatch(
+                &restarted_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": rotated_operation,
+                    "testOrchestratorHome": home,
+                    "testStartupCommand": harness_command,
+                }),
+            )
+            .unwrap();
+            assert_eq!(recovered["operationId"], old_operation);
+            let durable = restarted.cortana_identity();
+            assert!(durable.managed_launch.is_none());
+            assert!(matches!(
+                durable.recovery,
+                crate::cortana_reconcile::CortanaRecoveryState::Healthy {
+                    ref operation_id,
+                    ..
+                } if operation_id == &old_operation
+            ));
+
+            let fresh = dispatch(
+                &restarted_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": fresh_operation,
+                    "testOrchestratorHome": home,
+                    "testStartupCommand": harness_command,
+                }),
+            )
+            .unwrap();
+            assert_eq!(fresh["operationId"], fresh_operation);
+            assert!(restarted.cortana_identity().managed_launch.is_none());
+            let recovered_terminal = fresh["terminalId"].as_str().unwrap();
+            dispatch(
+                &restarted_ctx,
+                "close_terminal",
+                &json!({"sessionId": recovered_terminal}),
+            )
+            .unwrap();
+            assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+            std::fs::remove_dir_all(harness_bin_dir).ok();
+            std::fs::remove_dir_all(home).ok();
+            std::fs::remove_file(registry_path).ok();
+            std::fs::remove_file(identity_path).ok();
+        }
     }
 
     #[test]

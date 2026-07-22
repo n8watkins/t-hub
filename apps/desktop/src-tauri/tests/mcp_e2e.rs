@@ -1506,6 +1506,11 @@ fn continuity_control_fixture() -> (
             launcher_start_ticks: 200,
             launch_nonce: "a".repeat(32),
             tools: control::CortanaManagedSystemTools {
+                python: control::CortanaExecutableIdentity {
+                    path: "/usr/bin/python3.12".into(),
+                    device: 1,
+                    inode: 3,
+                },
                 systemctl: control::CortanaExecutableIdentity {
                     path: "/usr/bin/systemctl".into(),
                     device: 1,

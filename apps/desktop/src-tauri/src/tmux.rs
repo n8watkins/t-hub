@@ -156,6 +156,7 @@ pub(crate) struct ManagedExecutableIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ManagedSystemTools {
+    pub(crate) python: ManagedExecutableIdentity,
     pub(crate) systemctl: ManagedExecutableIdentity,
     pub(crate) systemd_run: ManagedExecutableIdentity,
 }
@@ -729,10 +730,11 @@ pub(crate) fn new_prepared_managed_session_with_env(
 }
 
 fn stop_managed_unit(tools: &ManagedSystemTools, unit_name: &str) -> Result<(), TmuxError> {
+    revalidate_managed_system_tools(tools)?;
     #[cfg(windows)]
     let mut command = {
         use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
+        let mut command = Command::new(trusted_wsl_path()?);
         command
             .arg("--cd")
             .arg("~")
@@ -1092,10 +1094,38 @@ fn exact_effect_target(name: &str) -> Result<(), TmuxError> {
 }
 
 const EXACT_SESSION_EFFECT_PY: &str = r##"
-import json, os, re, signal, subprocess, sys, time
+import json, os, re, signal, stat, subprocess, sys, time
+
+KNOWN_PYTHON = ("/usr/bin/python3", "/bin/python3")
 
 def refuse(code):
     raise SystemExit(code)
+
+def executable_identity(path, candidates):
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        refuse(68)
+    canonical_candidates = {os.path.realpath(candidate) for candidate in candidates}
+    canonical = os.path.realpath(path)
+    if canonical not in canonical_candidates or path != canonical:
+        refuse(69)
+    try:
+        details = os.stat(canonical, follow_symlinks=False)
+    except OSError:
+        refuse(70)
+    if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or
+        details.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or
+        not details.st_mode & stat.S_IXUSR):
+        refuse(71)
+    return {"path": canonical, "device": details.st_dev, "inode": details.st_ino}
+
+try:
+    expected_python = json.loads(sys.argv[1])
+except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+    refuse(72)
+actual_python = executable_identity(os.path.realpath(sys.executable), KNOWN_PYTHON)
+if actual_python != expected_python:
+    refuse(73)
+sys.argv = [sys.argv[0], *sys.argv[2:]]
 
 def proc_stat(pid):
     try:
@@ -1252,26 +1282,204 @@ finally:
         os.close(descriptor)
 "##;
 
-fn exact_effect_command() -> Command {
+const KNOWN_PYTHON_CANDIDATES: [&str; 2] = ["/usr/bin/python3", "/bin/python3"];
+
+#[cfg(unix)]
+fn trusted_python_identity() -> Result<ManagedExecutableIdentity, TmuxError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for candidate in KNOWN_PYTHON_CANDIDATES {
+        let Ok(path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let allowed = KNOWN_PYTHON_CANDIDATES
+            .iter()
+            .any(|candidate| std::fs::canonicalize(candidate).is_ok_and(|known| known == path));
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if allowed
+            && path.is_absolute()
+            && metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o022 == 0
+            && metadata.permissions().mode() & 0o100 != 0
+        {
+            return Ok(ManagedExecutableIdentity {
+                path: path.to_string_lossy().into_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+    }
+    Err(TmuxError {
+        op: "trusted-python",
+        code: None,
+        message: "trusted absolute Python interpreter is unavailable".into(),
+    })
+}
+
+#[cfg(unix)]
+fn revalidate_python_identity(expected: &ManagedExecutableIdentity) -> Result<(), TmuxError> {
+    let actual = trusted_python_identity()?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(TmuxError {
+            op: "trusted-python",
+            code: None,
+            message: "trusted Python interpreter identity changed".into(),
+        })
+    }
+}
+
+#[cfg(windows)]
+fn trusted_wsl_path() -> Result<std::path::PathBuf, TmuxError> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 32_768];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err(TmuxError {
+            op: "trusted-wsl",
+            code: None,
+            message: "Windows system directory is unavailable".into(),
+        });
+    }
+    let system_directory = std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+    let canonical_system = std::fs::canonicalize(&system_directory).map_err(|error| TmuxError {
+        op: "trusted-wsl",
+        code: None,
+        message: format!("Windows system directory could not be validated: {error}"),
+    })?;
+    let wsl =
+        std::fs::canonicalize(system_directory.join("wsl.exe")).map_err(|error| TmuxError {
+            op: "trusted-wsl",
+            code: None,
+            message: format!("Windows WSL host executable could not be validated: {error}"),
+        })?;
+    let metadata = std::fs::metadata(&wsl).map_err(|error| TmuxError {
+        op: "trusted-wsl",
+        code: None,
+        message: format!("Windows WSL host executable metadata is unavailable: {error}"),
+    })?;
+    let parent_matches = wsl.parent().is_some_and(|parent| {
+        parent
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&canonical_system.to_string_lossy())
+    });
+    let name_matches = wsl
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("wsl.exe"));
+    if !metadata.is_file() || !parent_matches || !name_matches {
+        return Err(TmuxError {
+            op: "trusted-wsl",
+            code: None,
+            message: "Windows WSL host executable is outside the system directory".into(),
+        });
+    }
+    Ok(wsl)
+}
+
+#[cfg(windows)]
+fn trusted_python_identity() -> Result<ManagedExecutableIdentity, TmuxError> {
+    let wsl = trusted_wsl_path()?;
+    let script = r#"import json, os, stat, sys
+for candidate in ('/usr/bin/python3', '/bin/python3'):
+    canonical = os.path.realpath(candidate)
+    try:
+        details = os.stat(canonical, follow_symlinks=False)
+    except OSError:
+        continue
+    if (canonical.startswith('/') and stat.S_ISREG(details.st_mode) and details.st_uid == 0
+        and not details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        and details.st_mode & stat.S_IXUSR):
+        print(json.dumps({'path': canonical, 'device': details.st_dev, 'inode': details.st_ino}, separators=(',', ':')))
+        raise SystemExit(0)
+raise SystemExit(1)"#;
+    let command = windows_helper_command(&wsl, "/usr/bin/python3", script, None);
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "trusted-python",
+                code: None,
+                message: format!("trusted Python interpreter resolution failed: {error}"),
+            })?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(TmuxError {
+            op: "trusted-python",
+            code: output.status.code(),
+            message: "trusted absolute Python interpreter is unavailable".into(),
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
+        op: "trusted-python",
+        code: None,
+        message: "trusted Python interpreter identity was malformed".into(),
+    })
+}
+
+#[cfg(windows)]
+fn revalidate_python_identity(expected: &ManagedExecutableIdentity) -> Result<(), TmuxError> {
+    let actual = trusted_python_identity()?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(TmuxError {
+            op: "trusted-python",
+            code: None,
+            message: "trusted Python interpreter identity changed".into(),
+        })
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_helper_command(
+    wsl: &std::path::Path,
+    python: &str,
+    script: &str,
+    identity: Option<&ManagedExecutableIdentity>,
+) -> Command {
+    let mut command = Command::new(wsl);
+    command
+        .arg("--cd")
+        .arg("~")
+        .arg("-e")
+        .arg(python)
+        .arg("-c")
+        .arg(script);
+    if let Some(identity) = identity {
+        command.arg(serde_json::to_string(identity).expect("executable identity serializes"));
+    }
+    command
+}
+
+fn exact_effect_command() -> Result<Command, TmuxError> {
+    let python = trusted_python_identity()?;
+    exact_effect_command_with_python(&python)
+}
+
+fn exact_effect_command_with_python(
+    python: &ManagedExecutableIdentity,
+) -> Result<Command, TmuxError> {
+    revalidate_python_identity(python)?;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
-        command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("python3")
-            .arg("-c")
-            .arg(EXACT_SESSION_EFFECT_PY);
+        let wsl = trusted_wsl_path()?;
+        let mut command =
+            windows_helper_command(&wsl, &python.path, EXACT_SESSION_EFFECT_PY, Some(python));
         command.creation_flags(0x0800_0000);
-        command
+        Ok(command)
     }
     #[cfg(unix)]
     {
-        let mut command = Command::new("python3");
-        command.arg("-c").arg(EXACT_SESSION_EFFECT_PY);
+        let mut command = Command::new(&python.path);
         command
+            .arg("-c")
+            .arg(EXACT_SESSION_EFFECT_PY)
+            .arg(serde_json::to_string(python).expect("executable identity serializes"));
+        Ok(command)
     }
 }
 
@@ -1301,6 +1509,7 @@ def proc_start(pid):
 
 KNOWN_SYSTEMCTL = ("/usr/bin/systemctl", "/bin/systemctl")
 KNOWN_SYSTEMD_RUN = ("/usr/bin/systemd-run", "/bin/systemd-run")
+KNOWN_PYTHON = ("/usr/bin/python3", "/bin/python3")
 
 def executable_identity(path, candidates):
     if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
@@ -1327,13 +1536,15 @@ def resolve_tool(candidates):
     refuse(108)
 
 def validate_tools(raw):
-    if not isinstance(raw, dict) or set(raw) != {"systemctl", "systemdRun"}:
+    if not isinstance(raw, dict) or set(raw) != {"python", "systemctl", "systemdRun"}:
         refuse(109)
+    python = executable_identity(raw["python"].get("path"), KNOWN_PYTHON)
     systemctl = executable_identity(raw["systemctl"].get("path"), KNOWN_SYSTEMCTL)
     systemd_run = executable_identity(raw["systemdRun"].get("path"), KNOWN_SYSTEMD_RUN)
-    if systemctl != raw["systemctl"] or systemd_run != raw["systemdRun"]:
+    if (python != raw["python"] or systemctl != raw["systemctl"] or
+        systemd_run != raw["systemdRun"]):
         refuse(110)
-    return {"systemctl": systemctl, "systemdRun": systemd_run}
+    return {"python": python, "systemctl": systemctl, "systemdRun": systemd_run}
 
 def bounded_systemctl(systemctl, unit):
     def limit_output():
@@ -1486,10 +1697,23 @@ def write_control(directory, name, value):
     except (FileNotFoundError, PermissionError, OSError):
         refuse(99)
 
+try:
+    expected_python = json.loads(sys.argv[1])
+except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+    refuse(126)
+actual_python = executable_identity(os.path.realpath(sys.executable), KNOWN_PYTHON)
+if actual_python != expected_python:
+    refuse(127)
+sys.argv = [sys.argv[0], *sys.argv[2:]]
+
 mode = sys.argv[1] if len(sys.argv) > 1 else ""
 if mode == "tools" and len(sys.argv) == 2:
-    print(json.dumps({"systemctl": resolve_tool(KNOWN_SYSTEMCTL),
+    print(json.dumps({"python": actual_python,
+                      "systemctl": resolve_tool(KNOWN_SYSTEMCTL),
                       "systemdRun": resolve_tool(KNOWN_SYSTEMD_RUN)}, separators=(",", ":")))
+    raise SystemExit(0)
+if mode == "validate-tools" and len(sys.argv) == 3:
+    validate_tools(json.loads(sys.argv[2]))
     raise SystemExit(0)
 if mode == "validate-path" and len(sys.argv) == 4:
     if not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", sys.argv[2]):
@@ -1616,26 +1840,25 @@ finally:
     os.close(directory)
 "##;
 
-fn managed_cgroup_effect_command() -> Command {
+fn managed_cgroup_effect_command(python: &ManagedExecutableIdentity) -> Result<Command, TmuxError> {
+    revalidate_python_identity(python)?;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
-        command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("python3")
-            .arg("-c")
-            .arg(MANAGED_CGROUP_EFFECT_PY);
+        let wsl = trusted_wsl_path()?;
+        let mut command =
+            windows_helper_command(&wsl, &python.path, MANAGED_CGROUP_EFFECT_PY, Some(python));
         command.creation_flags(0x0800_0000);
-        command
+        Ok(command)
     }
     #[cfg(unix)]
     {
-        let mut command = Command::new("python3");
-        command.arg("-c").arg(MANAGED_CGROUP_EFFECT_PY);
+        let mut command = Command::new(&python.path);
         command
+            .arg("-c")
+            .arg(MANAGED_CGROUP_EFFECT_PY)
+            .arg(serde_json::to_string(python).expect("executable identity serializes"));
+        Ok(command)
     }
 }
 
@@ -1646,7 +1869,8 @@ pub(crate) fn managed_runtime_preflight() -> Result<(), TmuxError> {
 }
 
 fn resolve_managed_system_tools() -> Result<ManagedSystemTools, TmuxError> {
-    let mut command = managed_cgroup_effect_command();
+    let python = trusted_python_identity()?;
+    let mut command = managed_cgroup_effect_command(&python)?;
     command.arg("tools");
     let output =
         output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
@@ -1670,7 +1894,7 @@ fn resolve_managed_system_tools() -> Result<ManagedSystemTools, TmuxError> {
 }
 
 fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<(), TmuxError> {
-    let mut command = managed_cgroup_effect_command();
+    let mut command = managed_cgroup_effect_command(&tools.python)?;
     let encoded = serde_json::to_string(tools).map_err(|_| TmuxError {
         op: "managed-runtime-preflight",
         code: None,
@@ -1695,6 +1919,32 @@ fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<()
     }
 }
 
+fn revalidate_managed_system_tools(tools: &ManagedSystemTools) -> Result<(), TmuxError> {
+    let mut command = managed_cgroup_effect_command(&tools.python)?;
+    let encoded = serde_json::to_string(tools).map_err(|_| TmuxError {
+        op: "managed-runtime-tools",
+        code: None,
+        message: "managed system helper identity could not be encoded".into(),
+    })?;
+    command.args(["validate-tools", &encoded]);
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "managed-runtime-tools",
+                code: None,
+                message: format!("managed system helper revalidation failed: {error}"),
+            })?;
+    if output.status.success() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(TmuxError {
+            op: "managed-runtime-tools",
+            code: output.status.code(),
+            message: "managed system helper identity changed".into(),
+        })
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManagedRuntimeObservation {
@@ -1714,7 +1964,7 @@ fn observe_managed_runtime_owner(
     launch_nonce: &str,
     tmux: SessionEffectIdentity,
 ) -> Result<ManagedRuntimeOwnerToken, TmuxError> {
-    let mut command = managed_cgroup_effect_command();
+    let mut command = managed_cgroup_effect_command(&tools.python)?;
     let encoded_tools = serde_json::to_string(tools).map_err(|_| TmuxError {
         op: "observe-managed-runtime-owner",
         code: None,
@@ -1777,7 +2027,7 @@ pub(crate) fn retire_prepared_managed_runtime(
         code: None,
         message: "prepared managed runtime identity could not be encoded".into(),
     })?;
-    let mut command = managed_cgroup_effect_command();
+    let mut command = managed_cgroup_effect_command(&launch.tools.python)?;
     command.args(["retire-prepared", &encoded]);
     let output =
         output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
@@ -1844,7 +2094,7 @@ pub(crate) fn observe_session_effect_identity(
 ) -> Result<SessionEffectIdentity, TmuxError> {
     exact_effect_target(name)?;
     let socket = validated_socket_name()?;
-    let mut command = exact_effect_command();
+    let mut command = exact_effect_command()?;
     command.args(["observe", socket, name]);
     let output =
         output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
@@ -1936,7 +2186,7 @@ pub(crate) fn kill_session_tree_exact(
         code: None,
         message: "exact session effect identity could not be encoded".into(),
     })?;
-    let mut command = exact_effect_command();
+    let mut command = exact_effect_command()?;
     command.args(["kill", socket, name, &encoded]);
     #[cfg(test)]
     {
@@ -2006,7 +2256,7 @@ pub(crate) fn retire_managed_runtime(
         code: None,
         message: "managed runtime owner token could not be encoded".into(),
     })?;
-    let mut command = managed_cgroup_effect_command();
+    let mut command = managed_cgroup_effect_command(&owner.tools.python)?;
     command.args([
         if tmux_liveness == SessionLiveness::Gone {
             "retire-gone"
@@ -2492,12 +2742,21 @@ mod tests {
                 std::env::var_os("T_HUB_MANAGED_PATH_SHIM_MARKER").unwrap(),
             );
             managed_runtime_preflight().unwrap();
+            let mut exact = exact_effect_command().unwrap();
+            exact.args(["observe", validated_socket_name().unwrap(), "=th_missing:"]);
+            let output = output_with_timeout_and_limit(
+                exact,
+                Duration::from_secs(5),
+                MANAGED_HELPER_OUTPUT_LIMIT,
+            )
+            .unwrap();
+            assert!(!output.status.success());
             assert!(!marker.exists());
             return;
         }
         let fixture = tempfile::tempdir().unwrap();
         let marker = fixture.path().join("intercepted");
-        for helper in ["systemctl", "systemd-run"] {
+        for helper in ["python3", "systemctl", "systemd-run"] {
             let path = fixture.path().join(helper);
             std::fs::write(
                 &path,
@@ -2531,6 +2790,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exact_and_managed_helpers_pin_python_identity_and_reject_reuse() {
+        let python = trusted_python_identity().unwrap();
+        let exact = exact_effect_command_with_python(&python).unwrap();
+        let managed = managed_cgroup_effect_command(&python).unwrap();
+        assert_eq!(exact.get_program(), std::ffi::OsStr::new(&python.path));
+        assert_eq!(managed.get_program(), std::ffi::OsStr::new(&python.path));
+
+        let mut reused = python.clone();
+        reused.inode = reused.inode.saturating_add(1);
+        assert!(exact_effect_command_with_python(&reused).is_err());
+        assert!(managed_cgroup_effect_command(&reused).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_helper_construction_cannot_select_wsl_or_python_from_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join("intercepted");
+        for helper in ["wsl.exe", "python3"] {
+            let path = fixture.path().join(helper);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let python = trusted_python_identity().unwrap();
+        let trusted_wsl = std::path::Path::new("/not-on-this-host/System32/wsl.exe");
+        let mut command = windows_helper_command(
+            trusted_wsl,
+            &python.path,
+            "raise SystemExit(0)",
+            Some(&python),
+        );
+        command.env("PATH", fixture.path());
+        assert_eq!(command.get_program(), trusted_wsl.as_os_str());
+        assert!(command
+            .get_args()
+            .any(|argument| argument == std::ffi::OsStr::new(&python.path)));
+        assert!(command.output().is_err());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_cgroup_path_validation_rejects_every_broad_group() {
         let unit = format!("t-hub-{}.scope", "a".repeat(32));
         for broad in [
@@ -2540,7 +2847,8 @@ mod tests {
             "/user.slice/user-1000.slice/user@1000.service",
             "/user.slice/user-1000.slice/user@1000.service/app.slice",
         ] {
-            let mut command = managed_cgroup_effect_command();
+            let python = trusted_python_identity().unwrap();
+            let mut command = managed_cgroup_effect_command(&python).unwrap();
             command.args(["validate-path", &unit, broad]);
             let output = output_with_timeout_and_limit(
                 command,
