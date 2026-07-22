@@ -103,6 +103,7 @@ pub enum CortanaManagedLaunchPhase {
     Prepared,
     OwnerObserved,
     Observed,
+    Claimed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +137,26 @@ pub const ACTIVE_HARNESS_ATTESTATION_VERSION: u32 = 1;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CortanaActiveHarnessAttestation {
     pub version: u32,
+    pub expected_launch_provenance: crate::harness::ExpectedHarnessLaunchProvenance,
+    pub process: crate::harness::HarnessProcessIdentity,
+}
+
+pub const ACTIVE_HARNESS_ATTESTATION_RECOVERY_VERSION: u32 = 1;
+
+/// Write-ahead evidence for upgrading a live pre-attestation Cortana runtime.
+///
+/// The configured launch provenance and exact process generation are resolved
+/// independently from the legacy durable owner. A restart must revalidate this
+/// evidence before it can become active authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaActiveHarnessAttestationRecovery {
+    pub version: u32,
+    pub operation_id: String,
+    pub identity_id: String,
+    pub generation: u64,
+    pub terminal_id: String,
+    pub harness: String,
     pub expected_launch_provenance: crate::harness::ExpectedHarnessLaunchProvenance,
     pub process: crate::harness::HarnessProcessIdentity,
 }
@@ -183,6 +204,8 @@ pub struct CortanaDurableIdentity {
     pub managed_launch: Option<CortanaManagedLaunchIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_harness_attestation: Option<CortanaActiveHarnessAttestation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_harness_attestation_recovery: Option<CortanaActiveHarnessAttestationRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_quarantine: Option<CortanaLegacyQuarantine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -591,6 +614,7 @@ mod tests {
             owner: None,
             managed_launch: None,
             active_harness_attestation: None,
+            active_harness_attestation_recovery: None,
             legacy_quarantine: None,
             legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {

@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which agent harness backs a session. Keyed to `AgentSessionRecord::provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,6 +536,22 @@ pub fn attest_final_launch_permissions(
 pub fn observe_harness_process(
     tmux_target: &str,
 ) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    observe_harness_process_until(tmux_target, Instant::now() + Duration::from_secs(2))
+}
+
+fn observation_time_remaining(deadline: Instant) -> Result<Duration, LaunchAttestationError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(LaunchAttestationError::UnreadableEvidence)
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn observe_harness_process_until(
+    tmux_target: &str,
+    deadline: Instant,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
     const SCRIPT: &str = r#"
 set -eu
 tmux_socket=$1
@@ -638,8 +654,11 @@ cat "$cmdline"
         command
     };
 
-    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
-        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let output = crate::bounded_exec::output_with_timeout(
+        command,
+        observation_time_remaining(deadline)?.min(Duration::from_secs(2)),
+    )
+    .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
@@ -809,6 +828,152 @@ fn parse_scoped_process_details(
         session_token: (!token.is_empty()).then_some(token),
         argv,
     })
+}
+
+fn observe_scoped_processes_until(
+    identities: &[ProcessIdentity],
+    deadline: Instant,
+) -> Result<Vec<ScopedProcessDetails>, LaunchAttestationError> {
+    if identities.is_empty() || identities.len() > 64 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    const SCRIPT: &str = r#"
+set -eu
+count=$1
+shift
+case "$count" in ''|*[!0-9]*|0) exit 51;; esac
+[ "$count" -le 64 ]
+[ "$#" -eq "$count" ]
+printf 'THPB1\n%s\n' "$count"
+for expected in "$@"; do
+    pid=${expected%%:*}
+    expected_start=${expected#*:}
+    case "$pid:$expected_start" in ''|*[!0-9:]*) exit 52;; esac
+    stat_before=$(cat "/proc/$pid/stat")
+    rest=${stat_before##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    parent_pid=$2
+    process_group_id=$3
+    process_session_id=$4
+    start_ticks=${20}
+    [ "$start_ticks" = "$expected_start" ]
+    case "$parent_pid:$process_group_id:$process_session_id:$start_ticks" in *[!0-9:]*) exit 53;; esac
+    executable_path=$(readlink -f "/proc/$pid/exe")
+    [ -n "$executable_path" ]
+    case "$executable_path" in *' (deleted)') exit 54;; esac
+    [ "$(printf '%s\n' "$executable_path" | wc -l | tr -d ' ')" -eq 1 ]
+    set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+    [ "$#" -eq 2 ]
+    executable_device=$1
+    executable_inode=$2
+    case "$executable_device:$executable_inode" in *[!0-9:]*) exit 55;; esac
+    cgroup=$(cat "/proc/$pid/cgroup")
+    case "$cgroup" in 0::/*) ;; *) exit 56;; esac
+    [ "$(printf '%s\n' "$cgroup" | wc -l | tr -d ' ')" -eq 1 ]
+    cgroup_path=${cgroup#0::}
+    token_line=$(tr '\0' '\n' < "/proc/$pid/environ" | awk 'BEGIN { found=0 } /^T_HUB_SESSION_TOKEN=/ { if (found) exit 62; found=1; value=substr($0, length("T_HUB_SESSION_TOKEN=") + 1) } END { if (found) printf "%s", value }')
+    [ "${#token_line}" -le 4096 ]
+    [ "$(printf '%s\n' "$token_line" | wc -l | tr -d ' ')" -eq 1 ]
+    cmdline="/proc/$pid/cmdline"
+    size=$(wc -c < "$cmdline" | tr -d ' ')
+    case "$size" in ''|*[!0-9]*|0) exit 57;; esac
+    [ "$size" -le 65536 ]
+    stat_after=$(cat "/proc/$pid/stat")
+    [ "$stat_after" = "$stat_before" ]
+    set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+    [ "$#" -eq 2 ]
+    [ "$1" = "$executable_device" ]
+    [ "$2" = "$executable_inode" ]
+    printf 'THPI1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$pid" "$parent_pid" "$start_ticks" "$process_group_id" "$process_session_id" \
+        "$executable_device" "$executable_inode" "$executable_path" "$cgroup_path" \
+        "$token_line" "$size"
+    cat "$cmdline"
+    printf '\n'
+done
+"#;
+    let mut command = Command::new("sh");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command = Command::new("wsl.exe");
+        command.arg("--cd").arg("~").arg("-e").arg("sh");
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("t-hub-scoped-harness-attestation-batch")
+        .arg(identities.len().to_string());
+    for identity in identities {
+        command.arg(format!("{}:{}", identity.pid, identity.start_ticks));
+    }
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        observation_time_remaining(deadline)?.min(Duration::from_secs(2)),
+        identities.len().saturating_mul(70_000).saturating_add(1024),
+    )
+    .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let bytes = output.stdout;
+    let mut cursor = 0usize;
+    let take_line = |cursor: &mut usize| -> Result<&[u8], LaunchAttestationError> {
+        let rest = bytes
+            .get(*cursor..)
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        let end = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        *cursor = cursor.saturating_add(end + 1);
+        Ok(&rest[..end])
+    };
+    if take_line(&mut cursor)? != b"THPB1" {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let count = usize::try_from(parse_ascii_number(Some(take_line(&mut cursor)?))?)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if count != identities.len() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let mut observed = Vec::with_capacity(count);
+    for identity in identities {
+        let mut record = Vec::new();
+        for _ in 0..11 {
+            record.extend_from_slice(take_line(&mut cursor)?);
+            record.push(b'\n');
+        }
+        let cmdline_size = usize::try_from(parse_ascii_number(Some(take_line(&mut cursor)?))?)
+            .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+        if cmdline_size == 0 || cmdline_size > 65_536 {
+            return Err(LaunchAttestationError::UnreadableEvidence);
+        }
+        let end = cursor
+            .checked_add(cmdline_size)
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        record.extend_from_slice(
+            bytes
+                .get(cursor..end)
+                .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+        );
+        cursor = end;
+        if bytes.get(cursor) != Some(&b'\n') {
+            return Err(LaunchAttestationError::UnreadableEvidence);
+        }
+        cursor += 1;
+        let process = parse_scoped_process_details(&record)?;
+        if process.pid != identity.pid || process.start_ticks != identity.start_ticks {
+            return Err(LaunchAttestationError::ProcessChanged);
+        }
+        observed.push(process);
+    }
+    if cursor != bytes.len() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(observed)
 }
 
 fn framed_sha256(label: &[u8], values: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
@@ -1391,6 +1556,7 @@ pub fn observe_scoped_harness_process(
     expected_session_token: &str,
     expected_cgroup_path: &str,
     pane_start_ticks: u64,
+    deadline: Instant,
 ) -> Result<HarnessProcessIdentity, LaunchAttestationError> {
     if identity_id.is_empty()
         || expected_session_token.is_empty()
@@ -1401,15 +1567,8 @@ pub fn observe_scoped_harness_process(
     {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
-    let foreground = observe_harness_process(tmux_target)?;
-    let mut details = Vec::with_capacity(foreground.ancestry.len());
-    for identity in &foreground.ancestry {
-        let process = observe_scoped_process(identity.pid)?;
-        if process.pid != identity.pid || process.start_ticks != identity.start_ticks {
-            return Err(LaunchAttestationError::ProcessChanged);
-        }
-        details.push(process);
-    }
+    let foreground = observe_harness_process_until(tmux_target, deadline)?;
+    let details = observe_scoped_processes_until(&foreground.ancestry, deadline)?;
     for (index, process) in details.iter().enumerate() {
         if index + 1 < details.len() && process.parent_pid != details[index + 1].pid {
             return Err(LaunchAttestationError::AncestryChanged);
