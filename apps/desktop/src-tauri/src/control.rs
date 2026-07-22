@@ -20137,7 +20137,6 @@ fn quarantine_unattested_cortana_incumbent(
         .ok_or("unattested Cortana incumbent Harness is ambiguous")?;
     let effect = candidate
         .effect_identity
-        .clone()
         .filter(valid_cortana_effect_identity)
         .ok_or("unattested Cortana incumbent has no exact tmux generation")?;
     ctx.identity.revoke(identity_id)?;
@@ -20788,16 +20787,12 @@ fn reconcile_cortana_inner(
     }
     std::fs::create_dir_all(files::to_host_path(&home))
         .map_err(|error| format!("reconcile_cortana: could not create '{home}': {error}"))?;
-    if durable.active_harness_attestation_recovery.is_some() {
+    if let Some(recovery) = durable.active_harness_attestation_recovery.as_ref() {
         let observed = observation
             .filter(|observed| same_cortana_attestation_basis(&observed.durable_basis, &durable))
             .and_then(|observed| observed.legacy_result.as_ref())
             .ok_or(CORTANA_ATTESTATION_REQUIRED)?
             .clone()?;
-        let recovery = durable
-            .active_harness_attestation_recovery
-            .as_ref()
-            .expect("checked above");
         if observed.0 != recovery.expected_launch_provenance || observed.1 != recovery.process {
             return Err("Cortana staged attestation observation changed before commit".into());
         }
