@@ -56,13 +56,6 @@ impl PreviewScope {
             workspace_id,
         })
     }
-
-    pub fn key(&self) -> String {
-        match self.workspace_id.as_deref() {
-            Some(workspace) => format!("{}:{workspace}", self.project_id),
-            None => self.project_id.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,11 +191,14 @@ mod tests {
     }
 
     #[test]
-    fn scope_has_stable_project_and_workspace_keys() {
+    fn scope_identity_is_typed_and_collision_free() {
         let project = PreviewScope::new("project-1", None).unwrap();
-        assert_eq!(project.key(), "project-1");
         let workspace = PreviewScope::new("project-1", Some("web".into())).unwrap();
-        assert_eq!(workspace.key(), "project-1:web");
+        assert_ne!(project, workspace);
+        assert_ne!(
+            PreviewScope::new("a:b", None).unwrap(),
+            PreviewScope::new("a", Some("b".into())).unwrap()
+        );
         assert!(PreviewScope::new("project/escape", None).is_err());
     }
 

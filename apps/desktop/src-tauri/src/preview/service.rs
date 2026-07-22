@@ -30,8 +30,8 @@ pub struct PreviewService<R> {
     runtime: R,
     profiles: Arc<PreviewProfileStore>,
     discovery: PreviewDiscoveryCache,
-    scope_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    active: Mutex<HashMap<String, ActiveRun>>,
+    scope_locks: Mutex<HashMap<PreviewScope, Arc<Mutex<()>>>>,
+    active: Mutex<HashMap<PreviewScope, ActiveRun>>,
 }
 
 impl<R: PreviewRuntime> PreviewService<R> {
@@ -180,7 +180,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .cloned();
         let target_ref = active.as_ref().map(|run| run.process.target.clone());
         if let Some(replayed) =
@@ -244,7 +244,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 self.active
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .remove(&scope.key());
+                    .remove(scope);
                 let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
                 self.commit_intent(request_id, status.clone())?;
                 Ok(result(
@@ -262,7 +262,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 self.active
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .remove(&scope.key());
+                    .remove(scope);
                 let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
                 self.commit_intent(request_id, status.clone())?;
                 Ok(result(
@@ -298,7 +298,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .map(|run| run.process.target.clone())
         {
             Some(target_ref) => target_ref,
@@ -316,7 +316,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .cloned();
         if let Some(active) = active {
             match self.runtime.observe(&active.process)? {
@@ -331,7 +331,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             self.active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(&scope.key());
+                .remove(scope);
         }
         self.start_locked(
             &discovery,
@@ -382,7 +382,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .cloned();
         let target_id = active.as_ref().map(|run| &run.process.target.target_id);
         if let Some(replayed) =
@@ -443,7 +443,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 .active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .get(&intent.scope.key())
+                .get(&intent.scope)
                 .cloned();
             if intent.operation == PreviewOperation::Select {
                 let selected_matches = self
@@ -533,7 +533,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             self.active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(&intent.scope.key());
+                .remove(&intent.scope);
             let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
             self.commit_intent(&intent.request_id, status.clone())?;
             recovered.push(result(
@@ -562,7 +562,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .cloned();
         if let Some(current) = current {
             if current.process.target == *target_ref {
@@ -591,7 +591,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             self.active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(&scope.key());
+                .remove(scope);
         }
 
         let process =
@@ -632,7 +632,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(
-                scope.key(),
+                scope.clone(),
                 ActiveRun {
                     process,
                     state: PreviewState::Starting,
@@ -659,7 +659,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&scope.key())
+            .get(scope)
             .cloned();
         let Some(mut active) = active else {
             return Ok(PreviewStatus::stopped(scope.clone(), self.runtime.now_ms()));
@@ -704,7 +704,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         self.active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(scope.key(), active.clone());
+            .insert(scope.clone(), active.clone());
         Ok(status_from_active(
             scope,
             &active,
@@ -743,7 +743,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         self.scope_locks
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .entry(scope.key())
+            .entry(scope.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -1206,6 +1206,53 @@ mod tests {
             ]
         );
         assert_eq!(runtime.spawn_count(), 1);
+    }
+
+    #[test]
+    fn formerly_colliding_scope_strings_have_independent_lifecycles() {
+        let fixture = fixture("scope-collision");
+        let project_scope = PreviewScope::new("a:b", None).unwrap();
+        let workspace_scope = PreviewScope::new("a", Some("b".into())).unwrap();
+        let project_target = PreviewTargetRef {
+            scope: project_scope.clone(),
+            target_id: fixture.target_ref.target_id.clone(),
+            discovery_fingerprint: fixture.target_ref.discovery_fingerprint.clone(),
+        };
+        let workspace_target = PreviewTargetRef {
+            scope: workspace_scope.clone(),
+            target_id: fixture.target_ref.target_id.clone(),
+            discovery_fingerprint: fixture.target_ref.discovery_fingerprint.clone(),
+        };
+        let project_run = fixture
+            .service
+            .start(
+                &fixture.root,
+                &project_scope,
+                Some(&project_target),
+                "scope-project",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        let workspace_run = fixture
+            .service
+            .start(
+                &fixture.root,
+                &workspace_scope,
+                Some(&workspace_target),
+                "scope-workspace",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        assert_ne!(project_run.status.run_id, workspace_run.status.run_id);
+        assert_eq!(fixture.runtime.spawn_count(), 2);
+        assert_eq!(
+            fixture.service.status(&project_scope).unwrap().scope,
+            project_scope
+        );
+        assert_eq!(
+            fixture.service.status(&workspace_scope).unwrap().scope,
+            workspace_scope
+        );
     }
 
     #[test]
