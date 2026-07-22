@@ -45,6 +45,7 @@ pub struct CortanaRuntimeCandidate {
 }
 
 pub const LEGACY_ORPHAN_PROVENANCE_VERSION: u32 = 1;
+pub const MANAGED_OWNER_TOKEN_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -80,6 +81,32 @@ pub struct CortanaLegacyOrphanProvenance {
     pub healthy_operation_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaManagedOwnerToken {
+    pub version: u32,
+    pub unit_name: String,
+    pub invocation_id: String,
+    pub cgroup_path: String,
+    pub cgroup_inode: u64,
+    pub launcher_pid: u32,
+    pub launcher_start_ticks: u64,
+    pub launch_nonce: String,
+    pub tmux: CortanaOrphanEffectIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaLegacyQuarantine {
+    pub terminal_id: String,
+    pub identity_id: String,
+    pub generation: u64,
+    pub harness: String,
+    pub tmux: CortanaOrphanEffectIdentity,
+    pub authority_revoked: bool,
+    pub quarantined_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CortanaDurableIdentity {
@@ -90,6 +117,10 @@ pub struct CortanaDurableIdentity {
     pub provider_session_id: Option<String>,
     pub conversation_id: Option<String>,
     pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<CortanaManagedOwnerToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_quarantine: Option<CortanaLegacyQuarantine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_orphan_provenance: Option<CortanaLegacyOrphanProvenance>,
     #[serde(default)]
@@ -118,6 +149,14 @@ pub enum CortanaRecoveryState {
         orphan_generation: u64,
         harness: String,
         effect_identity: CortanaOrphanEffectIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_identity_id: Option<String>,
+    },
+    LegacyUnownedQuarantined {
+        operation_id: String,
+        quarantined_at: u64,
+        legacy_terminal_id: String,
+        legacy_generation: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replacement_identity_id: Option<String>,
     },
@@ -485,6 +524,8 @@ mod tests {
             provider_session_id: Some("thread-1".into()),
             conversation_id: Some("conversation-1".into()),
             checkpoint: Some("checkpoint-1".into()),
+            owner: None,
+            legacy_quarantine: None,
             legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {
                 operation_id: "startup-3".into(),
