@@ -18933,6 +18933,199 @@ fn discover_cortana_runtimes(
         .collect())
 }
 
+fn same_cortana_tmux_generation(
+    observed: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+    expected: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+) -> bool {
+    observed.tmux_session_id == expected.tmux_session_id
+        && observed.tmux_session_created == expected.tmux_session_created
+        && observed.tmux_window_id == expected.tmux_window_id
+        && observed.tmux_pane_id == expected.tmux_pane_id
+        && observed.pane_pid == expected.pane_pid
+        && observed.pane_start_ticks == expected.pane_start_ticks
+}
+
+fn observed_launch_matches_recovery(
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+) -> bool {
+    match &durable.recovery {
+        crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. } => {
+            operation_id == &launch.operation_id
+                && launch.generation == durable.generation.saturating_add(1)
+                && durable
+                    .identity_id
+                    .as_deref()
+                    .is_none_or(|identity_id| identity_id == launch.identity_id)
+                && durable
+                    .harness
+                    .as_deref()
+                    .is_none_or(|harness| harness == launch.harness)
+        }
+        crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+            operation_id,
+            orphan_terminal_id,
+            orphan_generation,
+            harness,
+            replacement_identity_id,
+            ..
+        } => {
+            operation_id == &launch.operation_id
+                && replacement_identity_id.as_deref() == Some(launch.identity_id.as_str())
+                && launch.generation == orphan_generation.saturating_add(1)
+                && launch.harness == *harness
+                && launch.terminal_id != *orphan_terminal_id
+        }
+        crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+            operation_id,
+            legacy_terminal_id,
+            legacy_generation,
+            replacement_identity_id,
+            ..
+        } => {
+            operation_id == &launch.operation_id
+                && replacement_identity_id.as_deref() == Some(launch.identity_id.as_str())
+                && launch.generation == legacy_generation.saturating_add(1)
+                && launch.terminal_id != *legacy_terminal_id
+                && durable
+                    .legacy_quarantine
+                    .as_ref()
+                    .is_some_and(|quarantine| quarantine.harness == launch.harness)
+        }
+        _ => false,
+    }
+}
+
+fn exact_observed_cortana_claim(
+    claim: &CaptainRecord,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+) -> bool {
+    claim.role == FleetRole::Cortana
+        && claim.state == ClaimState::Active
+        && claim.terminal_id.as_deref() == Some(launch.terminal_id.as_str())
+        && claim.provider.as_deref() == Some(launch.harness.as_str())
+        && claim.harness.as_deref() == Some(launch.harness.as_str())
+}
+
+fn exact_observed_cortana_candidate<'a>(
+    candidates: &'a [crate::cortana_reconcile::CortanaRuntimeCandidate],
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
+) -> Option<&'a crate::cortana_reconcile::CortanaRuntimeCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.terminal_id == launch.terminal_id)
+        .filter(|candidate| {
+            candidates.len() == 1
+                && candidate.identity_id.as_deref() == Some(launch.identity_id.as_str())
+                && candidate.generation == launch.generation
+                && candidate.harness == launch.harness
+                && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+                && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
+                && candidate.identity_bound_to_terminal
+                && candidate.canonical_control_file
+                && candidate.rotating_control_env_scrubbed
+                && candidate.current_control_capability
+                && candidate.trusted_cortana_identity
+                && candidate.effect_identity.as_ref().is_some_and(|effect| {
+                    valid_cortana_effect_identity(effect)
+                        && same_cortana_tmux_generation(effect, &owner.tmux)
+                })
+        })
+}
+
+fn finalize_observed_cortana_launch(
+    ctx: &ControlContext,
+    operation_id: &str,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+) -> Result<Value, String> {
+    let launch = durable
+        .managed_launch
+        .as_ref()
+        .filter(|launch| {
+            launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        })
+        .ok_or("reconcile_cortana: observed launch completion lost its durable WAL")?;
+    if launch.operation_id != operation_id
+        || durable.terminal_id.as_deref() != Some(launch.terminal_id.as_str())
+        || !observed_launch_matches_recovery(durable, launch)
+    {
+        return Err(
+            "reconcile_cortana: observed launch does not match its durable recovery intent".into(),
+        );
+    }
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("reconcile_cortana: observed launch lost its durable owner")?;
+    if owner.unit_name != launch.unit_name || owner.launch_nonce != launch.launch_nonce {
+        return Err("reconcile_cortana: observed launch and managed owner disagree".into());
+    }
+    let identity = ctx.identity.get(&launch.identity_id).ok_or_else(|| {
+        format!(
+            "reconcile_cortana: observed launch identity '{}' is unavailable or revoked",
+            launch.identity_id
+        )
+    })?;
+    if identity.role != crate::identity::Role::Cortana
+        || identity.session_tile.as_deref() != Some(launch.terminal_id.as_str())
+    {
+        return Err(
+            "reconcile_cortana: observed launch identity is not exactly bound to its terminal"
+                .into(),
+        );
+    }
+    tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
+        .map_err(|error| {
+            format!("reconcile_cortana: observed launch owner is unverifiable: {error}")
+        })?;
+    let candidate = exact_observed_cortana_candidate(candidates, launch, owner).ok_or(
+        "reconcile_cortana: observed launch runtime evidence is missing, extra, or mismatched",
+    )?;
+    let snapshot = ctx.captains.snapshot();
+    let claims = snapshot
+        .captains
+        .iter()
+        .filter(|claim| claim.role == FleetRole::Cortana)
+        .collect::<Vec<_>>();
+    if claims.len() > 1
+        || claims
+            .first()
+            .is_some_and(|claim| !exact_observed_cortana_claim(claim, launch))
+    {
+        return Err(
+            "reconcile_cortana: observed launch conflicts with durable Fleet authority".into(),
+        );
+    }
+    if claims.is_empty() {
+        claim_cortana_runtime(ctx, candidate)?;
+    }
+    let provider_session_id = candidate.provider_session_id.clone();
+    let committed = ctx.captains.commit_cortana_runtime(
+        operation_id,
+        &launch.identity_id,
+        launch.generation,
+        &launch.terminal_id,
+        &launch.harness,
+        provider_session_id.as_deref(),
+    )?;
+    let quarantined = durable
+        .legacy_quarantine
+        .as_ref()
+        .map(|quarantine| vec![quarantine.terminal_id.clone()])
+        .unwrap_or_default();
+    let _ = captains_sync_apply(ctx);
+    Ok(cortana_reconcile_response(
+        operation_id,
+        crate::cortana_reconcile::CortanaReconcileAction::Recover,
+        committed,
+        quarantined,
+        Vec::new(),
+        None,
+    ))
+}
+
 fn claim_cortana_runtime(
     ctx: &ControlContext,
     candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
@@ -19287,17 +19480,9 @@ fn reconcile_cortana_inner(
                 crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
                 tmux::SessionLiveness::Alive,
             ) => {
-                let owner = durable
-                    .owner
-                    .as_ref()
-                    .ok_or("reconcile_cortana: observed launch lost its durable owner")?;
-                tmux::revalidate_managed_runtime_owner(
-                    &launch.tmux_target,
-                    &tmux_cortana_owner(owner),
-                )
-                .map_err(|error| {
-                    format!("reconcile_cortana: observed launch owner is unverifiable: {error}")
-                })?;
+                if durable.owner.is_none() {
+                    return Err("reconcile_cortana: observed launch lost its durable owner".into());
+                }
             }
             (
                 crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
@@ -19318,6 +19503,11 @@ fn reconcile_cortana_inner(
         }
     }
     let mut candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
+    if durable.managed_launch.as_ref().is_some_and(|launch| {
+        launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+    }) {
+        return finalize_observed_cortana_launch(ctx, operation_id, &durable, &candidates);
+    }
     if let Some(terminal_id) = durable.terminal_id.as_deref() {
         if !candidates
             .iter()
@@ -34928,6 +35118,8 @@ mod tests {
     const SCHEMA_18_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-18.json");
     const PACKAGED_SCHEMA_25_LEGACY_ORPHAN_FIXTURE: &str =
         include_str!("fixtures/captains-schema-25-packaged-legacy-orphan.json");
+    const PACKAGED_SCHEMA_25_OBSERVED_LAUNCH_FIXTURE: &str =
+        include_str!("fixtures/captains-schema-25-packaged-observed-launch.json");
 
     /// A crew ref's tile ids, for concise assertions.
     fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
@@ -45410,6 +45602,372 @@ mod tests {
         let reloaded = powder_lifecycle_registry(Some(path.clone())).cortana_identity();
         assert_eq!(reloaded, observed);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn captured_packaged_observed_launch_requires_its_wal_before_generic_planning() {
+        let fixture: Value =
+            serde_json::from_str(PACKAGED_SCHEMA_25_OBSERVED_LAUNCH_FIXTURE).unwrap();
+        let snapshot: CaptainsSnapshot =
+            serde_json::from_value(fixture["captainsSnapshot"].clone()).unwrap();
+        CaptainsRegistry::validate_snapshot(&snapshot).unwrap();
+        let durable = snapshot.cortana;
+        let launch = durable.managed_launch.as_ref().unwrap();
+        let owner = durable.owner.as_ref().unwrap();
+        let candidate = crate::cortana_reconcile::CortanaRuntimeCandidate {
+            terminal_id: launch.terminal_id.clone(),
+            identity_id: Some(launch.identity_id.clone()),
+            generation: launch.generation,
+            harness: launch.harness.clone(),
+            provider_session_id: None,
+            terminal: crate::cortana_reconcile::RuntimeEvidence::Alive,
+            harness_process: crate::cortana_reconcile::RuntimeEvidence::Alive,
+            identity_bound_to_terminal: true,
+            canonical_control_file: true,
+            rotating_control_env_scrubbed: true,
+            stale_legacy_control_env: false,
+            unresolved_session_bearer: false,
+            effect_identity: Some(owner.tmux),
+            current_control_capability: true,
+            trusted_cortana_identity: true,
+        };
+
+        let generic = crate::cortana_reconcile::plan_reconciliation(
+            &durable,
+            &launch.operation_id,
+            std::slice::from_ref(&candidate),
+        );
+        assert_eq!(
+            generic.action,
+            crate::cortana_reconcile::CortanaReconcileAction::Degraded
+        );
+        assert!(
+            generic
+                .degraded_reason
+                .as_deref()
+                .unwrap()
+                .contains("different Cortana identity than the durable singleton"),
+            "{:?}",
+            generic.degraded_reason
+        );
+        assert!(observed_launch_matches_recovery(&durable, launch));
+        assert!(
+            exact_observed_cortana_candidate(std::slice::from_ref(&candidate), launch, owner)
+                .is_some()
+        );
+
+        let mut foreground_changed = candidate.clone();
+        let effect = foreground_changed.effect_identity.as_mut().unwrap();
+        effect.foreground_pid = effect.foreground_pid.saturating_add(100);
+        effect.foreground_start_ticks = effect.foreground_start_ticks.saturating_add(100);
+        effect.foreground_process_group_id = effect.foreground_pid;
+        assert!(exact_observed_cortana_candidate(
+            std::slice::from_ref(&foreground_changed),
+            launch,
+            owner
+        )
+        .is_some());
+
+        let mut reused_pane = candidate.clone();
+        reused_pane
+            .effect_identity
+            .as_mut()
+            .unwrap()
+            .pane_start_ticks += 1;
+        assert!(exact_observed_cortana_candidate(
+            std::slice::from_ref(&reused_pane),
+            launch,
+            owner
+        )
+        .is_none());
+        let mut wrong_generation = candidate.clone();
+        wrong_generation.generation += 1;
+        assert!(exact_observed_cortana_candidate(
+            std::slice::from_ref(&wrong_generation),
+            launch,
+            owner
+        )
+        .is_none());
+        assert!(exact_observed_cortana_candidate(
+            &[candidate.clone(), wrong_generation],
+            launch,
+            owner
+        )
+        .is_none());
+        let mut stale_control = candidate;
+        stale_control.current_control_capability = false;
+        assert!(exact_observed_cortana_candidate(
+            std::slice::from_ref(&stale_control),
+            launch,
+            owner
+        )
+        .is_none());
+
+        let exact_claim: CaptainRecord = serde_json::from_value(json!({
+            "shipSlug": CORTANA_SLUG,
+            "assignmentId": assignment_id_for(None, CORTANA_SLUG),
+            "displayName": "Cortana",
+            "role": "cortana",
+            "provider": "codex",
+            "terminalId": launch.terminal_id,
+            "harness": "codex",
+            "workspaceTabIds": [CAPTAIN_WORKSPACE_ID],
+            "crew": [],
+            "state": {"kind": "active"}
+        }))
+        .unwrap();
+        assert!(exact_observed_cortana_claim(&exact_claim, launch));
+        let mut foreign_claim = exact_claim;
+        foreign_claim.terminal_id = Some("foreign1".into());
+        assert!(!exact_observed_cortana_claim(&foreign_claim, launch));
+
+        let mut owner_disagreement = durable.clone();
+        owner_disagreement.owner.as_mut().unwrap().unit_name =
+            format!("t-hub-{}.scope", "f".repeat(32));
+        let ctx = test_ctx("captured-owner-disagreement");
+        let error =
+            finalize_observed_cortana_launch(&ctx, &launch.operation_id, &owner_disagreement, &[])
+                .unwrap_err();
+        assert!(error.contains("observed launch and managed owner disagree"));
+        assert!(ctx.captains.snapshot().captains.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_observed_launch_reload_and_duplicate_reconcile_finalize_once() {
+        if tmux::managed_runtime_preflight().is_err() || !tmux_process_tests_available() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let fixture: Value =
+            serde_json::from_str(PACKAGED_SCHEMA_25_OBSERVED_LAUNCH_FIXTURE).unwrap();
+        let registry_path = captains_tmp("captured-observed-live");
+        let identity_path = captains_tmp("captured-observed-live-identities");
+        let _ = std::fs::remove_file(&registry_path);
+        let _ = std::fs::remove_file(&identity_path);
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let legacy_identity = identities.mint(crate::identity::Role::Cortana).unwrap();
+        identities.revoke(&legacy_identity.id).unwrap();
+        let replacement_identity = identities.mint(crate::identity::Role::Cortana).unwrap();
+        let legacy_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let replacement_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        identities
+            .bind_tile(&replacement_identity.id, &replacement_terminal)
+            .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-captured-observed-live-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let control_token = "captured-observed-control-token";
+        let mut spawn_ctx = test_ctx(control_token).with_identity_store(identities.clone());
+        spawn_ctx.addr = "127.0.0.1:4242".into();
+        let legacy_target = tmux_target(&legacy_terminal);
+        create_test_tmux_session_with_env(
+            &legacy_target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    "captured-unresolved-legacy-token".into(),
+                ),
+                (CORTANA_GENERATION_ENV.into(), "1".into()),
+                ("T_HUB_CONTROL_ADDR".into(), "127.0.0.1:31337".into()),
+                ("T_HUB_CONTROL_TOKEN".into(), "retired-control-token".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&legacy_terminal, "codex").unwrap();
+        let legacy_effect = durable_cortana_effect_identity(
+            tmux::observe_session_effect_identity(&legacy_target).unwrap(),
+        );
+
+        let operation_id = format!("captured-observed-{}", uuid::Uuid::new_v4());
+        let launch = tmux::prepare_managed_runtime_launch().unwrap();
+        let spawn_args = json!({
+            "cwd": home,
+            "name": "Cortana",
+            "startupCommand": harness_command,
+            "tabId": CAPTAIN_WORKSPACE_ID,
+        });
+        let mut elevation = elevation_env(&spawn_ctx, &spawn_args);
+        elevation.push((
+            crate::identity::SESSION_TOKEN_ENV.into(),
+            replacement_identity.secret.clone(),
+        ));
+        elevation.push((CORTANA_GENERATION_ENV.into(), "2".into()));
+        elevation.push((
+            PROVIDER_SESSION_ENV.into(),
+            pending_provider_marker("codex"),
+        ));
+        let pane = crate::commands::pane_command(None, Some(&harness_command));
+        let (_, replacement_target, owner) = spawn_managed_tmux_terminal_with_id(
+            &replacement_terminal,
+            home.to_str().unwrap(),
+            pane.as_deref(),
+            &elevation,
+            &launch,
+        )
+        .unwrap();
+        wait_for_harness_started(&replacement_terminal, "codex").unwrap();
+        let durable_owner = durable_cortana_owner(owner.clone());
+        let durable_launch = crate::cortana_reconcile::CortanaManagedLaunchIntent {
+            version: 1,
+            operation_id: operation_id.clone(),
+            terminal_id: replacement_terminal.clone(),
+            tmux_target: replacement_target.clone(),
+            identity_id: replacement_identity.id.clone(),
+            generation: 2,
+            harness: "codex".into(),
+            unit_name: launch.unit_name.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            tools: durable_cortana_tools(&launch.tools),
+            phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+        };
+        let mut snapshot = fixture["captainsSnapshot"].clone();
+        let cortana = snapshot.get_mut("cortana").unwrap();
+        cortana["identityId"] = json!(legacy_identity.id);
+        cortana["generation"] = json!(1);
+        cortana["terminalId"] = json!(replacement_terminal);
+        cortana["harness"] = json!("codex");
+        cortana["owner"] = serde_json::to_value(&durable_owner).unwrap();
+        cortana["managedLaunch"] = serde_json::to_value(&durable_launch).unwrap();
+        cortana["legacyQuarantine"] = json!({
+            "terminalId": legacy_terminal,
+            "identityId": legacy_identity.id,
+            "generation": 1,
+            "harness": "codex",
+            "tmux": legacy_effect,
+            "authorityRevoked": true,
+            "quarantinedAt": now_ms().max(1),
+        });
+        cortana["recovery"] = json!({
+            "kind": "legacyUnownedQuarantined",
+            "operation_id": operation_id,
+            "quarantined_at": now_ms().max(1),
+            "legacy_terminal_id": legacy_terminal,
+            "legacy_generation": 1,
+            "replacement_identity_id": replacement_identity.id,
+        });
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx(control_token)
+            .with_captains_registry(captains.clone())
+            .with_identity_store(identities.clone())
+            .with_apply_sink(sink.clone());
+        ctx.addr = spawn_ctx.addr.clone();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let ctx = Arc::new(ctx);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let results = std::thread::scope(|scope| {
+            let first = {
+                let ctx = ctx.clone();
+                let barrier = barrier.clone();
+                let home = home.clone();
+                let harness_command = harness_command.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &ctx,
+                        "reconcile_cortana",
+                        &json!({
+                            "operationId": "duplicate-observed-a",
+                            "testOrchestratorHome": home,
+                            "testStartupCommand": harness_command,
+                        }),
+                    )
+                })
+            };
+            let second = {
+                let ctx = ctx.clone();
+                let barrier = barrier.clone();
+                let home = home.clone();
+                let harness_command = harness_command.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    dispatch(
+                        &ctx,
+                        "reconcile_cortana",
+                        &json!({
+                            "operationId": "duplicate-observed-b",
+                            "testOrchestratorHome": home,
+                            "testStartupCommand": harness_command,
+                        }),
+                    )
+                })
+            };
+            barrier.wait();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        for result in results {
+            let result = result.unwrap();
+            assert_eq!(result["healthy"], true);
+            assert_eq!(result["terminalId"], replacement_terminal);
+            assert_eq!(result["identityId"], replacement_identity.id);
+            assert_eq!(result["generation"], 2);
+        }
+        let durable = captains.cortana_identity();
+        assert!(durable.managed_launch.is_none());
+        assert!(matches!(
+            durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert_eq!(
+            durable.identity_id.as_deref(),
+            Some(replacement_identity.id.as_str())
+        );
+        let claims = captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .filter(|claim| claim.role == FleetRole::Cortana && claim.state == ClaimState::Active)
+            .collect::<Vec<_>>();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].terminal_id.as_deref(),
+            Some(replacement_terminal.as_str())
+        );
+        assert_eq!(
+            tmux::session_liveness(&legacy_target),
+            tmux::SessionLiveness::Alive
+        );
+        assert_eq!(
+            tmux::session_liveness(&replacement_target),
+            tmux::SessionLiveness::Alive
+        );
+        assert!(sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(command, _)| command != "spawn_terminal"));
+
+        dispatch(
+            &ctx,
+            "close_terminal",
+            &json!({"sessionId": replacement_terminal}),
+        )
+        .unwrap();
+        reap_test_tmux_session_and_assert_absent(&legacy_target);
+        std::fs::remove_dir_all(harness_bin_dir).ok();
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_file(registry_path).ok();
+        std::fs::remove_file(identity_path).ok();
     }
 
     #[cfg(unix)]

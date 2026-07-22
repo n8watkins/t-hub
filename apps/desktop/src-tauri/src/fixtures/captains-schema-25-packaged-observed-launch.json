@@ -1,0 +1,148 @@
+{
+  "capture": {
+    "source": "dev-build-495283c-20260722T144850Z/install-live-20260722T150831Z",
+    "runtime": {
+      "legacyTerminalId": "f9891ff2",
+      "replacementTerminalId": "5bfa4f12",
+      "replacementIdentityId": "22afdf57ef764b318d838922718dec12",
+      "generation": 2,
+      "harness": "codex",
+      "operationId": "3da33ada-3f36-4cb3-8c1d-1ac7cb608d5a",
+      "sessionToken": "<redacted:replacement-session-token>",
+      "controlFile": "<redacted:canonical-control-file>",
+      "controlAddress": "",
+      "controlToken": ""
+    },
+    "ownerEvidence": {
+      "unitName": "t-hub-8bf23057346046b484deaf77aa5dd3e8.scope",
+      "invocationId": "398e2b621ac143d6a2fcd22b8eb7fcb9",
+      "cgroupPath": "/user.slice/user-1000.slice/user@1000.service/app.slice/t-hub-8bf23057346046b484deaf77aa5dd3e8.scope",
+      "cgroupInode": 6166229,
+      "launcherPid": 2998647,
+      "launcherStartTicks": 26434939,
+      "launchNonce": "8bf23057346046b484deaf77aa5dd3e8",
+      "activeState": "active",
+      "subState": "running",
+      "processCgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/t-hub-8bf23057346046b484deaf77aa5dd3e8.scope"
+    }
+  },
+  "captainsSnapshot": {
+    "schemaVersion": 25,
+    "seq": 2662,
+    "captains": [],
+    "cortana": {
+      "identityId": "cb6723e104c345f9801722c6cc336e05",
+      "generation": 1,
+      "terminalId": "5bfa4f12",
+      "harness": "codex",
+      "providerSessionId": null,
+      "conversationId": null,
+      "checkpoint": null,
+      "owner": {
+        "version": 2,
+        "unitName": "t-hub-8bf23057346046b484deaf77aa5dd3e8.scope",
+        "invocationId": "398e2b621ac143d6a2fcd22b8eb7fcb9",
+        "cgroupPath": "/user.slice/user-1000.slice/user@1000.service/app.slice/t-hub-8bf23057346046b484deaf77aa5dd3e8.scope",
+        "cgroupInode": 6166229,
+        "launcherPid": 2998647,
+        "launcherStartTicks": 26434939,
+        "launchNonce": "8bf23057346046b484deaf77aa5dd3e8",
+        "tools": {
+          "python": { "path": "/usr/bin/python3.12", "device": 2096, "inode": 11282 },
+          "systemctl": { "path": "/usr/bin/systemctl", "device": 2096, "inode": 1776247 },
+          "systemdRun": { "path": "/usr/bin/systemd-run", "device": 2096, "inode": 1776268 }
+        },
+        "tmux": {
+          "tmuxSessionId": 2,
+          "tmuxSessionCreated": 1784733606,
+          "tmuxWindowId": 2,
+          "tmuxPaneId": 2,
+          "panePid": 2998647,
+          "paneStartTicks": 26434939,
+          "paneProcessGroupId": 2998647,
+          "paneProcessSessionId": 2998647,
+          "foregroundPid": 2998772,
+          "foregroundStartTicks": 26434979,
+          "foregroundProcessGroupId": 2998772,
+          "foregroundProcessSessionId": 2998647
+        }
+      },
+      "managedLaunch": {
+        "version": 1,
+        "operationId": "3da33ada-3f36-4cb3-8c1d-1ac7cb608d5a",
+        "terminalId": "5bfa4f12",
+        "tmuxTarget": "th_5bfa4f12",
+        "identityId": "22afdf57ef764b318d838922718dec12",
+        "generation": 2,
+        "harness": "codex",
+        "unitName": "t-hub-8bf23057346046b484deaf77aa5dd3e8.scope",
+        "launchNonce": "8bf23057346046b484deaf77aa5dd3e8",
+        "tools": {
+          "python": { "path": "/usr/bin/python3.12", "device": 2096, "inode": 11282 },
+          "systemctl": { "path": "/usr/bin/systemctl", "device": 2096, "inode": 1776247 },
+          "systemdRun": { "path": "/usr/bin/systemd-run", "device": 2096, "inode": 1776268 }
+        },
+        "phase": "observed"
+      },
+      "legacyQuarantine": {
+        "terminalId": "f9891ff2",
+        "identityId": "cb6723e104c345f9801722c6cc336e05",
+        "generation": 1,
+        "harness": "codex",
+        "tmux": {
+          "tmuxSessionId": 0,
+          "tmuxSessionCreated": 1784583029,
+          "tmuxWindowId": 0,
+          "tmuxPaneId": 0,
+          "panePid": 1640392,
+          "paneStartTicks": 11377235,
+          "paneProcessGroupId": 1640392,
+          "paneProcessSessionId": 1640392,
+          "foregroundPid": 1640627,
+          "foregroundStartTicks": 11377281,
+          "foregroundProcessGroupId": 1640627,
+          "foregroundProcessSessionId": 1640392
+        },
+        "authorityRevoked": true,
+        "quarantinedAt": 1784733570172
+      },
+      "recovery": {
+        "kind": "legacyUnownedQuarantined",
+        "operation_id": "3da33ada-3f36-4cb3-8c1d-1ac7cb608d5a",
+        "quarantined_at": 1784733570172,
+        "legacy_terminal_id": "f9891ff2",
+        "legacy_generation": 1,
+        "replacement_identity_id": "22afdf57ef764b318d838922718dec12"
+      }
+    },
+    "agentSessions": [],
+    "agentCheckpoints": [],
+    "agentEvents": [],
+    "projects": [],
+    "workspaces": [
+      {
+        "id": "captains-reserved",
+        "name": "Captain Workspace",
+        "kind": "captain",
+        "tileIds": []
+      }
+    ],
+    "pendingFleetOperations": [],
+    "retiredFleetTileIds": [],
+    "pendingDispatchClaims": [],
+    "pendingDispatchReleases": [],
+    "pendingGitInitializations": []
+  },
+  "identitiesSnapshot": {
+    "identities": {
+      "22afdf57ef764b318d838922718dec12": {
+        "id": "22afdf57ef764b318d838922718dec12",
+        "secret": "<redacted:replacement-session-token>",
+        "role": "cortana",
+        "sessionTile": "5bfa4f12",
+        "mintedAt": 1784733573687
+      }
+    },
+    "revoked": ["cb6723e104c345f9801722c6cc336e05"]
+  }
+}
