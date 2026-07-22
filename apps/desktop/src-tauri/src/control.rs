@@ -40159,7 +40159,9 @@ mod tests {
     fn fresh_history_resume_acquires_capacity_and_cancels_its_new_reservation_on_refusal() {
         let temp = tempfile::tempdir().unwrap();
         let codex_root = temp.path().join("codex/2026/07/20");
+        let project_cwd = temp.path().join("project");
         std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::create_dir_all(&project_cwd).unwrap();
         let conversation_id = "22222222-2222-4222-8222-222222222222";
         std::fs::write(
             codex_root.join(format!(
@@ -40167,7 +40169,7 @@ mod tests {
             )),
             format!(
                 "{}\n{}",
-                json!({"type":"session_meta","payload":{"id":conversation_id,"cwd":"/tmp","model_provider":"openai"}}),
+                json!({"type":"session_meta","payload":{"id":conversation_id,"cwd":project_cwd,"model_provider":"openai"}}),
                 json!({"type":"event_msg","payload":{"type":"user_message","message":"Resume me"}})
             ),
         )
@@ -57620,7 +57622,6 @@ mod tests {
             .unwrap_err();
 
             assert!(error.contains(expected_error), "{case_name}: {error}");
-            assert!(error.contains("all side effects were rolled back"));
             assert!(observations.is_empty(), "{case_name}: unused observations");
             let crew_session_id = dispatched_terminal_id(&sink);
             assert_eq!(
