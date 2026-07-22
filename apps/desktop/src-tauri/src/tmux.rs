@@ -3119,6 +3119,7 @@ while True:
             eprintln!("managed cgroup retirement test skipped: {error}");
             return;
         }
+        let _server_anchor = TmuxTestServerAnchor::acquire();
         let fixture = tempfile::tempdir().unwrap();
         let survivor = fixture.path().join("managed-child.pid");
         let workload = fixture.path().join("continuous-fork.py");
