@@ -10,7 +10,7 @@ use super::discovery::{PreviewDiscovery, PreviewDiscoveryCache};
 use super::endpoint::{EndpointError, ProbeCancellation};
 use super::model::{
     PreviewOperation, PreviewOperationOutcome, PreviewOperationResult, PreviewScope, PreviewState,
-    PreviewStatus, PreviewTarget, PreviewTargetId, PreviewTargetRef,
+    PreviewStatus, PreviewTarget, PreviewTargetRef,
 };
 use super::profile::{
     PreviewIntent, PreviewIntentPhase, PreviewProfileStore, ProjectPreviewProfile,
@@ -133,11 +133,16 @@ impl<R: PreviewRuntime> PreviewService<R> {
         if requested.is_some_and(|target_ref| target_ref.scope != *scope) {
             return Err("Preview target reference belongs to another scope".into());
         }
+        let target_ref = match requested {
+            Some(target_ref) => target_ref.clone(),
+            None => self.persisted_selected_ref(scope)?,
+        };
         if let Some(replayed) = self.replay_optional(
             request_id,
             PreviewOperation::Start,
             scope,
-            requested.map(|target_ref| &target_ref.target_id),
+            Some(&target_ref),
+            None,
         )? {
             return Ok(replayed);
         }
@@ -145,10 +150,9 @@ impl<R: PreviewRuntime> PreviewService<R> {
             return Err("Preview start was cancelled before spawning".into());
         }
         let discovery = self.discovery.discover(root)?;
-        let target_ref = match requested {
-            Some(target_ref) => target_ref.clone(),
-            None => self.selected_ref(scope, &discovery)?,
-        };
+        if requested.is_none() {
+            let _ = self.selected_ref(scope, &discovery)?;
+        }
         let target = resolve_target(&discovery, &target_ref)?.clone();
         let run_id = Uuid::new_v4().to_string();
         let expected_stop = self
@@ -192,9 +196,13 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .get(scope)
             .cloned();
         let target_ref = active.as_ref().map(|run| run.process.target.clone());
-        if let Some(replayed) =
-            self.replay_optional(request_id, PreviewOperation::Stop, scope, None)?
-        {
+        if let Some(replayed) = self.replay_optional(
+            request_id,
+            PreviewOperation::Stop,
+            scope,
+            None,
+            expected_run_id,
+        )? {
             return Ok(replayed);
         }
         self.prepare_optional_intent(
@@ -205,6 +213,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             active
                 .as_ref()
                 .map(|run| run.process.identity.run_id.as_str()),
+            expected_run_id,
             active.as_ref().map(|run| &run.process),
         )?;
         let Some(active) = active else {
@@ -295,15 +304,6 @@ impl<R: PreviewRuntime> PreviewService<R> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(replayed) =
-            self.replay_optional(request_id, PreviewOperation::Restart, scope, None)?
-        {
-            return Ok(replayed);
-        }
-        if cancellation.is_cancelled() {
-            return Err("Preview restart was cancelled before spawning".into());
-        }
-        let discovery = self.discovery.discover(root)?;
         let active = self
             .active
             .lock()
@@ -312,8 +312,24 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .cloned();
         let target_ref = match active.as_ref() {
             Some(active) => active.process.target.clone(),
-            None => self.selected_ref(scope, &discovery)?,
+            None => self.persisted_selected_ref(scope)?,
         };
+        if let Some(replayed) = self.replay_optional(
+            request_id,
+            PreviewOperation::Restart,
+            scope,
+            Some(&target_ref),
+            None,
+        )? {
+            return Ok(replayed);
+        }
+        if cancellation.is_cancelled() {
+            return Err("Preview restart was cancelled before spawning".into());
+        }
+        let discovery = self.discovery.discover(root)?;
+        if active.is_none() {
+            let _ = self.selected_ref(scope, &discovery)?;
+        }
         let target = resolve_target(&discovery, &target_ref)?.clone();
         let run_id = Uuid::new_v4().to_string();
         self.prepare_intent(
@@ -331,7 +347,12 @@ impl<R: PreviewRuntime> PreviewService<R> {
                         return Err(error);
                     }
                 }
-                RuntimeObservation::Exited { .. } | RuntimeObservation::OwnershipLost => {}
+                RuntimeObservation::Exited { .. } => {}
+                RuntimeObservation::OwnershipLost => {
+                    let detail = "refused to restart a reused or foreign Preview process";
+                    self.block_intent(request_id, detail)?;
+                    return Err(detail.into());
+                }
             }
             self.active
                 .lock()
@@ -360,7 +381,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(replayed) =
-            self.replay_optional(request_id, PreviewOperation::Refresh, scope, None)?
+            self.replay_optional(request_id, PreviewOperation::Refresh, scope, None, None)?
         {
             return Ok(replayed);
         }
@@ -368,6 +389,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             request_id,
             PreviewOperation::Refresh,
             scope,
+            None,
             None,
             None,
             None,
@@ -397,7 +419,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .get(scope)
             .cloned();
         if let Some(replayed) =
-            self.replay_optional(request_id, PreviewOperation::Open, scope, None)?
+            self.replay_optional(request_id, PreviewOperation::Open, scope, None, None)?
         {
             return Ok(replayed);
         }
@@ -406,6 +428,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             PreviewOperation::Open,
             scope,
             active.as_ref().map(|run| &run.process.target),
+            None,
             None,
             None,
         )?;
@@ -726,26 +749,38 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .cloned();
         if let Some(current) = current {
             if current.process.target == *target_ref {
-                if matches!(
-                    self.runtime.observe(&current.process)?,
-                    RuntimeObservation::Running { .. }
-                ) {
-                    let status = self.status_locked(scope, cancellation)?;
-                    self.commit_intent(request_id, status.clone())?;
-                    return Ok(result(
-                        operation,
-                        PreviewOperationOutcome::Unchanged,
-                        request_id,
-                        status,
-                    ));
+                match self.runtime.observe(&current.process)? {
+                    RuntimeObservation::Running { .. } => {
+                        let status = self.status_locked(scope, cancellation)?;
+                        self.commit_intent(request_id, status.clone())?;
+                        return Ok(result(
+                            operation,
+                            PreviewOperationOutcome::Unchanged,
+                            request_id,
+                            status,
+                        ));
+                    }
+                    RuntimeObservation::OwnershipLost => {
+                        let detail = "refused to replace a reused or foreign Preview process";
+                        self.block_intent(request_id, detail)?;
+                        return Err(detail.into());
+                    }
+                    RuntimeObservation::Exited { .. } => {}
                 }
-            } else if matches!(
-                self.runtime.observe(&current.process)?,
-                RuntimeObservation::Running { .. }
-            ) {
-                if let Err(error) = self.runtime.stop(&current.process) {
-                    self.block_intent(request_id, &error)?;
-                    return Err(error);
+            } else {
+                match self.runtime.observe(&current.process)? {
+                    RuntimeObservation::Running { .. } => {
+                        if let Err(error) = self.runtime.stop(&current.process) {
+                            self.block_intent(request_id, &error)?;
+                            return Err(error);
+                        }
+                    }
+                    RuntimeObservation::OwnershipLost => {
+                        let detail = "refused to replace a reused or foreign Preview process";
+                        self.block_intent(request_id, detail)?;
+                        return Err(detail.into());
+                    }
+                    RuntimeObservation::Exited { .. } => {}
                 }
             }
             self.active
@@ -904,6 +939,14 @@ impl<R: PreviewRuntime> PreviewService<R> {
         if profile.canonical_root_fingerprint != discovery.canonical_root_fingerprint {
             return Err("registered project root fingerprint changed".into());
         }
+        self.persisted_selected_ref(scope)
+    }
+
+    fn persisted_selected_ref(&self, scope: &PreviewScope) -> Result<PreviewTargetRef, String> {
+        let profile = self
+            .profiles
+            .project(&scope.project_id)
+            .ok_or_else(|| "no Preview target is selected for this project".to_string())?;
         let selected = scope
             .workspace_id
             .as_ref()
@@ -936,7 +979,8 @@ impl<R: PreviewRuntime> PreviewService<R> {
             request_id,
             operation,
             &target_ref.scope,
-            Some(&target_ref.target_id),
+            Some(target_ref),
+            None,
         )
     }
 
@@ -945,14 +989,20 @@ impl<R: PreviewRuntime> PreviewService<R> {
         request_id: &str,
         operation: PreviewOperation,
         scope: &PreviewScope,
-        target_id: Option<&PreviewTargetId>,
+        target_ref: Option<&PreviewTargetRef>,
+        requested_stop_run_id: Option<&str>,
     ) -> Result<Option<PreviewOperationResult>, String> {
         let Some(intent) = self.profiles.intent(request_id) else {
             return Ok(None);
         };
         if intent.operation != operation
             || intent.scope != *scope
-            || target_id.is_some() && intent.target_id.as_ref() != target_id
+            || target_ref.is_some_and(|target| {
+                intent.target_id.as_ref() != Some(&target.target_id)
+                    || intent.discovery_fingerprint.as_deref()
+                        != Some(target.discovery_fingerprint.as_str())
+            })
+            || intent.requested_stop_run_id.as_deref() != requested_stop_run_id
         {
             return Err("request id is already bound to a different Preview operation".into());
         }
@@ -981,6 +1031,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             &target_ref.scope,
             Some(target_ref),
             run_id,
+            None,
             expected_stop,
         )
     }
@@ -992,6 +1043,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         scope: &PreviewScope,
         target_ref: Option<&PreviewTargetRef>,
         run_id: Option<&str>,
+        requested_stop_run_id: Option<&str>,
         expected_stop: Option<&ManagedPreviewProcess>,
     ) -> Result<(), String> {
         self.profiles.record_intent(PreviewIntent {
@@ -1001,6 +1053,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             target_id: target_ref.map(|target| target.target_id.clone()),
             discovery_fingerprint: target_ref.map(|target| target.discovery_fingerprint.clone()),
             run_id: run_id.map(str::to_string),
+            requested_stop_run_id: requested_stop_run_id.map(str::to_string),
             managed_run: None,
             expected_stop_run: expected_stop.map(|process| process.identity.clone()),
             expected_stop_target: expected_stop.map(|process| process.target.clone()),
@@ -1396,6 +1449,113 @@ mod tests {
     }
 
     #[test]
+    fn replay_binds_target_fingerprint_and_requested_stop_run() {
+        let fixture = fixture("replay-binding");
+        let mut changed_fingerprint = fixture.target_ref.clone();
+        changed_fingerprint.discovery_fingerprint = format!("sha256:{}", "f".repeat(64));
+        assert!(fixture
+            .service
+            .select(&fixture.root, &changed_fingerprint, "select-1")
+            .is_err());
+
+        let started = fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                Some(&fixture.target_ref),
+                "binding-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        let run_id = started.status.run_id.unwrap();
+        fixture
+            .service
+            .stop(&fixture.scope, Some(&run_id), "binding-stop")
+            .unwrap();
+        assert!(fixture
+            .service
+            .stop(&fixture.scope, None, "binding-stop")
+            .is_err());
+        assert_eq!(fixture.runtime.spawn_count(), 1);
+        assert_eq!(fixture.runtime.stop_count(), 1);
+    }
+
+    #[test]
+    fn start_and_restart_refuse_to_replace_foreign_process_identity() {
+        let start_fixture = fixture("foreign-start-replacement");
+        let started = start_fixture
+            .service
+            .start(
+                &start_fixture.root,
+                &start_fixture.scope,
+                Some(&start_fixture.target_ref),
+                "initial-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        start_fixture.runtime.set_observation(
+            started.status.run_id.as_deref().unwrap(),
+            RuntimeObservation::OwnershipLost,
+        );
+        assert!(start_fixture
+            .service
+            .start(
+                &start_fixture.root,
+                &start_fixture.scope,
+                Some(&start_fixture.target_ref),
+                "foreign-replacement-start",
+                &ProbeCancellation::default(),
+            )
+            .is_err());
+        assert_eq!(start_fixture.runtime.spawn_count(), 1);
+        assert_eq!(start_fixture.runtime.stop_count(), 0);
+        assert_eq!(
+            start_fixture
+                .profiles
+                .intent("foreign-replacement-start")
+                .unwrap()
+                .phase,
+            PreviewIntentPhase::RecoveryBlocked
+        );
+
+        let restart_fixture = fixture("foreign-restart-replacement");
+        let started = restart_fixture
+            .service
+            .start(
+                &restart_fixture.root,
+                &restart_fixture.scope,
+                Some(&restart_fixture.target_ref),
+                "initial-restart-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        restart_fixture.runtime.set_observation(
+            started.status.run_id.as_deref().unwrap(),
+            RuntimeObservation::OwnershipLost,
+        );
+        assert!(restart_fixture
+            .service
+            .restart(
+                &restart_fixture.root,
+                &restart_fixture.scope,
+                "foreign-restart",
+                &ProbeCancellation::default(),
+            )
+            .is_err());
+        assert_eq!(restart_fixture.runtime.spawn_count(), 1);
+        assert_eq!(restart_fixture.runtime.stop_count(), 0);
+        assert_eq!(
+            restart_fixture
+                .profiles
+                .intent("foreign-restart")
+                .unwrap()
+                .phase,
+            PreviewIntentPhase::RecoveryBlocked
+        );
+    }
+
+    #[test]
     fn cancellation_before_start_has_no_process_or_intent_effect() {
         let fixture = fixture("cancelled");
         let cancellation = ProbeCancellation::default();
@@ -1601,6 +1761,7 @@ mod tests {
                 target_id: Some(fixture.target_ref.target_id.clone()),
                 discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
                 run_id: Some(run_id.into()),
+                requested_stop_run_id: None,
                 managed_run: None,
                 expected_stop_run: None,
                 expected_stop_target: None,
@@ -1657,6 +1818,7 @@ mod tests {
                 target_id: Some(fixture.target_ref.target_id.clone()),
                 discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
                 run_id: Some("lost-run".into()),
+                requested_stop_run_id: None,
                 managed_run: None,
                 expected_stop_run: None,
                 expected_stop_target: None,
@@ -1688,6 +1850,7 @@ mod tests {
                 target_id: Some(fixture.target_ref.target_id.clone()),
                 discovery_fingerprint: Some(fixture.target_ref.discovery_fingerprint.clone()),
                 run_id: Some("ambiguous-run".into()),
+                requested_stop_run_id: None,
                 managed_run: None,
                 expected_stop_run: None,
                 expected_stop_target: None,

@@ -63,6 +63,8 @@ pub struct PreviewIntent {
     pub discovery_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_stop_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_run: Option<ManagedRunIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,6 +172,7 @@ impl PreviewProfileStore {
                 || existing.target_id != intent.target_id
                 || existing.discovery_fingerprint != intent.discovery_fingerprint
                 || existing.run_id != intent.run_id
+                || existing.requested_stop_run_id != intent.requested_stop_run_id
                 || existing.expected_stop_run != intent.expected_stop_run
                 || existing.expected_stop_target != intent.expected_stop_target
             {
@@ -405,6 +408,12 @@ fn validate_intent(intent: &PreviewIntent) -> Result<(), String> {
     }
     if let Some(run_id) = intent.run_id.as_deref() {
         validate_bounded_text(run_id, "Preview run id", 160, false)?;
+    }
+    if let Some(run_id) = intent.requested_stop_run_id.as_deref() {
+        if intent.operation != PreviewOperation::Stop {
+            return Err("requested stop run id belongs to a non-stop operation".into());
+        }
+        validate_bounded_text(run_id, "requested Preview stop run id", 160, false)?;
     }
     if let Some(managed_run) = &intent.managed_run {
         managed_run.validate()?;
@@ -697,6 +706,7 @@ mod tests {
             target_id: Some(PreviewTargetId::parse("root:dev").unwrap()),
             discovery_fingerprint: Some(format!("sha256:{}", "a".repeat(64))),
             run_id: Some("run-1".into()),
+            requested_stop_run_id: None,
             managed_run: None,
             expected_stop_run: None,
             expected_stop_target: None,
