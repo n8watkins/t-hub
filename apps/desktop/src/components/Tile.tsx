@@ -1508,7 +1508,7 @@ function PanelPane({
       ? "Preview"
       : tab.charAt(0).toUpperCase() + tab.slice(1);
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="th-panel-pane flex h-full min-h-0 flex-col">
       <div
         className="flex shrink-0 items-center gap-2 border-b px-2 py-1"
         style={{
@@ -1517,7 +1517,10 @@ function PanelPane({
           fontSize: "var(--th-font-size)",
         }}
       >
-        <span className="min-w-0 flex-1 truncate" style={{ color: "var(--th-fg-muted)" }}>
+        <span
+          className="th-panel-title min-w-0 flex-1 truncate"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
           {title}
         </span>
         <button

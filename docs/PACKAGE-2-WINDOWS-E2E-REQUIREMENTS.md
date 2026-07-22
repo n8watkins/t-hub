@@ -7,6 +7,7 @@ The final candidate must be exercised in the installed Windows Dev build through
 
 Run `pnpm test`, `pnpm typecheck`, `pnpm build`, and `pnpm test:browser` from `apps/desktop` against the exact candidate commit.
 The browser suite must retain coverage for 1, 2, 4, 8, and 16 tiles, adjacent container-query widths, keyboard activation, repeated resizing, and emulated display scales.
+Successful browser runs retain deterministic grid, breakpoint, keyboard, resize, and scale screenshots under `apps/desktop/test-results/`, which remains ignored by Git.
 The source evidence must record the candidate commit and the passing command output.
 
 ## Installed Dev-build matrix
