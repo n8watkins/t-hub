@@ -152,6 +152,28 @@ function Resolve-NsisDefines {
   throw "Dev installer validation failed: NSIS definitions did not resolve within 20 passes."
 }
 
+function ConvertFrom-NsisPhysicalLines {
+  param([string]$Script)
+  $normalized = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
+  $physicalLines = @($normalized -split "`n")
+  $logicalLines = New-Object System.Collections.Generic.List[string]
+  $logicalLine = New-Object System.Text.StringBuilder
+  for ($index = 0; $index -lt $physicalLines.Count; $index++) {
+    $physicalLine = $physicalLines[$index]
+    $continues = $physicalLine.EndsWith("\", [System.StringComparison]::Ordinal)
+    if ($continues) {
+      Assert-Contract ($index -lt $physicalLines.Count - 1) "installer.nsi contains a dangling NSIS line continuation."
+      [void]$logicalLine.Append($physicalLine.Substring(0, $physicalLine.Length - 1))
+    } else {
+      [void]$logicalLine.Append($physicalLine)
+      $logicalLines.Add($logicalLine.ToString())
+      [void]$logicalLine.Clear()
+    }
+  }
+  Assert-Contract ($logicalLine.Length -eq 0) "installer.nsi contains a malformed NSIS line continuation."
+  return $logicalLines -join "`n"
+}
+
 function Get-UniqueNsisSection {
   param(
     [string]$Script,
@@ -221,7 +243,7 @@ Assert-Contract ($developmentConfig.identifier -ceq "com.t-hub.dev") "developmen
 $developmentEndpoints = $developmentConfig.plugins.updater.endpoints
 Assert-Contract ($developmentEndpoints.Count -eq 0) "development updater endpoints must remain disabled."
 
-$installerScript = (Get-Content -LiteralPath $InstallerScriptPath -Raw).Replace("`r`n", "`n").Replace("`r", "`n")
+$installerScript = ConvertFrom-NsisPhysicalLines (Get-Content -LiteralPath $InstallerScriptPath -Raw)
 $mainBinaryName = Get-UniqueNsisDefine $installerScript "MAINBINARYNAME"
 $mainBinarySourcePath = Get-UniqueNsisDefine $installerScript "MAINBINARYSRCPATH"
 $productName = Get-UniqueNsisDefine $installerScript "PRODUCTNAME"

@@ -220,6 +220,39 @@ SectionEnd
     Invoke-Validator $misplacedChecksScriptPath $rawPath $extractedPath $installedPath
   } "all CheckIfAppIsRunning calls must be confined"
 
+  $continuedScriptPath = Join-Path $fixtureRoot "continued-installer.nsi"
+  $continuedScript = $validScript.Replace(
+    '!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"',
+    "!insertmacro \`n    CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`""
+  )
+  Assert-True ($continuedScript -cne $validScript) "continued valid fixture mutation must take effect."
+  Write-NsisFixture $continuedScriptPath $continuedScript
+  $continuedResult = (Invoke-Validator $continuedScriptPath $rawPath $extractedPath $installedPath | Out-String) | ConvertFrom-Json
+  Assert-True ($continuedResult.expectedSha256 -ceq $continuedResult.extractedSha256) "continued valid process checks must validate."
+
+  $continuedOutsideScriptPath = Join-Path $fixtureRoot "continued-outside-installer.nsi"
+  $continuedOutsideScript = $continuedScript.Replace(
+    "Section Uninstall`n  !insertmacro \`n    CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"",
+    "  !insertmacro \`n    CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"`nSection Uninstall"
+  )
+  Assert-True ($continuedOutsideScript -cne $continuedScript) "continued outside-section fixture mutation must take effect."
+  Write-NsisFixture $continuedOutsideScriptPath $continuedOutsideScript
+  Assert-ValidatorFails "continued process check outside sections" {
+    Invoke-Validator $continuedOutsideScriptPath $rawPath $extractedPath $installedPath
+  } "all CheckIfAppIsRunning calls must be confined"
+
+  $mixedContinuedOutsideScriptPath = Join-Path $fixtureRoot "mixed-continued-outside-installer.nsi"
+  Write-AsciiFixture $mixedContinuedOutsideScriptPath (ConvertTo-MixedLineEndings $continuedOutsideScript)
+  Assert-ValidatorFails "mixed-line-ending continued process check outside sections" {
+    Invoke-Validator $mixedContinuedOutsideScriptPath $rawPath $extractedPath $installedPath
+  } "all CheckIfAppIsRunning calls must be confined"
+
+  $danglingContinuationScriptPath = Join-Path $fixtureRoot "dangling-continuation-installer.nsi"
+  Write-NsisFixture $danglingContinuationScriptPath ($validScript + "`n\")
+  Assert-ValidatorFails "dangling NSIS continuation" {
+    Invoke-Validator $danglingContinuationScriptPath $rawPath $extractedPath $installedPath
+  } "dangling NSIS line continuation"
+
   $directKillScriptPath = Join-Path $fixtureRoot "direct-production-kill.nsi"
   $directKillScript = $validScript.Replace(
     "Section Install",
@@ -281,7 +314,7 @@ SectionEnd
     Assert-True ($workflow.Contains($requiredWorkflowContract)) "release workflow is missing '$requiredWorkflowContract'."
   }
 
-  Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected thirteen unsafe fixtures."
+  Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected sixteen unsafe fixtures."
 } finally {
   if (Test-Path -LiteralPath $fixtureRoot) {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force
