@@ -218,12 +218,23 @@ impl<I: EndpointInspector> EndpointResolver<I> {
             });
             match reached {
                 Some(true) => {
+                    if cancellation.is_cancelled() {
+                        return Err(EndpointError::Cancelled);
+                    }
+                    let final_owner = self
+                        .inspector
+                        .listener_ownership(hint.port)
+                        .map_err(EndpointError::Inspection)?
+                        .ok_or(EndpointError::ListenerMissing)?;
+                    if !final_owner.belongs_to(run) {
+                        return Err(EndpointError::ForeignListener);
+                    }
                     return Ok(PreviewEndpoint {
                         hinted_url,
                         advertised_url,
                         reachable_url: candidate,
                         port: hint.port,
-                    })
+                    });
                 }
                 Some(false) => {}
                 None => return Err(EndpointError::Cancelled),
@@ -414,14 +425,19 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     struct FakeInspector {
-        ownership: Option<ListenerOwnership>,
+        ownership: Mutex<VecDeque<Option<ListenerOwnership>>>,
         probes: Mutex<VecDeque<bool>>,
         calls: Mutex<Vec<String>>,
     }
 
     impl EndpointInspector for FakeInspector {
         fn listener_ownership(&self, _port: u16) -> Result<Option<ListenerOwnership>, String> {
-            Ok(self.ownership.clone())
+            let mut ownership = self.ownership.lock().unwrap();
+            if ownership.len() > 1 {
+                Ok(ownership.pop_front().flatten())
+            } else {
+                Ok(ownership.front().cloned().flatten())
+            }
         }
 
         fn probe(&self, url: &str, _timeout: Duration, _cancellation: &ProbeCancellation) -> bool {
@@ -442,10 +458,10 @@ mod tests {
 
     fn inspector(probes: impl Into<VecDeque<bool>>) -> FakeInspector {
         FakeInspector {
-            ownership: Some(ListenerOwnership {
+            ownership: Mutex::new(VecDeque::from([Some(ListenerOwnership {
                 process_group_id: 42,
                 process_group_started_at: 100,
-            }),
+            })])),
             probes: Mutex::new(probes.into()),
             calls: Mutex::new(Vec::new()),
         }
@@ -468,8 +484,15 @@ mod tests {
 
     #[test]
     fn listener_must_belong_to_exact_managed_process_group() {
-        let mut fake = inspector(VecDeque::from([true]));
-        fake.ownership.as_mut().unwrap().process_group_started_at = 99;
+        let fake = inspector(VecDeque::from([true]));
+        fake.ownership
+            .lock()
+            .unwrap()
+            .front_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .process_group_started_at = 99;
         let resolver = EndpointResolver::new(fake);
         assert_eq!(
             resolver.resolve(
@@ -497,6 +520,31 @@ mod tests {
         assert_eq!(endpoint.advertised_url, "http://127.0.0.1:5173/app");
         assert_eq!(endpoint.reachable_url, "http://172.30.1.2:5173/app");
         assert_eq!(resolver.inspector.calls.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn listener_rebind_after_successful_probe_is_rejected() {
+        let fake = inspector(VecDeque::from([true]));
+        *fake.ownership.lock().unwrap() = VecDeque::from([
+            Some(ListenerOwnership {
+                process_group_id: 42,
+                process_group_started_at: 100,
+            }),
+            Some(ListenerOwnership {
+                process_group_id: 42,
+                process_group_started_at: 101,
+            }),
+        ]);
+        let resolver = EndpointResolver::new(fake);
+        assert_eq!(
+            resolver.resolve(
+                &run(),
+                b"http://localhost:4173",
+                None,
+                &ProbeCancellation::default(),
+            ),
+            Err(EndpointError::ForeignListener)
+        );
     }
 
     #[test]
