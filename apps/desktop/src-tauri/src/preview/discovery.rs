@@ -619,17 +619,23 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 fn normalize_relative(value: &str) -> Result<String, String> {
     let normalized = value.trim().replace('\\', "/");
     let path = Path::new(&normalized);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
+    if path.is_absolute() {
         return Err("Preview paths must be canonical-root-relative".into());
     }
-    Ok(normalized.trim_matches('/').to_string())
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(
+                part.to_str()
+                    .ok_or_else(|| "Preview paths must be valid UTF-8".to_string())?,
+            ),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("Preview paths must be canonical-root-relative".into());
+            }
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 fn nofollow_options(maybe_dir: bool) -> CapOpenOptions {
