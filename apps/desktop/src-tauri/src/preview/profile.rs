@@ -1,7 +1,7 @@
 //! Durable Preview profile storage.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +117,19 @@ impl PreviewProfileStore {
         Ok(())
     }
 
+    pub fn update_project<F>(&self, project_id: &str, update: F) -> Result<(), String>
+    where
+        F: FnOnce(Option<ProjectPreviewProfile>) -> Result<ProjectPreviewProfile, String>,
+    {
+        let mut guard = self.state.lock();
+        let profile = update(guard.projects.get(project_id).cloned())?;
+        let mut next = guard.clone();
+        next.projects.insert(project_id.to_string(), profile);
+        persist_profiles(&self.path, &next)?;
+        *guard = next;
+        Ok(())
+    }
+
     pub fn intent(&self, request_id: &str) -> Option<PreviewIntent> {
         self.state
             .lock()
@@ -127,6 +140,9 @@ impl PreviewProfileStore {
     }
 
     pub fn record_intent(&self, intent: PreviewIntent) -> Result<PreviewIntent, String> {
+        if intent.request_id.is_empty() || intent.request_id.len() > 160 {
+            return Err("Preview request id must contain 1 to 160 bytes".into());
+        }
         let mut guard = self.state.lock();
         if let Some(existing) = guard
             .idempotency_journal
@@ -147,7 +163,16 @@ impl PreviewProfileStore {
         let mut next = guard.clone();
         next.idempotency_journal.push_back(intent.clone());
         while next.idempotency_journal.len() > IDEMPOTENCY_JOURNAL_CAP {
-            next.idempotency_journal.pop_front();
+            let terminal = next.idempotency_journal.iter().position(|entry| {
+                matches!(
+                    entry.phase,
+                    PreviewIntentPhase::Committed | PreviewIntentPhase::RecoveryBlocked
+                )
+            });
+            let Some(terminal) = terminal else {
+                return Err("Preview idempotency journal is full of incomplete intents".into());
+            };
+            next.idempotency_journal.remove(terminal);
         }
         persist_profiles(&self.path, &next)?;
         *guard = next;
@@ -240,8 +265,15 @@ fn load_profiles(path: &Path) -> Result<PreviewProfilesV1, String> {
             "unsupported Preview profiles schemaVersion {version}; expected {PROFILE_SCHEMA_VERSION}"
         ));
     }
-    serde_json::from_value(value)
-        .map_err(|error| format!("invalid Preview profiles {}: {error}", path.display()))
+    let profiles: PreviewProfilesV1 = serde_json::from_value(value)
+        .map_err(|error| format!("invalid Preview profiles {}: {error}", path.display()))?;
+    if profiles.idempotency_journal.len() > IDEMPOTENCY_JOURNAL_CAP {
+        return Err(format!(
+            "Preview profiles {} exceed the idempotency journal bound",
+            path.display()
+        ));
+    }
+    Ok(profiles)
 }
 
 fn persist_profiles(path: &Path, state: &PreviewProfilesV1) -> Result<(), String> {
@@ -277,8 +309,10 @@ fn persist_profiles(path: &Path, state: &PreviewProfilesV1) -> Result<(), String
             <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )
         .map_err(|error| format!("chmod {}: {error}", temp.display()))?;
-        fs::rename(&temp, path).map_err(|error| format!("publish {}: {error}", path.display()))?;
-        File::open(parent)
+        replace_file(&temp, path)
+            .map_err(|error| format!("publish {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("sync {}: {error}", parent.display()))?;
         Ok(())
@@ -287,6 +321,35 @@ fn persist_profiles(path: &Path, state: &PreviewProfilesV1) -> Result<(), String
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())
 }
 
 #[cfg(test)]
@@ -352,6 +415,21 @@ mod tests {
             fs::read(&newer).unwrap(),
             br#"{"schemaVersion":99,"projects":{}}"#
         );
+    }
+
+    #[test]
+    fn oversized_journal_fails_closed_without_dropping_incomplete_intents() {
+        let path = temp_path("oversized");
+        let mut profiles = PreviewProfilesV1::default();
+        for index in 0..=IDEMPOTENCY_JOURNAL_CAP {
+            profiles
+                .idempotency_journal
+                .push_back(prepared(&format!("request-{index}")));
+        }
+        let original = serde_json::to_vec(&profiles).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(PreviewProfileStore::open(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
