@@ -114,6 +114,10 @@ Section Uninstall
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
 SectionEnd
 '@
+  # PowerShell preserves the host platform's line endings in here-strings.
+  # Normalize before constructing mutations so every negative fixture is
+  # materially unsafe on both Windows and Unix hosts.
+  $validScript = $validScript.Replace("`r`n", "`n").Replace("`r", "`n")
   Write-NsisFixture $validScriptPath $validScript
   Write-AsciiFixture $installerPath "fixture installer"
   $binaryPrefix = "T-Hub Dev|t-hub-dev|.t-hub-dev|t-hub-dev.db|__TAURI_BUNDLE_TYPE_VAR_NSS|"
@@ -210,10 +214,11 @@ SectionEnd
     "Section Uninstall`n  !insertmacro CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"",
     "  !insertmacro CheckIfAppIsRunning `"`${MAINBINARYNAME}.exe`" `"`${PRODUCTNAME}`"`nSection Uninstall"
   )
+  Assert-True ($misplacedChecksScript -cne $validScript) "misplaced process-check fixture mutation must take effect."
   Write-NsisFixture $misplacedChecksScriptPath $misplacedChecksScript
   Assert-ValidatorFails "both process checks in install section" {
     Invoke-Validator $misplacedChecksScriptPath $rawPath $extractedPath $installedPath
-  } "Uninstall section must contain exactly one"
+  } "all CheckIfAppIsRunning calls must be confined"
 
   $directKillScriptPath = Join-Path $fixtureRoot "direct-production-kill.nsi"
   $directKillScript = $validScript.Replace(

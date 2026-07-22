@@ -241,6 +241,7 @@ $allProcessChecks = [regex]::Matches($resolvedScript, '(?im)^\s*!insertmacro\s+C
 $installProcessChecks = [regex]::Matches($installSection, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*"t-hub-dev\.exe"[^\r\n]*$')
 $uninstallProcessChecks = [regex]::Matches($uninstallSection, '(?im)^\s*!insertmacro\s+CheckIfAppIsRunning\b[^\r\n]*"t-hub-dev\.exe"[^\r\n]*$')
 Assert-Contract ($allProcessChecks.Count -eq 2) "installer.nsi must contain exactly two CheckIfAppIsRunning calls."
+Assert-Contract (($installProcessChecks.Count + $uninstallProcessChecks.Count) -eq $allProcessChecks.Count) "all CheckIfAppIsRunning calls must be confined to the Install and Uninstall sections."
 Assert-Contract ($installProcessChecks.Count -eq 1) "Install section must contain exactly one t-hub-dev.exe CheckIfAppIsRunning call."
 Assert-Contract ($uninstallProcessChecks.Count -eq 1) "Uninstall section must contain exactly one t-hub-dev.exe CheckIfAppIsRunning call."
 foreach ($processLine in [regex]::Matches($activeLines, '(?im)^.*(?:KillProcess|taskkill)[^\r\n]*$')) {
