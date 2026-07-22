@@ -125,7 +125,7 @@ describe("HistoryList", () => {
         .querySelector('[data-history-id="history-claude"]')
         ?.getAttribute("data-continuity-state"),
     ).toBe("active");
-    expect(onCount).toHaveBeenLastCalledWith(2);
+    await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(2));
     expect(localStorage.getItem("th.recent.cache.v1")).toBeNull();
     expect(localStorage.getItem("th.recent.hidden.v2")).toBeNull();
 
