@@ -45,7 +45,7 @@ pub struct CortanaRuntimeCandidate {
 }
 
 pub const LEGACY_ORPHAN_PROVENANCE_VERSION: u32 = 1;
-pub const MANAGED_OWNER_TOKEN_VERSION: u32 = 1;
+pub const MANAGED_OWNER_TOKEN_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -83,6 +83,44 @@ pub struct CortanaLegacyOrphanProvenance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaExecutableIdentity {
+    pub path: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaManagedSystemTools {
+    pub systemctl: CortanaExecutableIdentity,
+    pub systemd_run: CortanaExecutableIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CortanaManagedLaunchPhase {
+    Prepared,
+    Observed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaManagedLaunchIntent {
+    pub version: u32,
+    pub operation_id: String,
+    pub terminal_id: String,
+    pub tmux_target: String,
+    pub identity_id: String,
+    pub generation: u64,
+    pub harness: String,
+    pub unit_name: String,
+    pub launch_nonce: String,
+    pub tools: CortanaManagedSystemTools,
+    pub phase: CortanaManagedLaunchPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CortanaManagedOwnerToken {
     pub version: u32,
     pub unit_name: String,
@@ -92,6 +130,7 @@ pub struct CortanaManagedOwnerToken {
     pub launcher_pid: u32,
     pub launcher_start_ticks: u64,
     pub launch_nonce: String,
+    pub tools: CortanaManagedSystemTools,
     pub tmux: CortanaOrphanEffectIdentity,
 }
 
@@ -119,6 +158,8 @@ pub struct CortanaDurableIdentity {
     pub checkpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<CortanaManagedOwnerToken>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_launch: Option<CortanaManagedLaunchIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_quarantine: Option<CortanaLegacyQuarantine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -525,6 +566,7 @@ mod tests {
             conversation_id: Some("conversation-1".into()),
             checkpoint: Some("checkpoint-1".into()),
             owner: None,
+            managed_launch: None,
             legacy_quarantine: None,
             legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {

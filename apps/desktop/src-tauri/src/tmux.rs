@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use crate::bounded_exec::output_with_timeout;
+use crate::bounded_exec::{output_with_timeout, output_with_timeout_and_limit};
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
 ///
@@ -141,10 +141,41 @@ pub(crate) struct SessionEffectIdentity {
     pub(crate) foreground_process_session_id: u32,
 }
 
-pub(crate) const MANAGED_RUNTIME_OWNER_VERSION: u32 = 1;
+pub(crate) const MANAGED_RUNTIME_OWNER_VERSION: u32 = 2;
+
+const MANAGED_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ManagedExecutableIdentity {
+    pub(crate) path: String,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ManagedSystemTools {
+    pub(crate) systemctl: ManagedExecutableIdentity,
+    pub(crate) systemd_run: ManagedExecutableIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ManagedRuntimeLaunchSpec {
+    pub(crate) unit_name: String,
+    pub(crate) launch_nonce: String,
+    pub(crate) tools: ManagedSystemTools,
+}
 
 /// Stable proof that one tmux pane generation is owned by one transient user
 /// systemd scope and its exact cgroup-v2 directory.
+///
+/// This is a stale-effect and accidental-interposition boundary, not a hostile
+/// same-UID security boundary.
+/// A malicious process running as the same user can modify user-owned state.
+/// Legacy migration therefore treats ambiguous effects as unowned, revokes every
+/// candidate bearer identity, and does not signal any candidate runtime.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ManagedRuntimeOwnerToken {
@@ -156,6 +187,7 @@ pub(crate) struct ManagedRuntimeOwnerToken {
     pub(crate) launcher_pid: u32,
     pub(crate) launcher_start_ticks: u64,
     pub(crate) launch_nonce: String,
+    pub(crate) tools: ManagedSystemTools,
     pub(crate) tmux: SessionEffectIdentity,
 }
 
@@ -598,13 +630,49 @@ pub fn new_session_with_env(
 /// Create a detached pane whose first user process is already inside a unique
 /// transient user-systemd scope, then publish ownership only after every kernel,
 /// systemd, nonce, process, and tmux identity agrees.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn new_managed_session_with_env(
     name: &str,
     cwd: &str,
     command: Option<&str>,
     env: &[(String, String)],
 ) -> Result<ManagedRuntimeOwnerToken, TmuxError> {
-    managed_runtime_preflight()?;
+    let launch = prepare_managed_runtime_launch()?;
+    new_prepared_managed_session_with_env(name, cwd, command, env, &launch)
+}
+
+pub(crate) fn prepare_managed_runtime_launch() -> Result<ManagedRuntimeLaunchSpec, TmuxError> {
+    let tools = resolve_managed_system_tools()?;
+    managed_runtime_preflight_with_tools(&tools)?;
+    let launch_nonce = uuid::Uuid::new_v4().simple().to_string();
+    Ok(ManagedRuntimeLaunchSpec {
+        unit_name: format!("t-hub-{launch_nonce}.scope"),
+        launch_nonce,
+        tools,
+    })
+}
+
+pub(crate) fn new_prepared_managed_session_with_env(
+    name: &str,
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+    launch: &ManagedRuntimeLaunchSpec,
+) -> Result<ManagedRuntimeOwnerToken, TmuxError> {
+    managed_runtime_preflight_with_tools(&launch.tools)?;
+    if launch.unit_name != format!("t-hub-{}.scope", launch.launch_nonce)
+        || launch.launch_nonce.len() != 32
+        || !launch
+            .launch_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(TmuxError {
+            op: "new-managed-session",
+            code: None,
+            message: "prepared managed runtime identity is malformed".into(),
+        });
+    }
     if env
         .iter()
         .any(|(key, _)| matches!(key.as_str(), "T_HUB_LAUNCH_NONCE" | "T_HUB_MANAGED_STARTUP"))
@@ -615,8 +683,8 @@ pub(crate) fn new_managed_session_with_env(
             message: "managed runtime ownership environment is reserved".into(),
         });
     }
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let unit_name = format!("t-hub-{nonce}.scope");
+    let nonce = &launch.launch_nonce;
+    let unit_name = &launch.unit_name;
     let startup = command
         .map(str::to_string)
         .unwrap_or_else(|| "exec \"${SHELL:-/bin/sh}\" -l".into());
@@ -624,8 +692,9 @@ pub(crate) fn new_managed_session_with_env(
     managed_env.push(("T_HUB_LAUNCH_NONCE".into(), nonce.clone()));
     managed_env.push(("T_HUB_MANAGED_STARTUP".into(), startup));
     let wrapper = format!(
-        "exec systemd-run --user --scope --unit={unit_name} --collect --quiet -- \
-         /bin/sh -lc 'exec /bin/sh -lc \"$T_HUB_MANAGED_STARTUP\"'"
+        "exec {} --user --scope --unit={unit_name} --collect --quiet -- \
+         /bin/sh -lc 'exec /bin/sh -lc \"$T_HUB_MANAGED_STARTUP\"'",
+        launch.tools.systemd_run.path
     );
     new_session_with_env(name, cwd, Some(&wrapper), &managed_env)?;
 
@@ -633,41 +702,57 @@ pub(crate) fn new_managed_session_with_env(
     let mut last_error = None;
     while std::time::Instant::now() < deadline {
         match observe_session_effect_identity(name)
-            .and_then(|tmux| observe_managed_runtime_owner(&unit_name, &nonce, tmux))
+            .and_then(|tmux| observe_managed_runtime_owner(&launch.tools, unit_name, nonce, tmux))
         {
             Ok(owner) => return Ok(owner),
             Err(error) => last_error = Some(error),
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = stop_managed_unit(&unit_name);
-    let _ = kill_session(name);
-    Err(last_error.unwrap_or(TmuxError {
+    let unit_cleanup = stop_managed_unit(&launch.tools, unit_name);
+    let session_cleanup = kill_session(name);
+    let mut error = last_error.unwrap_or(TmuxError {
         op: "new-managed-session",
         code: None,
         message: "managed runtime ownership was not established before publication".into(),
-    }))
+    });
+    if let Err(cleanup) = unit_cleanup {
+        error.message = format!(
+            "{}; exact prepared cleanup failed: {cleanup}",
+            error.message
+        );
+    }
+    if let Err(cleanup) = session_cleanup {
+        error.message = format!("{}; exact tmux cleanup failed: {cleanup}", error.message);
+    }
+    Err(error)
 }
 
-fn stop_managed_unit(unit_name: &str) -> Result<(), TmuxError> {
+fn stop_managed_unit(tools: &ManagedSystemTools, unit_name: &str) -> Result<(), TmuxError> {
     #[cfg(windows)]
     let mut command = {
         use std::os::windows::process::CommandExt;
         let mut command = Command::new("wsl.exe");
-        command.arg("--cd").arg("~").arg("-e").arg("systemctl");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg(&tools.systemctl.path);
         command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(unix)]
-    let mut command = Command::new("systemctl");
+    let mut command = Command::new(&tools.systemctl.path);
     command.args(["--user", "stop", unit_name]);
     #[cfg(windows)]
     command.args(["--user", "stop", unit_name]);
-    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
-        op: "stop-managed-unit",
-        code: None,
-        message: format!("failed to stop unpublished managed unit: {error}"),
-    })?;
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "stop-managed-unit",
+                code: None,
+                message: format!("failed to stop unpublished managed unit: {error}"),
+            })?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1191,7 +1276,7 @@ fn exact_effect_command() -> Command {
 }
 
 const MANAGED_CGROUP_EFFECT_PY: &str = r##"
-import json, os, re, shutil, subprocess, sys, time
+import json, os, re, resource, stat, subprocess, sys, tempfile, time
 
 def refuse(code):
     raise SystemExit(code)
@@ -1214,19 +1299,72 @@ def proc_start(pid):
     except (ValueError, IndexError):
         refuse(82)
 
-def systemd_properties(unit):
+KNOWN_SYSTEMCTL = ("/usr/bin/systemctl", "/bin/systemctl")
+KNOWN_SYSTEMD_RUN = ("/usr/bin/systemd-run", "/bin/systemd-run")
+
+def executable_identity(path, candidates):
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        refuse(104)
+    canonical_candidates = {os.path.realpath(candidate) for candidate in candidates}
+    canonical = os.path.realpath(path)
+    if canonical not in canonical_candidates or path != canonical:
+        refuse(105)
+    try:
+        details = os.stat(canonical, follow_symlinks=False)
+    except OSError:
+        refuse(106)
+    if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or
+        details.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or
+        not details.st_mode & stat.S_IXUSR):
+        refuse(107)
+    return {"path": canonical, "device": details.st_dev, "inode": details.st_ino}
+
+def resolve_tool(candidates):
+    for candidate in candidates:
+        canonical = os.path.realpath(candidate)
+        if os.path.exists(canonical):
+            return executable_identity(canonical, candidates)
+    refuse(108)
+
+def validate_tools(raw):
+    if not isinstance(raw, dict) or set(raw) != {"systemctl", "systemdRun"}:
+        refuse(109)
+    systemctl = executable_identity(raw["systemctl"].get("path"), KNOWN_SYSTEMCTL)
+    systemd_run = executable_identity(raw["systemdRun"].get("path"), KNOWN_SYSTEMD_RUN)
+    if systemctl != raw["systemctl"] or systemd_run != raw["systemdRun"]:
+        refuse(110)
+    return {"systemctl": systemctl, "systemdRun": systemd_run}
+
+def bounded_systemctl(systemctl, unit):
+    def limit_output():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536))
+    stdout = tempfile.TemporaryFile()
+    stderr = tempfile.TemporaryFile()
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "show", "--no-pager", unit,
+            [systemctl, "--user", "show", "--no-pager", unit,
              "--property=Id", "--property=InvocationID", "--property=ControlGroup",
              "--property=ActiveState", "--property=SubState"],
-            capture_output=True, text=True, timeout=5, check=False)
+            stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+            timeout=5, check=False, preexec_fn=limit_output)
     except (OSError, subprocess.TimeoutExpired):
         refuse(83)
-    if result.returncode != 0 or result.stderr:
+    stdout.seek(0)
+    stderr.seek(0)
+    stdout_raw = stdout.read(65537)
+    stderr_raw = stderr.read(65537)
+    if (result.returncode != 0 or stderr_raw or len(stdout_raw) > 65536 or
+        len(stderr_raw) > 65536):
         refuse(84)
+    try:
+        return stdout_raw.decode("utf-8")
+    except UnicodeDecodeError:
+        refuse(84)
+
+def systemd_properties(systemctl, unit):
+    output = bounded_systemctl(systemctl, unit)
     props = {}
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         key, separator, value = line.partition("=")
         if not separator or key in props:
             refuse(85)
@@ -1235,22 +1373,31 @@ def systemd_properties(unit):
         refuse(86)
     return props
 
-def observe(unit, nonce, pid):
+def exact_cgroup_path(unit, path):
+    uid = os.getuid()
+    expected = f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
+    return path == expected and os.path.basename(path) == unit
+
+def observe(tools, unit, nonce, pid):
     if not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit):
         refuse(87)
     if not re.fullmatch(r"[0-9a-f]{32}", nonce) or pid <= 0:
         refuse(88)
-    props = systemd_properties(unit)
+    props = systemd_properties(tools["systemctl"]["path"], unit)
     path = props["ControlGroup"]
     if (props["Id"] != unit or props["ActiveState"] != "active" or
         props["SubState"] != "running" or
         not re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"]) or
-        not path.startswith("/") or ".." in path.split("/") or "\x00" in path):
+        not exact_cgroup_path(unit, path) or ".." in path.split("/") or "\x00" in path):
         refuse(89)
     directory = "/sys/fs/cgroup" + path
     try:
         descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         inode = os.fstat(descriptor).st_ino
+        for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
+            control_details = os.stat(control, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISREG(control_details.st_mode):
+                refuse(90)
         os.close(descriptor)
     except (FileNotFoundError, PermissionError, OSError):
         refuse(90)
@@ -1271,7 +1418,41 @@ def observe(unit, nonce, pid):
         "launcherPid": pid,
         "launcherStartTicks": proc_start(pid),
         "launchNonce": nonce,
+        "tools": tools,
     }
+
+def static_owner(expected):
+    tools = validate_tools(expected.get("tools"))
+    unit = expected.get("unitName")
+    path = expected.get("cgroupPath")
+    if (not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit or "") or
+        expected.get("launchNonce") != unit[6:-6] or
+        not exact_cgroup_path(unit, path or "") or
+        not re.fullmatch(r"[0-9a-f]{32}", expected.get("invocationId") or "") or
+        not isinstance(expected.get("cgroupInode"), int) or expected["cgroupInode"] <= 0):
+        refuse(113)
+    props = systemd_properties(tools["systemctl"]["path"], unit)
+    directory_path = "/sys/fs/cgroup" + path
+    if props["ActiveState"] != "active":
+        if (props["Id"] == unit and props["InvocationID"] in ("", expected["invocationId"]) and
+            props["ControlGroup"] in ("", path) and not os.path.exists(directory_path)):
+            return tools, None
+        refuse(114)
+    if (props["Id"] != unit or props["SubState"] != "running" or
+        props["InvocationID"] != expected["invocationId"] or
+        props["ControlGroup"] != path):
+        refuse(115)
+    directory = None
+    try:
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        if os.fstat(directory).st_ino != expected["cgroupInode"]:
+            refuse(116)
+        for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
+            if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
+                refuse(117)
+    except (FileNotFoundError, PermissionError, OSError):
+        refuse(118)
+    return tools, directory
 
 def event_value(directory, key, missing_is_zero=False):
     try:
@@ -1306,9 +1487,19 @@ def write_control(directory, name, value):
         refuse(99)
 
 mode = sys.argv[1] if len(sys.argv) > 1 else ""
-if mode == "preflight":
-    if (shutil.which("systemctl") is None or shutil.which("systemd-run") is None or
-        not os.path.exists("/sys/fs/cgroup/cgroup.controllers")):
+if mode == "tools" and len(sys.argv) == 2:
+    print(json.dumps({"systemctl": resolve_tool(KNOWN_SYSTEMCTL),
+                      "systemdRun": resolve_tool(KNOWN_SYSTEMD_RUN)}, separators=(",", ":")))
+    raise SystemExit(0)
+if mode == "validate-path" and len(sys.argv) == 4:
+    if not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", sys.argv[2]):
+        refuse(111)
+    if not exact_cgroup_path(sys.argv[2], sys.argv[3]):
+        refuse(112)
+    raise SystemExit(0)
+if mode == "preflight" and len(sys.argv) == 3:
+    tools = validate_tools(json.loads(sys.argv[2]))
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
         refuse(70)
     current = bounded_read("/proc/self/cgroup").strip()
     if not current.startswith("0::/"):
@@ -1317,35 +1508,89 @@ if mode == "preflight":
     for name in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
         if not os.path.exists(os.path.join(directory, name)):
             refuse(72)
-    props = systemd_properties("app.slice")
+    props = systemd_properties(tools["systemctl"]["path"], "app.slice")
     if props["ActiveState"] != "active":
         refuse(73)
     raise SystemExit(0)
-if mode == "observe" and len(sys.argv) == 5:
-    print(json.dumps(observe(sys.argv[2], sys.argv[3], int(sys.argv[4])), separators=(",", ":")))
+if mode == "retire-prepared" and len(sys.argv) == 3:
+    prepared = json.loads(sys.argv[2])
+    tools = validate_tools(prepared.get("tools"))
+    unit = prepared.get("unitName")
+    nonce = prepared.get("launchNonce")
+    if (not re.fullmatch(r"t-hub-[0-9a-f]{32}\.scope", unit or "") or
+        nonce != unit[6:-6]):
+        refuse(119)
+    path = f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}"
+    props = systemd_properties(tools["systemctl"]["path"], unit)
+    directory_path = "/sys/fs/cgroup" + path
+    if props["ActiveState"] != "active":
+        if (props["Id"] == unit and props["InvocationID"] == "" and
+            props["ControlGroup"] in ("", path) and not os.path.exists(directory_path)):
+            raise SystemExit(0)
+        refuse(120)
+    if (props["Id"] != unit or props["SubState"] != "running" or
+        props["ControlGroup"] != path or
+        not re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"])):
+        refuse(121)
+    directory = None
+    try:
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        for control in ("cgroup.freeze", "cgroup.kill", "cgroup.events"):
+            if not stat.S_ISREG(os.stat(control, dir_fd=directory, follow_symlinks=False).st_mode):
+                refuse(122)
+        write_control(directory, "cgroup.freeze", b"1")
+        deadline = time.monotonic() + 5
+        while event_value(directory, "frozen") != 1:
+            if time.monotonic() >= deadline:
+                refuse(123)
+            time.sleep(0.005)
+        write_control(directory, "cgroup.kill", b"1")
+        deadline = time.monotonic() + 5
+        while event_value(directory, "populated", True) != 0:
+            if time.monotonic() >= deadline:
+                refuse(124)
+            time.sleep(0.005)
+    except (FileNotFoundError, PermissionError, OSError):
+        refuse(125)
+    finally:
+        if directory is not None:
+            os.close(directory)
     raise SystemExit(0)
-if mode != "retire" or len(sys.argv) not in (3, 5):
+if mode == "observe" and len(sys.argv) == 6:
+    tools = validate_tools(json.loads(sys.argv[2]))
+    print(json.dumps(observe(tools, sys.argv[3], sys.argv[4], int(sys.argv[5])), separators=(",", ":")))
+    raise SystemExit(0)
+if mode not in ("retire", "retire-gone") or len(sys.argv) not in (3, 5):
     refuse(74)
 crash_stage = sys.argv[3] if len(sys.argv) == 5 else ""
 crash_marker = sys.argv[4] if len(sys.argv) == 5 else ""
 try:
     expected = json.loads(sys.argv[2])
-    actual = observe(expected["unitName"], expected["launchNonce"], expected["launcherPid"])
+    tools = validate_tools(expected["tools"])
+    if mode == "retire":
+        actual = observe(tools, expected["unitName"], expected["launchNonce"], expected["launcherPid"])
+        directory = None
+    else:
+        tools, directory = static_owner(expected)
+        if directory is None:
+            raise SystemExit(0)
+        actual = expected
 except (KeyError, TypeError, ValueError):
     refuse(75)
 for key in ("unitName", "invocationId", "cgroupPath", "cgroupInode",
-            "launcherPid", "launcherStartTicks", "launchNonce"):
+            "launcherPid", "launcherStartTicks", "launchNonce", "tools"):
     if actual[key] != expected.get(key):
         refuse(76)
 directory_path = "/sys/fs/cgroup" + actual["cgroupPath"]
-try:
-    directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-except (FileNotFoundError, PermissionError, OSError):
-    refuse(77)
+if directory is None:
+    try:
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except (FileNotFoundError, PermissionError, OSError):
+        refuse(77)
 try:
     if os.fstat(directory).st_ino != actual["cgroupInode"]:
         refuse(78)
-    second = systemd_properties(actual["unitName"])
+    second = systemd_properties(tools["systemctl"]["path"], actual["unitName"])
     if (second["InvocationID"] != actual["invocationId"] or
         second["ControlGroup"] != actual["cgroupPath"]):
         refuse(79)
@@ -1394,14 +1639,51 @@ fn managed_cgroup_effect_command() -> Command {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn managed_runtime_preflight() -> Result<(), TmuxError> {
+    let tools = resolve_managed_system_tools()?;
+    managed_runtime_preflight_with_tools(&tools)
+}
+
+fn resolve_managed_system_tools() -> Result<ManagedSystemTools, TmuxError> {
     let mut command = managed_cgroup_effect_command();
-    command.arg("preflight");
-    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
+    command.arg("tools");
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "managed-runtime-tools",
+                code: None,
+                message: format!("managed system helper resolution failed: {error}"),
+            })?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(TmuxError {
+            op: "managed-runtime-tools",
+            code: output.status.code(),
+            message: "trusted absolute systemd helpers are unavailable".into(),
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
+        op: "managed-runtime-tools",
+        code: None,
+        message: "managed system helper identity was malformed".into(),
+    })
+}
+
+fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<(), TmuxError> {
+    let mut command = managed_cgroup_effect_command();
+    let encoded = serde_json::to_string(tools).map_err(|_| TmuxError {
         op: "managed-runtime-preflight",
         code: None,
-        message: format!("managed runtime ownership probe failed: {error}"),
+        message: "managed system helper identity could not be encoded".into(),
     })?;
+    command.args(["preflight", &encoded]);
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "managed-runtime-preflight",
+                code: None,
+                message: format!("managed runtime ownership probe failed: {error}"),
+            })?;
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
@@ -1423,25 +1705,35 @@ struct ManagedRuntimeObservation {
     launcher_pid: u32,
     launcher_start_ticks: u64,
     launch_nonce: String,
+    tools: ManagedSystemTools,
 }
 
 fn observe_managed_runtime_owner(
+    tools: &ManagedSystemTools,
     unit_name: &str,
     launch_nonce: &str,
     tmux: SessionEffectIdentity,
 ) -> Result<ManagedRuntimeOwnerToken, TmuxError> {
     let mut command = managed_cgroup_effect_command();
+    let encoded_tools = serde_json::to_string(tools).map_err(|_| TmuxError {
+        op: "observe-managed-runtime-owner",
+        code: None,
+        message: "managed system helper identity could not be encoded".into(),
+    })?;
     command.args([
         "observe",
+        &encoded_tools,
         unit_name,
         launch_nonce,
         &tmux.pane_pid.to_string(),
     ]);
-    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
-        op: "observe-managed-runtime-owner",
-        code: None,
-        message: format!("managed runtime ownership inspection failed: {error}"),
-    })?;
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "observe-managed-runtime-owner",
+                code: None,
+                message: format!("managed runtime ownership inspection failed: {error}"),
+            })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "observe-managed-runtime-owner",
@@ -1464,8 +1756,45 @@ fn observe_managed_runtime_owner(
         launcher_pid: observed.launcher_pid,
         launcher_start_ticks: observed.launcher_start_ticks,
         launch_nonce: observed.launch_nonce,
+        tools: observed.tools,
         tmux,
     })
+}
+
+pub(crate) fn observe_prepared_managed_runtime_owner(
+    name: &str,
+    launch: &ManagedRuntimeLaunchSpec,
+) -> Result<ManagedRuntimeOwnerToken, TmuxError> {
+    let tmux = observe_session_effect_identity(name)?;
+    observe_managed_runtime_owner(&launch.tools, &launch.unit_name, &launch.launch_nonce, tmux)
+}
+
+pub(crate) fn retire_prepared_managed_runtime(
+    launch: &ManagedRuntimeLaunchSpec,
+) -> Result<(), TmuxError> {
+    let encoded = serde_json::to_string(launch).map_err(|_| TmuxError {
+        op: "retire-prepared-managed-runtime",
+        code: None,
+        message: "prepared managed runtime identity could not be encoded".into(),
+    })?;
+    let mut command = managed_cgroup_effect_command();
+    command.args(["retire-prepared", &encoded]);
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "retire-prepared-managed-runtime",
+                code: None,
+                message: format!("prepared managed runtime cleanup failed: {error}"),
+            })?;
+    if output.status.success() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(TmuxError {
+            op: "retire-prepared-managed-runtime",
+            code: output.status.code(),
+            message: "prepared managed unit was populated, reused, or unverifiable".into(),
+        })
+    }
 }
 
 pub(crate) fn revalidate_managed_runtime_owner(
@@ -1481,8 +1810,12 @@ pub(crate) fn revalidate_managed_runtime_owner(
             message: "managed tmux generation changed".into(),
         });
     }
-    let observed =
-        observe_managed_runtime_owner(&owner.unit_name, &owner.launch_nonce, owner.tmux)?;
+    let observed = observe_managed_runtime_owner(
+        &owner.tools,
+        &owner.unit_name,
+        &owner.launch_nonce,
+        owner.tmux,
+    )?;
     if &observed == owner {
         Ok(())
     } else {
@@ -1513,11 +1846,13 @@ pub(crate) fn observe_session_effect_identity(
     let socket = validated_socket_name()?;
     let mut command = exact_effect_command();
     command.args(["observe", socket, name]);
-    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
-        op: "observe-session-effect",
-        code: None,
-        message: format!("failed to inspect exact session effect identity: {error}"),
-    })?;
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "observe-session-effect",
+                code: None,
+                message: format!("failed to inspect exact session effect identity: {error}"),
+            })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "observe-session-effect",
@@ -1645,8 +1980,9 @@ pub(crate) fn retire_managed_runtime(
             message: "managed runtime owner token version is unsupported".into(),
         });
     }
-    match session_liveness(name) {
-        SessionLiveness::Gone => return Ok(()),
+    let tmux_liveness = session_liveness(name);
+    match tmux_liveness {
+        SessionLiveness::Gone => {}
         SessionLiveness::Unknown => {
             return Err(TmuxError {
                 op: "retire-managed-runtime",
@@ -1656,7 +1992,9 @@ pub(crate) fn retire_managed_runtime(
         }
         SessionLiveness::Alive => {}
     }
-    if !same_managed_tmux_generation(&observe_session_effect_identity(name)?, &owner.tmux) {
+    if tmux_liveness == SessionLiveness::Alive
+        && !same_managed_tmux_generation(&observe_session_effect_identity(name)?, &owner.tmux)
+    {
         return Err(TmuxError {
             op: "retire-managed-runtime",
             code: None,
@@ -1669,7 +2007,14 @@ pub(crate) fn retire_managed_runtime(
         message: "managed runtime owner token could not be encoded".into(),
     })?;
     let mut command = managed_cgroup_effect_command();
-    command.args(["retire", &encoded]);
+    command.args([
+        if tmux_liveness == SessionLiveness::Gone {
+            "retire-gone"
+        } else {
+            "retire"
+        },
+        &encoded,
+    ]);
     #[cfg(test)]
     {
         let mut pending = MANAGED_RETIRE_CRASH.lock().unwrap();
@@ -1680,11 +2025,13 @@ pub(crate) fn retire_managed_runtime(
             command.arg(stage).arg(marker);
         }
     }
-    let output = output_with_timeout(command, tmux_cmd_timeout()).map_err(|error| TmuxError {
-        op: "retire-managed-runtime",
-        code: None,
-        message: format!("managed cgroup retirement failed: {error}"),
-    })?;
+    let output =
+        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
+            .map_err(|error| TmuxError {
+                op: "retire-managed-runtime",
+                code: None,
+                message: format!("managed cgroup retirement failed: {error}"),
+            })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(TmuxError {
             op: "retire-managed-runtime",
@@ -2137,6 +2484,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_path_shims_cannot_intercept_systemd_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("T_HUB_MANAGED_PATH_SHIM_HELPER").is_some() {
+            let marker = std::path::PathBuf::from(
+                std::env::var_os("T_HUB_MANAGED_PATH_SHIM_MARKER").unwrap(),
+            );
+            managed_runtime_preflight().unwrap();
+            assert!(!marker.exists());
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join("intercepted");
+        for helper in ["systemctl", "systemd-run"] {
+            let path = fixture.path().join(helper);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::tests::managed_path_shims_cannot_intercept_systemd_helpers",
+                "--nocapture",
+            ])
+            .env("T_HUB_MANAGED_PATH_SHIM_HELPER", "1")
+            .env("T_HUB_MANAGED_PATH_SHIM_MARKER", &marker)
+            .env(
+                "PATH",
+                format!("{}:{original_path}", fixture.path().display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_cgroup_path_validation_rejects_every_broad_group() {
+        let unit = format!("t-hub-{}.scope", "a".repeat(32));
+        for broad in [
+            "/",
+            "/user.slice",
+            "/user.slice/user-1000.slice",
+            "/user.slice/user-1000.slice/user@1000.service",
+            "/user.slice/user-1000.slice/user@1000.service/app.slice",
+        ] {
+            let mut command = managed_cgroup_effect_command();
+            command.args(["validate-path", &unit, broad]);
+            let output = output_with_timeout_and_limit(
+                command,
+                Duration::from_secs(5),
+                MANAGED_HELPER_OUTPUT_LIMIT,
+            )
+            .unwrap();
+            assert!(
+                !output.status.success(),
+                "broad cgroup was accepted: {broad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pane_scans_use_bash_for_pipefail_semantics() {
         let command = pane_info_command_with_args("set -o pipefail; printf '%s' \"$1\"", &["ok"]);
         assert_eq!(command.get_program(), "bash");
@@ -2525,6 +2945,46 @@ while True:
             retire_managed_runtime(&session.name, &owner).unwrap();
             assert_eq!(session_liveness(&session.name), SessionLiveness::Gone);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_retirement_handles_detached_descendant_after_tmux_is_gone() {
+        if !tmux_available() || managed_runtime_preflight().is_err() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let pid_file = fixture.path().join("detached.pid");
+        let script = fixture.path().join("detached.py");
+        std::fs::write(
+            &script,
+            format!(
+                "import os,signal,time\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nopen({:?}, 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)\n",
+                pid_file
+            ),
+        )
+        .unwrap();
+        let session = TestSession::new();
+        let owner = new_managed_session_with_env(
+            &session.name,
+            "/tmp",
+            Some(&format!("python3 {}", script.display())),
+            &[],
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        kill_session(&session.name).unwrap();
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Gone);
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        retire_managed_runtime(&session.name, &owner).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]

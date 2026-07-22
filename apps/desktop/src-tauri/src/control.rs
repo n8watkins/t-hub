@@ -70,8 +70,9 @@ use crate::{
 
 #[doc(hidden)]
 pub use crate::cortana_reconcile::{
-    CortanaDurableIdentity, CortanaManagedOwnerToken, CortanaOrphanEffectIdentity,
-    CortanaRecoveryState,
+    CortanaDurableIdentity, CortanaExecutableIdentity, CortanaManagedLaunchIntent,
+    CortanaManagedLaunchPhase, CortanaManagedOwnerToken, CortanaManagedSystemTools,
+    CortanaOrphanEffectIdentity, CortanaRecoveryState,
 };
 #[doc(hidden)]
 pub use crate::identity::{IdentityStore, Role as SessionIdentityRole};
@@ -1232,10 +1233,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-/// v24 replaces process enumeration with a versioned user-systemd/cgroup-v2
+/// v25 replaces process enumeration with a versioned user-systemd/cgroup-v2
 /// owner token and converts all pre-owner Cortana generations into durable,
 /// authority-revoked quarantine records that are never automatically signaled.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 24;
+/// It also records the generated unit and nonce before any launch effect.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 25;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3446,6 +3448,7 @@ impl CaptainsRegistry {
             .pointer("/cortana/legacyOrphanProvenance")
             .is_some();
         let has_cortana_managed_owner = document.pointer("/cortana/owner").is_some();
+        let has_cortana_managed_launch = document.pointer("/cortana/managedLaunch").is_some();
         let has_cortana_legacy_quarantine = document.pointer("/cortana/legacyQuarantine").is_some()
             || document
                 .pointer("/cortana/recovery/kind")
@@ -3473,10 +3476,16 @@ impl CaptainsRegistry {
                 path: path.to_path_buf(),
             });
         }
+        if has_cortana_managed_launch && schema_version < 25 {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
         let has_recovery = has_release_recovery
             || has_cortana_orphan_recovery
             || has_cortana_legacy_provenance
             || has_cortana_managed_owner
+            || has_cortana_managed_launch
             || has_cortana_legacy_quarantine;
         let mut snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
             if has_recovery {
@@ -4044,9 +4053,41 @@ impl CaptainsRegistry {
                         durable.recovery,
                         crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
                     )
-                    && durable.owner.is_none()
+                    && (durable.owner.is_none() || durable.managed_launch.is_some())
             {
                 return Err("durable Cortana has an invalid managed owner".into());
+            }
+            if durable
+                .managed_launch
+                .as_ref()
+                .is_some_and(|launch| !valid_cortana_managed_launch(launch))
+            {
+                return Err("durable Cortana has an invalid managed launch intent".into());
+            }
+            if let Some(launch) = durable.managed_launch.as_ref() {
+                match launch.phase {
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared => {
+                        if durable.owner.is_some()
+                            && durable.terminal_id.as_deref() == Some(launch.terminal_id.as_str())
+                        {
+                            return Err(
+                                "prepared Cortana launch already publishes an owner binding".into(),
+                            );
+                        }
+                    }
+                    crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed => {
+                        let owner = durable
+                            .owner
+                            .as_ref()
+                            .ok_or("observed Cortana launch has no durable managed owner")?;
+                        if durable.terminal_id.as_deref() != Some(launch.terminal_id.as_str())
+                            || owner.unit_name != launch.unit_name
+                            || owner.launch_nonce != launch.launch_nonce
+                        {
+                            return Err("observed Cortana launch and owner binding disagree".into());
+                        }
+                    }
+                }
             }
             match &durable.recovery {
                 crate::cortana_reconcile::CortanaRecoveryState::Uninitialized => {}
@@ -4430,6 +4471,7 @@ impl CaptainsRegistry {
                 durable.checkpoint = incumbent.resume_point.clone();
             }
         } else if durable.terminal_id.is_some()
+            && durable.managed_launch.is_none()
             && !matches!(
                 durable.recovery,
                 crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. }
@@ -5736,11 +5778,48 @@ impl CaptainsRegistry {
         if current.cortana.owner.is_none() {
             return Err("cannot commit Cortana without a durable managed owner".into());
         }
+        #[cfg(test)]
+        if current.cortana.managed_launch.is_none() {
+            let owner = current
+                .cortana
+                .owner
+                .as_ref()
+                .expect("owner synthesized above");
+            current.cortana.managed_launch =
+                Some(crate::cortana_reconcile::CortanaManagedLaunchIntent {
+                    version: 1,
+                    operation_id: operation_id.to_string(),
+                    terminal_id: terminal_id.to_string(),
+                    tmux_target: tmux_target(terminal_id),
+                    identity_id: identity_id.to_string(),
+                    generation,
+                    harness: harness.to_string(),
+                    unit_name: owner.unit_name.clone(),
+                    launch_nonce: owner.launch_nonce.clone(),
+                    tools: owner.tools.clone(),
+                    phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                });
+        }
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_ref()
+            .ok_or("cannot commit Cortana without an observed managed launch")?;
+        if launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+            || launch.operation_id != operation_id
+            || launch.identity_id != identity_id
+            || launch.generation != generation
+            || launch.terminal_id != terminal_id
+            || launch.harness != harness
+        {
+            return Err("cannot commit Cortana outside its observed managed launch".into());
+        }
         current.cortana.identity_id = Some(identity_id.to_string());
         current.cortana.generation = generation;
         current.cortana.terminal_id = Some(terminal_id.to_string());
         current.cortana.harness = Some(harness.to_string());
         current.cortana.legacy_orphan_provenance = None;
+        current.cortana.managed_launch = None;
         if let Some(provider_session_id) = provider_session_id {
             current.cortana.provider_session_id = Some(provider_session_id.to_string());
             current.cortana.conversation_id = Some(provider_session_id.to_string());
@@ -5758,9 +5837,11 @@ impl CaptainsRegistry {
     fn record_cortana_runtime_owner(
         &self,
         operation_id: &str,
+        terminal_id: &str,
         owner: crate::cortana_reconcile::CortanaManagedOwnerToken,
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         if operation_id.trim().is_empty()
+            || terminal_id.trim().is_empty()
             || owner.version != crate::cortana_reconcile::MANAGED_OWNER_TOKEN_VERSION
         {
             return Err("cannot record an invalid Cortana runtime owner".into());
@@ -5782,6 +5863,19 @@ impl CaptainsRegistry {
         if active_operation != operation_id {
             return Err("Cortana owner operation does not match durable recovery".into());
         }
+        let launch = current
+            .cortana
+            .managed_launch
+            .as_ref()
+            .ok_or("Cortana owner has no durable prepared launch")?;
+        if launch.operation_id != operation_id
+            || launch.terminal_id != terminal_id
+            || launch.unit_name != owner.unit_name
+            || launch.launch_nonce != owner.launch_nonce
+            || launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+        {
+            return Err("Cortana owner does not match its durable prepared launch".into());
+        }
         if let Some(existing) = current.cortana.owner.as_ref() {
             return if existing == &owner {
                 Ok(current.cortana.clone())
@@ -5791,6 +5885,92 @@ impl CaptainsRegistry {
         }
         let previous = current.clone();
         current.cortana.owner = Some(owner);
+        current.cortana.terminal_id = Some(terminal_id.to_string());
+        current
+            .cortana
+            .managed_launch
+            .as_mut()
+            .expect("checked above")
+            .phase = crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed;
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    fn prepare_cortana_managed_launch(
+        &self,
+        operation_id: &str,
+        terminal_id: &str,
+        identity_id: &str,
+        generation: u64,
+        harness: &str,
+        launch: &tmux::ManagedRuntimeLaunchSpec,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        let tools = durable_cortana_tools(&launch.tools);
+        let intent = crate::cortana_reconcile::CortanaManagedLaunchIntent {
+            version: 1,
+            operation_id: operation_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            tmux_target: tmux_target(terminal_id),
+            identity_id: identity_id.to_string(),
+            generation,
+            harness: harness.to_string(),
+            unit_name: launch.unit_name.clone(),
+            launch_nonce: launch.launch_nonce.clone(),
+            tools,
+            phase: crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
+        };
+        if !valid_cortana_managed_launch(&intent) {
+            return Err("cannot prepare an invalid Cortana managed launch".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let active_operation = match &current.cortana.recovery {
+            crate::cortana_reconcile::CortanaRecoveryState::Recovering { operation_id, .. }
+            | crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                operation_id,
+                ..
+            }
+            | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+                operation_id,
+                ..
+            } => operation_id,
+            _ => return Err("Cortana launch cannot be prepared outside recovery".into()),
+        };
+        if active_operation != operation_id {
+            return Err("Cortana launch operation changed before prepare".into());
+        }
+        if let Some(existing) = current.cortana.managed_launch.as_ref() {
+            return if existing == &intent {
+                Ok(current.cortana.clone())
+            } else {
+                Err("a different Cortana managed launch is already prepared".into())
+            };
+        }
+        let previous = current.clone();
+        current.cortana.managed_launch = Some(intent);
+        current.seq = current.seq.saturating_add(1);
+        let result = current.cortana.clone();
+        self.commit_mutation(current, previous)?;
+        Ok(result)
+    }
+
+    fn clear_prepared_cortana_managed_launch(
+        &self,
+        expected: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current.cortana.managed_launch.as_ref() != Some(expected) {
+            return Err("Cortana managed launch changed before cleanup commit".into());
+        }
+        let previous = current.clone();
+        current.cortana.managed_launch = None;
+        if expected.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed {
+            current.cortana.owner = None;
+            current.cortana.terminal_id = None;
+        }
         current.seq = current.seq.saturating_add(1);
         let result = current.cortana.clone();
         self.commit_mutation(current, previous)?;
@@ -18193,6 +18373,16 @@ fn valid_cortana_managed_owner(owner: &crate::cortana_reconcile::CortanaManagedO
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
+    let valid_tool = |tool: &crate::cortana_reconcile::CortanaExecutableIdentity,
+                      basename: &str| {
+        matches!(
+            tool.path.as_str(),
+            "/usr/bin/systemctl" | "/usr/bin/systemd-run"
+        ) && tool.path.ends_with(basename)
+            && tool.device > 0
+            && tool.inode > 0
+    };
+    let expected_suffix = format!("/app.slice/{}", owner.unit_name);
     owner.version == crate::cortana_reconcile::MANAGED_OWNER_TOKEN_VERSION
         && owner.unit_name.starts_with("t-hub-")
         && owner.unit_name.ends_with(".scope")
@@ -18205,14 +18395,42 @@ fn valid_cortana_managed_owner(owner: &crate::cortana_reconcile::CortanaManagedO
         )
         && lowercase_hex_32(&owner.invocation_id)
         && lowercase_hex_32(&owner.launch_nonce)
-        && owner.cgroup_path.starts_with('/')
+        && owner.cgroup_path.starts_with("/user.slice/user-")
+        && owner.cgroup_path.ends_with(&expected_suffix)
+        && owner.cgroup_path.rsplit('/').next() == Some(owner.unit_name.as_str())
         && !owner.cgroup_path.split('/').any(|part| part == "..")
         && owner.cgroup_inode > 0
         && owner.launcher_pid > 0
         && owner.launcher_start_ticks > 0
         && owner.launcher_pid == owner.tmux.pane_pid
         && owner.launcher_start_ticks == owner.tmux.pane_start_ticks
+        && valid_tool(&owner.tools.systemctl, "/systemctl")
+        && valid_tool(&owner.tools.systemd_run, "/systemd-run")
         && valid_cortana_effect_identity(&owner.tmux)
+}
+
+fn valid_cortana_managed_launch(
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+) -> bool {
+    let nonce_valid = launch.launch_nonce.len() == 32
+        && launch
+            .launch_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let valid_tool = |tool: &crate::cortana_reconcile::CortanaExecutableIdentity, path: &str| {
+        tool.path == path && tool.device > 0 && tool.inode > 0
+    };
+    launch.version == 1
+        && !launch.operation_id.trim().is_empty()
+        && exact_cortana_tmux_target(&launch.terminal_id)
+            .is_ok_and(|target| target == launch.tmux_target)
+        && !launch.identity_id.trim().is_empty()
+        && launch.generation > 0
+        && matches!(launch.harness.as_str(), "codex" | "claude")
+        && nonce_valid
+        && launch.unit_name == format!("t-hub-{}.scope", launch.launch_nonce)
+        && valid_tool(&launch.tools.systemctl, "/usr/bin/systemctl")
+        && valid_tool(&launch.tools.systemd_run, "/usr/bin/systemd-run")
 }
 
 #[cfg(test)]
@@ -18235,11 +18453,26 @@ fn synthetic_cortana_managed_owner() -> crate::cortana_reconcile::CortanaManaged
         version: crate::cortana_reconcile::MANAGED_OWNER_TOKEN_VERSION,
         unit_name: format!("t-hub-{}.scope", "a".repeat(32)),
         invocation_id: "b".repeat(32),
-        cgroup_path: "/test/cortana.scope".into(),
+        cgroup_path: format!(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/t-hub-{}.scope",
+            "a".repeat(32)
+        ),
         cgroup_inode: 1,
         launcher_pid: tmux.pane_pid,
         launcher_start_ticks: tmux.pane_start_ticks,
         launch_nonce: "a".repeat(32),
+        tools: crate::cortana_reconcile::CortanaManagedSystemTools {
+            systemctl: crate::cortana_reconcile::CortanaExecutableIdentity {
+                path: "/usr/bin/systemctl".into(),
+                device: 1,
+                inode: 1,
+            },
+            systemd_run: crate::cortana_reconcile::CortanaExecutableIdentity {
+                path: "/usr/bin/systemd-run".into(),
+                device: 1,
+                inode: 2,
+            },
+        },
         tmux,
     }
 }
@@ -18285,6 +18518,7 @@ fn tmux_cortana_effect_identity(
 fn durable_cortana_owner(
     owner: tmux::ManagedRuntimeOwnerToken,
 ) -> crate::cortana_reconcile::CortanaManagedOwnerToken {
+    let tools = durable_cortana_tools(&owner.tools);
     crate::cortana_reconcile::CortanaManagedOwnerToken {
         version: owner.version,
         unit_name: owner.unit_name,
@@ -18294,13 +18528,72 @@ fn durable_cortana_owner(
         launcher_pid: owner.launcher_pid,
         launcher_start_ticks: owner.launcher_start_ticks,
         launch_nonce: owner.launch_nonce,
+        tools,
         tmux: durable_cortana_effect_identity(owner.tmux),
     }
+}
+
+fn durable_cortana_tools(
+    tools: &tmux::ManagedSystemTools,
+) -> crate::cortana_reconcile::CortanaManagedSystemTools {
+    let durable_tool = |tool: &tmux::ManagedExecutableIdentity| {
+        crate::cortana_reconcile::CortanaExecutableIdentity {
+            path: tool.path.clone(),
+            device: tool.device,
+            inode: tool.inode,
+        }
+    };
+    crate::cortana_reconcile::CortanaManagedSystemTools {
+        systemctl: durable_tool(&tools.systemctl),
+        systemd_run: durable_tool(&tools.systemd_run),
+    }
+}
+
+fn tmux_cortana_launch(
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+) -> tmux::ManagedRuntimeLaunchSpec {
+    let tmux_tool = |tool: &crate::cortana_reconcile::CortanaExecutableIdentity| {
+        tmux::ManagedExecutableIdentity {
+            path: tool.path.clone(),
+            device: tool.device,
+            inode: tool.inode,
+        }
+    };
+    tmux::ManagedRuntimeLaunchSpec {
+        unit_name: launch.unit_name.clone(),
+        launch_nonce: launch.launch_nonce.clone(),
+        tools: tmux::ManagedSystemTools {
+            systemctl: tmux_tool(&launch.tools.systemctl),
+            systemd_run: tmux_tool(&launch.tools.systemd_run),
+        },
+    }
+}
+
+fn cleanup_cortana_managed_launch(
+    ctx: &ControlContext,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    owner: Option<&tmux::ManagedRuntimeOwnerToken>,
+) -> Result<(), String> {
+    match owner {
+        Some(owner) => tmux::retire_managed_runtime(&launch.tmux_target, owner)
+            .map_err(|error| format!("exact observed owner cleanup failed: {error}"))?,
+        None => tmux::retire_prepared_managed_runtime(&tmux_cortana_launch(launch))
+            .map_err(|error| format!("exact prepared owner cleanup failed: {error}"))?,
+    }
+    ctx.captains.clear_prepared_cortana_managed_launch(launch)?;
+    Ok(())
 }
 
 fn tmux_cortana_owner(
     owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
 ) -> tmux::ManagedRuntimeOwnerToken {
+    let tmux_tool = |tool: &crate::cortana_reconcile::CortanaExecutableIdentity| {
+        tmux::ManagedExecutableIdentity {
+            path: tool.path.clone(),
+            device: tool.device,
+            inode: tool.inode,
+        }
+    };
     tmux::ManagedRuntimeOwnerToken {
         version: owner.version,
         unit_name: owner.unit_name.clone(),
@@ -18310,6 +18603,10 @@ fn tmux_cortana_owner(
         launcher_pid: owner.launcher_pid,
         launcher_start_ticks: owner.launcher_start_ticks,
         launch_nonce: owner.launch_nonce.clone(),
+        tools: tmux::ManagedSystemTools {
+            systemctl: tmux_tool(&owner.tools.systemctl),
+            systemd_run: tmux_tool(&owner.tools.systemd_run),
+        },
         tmux: tmux_cortana_effect_identity(&owner.tmux),
     }
 }
@@ -18582,6 +18879,16 @@ fn quarantine_cortana_runtimes(
         .map(|candidate| candidate.terminal_id.clone())
         .collect::<Vec<_>>();
     quarantined.sort();
+    for candidate in &requested {
+        if let Some(identity_id) = candidate.identity_id.as_deref() {
+            ctx.identity.revoke(identity_id)?;
+            if ctx.identity.get(identity_id).is_some() || !ctx.identity.is_revoked(identity_id) {
+                return Err(format!(
+                    "reconcile_cortana: ambiguous bearer '{identity_id}' could not be durably revoked"
+                ));
+            }
+        }
+    }
     let _ = durable;
     audit_cortana_runtime_mutation(
         ctx,
@@ -18758,6 +19065,90 @@ fn reconcile_cortana_inner(
     }
     std::fs::create_dir_all(files::to_host_path(&home))
         .map_err(|error| format!("reconcile_cortana: could not create '{home}': {error}"))?;
+    if let Some(launch) = durable.managed_launch.clone() {
+        if launch.operation_id != operation_id {
+            return Err(
+                "reconcile_cortana: a different durable managed launch is still active".into(),
+            );
+        }
+        let target_liveness = tmux::session_liveness(&launch.tmux_target);
+        match (launch.phase, target_liveness) {
+            (
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
+                tmux::SessionLiveness::Alive,
+            ) => {
+                let owner = tmux::observe_prepared_managed_runtime_owner(
+                    &launch.tmux_target,
+                    &tmux_cortana_launch(&launch),
+                )
+                .map_err(|error| {
+                    format!(
+                        "reconcile_cortana: prepared launch effect is alive but ownership is unverifiable: {error}"
+                    )
+                })?;
+                durable = ctx.captains.record_cortana_runtime_owner(
+                    operation_id,
+                    &launch.terminal_id,
+                    durable_cortana_owner(owner),
+                )?;
+            }
+            (
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared,
+                tmux::SessionLiveness::Gone,
+            ) => {
+                cleanup_cortana_managed_launch(ctx, &launch, None)?;
+                let identity_is_reserved = durable.identity_id.as_deref()
+                    == Some(launch.identity_id.as_str())
+                    || matches!(
+                        &durable.recovery,
+                        crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                            replacement_identity_id: Some(identity_id),
+                            ..
+                        }
+                        | crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+                            replacement_identity_id: Some(identity_id),
+                            ..
+                        } if identity_id == &launch.identity_id
+                    );
+                if !identity_is_reserved {
+                    ctx.identity.retire(&launch.identity_id)?;
+                }
+                durable = ctx.captains.cortana_identity();
+            }
+            (
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                tmux::SessionLiveness::Alive,
+            ) => {
+                let owner = durable
+                    .owner
+                    .as_ref()
+                    .ok_or("reconcile_cortana: observed launch lost its durable owner")?;
+                tmux::revalidate_managed_runtime_owner(
+                    &launch.tmux_target,
+                    &tmux_cortana_owner(owner),
+                )
+                .map_err(|error| {
+                    format!("reconcile_cortana: observed launch owner is unverifiable: {error}")
+                })?;
+            }
+            (
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed,
+                tmux::SessionLiveness::Gone,
+            ) => {
+                let owner = durable
+                    .owner
+                    .as_ref()
+                    .ok_or("reconcile_cortana: observed launch lost its durable owner")?;
+                cleanup_cortana_managed_launch(ctx, &launch, Some(&tmux_cortana_owner(owner)))?;
+                durable = ctx.captains.cortana_identity();
+            }
+            (_, tmux::SessionLiveness::Unknown) => {
+                return Err(retryable_error(
+                    "reconcile_cortana: durable managed launch has uncertain tmux evidence",
+                ));
+            }
+        }
+    }
     let mut candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
     if let Some(terminal_id) = durable.terminal_id.as_deref() {
         if !candidates
@@ -18767,6 +19158,16 @@ fn reconcile_cortana_inner(
             match tmux::session_liveness(&tmux_target(terminal_id)) {
                 tmux::SessionLiveness::Gone => {
                     if let Some(owner) = durable.owner.clone() {
+                        if let Err(error) = tmux::retire_managed_runtime(
+                            &tmux_target(terminal_id),
+                            &tmux_cortana_owner(&owner),
+                        ) {
+                            let reason = format!(
+                                "managed owner for gone terminal '{terminal_id}' remains populated or unverifiable: {error}"
+                            );
+                            ctx.captains.mark_cortana_degraded(operation_id, &reason)?;
+                            return Err(format!("reconcile_cortana: {reason}"));
+                        }
                         durable = ctx
                             .captains
                             .clear_gone_cortana_runtime_owner(operation_id, &owner)?;
@@ -19288,52 +19689,68 @@ fn reconcile_cortana_inner(
     ));
     let pane = crate::commands::pane_command(None, Some(&startup_command));
     let tmux_cwd = files::posix_form(&home);
+    let launch = tmux::prepare_managed_runtime_launch().map_err(|error| {
+        format!("reconcile_cortana: managed launch preparation failed: {error}")
+    })?;
+    ctx.captains.prepare_cortana_managed_launch(
+        operation_id,
+        &terminal_id,
+        &identity.id,
+        plan.next_generation,
+        harness.as_provider(),
+        &launch,
+    )?;
+    let prepared_launch = ctx
+        .captains
+        .cortana_identity()
+        .managed_launch
+        .expect("managed launch was just prepared");
     let (_, tmux_session, owner) = match spawn_managed_tmux_terminal_with_id(
         &terminal_id,
         &tmux_cwd,
         pane.as_deref(),
         &elevation,
+        &launch,
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
-            let rollback = if replacement.is_some() {
-                Ok(())
-            } else {
-                rollback_cortana_identity_binding(
-                    ctx,
-                    &identity,
-                    previous_tile.as_deref(),
-                    newly_minted,
-                )
-            };
             return Err(format!(
-                "reconcile_cortana: terminal startup failed: {error}{}",
-                rollback
-                    .err()
-                    .map(|rollback| format!("; identity rollback also failed: {rollback}"))
-                    .unwrap_or_default()
+                "reconcile_cortana: terminal startup failed with durable prepared cleanup pending: {error}"
             ));
         }
     };
     let durable_owner = durable_cortana_owner(owner.clone());
-    if let Err(error) = ctx
-        .captains
-        .record_cortana_runtime_owner(operation_id, durable_owner)
+    if let Err(error) =
+        ctx.captains
+            .record_cortana_runtime_owner(operation_id, &terminal_id, durable_owner)
     {
-        let _ = tmux::retire_managed_runtime(&tmux_session, &owner);
+        cleanup_cortana_managed_launch(ctx, &prepared_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: managed runtime owner durability failed: {error}; {cleanup}; prepared WAL retained"
+            )
+        })?;
         return Err(format!(
             "reconcile_cortana: managed runtime owner could not be made durable: {error}"
         ));
     }
+    let observed_launch = ctx
+        .captains
+        .cortana_identity()
+        .managed_launch
+        .expect("managed launch was just observed");
     if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
-        let _ = tmux::retire_managed_runtime(&tmux_session, &owner);
+        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: harness startup failed: {error}; {cleanup}; observed WAL retained"
+            )
+        })?;
         if replacement.is_none() {
-            let _ = rollback_cortana_identity_binding(
+            rollback_cortana_identity_binding(
                 ctx,
                 &identity,
                 previous_tile.as_deref(),
                 newly_minted,
-            );
+            )?;
         }
         return Err(format!(
             "reconcile_cortana: harness startup failed and the replacement was retired: {error}"
@@ -19373,14 +19790,18 @@ fn reconcile_cortana_inner(
             && candidate.current_control_capability
             && candidate.trusted_cortana_identity
     }) else {
-        let _ = tmux::retire_managed_runtime(&tmux_session, &owner);
+        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: spawned authority verification failed; {cleanup}; observed WAL retained"
+            )
+        })?;
         if replacement.is_none() {
-            let _ = rollback_cortana_identity_binding(
+            rollback_cortana_identity_binding(
                 ctx,
                 &identity,
                 previous_tile.as_deref(),
                 newly_minted,
-            );
+            )?;
         }
         return Err(format!(
             "reconcile_cortana: spawned replacement failed exact runtime authority verification (candidates={}, targetPresent={}, evidence={})",
@@ -19389,21 +19810,30 @@ fn reconcile_cortana_inner(
             candidate_evidence.as_deref().unwrap_or("missing")
         ));
     };
-    tmux::revalidate_managed_runtime_owner(&tmux_session, &owner).map_err(|error| {
-        format!(
+    if let Err(error) = tmux::revalidate_managed_runtime_owner(&tmux_session, &owner) {
+        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: managed runtime ownership changed before authority publication: {error}; {cleanup}; observed WAL retained"
+            )
+        })?;
+        return Err(format!(
             "reconcile_cortana: managed runtime ownership changed before authority publication: {error}"
-        )
-    })?;
+        ));
+    }
     let provider_session_id = candidate.provider_session_id.clone();
     if let Err(error) = claim_cortana_runtime(ctx, &candidate) {
-        let _ = tmux::retire_managed_runtime(&tmux_session, &owner);
+        cleanup_cortana_managed_launch(ctx, &observed_launch, Some(&owner)).map_err(|cleanup| {
+            format!(
+                "reconcile_cortana: replacement Fleet claim failed: {error}; {cleanup}; observed WAL retained"
+            )
+        })?;
         if replacement.is_none() {
-            let _ = rollback_cortana_identity_binding(
+            rollback_cortana_identity_binding(
                 ctx,
                 &identity,
                 previous_tile.as_deref(),
                 newly_minted,
-            );
+            )?;
         }
         return Err(format!(
             "reconcile_cortana: replacement Fleet claim failed and the runtime was retired: {error}"
@@ -29092,6 +29522,7 @@ fn spawn_managed_tmux_terminal_with_id(
     cwd: &str,
     command: Option<&str>,
     env: &[(String, String)],
+    launch: &tmux::ManagedRuntimeLaunchSpec,
 ) -> Result<(String, String, tmux::ManagedRuntimeOwnerToken), String> {
     let tmux_session = format!("th_{id}");
     let mut session_env = env.to_vec();
@@ -29101,10 +29532,20 @@ fn spawn_managed_tmux_terminal_with_id(
     {
         session_env.push((PROVIDER_SESSION_ENV.into(), "none".into()));
     }
-    let owner = tmux::new_managed_session_with_env(&tmux_session, cwd, command, &session_env)
-        .map_err(|error| format!("failed to create cgroup-owned tmux session: {error}"))?;
+    let owner = tmux::new_prepared_managed_session_with_env(
+        &tmux_session,
+        cwd,
+        command,
+        &session_env,
+        launch,
+    )
+    .map_err(|error| format!("failed to create cgroup-owned tmux session: {error}"))?;
     if !tmux::has_session(&tmux_session) {
-        let _ = tmux::retire_managed_runtime(&tmux_session, &owner);
+        tmux::retire_managed_runtime(&tmux_session, &owner).map_err(|cleanup| {
+            format!(
+                "managed tmux session '{tmux_session}' was unobservable and exact owner cleanup failed: {cleanup}"
+            )
+        })?;
         return Err(format!(
             "managed tmux session '{tmux_session}' did not materialize after ownership verification"
         ));
@@ -37147,6 +37588,62 @@ mod tests {
     }
 
     #[test]
+    fn managed_launch_recovery_requires_schema_v25_and_exact_shape() {
+        let path = captains_tmp("managed-launch-schema");
+        let launch = json!({
+            "version": 1,
+            "operationId": "launch-operation",
+            "terminalId": "a1b2c3d4",
+            "tmuxTarget": "=th_a1b2c3d4:",
+            "identityId": "cortana-identity",
+            "generation": 1,
+            "harness": "codex",
+            "unitName": format!("t-hub-{}.scope", "a".repeat(32)),
+            "launchNonce": "a".repeat(32),
+            "tools": {
+                "systemctl": {"path": "/usr/bin/systemctl", "device": 1, "inode": 1},
+                "systemdRun": {"path": "/usr/bin/systemd-run", "device": 1, "inode": 2}
+            },
+            "phase": "prepared"
+        });
+        let document = |schema_version, launch: Value| {
+            json!({
+                "schemaVersion": schema_version,
+                "cortana": {
+                    "identityId": "cortana-identity",
+                    "generation": 1,
+                    "harness": "codex",
+                    "managedLaunch": launch,
+                    "recovery": {
+                        "kind": "recovering",
+                        "operation_id": "launch-operation",
+                        "started_at": 1
+                    }
+                }
+            })
+        };
+
+        std::fs::write(&path, document(24, launch.clone()).to_string()).unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+
+        let mut malformed = launch;
+        malformed["tools"]["systemctl"]["path"] = json!("/tmp/systemctl");
+        std::fs::write(
+            &path,
+            document(CAPTAINS_SCHEMA_VERSION, malformed).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn legacy_orphan_provenance_requires_schema_v22_and_exact_durable_binding() {
         let path = captains_tmp("legacy-orphan-provenance-old-schema");
         let provenance = json!({
@@ -44325,7 +44822,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_quarantine_preserves_all_identities_and_refuses_authority() {
+    fn ambiguous_quarantine_revokes_all_bearers_without_signaling_runtimes() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let audit_dir = std::env::temp_dir().join(format!(
             "t-hub-cortana-identity-quarantine-audit-{}-{}",
@@ -44404,9 +44901,196 @@ mod tests {
         let mut expected = requested;
         expected.sort();
         assert_eq!(quarantined, expected);
-        assert!(ctx.identity.resolve(&durable_identity.secret).is_some());
-        assert!(ctx.identity.resolve(&foreign_identity.secret).is_some());
+        for (identity, terminal_id) in [
+            (&durable_identity, &candidates[0].terminal_id),
+            (&foreign_identity, &candidates[1].terminal_id),
+        ] {
+            assert!(ctx.identity.resolve(&identity.secret).is_none());
+            assert!(ctx.identity.is_revoked(&identity.id));
+            let denied = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &ctx.token,
+                    &identity.secret,
+                    "register_project",
+                    json!({"rootPath": "/tmp/ambiguous-bearer-must-not-register"}),
+                ),
+            );
+            assert!(!denied.ok);
+            assert_eq!(
+                denied.error.as_deref(),
+                Some(
+                    "unauthorized: 'register_project' requires a valid T_HUB_SESSION_TOKEN with the control capability"
+                )
+            );
+            assert_eq!(
+                tmux::session_liveness(&exact_cortana_tmux_target(terminal_id).unwrap()),
+                tmux::SessionLiveness::Alive
+            );
+        }
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+        for terminal_id in &expected {
+            reap_test_tmux_session_and_assert_absent(
+                &exact_cortana_tmux_target(terminal_id).unwrap(),
+            );
+        }
         let _ = std::fs::remove_dir_all(audit_dir);
+    }
+
+    #[test]
+    fn cortana_managed_launch_wal_never_partially_publishes_owner_or_terminal() {
+        let path = captains_tmp("cortana-managed-launch-wal");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry(Some(path.clone()));
+        registry.begin_cortana_recovery("wal-operation").unwrap();
+        let owner = synthetic_cortana_managed_owner();
+        let launch = tmux::ManagedRuntimeLaunchSpec {
+            unit_name: owner.unit_name.clone(),
+            launch_nonce: owner.launch_nonce.clone(),
+            tools: tmux::ManagedSystemTools {
+                systemctl: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.systemctl.path.clone(),
+                    device: owner.tools.systemctl.device,
+                    inode: owner.tools.systemctl.inode,
+                },
+                systemd_run: tmux::ManagedExecutableIdentity {
+                    path: owner.tools.systemd_run.path.clone(),
+                    device: owner.tools.systemd_run.device,
+                    inode: owner.tools.systemd_run.inode,
+                },
+            },
+        };
+
+        registry.fail_next_persist("before prepared WAL");
+        assert!(registry
+            .prepare_cortana_managed_launch(
+                "wal-operation",
+                "wal00001",
+                "identity-wal",
+                1,
+                "codex",
+                &launch,
+            )
+            .is_err());
+        assert!(registry.cortana_identity().managed_launch.is_none());
+
+        let prepared = registry
+            .prepare_cortana_managed_launch(
+                "wal-operation",
+                "wal00001",
+                "identity-wal",
+                1,
+                "codex",
+                &launch,
+            )
+            .unwrap();
+        assert!(prepared.owner.is_none());
+        assert!(prepared.terminal_id.is_none());
+        assert_eq!(
+            prepared.managed_launch.as_ref().unwrap().phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+        );
+
+        registry.fail_next_persist("after effect before observed WAL");
+        assert!(registry
+            .record_cortana_runtime_owner("wal-operation", "wal00001", owner.clone())
+            .is_err());
+        let still_prepared = registry.cortana_identity();
+        assert!(still_prepared.owner.is_none());
+        assert!(still_prepared.terminal_id.is_none());
+        assert_eq!(
+            still_prepared.managed_launch.as_ref().unwrap().phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+        );
+
+        let observed = registry
+            .record_cortana_runtime_owner("wal-operation", "wal00001", owner)
+            .unwrap();
+        assert_eq!(observed.terminal_id.as_deref(), Some("wal00001"));
+        assert!(observed.owner.is_some());
+        assert_eq!(
+            observed.managed_launch.as_ref().unwrap().phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        );
+        let reloaded = powder_lifecycle_registry(Some(path.clone())).cortana_identity();
+        assert_eq!(reloaded, observed);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_managed_launch_wal_recovers_live_effect_before_healthy_commit() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let path = captains_tmp("cortana-managed-launch-live");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry(Some(path.clone()));
+        registry.begin_cortana_recovery("wal-live").unwrap();
+        let launch = tmux::prepare_managed_runtime_launch().unwrap();
+        registry
+            .prepare_cortana_managed_launch(
+                "wal-live",
+                "wal00002",
+                "identity-wal-live",
+                1,
+                "codex",
+                &launch,
+            )
+            .unwrap();
+        let target = tmux_target("wal00002");
+        let owner = tmux::new_prepared_managed_session_with_env(
+            &target,
+            "/tmp",
+            Some("sleep 60"),
+            &[],
+            &launch,
+        )
+        .unwrap();
+
+        let restarted = powder_lifecycle_registry(Some(path.clone()));
+        let prepared = restarted.cortana_identity();
+        assert_eq!(
+            prepared.managed_launch.as_ref().unwrap().phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Prepared
+        );
+        let recovered_owner = tmux::observe_prepared_managed_runtime_owner(&target, &launch)
+            .expect("restart must recover the exact live prepared effect");
+        assert_eq!(recovered_owner, owner);
+        let observed = restarted
+            .record_cortana_runtime_owner(
+                "wal-live",
+                "wal00002",
+                durable_cortana_owner(recovered_owner),
+            )
+            .unwrap();
+        assert_eq!(observed.terminal_id.as_deref(), Some("wal00002"));
+        assert!(observed.owner.is_some());
+        assert_eq!(
+            observed.managed_launch.as_ref().unwrap().phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+        );
+        assert_eq!(
+            powder_lifecycle_registry(Some(path.clone())).cortana_identity(),
+            observed
+        );
+
+        tmux::kill_session(&target).unwrap();
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+        restarted
+            .clear_prepared_cortana_managed_launch(observed.managed_launch.as_ref().unwrap())
+            .unwrap();
+        let cleaned = restarted.cortana_identity();
+        assert!(cleaned.managed_launch.is_none());
+        assert!(cleaned.owner.is_none());
+        assert!(cleaned.terminal_id.is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

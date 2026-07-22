@@ -1494,14 +1494,29 @@ fn continuity_control_fixture() -> (
         conversation_id: None,
         checkpoint: None,
         owner: Some(control::CortanaManagedOwnerToken {
-            version: 1,
+            version: 2,
             unit_name: format!("t-hub-{}.scope", "a".repeat(32)),
             invocation_id: "b".repeat(32),
-            cgroup_path: "/test/cortana.scope".into(),
+            cgroup_path: format!(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/t-hub-{}.scope",
+                "a".repeat(32)
+            ),
             cgroup_inode: 1,
             launcher_pid: 100,
             launcher_start_ticks: 200,
             launch_nonce: "a".repeat(32),
+            tools: control::CortanaManagedSystemTools {
+                systemctl: control::CortanaExecutableIdentity {
+                    path: "/usr/bin/systemctl".into(),
+                    device: 1,
+                    inode: 1,
+                },
+                systemd_run: control::CortanaExecutableIdentity {
+                    path: "/usr/bin/systemd-run".into(),
+                    device: 1,
+                    inode: 2,
+                },
+            },
             tmux: control::CortanaOrphanEffectIdentity {
                 tmux_session_id: 1,
                 tmux_session_created: 1,
@@ -1517,6 +1532,7 @@ fn continuity_control_fixture() -> (
                 foreground_process_session_id: 100,
             },
         }),
+        managed_launch: None,
         legacy_quarantine: None,
         legacy_orphan_provenance: None,
         recovery: control::CortanaRecoveryState::Healthy {

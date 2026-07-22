@@ -19,6 +19,10 @@
 //! the handler thread and its connection slot.
 
 use std::process::{Command, Output, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 /// Poll cadence for [`output_with_timeout`]'s wait loop. Small enough that
@@ -70,6 +74,34 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(25);
 /// slot even if the process inside WSL lingers (an orphan the WSL server reaps), which
 /// is the property that matters — the control channel must not stay wedged.
 pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Output> {
+    output_with_timeout_inner(&mut cmd, timeout, None)
+}
+
+/// Run a command with both a wall-clock deadline and an aggregate byte cap for
+/// each output stream.
+///
+/// The child is terminated as soon as either stdout or stderr crosses `limit`,
+/// so an untrusted helper cannot turn a small control response into unbounded
+/// allocation or an indefinitely draining pipe.
+pub fn output_with_timeout_and_limit(
+    mut cmd: Command,
+    timeout: Duration,
+    limit: usize,
+) -> std::io::Result<Output> {
+    if limit == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output byte limit must be positive",
+        ));
+    }
+    output_with_timeout_inner(&mut cmd, timeout, Some(limit))
+}
+
+fn output_with_timeout_inner(
+    cmd: &mut Command,
+    timeout: Duration,
+    limit: Option<usize>,
+) -> std::io::Result<Output> {
     use std::io::Read;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -79,22 +111,94 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
     // child from making progress on the other (avoids a full-buffer deadlock).
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
+    let overflow = Arc::new(AtomicBool::new(false));
+    let out_overflow = Arc::clone(&overflow);
     let out_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = stdout.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            if limit.is_some_and(|limit| buf.len().saturating_add(count) > limit) {
+                out_overflow.store(true, Ordering::SeqCst);
+                continue;
+            }
+            buf.extend_from_slice(&chunk[..count]);
+        }
         buf
     });
+    let err_overflow = Arc::clone(&overflow);
     let err_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = stderr.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            if limit.is_some_and(|limit| buf.len().saturating_add(count) > limit) {
+                err_overflow.store(true, Ordering::SeqCst);
+                continue;
+            }
+            buf.extend_from_slice(&chunk[..count]);
+        }
         buf
     });
     let deadline = Instant::now() + timeout;
     loop {
+        if overflow.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let grace = Instant::now() + REAP_JOIN_GRACE;
+            join_or_detach(out_handle, grace);
+            join_or_detach(err_handle, grace);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "command output exceeded its byte limit",
+            ));
+        }
         match child.try_wait()? {
             Some(status) => {
+                if limit.is_some() {
+                    loop {
+                        if overflow.load(Ordering::SeqCst) {
+                            let grace = Instant::now() + REAP_JOIN_GRACE;
+                            join_or_detach(out_handle, grace);
+                            join_or_detach(err_handle, grace);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "command output exceeded its byte limit",
+                            ));
+                        }
+                        if out_handle.is_finished() && err_handle.is_finished() {
+                            let stdout = out_handle.join().unwrap_or_default();
+                            let stderr = err_handle.join().unwrap_or_default();
+                            return Ok(Output {
+                                status,
+                                stdout,
+                                stderr,
+                            });
+                        }
+                        if Instant::now() >= deadline {
+                            let grace = Instant::now() + REAP_JOIN_GRACE;
+                            join_or_detach(out_handle, grace);
+                            join_or_detach(err_handle, grace);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "command output pipes remained open past the deadline",
+                            ));
+                        }
+                        std::thread::sleep(OUTPUT_POLL_INTERVAL);
+                    }
+                }
                 let stdout = out_handle.join().unwrap_or_default();
                 let stderr = err_handle.join().unwrap_or_default();
+                if overflow.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "command output exceeded its byte limit",
+                    ));
+                }
                 return Ok(Output {
                     status,
                     stdout,
@@ -287,6 +391,28 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "dual-pipe drain should finish on throughput, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn output_limit_terminates_a_flood_without_allocating_the_flood() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do printf 0123456789; done"]);
+        let started = Instant::now();
+        let error = output_with_timeout_and_limit(cmd, Duration::from_secs(5), 4096)
+            .expect_err("an output flood must cross the byte cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn output_limit_does_not_wait_forever_on_inherited_pipes_after_child_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 &"]);
+        let started = Instant::now();
+        let error = output_with_timeout_and_limit(cmd, Duration::from_millis(300), 4096)
+            .expect_err("an inherited output pipe must remain deadline-bounded");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// PIPE-INHERITANCE guard (the reason bounded_exec's timeout branch was audited
