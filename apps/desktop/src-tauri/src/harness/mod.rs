@@ -949,7 +949,35 @@ fn argv_layout_sha256(arguments: &[String]) -> String {
     framed_sha256(b"t-hub:harness-argv-layout:v1\0", fields)
 }
 
-#[cfg(unix)]
+fn codex_native_layout(os: &str, arch: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match (os, arch) {
+        ("Linux" | "Android", "x86_64") => {
+            Some(("codex-linux-x64", "x86_64-unknown-linux-musl", "codex"))
+        }
+        ("Linux" | "Android", "aarch64" | "arm64") => {
+            Some(("codex-linux-arm64", "aarch64-unknown-linux-musl", "codex"))
+        }
+        ("Darwin", "x86_64") => Some(("codex-darwin-x64", "x86_64-apple-darwin", "codex")),
+        ("Darwin", "aarch64" | "arm64") => {
+            Some(("codex-darwin-arm64", "aarch64-apple-darwin", "codex"))
+        }
+        _ => None,
+    }
+}
+
+fn codex_native_candidates(
+    package_root: &str,
+    platform_package: &str,
+    target_triple: &str,
+    executable_name: &str,
+) -> Option<[String; 2]> {
+    let namespace_root = package_root.strip_suffix("/codex")?;
+    Some([
+        format!("{namespace_root}/{platform_package}/vendor/{target_triple}/bin/{executable_name}"),
+        format!("{package_root}/vendor/{target_triple}/bin/{executable_name}"),
+    ])
+}
+
 fn resolve_trusted_script_child(
     entry: &HarnessExecutableIdentity,
     expected_provider: Harness,
@@ -957,80 +985,133 @@ fn resolve_trusted_script_child(
     if expected_provider != Harness::Codex {
         return Ok(None);
     }
-    let entry_path = std::path::Path::new(&entry.path);
-    if entry_path.file_name().and_then(|name| name.to_str()) != Some("codex.js")
-        || entry_path
-            .parent()
-            .and_then(std::path::Path::file_name)
-            .and_then(|name| name.to_str())
-            != Some("bin")
+    let Some(package_root) = entry.path.strip_suffix("/bin/codex.js") else {
+        return Ok(None);
+    };
+    if !package_root.ends_with("/@openai/codex")
+        || package_root.contains(['\0', '\n', '\r'])
+        || package_root.len() > 4096
     {
         return Ok(None);
     }
-    let package_root = entry_path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
-    if package_root.file_name().and_then(|name| name.to_str()) != Some("codex")
-        || package_root
-            .parent()
-            .and_then(std::path::Path::file_name)
-            .and_then(|name| name.to_str())
-            != Some("@openai")
-    {
-        return Ok(None);
+    const SCRIPT: &str = r#"
+set -eu
+package_root=$1
+os=$(uname -s)
+arch=$(uname -m)
+case "$os:$arch" in
+  Linux:x86_64|Android:x86_64)
+    platform_package=codex-linux-x64
+    target_triple=x86_64-unknown-linux-musl
+    executable_name=codex;;
+  Linux:aarch64|Linux:arm64|Android:aarch64|Android:arm64)
+    platform_package=codex-linux-arm64
+    target_triple=aarch64-unknown-linux-musl
+    executable_name=codex;;
+  Darwin:x86_64)
+    platform_package=codex-darwin-x64
+    target_triple=x86_64-apple-darwin
+    executable_name=codex;;
+  Darwin:aarch64|Darwin:arm64)
+    platform_package=codex-darwin-arm64
+    target_triple=aarch64-apple-darwin
+    executable_name=codex;;
+  *) exit 60;;
+esac
+namespace_root=${package_root%/codex}
+optional="$namespace_root/$platform_package/vendor/$target_triple/bin/$executable_name"
+bundled="$package_root/vendor/$target_triple/bin/$executable_name"
+candidate=
+if [ -f "$optional" ] && [ -x "$optional" ]; then
+  candidate=$optional
+elif [ -f "$bundled" ] && [ -x "$bundled" ]; then
+  candidate=$bundled
+else
+  exit 61
+fi
+canonical=$(readlink -f "$candidate")
+case "$canonical" in /*) ;; *) exit 62;; esac
+[ -f "$canonical" ]
+[ -x "$canonical" ]
+if LC_ALL=C head -c 2 "$canonical" | grep -q '^#!'; then exit 63; fi
+set -- $(stat -Lc '%d %i' "$canonical")
+[ "$#" -eq 2 ]
+case "$1:$2" in *[!0-9:]*) exit 64;; esac
+printf 'THLC1\n%s\n%s\n%s\n%s\n%s\n%s\n' "$os" "$arch" "$candidate" "$canonical" "$1" "$2"
+"#;
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("wsl.exe");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-codex-native-child")
+            .arg(package_root);
+        command.creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(unix)]
+    let command = {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-codex-native-child")
+            .arg(package_root);
+        command
+    };
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    if !output.status.success() || !output.stderr.is_empty() || output.stdout.len() > 4352 {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
+    let mut fields = output.stdout.splitn(8, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THLC1".as_slice()) {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    fn text(field: Option<&[u8]>) -> Result<&str, LaunchAttestationError> {
+        std::str::from_utf8(field.ok_or(LaunchAttestationError::UntrustedLaunchCommand)?)
+            .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)
+    }
+    let os = text(fields.next())?;
+    let arch = text(fields.next())?;
+    let selected = text(fields.next())?;
+    let path = text(fields.next())?.to_string();
+    let device = text(fields.next())?
+        .parse::<u64>()
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let inode = text(fields.next())?
+        .parse::<u64>()
+        .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
     let (platform_package, target_triple, executable_name) =
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux" | "android", "x86_64") => {
-                ("codex-linux-x64", "x86_64-unknown-linux-musl", "codex")
-            }
-            ("linux" | "android", "aarch64") => {
-                ("codex-linux-arm64", "aarch64-unknown-linux-musl", "codex")
-            }
-            ("macos", "x86_64") => ("codex-darwin-x64", "x86_64-apple-darwin", "codex"),
-            ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin", "codex"),
-            _ => return Ok(None),
-        };
-    let namespace_root = package_root
-        .parent()
-        .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
-    let candidates = [
-        namespace_root
-            .join(platform_package)
-            .join("vendor")
-            .join(target_triple)
-            .join("bin")
-            .join(executable_name),
-        package_root
-            .join("vendor")
-            .join(target_triple)
-            .join("bin")
-            .join(executable_name),
-    ];
-    for candidate in candidates {
-        if !candidate.is_file() {
-            continue;
-        }
-        let resolved = resolve_launch_executable(
-            candidate
-                .to_str()
-                .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?,
-        )?;
-        if resolved.shebang.is_some() {
-            return Err(LaunchAttestationError::UntrustedLaunchCommand);
-        }
-        return Ok(Some(resolved.identity));
+        codex_native_layout(os, arch).ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+    let candidates = codex_native_candidates(
+        package_root,
+        platform_package,
+        target_triple,
+        executable_name,
+    )
+    .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+    if fields.next() != Some(b"".as_slice())
+        || !candidates.iter().any(|candidate| candidate == selected)
+        || !path.starts_with('/')
+        || path.len() > 4096
+        || path.contains(['\0', '\n', '\r'])
+        || device == 0
+        || inode == 0
+    {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
-    Ok(None)
-}
-
-#[cfg(not(unix))]
-fn resolve_trusted_script_child(
-    _entry: &HarnessExecutableIdentity,
-    _expected_provider: Harness,
-) -> Result<Option<HarnessExecutableIdentity>, LaunchAttestationError> {
-    Ok(None)
+    Ok(Some(HarnessExecutableIdentity {
+        path,
+        device,
+        inode,
+    }))
 }
 
 pub fn resolve_expected_harness_launch_provenance(
@@ -1655,6 +1736,41 @@ pub(crate) fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_linux_native_layout_prefers_optional_package_then_bundled_fallback() {
+        let (package, triple, executable) = codex_native_layout("Linux", "x86_64").unwrap();
+        assert_eq!(package, "codex-linux-x64");
+        assert_eq!(triple, "x86_64-unknown-linux-musl");
+        let candidates = codex_native_candidates(
+            "/home/test/node_modules/@openai/codex",
+            package,
+            triple,
+            executable,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates[0],
+            "/home/test/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+        );
+        assert_eq!(
+            candidates[1],
+            "/home/test/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex"
+        );
+
+        assert_eq!(
+            codex_native_layout("Linux", "aarch64").unwrap().0,
+            "codex-linux-arm64"
+        );
+        assert!(codex_native_layout("Windows_NT", "AMD64").is_none());
+        assert!(codex_native_candidates(
+            "C:\\node_modules\\@openai\\codex",
+            package,
+            triple,
+            executable
+        )
+        .is_none());
+    }
 
     #[cfg(unix)]
     fn make_executable(path: &std::path::Path) {

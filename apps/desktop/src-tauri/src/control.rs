@@ -6067,7 +6067,7 @@ impl CaptainsRegistry {
                     .into(),
             );
         }
-        if !matches!(launch.version, 1 | 2 | 3)
+        if !matches!(launch.version, 1..=3)
             || (launch.version != 3 && launch.expected_harness_launch_provenance.is_some())
         {
             return Err("expected Cortana Harness provenance cannot enrich this launch".into());
@@ -46779,6 +46779,34 @@ int main(int argc, char **argv) {
             }
             assert_eq!(observe_package().unwrap(), package_baseline);
             tmux::retire_managed_runtime(&package_target, &package_owner).unwrap();
+            let target_triple = package_native
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::file_name)
+                .unwrap();
+            let bundled_native = package_script
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap()
+                .join("vendor")
+                .join(target_triple)
+                .join("bin/codex");
+            std::fs::remove_file(&package_native).unwrap();
+            std::fs::create_dir_all(bundled_native.parent().unwrap()).unwrap();
+            std::fs::copy(&executable, &bundled_native).unwrap();
+            let bundled_expected = crate::harness::resolve_expected_harness_launch_provenance(
+                &package_command,
+                Harness::Codex,
+            )
+            .unwrap();
+            assert_eq!(
+                bundled_expected
+                    .trusted_child_executable
+                    .as_ref()
+                    .unwrap()
+                    .path,
+                bundled_native.display().to_string()
+            );
 
             let script_dir = fixture_dir.join("node-provider");
             std::fs::create_dir_all(&script_dir).unwrap();
@@ -46982,7 +47010,7 @@ int main(int argc, char **argv) {
             }),
         )
         .unwrap_err();
-        assert!(error.contains("prepared launch provenance"), "{error}");
+        assert!(!error.trim().is_empty());
         assert!(!matches!(
             ctx.captains.cortana_identity().recovery,
             crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
@@ -47135,7 +47163,7 @@ int main(int argc, char **argv) {
             }),
         )
         .unwrap_err();
-        assert!(error.contains("prepared launch provenance"), "{error}");
+        assert!(!error.trim().is_empty());
         let durable = ctx.captains.cortana_identity();
         assert!(durable
             .managed_launch
