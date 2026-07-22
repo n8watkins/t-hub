@@ -1,6 +1,6 @@
 // Typed wrappers over the Dev-server IPC surface (feat/dev-runner).
 //
-// Run and Preview runs one managed typed target per project, scoped to that
+// Preview runs one managed typed target per project, scoped to that
 // project's directory. These wrappers invoke the discovery and lifecycle commands and
 // `listen` on the per-terminal output channel. Kept separate from ./client (0.1
 // nucleus) and ./files so the dev-runner contract lives in one place. Mirrors

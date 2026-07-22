@@ -1,7 +1,7 @@
 // TilePanel — the per-tile body SWITCHER for the non-terminal views.
 //
 // A project tile (Tile.tsx) is a little workbench with a Terminal / Files /
-// Run + Preview tab bar. The Terminal view is special: its xterm is not
+// Preview tab bar. The Terminal view is special: its xterm is not
 // a child
 // of the tile — the persistent pool (TerminalPool.tsx) renders each terminal
 // once in an overlay and positions it over the tile's empty placeholder, so a

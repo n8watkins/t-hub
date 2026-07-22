@@ -127,12 +127,14 @@ describe("Tile header orchestrator identity", () => {
   });
 });
 
-describe("Tile Run and Preview entry point", () => {
-  it("offers one Run + Preview tab and no separate Dev tab", () => {
+describe("Tile Preview entry point", () => {
+  it("offers one Preview tab and no separate Dev tab", () => {
     const header = renderTile("cap00001");
 
-    expect(within(header).getByTitle("Run + Preview view")).toBeTruthy();
-    expect(within(header).queryByTitle("Preview view")).toBeNull();
+    const preview = within(header).getByTitle("Preview view");
+    expect(preview.querySelector(".lucide-eye")).toBeTruthy();
+    expect(preview.querySelector(".lucide-play")).toBeNull();
+    expect(within(header).queryByTitle("Run + Preview view")).toBeNull();
     expect(within(header).queryByTitle("Dev view")).toBeNull();
   });
 });
@@ -143,7 +145,7 @@ describe("Tile responsive header controls", () => {
     const tabs = [
       { label: "Terminal", short: "Term", pressed: "true" },
       { label: "Files", short: "Files", pressed: "false" },
-      { label: "Run + Preview", short: "Run", pressed: "false" },
+      { label: "Preview", short: "Preview", pressed: "false" },
     ];
 
     for (const tab of tabs) {

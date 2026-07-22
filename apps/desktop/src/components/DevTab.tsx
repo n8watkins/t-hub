@@ -1,4 +1,4 @@
-// Managed-runner portion of the per-project Run and Preview surface.
+// Managed-runner portion of the per-project Preview surface.
 //
 // The backend discovers and validates typed package-script or static-site
 // targets, constructs executable arguments or a confined loopback server, and

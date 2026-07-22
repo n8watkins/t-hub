@@ -37,7 +37,7 @@ export function RunPreviewPanel({
 
   return (
     <section
-      aria-label="Run and Preview"
+      aria-label="Preview"
       className="grid h-full min-h-0 grid-rows-[minmax(10rem,38%)_minmax(0,1fr)]"
     >
       <div

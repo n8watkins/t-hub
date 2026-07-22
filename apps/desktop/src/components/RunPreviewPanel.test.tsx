@@ -49,7 +49,7 @@ describe("RunPreviewPanel", () => {
 
     render(<RunPreviewPanel terminalId="terminal-1" cwd="/repo/t-hub" />);
 
-    expect(screen.getByRole("region", { name: "Run and Preview" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Preview" })).toBeTruthy();
     expect(screen.getByTestId("runner").textContent).toBe("terminal-1:/repo/t-hub");
     expect(screen.getByTestId("preview").textContent).toBe("http://localhost:5173");
     expect(previewProps.at(-1)).not.toHaveProperty("detectedUrls");

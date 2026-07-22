@@ -1,6 +1,6 @@
 // Per-project panel state — the per-tile "workbench".
 //
-// Each project tile shows one of Terminal / Files / Run + Preview, plus
+// Each project tile shows one of Terminal / Files / Preview, plus
 // a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
 // the parallel panel work doesn't contend on workspace.ts.
@@ -78,7 +78,7 @@ interface PanelState {
   fullscreenId: TerminalId | null;
   /** Dev-server URL reported by the managed runner for this terminal. */
   devUrl: Record<TerminalId, string | null>;
-  /** Last URL the user committed in Run and Preview, so it survives a tab switch.
+  /** Last URL the user committed in Preview, so it survives a tab switch.
    *  The managed runner's live `devUrl` takes precedence. */
   previewUrl: Record<TerminalId, string | null>;
   /** Per-tile: when a non-terminal tab is active the tile SPLITS (terminal +

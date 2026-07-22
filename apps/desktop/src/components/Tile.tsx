@@ -68,9 +68,9 @@ import { clipboardWrite } from "../lib/clipboard";
 import {
   Anchor,
   Copy,
+  Eye,
   Files,
   GitBranch,
-  Play,
   RotateCcw,
   SquareTerminal,
 } from "lucide-react";
@@ -129,7 +129,7 @@ const PANEL_TABS: {
 }[] = [
   { id: "terminal", label: "Terminal", short: "Term", icon: SquareTerminal },
   { id: "files", label: "Files", short: "Files", icon: Files },
-  { id: "preview", label: "Run + Preview", short: "Run", icon: Play },
+  { id: "preview", label: "Preview", short: "Preview", icon: Eye },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -274,7 +274,7 @@ export function Tile({
   const busy =
     (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
-  // Per-tile panel state (the Terminal / Files / Run + Preview workbench).
+  // Per-tile panel state (the Terminal / Files / Preview workbench).
   // Kept in usePanels so this presentational state doesn't
   // contend with the workspace store. The active tab decides whether the body
   // shows the pooled terminal or an in-tile surface. Fullscreen blows this one
@@ -1505,7 +1505,7 @@ function PanelPane({
 }) {
   const title =
     tab === "preview"
-      ? "Run and Preview"
+      ? "Preview"
       : tab.charAt(0).toUpperCase() + tab.slice(1);
   return (
     <div className="flex h-full min-h-0 flex-col">
