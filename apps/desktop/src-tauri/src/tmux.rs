@@ -100,6 +100,26 @@ pub(crate) struct PaneGeneration {
     pub(crate) pane_pid: u32,
 }
 
+/// Exact Linux process and tmux generation for one retirement effect.
+///
+/// Both process start tokens and the process-group/session ownership are needed:
+/// numeric PIDs and a tmux session name can be reused independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionEffectIdentity {
+    pub(crate) tmux_session_id: u64,
+    pub(crate) tmux_session_created: u64,
+    pub(crate) tmux_window_id: u64,
+    pub(crate) tmux_pane_id: u64,
+    pub(crate) pane_pid: u32,
+    pub(crate) pane_start_ticks: u64,
+    pub(crate) pane_process_group_id: u32,
+    pub(crate) pane_process_session_id: u32,
+    pub(crate) foreground_pid: u32,
+    pub(crate) foreground_start_ticks: u64,
+    pub(crate) foreground_process_group_id: u32,
+    pub(crate) foreground_process_session_id: u32,
+}
+
 /// Evidence for a private dormant-pane to provider-pane transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RespawnPaneTransition {
@@ -843,6 +863,213 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
         code: output.status.code(),
         message: stderr.trim().to_string(),
     })
+}
+
+fn exact_effect_target(name: &str) -> Result<(), TmuxError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'='))
+    {
+        return Err(TmuxError {
+            op: "exact-session-effect",
+            code: None,
+            message: "target is outside the exact session effect contract".into(),
+        });
+    }
+    Ok(())
+}
+
+fn session_effect_identity_script(name: &str) -> String {
+    format!(
+        r#"set -eu
+pane=$(tmux -L {socket} list-panes -t '{name}' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}')
+case "$pane" in *$'\n'*) exit 30;; esac
+IFS='|' read -r tmux_session_id tmux_session_created tmux_window_id tmux_pane_id pane_pid extra <<EOF
+$pane
+EOF
+[ -z "${{extra:-}}" ]
+pane_stat=$(cat "/proc/$pane_pid/stat")
+rest=${{pane_stat##*) }}
+set -- $rest
+[ "$#" -ge 20 ]
+pane_process_group_id=$3
+pane_process_session_id=$4
+pane_start_ticks=${{20}}
+foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
+case "$pane_process_group_id:$pane_process_session_id:$pane_start_ticks:$foreground_pid" in ''|*[!0-9:]*) exit 32;; esac
+foreground_stat=$(cat "/proc/$foreground_pid/stat")
+rest=${{foreground_stat##*) }}
+set -- $rest
+[ "$#" -ge 20 ]
+foreground_process_group_id=$3
+foreground_process_session_id=$4
+foreground_start_ticks=${{20}}
+case "$foreground_process_group_id:$foreground_process_session_id:$foreground_start_ticks" in ''|*[!0-9:]*) exit 33;; esac
+[ "$foreground_pid" = "$foreground_process_group_id" ]
+[ "$foreground_process_session_id" = "$pane_process_session_id" ]
+pane_after=$(tmux -L {socket} list-panes -t '{name}' -F '#{{session_id}}|#{{session_created}}|#{{window_id}}|#{{pane_id}}|#{{pane_pid}}')
+[ "$pane_after" = "$pane" ]
+pane_stat_after=$(cat "/proc/$pane_pid/stat")
+rest=${{pane_stat_after##*) }}
+set -- $rest
+[ "${{20}}" = "$pane_start_ticks" ]
+foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
+[ "$foreground_after" = "$foreground_pid" ]
+foreground_stat_after=$(cat "/proc/$foreground_pid/stat")
+rest=${{foreground_stat_after##*) }}
+set -- $rest
+[ "$3:$4:${{20}}" = "$foreground_process_group_id:$foreground_process_session_id:$foreground_start_ticks" ]
+printf 'THSE1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  "$tmux_session_id" "$tmux_session_created" "$tmux_window_id" "$tmux_pane_id" \
+  "$pane_pid" "$pane_start_ticks" "$pane_process_group_id" "$pane_process_session_id" \
+  "$foreground_pid" "$foreground_start_ticks" "$foreground_process_group_id" "$foreground_process_session_id"
+"#,
+        socket = socket(),
+        name = name,
+    )
+}
+
+fn parse_session_effect_identity(value: &str) -> Option<SessionEffectIdentity> {
+    let mut fields = value.trim().split('|');
+    if fields.next()? != "THSE1" {
+        return None;
+    }
+    let parse_prefixed = |value: Option<&str>, prefix: char| {
+        value
+            .and_then(|value| value.strip_prefix(prefix))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let parse_u64 = |value: Option<&str>| value.and_then(|value| value.parse::<u64>().ok());
+    let parse_u32 = |value: Option<&str>| {
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| u32::try_from(value).ok())
+    };
+    let identity = SessionEffectIdentity {
+        tmux_session_id: parse_prefixed(fields.next(), '$')?,
+        tmux_session_created: parse_u64(fields.next())?,
+        tmux_window_id: parse_prefixed(fields.next(), '@')?,
+        tmux_pane_id: parse_prefixed(fields.next(), '%')?,
+        pane_pid: parse_u32(fields.next())?,
+        pane_start_ticks: parse_u64(fields.next())?,
+        pane_process_group_id: parse_u32(fields.next())?,
+        pane_process_session_id: parse_u32(fields.next())?,
+        foreground_pid: parse_u32(fields.next())?,
+        foreground_start_ticks: parse_u64(fields.next())?,
+        foreground_process_group_id: parse_u32(fields.next())?,
+        foreground_process_session_id: parse_u32(fields.next())?,
+    };
+    if fields.next().is_some()
+        || identity.tmux_session_created == 0
+        || identity.pane_pid == 0
+        || identity.pane_start_ticks == 0
+        || identity.pane_process_group_id == 0
+        || identity.pane_process_session_id == 0
+        || identity.foreground_pid == 0
+        || identity.foreground_start_ticks == 0
+        || identity.foreground_process_group_id != identity.foreground_pid
+        || identity.foreground_process_session_id != identity.pane_process_session_id
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+pub(crate) fn observe_session_effect_identity(
+    name: &str,
+) -> Result<SessionEffectIdentity, TmuxError> {
+    exact_effect_target(name)?;
+    let script = session_effect_identity_script(name);
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
+            TmuxError {
+                op: "observe-session-effect",
+                code: None,
+                message: format!("failed to inspect exact session effect identity: {error}"),
+            }
+        })?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(TmuxError {
+            op: "observe-session-effect",
+            code: output.status.code(),
+            message: "exact session effect identity is unavailable or ambiguous".into(),
+        });
+    }
+    parse_session_effect_identity(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        TmuxError {
+            op: "observe-session-effect",
+            code: None,
+            message: "exact session effect identity is malformed".into(),
+        }
+    })
+}
+
+/// Retire only the exact process generation recorded before the durable prepare.
+///
+/// This intentionally does not call `tmux kill-session`: a reused session name or
+/// pane may now own a different process. The in-effect identity check precedes
+/// signals, and the caller must separately prove that the original session is gone.
+pub(crate) fn kill_session_tree_exact(
+    name: &str,
+    expected: SessionEffectIdentity,
+) -> Result<(), TmuxError> {
+    let observed = observe_session_effect_identity(name)?;
+    if observed != expected {
+        return Err(TmuxError {
+            op: "kill-session-tree-exact",
+            code: None,
+            message: "exact session effect identity changed before retirement".into(),
+        });
+    }
+    let expected_line = format!(
+        "THSE1|${}|{}|@{}|%{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        expected.tmux_session_id,
+        expected.tmux_session_created,
+        expected.tmux_window_id,
+        expected.tmux_pane_id,
+        expected.pane_pid,
+        expected.pane_start_ticks,
+        expected.pane_process_group_id,
+        expected.pane_process_session_id,
+        expected.foreground_pid,
+        expected.foreground_start_ticks,
+        expected.foreground_process_group_id,
+        expected.foreground_process_session_id,
+    );
+    let script = format!(
+        r#"set -eu
+observed=$({observe})
+[ "$observed" = '{expected_line}' ]
+kill -9 -- -{foreground_group} 2>/dev/null || true
+if [ '{pane_group}' != '{foreground_group}' ]; then
+  kill -9 -- -{pane_group} 2>/dev/null || true
+fi
+kill -9 {pane_pid} 2>/dev/null || true
+"#,
+        observe = session_effect_identity_script(name),
+        expected_line = expected_line,
+        foreground_group = expected.foreground_process_group_id,
+        pane_group = expected.pane_process_group_id,
+        pane_pid = expected.pane_pid,
+    );
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|error| {
+            TmuxError {
+                op: "kill-session-tree-exact",
+                code: None,
+                message: format!("failed to retire exact session process identity: {error}"),
+            }
+        })?;
+    if output.status.success() && output.stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(TmuxError {
+            op: "kill-session-tree-exact",
+            code: output.status.code(),
+            message: "exact session effect identity changed during retirement".into(),
+        })
+    }
 }
 
 /// Like [`kill_session`] but GUARANTEES the pane process tree dies. `tmux

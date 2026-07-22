@@ -1225,10 +1225,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// v22 adds one-use provenance for an exact healthy schema-v18 Cortana binding.
 /// It permits retirement of that exact legacy runtime after its identity has
 /// disappeared without weakening the stable-discovery contract for adoption.
+/// v23 binds orphan retirement to one exact tmux and Linux process generation.
 /// Snapshots older than a recovery shape load and upgrade only when they carry
 /// no such recovery state.  A recovery record requires its exact schema and
 /// fails closed rather than letting an older binary discard it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 22;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 23;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3445,7 +3446,7 @@ impl CaptainsRegistry {
                 path: path.to_path_buf(),
             });
         }
-        if has_cortana_orphan_recovery && schema_version < 21 {
+        if has_cortana_orphan_recovery && schema_version < 23 {
             return Err(SnapshotReadError::IncompatibleRecovery {
                 path: path.to_path_buf(),
             });
@@ -4031,6 +4032,7 @@ impl CaptainsRegistry {
                     orphan_identity_id,
                     orphan_generation,
                     harness,
+                    effect_identity,
                     replacement_identity_id,
                 } => {
                     if operation_id.trim().is_empty()
@@ -4046,6 +4048,8 @@ impl CaptainsRegistry {
                         || durable.identity_id.as_deref() != Some(orphan_identity_id.as_str())
                         || durable.generation != *orphan_generation
                         || durable.harness.as_deref() != Some(harness.as_str())
+                        || snapshot.schema_version < 23
+                        || !valid_cortana_effect_identity(effect_identity)
                     {
                         return Err(
                             "durable Cortana has an invalid orphan replacement operation".into(),
@@ -5387,6 +5391,7 @@ impl CaptainsRegistry {
         identity_id: &str,
         generation: u64,
         harness: &str,
+        effect_identity: crate::cortana_reconcile::CortanaOrphanEffectIdentity,
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
@@ -5396,6 +5401,7 @@ impl CaptainsRegistry {
             orphan_identity_id,
             orphan_generation,
             harness: active_harness,
+            effect_identity: active_effect_identity,
             ..
         } = &current.cortana.recovery
         {
@@ -5404,6 +5410,7 @@ impl CaptainsRegistry {
                 && orphan_identity_id == identity_id
                 && *orphan_generation == generation
                 && active_harness == harness
+                && *active_effect_identity == effect_identity
             {
                 return Ok(current.cortana.clone());
             }
@@ -5438,6 +5445,7 @@ impl CaptainsRegistry {
                         && provenance.harness == harness
                         && !provenance.healthy_operation_id.trim().is_empty()
                 })
+            || !valid_cortana_effect_identity(&effect_identity)
             || current.captains.iter().any(|captain| {
                 captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
             })
@@ -5458,6 +5466,7 @@ impl CaptainsRegistry {
                 orphan_identity_id: identity_id.to_string(),
                 orphan_generation: generation,
                 harness: harness.to_string(),
+                effect_identity,
                 replacement_identity_id: None,
             };
         current.seq = current.seq.saturating_add(1);
@@ -17954,6 +17963,58 @@ fn runtime_evidence(value: tmux::SessionLiveness) -> crate::cortana_reconcile::R
     }
 }
 
+fn valid_cortana_effect_identity(
+    identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+) -> bool {
+    identity.tmux_session_created > 0
+        && identity.pane_pid > 0
+        && identity.pane_start_ticks > 0
+        && identity.pane_process_group_id > 0
+        && identity.pane_process_session_id > 0
+        && identity.foreground_pid > 0
+        && identity.foreground_start_ticks > 0
+        && identity.foreground_process_group_id == identity.foreground_pid
+        && identity.foreground_process_session_id == identity.pane_process_session_id
+}
+
+fn durable_cortana_effect_identity(
+    identity: tmux::SessionEffectIdentity,
+) -> crate::cortana_reconcile::CortanaOrphanEffectIdentity {
+    crate::cortana_reconcile::CortanaOrphanEffectIdentity {
+        tmux_session_id: identity.tmux_session_id,
+        tmux_session_created: identity.tmux_session_created,
+        tmux_window_id: identity.tmux_window_id,
+        tmux_pane_id: identity.tmux_pane_id,
+        pane_pid: identity.pane_pid,
+        pane_start_ticks: identity.pane_start_ticks,
+        pane_process_group_id: identity.pane_process_group_id,
+        pane_process_session_id: identity.pane_process_session_id,
+        foreground_pid: identity.foreground_pid,
+        foreground_start_ticks: identity.foreground_start_ticks,
+        foreground_process_group_id: identity.foreground_process_group_id,
+        foreground_process_session_id: identity.foreground_process_session_id,
+    }
+}
+
+fn tmux_cortana_effect_identity(
+    identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+) -> tmux::SessionEffectIdentity {
+    tmux::SessionEffectIdentity {
+        tmux_session_id: identity.tmux_session_id,
+        tmux_session_created: identity.tmux_session_created,
+        tmux_window_id: identity.tmux_window_id,
+        tmux_pane_id: identity.tmux_pane_id,
+        pane_pid: identity.pane_pid,
+        pane_start_ticks: identity.pane_start_ticks,
+        pane_process_group_id: identity.pane_process_group_id,
+        pane_process_session_id: identity.pane_process_session_id,
+        foreground_pid: identity.foreground_pid,
+        foreground_start_ticks: identity.foreground_start_ticks,
+        foreground_process_group_id: identity.foreground_process_group_id,
+        foreground_process_session_id: identity.foreground_process_session_id,
+    }
+}
+
 fn stale_legacy_cortana_control_env(
     control_file: Option<&str>,
     control_addr: Option<&str>,
@@ -18076,6 +18137,9 @@ fn discover_cortana_runtimes(
                 .filter(|value| !value.trim().is_empty())
         };
         let target = tmux_target(&terminal_id);
+        let effect_identity = tmux::observe_session_effect_identity(&target)
+            .ok()
+            .map(durable_cortana_effect_identity);
         by_terminal.insert(
             terminal_id.clone(),
             crate::cortana_reconcile::CortanaRuntimeCandidate {
@@ -18093,6 +18157,7 @@ fn discover_cortana_runtimes(
                     && control_token.as_deref().is_none_or(str::is_empty),
                 stale_legacy_control_env,
                 unresolved_session_bearer,
+                effect_identity,
                 // A durable Cortana identity can reacquire scoped authority. The
                 // rotating global token is intentionally absent from its env.
                 current_control_capability: trusted_cortana_identity,
@@ -18476,6 +18541,10 @@ fn retirable_legacy_cortana_orphan(
         && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
         && !candidate.identity_bound_to_terminal
         && candidate.unresolved_session_bearer
+        && candidate
+            .effect_identity
+            .as_ref()
+            .is_some_and(valid_cortana_effect_identity)
         && ((candidate.canonical_control_file && candidate.rotating_control_env_scrubbed)
             || candidate.stale_legacy_control_env)
         && !candidate.current_control_capability
@@ -18487,18 +18556,31 @@ fn retire_exact_cortana_orphan(
     ctx: &ControlContext,
     operation_id: &str,
     candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
+    expected_effect_identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
 ) -> Result<(), String> {
     let target = exact_cortana_tmux_target(&candidate.terminal_id)?;
     let requested = vec![candidate.terminal_id.clone()];
-    let kill = tmux::kill_session_tree(&target);
-    let result = match tmux::session_liveness(&target) {
-        tmux::SessionLiveness::Gone => Ok(()),
-        tmux::SessionLiveness::Alive => Err(format!(
-            "reconcile_cortana: exact orphan '{}' remained alive after retirement: {kill:?}",
+    if candidate.effect_identity.as_ref() != Some(expected_effect_identity) {
+        return Err(
+            "reconcile_cortana: exact orphan process identity changed after durable prepare".into(),
+        );
+    }
+    let kill = tmux::kill_session_tree_exact(
+        &target,
+        tmux_cortana_effect_identity(expected_effect_identity),
+    );
+    let result = match (kill, tmux::session_liveness(&target)) {
+        (Ok(()), tmux::SessionLiveness::Gone) => Ok(()),
+        (Err(error), _) => Err(retryable_error(format!(
+            "reconcile_cortana: exact orphan '{}' process identity could not be revalidated for retirement: {error}",
+            candidate.terminal_id
+        ))),
+        (Ok(()), tmux::SessionLiveness::Alive) => Err(format!(
+            "reconcile_cortana: exact orphan '{}' remained alive after exact retirement",
             candidate.terminal_id
         )),
-        tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
-            "reconcile_cortana: exact orphan '{}' has uncertain liveness after retirement: {kill:?}",
+        (Ok(()), tmux::SessionLiveness::Unknown) => Err(retryable_error(format!(
+            "reconcile_cortana: exact orphan '{}' has uncertain liveness after exact retirement",
             candidate.terminal_id
         ))),
     };
@@ -18574,12 +18656,16 @@ fn reconcile_cortana_inner(
                 .harness
                 .clone()
                 .expect("exact orphan requires a durable harness");
+            let effect_identity = orphan
+                .effect_identity
+                .expect("exact orphan requires an authoritative effect identity");
             durable = ctx.captains.prepare_cortana_orphan_replacement(
                 operation_id,
                 &orphan.terminal_id,
                 &identity_id,
                 durable.generation,
                 &harness,
+                effect_identity,
             )?;
             #[cfg(test)]
             ctx.captains.pause_dispatch("cortana_orphan_prepared");
@@ -18592,6 +18678,7 @@ fn reconcile_cortana_inner(
             orphan_identity_id,
             orphan_generation,
             harness,
+            effect_identity,
             replacement_identity_id,
             ..
         } => Some((
@@ -18599,6 +18686,7 @@ fn reconcile_cortana_inner(
             orphan_identity_id.clone(),
             *orphan_generation,
             harness.clone(),
+            *effect_identity,
             replacement_identity_id.clone(),
         )),
         _ => None,
@@ -18608,6 +18696,7 @@ fn reconcile_cortana_inner(
         orphan_identity_id,
         orphan_generation,
         harness,
+        effect_identity,
         replacement_identity_id,
     )) = &replacement
     {
@@ -18631,13 +18720,14 @@ fn reconcile_cortana_inner(
                     || orphan.stale_legacy_control_env)
                 || orphan.current_control_capability
                 || orphan.trusted_cortana_identity
+                || orphan.effect_identity.as_ref() != Some(effect_identity)
             {
                 return Err(
                     "reconcile_cortana: durable orphan replacement evidence no longer matches its exact prepared target"
                         .into(),
                 );
             }
-            retire_exact_cortana_orphan(ctx, operation_id, &orphan)?;
+            retire_exact_cortana_orphan(ctx, operation_id, &orphan, effect_identity)?;
             candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
         }
         if !candidates.is_empty() {
@@ -18685,7 +18775,7 @@ fn reconcile_cortana_inner(
         }
     }
 
-    let plan = if let Some((_, _, orphan_generation, _, _)) = &replacement {
+    let plan = if let Some((_, _, orphan_generation, _, _, _)) = &replacement {
         crate::cortana_reconcile::CortanaReconcilePlan {
             operation_id: operation_id.to_string(),
             action: crate::cortana_reconcile::CortanaReconcileAction::Recover,
@@ -18829,7 +18919,8 @@ fn reconcile_cortana_inner(
     let startup_command =
         arg_str(args, "testStartupCommand").unwrap_or_else(|| startup_command.clone());
 
-    let (identity, newly_minted) = if let Some((_, _, _, _, replacement_identity_id)) = &replacement
+    let (identity, newly_minted) = if let Some((_, _, _, _, _, replacement_identity_id)) =
+        &replacement
     {
         match replacement_identity_id.as_deref() {
             Some(identity_id) => {
@@ -36659,7 +36750,7 @@ mod tests {
         std::fs::write(
             &path,
             json!({
-                "schemaVersion": 20,
+                "schemaVersion": 22,
                 "cortana": {
                     "recovery": {
                         "kind": "replacingOrphan"
@@ -36670,6 +36761,34 @@ mod tests {
         )
         .unwrap();
 
+        assert!(matches!(
+            CaptainsRegistry::read_snapshot(&path),
+            Err(SnapshotReadError::IncompatibleRecovery { .. })
+        ));
+
+        std::fs::write(
+            &path,
+            json!({
+                "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                "cortana": {
+                    "identityId": "legacy-orphan-identity",
+                    "generation": 1,
+                    "terminalId": "a1b2c3d4",
+                    "harness": "codex",
+                    "recovery": {
+                        "kind": "replacingOrphan",
+                        "operation_id": "missing-effect-identity",
+                        "started_at": 1,
+                        "orphan_terminal_id": "a1b2c3d4",
+                        "orphan_identity_id": "legacy-orphan-identity",
+                        "orphan_generation": 1,
+                        "harness": "codex"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
         assert!(matches!(
             CaptainsRegistry::read_snapshot(&path),
             Err(SnapshotReadError::IncompatibleRecovery { .. })
@@ -42697,8 +42816,28 @@ mod tests {
             rotating_control_env_scrubbed: false,
             stale_legacy_control_env: true,
             unresolved_session_bearer: true,
+            effect_identity: Some(test_cortana_effect_identity(100)),
             current_control_capability: false,
             trusted_cortana_identity: false,
+        }
+    }
+
+    fn test_cortana_effect_identity(
+        seed: u32,
+    ) -> crate::cortana_reconcile::CortanaOrphanEffectIdentity {
+        crate::cortana_reconcile::CortanaOrphanEffectIdentity {
+            tmux_session_id: u64::from(seed),
+            tmux_session_created: u64::from(seed) + 1,
+            tmux_window_id: u64::from(seed) + 2,
+            tmux_pane_id: u64::from(seed) + 3,
+            pane_pid: seed + 4,
+            pane_start_ticks: u64::from(seed) + 5,
+            pane_process_group_id: seed + 4,
+            pane_process_session_id: seed + 4,
+            foreground_pid: seed + 6,
+            foreground_start_ticks: u64::from(seed) + 7,
+            foreground_process_group_id: seed + 6,
+            foreground_process_session_id: seed + 4,
         }
     }
 
@@ -42760,6 +42899,15 @@ mod tests {
             &ctx,
             &durable,
             std::slice::from_ref(&unknown_liveness)
+        )
+        .is_none());
+
+        let mut missing_effect_identity = candidate.clone();
+        missing_effect_identity.effect_identity = None;
+        assert!(retirable_legacy_cortana_orphan(
+            &ctx,
+            &durable,
+            std::slice::from_ref(&missing_effect_identity)
         )
         .is_none());
 
@@ -42987,6 +43135,7 @@ mod tests {
                 orphan_identity,
                 1,
                 "codex",
+                test_cortana_effect_identity(200),
             )
             .unwrap();
         let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
@@ -43170,6 +43319,9 @@ mod tests {
         )
         .unwrap();
         wait_for_harness_started(&orphan_terminal, "codex").unwrap();
+        let orphan_effect_identity = durable_cortana_effect_identity(
+            tmux::observe_session_effect_identity(&orphan_target).unwrap(),
+        );
         let sentinel_target = exact_cortana_tmux_target(&sentinel_terminal).unwrap();
         create_test_tmux_session(&sentinel_target).unwrap();
 
@@ -43184,6 +43336,7 @@ mod tests {
                 missing_identity,
                 1,
                 "codex",
+                orphan_effect_identity,
             )
             .unwrap();
         assert_eq!(
@@ -43299,6 +43452,150 @@ mod tests {
     }
 
     #[test]
+    fn prepared_legacy_orphan_restart_preserves_same_session_replacement() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "prepared_legacy_orphan_restart_preserves_same_session_replacement: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let registry_path = captains_tmp("cortana-prepared-same-session-reuse");
+        let identity_path = captains_tmp("cortana-prepared-same-session-reuse-identities");
+        let orphan_terminal = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let missing_identity = "missing-reused-session-cortana-identity";
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 18,
+                "seq": 40,
+                "captains": [],
+                "workspaces": [{
+                    "id": CAPTAIN_WORKSPACE_ID,
+                    "name": CAPTAIN_WORKSPACE_NAME,
+                    "kind": "captain",
+                    "tileIds": [orphan_terminal.clone()]
+                }],
+                "cortana": {
+                    "identityId": missing_identity,
+                    "generation": 1,
+                    "terminalId": orphan_terminal,
+                    "harness": "codex",
+                    "recovery": {
+                        "kind": "healthy",
+                        "operation_id": "same-session-original",
+                        "verified_at": 1
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-same-session-reuse-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let orphan_target = exact_cortana_tmux_target(&orphan_terminal).unwrap();
+        create_test_tmux_session_with_env(
+            &orphan_target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    "unresolved-reused-session-bearer".into(),
+                ),
+                ("T_HUB_CONTROL_ADDR".into(), "127.0.0.1:51330".into()),
+                ("T_HUB_CONTROL_TOKEN".into(), "stale-control-token".into()),
+                (CORTANA_GENERATION_ENV.into(), "1".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(&orphan_terminal, "codex").unwrap();
+        let original_effect = tmux::observe_session_effect_identity(&orphan_target).unwrap();
+
+        let captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        captains
+            .begin_cortana_recovery("same-session-reuse-operation")
+            .unwrap();
+        captains
+            .prepare_cortana_orphan_replacement(
+                "same-session-reuse-operation",
+                &orphan_terminal,
+                missing_identity,
+                1,
+                "codex",
+                durable_cortana_effect_identity(original_effect),
+            )
+            .unwrap();
+
+        let transition =
+            tmux::respawn_pane_exact(&orphan_target, home.to_str().unwrap(), &harness_command)
+                .unwrap();
+        assert_eq!(transition.before.session_id, transition.after.session_id);
+        assert_eq!(
+            transition.before.session_created,
+            transition.after.session_created
+        );
+        assert_eq!(transition.before.window_id, transition.after.window_id);
+        assert_eq!(transition.before.pane_id, transition.after.pane_id);
+        assert_ne!(transition.before.pane_pid, transition.after.pane_pid);
+        wait_for_harness_started(&orphan_terminal, "codex").unwrap();
+        let replacement_effect = tmux::observe_session_effect_identity(&orphan_target).unwrap();
+        assert_ne!(replacement_effect, original_effect);
+        drop(captains);
+
+        let restarted_captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let mut ctx = test_ctx("same-session-reuse-current-token")
+            .with_captains_registry(restarted_captains.clone())
+            .with_identity_store(identities)
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:63930".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![orphan_terminal.clone()],
+        }]);
+
+        let error = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "ignored-after-same-session-reuse",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("evidence no longer matches"), "{error}");
+        assert_eq!(
+            tmux::session_liveness(&orphan_target),
+            tmux::SessionLiveness::Alive,
+            "same-session replacement must survive a stale prepared retirement"
+        );
+        assert_eq!(
+            tmux::observe_session_effect_identity(&orphan_target).unwrap(),
+            replacement_effect
+        );
+        assert!(matches!(
+            restarted_captains.cortana_identity().recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. }
+        ));
+
+        reap_test_tmux_session(&orphan_target).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).ok();
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_file(registry_path).ok();
+        std::fs::remove_file(identity_path).ok();
+    }
+
+    #[test]
     fn orphan_replacement_restart_rejects_copied_bearers_and_control_env_drift() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         if !tmux_process_tests_available() {
@@ -43359,6 +43656,7 @@ mod tests {
                     "missing-negative-cortana-identity",
                     1,
                     "codex",
+                    test_cortana_effect_identity(300),
                 )
                 .unwrap();
             let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
@@ -43726,6 +44024,7 @@ mod tests {
                 rotating_control_env_scrubbed: true,
                 stale_legacy_control_env: false,
                 unresolved_session_bearer: false,
+                effect_identity: None,
                 current_control_capability: true,
                 trusted_cortana_identity: true,
             },
@@ -43742,6 +44041,7 @@ mod tests {
                 rotating_control_env_scrubbed: true,
                 stale_legacy_control_env: false,
                 unresolved_session_bearer: false,
+                effect_identity: None,
                 current_control_capability: true,
                 trusted_cortana_identity: true,
             },

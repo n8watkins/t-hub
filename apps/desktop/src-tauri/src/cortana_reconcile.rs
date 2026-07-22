@@ -36,11 +36,32 @@ pub struct CortanaRuntimeCandidate {
     /// The runtime presented a non-empty per-session bearer which no longer
     /// resolves in the current durable identity store.
     pub unresolved_session_bearer: bool,
+    /// Exact Linux/tmux process generation authorized for a legacy retirement.
+    /// Adoption never relies on this evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_identity: Option<CortanaOrphanEffectIdentity>,
     pub current_control_capability: bool,
     pub trusted_cortana_identity: bool,
 }
 
 pub const LEGACY_ORPHAN_PROVENANCE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaOrphanEffectIdentity {
+    pub tmux_session_id: u64,
+    pub tmux_session_created: u64,
+    pub tmux_window_id: u64,
+    pub tmux_pane_id: u64,
+    pub pane_pid: u32,
+    pub pane_start_ticks: u64,
+    pub pane_process_group_id: u32,
+    pub pane_process_session_id: u32,
+    pub foreground_pid: u32,
+    pub foreground_start_ticks: u64,
+    pub foreground_process_group_id: u32,
+    pub foreground_process_session_id: u32,
+}
 
 /// One-use evidence recovered while upgrading to captains schema v22.
 ///
@@ -96,6 +117,7 @@ pub enum CortanaRecoveryState {
         orphan_identity_id: String,
         orphan_generation: u64,
         harness: String,
+        effect_identity: CortanaOrphanEffectIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replacement_identity_id: Option<String>,
     },
@@ -448,6 +470,7 @@ mod tests {
             rotating_control_env_scrubbed: true,
             stale_legacy_control_env: false,
             unresolved_session_bearer: false,
+            effect_identity: None,
             current_control_capability: true,
             trusted_cortana_identity: true,
         }
