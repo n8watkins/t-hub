@@ -1538,6 +1538,7 @@ fn continuity_control_fixture() -> (
             },
         }),
         managed_launch: None,
+        active_harness_attestation: None,
         legacy_quarantine: None,
         legacy_orphan_provenance: None,
         recovery: control::CortanaRecoveryState::Healthy {
@@ -1545,6 +1546,10 @@ fn continuity_control_fixture() -> (
             verified_at: 1,
         },
     };
+    // This process-continuity fixture intentionally has no real managed Cortana
+    // process. Keep it on the last legacy schema and verify that loading it
+    // preserves Captain continuity while refusing historical Cortana authority.
+    snapshot.schema_version = 28;
     fs::write(
         &captains_path,
         serde_json::to_vec_pretty(&snapshot).expect("serialize continuity Fleet"),
@@ -2506,9 +2511,10 @@ fn captain_control_continuity_process_merge_gate() {
     initialize_mcp(&cortana, 210);
     let cortana_mutation = call_tool(&cortana, 211, "new_tab", json!({"name": "Cortana scoped"}));
     assert_eq!(
-        cortana_mutation["result"]["isError"], false,
+        cortana_mutation["result"]["isError"], true,
         "{cortana_mutation}"
     );
+    assert!(tool_error_text(&cortana_mutation).contains("no active scoped mutation authority"));
     let fleet_appointment = call_tool(
         &cortana,
         212,
@@ -2520,7 +2526,7 @@ fn captain_control_continuity_process_merge_gate() {
         }),
     );
     assert_eq!(
-        fleet_appointment["result"]["isError"], false,
+        fleet_appointment["result"]["isError"], true,
         "{fleet_appointment}"
     );
 
@@ -2570,7 +2576,7 @@ fn captain_control_continuity_process_merge_gate() {
             "target": {"kind": "fleet"}
         }),
     );
-    assert_eq!(fleet_allowed["result"]["isError"], false, "{fleet_allowed}");
+    assert!(tool_error_text(&fleet_allowed).contains("no active scoped mutation authority"));
     let fleet_wrong_operation = call_tool(
         &fleet_admin,
         232,
@@ -2580,7 +2586,7 @@ fn captain_control_continuity_process_merge_gate() {
             "target": {"kind": "session", "sessionId": CONTINUITY_CREW}
         }),
     );
-    assert!(tool_error_text(&fleet_wrong_operation).contains("operationNotGranted"));
+    assert!(tool_error_text(&fleet_wrong_operation).contains("no active scoped mutation authority"));
 
     let mut crew = McpProc::spawn(
         &bin,

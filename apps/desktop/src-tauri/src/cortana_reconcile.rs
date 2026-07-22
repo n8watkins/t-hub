@@ -125,6 +125,21 @@ pub struct CortanaManagedLaunchIntent {
     pub harness_process: Option<crate::harness::HarnessProcessIdentity>,
 }
 
+pub const ACTIVE_HARNESS_ATTESTATION_VERSION: u32 = 1;
+
+/// Sanitized evidence retained after the launch WAL commits Healthy.
+///
+/// This contains no bearer, raw argv, or session token. It binds the expected
+/// executable provenance to the exact accepted process generation so every
+/// later Cortana authorization can revalidate the live runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaActiveHarnessAttestation {
+    pub version: u32,
+    pub expected_launch_provenance: crate::harness::ExpectedHarnessLaunchProvenance,
+    pub process: crate::harness::HarnessProcessIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CortanaManagedOwnerToken {
@@ -166,6 +181,8 @@ pub struct CortanaDurableIdentity {
     pub owner: Option<CortanaManagedOwnerToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_launch: Option<CortanaManagedLaunchIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_harness_attestation: Option<CortanaActiveHarnessAttestation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_quarantine: Option<CortanaLegacyQuarantine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -573,6 +590,7 @@ mod tests {
             checkpoint: Some("checkpoint-1".into()),
             owner: None,
             managed_launch: None,
+            active_harness_attestation: None,
             legacy_quarantine: None,
             legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {
