@@ -31097,30 +31097,14 @@ mod tests {
     /// independently probes its absence, including after a successful final
     /// removal that tmux reports as `server exited unexpectedly`.
     struct ProcessAttestationTmuxGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        anchor: String,
+        _lifecycle: tmux::TestLifecycleGuard,
     }
 
     impl ProcessAttestationTmuxGuard {
         fn acquire() -> Self {
-            static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK
-                .get_or_init(|| StdMutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let anchor_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-            let anchor = tmux_target(&anchor_id);
-            create_test_tmux_session(&anchor).unwrap();
             Self {
-                _lock: lock,
-                anchor,
+                _lifecycle: tmux::TestLifecycleGuard::acquire(),
             }
-        }
-    }
-
-    impl Drop for ProcessAttestationTmuxGuard {
-        fn drop(&mut self) {
-            let _ = reap_test_tmux_session(&self.anchor);
         }
     }
 

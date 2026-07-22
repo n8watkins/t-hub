@@ -90,6 +90,54 @@ pub(crate) fn validated_socket_name() -> Result<&'static str, TmuxError> {
     validate_socket_name(socket())
 }
 
+/// Serialize tests that exercise real tmux process ownership and keep an
+/// independent anchor alive while the shared isolated server is in use.
+#[cfg(test)]
+pub(crate) struct TestLifecycleGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    anchor: String,
+}
+
+#[cfg(test)]
+impl TestLifecycleGuard {
+    pub(crate) fn acquire() -> Self {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let anchor = format!(
+            "th_test_anchor_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match new_session_with_env(&anchor, "/tmp", None, &[]) {
+                Ok(()) => return Self { _lock: lock, anchor },
+                Err(error) if error.message == "server exited unexpectedly" => {
+                    match session_liveness(&anchor) {
+                        SessionLiveness::Alive => return Self { _lock: lock, anchor },
+                        SessionLiveness::Gone if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        liveness => panic!(
+                            "tmux test anchor could not start after server teardown ({liveness:?}): {error}"
+                        ),
+                    }
+                }
+                Err(error) => panic!("tmux test anchor could not start: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLifecycleGuard {
+    fn drop(&mut self) {
+        let _ = kill_session(&self.anchor);
+    }
+}
+
 /// tmux per-window scrollback cap for NEW sessions. The default 2000 is why you
 /// couldn't scroll up far. `history-limit` is per-window and FIXED at window
 /// creation, so we set it GLOBALLY (`-g`) before `new-session` — new terminals keep
@@ -2951,64 +2999,19 @@ mod tests {
         format!("th_test_{ts}")
     }
 
-    /// Keep the shared test tmux server alive for a case that needs several
-    /// independent probes or session operations. The initial anchor creation
-    /// retries across another case removing the server's final session.
-    struct TmuxTestServerAnchor {
-        name: String,
-    }
-
-    impl TmuxTestServerAnchor {
-        fn acquire() -> Self {
-            let name = unique_name();
-            let _ = kill_session(&name);
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                match new_session_with_env(&name, "/tmp", None, &[]) {
-                    Ok(()) => return Self { name },
-                    Err(error) if error.message == "server exited unexpectedly" => {
-                        match session_liveness(&name) {
-                            SessionLiveness::Alive => return Self { name },
-                            SessionLiveness::Gone if std::time::Instant::now() < deadline => {
-                                std::thread::sleep(Duration::from_millis(10));
-                            }
-                            liveness => panic!(
-                                "tmux test anchor could not start after server teardown ({liveness:?}): {error}"
-                            ),
-                        }
-                    }
-                    Err(error) => panic!("tmux test anchor could not start: {error}"),
-                }
-            }
-        }
-    }
-
-    impl Drop for TmuxTestServerAnchor {
-        fn drop(&mut self) {
-            let _ = kill_session(&self.name);
-        }
-    }
-
     struct TestSession {
         name: String,
-        _lifecycle_lock: std::sync::MutexGuard<'static, ()>,
-        _server_anchor: TmuxTestServerAnchor,
+        _lifecycle: TestLifecycleGuard,
     }
 
     impl TestSession {
         fn new() -> Self {
-            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-            let lifecycle_lock = LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let server_anchor = TmuxTestServerAnchor::acquire();
+            let lifecycle = TestLifecycleGuard::acquire();
             let name = unique_name();
             let _ = kill_session(&name);
             Self {
                 name,
-                _lifecycle_lock: lifecycle_lock,
-                _server_anchor: server_anchor,
+                _lifecycle: lifecycle,
             }
         }
     }
@@ -3751,7 +3754,7 @@ while True:
             );
             return;
         }
-        let _server_anchor = TmuxTestServerAnchor::acquire();
+        let _lifecycle = TestLifecycleGuard::acquire();
         // Reads the window-size option's current mode ("latest" / "manual") off a
         // live session. `show-options -w -t <name> window-size` prints
         // `window-size <mode>`; we return just the mode token.
