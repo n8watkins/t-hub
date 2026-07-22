@@ -46547,6 +46547,99 @@ int main(int argc, char **argv) {
                 std::thread::sleep(Duration::from_millis(20));
             };
             assert_eq!(observed.executable, script_expected.executable);
+
+            let foreign_script_dir = fixture_dir.join("node-provider-foreign-child");
+            std::fs::create_dir_all(&foreign_script_dir).unwrap();
+            let foreign_script = foreign_script_dir.join("codex");
+            let foreign_marker = foreign_script_dir.join("wrapper-ready");
+            let child_marker = foreign_script_dir.join("child-start");
+            let foreign_source = format!(
+                "#!/usr/bin/env node\nconst fs = require('fs');\nconst {{ spawn }} = require('child_process');\nfs.writeFileSync({}, 'ready');\nspawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});\nsetInterval(() => {{}}, 1000);\n",
+                serde_json::to_string(&foreign_marker).unwrap(),
+                serde_json::to_string(&executable).unwrap(),
+                serde_json::to_string(&child_marker).unwrap(),
+                serde_json::to_string(&fake).unwrap(),
+            );
+            std::fs::write(&foreign_script, foreign_source).unwrap();
+            let mut permissions = std::fs::metadata(&foreign_script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&foreign_script, permissions).unwrap();
+            let foreign_script_command = foreign_script.display().to_string();
+            let foreign_script_expected =
+                crate::harness::resolve_expected_harness_launch_provenance(
+                    &foreign_script_command,
+                    Harness::Codex,
+                )
+                .unwrap();
+            let pane = crate::commands::pane_command(None, Some(&foreign_script_command));
+            let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let foreign_target = tmux_target(&terminal_id);
+            let launch = tmux::prepare_managed_runtime_launch().unwrap();
+            let foreign_owner = tmux::new_prepared_managed_session_with_env(
+                &foreign_target,
+                fixture_dir.to_str().unwrap(),
+                pane.as_deref(),
+                &[(crate::identity::SESSION_TOKEN_ENV.into(), token.clone())],
+                &launch,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !foreign_marker.exists() {
+                assert!(Instant::now() < deadline, "Node wrapper did not start");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            loop {
+                match crate::harness::observe_scoped_harness_process(
+                    &foreign_target,
+                    Harness::Codex,
+                    &foreign_script_expected,
+                    &identity_id,
+                    &token,
+                    &foreign_owner.cgroup_path,
+                    foreign_owner.tmux.pane_start_ticks,
+                ) {
+                    Err(crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => {
+                        break
+                    }
+                    Err(_) => {}
+                    Ok(observed) => panic!(
+                        "foreign same-provider child beneath Node wrapper was trusted: {observed:?}"
+                    ),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "foreign Node child never reached a stable rejected state"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let effect = tmux::observe_session_effect_identity(&foreign_target).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            let foreground_exe =
+                std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
+            let fake_exe = std::fs::metadata(&fake).unwrap();
+            assert_eq!(foreground_exe.dev(), fake_exe.dev());
+            assert_eq!(foreground_exe.ino(), fake_exe.ino());
+            let environment =
+                std::fs::read(format!("/proc/{}/environ", effect.foreground_pid)).unwrap();
+            assert!(environment.split(|byte| *byte == 0).any(|entry| {
+                entry == format!("{}={token}", crate::identity::SESSION_TOKEN_ENV).as_bytes()
+            }));
+            let stat =
+                std::fs::read_to_string(format!("/proc/{}/stat", effect.foreground_pid)).unwrap();
+            let parent_pid = stat
+                .rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let wrapper_exe = std::fs::metadata(format!("/proc/{parent_pid}/exe")).unwrap();
+            assert_eq!(wrapper_exe.dev(), foreign_script_expected.executable.device);
+            assert_eq!(wrapper_exe.ino(), foreign_script_expected.executable.inode);
+            tmux::retire_managed_runtime(&foreign_target, &foreign_owner).unwrap();
+
             let replacement = script_dir.join("replacement");
             std::fs::write(
                 &replacement,
@@ -46619,6 +46712,154 @@ int main(int argc, char **argv) {
         std::fs::remove_dir_all(expected_dir).unwrap();
         std::fs::remove_dir_all(foreign_dir).unwrap();
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_node_launch_rejects_foreign_same_provider_foreground_child() {
+        if tmux::managed_runtime_preflight().is_err()
+            || !std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let Some((fixture_dir, executable)) = compile_scoped_attestation_harness() else {
+            eprintln!("prepared Node launch provenance: cc is unavailable - skipping");
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-node-child-provider-provenance").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4259".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = fixture_dir.join("home");
+        let script_dir = fixture_dir.join("node-provider");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let fake = script_dir.join("foreign-codex");
+        std::fs::copy(&executable, &fake).unwrap();
+        let script = script_dir.join("codex");
+        let child_marker = script_dir.join("child-start");
+        let source = format!(
+            "#!/usr/bin/env node\nconst {{ spawn }} = require('child_process');\nspawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});\nsetInterval(() => {{}}, 1000);\n",
+            serde_json::to_string(&executable).unwrap(),
+            serde_json::to_string(&child_marker).unwrap(),
+            serde_json::to_string(&fake).unwrap(),
+        );
+        std::fs::write(&script, source).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let operation_id = "cortana-node-child-provider-operation";
+        let terminal_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let identity = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        ctx.identity.bind_tile(&identity.id, &terminal_id).unwrap();
+        ctx.captains.begin_cortana_recovery(operation_id).unwrap();
+        let command = script.display().to_string();
+        let expected =
+            crate::harness::resolve_expected_harness_launch_provenance(&command, Harness::Codex)
+                .unwrap();
+        let launch = tmux::prepare_managed_runtime_launch().unwrap();
+        ctx.captains
+            .prepare_cortana_managed_launch(
+                operation_id,
+                &terminal_id,
+                &identity.id,
+                1,
+                "codex",
+                &launch,
+                expected.clone(),
+            )
+            .unwrap();
+        let spawn_args = json!({
+            "cwd": home,
+            "name": "Cortana",
+            "startupCommand": command,
+            "tabId": CAPTAIN_WORKSPACE_ID,
+        });
+        let mut elevation = elevation_env(&ctx, &spawn_args);
+        elevation.push((
+            crate::identity::SESSION_TOKEN_ENV.to_string(),
+            identity.secret.clone(),
+        ));
+        elevation.push((CORTANA_GENERATION_ENV.to_string(), "1".into()));
+        elevation.push((
+            PROVIDER_SESSION_ENV.to_string(),
+            pending_provider_marker("codex"),
+        ));
+        let pane = crate::commands::pane_command(None, Some(&command));
+        let (_, target, owner) = spawn_managed_tmux_terminal_with_id(
+            &terminal_id,
+            home.to_str().unwrap(),
+            pane.as_deref(),
+            &elevation,
+            &launch,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match crate::harness::observe_scoped_harness_process(
+                &target,
+                Harness::Codex,
+                &expected,
+                &identity.id,
+                &identity.secret,
+                &owner.cgroup_path,
+                owner.tmux.pane_start_ticks,
+            ) {
+                Err(crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => break,
+                Err(_) => {}
+                Ok(observed) => {
+                    panic!("Node foreign child was trusted before WAL recovery: {observed:?}")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Node foreign child never became the rejected foreground provider"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let error = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": operation_id,
+                "testOrchestratorHome": home,
+                "testStartupCommand": command,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("prepared launch provenance"), "{error}");
+        let durable = ctx.captains.cortana_identity();
+        assert!(durable
+            .managed_launch
+            .as_ref()
+            .is_some_and(|launch| launch.harness_process.is_none()));
+        assert!(!matches!(
+            durable.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+
+        tmux::retire_managed_runtime(&target, &owner).unwrap();
+        std::fs::remove_dir_all(fixture_dir).unwrap();
     }
 
     #[cfg(unix)]

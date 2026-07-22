@@ -1122,12 +1122,9 @@ pub fn observe_scoped_harness_process(
         }
     }
     let harness_index = harness_index.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?;
-    if expected_launch.kind == "direct"
-        && details[..harness_index].iter().any(|process| {
-            process_provider(&process.argv)
-                .is_some_and(|(provider, _)| provider == expected_provider)
-        })
-    {
+    if details[..harness_index].iter().any(|process| {
+        process_provider(&process.argv).is_some_and(|(provider, _)| provider == expected_provider)
+    }) {
         return Err(LaunchAttestationError::ExpectedProvenanceMismatch);
     }
     let process = &details[harness_index];
