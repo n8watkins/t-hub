@@ -1,6 +1,7 @@
 //! Bounded, deterministic Preview target discovery.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -498,7 +499,8 @@ fn accept_config_target(
         return Err("configured Preview target label must contain 1 to 200 bytes".into());
     }
     let relative_root = normalize_relative(&relative_root)?;
-    let target_root = open_relative_directory(root, Path::new(&relative_root))?;
+    let target_root = open_relative_directory(root, Path::new(&relative_root))
+        .map_err(|error| error.to_string())?;
     let kind = match kind {
         ConfiguredTargetKind::PackageScript {
             package_manager,
@@ -672,27 +674,84 @@ fn open_root(root: &Path) -> Result<CapDir, String> {
     Ok(CapDir::from_std_file(file.into_std()))
 }
 
-fn open_relative_directory(root: &CapDir, relative: &Path) -> Result<CapDir, String> {
+#[derive(Debug)]
+enum RelativeDirectoryError {
+    Io {
+        operation: &'static str,
+        relative: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidPath,
+    ReparsePoint(PathBuf),
+}
+
+impl RelativeDirectoryError {
+    fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io { source, .. } => Some(source.kind()),
+            Self::InvalidPath | Self::ReparsePoint(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for RelativeDirectoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io {
+                operation,
+                relative,
+                source,
+            } => write!(
+                formatter,
+                "{operation} Preview directory {}: {source}",
+                relative.display()
+            ),
+            Self::InvalidPath => {
+                formatter.write_str("Preview paths must be canonical-root-relative")
+            }
+            Self::ReparsePoint(relative) => write!(
+                formatter,
+                "Preview path contains a reparse point: {}",
+                relative.display()
+            ),
+        }
+    }
+}
+
+fn open_relative_directory(
+    root: &CapDir,
+    relative: &Path,
+) -> Result<CapDir, RelativeDirectoryError> {
     let mut directory = root
         .try_clone()
-        .map_err(|error| format!("clone Preview root handle: {error}"))?;
+        .map_err(|source| RelativeDirectoryError::Io {
+            operation: "clone",
+            relative: relative.to_path_buf(),
+            source,
+        })?;
     for component in relative.components() {
         let name = match component {
             Component::Normal(name) => name,
             Component::CurDir => continue,
-            _ => return Err("Preview paths must be canonical-root-relative".into()),
+            _ => return Err(RelativeDirectoryError::InvalidPath),
         };
-        directory = directory
-            .open_dir_nofollow(name)
-            .map_err(|error| format!("open Preview directory {}: {error}", relative.display()))?;
-        let metadata = directory.dir_metadata().map_err(|error| {
-            format!("inspect Preview directory {}: {error}", relative.display())
-        })?;
+        directory =
+            directory
+                .open_dir_nofollow(name)
+                .map_err(|source| RelativeDirectoryError::Io {
+                    operation: "open",
+                    relative: relative.to_path_buf(),
+                    source,
+                })?;
+        let metadata = directory
+            .dir_metadata()
+            .map_err(|source| RelativeDirectoryError::Io {
+                operation: "inspect",
+                relative: relative.to_path_buf(),
+                source,
+            })?;
         if cap_metadata_has_reparse_point(&metadata) {
-            return Err(format!(
-                "Preview path contains a reparse point: {}",
-                relative.display()
-            ));
+            return Err(RelativeDirectoryError::ReparsePoint(relative.to_path_buf()));
         }
     }
     Ok(directory)
@@ -703,18 +762,30 @@ fn read_relative_optional(
     relative: &Path,
     fingerprint: &mut Sha256,
 ) -> Result<Option<Vec<u8>>, String> {
+    read_relative_optional_with(root, relative, fingerprint, open_relative_directory)
+}
+
+fn read_relative_optional_with<F>(
+    root: &CapDir,
+    relative: &Path,
+    fingerprint: &mut Sha256,
+    open_parent: F,
+) -> Result<Option<Vec<u8>>, String>
+where
+    F: FnOnce(&CapDir, &Path) -> Result<CapDir, RelativeDirectoryError>,
+{
     let display = relative.to_string_lossy().replace('\\', "/");
     let Some(name) = relative.file_name() else {
         return Err("Preview file path must include a file name".into());
     };
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    let directory = match open_relative_directory(root, parent) {
+    let directory = match open_parent(root, parent) {
         Ok(directory) => directory,
-        Err(error) if error.contains("No such file") => {
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
             fingerprint_missing(&display, fingerprint);
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.to_string()),
     };
     read_in_directory_optional(&directory, name.as_ref(), &display, fingerprint)
 }
@@ -786,7 +857,8 @@ fn fingerprint_relative_file(
         return Err("configured static Preview entrypoint must be a file".into());
     };
     let directory =
-        open_relative_directory(root, relative.parent().unwrap_or_else(|| Path::new("")))?;
+        open_relative_directory(root, relative.parent().unwrap_or_else(|| Path::new("")))
+            .map_err(|error| error.to_string())?;
     let file = directory
         .open_with(name, &nofollow_options(false))
         .map_err(|error| format!("open configured static Preview entrypoint {display}: {error}"))?;
@@ -906,6 +978,66 @@ mod tests {
             .label
             .is_char_boundary(result.targets[0].label.len()));
         assert!(validate_pattern(&"x".repeat(MAX_PATTERN_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn optional_parent_not_found_is_portable_and_other_errors_fail_closed() {
+        let root = fixture("optional-parent-errors");
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let root_handle = open_root(&canonical_root).unwrap();
+        let relative = Path::new(".t-hub/preview.json");
+
+        let mut fingerprint = Sha256::new();
+        let missing = read_relative_optional_with(
+            &root_handle,
+            relative,
+            &mut fingerprint,
+            |_root, parent| {
+                Err(RelativeDirectoryError::Io {
+                    operation: "open",
+                    relative: parent.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "The system cannot find the file specified.",
+                    ),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(missing, None);
+        let mut expected = Sha256::new();
+        fingerprint_missing(".t-hub/preview.json", &mut expected);
+        assert_eq!(fingerprint.finalize(), expected.finalize());
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let mut fingerprint = Sha256::new();
+            let error = read_relative_optional_with(
+                &root_handle,
+                relative,
+                &mut fingerprint,
+                |_root, parent| {
+                    Err(RelativeDirectoryError::Io {
+                        operation: "open",
+                        relative: parent.to_path_buf(),
+                        source: std::io::Error::new(kind, "injected failure"),
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("open Preview directory .t-hub"));
+        }
+
+        let mut fingerprint = Sha256::new();
+        assert!(read_relative_optional_with(
+            &root_handle,
+            relative,
+            &mut fingerprint,
+            |_root, _parent| Err(RelativeDirectoryError::InvalidPath),
+        )
+        .is_err());
     }
 
     #[test]
