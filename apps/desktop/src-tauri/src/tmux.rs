@@ -708,9 +708,12 @@ pub(crate) fn new_prepared_managed_session_with_env(
             Ok(owner) => return Ok(owner),
             Err(error) => last_error = Some(error),
         }
+        if session_liveness(name) == SessionLiveness::Gone {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let unit_cleanup = stop_managed_unit(&launch.tools, unit_name);
+    let unit_cleanup = retire_prepared_managed_runtime(launch);
     let session_cleanup = kill_session(name);
     let mut error = last_error.unwrap_or(TmuxError {
         op: "new-managed-session",
@@ -727,43 +730,6 @@ pub(crate) fn new_prepared_managed_session_with_env(
         error.message = format!("{}; exact tmux cleanup failed: {cleanup}", error.message);
     }
     Err(error)
-}
-
-fn stop_managed_unit(tools: &ManagedSystemTools, unit_name: &str) -> Result<(), TmuxError> {
-    revalidate_managed_system_tools(tools)?;
-    #[cfg(windows)]
-    let mut command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new(trusted_wsl_path()?);
-        command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg(&tools.systemctl.path);
-        command.creation_flags(0x0800_0000);
-        command
-    };
-    #[cfg(unix)]
-    let mut command = Command::new(&tools.systemctl.path);
-    command.args(["--user", "stop", unit_name]);
-    #[cfg(windows)]
-    command.args(["--user", "stop", unit_name]);
-    let output =
-        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
-            .map_err(|error| TmuxError {
-                op: "stop-managed-unit",
-                code: None,
-                message: format!("failed to stop unpublished managed unit: {error}"),
-            })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(TmuxError {
-            op: "stop-managed-unit",
-            code: output.status.code(),
-            message: "unpublished managed unit could not be stopped".into(),
-        })
-    }
 }
 
 /// Test-only: pin a window to a deterministic geometry. `resize-window` flips
@@ -1748,7 +1714,9 @@ if mode == "retire-prepared" and len(sys.argv) == 3:
     props = systemd_properties(tools["systemctl"]["path"], unit)
     directory_path = "/sys/fs/cgroup" + path
     if props["ActiveState"] != "active":
-        if (props["Id"] == unit and props["InvocationID"] == "" and
+        if (props["Id"] == unit and
+            (props["InvocationID"] == "" or
+             re.fullmatch(r"[0-9a-f]{32}", props["InvocationID"])) and
             props["ControlGroup"] in ("", path) and not os.path.exists(directory_path)):
             raise SystemExit(0)
         refuse(120)
@@ -1915,32 +1883,6 @@ fn managed_runtime_preflight_with_tools(tools: &ManagedSystemTools) -> Result<()
             op: "managed-runtime-preflight",
             code: output.status.code(),
             message: "user systemd with delegated cgroup-v2 freeze and kill is unavailable".into(),
-        })
-    }
-}
-
-fn revalidate_managed_system_tools(tools: &ManagedSystemTools) -> Result<(), TmuxError> {
-    let mut command = managed_cgroup_effect_command(&tools.python)?;
-    let encoded = serde_json::to_string(tools).map_err(|_| TmuxError {
-        op: "managed-runtime-tools",
-        code: None,
-        message: "managed system helper identity could not be encoded".into(),
-    })?;
-    command.args(["validate-tools", &encoded]);
-    let output =
-        output_with_timeout_and_limit(command, tmux_cmd_timeout(), MANAGED_HELPER_OUTPUT_LIMIT)
-            .map_err(|error| TmuxError {
-                op: "managed-runtime-tools",
-                code: None,
-                message: format!("managed system helper revalidation failed: {error}"),
-            })?;
-    if output.status.success() && output.stderr.is_empty() {
-        Ok(())
-    } else {
-        Err(TmuxError {
-            op: "managed-runtime-tools",
-            code: output.status.code(),
-            message: "managed system helper identity changed".into(),
         })
     }
 }
@@ -3203,6 +3145,44 @@ while True:
         assert!(std::path::Path::new(&format!("/proc/{sibling_pid}")).exists());
         let _ = sibling.kill();
         let _ = sibling.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpublished_managed_cleanup_converges_when_exact_unit_is_absent() {
+        if managed_runtime_preflight().is_err() {
+            return;
+        }
+        let launch = prepare_managed_runtime_launch().unwrap();
+
+        retire_prepared_managed_runtime(&launch).unwrap();
+        retire_prepared_managed_runtime(&launch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_managed_publication_converges_after_runtime_exits() {
+        if !tmux_available() || managed_runtime_preflight().is_err() {
+            return;
+        }
+        let session = TestSession::new();
+        let launch = prepare_managed_runtime_launch().unwrap();
+
+        let error = new_prepared_managed_session_with_env(
+            &session.name,
+            "/tmp",
+            Some("exit 0"),
+            &[],
+            &launch,
+        )
+        .unwrap_err();
+
+        assert!(
+            !error.message.contains("prepared cleanup failed"),
+            "{error}"
+        );
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Gone);
+        retire_prepared_managed_runtime(&launch).unwrap();
     }
 
     #[cfg(unix)]
