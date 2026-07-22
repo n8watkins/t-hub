@@ -128,15 +128,25 @@ impl<R: PreviewRuntime> PreviewService<R> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
-        let discovery = self.discovery.discover(root)?;
-        let target_ref = match requested {
-            Some(target_ref) if target_ref.scope == *scope => target_ref.clone(),
-            Some(_) => return Err("Preview target reference belongs to another scope".into()),
-            None => self.selected_ref(scope, &discovery)?,
-        };
-        if let Some(replayed) = self.replay(request_id, PreviewOperation::Start, &target_ref)? {
+        if requested.is_some_and(|target_ref| target_ref.scope != *scope) {
+            return Err("Preview target reference belongs to another scope".into());
+        }
+        if let Some(replayed) = self.replay_optional(
+            request_id,
+            PreviewOperation::Start,
+            scope,
+            requested.map(|target_ref| &target_ref.target_id),
+        )? {
             return Ok(replayed);
         }
+        if cancellation.is_cancelled() {
+            return Err("Preview start was cancelled before spawning".into());
+        }
+        let discovery = self.discovery.discover(root)?;
+        let target_ref = match requested {
+            Some(target_ref) => target_ref.clone(),
+            None => self.selected_ref(scope, &discovery)?,
+        };
         let target = resolve_target(&discovery, &target_ref)?.clone();
         let run_id = Uuid::new_v4().to_string();
         self.prepare_intent(
@@ -275,6 +285,14 @@ impl<R: PreviewRuntime> PreviewService<R> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(replayed) =
+            self.replay_optional(request_id, PreviewOperation::Restart, scope, None)?
+        {
+            return Ok(replayed);
+        }
+        if cancellation.is_cancelled() {
+            return Err("Preview restart was cancelled before spawning".into());
+        }
         let discovery = self.discovery.discover(root)?;
         let target_ref = match self
             .active
@@ -286,9 +304,6 @@ impl<R: PreviewRuntime> PreviewService<R> {
             Some(target_ref) => target_ref,
             None => self.selected_ref(scope, &discovery)?,
         };
-        if let Some(replayed) = self.replay(request_id, PreviewOperation::Restart, &target_ref)? {
-            return Ok(replayed);
-        }
         let target = resolve_target(&discovery, &target_ref)?.clone();
         let run_id = Uuid::new_v4().to_string();
         self.prepare_intent(
@@ -339,16 +354,9 @@ impl<R: PreviewRuntime> PreviewService<R> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(replayed) = self.replay_optional(
-            request_id,
-            PreviewOperation::Refresh,
-            scope,
-            self.active
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(&scope.key())
-                .map(|run| &run.process.target.target_id),
-        )? {
+        if let Some(replayed) =
+            self.replay_optional(request_id, PreviewOperation::Refresh, scope, None)?
+        {
             return Ok(replayed);
         }
         self.prepare_optional_intent(request_id, PreviewOperation::Refresh, scope, None, None)?;
@@ -378,7 +386,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .cloned();
         let target_id = active.as_ref().map(|run| &run.process.target.target_id);
         if let Some(replayed) =
-            self.replay_optional(request_id, PreviewOperation::Open, scope, target_id)?
+            self.replay_optional(request_id, PreviewOperation::Open, scope, None)?
         {
             return Ok(replayed);
         }
@@ -1098,6 +1106,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.outcome, PreviewOperationOutcome::Applied);
         assert_eq!(first.status.state, PreviewState::Running);
+        fs::write(fixture.root.join("package.json"), "not json").unwrap();
         let replayed = fixture
             .service
             .start(
@@ -1109,6 +1118,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replayed.outcome, PreviewOperationOutcome::Unchanged);
+        fs::write(
+            fixture.root.join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
         let same_target = fixture
             .service
             .start(
@@ -1121,6 +1135,25 @@ mod tests {
             .unwrap();
         assert_eq!(same_target.outcome, PreviewOperationOutcome::Unchanged);
         assert_eq!(fixture.runtime.spawn_count(), 1);
+    }
+
+    #[test]
+    fn cancellation_before_start_has_no_process_or_intent_effect() {
+        let fixture = fixture("cancelled");
+        let cancellation = ProbeCancellation::default();
+        cancellation.cancel();
+        assert!(fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                None,
+                "cancelled-start",
+                &cancellation,
+            )
+            .is_err());
+        assert_eq!(fixture.runtime.spawn_count(), 0);
+        assert!(fixture.profiles.intent("cancelled-start").is_none());
     }
 
     #[test]

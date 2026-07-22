@@ -14,8 +14,12 @@ use super::model::{
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_DEPTH: usize = 8;
+const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_VISITED_DIRECTORIES: usize = 4096;
 const MAX_TARGETS: usize = 256;
+const MAX_WORKSPACE_PATTERNS: usize = 256;
+const MAX_PATTERN_BYTES: usize = 512;
+const MAX_LABEL_BYTES: usize = 200;
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const PACKAGE_SCRIPTS: [&str; 3] = ["dev", "preview", "start"];
 const LOCK_FILES: [&str; 5] = [
@@ -92,6 +96,9 @@ pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
     }
     workspace_patterns.sort();
     workspace_patterns.dedup();
+    if workspace_patterns.len() > MAX_WORKSPACE_PATTERNS {
+        return Err("Preview workspace discovery exceeds its pattern bound".into());
+    }
 
     let mut manifest_roots = vec![(canonical_root.clone(), PreviewTargetSource::Root)];
     if !workspace_patterns.is_empty() {
@@ -253,6 +260,7 @@ fn pnpm_workspace_patterns(bytes: &[u8]) -> Result<Vec<String>, String> {
 fn validate_pattern(value: &str) -> Result<String, String> {
     let normalized = value.trim().replace('\\', "/");
     if normalized.is_empty()
+        || normalized.len() > MAX_PATTERN_BYTES
         || normalized.starts_with('/')
         || normalized.starts_with('!')
         || normalized.split('/').any(|part| part == "..")
@@ -272,10 +280,21 @@ fn bounded_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
         if depth >= MAX_DEPTH {
             continue;
         }
-        let mut children = fs::read_dir(&directory)
+        let mut children = Vec::new();
+        for entry in fs::read_dir(&directory)
             .map_err(|error| format!("read directory {}: {error}", directory.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read directory {}: {error}", directory.display()))?;
+        {
+            if children.len() >= MAX_DIRECTORY_ENTRIES {
+                return Err(format!(
+                    "Preview workspace discovery exceeded the entry bound in {}",
+                    directory.display()
+                ));
+            }
+            children.push(
+                entry
+                    .map_err(|error| format!("read directory {}: {error}", directory.display()))?,
+            );
+        }
         children.sort_by_key(|entry| entry.file_name());
         for child in children.into_iter().rev() {
             let name = child.file_name();
@@ -449,6 +468,7 @@ fn accept_config_target(
     }
     let relative_root = normalize_relative(&relative_root)?;
     let target_root = confined_canonical(root, &root.join(&relative_root))?;
+    let relative_root = relative_slash(root, &target_root)?;
     let kind = match kind {
         ConfiguredTargetKind::PackageScript {
             package_manager,
@@ -476,7 +496,9 @@ fn accept_config_target(
                 return Err("configured static Preview entrypoint must be a file".into());
             }
             fingerprint_metadata(root, &entry, fingerprint)?;
-            PreviewTargetKind::StaticSite { entrypoint }
+            PreviewTargetKind::StaticSite {
+                entrypoint: relative_slash(&target_root, &entry)?,
+            }
         }
     };
     Ok(PreviewTarget {
@@ -545,7 +567,18 @@ fn target_label(name: Option<&str>, relative_root: &str, script: &str) -> String
             } else {
                 relative_root
             });
-    format!("{owner}: {script}")
+    bounded_text(&format!("{owner}: {script}"), MAX_LABEL_BYTES)
+}
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn normalize_relative(value: &str) -> Result<String, String> {
@@ -729,6 +762,23 @@ mod tests {
         let second = discover(&root).unwrap();
         assert_ne!(first.discovery_fingerprint, second.discovery_fingerprint);
         assert_ne!(first.targets, second.targets);
+    }
+
+    #[test]
+    fn generated_labels_and_workspace_patterns_are_bounded() {
+        let root = fixture("bounds");
+        let long_name = "船".repeat(300);
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"{long_name}","scripts":{{"dev":"vite"}}}}"#),
+        )
+        .unwrap();
+        let result = discover(&root).unwrap();
+        assert!(result.targets[0].label.len() <= MAX_LABEL_BYTES);
+        assert!(result.targets[0]
+            .label
+            .is_char_boundary(result.targets[0].label.len()));
+        assert!(validate_pattern(&"x".repeat(MAX_PATTERN_BYTES + 1)).is_err());
     }
 
     #[test]

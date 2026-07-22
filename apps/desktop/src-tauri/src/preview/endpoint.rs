@@ -186,7 +186,14 @@ impl<I: EndpointInspector> EndpointResolver<I> {
         let mut candidates = vec![advertised_url.clone()];
         if let Some(host) = mapped_host {
             if valid_derived_host(host) {
-                let mapped = format!("http://{host}:{}{}", hint.port, hint.path_and_query);
+                let mapped_host = host
+                    .parse::<IpAddr>()
+                    .map(|address| match address {
+                        IpAddr::V4(_) => address.to_string(),
+                        IpAddr::V6(_) => format!("[{address}]"),
+                    })
+                    .unwrap_or_else(|_| host.to_string());
+                let mapped = format!("http://{mapped_host}:{}{}", hint.port, hint.path_and_query);
                 if mapped != advertised_url {
                     candidates.push(mapped);
                 }
@@ -305,9 +312,15 @@ fn valid_derived_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<IpAddr>()
-        .map(|address| !address.is_unspecified() && !address.is_multicast())
-        .unwrap_or(false)
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            address.is_loopback() || address.is_private() || address.is_link_local()
+        }
+        Ok(IpAddr::V6(address)) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +554,8 @@ mod tests {
     #[test]
     fn wsl_mapping_cache_keys_ttl_to_distro_boot_and_interfaces() {
         let cache = WslHostMappingCache::default();
+        assert!(!valid_derived_host("8.8.8.8"));
+        assert!(valid_derived_host("172.30.1.2"));
         let snapshot = WslNetworkSnapshot {
             distribution: "Ubuntu".into(),
             boot_id: "boot-1".into(),

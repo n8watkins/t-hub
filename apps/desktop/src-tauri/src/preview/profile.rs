@@ -152,6 +152,7 @@ impl PreviewProfileStore {
             if existing.scope != intent.scope
                 || existing.operation != intent.operation
                 || existing.target_id != intent.target_id
+                || existing.run_id != intent.run_id
             {
                 return Err("request id is already bound to a different Preview operation".into());
             }
@@ -441,6 +442,9 @@ mod tests {
         let mut conflict = first;
         conflict.operation = PreviewOperation::Stop;
         assert!(store.record_intent(conflict).is_err());
+        let mut conflicting_run = prepared("same-request");
+        conflicting_run.run_id = Some("run-2".into());
+        assert!(store.record_intent(conflicting_run).is_err());
         assert_eq!(store.snapshot().idempotency_journal.len(), 1);
     }
 
