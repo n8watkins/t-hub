@@ -414,6 +414,12 @@ fn validate_intent(intent: &PreviewIntent) -> Result<(), String> {
             return Err("requested stop run id belongs to a non-stop operation".into());
         }
         validate_bounded_text(run_id, "requested Preview stop run id", 160, false)?;
+        let expected = intent.expected_stop_run.as_ref().ok_or_else(|| {
+            "requested Preview stop run has no durable process identity".to_string()
+        })?;
+        if expected.run_id != run_id {
+            return Err("requested Preview stop run does not match the durable identity".into());
+        }
     }
     if let Some(managed_run) = &intent.managed_run {
         managed_run.validate()?;
@@ -803,6 +809,28 @@ mod tests {
         profiles.idempotency_journal.push_back(intent);
         fs::write(&invalid_fingerprint, serde_json::to_vec(&profiles).unwrap()).unwrap();
         assert!(PreviewProfileStore::open(&invalid_fingerprint).is_err());
+
+        let invalid_stop = temp_path("invalid-stop-predicate");
+        let mut intent = prepared("invalid-stop-predicate");
+        intent.operation = PreviewOperation::Stop;
+        intent.requested_stop_run_id = Some("run-1".into());
+        intent.expected_stop_run = Some(ManagedRunIdentity {
+            run_id: "run-1".into(),
+            process_group_id: 10,
+            process_group_started_at: 20,
+        });
+        intent.expected_stop_target = Some(PreviewTargetRef {
+            scope: intent.scope.clone(),
+            target_id: intent.target_id.clone().unwrap(),
+            discovery_fingerprint: intent.discovery_fingerprint.clone().unwrap(),
+        });
+        let mut profiles = PreviewProfilesV1::default();
+        profiles.idempotency_journal.push_back(intent);
+        let mut value = serde_json::to_value(profiles).unwrap();
+        value["idempotencyJournal"][0]["requestedStopRunId"] =
+            serde_json::Value::String("stale-run".into());
+        fs::write(&invalid_stop, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(PreviewProfileStore::open(&invalid_stop).is_err());
     }
 
     #[test]

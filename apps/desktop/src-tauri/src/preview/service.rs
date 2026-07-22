@@ -187,6 +187,11 @@ impl<R: PreviewRuntime> PreviewService<R> {
         request_id: &str,
     ) -> Result<PreviewOperationResult, String> {
         validate_request_id(request_id)?;
+        if let Some(expected_run_id) = expected_run_id {
+            if expected_run_id.is_empty() || expected_run_id.len() > 160 {
+                return Err("expected Preview run id must contain 1 to 160 bytes".into());
+            }
+        }
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
         let active = self
@@ -204,6 +209,30 @@ impl<R: PreviewRuntime> PreviewService<R> {
             expected_run_id,
         )? {
             return Ok(replayed);
+        }
+        if expected_run_id.is_some_and(|expected| {
+            active
+                .as_ref()
+                .is_none_or(|active| expected != active.process.identity.run_id)
+        }) {
+            let status = active.as_ref().map_or_else(
+                || PreviewStatus::stopped(scope.clone(), self.runtime.now_ms()),
+                |active| {
+                    status_from_active(
+                        scope,
+                        active,
+                        PreviewState::Stale,
+                        Some("requested run was replaced".into()),
+                        self.runtime.now_ms(),
+                    )
+                },
+            );
+            return Ok(result(
+                PreviewOperation::Stop,
+                PreviewOperationOutcome::Unchanged,
+                request_id,
+                status,
+            ));
         }
         self.prepare_optional_intent(
             request_id,
@@ -226,22 +255,6 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 status,
             ));
         };
-        if expected_run_id.is_some_and(|expected| expected != active.process.identity.run_id) {
-            let status = status_from_active(
-                scope,
-                &active,
-                PreviewState::Stale,
-                Some("requested run was replaced".into()),
-                self.runtime.now_ms(),
-            );
-            self.commit_intent(request_id, status.clone())?;
-            return Ok(result(
-                PreviewOperation::Stop,
-                PreviewOperationOutcome::Unchanged,
-                request_id,
-                status,
-            ));
-        }
         match self.runtime.observe(&active.process)? {
             RuntimeObservation::OwnershipLost => {
                 let status = status_from_active(
@@ -385,6 +398,9 @@ impl<R: PreviewRuntime> PreviewService<R> {
         {
             return Ok(replayed);
         }
+        if cancellation.is_cancelled() {
+            return Err("Preview refresh was cancelled before observation".into());
+        }
         self.prepare_optional_intent(
             request_id,
             PreviewOperation::Refresh,
@@ -473,7 +489,11 @@ impl<R: PreviewRuntime> PreviewService<R> {
                             .or(profile.selected_target.as_ref())
                             .cloned()
                     })
-                    .is_some_and(|selected| Some(selected.target_id) == intent.target_id);
+                    .is_some_and(|selected| {
+                        Some(selected.target_id) == intent.target_id
+                            && Some(selected.discovery_fingerprint.as_str())
+                                == intent.discovery_fingerprint.as_deref()
+                    });
                 if selected_matches {
                     let status =
                         self.status_locked(&intent.scope, &ProbeCancellation::default())?;
@@ -531,10 +551,33 @@ impl<R: PreviewRuntime> PreviewService<R> {
         &self,
         intent: &PreviewIntent,
     ) -> Result<Option<PreviewStatus>, String> {
-        if intent.operation == PreviewOperation::Stop && intent.expected_stop_run.is_none() {
-            let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
-            self.commit_intent(&intent.request_id, status.clone())?;
-            return Ok(Some(status));
+        if intent.operation == PreviewOperation::Stop {
+            match (
+                intent.requested_stop_run_id.as_deref(),
+                intent.expected_stop_run.as_ref(),
+            ) {
+                (Some(requested), Some(expected)) if requested != expected.run_id => {
+                    self.block_intent(
+                        &intent.request_id,
+                        "requested stop run does not match the durable process identity",
+                    )?;
+                    return Ok(None);
+                }
+                (Some(_), None) => {
+                    self.block_intent(
+                        &intent.request_id,
+                        "requested stop run has no durable process identity",
+                    )?;
+                    return Ok(None);
+                }
+                (_, None) => {
+                    let status =
+                        PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+                    self.commit_intent(&intent.request_id, status.clone())?;
+                    return Ok(Some(status));
+                }
+                (None, Some(_)) | (Some(_), Some(_)) => {}
+            }
         }
         let target = match intent_target_ref(intent) {
             Ok(target) => target,
@@ -1556,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_before_start_has_no_process_or_intent_effect() {
+    fn cancellation_precedes_start_and_refresh_intent_authority() {
         let fixture = fixture("cancelled");
         let cancellation = ProbeCancellation::default();
         cancellation.cancel();
@@ -1572,6 +1615,12 @@ mod tests {
             .is_err());
         assert_eq!(fixture.runtime.spawn_count(), 0);
         assert!(fixture.profiles.intent("cancelled-start").is_none());
+
+        assert!(fixture
+            .service
+            .refresh(&fixture.scope, "cancelled-refresh", &cancellation)
+            .is_err());
+        assert!(fixture.profiles.intent("cancelled-refresh").is_none());
     }
 
     #[test]
@@ -1713,9 +1762,102 @@ mod tests {
         assert_eq!(stale.outcome, PreviewOperationOutcome::Unchanged);
         assert_eq!(stale.status.state, PreviewState::Stale);
         assert_eq!(fixture.runtime.stop_count(), 1);
+        assert!(fixture.profiles.intent("stale-stop").is_none());
         assert_eq!(
             fixture.service.status(&fixture.scope).unwrap().run_id,
             Some(replacement)
+        );
+    }
+
+    #[test]
+    fn stale_expected_stop_has_no_durable_effect_across_fresh_service_recovery() {
+        let fixture = fixture("stale-stop-crash-boundary");
+        let first = fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                None,
+                "crash-first-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        let first_run = first.status.run_id.unwrap();
+        let replacement = fixture
+            .service
+            .restart(
+                &fixture.root,
+                &fixture.scope,
+                "crash-replacement",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        let replacement_run = replacement.status.run_id.unwrap();
+        let stops_before_stale_request = fixture.runtime.stop_count();
+
+        let stale = fixture
+            .service
+            .stop(&fixture.scope, Some(&first_run), "crash-stale-stop")
+            .unwrap();
+        assert_eq!(stale.status.state, PreviewState::Stale);
+        assert!(fixture.profiles.intent("crash-stale-stop").is_none());
+
+        let restarted_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let restarted_runtime = fixture.runtime.restart_facade();
+        let restarted =
+            PreviewService::new(restarted_runtime.clone(), Arc::clone(&restarted_profiles));
+        assert!(restarted.recover_incomplete().unwrap().is_empty());
+        assert_eq!(fixture.runtime.stop_count(), stops_before_stale_request);
+        let rediscovered = restarted_runtime
+            .rediscover(&fixture.scope, &fixture.target_ref, &replacement_run, None)
+            .unwrap();
+        let RuntimeRediscovery::Exact(process) = rediscovered else {
+            panic!("replacement process was not preserved across restart");
+        };
+        assert!(matches!(
+            restarted_runtime.observe(&process).unwrap(),
+            RuntimeObservation::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn select_recovery_requires_matching_target_and_fingerprint() {
+        let fixture = fixture("select-fingerprint-recovery");
+        let mismatched_fingerprint = format!("sha256:{}", "f".repeat(64));
+        fixture
+            .profiles
+            .record_intent(PreviewIntent {
+                request_id: "crashed-select-fingerprint".into(),
+                scope: fixture.scope.clone(),
+                operation: PreviewOperation::Select,
+                target_id: Some(fixture.target_ref.target_id.clone()),
+                discovery_fingerprint: Some(mismatched_fingerprint),
+                run_id: None,
+                requested_stop_run_id: None,
+                managed_run: None,
+                expected_stop_run: None,
+                expected_stop_target: None,
+                phase: PreviewIntentPhase::Prepared,
+                observed_status: None,
+                detail: None,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+
+        let restarted_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let restarted = PreviewService::new(
+            fixture.runtime.restart_facade(),
+            Arc::clone(&restarted_profiles),
+        );
+        assert!(restarted.recover_incomplete().unwrap().is_empty());
+        assert_eq!(
+            restarted_profiles
+                .intent("crashed-select-fingerprint")
+                .unwrap()
+                .phase,
+            PreviewIntentPhase::RecoveryBlocked
         );
     }
 
