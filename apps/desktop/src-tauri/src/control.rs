@@ -44729,6 +44729,7 @@ mod tests {
             &json!({
                 "operationId": "cortana-no-spawn-rate-1",
                 "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
             }),
         )
         .unwrap();
