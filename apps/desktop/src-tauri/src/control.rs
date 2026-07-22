@@ -19384,11 +19384,17 @@ fn exact_observed_cortana_candidate<'a>(
         })
 }
 
-fn observe_cortana_harness_process(
+fn cortana_harness_attestation_scope<'a>(
     ctx: &ControlContext,
-    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
-    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
-) -> Result<crate::harness::HarnessProcessIdentity, String> {
+    launch: &'a crate::cortana_reconcile::CortanaManagedLaunchIntent,
+) -> Result<
+    (
+        Harness,
+        &'a crate::harness::ExpectedHarnessLaunchProvenance,
+        String,
+    ),
+    String,
+> {
     let identity = ctx.identity.get(&launch.identity_id).ok_or_else(|| {
         format!(
             "reconcile_cortana: managed launch identity '{}' is unavailable or revoked",
@@ -19412,18 +19418,101 @@ fn observe_cortana_harness_process(
         .expected_harness_launch_provenance
         .as_ref()
         .ok_or("reconcile_cortana: managed launch has no expected Harness provenance")?;
+    Ok((harness, expected, identity.secret))
+}
+
+fn observe_cortana_harness_process(
+    ctx: &ControlContext,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
+) -> Result<crate::harness::HarnessProcessIdentity, String> {
+    let (harness, expected, secret) = cortana_harness_attestation_scope(ctx, launch)?;
     crate::harness::observe_scoped_harness_process(
         &launch.tmux_target,
         harness,
         expected,
         &launch.identity_id,
-        &identity.secret,
+        &secret,
         &owner.cgroup_path,
         owner.tmux.pane_start_ticks,
     )
     .map_err(|error| {
         format!("reconcile_cortana: managed Harness process attestation failed: {error}")
     })
+}
+
+/// Require a newly observed Harness process generation to remain identical
+/// across a bounded startup window before its identity can enter the durable
+/// managed-launch WAL. Script providers can briefly expose their trusted runtime
+/// entry before replacing it with a native provider child. Retrying an allowed
+/// transition lets that legitimate topology settle, while any foreign foreground
+/// process fails immediately through the ordinary scoped attestation.
+fn observe_stable_cortana_harness_process(
+    ctx: &ControlContext,
+    launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
+    owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
+) -> Result<crate::harness::HarnessProcessIdentity, String> {
+    const CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
+    const REQUIRED_CONFIRMATIONS: usize = 2;
+    const MAX_OBSERVATIONS: usize = 12;
+
+    let (harness, expected, secret) = cortana_harness_attestation_scope(ctx, launch)?;
+    let observe = || {
+        crate::harness::observe_scoped_harness_process(
+            &launch.tmux_target,
+            harness,
+            expected,
+            &launch.identity_id,
+            &secret,
+            &owner.cgroup_path,
+            owner.tmux.pane_start_ticks,
+        )
+    };
+    let retryable = |error| {
+        matches!(
+            error,
+            crate::harness::LaunchAttestationError::UnreadableEvidence
+                | crate::harness::LaunchAttestationError::StaleEvidence
+                | crate::harness::LaunchAttestationError::WrapperObscured
+                | crate::harness::LaunchAttestationError::ProcessChanged
+                | crate::harness::LaunchAttestationError::AncestryChanged
+                | crate::harness::LaunchAttestationError::HarnessMissing
+        )
+    };
+    let mut baseline = None;
+    let mut confirmations = 0;
+    for _ in 0..MAX_OBSERVATIONS {
+        match observe() {
+            Ok(observed) => {
+                #[cfg(test)]
+                ctx.captains
+                    .pause_dispatch("cortana_harness_stability_observed");
+                if baseline.as_ref() == Some(&observed) {
+                    confirmations += 1;
+                    if confirmations == REQUIRED_CONFIRMATIONS {
+                        return Ok(observed);
+                    }
+                } else {
+                    baseline = Some(observed);
+                    confirmations = 0;
+                }
+            }
+            Err(error) if retryable(error) => {
+                baseline = None;
+                confirmations = 0;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "reconcile_cortana: managed Harness process attestation failed: {error}"
+                ));
+            }
+        }
+        std::thread::sleep(CONFIRM_INTERVAL);
+    }
+    Err(
+        "reconcile_cortana: managed Harness process did not reach a stable startup generation"
+            .into(),
+    )
 }
 
 fn cortana_startup_command(
@@ -19477,7 +19566,7 @@ fn attest_cortana_managed_harness(
         })?;
     let mut current = durable.clone();
     if launch.harness_process.is_none() {
-        let observed = observe_cortana_harness_process(ctx, launch, owner)?;
+        let observed = observe_stable_cortana_harness_process(ctx, launch, owner)?;
         current = ctx.captains.record_cortana_harness_process(
             &launch.operation_id,
             &launch.terminal_id,
@@ -31849,8 +31938,15 @@ static void wait_marker(const char *path) {
     while (access(path, F_OK) != 0) usleep(10000);
 }
 
+static void write_marker(const char *path) {
+    FILE *marker = fopen(path, "w");
+    if (marker == NULL) _exit(17);
+    if (fputs("ready", marker) < 0 || fclose(marker) != 0) _exit(18);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "changed") == 0) {
+        if (argc >= 3) write_marker(argv[2]);
         for (;;) sleep(1);
     }
     if (argc < 3) return 2;
@@ -31861,7 +31957,7 @@ int main(int argc, char **argv) {
     const char *marker = argv[2];
     if (strcmp(mode, "foreign-first") == 0) {
         if (argc < 4) return 15;
-        execl(argv[3], "codex", "changed", (char *)0);
+        execl(argv[3], "codex", "changed", marker, (char *)0);
         return 16;
     }
     wait_marker(marker);
@@ -47048,8 +47144,9 @@ int main(int argc, char **argv) {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let mut ctx = test_ctx("cortana-node-child-provider-provenance").with_apply_sink(sink);
-        ctx.addr = "127.0.0.1:4259".into();
+        let mut context = test_ctx("cortana-node-child-provider-provenance").with_apply_sink(sink);
+        context.addr = "127.0.0.1:4259".into();
+        let ctx = Arc::new(context);
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
             name: CAPTAIN_WORKSPACE_NAME.into(),
@@ -47067,9 +47164,13 @@ int main(int argc, char **argv) {
         std::fs::copy(&executable, &trusted_native).unwrap();
         let fake = script_dir.join("foreign-codex");
         std::fs::copy(&executable, &fake).unwrap();
+        let wrapper_marker = script_dir.join("wrapper-start");
+        let spawn_gate = script_dir.join("spawn-foreign-child");
         let child_marker = script_dir.join("child-start");
         let source = format!(
-            "#!/usr/bin/env node\nconst {{ spawn }} = require('child_process');\nspawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});\nsetInterval(() => {{}}, 1000);\n",
+            "#!/usr/bin/env node\nconst fs = require('fs');\nconst {{ spawn }} = require('child_process');\nfs.writeFileSync({}, 'ready');\nconst timer = setInterval(() => {{\n  if (!fs.existsSync({})) return;\n  clearInterval(timer);\n  spawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});\n}}, 10);\n",
+            serde_json::to_string(&wrapper_marker).unwrap(),
+            serde_json::to_string(&spawn_gate).unwrap(),
             serde_json::to_string(&executable).unwrap(),
             serde_json::to_string(&child_marker).unwrap(),
             serde_json::to_string(&fake).unwrap(),
@@ -47129,7 +47230,14 @@ int main(int argc, char **argv) {
             &launch,
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEST_ASYNC_FIXTURE_TIMEOUT;
+        while !wrapper_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "trusted Node wrapper did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         loop {
             match crate::harness::observe_scoped_harness_process(
                 &target,
@@ -47140,29 +47248,107 @@ int main(int argc, char **argv) {
                 &owner.cgroup_path,
                 owner.tmux.pane_start_ticks,
             ) {
-                Err(crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => break,
-                Err(_) => {}
                 Ok(observed) => {
-                    panic!("Node foreign child was trusted before WAL recovery: {observed:?}")
+                    assert_eq!(observed.executable, expected.executable);
+                    break;
+                }
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "trusted Node wrapper never became observable"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
+        }
+
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "cortana_harness_stability_observed",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let worker_ctx = Arc::clone(&ctx);
+        let worker_home = home.clone();
+        let worker_command = command.clone();
+        let worker = std::thread::spawn(move || {
+            dispatch(
+                &worker_ctx,
+                "reconcile_cortana",
+                &json!({
+                    "operationId": operation_id,
+                    "testOrchestratorHome": worker_home,
+                    "testStartupCommand": worker_command,
+                }),
+            )
+        });
+        let reached = reached_rx.recv_timeout(TEST_ASYNC_FIXTURE_TIMEOUT);
+        if reached.is_err() && worker.is_finished() {
+            panic!(
+                "Cortana exited before its startup-stability boundary: {:?}",
+                worker.join().unwrap()
+            );
+        }
+        assert_eq!(
+            reached.expect("Cortana did not reach its startup-stability boundary"),
+            "cortana_harness_stability_observed"
+        );
+        let initially_observed = ctx.captains.cortana_identity();
+        assert!(initially_observed
+            .managed_launch
+            .as_ref()
+            .is_some_and(|launch| launch.harness_process.is_none()));
+        assert!(!matches!(
+            initially_observed.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+        ));
+        assert!(!ctx
+            .captains
+            .snapshot()
+            .captains
+            .iter()
+            .any(|captain| captain.role == FleetRole::Cortana));
+
+        std::fs::write(&spawn_gate, "go").unwrap();
+        while !child_marker.exists() {
             assert!(
                 Instant::now() < deadline,
-                "Node foreign child never became the rejected foreground provider"
+                "foreign provider child did not start"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        use std::os::unix::fs::MetadataExt;
+        let fake_exe = std::fs::metadata(&fake).unwrap();
+        loop {
+            let effect = tmux::observe_session_effect_identity(&target).unwrap();
+            let foreground_exe =
+                std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
+            if foreground_exe.dev() == fake_exe.dev() && foreground_exe.ino() == fake_exe.ino() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreign provider child never became the foreground generation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            crate::harness::observe_scoped_harness_process(
+                &target,
+                Harness::Codex,
+                &expected,
+                &identity.id,
+                &identity.secret,
+                &owner.cgroup_path,
+                owner.tmux.pane_start_ticks,
+            )
+            .unwrap_err(),
+            crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch
+        );
 
-        let error = dispatch(
-            &ctx,
-            "reconcile_cortana",
-            &json!({
-                "operationId": operation_id,
-                "testOrchestratorHome": home,
-                "testStartupCommand": command,
-            }),
-        )
-        .unwrap_err();
+        resume_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
         assert!(!error.trim().is_empty());
         let durable = ctx.captains.cortana_identity();
         assert!(durable
