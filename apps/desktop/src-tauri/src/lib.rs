@@ -281,10 +281,31 @@ fn start_control_listener(
     // isolation). For loopback the MCP/client rediscover it from the handshake file
     // each launch, so persistence is invisible there; it matters only once M2b binds
     // a network interface and a remote client knows the key out-of-band.
-    let token = std::env::var("T_HUB_CONTROL_TOKEN")
+    let legacy_orphan_bearer_may_be_live = captains_registry
+        .cortana_identity()
+        .legacy_orphan_provenance
+        .is_some();
+    let explicit_token = std::env::var("T_HUB_CONTROL_TOKEN")
         .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(control::persistent_key);
+        .filter(|token| !token.is_empty());
+    let explicit_token =
+        match explicit_control_token_for_start(legacy_orphan_bearer_may_be_live, explicit_token) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("t-hub: control listener refused: {error}");
+                return None;
+            }
+        };
+    let token = match explicit_token {
+        Some(token) => token,
+        None => match control::persistent_key_for_start(legacy_orphan_bearer_may_be_live) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("t-hub: control listener refused before publication: {error}");
+                return None;
+            }
+        },
+    };
 
     // socket-gate Phase 2: a distinct, persistent READ capability token minted
     // alongside the control token. Published in control.json as `read_token`; grants
@@ -376,6 +397,16 @@ fn start_control_listener(
             None
         }
     }
+}
+
+fn explicit_control_token_for_start(
+    legacy_orphan_bearer_may_be_live: bool,
+    explicit_token: Option<String>,
+) -> Result<Option<String>, &'static str> {
+    if legacy_orphan_bearer_may_be_live && explicit_token.is_some() {
+        return Err("pending legacy Cortana quarantine cannot rotate an explicit control token");
+    }
+    Ok(explicit_token)
 }
 
 /// Return every environment default that separates a development runtime from
@@ -1005,4 +1036,22 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");
+}
+
+#[cfg(test)]
+mod control_start_tests {
+    use super::explicit_control_token_for_start;
+
+    #[test]
+    fn pending_legacy_quarantine_refuses_an_unrotatable_explicit_control_token() {
+        assert_eq!(
+            explicit_control_token_for_start(true, Some("fixed-token".into())),
+            Err("pending legacy Cortana quarantine cannot rotate an explicit control token")
+        );
+        assert_eq!(
+            explicit_control_token_for_start(false, Some("fixed-token".into())).unwrap(),
+            Some("fixed-token".into())
+        );
+        assert_eq!(explicit_control_token_for_start(true, None).unwrap(), None);
+    }
 }

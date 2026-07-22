@@ -1,0 +1,61 @@
+{
+  "capture": {
+    "source": "dev-build-f1795df-20260722T130042Z/install-live-20260722T131337Z",
+    "control": {
+      "legacyAddress": "127.0.0.1:51330",
+      "currentAddress": "127.0.0.1:59091",
+      "sharedPersistentToken": "<redacted:shared-persistent-control-token>"
+    },
+    "runtime": {
+      "terminalId": "f9891ff2",
+      "generation": 1,
+      "harness": "codex",
+      "sessionToken": "<redacted:unresolved-session-token>",
+      "panePid": 1640392,
+      "paneStartTicks": 11377235,
+      "tmuxSessionCreated": 1784583029,
+      "cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-tmux.slice/tmux-spawn-d88c8ad8-aa02-4689-b63c-da98adced954.scope"
+    }
+  },
+  "captainsSnapshot": {
+    "schemaVersion": 25,
+    "seq": 2209,
+    "captains": [],
+    "workspaces": [
+      {
+        "id": "captains-reserved",
+        "name": "Captain Workspace",
+        "kind": "captain",
+        "tileIds": []
+      }
+    ],
+    "cortana": {
+      "identityId": "cb6723e104c345f9801722c6cc336e05",
+      "generation": 1,
+      "terminalId": null,
+      "harness": "codex",
+      "providerSessionId": null,
+      "conversationId": null,
+      "checkpoint": null,
+      "legacyOrphanProvenance": {
+        "version": 1,
+        "sourceSchemaVersion": 18,
+        "identityId": "cb6723e104c345f9801722c6cc336e05",
+        "terminalId": "f9891ff2",
+        "generation": 1,
+        "harness": "codex",
+        "healthyOperationId": "1db524f5-36c9-47ee-a775-10beaf497e57"
+      },
+      "recovery": {
+        "kind": "degraded",
+        "operation_id": "f71641d0-8ce6-4be0-8b95-0c5bc0b914e4",
+        "reason": "live runtime 'f9891ff2' in Cortana's reserved scope lacks authoritative identity, generation, or control evidence",
+        "detected_at": 1784726694845
+      }
+    }
+  },
+  "identitiesSnapshot": {
+    "identities": {},
+    "revoked": []
+  }
+}

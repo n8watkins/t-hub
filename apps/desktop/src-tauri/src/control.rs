@@ -10066,6 +10066,98 @@ pub fn persistent_key() -> String {
     load_or_rotate_key(&key_path())
 }
 
+fn write_key_file_durable_with(
+    path: &Path,
+    key: &str,
+    before_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "control key path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create control key directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+    let temporary = path.with_extension(format!(
+        "key.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("could not create rotated control key: {error}"))?;
+        file.write_all(crate::secret_seal::seal_str(key).as_bytes())
+            .map_err(|error| format!("could not write rotated control key: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!("could not restrict rotated control key permissions: {error}")
+                })?;
+        }
+        file.sync_all()
+            .map_err(|error| format!("could not sync rotated control key: {error}"))?;
+        before_publish()?;
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("could not publish rotated control key: {error}"))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("could not sync control key directory: {error}"))?;
+        let stored = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not verify rotated control key: {error}"))?;
+        if crate::secret_seal::unseal_str(&stored).as_deref() != Some(key) {
+            return Err("rotated control key verification failed".into());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&temporary).ok();
+    }
+    result
+}
+
+fn write_key_file_durable(path: &Path, key: &str) -> Result<(), String> {
+    write_key_file_durable_with(path, key, || Ok(()))
+}
+
+fn persistent_key_for_start_with(
+    path: &Path,
+    force: bool,
+    max_age_secs: u64,
+    legacy_orphan_bearer_may_be_live: bool,
+) -> Result<String, String> {
+    if legacy_orphan_bearer_may_be_live {
+        let key = uuid::Uuid::new_v4().to_string();
+        write_key_file_durable(path, &key)?;
+        return Ok(key);
+    }
+    Ok(load_or_rotate_key_with(path, force, max_age_secs))
+}
+
+/// Resolve the full control key before listener publication.
+///
+/// A validated legacy Cortana orphan can still hold the persistent full-control
+/// bearer from the previous listener generation. Rotate before publishing the new
+/// listener so reconciliation can prove that the retained endpoint is stale and
+/// quarantine its exact generation without leaving the old process authorized.
+pub fn persistent_key_for_start(legacy_orphan_bearer_may_be_live: bool) -> Result<String, String> {
+    persistent_key_for_start_with(
+        &key_path(),
+        force_key_rotation(),
+        key_max_age_secs(),
+        legacy_orphan_bearer_may_be_live,
+    )
+}
+
 /// Resolve the persistent **read**-key file: `$T_HUB_SERVER_READ_KEY_FILE` if set,
 /// else `~/.t-hub/server-read-key`. Mirrors [`key_path`] so dev-isolation can point
 /// it elsewhere; kept separate from the control key so the two secrets never share
@@ -19420,6 +19512,10 @@ fn reconcile_cortana_inner(
         let effect_identity = orphan
             .effect_identity
             .expect("exact legacy quarantine requires a tmux generation");
+        ctx.identity.revoke(&identity_id)?;
+        if ctx.identity.get(&identity_id).is_some() || !ctx.identity.is_revoked(&identity_id) {
+            return Err("reconcile_cortana: legacy orphan identity revocation is ambiguous".into());
+        }
         durable = ctx.captains.quarantine_legacy_cortana(
             operation_id,
             &orphan.terminal_id,
@@ -34846,6 +34942,8 @@ mod tests {
     const SCHEMA_13_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-13.json");
     const SCHEMA_17_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-17.json");
     const SCHEMA_18_REGISTRY_FIXTURE: &str = include_str!("fixtures/captains-schema-18.json");
+    const PACKAGED_SCHEMA_25_LEGACY_ORPHAN_FIXTURE: &str =
+        include_str!("fixtures/captains-schema-25-packaged-legacy-orphan.json");
 
     /// A crew ref's tile ids, for concise assertions.
     fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
@@ -43690,6 +43788,220 @@ mod tests {
         std::fs::remove_file(identity_path).ok();
     }
 
+    #[test]
+    fn captured_packaged_schema25_orphan_rotates_then_quarantines_without_signal() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "captured_packaged_schema25_orphan_rotates_then_quarantines_without_signal: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let fixture: Value =
+            serde_json::from_str(PACKAGED_SCHEMA_25_LEGACY_ORPHAN_FIXTURE).unwrap();
+        let registry_path = captains_tmp("captured-packaged-schema25-orphan");
+        let identity_path = captains_tmp("captured-packaged-schema25-identities");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&fixture["captainsSnapshot"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&fixture["identitiesSnapshot"]).unwrap(),
+        )
+        .unwrap();
+        let captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let terminal_id = fixture["capture"]["runtime"]["terminalId"]
+            .as_str()
+            .unwrap();
+        let legacy_addr = fixture["capture"]["control"]["legacyAddress"]
+            .as_str()
+            .unwrap();
+        let current_addr = fixture["capture"]["control"]["currentAddress"]
+            .as_str()
+            .unwrap();
+        let shared_token = fixture["capture"]["control"]["sharedPersistentToken"]
+            .as_str()
+            .unwrap();
+        let session_token = fixture["capture"]["runtime"]["sessionToken"]
+            .as_str()
+            .unwrap();
+        let legacy_identity = captains.cortana_identity().identity_id.clone().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-captured-packaged-orphan-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let target = exact_cortana_tmux_target(terminal_id).unwrap();
+        create_test_tmux_session_with_env(
+            &target,
+            home.to_str().unwrap(),
+            Some(&harness_command),
+            &[
+                (
+                    crate::identity::SESSION_TOKEN_ENV.into(),
+                    session_token.into(),
+                ),
+                ("T_HUB_CONTROL_ADDR".into(), legacy_addr.into()),
+                ("T_HUB_CONTROL_TOKEN".into(), shared_token.into()),
+                (CORTANA_GENERATION_ENV.into(), "1".into()),
+            ],
+        )
+        .unwrap();
+        wait_for_harness_started(terminal_id, "codex").unwrap();
+
+        let build_ctx = |token: &str| {
+            let mut ctx = test_ctx(token)
+                .with_captains_registry(captains.clone())
+                .with_identity_store(identities.clone())
+                .with_apply_sink(Arc::new(RecordingSink {
+                    calls: StdMutex::new(Vec::new()),
+                }));
+            ctx.addr = current_addr.into();
+            ctx.tab_registry().replace(vec![TabRecord {
+                id: CAPTAIN_WORKSPACE_ID.into(),
+                name: CAPTAIN_WORKSPACE_NAME.into(),
+                tile_ids: vec![terminal_id.into()],
+            }]);
+            ctx
+        };
+        let same_bearer = build_ctx(shared_token);
+        let reproduced = dispatch(
+            &same_bearer,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "captured-packaged-before-rotation",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(reproduced["action"], "degraded");
+        assert_eq!(
+            reproduced["degradedReason"],
+            format!(
+                "live runtime '{terminal_id}' in Cortana's reserved scope lacks authoritative identity, generation, or control evidence"
+            )
+        );
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        assert!(!identities.is_revoked(&legacy_identity));
+
+        let key_dir = std::env::temp_dir().join(format!(
+            "t-hub-captured-packaged-key-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("server-key");
+        write_key_file(&key_path, shared_token);
+        let rotated_token = persistent_key_for_start_with(&key_path, false, 3600, true).unwrap();
+        assert_ne!(rotated_token, shared_token);
+
+        let restarted = build_ctx(&rotated_token);
+        assert_eq!(resolve_capability(&restarted, shared_token), None);
+        assert_eq!(
+            resolve_capability(&restarted, &rotated_token),
+            Some(Capability::Full)
+        );
+        let denied = dispatch_authenticated(
+            &restarted,
+            ControlRequest {
+                token: shared_token.into(),
+                command: "close_terminal".into(),
+                args: json!({ "sessionId": terminal_id }),
+                session: session_token.into(),
+                host: String::new(),
+                v: Some(PROTOCOL_VERSION),
+            },
+        );
+        assert!(!denied.ok);
+        assert_eq!(
+            denied.error.as_deref(),
+            Some("unauthorized: bad control token")
+        );
+        let recovered = dispatch(
+            &restarted,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "captured-packaged-after-rotation",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "recover");
+        assert_eq!(recovered["healthy"], true);
+        assert_eq!(recovered["generation"], 2);
+        assert_eq!(
+            tmux::session_liveness(&target),
+            tmux::SessionLiveness::Alive
+        );
+        assert!(identities.is_revoked(&legacy_identity));
+        assert_eq!(
+            captains
+                .cortana_identity()
+                .legacy_quarantine
+                .as_ref()
+                .map(|quarantine| quarantine.terminal_id.as_str()),
+            Some(terminal_id)
+        );
+
+        let replacement = recovered["terminalId"].as_str().unwrap().to_string();
+        let replacement_target = exact_cortana_tmux_target(&replacement).unwrap();
+        assert_eq!(
+            tmux::session_environment(&replacement_target, "T_HUB_CONTROL_FILE").unwrap(),
+            Some(discovery_file_for_spawn())
+        );
+        assert_eq!(
+            tmux::session_environment(&replacement_target, "T_HUB_CONTROL_TOKEN").unwrap(),
+            Some(String::new())
+        );
+        let replacement_session_token =
+            tmux::session_environment(&replacement_target, crate::identity::SESSION_TOKEN_ENV)
+                .unwrap()
+                .expect("replacement has a per-session bearer");
+        let replacement_identity = identities
+            .resolve(&replacement_session_token)
+            .expect("replacement bearer resolves after control-key rotation");
+        assert_eq!(replacement_identity.role, crate::identity::Role::Cortana);
+        assert_eq!(
+            replacement_identity.session_tile.as_deref(),
+            Some(replacement.as_str())
+        );
+        assert_eq!(
+            captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| {
+                    captain.role == FleetRole::Cortana
+                        && captain.state == ClaimState::Active
+                        && captain.terminal_id.as_deref() == Some(replacement.as_str())
+                })
+                .count(),
+            1
+        );
+        dispatch(
+            &restarted,
+            "close_terminal",
+            &json!({ "sessionId": replacement }),
+        )
+        .unwrap();
+        reap_test_tmux_session_and_assert_absent(&target);
+        std::fs::remove_dir_all(key_dir).ok();
+        std::fs::remove_dir_all(harness_bin_dir).ok();
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_file(registry_path).ok();
+        std::fs::remove_file(identity_path).ok();
+    }
+
     fn legacy_orphan_durable(
         identity_id: &str,
         terminal_id: &str,
@@ -50664,6 +50976,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn packaged_legacy_orphan_forces_control_bearer_rotation_before_start() {
+        let fixture: Value =
+            serde_json::from_str(PACKAGED_SCHEMA_25_LEGACY_ORPHAN_FIXTURE).unwrap();
+        let snapshot: CaptainsSnapshot =
+            serde_json::from_value(fixture["captainsSnapshot"].clone()).unwrap();
+        CaptainsRegistry::validate_snapshot(&snapshot).unwrap();
+        assert!(snapshot.cortana.legacy_orphan_provenance.is_some());
+
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-packaged-orphan-keyrot-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-key");
+        let old = fixture["capture"]["control"]["sharedPersistentToken"]
+            .as_str()
+            .unwrap();
+        write_key_file(&path, old);
+
+        let kept = persistent_key_for_start_with(&path, false, 3600, false).unwrap();
+        assert_eq!(kept, old);
+        let rotated = persistent_key_for_start_with(&path, false, 3600, true).unwrap();
+        assert_ne!(rotated, old);
+        assert_eq!(
+            crate::secret_seal::unseal_str(&std::fs::read_to_string(&path).unwrap()).as_deref(),
+            Some(rotated.as_str())
+        );
+        let read = "profile-scoped-read-token";
+        let handshake = ControlHandshake {
+            addr: fixture["capture"]["control"]["currentAddress"]
+                .as_str()
+                .unwrap()
+                .into(),
+            token: select_published_token(&rotated, read, true).into(),
+            read_token: read.into(),
+            pid: 7,
+            protocol_version: PROTOCOL_VERSION,
+            instance_id: "captured-package-start".into(),
+            listener_generation: 1,
+            published_at: 1,
+            local_control_token: rotated.clone(),
+            local_host_token: "host-only".into(),
+        };
+        let published = serde_json::to_string(&handshake).unwrap();
+        assert_eq!(handshake.token, read);
+        assert_eq!(handshake.local_control_token, rotated);
+        assert!(!published.contains(old));
+        assert!(!published.contains(&rotated));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn legacy_bearer_rotation_failure_is_prepublication_and_preserves_old_key() {
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-packaged-orphan-key-failure-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-key");
+        let old = "old-profile-control-bearer";
+        write_key_file(&path, old);
+
+        let error = write_key_file_durable_with(&path, "unpublished-new-bearer", || {
+            Err("injected crash before key publication".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("injected crash before key publication"));
+        assert_eq!(
+            crate::secret_seal::unseal_str(&std::fs::read_to_string(&path).unwrap()).as_deref(),
+            Some(old)
+        );
+        assert_eq!(
+            std::fs::read_dir(&base)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "a refused rotation must not leave a publishable temporary key"
+        );
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
