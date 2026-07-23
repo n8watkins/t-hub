@@ -141,6 +141,7 @@ fn record_command(journal: &Journal, entity: &str, op: &str, err: Option<&anyhow
         seq: 0,
         timestamp_ms: host::now_ms(),
         source: JournalSource::Agent,
+        event_id: None,
         entity_id: Some(entity.to_string()),
         event_type: JournalEventType::AgentCommand,
         payload: serde_json::json!({ "op": op }),

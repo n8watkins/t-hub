@@ -1166,6 +1166,7 @@ mod tests {
             seq,
             timestamp_ms: seq,
             source: JournalSource::Hook,
+            event_id: None,
             entity_id: Some(session.to_string()),
             event_type: ev,
             payload,
@@ -1401,6 +1402,7 @@ mod tests {
                 seq,
                 timestamp_ms: seq,
                 source: JournalSource::Agent,
+                event_id: None,
                 entity_id: Some("thread-1".to_string()),
                 event_type: JournalEventType::PermissionRequest,
                 payload: serde_json::json!({
@@ -1553,6 +1555,7 @@ mod tests {
             seq,
             timestamp_ms: seq * 10,
             source: JournalSource::Agent,
+            event_id: None,
             entity_id: Some("thread-1".to_string()),
             event_type,
             payload,
@@ -1670,6 +1673,7 @@ mod tests {
             seq,
             timestamp_ms: seq * 10,
             source: JournalSource::Agent,
+            event_id: None,
             entity_id: Some("thread-1".to_string()),
             event_type,
             payload,
@@ -1788,6 +1792,7 @@ mod tests {
             seq: 1,
             timestamp_ms: 10,
             source: JournalSource::Agent,
+            event_id: None,
             entity_id: Some("codex-unobserved:th_crew0001".to_string()),
             event_type: JournalEventType::AgentCommand,
             payload: serde_json::json!({
@@ -1964,6 +1969,7 @@ mod tests {
             seq: 1,
             timestamp_ms: 100,
             source: JournalSource::Status,
+            event_id: None,
             entity_id: Some("o1".to_string()),
             event_type: JournalEventType::StatusSnapshot,
             payload: serde_json::json!({
@@ -2007,6 +2013,7 @@ mod tests {
             seq,
             timestamp_ms: ts,
             source: JournalSource::Status,
+            event_id: None,
             entity_id: Some("o1".to_string()),
             event_type: JournalEventType::StatusSnapshot,
             payload: serde_json::json!({
@@ -2104,6 +2111,7 @@ mod tests {
             seq: 1,
             timestamp_ms: 1,
             source: JournalSource::Hook,
+            event_id: None,
             entity_id: Some("sess-7".into()),
             event_type: JournalEventType::UserPromptSubmit,
             payload: serde_json::json!({

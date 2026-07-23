@@ -449,6 +449,10 @@ pub struct EventJournalEntry {
     pub timestamp_ms: u64,
     /// Who/what produced the entry.
     pub source: JournalSource,
+    /// Optional stable provider event identity used for cross-process and
+    /// restart-safe deduplication. Older journal entries omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
     /// The primary entity the entry concerns — usually a Claude `session_id`,
     /// a subagent `agent_id`, or a tmux session name. Free-form by design so the
     /// journal can carry events about entities the core models loosely.
@@ -812,6 +816,7 @@ mod tests {
             seq: 7,
             timestamp_ms: now_ms(),
             source: JournalSource::Hook,
+            event_id: Some("provider-event:v1:0123456789abcdef".into()),
             entity_id: Some("sess-123".into()),
             event_type: JournalEventType::SessionStart,
             payload: serde_json::json!({
@@ -831,11 +836,38 @@ mod tests {
             AgentToCore::Journal { seq, entry } => {
                 assert_eq!(seq, 7);
                 assert_eq!(entry.event_type, JournalEventType::SessionStart);
+                assert_eq!(
+                    entry.event_id.as_deref(),
+                    Some("provider-event:v1:0123456789abcdef")
+                );
                 assert_eq!(entry.entity_id.as_deref(), Some("sess-123"));
                 assert_eq!(entry.payload["cwd"], "/home/u/proj");
             }
             other => panic!("expected Journal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_journal_entry_without_event_id_remains_readable() {
+        let entry: EventJournalEntry = serde_json::from_str(
+            r#"{
+                "seq": 4,
+                "timestamp_ms": 9,
+                "source": "hook",
+                "entity_id": "legacy-session",
+                "event_type": "session_start",
+                "payload": {}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(entry.seq, 4);
+        assert_eq!(entry.event_id, None);
+
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !encoded.contains("event_id"),
+            "absent identities must preserve the legacy wire shape"
+        );
     }
 
     #[test]

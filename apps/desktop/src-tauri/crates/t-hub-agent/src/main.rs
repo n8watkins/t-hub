@@ -272,6 +272,7 @@ fn run_codex_unobserved(journal_dir: Option<&str>) -> anyhow::Result<()> {
         seq: 0,
         timestamp_ms: now_ms(),
         source: JournalSource::Agent,
+        event_id: None,
         entity_id: Some(format!(
             "codex-unobserved:{}:{}",
             provenance.session_id, provenance.pane_id

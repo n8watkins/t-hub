@@ -80,6 +80,8 @@ export interface EventJournalEntry {
   /** Unix-epoch ms the event was recorded (agent clock). */
   timestamp_ms: number;
   source: JournalSource;
+  /** Stable provider event identity when the provider supplied exact IDs. */
+  event_id?: string;
   /** Primary entity: usually a Claude session_id / subagent agent_id / tmux name. */
   entity_id?: string;
   event_type: JournalEventType;

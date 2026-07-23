@@ -371,6 +371,7 @@ mod tests {
             seq: 3,
             timestamp_ms: 1_000_000,
             source: JournalSource::Hook,
+            event_id: None,
             entity_id: Some("sess-abc".into()),
             event_type: JournalEventType::SessionStart,
             payload: serde_json::json!({"session_id": "sess-abc"}),

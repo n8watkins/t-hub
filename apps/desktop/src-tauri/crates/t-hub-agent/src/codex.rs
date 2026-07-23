@@ -436,6 +436,7 @@ fn base_entry(
         seq: 0,
         timestamp_ms,
         source: JournalSource::Agent,
+        event_id: None,
         entity_id: session_id,
         event_type,
         payload,
