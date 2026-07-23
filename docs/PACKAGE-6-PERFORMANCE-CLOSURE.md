@@ -288,7 +288,7 @@ The Package 6 runner must use the following stable process exit codes.
 
 | Exit code | Meaning |
 | ---: | --- |
-| `0` | Every required cell has three eligible passing repetitions, every schema and evidence check passes, and independent review approves the result |
+| `0` | Every required cell has three eligible passing repetitions and every runner-verifiable schema and evidence check passes |
 | `2` | Invalid invocation, unsupported flag, or malformed runner configuration |
 | `3` | The exact Package 5 artifact or a required benchmark environment dependency is unavailable |
 | `4` | An absolute budget, paired-regression budget, cleanup invariant, evidence requirement, or mandatory scenario assertion failed |

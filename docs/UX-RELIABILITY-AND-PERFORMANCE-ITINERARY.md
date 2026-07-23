@@ -47,8 +47,9 @@ There is no provider-neutral Preview control surface in the T-Hub control dispat
 Kokoro settings are enabled and both local text-to-speech health endpoints responded successfully during the audit.
 A real Kokoro request produced a valid WAV file, so synthesis is available.
 Package 4 source now installs and repairs supported Claude and Codex lifecycle hooks, normalizes both providers into the same durable event authority, and records redacted delivery outcomes.
-Permission and question announcements remain enabled through the legacy attention projection.
-Completion and failure announcements have independent settings and default off.
+Fresh or missing voice configuration defaults all four event policies off.
+An enabled legacy `announceOnAttention` value migrates permission and question to enabled.
+Completion and failure remain off during that migration.
 This source behavior and audible Windows playback remain packaged-unproven until Package 5 passes.
 
 The reported Appturnity folder `/home/natkins/appturnity/monorepo-app` exists, is populated, and is a valid Git main worktree.
@@ -258,8 +259,8 @@ This package changes persisted control-plane state and requires migration review
 
 Voice remains globally opt-in and the master `enabled` setting defaults to `false`.
 Permission, question, completion, and failure are four independent per-event settings.
-Permission and question preserve an enabled legacy `announceOnAttention` value through the compatibility projection.
-Completion and failure default to `false`.
+Fresh or missing configuration defaults all four per-event settings to `false`.
+An enabled legacy `announceOnAttention` value migrates permission and question to `true`, while completion and failure remain `false`.
 The legacy `announceOnAttention` field is also written as true when either permission or question is enabled.
 The legacy field does not enable completion or failure.
 Enabling one event kind must never enable another event kind.
@@ -402,8 +403,8 @@ The next package starts only after the previous commit, test evidence, independe
 
 There is no open voice-policy decision for this itinerary.
 Package 4 keeps four independent permission, question, completion, and failure settings.
-The master voice switch, completion, and failure default off.
-An enabled legacy attention value projects to enabled permission and question settings.
+Fresh or missing configuration defaults the master voice switch and all four event policies off.
+An enabled legacy attention value migrates permission and question to enabled, while completion and failure remain off.
 The legacy attention field otherwise remains only a compatibility projection of permission or question.
 Package 5 must verify all four event policies in both states against the packaged Windows application.
 
@@ -423,6 +424,7 @@ The reports are therefore treated as completed historical evidence, while this i
 The General reported that Kokoro was silent for Codex commands.
 Package 4 implemented provider-neutral permission, question, completion, and failure authority with durable replay and delivery outcomes.
 All four event kinds are independently configurable.
-Permission and question preserve an enabled legacy attention value, while completion and failure default off.
+Fresh or missing configuration defaults all four event kinds off.
+An enabled legacy attention value migrates permission and question to enabled, while completion and failure remain off.
 The legacy attention projection reflects permission or question and has no authority over completion or failure.
 Package 5 must prove that exact policy and audible delivery in the installed Windows application.

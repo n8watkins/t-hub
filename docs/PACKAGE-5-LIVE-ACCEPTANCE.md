@@ -273,17 +273,16 @@ Use disposable registered Projects for Vite, Next.js, static content, and a conf
 ## Package 4 Voice Matrix
 
 The packaged policy contract is exact.
-The master voice switch defaults off.
 Permission, question, completion, and failure are independent settings.
-An enabled legacy attention value projects to enabled permission and question settings.
-Completion and failure default off.
+Fresh or missing configuration defaults the master voice switch and all four event policies off.
+An enabled legacy attention value migrates permission and question to enabled, while completion and failure remain off.
 The legacy attention field is otherwise only a compatibility projection of permission or question.
 
 - Use Test Voice with Kokoro and verify a valid synthesis response reaches the selected Windows audio device.
 - Record cold and warm synthesis plus playback latency for Package 6.
 - Trigger equivalent Claude and Codex permission events and verify one announcement with equivalent wording and timing.
 - Trigger equivalent Claude and Codex question events and verify one announcement with equivalent wording and timing.
-- Verify completion and failure are silent at their defaults.
+- Verify fresh or missing configuration leaves permission, question, completion, and failure silent.
 - Verify the enabled legacy attention projection enables permission and question without enabling completion or failure.
 - Enable and disable each policy separately and verify exactly one matching announcement or silence for each provider and event.
 - Disable the master switch and each individual event policy and verify the corresponding cue remains silent.
