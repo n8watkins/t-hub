@@ -10,9 +10,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
-use std::process::Stdio;
-use std::process::{Child, ChildStdin, Command};
+#[cfg(any(windows, test))]
+use std::process::Command;
+use std::process::{Child, ChildStdin};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, LazyLock, Weak,
@@ -618,13 +618,6 @@ fn unc_to_posix(path: &str) -> Option<String> {
     crate::preview::managed_runner::unc_to_posix(path)
 }
 
-/// Supervise the complete package-manager process group behind a stdin
-/// lifeline. The package manager and validated script remain argv data after
-/// the fixed shell program. EOF from T-Hub triggers TERM, a bounded grace
-/// period, and KILL for the owned group. Natural child exit preserves its code.
-#[cfg(test)]
-const PROCESS_TREE_SCRIPT: &str = crate::preview::managed_runner::PROCESS_TREE_SCRIPT;
-
 /// Wrap the user's dev command so the server binds to ALL interfaces
 /// (`0.0.0.0`) rather than only the WSL loopback (`127.0.0.1`).
 ///
@@ -655,13 +648,12 @@ fn build_command(
     run_id: &str,
     package_manager: PackageManager,
     script: &str,
-) -> Command {
-    crate::preview::managed_runner::package_command_with_marker(
+) -> Result<crate::preview::managed_runner::PreparedPreviewCommand, String> {
+    crate::preview::managed_runner::package_command(
         Path::new(cwd),
         run_id,
         package_manager.executable(),
         script,
-        "t-hub-devserver",
     )
 }
 
@@ -1405,11 +1397,10 @@ pub async fn start_dev_server(
         );
         return Err(reason);
     };
-    let mut cmd = build_command(&cwd, &run_id, package_manager, script);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    let prepared = match build_command(&cwd, &run_id, package_manager, script) {
+        Ok(prepared) => prepared,
         Err(error) => {
-            let reason = format!("failed to start dev server: {error}");
+            let reason = format!("failed to prepare dev server supervisor: {error}");
             publish_start_failure(
                 &mut REGISTRY.lock(),
                 &terminal_id,
@@ -1421,12 +1412,28 @@ pub async fn start_dev_server(
             return Err(reason);
         }
     };
+    let supervised = match prepared.spawn_authenticated(std::time::Duration::from_secs(5)) {
+        Ok(supervised) => supervised,
+        Err(error) => {
+            let reason = format!("failed to authenticate dev server supervisor: {error}");
+            publish_start_failure(
+                &mut REGISTRY.lock(),
+                &terminal_id,
+                operation,
+                &run_id,
+                Some(selected),
+                &reason,
+            );
+            return Err(reason);
+        }
+    };
+    let child = supervised.child;
 
     // Take the piped handles BEFORE moving `child` into the registry. Each is
     // drained on its own thread so stdout and stderr can't deadlock each other.
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdin = supervised.stdin;
+    let stdout = supervised.stdout;
+    let stderr = supervised.stderr;
     let job = crate::engine_supervisor::platform::assign_kill_on_close_job(&child).ok();
 
     let mut pending_process = Some(DevProcess {
@@ -2409,29 +2416,23 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn build_command_keeps_script_as_one_argument() {
-        let command = build_command(
+        let prepared = build_command(
             "/tmp",
             "run-test",
             PackageManager::Pnpm,
             "odd; $(unsafe) ' name",
-        );
-        assert_eq!(command.get_program(), "bash");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [
-                "-c",
-                PROCESS_TREE_SCRIPT,
-                "t-hub-devserver",
-                "run-test",
-                "pnpm",
-                "run",
-                "odd; $(unsafe) ' name",
-            ]
-        );
-        assert!(PROCESS_TREE_SCRIPT.contains("TAURI_DEV_HOST=0.0.0.0"));
-        assert!(PROCESS_TREE_SCRIPT.contains("setsid \"$@\" 3<&- </dev/null &"));
-        assert!(PROCESS_TREE_SCRIPT.contains("kill -TERM -- -\"$SRV\""));
-        assert!(PROCESS_TREE_SCRIPT.contains("kill -KILL -- -\"$SRV\""));
+        )
+        .unwrap();
+        let command = prepared.command();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(command.get_program().to_string_lossy().starts_with('/'));
+        assert_eq!(arguments[0], "-c");
+        assert_eq!(arguments[1], crate::preview::supervisor::SUPERVISOR_PY);
+        assert_eq!(arguments[2], "run-test");
+        assert_eq!(arguments[4..], ["pnpm", "run", "odd; $(unsafe) ' name"]);
     }
 
     #[cfg(not(windows))]
@@ -2441,22 +2442,19 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-devserver")
-            .arg("tree-test")
-            .arg("sh")
-            .arg("-c")
-            .arg("trap '' TERM; sleep 30 & echo $!; wait")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn supervised fixture");
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take().expect("fixture stdout");
-        let mut stderr = child.stderr.take().expect("fixture stderr");
+        let supervised = crate::preview::managed_runner::prepare_supervised_preview_command(
+            Path::new("/tmp"),
+            "tree-test",
+            "sh",
+            &["-c", "trap '' TERM; sleep 30 & echo $!; wait"],
+        )
+        .unwrap()
+        .spawn_authenticated(Duration::from_secs(3))
+        .unwrap();
+        let child = supervised.child;
+        let stdin = supervised.stdin;
+        let stdout = supervised.stdout.expect("fixture stdout");
+        let mut stderr = supervised.stderr.expect("fixture stderr");
         let (pid_tx, pid_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut output = BufReader::new(stdout);
@@ -2497,21 +2495,18 @@ mod tests {
     fn natural_parent_exit_reaps_its_surviving_descendant() {
         use std::time::{Duration, Instant};
 
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-devserver")
-            .arg("early-exit-test")
-            .arg("sh")
-            .arg("-c")
-            .arg("sleep 30 & echo $!; exit 0")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn early-exit fixture");
-        let _stdin = child.stdin.take();
-        let mut output = BufReader::new(child.stdout.take().expect("fixture stdout"));
+        let supervised = crate::preview::managed_runner::prepare_supervised_preview_command(
+            Path::new("/tmp"),
+            "early-exit-test",
+            "sh",
+            &["-c", "sleep 30 & echo $!; exit 0"],
+        )
+        .unwrap()
+        .spawn_authenticated(Duration::from_secs(3))
+        .unwrap();
+        let mut child = supervised.child;
+        let _stdin = supervised.stdin;
+        let mut output = BufReader::new(supervised.stdout.expect("fixture stdout"));
         let mut first = String::new();
         output.read_line(&mut first).expect("read descendant pid");
         let descendant = first.trim().parse::<u32>().expect("numeric descendant pid");

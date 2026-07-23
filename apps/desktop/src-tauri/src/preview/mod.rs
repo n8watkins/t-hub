@@ -14,3 +14,4 @@ pub(crate) mod proc_listener;
 pub mod profile;
 pub mod runtime;
 pub mod service;
+pub(crate) mod supervisor;
