@@ -956,9 +956,9 @@ mod tests {
         inbox
             .enqueue(
                 "ship:ship-alpha",
-                "powder:test",
+                "ship:test",
                 crate::inbox::Priority::Standard,
-                "Powder event ready",
+                "Ship event ready",
                 true,
             )
             .unwrap();
@@ -967,7 +967,7 @@ mod tests {
 
         assert_eq!(
             rec.calls(),
-            vec![("capaaaaa".into(), "Powder event ready".into())]
+            vec![("capaaaaa".into(), "Ship event ready".into())]
         );
         let depth = inbox.depth("ship:ship-alpha");
         assert_eq!(

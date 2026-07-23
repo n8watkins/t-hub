@@ -44,7 +44,6 @@ mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/reso
 mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
 mod model; // data-model structs (PRD §8)
 mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
-mod powder; // Powder API profiles and claim lifecycle client; credentials stay outside the Captain registry
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
                 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
@@ -461,10 +460,6 @@ fn devbuild_env_defaults(dev_home: &std::path::Path) -> Vec<(&'static str, std::
             "T_HUB_VOICE_FILE",
             dev_home.join("voice.json").into_os_string(),
         ),
-        (
-            "T_HUB_POWDER_PROFILES_FILE",
-            dev_home.join("powder-profiles.json").into_os_string(),
-        ),
         ("T_HUB_CONFIG_DIR", dev_home.join("config").into_os_string()),
         ("T_HUB_DB_NAME", OsString::from("t-hub-dev.db")),
         (
@@ -533,7 +528,6 @@ mod devbuild_isolation_tests {
             "T_HUB_SERVER_KEY_FILE",
             "T_HUB_SERVER_READ_KEY_FILE",
             "T_HUB_VOICE_FILE",
-            "T_HUB_POWDER_PROFILES_FILE",
             "T_HUB_CONFIG_DIR",
         ] {
             assert!(
