@@ -675,9 +675,6 @@ pub fn stop_scribe_status_emitter() {
     if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
         return;
     }
-    *latest_scribe_status_store()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
     state.enabled = false;
     state.generation = state.generation.wrapping_add(1);
     if let Some(cancel) = state.cancel.take() {
@@ -686,6 +683,9 @@ pub fn stop_scribe_status_emitter() {
     if let Some(handle) = state.handle.take() {
         let _ = handle.join();
     }
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 #[tauri::command]
@@ -711,6 +711,15 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
         if observed_at <= now && now - observed_at <= 3_000 {
             return Ok(status);
         }
+        return Ok(ScribeStatus::not_listening());
+    }
+    let emitter_running = {
+        let state = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.enabled && state.handle.is_some()
+    };
+    if emitter_running {
         return Ok(ScribeStatus::not_listening());
     }
     let now = now_ms().max(0) as u64;
