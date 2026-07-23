@@ -260,7 +260,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 .is_none_or(|active| expected != active.process.identity.run_id)
         }) {
             let status = active.as_ref().map_or_else(
-                || PreviewStatus::stopped(scope.clone(), self.runtime.now_ms()),
+                || self.stopped_status(scope),
                 |active| {
                     status_from_active(
                         scope,
@@ -290,7 +290,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             active.as_ref().map(|run| &run.process),
         )?;
         let Some(active) = active else {
-            let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
+            let status = self.stopped_status(scope);
             self.commit_intent(request_id, status.clone())?;
             return Ok(result(
                 PreviewOperation::Stop,
@@ -321,7 +321,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .remove(scope);
-                let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
+                let status = self.stopped_status(scope);
                 self.commit_intent(request_id, status.clone())?;
                 Ok(result(
                     PreviewOperation::Stop,
@@ -339,7 +339,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .remove(scope);
-                let status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
+                let status = self.stopped_status(scope);
                 self.commit_intent(request_id, status.clone())?;
                 Ok(result(
                     PreviewOperation::Stop,
@@ -632,8 +632,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                     return Ok(None);
                 }
                 (_, None) => {
-                    let status =
-                        PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+                    let status = self.stopped_status(&intent.scope);
                     self.commit_intent(&intent.request_id, status.clone())?;
                     return Ok(Some(status));
                 }
@@ -773,7 +772,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                         return self.recover_stop_identity(intent, expected_target, expected);
                     }
                 }
-                let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+                let status = self.stopped_status(&intent.scope);
                 self.commit_intent(&intent.request_id, status.clone())?;
                 Ok(Some(status))
             }
@@ -843,7 +842,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&intent.scope);
-        let status = PreviewStatus::stopped(intent.scope.clone(), self.runtime.now_ms());
+        let status = self.stopped_status(&intent.scope);
         self.commit_intent(&intent.request_id, status.clone())?;
         Ok(Some(status))
     }
@@ -997,7 +996,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
             .get(scope)
             .cloned();
         let Some(mut active) = active else {
-            return Ok(PreviewStatus::stopped(scope.clone(), self.runtime.now_ms()));
+            return Ok(self.stopped_status(scope));
         };
         match self.runtime.observe(&active.process)? {
             RuntimeObservation::Exited { code, detail } => {
@@ -1068,6 +1067,15 @@ impl<R: PreviewRuntime> PreviewService<R> {
             return Err("registered project root fingerprint changed".into());
         }
         self.persisted_selected_ref(scope)
+    }
+
+    fn stopped_status(&self, scope: &PreviewScope) -> PreviewStatus {
+        let mut status = PreviewStatus::stopped(scope.clone(), self.runtime.now_ms());
+        status.target_id = self
+            .persisted_selected_ref(scope)
+            .ok()
+            .map(|target| target.target_id);
+        status
     }
 
     fn persisted_selected_ref(&self, scope: &PreviewScope) -> Result<PreviewTargetRef, String> {
@@ -1750,6 +1758,25 @@ mod tests {
                 .canonical_root_fingerprint,
             mapped.canonical_root_fingerprint
         );
+    }
+
+    #[test]
+    fn stopped_status_restores_persisted_selection_after_service_restart() {
+        let fixture = fixture("selection-restart");
+        let restarted_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let restarted = PreviewService::new(
+            fixture.runtime.restart_facade(),
+            Arc::clone(&restarted_profiles),
+        );
+
+        let status = restarted.status(&fixture.scope).unwrap();
+        assert_eq!(status.state, PreviewState::Stopped);
+        assert_eq!(
+            status.target_id.as_ref(),
+            Some(&fixture.target_ref.target_id)
+        );
+        assert!(status.run_id.is_none());
     }
 
     #[test]

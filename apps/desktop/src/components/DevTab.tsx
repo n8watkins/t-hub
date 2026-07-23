@@ -64,6 +64,7 @@ function idleSnapshot(terminalId: TerminalId): DevServerSnapshot {
   return {
     terminalId,
     runId: null,
+    targetId: null,
     revision: 0,
     state: "idle",
     target: null,
@@ -150,6 +151,7 @@ function chooseTarget(
 ): string | null {
   const candidates = [
     snapshot.target?.id,
+    snapshot.targetId,
     previous,
     targets.find((target) => target.recommended)?.id,
     targets[0]?.id,

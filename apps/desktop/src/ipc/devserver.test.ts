@@ -92,6 +92,7 @@ describe("shared Preview lifecycle", () => {
       script: "dev",
     });
     expect(snapshot.state).toBe("running");
+    expect(snapshot.targetId).toBe("root:dev");
     expect(snapshot.previewUrl).toBe("http://127.0.0.1:43191/");
     expect(control.request).toHaveBeenNthCalledWith(2, "preview_discover", {
       rootPath: "/repo",

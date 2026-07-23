@@ -175,8 +175,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let profiles =
-            Arc::new(PreviewProfileStore::open(root.path().join("preview-profiles.json")).unwrap());
+        let profiles_path = root.path().join("preview-profiles.json");
+        let profiles = Arc::new(PreviewProfileStore::open(&profiles_path).unwrap());
         let service = PreviewService::new(ManagedPreviewRuntime::for_test(), profiles);
         let authority = PreviewRootAuthority {
             posix_identity: root.path().to_string_lossy().into_owned(),
@@ -272,5 +272,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stopped["status"]["state"], "stopped");
+        assert_eq!(stopped["status"]["targetId"], target["targetId"]);
+
+        drop(service);
+        let reopened_profiles = Arc::new(PreviewProfileStore::open(&profiles_path).unwrap());
+        let reopened = PreviewService::new(ManagedPreviewRuntime::for_test(), reopened_profiles);
+        let restored = dispatch(
+            &reopened,
+            "preview_status",
+            &json!({ "scope": scope }),
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(restored["state"], "stopped");
+        assert_eq!(restored["targetId"], target["targetId"]);
     }
 }

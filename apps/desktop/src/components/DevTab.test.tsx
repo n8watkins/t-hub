@@ -63,6 +63,7 @@ function snapshot(
   return {
     terminalId,
     runId,
+    targetId: runId ? discovery.targets[0].id : null,
     revision,
     state,
     target: runId ? discovery.targets[0] : null,
@@ -105,12 +106,27 @@ beforeEach(() => {
     "running",
     "stale",
     "start-error",
+    "selection-restart",
   ]) {
     forgetDevState(id);
   }
 });
 
 describe("DevTab", () => {
+  it("restores a persisted stopped target before recommended fallback after restart", async () => {
+    mocks.devServerSnapshot.mockResolvedValueOnce({
+      ...snapshot("selection-restart"),
+      targetId: "package-script:preview",
+      target: null,
+    });
+    render(<DevTab terminalId="selection-restart" cwd="/repo" />);
+
+    const select = await screen.findByRole("combobox", { name: "Run target" });
+    await waitFor(() =>
+      expect((select as HTMLSelectElement).value).toBe("package-script:preview"),
+    );
+  });
+
   it("selects a discovered target without exposing arbitrary command input", async () => {
     render(<DevTab terminalId="typed" cwd="/repo" />);
 

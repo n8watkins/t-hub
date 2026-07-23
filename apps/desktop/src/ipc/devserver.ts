@@ -73,6 +73,7 @@ export type RunnerState =
 export interface DevServerSnapshot {
   terminalId: TerminalId;
   runId: string | null;
+  targetId: string | null;
   revision: number;
   state: RunnerState;
   target: RunTarget | null;
@@ -399,6 +400,7 @@ function legacySnapshot(
   return {
     terminalId,
     runId: status.runId ?? null,
+    targetId: status.targetId ?? null,
     revision: status.observedAtMs,
     state,
     target,
