@@ -65,6 +65,11 @@ fn now_ms() -> u64 {
 /// - `result`: None
 pub fn build_entry(hook_name: &str, payload: &serde_json::Value) -> EventJournalEntry {
     let event_type = event_type_for_hook(hook_name);
+    let provider_event_id = ["event_id", "hook_event_id", "hookEventId"]
+        .into_iter()
+        .find_map(|key| payload.get(key).and_then(serde_json::Value::as_str));
+    let event_id =
+        crate::event_identity::derive("claude", hook_name, &[("event_id", provider_event_id)]);
     let entity_id = payload
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -74,7 +79,7 @@ pub fn build_entry(hook_name: &str, payload: &serde_json::Value) -> EventJournal
         seq: 0,
         timestamp_ms: now_ms(),
         source: JournalSource::Hook,
-        event_id: None,
+        event_id,
         entity_id,
         event_type,
         payload: payload.clone(),
@@ -410,6 +415,51 @@ mod tests {
             "seq is assigned by Journal::append, not build_entry"
         );
         assert!(entry.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn explicit_provider_event_id_is_stable_and_content_independent() {
+        let first = build_entry(
+            "PermissionRequest",
+            &serde_json::json!({
+                "session_id": "session-1",
+                "event_id": "provider-event-1",
+                "prompt": "first-secret-canary",
+                "tool_input": {"command": "first-command-canary"}
+            }),
+        );
+        let retry = build_entry(
+            "PermissionRequest",
+            &serde_json::json!({
+                "session_id": "session-1",
+                "event_id": "provider-event-1",
+                "prompt": "different-secret-canary",
+                "tool_input": {"command": "different-command-canary"}
+            }),
+        );
+        assert_eq!(first.event_id, retry.event_id);
+        let identity = first.event_id.unwrap();
+        assert!(!identity.contains("secret-canary"));
+        assert!(!identity.contains("command-canary"));
+    }
+
+    #[test]
+    fn distinct_provider_event_ids_do_not_alias() {
+        let first = build_entry("Stop", &serde_json::json!({"event_id": "provider-event-1"}));
+        let second = build_entry("Stop", &serde_json::json!({"event_id": "provider-event-2"}));
+        assert_ne!(first.event_id, second.event_id);
+    }
+
+    #[test]
+    fn missing_or_oversized_provider_event_id_stays_non_deduplicable() {
+        assert_eq!(
+            build_entry("Stop", &serde_json::json!({"session_id": "session-1"})).event_id,
+            None
+        );
+        assert_eq!(
+            build_entry("Stop", &serde_json::json!({"event_id": "x".repeat(513)})).event_id,
+            None
+        );
     }
 
     #[test]

@@ -35,6 +35,7 @@
 
 mod codex;
 mod dispatch;
+mod event_identity;
 mod gate;
 mod hook;
 mod host;

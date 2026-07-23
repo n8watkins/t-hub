@@ -256,6 +256,7 @@ fn map_app_server_message(
                 "permission_resolved",
             )?;
             entry.payload["permission_request_id"] = Value::String(request_id);
+            assign_codex_event_identity(&mut entry);
             Some(entry)
         }
         "turn/completed" => {
@@ -342,6 +343,7 @@ fn permission_entry(
             .is_some_and(|value| !value.is_null()),
     });
     entry.payload["permission_request_id"] = entry.payload["permission_request"]["id"].clone();
+    assign_codex_event_identity(&mut entry);
     Some(entry)
 }
 
@@ -432,7 +434,7 @@ fn base_entry(
             "runtime_health": "ready",
         }
     });
-    EventJournalEntry {
+    let mut entry = EventJournalEntry {
         seq: 0,
         timestamp_ms,
         source: JournalSource::Agent,
@@ -441,7 +443,9 @@ fn base_entry(
         event_type,
         payload,
         result: None,
-    }
+    };
+    assign_codex_event_identity(&mut entry);
+    entry
 }
 
 fn health_entry(
@@ -483,37 +487,57 @@ fn append_deduplicated(
     state: &mut TapState,
     entry: EventJournalEntry,
 ) -> anyhow::Result<()> {
-    let key = format!(
-        "{:?}:{}:{}:{}:{}:{}",
-        entry.event_type,
-        entry.entity_id.as_deref().unwrap_or(""),
-        entry
-            .payload
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        entry
-            .payload
-            .get("permission_request_id")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        entry
-            .payload
-            .get("lifecycle")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        entry
-            .payload
-            .pointer("/telemetry/detail")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    );
-    if !state.seen.insert(key) {
-        return Ok(());
+    if let Some(event_id) = entry.event_id.as_ref() {
+        if state.seen.contains(event_id) {
+            return Ok(());
+        }
     }
+    let event_id = entry.event_id.clone();
     journal.append(entry).context("appending Codex lifecycle")?;
+    if let Some(event_id) = event_id {
+        state.seen.insert(event_id);
+    }
     state.recognized_events += 1;
     Ok(())
+}
+
+fn assign_codex_event_identity(entry: &mut EventJournalEntry) {
+    let lifecycle = entry.payload.get("lifecycle").and_then(Value::as_str);
+    let session_id = entry.payload.get("session_id").and_then(Value::as_str);
+    let turn_id = entry.payload.get("turn_id").and_then(Value::as_str);
+    let request_id = entry
+        .payload
+        .get("permission_request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.starts_with("hook-opaque-v1:"));
+
+    let identity = match lifecycle {
+        Some(kind @ ("thread_started" | "thread_closed")) if session_id.is_some() => {
+            crate::event_identity::derive("codex", kind, &[("session_id", session_id)])
+        }
+        Some(kind @ ("turn_started" | "turn_completed" | "turn_failed"))
+            if session_id.is_some() && turn_id.is_some() =>
+        {
+            crate::event_identity::derive(
+                "codex",
+                kind,
+                &[("session_id", session_id), ("turn_id", turn_id)],
+            )
+        }
+        Some(kind @ ("permission_requested" | "permission_resolved")) if request_id.is_some() => {
+            crate::event_identity::derive(
+                "codex",
+                kind,
+                &[
+                    ("request_id", request_id),
+                    ("session_id", session_id),
+                    ("turn_id", turn_id),
+                ],
+            )
+        }
+        _ => None,
+    };
+    entry.event_id = identity;
 }
 
 /// Whether a hook payload contains Codex's documented provider-specific fields.
@@ -803,6 +827,108 @@ mod tests {
             "disconnected"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn app_server_identity_uses_only_exact_provider_ids() {
+        let mut first_state = TapState::default();
+        let first = map_tap_message(
+            &serde_json::json!({
+                "method": "item/commandExecution/requestApproval",
+                "id": "request-1",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "command": "first-command-secret-canary"
+                }
+            }),
+            &mut first_state,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+        let mut retry_state = TapState::default();
+        let retry = map_tap_message(
+            &serde_json::json!({
+                "method": "item/commandExecution/requestApproval",
+                "id": "request-1",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "command": "different-command-secret-canary"
+                }
+            }),
+            &mut retry_state,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+
+        assert_eq!(first.event_id, retry.event_id);
+        let identity = first.event_id.unwrap();
+        assert!(!identity.contains("command-secret-canary"));
+        assert!(!serde_json::to_string(&first.payload)
+            .unwrap()
+            .contains("command-secret-canary"));
+    }
+
+    #[test]
+    fn lifecycle_kinds_with_the_same_provider_ids_remain_distinct() {
+        let binding = TmuxBinding::default();
+        let state = TapState {
+            session_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..TapState::default()
+        };
+        let started = lifecycle_entry(
+            &state,
+            &binding,
+            JournalEventType::UserPromptSubmit,
+            "turn_started",
+        )
+        .unwrap();
+        let completed =
+            lifecycle_entry(&state, &binding, JournalEventType::Stop, "turn_completed").unwrap();
+        assert!(started.event_id.is_some());
+        assert!(completed.event_id.is_some());
+        assert_ne!(started.event_id, completed.event_id);
+    }
+
+    #[test]
+    fn codex_events_without_exact_provider_ids_are_non_deduplicable() {
+        let mut state = TapState {
+            session_id: Some("thread-1".to_string()),
+            ..TapState::default()
+        };
+        let exec_turn = map_exec_event(
+            "turn.started",
+            &serde_json::json!({"type": "turn.started"}),
+            &mut state,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+        assert_eq!(exec_turn.event_id, None);
+
+        let native_hook = entry_from_hook(
+            "PermissionRequest",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_input": {"command": "secret-command-canary"}
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(native_hook.event_id, None);
+        assert!(native_hook.payload["permission_request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("hook-opaque-v1:"));
+        assert!(!serde_json::to_string(&native_hook.payload)
+            .unwrap()
+            .contains("secret-command-canary"));
     }
 
     #[test]
