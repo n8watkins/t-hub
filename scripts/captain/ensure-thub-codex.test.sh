@@ -49,6 +49,19 @@ exit 1
 EOF
 chmod 700 "$FAKE_BIN"
 
+NONREGULAR_DIR="$WORK/nonregular"
+mkdir -p "$NONREGULAR_DIR/directory"
+ln -s "$FAKE_BIN" "$NONREGULAR_DIR/symlink"
+mkfifo "$NONREGULAR_DIR/fifo"
+chmod 700 "$NONREGULAR_DIR/fifo"
+for nonregular in symlink directory fifo; do
+  if T_HUB_MCP_BIN="$NONREGULAR_DIR/$nonregular" bash "$SCRIPT" >/dev/null 2>&1; then
+    fail "provisioner accepted nonregular binary: $nonregular"
+  else
+    pass "provisioner refuses nonregular binary without opening it: $nonregular"
+  fi
+done
+
 STALE_BIN="$WORK/stale-t-hub-mcp"
 cat > "$STALE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -65,6 +78,66 @@ elif [ ! -e "$WORK/config.toml" ]; then
   pass "stale MCP catalog is refused before changing Codex config"
 else
   fail "stale MCP catalog changed Codex config"
+fi
+
+RACE_HOME="$WORK/source-race"
+RACE_BIN="$RACE_HOME/t-hub-mcp"
+RACE_PAUSE="$RACE_HOME/pause"
+mkdir -p "$RACE_HOME" "$RACE_PAUSE"
+cp "$FAKE_BIN" "$RACE_BIN"
+printf 'model = "operator-model"\n' > "$RACE_HOME/config.toml"
+race_config_before="$(sha256sum "$RACE_HOME/config.toml" | awk '{print $1}')"
+CODEX_HOME="$RACE_HOME" T_HUB_MCP_BIN="$RACE_BIN" \
+  T_HUB_ENSURE_SOURCE_PAUSE_DIR="$RACE_PAUSE" bash "$SCRIPT" >/dev/null 2>&1 &
+race_pid=$!
+race_wait=0
+while [ ! -e "$RACE_PAUSE/discovered" ] && [ "$race_wait" -lt 1000 ]; do
+  sleep 0.01
+  race_wait=$((race_wait + 1))
+done
+RACE_REPLACEMENT="$RACE_HOME/replacement-t-hub-mcp"
+cp "$FAKE_BIN" "$RACE_REPLACEMENT"
+printf '\n# different valid binary bytes\n' >> "$RACE_REPLACEMENT"
+chmod 700 "$RACE_REPLACEMENT"
+mv "$RACE_REPLACEMENT" "$RACE_BIN"
+: > "$RACE_PAUSE/resume"
+wait "$race_pid"
+race_status=$?
+if [ "$race_status" -ne 0 ] \
+  && [ "$(sha256sum "$RACE_HOME/config.toml" | awk '{print $1}')" = "$race_config_before" ] \
+  && ! grep -q 'mcp_servers.t-hub' "$RACE_HOME/config.toml"; then
+  pass "binary inode swap after discovery preserves Codex config"
+else
+  fail "binary inode swap crossed the verified config boundary"
+fi
+
+HARDLINK_HOME="$WORK/hardlink-race"
+HARDLINK_BIN="$HARDLINK_HOME/t-hub-mcp"
+HARDLINK_SIBLING="$HARDLINK_HOME/t-hub-mcp-sibling"
+HARDLINK_PAUSE="$HARDLINK_HOME/pause"
+mkdir -p "$HARDLINK_HOME" "$HARDLINK_PAUSE"
+cp "$FAKE_BIN" "$HARDLINK_BIN"
+ln "$HARDLINK_BIN" "$HARDLINK_SIBLING"
+printf 'model = "operator-model"\n' > "$HARDLINK_HOME/config.toml"
+hardlink_config_before="$(sha256sum "$HARDLINK_HOME/config.toml" | awk '{print $1}')"
+CODEX_HOME="$HARDLINK_HOME" T_HUB_MCP_BIN="$HARDLINK_BIN" \
+  T_HUB_ENSURE_SOURCE_PAUSE_DIR="$HARDLINK_PAUSE" bash "$SCRIPT" >/dev/null 2>&1 &
+hardlink_pid=$!
+hardlink_wait=0
+while [ ! -e "$HARDLINK_PAUSE/discovered" ] && [ "$hardlink_wait" -lt 1000 ]; do
+  sleep 0.01
+  hardlink_wait=$((hardlink_wait + 1))
+done
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HARDLINK_SIBLING"
+: > "$HARDLINK_PAUSE/resume"
+wait "$hardlink_pid"
+hardlink_status=$?
+if [ "$hardlink_status" -ne 0 ] \
+  && [ "$(sha256sum "$HARDLINK_HOME/config.toml" | awk '{print $1}')" = "$hardlink_config_before" ] \
+  && ! grep -q 'mcp_servers.t-hub' "$HARDLINK_HOME/config.toml"; then
+  pass "hardlink binary mutation cannot cross the verified config boundary"
+else
+  fail "hardlink binary mutation changed Codex config"
 fi
 
 # Pre-seed a user config with [hooks] + [hooks.state] trust blocks (the clobber

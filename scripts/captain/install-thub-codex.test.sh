@@ -51,6 +51,20 @@ for bad_args in \
   fi
 done
 
+NONREGULAR_WORK="$WORK/nonregular-source"
+mkdir -p "$NONREGULAR_WORK/directory"
+ln -s "$SOURCE" "$NONREGULAR_WORK/symlink"
+mkfifo "$NONREGULAR_WORK/fifo"
+chmod 700 "$NONREGULAR_WORK/fifo"
+for nonregular in symlink directory fifo; do
+  if T_HUB_MCP_SOURCE="$NONREGULAR_WORK/$nonregular" T_HUB_BIN_DIR="$BIN_DIR" \
+    T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
+    fail "installer accepted nonregular source: $nonregular"
+  else
+    pass "installer refuses nonregular source without opening it: $nonregular"
+  fi
+done
+
 mkdir -p "$BIN_DIR"
 printf 'known-good binary\n' > "$BIN_DIR/t-hub-mcp"
 chmod 700 "$BIN_DIR/t-hub-mcp"
@@ -73,6 +87,130 @@ else
   fail "stale MCP catalog changed the installed binary"
 fi
 rm -f "$BIN_DIR/t-hub-mcp"
+
+RACE_WORK="$WORK/source-race"
+RACE_HOME="$RACE_WORK/home"
+RACE_CODEX="$RACE_WORK/codex"
+RACE_CLAUDE="$RACE_WORK/claude"
+RACE_BIN="$RACE_WORK/install/bin"
+RACE_CAPTAIN="$RACE_WORK/install/captain"
+RACE_SOURCE="$RACE_WORK/source-t-hub-mcp"
+RACE_PAUSE="$RACE_WORK/pause"
+mkdir -p "$RACE_HOME" "$RACE_CODEX" "$RACE_CLAUDE" "$RACE_BIN" "$RACE_CAPTAIN" "$RACE_PAUSE"
+cp "$SOURCE" "$RACE_SOURCE"
+printf 'known-good binary\n' > "$RACE_BIN/t-hub-mcp"
+chmod 700 "$RACE_BIN/t-hub-mcp"
+printf 'operator config\n' > "$RACE_CODEX/config.toml"
+race_config_before="$(sha256sum "$RACE_CODEX/config.toml" | awk '{print $1}')"
+HOME="$RACE_HOME" CODEX_HOME="$RACE_CODEX" CLAUDE_HOME="$RACE_CLAUDE" \
+  T_HUB_MCP_SOURCE="$RACE_SOURCE" T_HUB_BIN_DIR="$RACE_BIN" \
+  T_HUB_CAPTAIN_DIR="$RACE_CAPTAIN" T_HUB_INSTALL_SOURCE_PAUSE_DIR="$RACE_PAUSE" \
+  bash "$SCRIPT" >/dev/null 2>&1 &
+race_pid=$!
+race_wait=0
+while [ ! -e "$RACE_PAUSE/discovered" ] && [ "$race_wait" -lt 1000 ]; do
+  sleep 0.01
+  race_wait=$((race_wait + 1))
+done
+RACE_REPLACEMENT="$RACE_WORK/replacement-t-hub-mcp"
+cp "$SOURCE" "$RACE_REPLACEMENT"
+printf '\n# different valid binary bytes\n' >> "$RACE_REPLACEMENT"
+chmod 700 "$RACE_REPLACEMENT"
+mv "$RACE_REPLACEMENT" "$RACE_SOURCE"
+: > "$RACE_PAUSE/resume"
+wait "$race_pid"
+race_status=$?
+if [ "$race_status" -ne 0 ] \
+  && [ "$(cat "$RACE_BIN/t-hub-mcp")" = "known-good binary" ] \
+  && [ "$(sha256sum "$RACE_CODEX/config.toml" | awk '{print $1}')" = "$race_config_before" ] \
+  && [ ! -e "$RACE_HOME/.t-hub/transactions/install-current/manifest.json" ]; then
+  pass "source inode swap after discovery preserves binary, config, and manifest"
+else
+  fail "source inode swap crossed the verified snapshot boundary"
+fi
+
+HARDLINK_WORK="$WORK/source-hardlink-race"
+HARDLINK_HOME="$HARDLINK_WORK/home"
+HARDLINK_CODEX="$HARDLINK_WORK/codex"
+HARDLINK_CLAUDE="$HARDLINK_WORK/claude"
+HARDLINK_BIN="$HARDLINK_WORK/install/bin"
+HARDLINK_CAPTAIN="$HARDLINK_WORK/install/captain"
+HARDLINK_SOURCE="$HARDLINK_WORK/source-t-hub-mcp"
+HARDLINK_SIBLING="$HARDLINK_WORK/source-sibling"
+HARDLINK_PAUSE="$HARDLINK_WORK/pause"
+mkdir -p "$HARDLINK_HOME" "$HARDLINK_CODEX" "$HARDLINK_CLAUDE" \
+  "$HARDLINK_BIN" "$HARDLINK_CAPTAIN" "$HARDLINK_PAUSE"
+cp "$SOURCE" "$HARDLINK_SOURCE"
+ln "$HARDLINK_SOURCE" "$HARDLINK_SIBLING"
+printf 'known-good hardlink binary\n' > "$HARDLINK_BIN/t-hub-mcp"
+chmod 700 "$HARDLINK_BIN/t-hub-mcp"
+HOME="$HARDLINK_HOME" CODEX_HOME="$HARDLINK_CODEX" CLAUDE_HOME="$HARDLINK_CLAUDE" \
+  T_HUB_MCP_SOURCE="$HARDLINK_SOURCE" T_HUB_BIN_DIR="$HARDLINK_BIN" \
+  T_HUB_CAPTAIN_DIR="$HARDLINK_CAPTAIN" T_HUB_INSTALL_SOURCE_PAUSE_DIR="$HARDLINK_PAUSE" \
+  bash "$SCRIPT" >/dev/null 2>&1 &
+hardlink_pid=$!
+hardlink_wait=0
+while [ ! -e "$HARDLINK_PAUSE/discovered" ] && [ "$hardlink_wait" -lt 1000 ]; do
+  sleep 0.01
+  hardlink_wait=$((hardlink_wait + 1))
+done
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HARDLINK_SIBLING"
+: > "$HARDLINK_PAUSE/resume"
+wait "$hardlink_pid"
+hardlink_status=$?
+if [ "$hardlink_status" -ne 0 ] \
+  && [ "$(cat "$HARDLINK_BIN/t-hub-mcp")" = "known-good hardlink binary" ] \
+  && [ ! -e "$HARDLINK_HOME/.t-hub/transactions/install-current/manifest.json" ]; then
+  pass "hardlink content mutation cannot cross the verified snapshot boundary"
+else
+  fail "hardlink content mutation changed install state"
+fi
+
+ROLLBACK_WORK="$WORK/installed-catalog-rollback"
+ROLLBACK_HOME="$ROLLBACK_WORK/home"
+ROLLBACK_CODEX="$ROLLBACK_WORK/codex"
+ROLLBACK_CLAUDE="$ROLLBACK_WORK/claude"
+ROLLBACK_BIN="$ROLLBACK_WORK/install/bin"
+ROLLBACK_CAPTAIN="$ROLLBACK_WORK/install/captain"
+ROLLBACK_SOURCE="$ROLLBACK_WORK/source-t-hub-mcp"
+ROLLBACK_COUNTER="$ROLLBACK_WORK/catalog-counter"
+mkdir -p "$ROLLBACK_HOME" "$ROLLBACK_CODEX" "$ROLLBACK_CLAUDE" \
+  "$ROLLBACK_BIN" "$ROLLBACK_CAPTAIN"
+cat > "$ROLLBACK_SOURCE" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list-tools" ]; then
+  count=0
+  [ ! -f "$CATALOG_COUNTER" ] || count="$(cat "$CATALOG_COUNTER")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$CATALOG_COUNTER"
+  if [ "$count" -eq 1 ]; then
+    printf '{"tools":[{"name":"cortana_bootstrap","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"t-hubTier":"read","confirmationRequired":false,"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}]}\n'
+  else
+    printf '{"tools":[{"name":"list_terminals"}]}\n'
+  fi
+  exit 0
+fi
+exit 1
+EOF
+chmod 700 "$ROLLBACK_SOURCE"
+printf 'known-good rollback binary\n' > "$ROLLBACK_BIN/t-hub-mcp"
+chmod 700 "$ROLLBACK_BIN/t-hub-mcp"
+printf 'model = "operator-model"\n' > "$ROLLBACK_CODEX/config.toml"
+rollback_config_before="$(sha256sum "$ROLLBACK_CODEX/config.toml" | awk '{print $1}')"
+if HOME="$ROLLBACK_HOME" CODEX_HOME="$ROLLBACK_CODEX" CLAUDE_HOME="$ROLLBACK_CLAUDE" \
+  CATALOG_COUNTER="$ROLLBACK_COUNTER" T_HUB_MCP_SOURCE="$ROLLBACK_SOURCE" \
+  T_HUB_BIN_DIR="$ROLLBACK_BIN" T_HUB_CAPTAIN_DIR="$ROLLBACK_CAPTAIN" \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "installer accepted a stale post-install catalog"
+elif [ "$(cat "$ROLLBACK_BIN/t-hub-mcp")" = "known-good rollback binary" ] \
+  && [ "$(sha256sum "$ROLLBACK_CODEX/config.toml" | awk '{print $1}')" = "$rollback_config_before" ] \
+  && [ ! -e "$ROLLBACK_HOME/.t-hub/transactions/install-current/manifest.json" ] \
+  && ! find "$ROLLBACK_HOME/.t-hub/transactions" -name '.source-snapshot.*' -print -quit \
+    | grep -q .; then
+  pass "post-install catalog failure rolls back binary, config, manifest, and private snapshot"
+else
+  fail "post-install catalog failure left partial install state"
+fi
 
 if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "isolated install exits 0"

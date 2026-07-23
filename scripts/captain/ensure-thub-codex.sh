@@ -39,6 +39,7 @@ fi
 BIN_DIR="${T_HUB_BIN_DIR:-${HOME}/.t-hub/bin}"
 BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
 ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$(cd "$(dirname "$0")" && pwd)/atomic-config.py}"
+CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "ensure-thub-codex: codex not on PATH - install codex-cli first" >&2
@@ -53,17 +54,14 @@ if ! command -v flock >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x "$BIN" ]; then
-  echo "ensure-thub-codex: t-hub MCP binary is not executable: $BIN" >&2
-  echo "ensure-thub-codex: run install-thub-codex.sh first" >&2
-  exit 1
-fi
+install -d -m 700 "$(dirname "$CONFIG")"
+exec 9>"${CONFIG}.t-hub.lock"
+flock -x 9
 
-BIN_CATALOG="$("$BIN" --list-tools 2>/dev/null)" || {
-  echo "ensure-thub-codex: t-hub MCP binary failed its offline catalog probe: $BIN" >&2
-  exit 1
-}
-if ! printf '%s' "$BIN_CATALOG" | jq -e '
+verify_cortana_catalog() {
+  local binary="$1" catalog
+  catalog="$("$binary" --list-tools 2>/dev/null)" || return 1
+  printf '%s' "$catalog" | jq -e '
   [(.tools // .)[] | select(.name == "cortana_bootstrap")]
   | length == 1
     and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
@@ -73,19 +71,72 @@ if ! printf '%s' "$BIN_CATALOG" | jq -e '
     and .[0].annotations.destructiveHint == false
     and .[0].annotations.idempotentHint == true
     and .[0].annotations.openWorldHint == false
-' >/dev/null; then
+' >/dev/null
+}
+
+if [ ! -x "$BIN" ] || [ ! -f "$BIN" ] || [ -L "$BIN" ]; then
+  echo "ensure-thub-codex: t-hub MCP binary must be an executable regular file, not a symlink: $BIN" >&2
+  echo "ensure-thub-codex: run install-thub-codex.sh first" >&2
+  exit 1
+fi
+BIN_CANONICAL="$(readlink -f "$BIN")"
+exec 8<"$BIN"
+BIN_DEVICE="$(stat -Lc %d "/proc/$$/fd/8")"
+BIN_INODE="$(stat -Lc %i "/proc/$$/fd/8")"
+BIN_DIGEST="$(sha256sum "/proc/$$/fd/8" | awk '{print $1}')"
+if [ "$(stat -Lc %d "$BIN")" != "$BIN_DEVICE" ] \
+  || [ "$(stat -Lc %i "$BIN")" != "$BIN_INODE" ]; then
+  echo "ensure-thub-codex: t-hub MCP binary changed while it was selected: $BIN" >&2
+  exit 1
+fi
+BIN_SNAPSHOT="$(mktemp "$(dirname "$CONFIG")/.t-hub-mcp-probe.XXXXXX")"
+cleanup_binary_snapshot() {
+  if [ -n "${BIN_SNAPSHOT:-}" ] && [ -f "$BIN_SNAPSHOT" ]; then
+    rm -f -- "$BIN_SNAPSHOT"
+  fi
+  BIN_SNAPSHOT=
+}
+trap cleanup_binary_snapshot EXIT
+if [ -n "${T_HUB_ENSURE_SOURCE_PAUSE_DIR:-}" ]; then
+  printf 'selected\n' > "$T_HUB_ENSURE_SOURCE_PAUSE_DIR/discovered"
+  source_wait_count=0
+  while [ "$source_wait_count" -lt 1000 ]; do
+    [ ! -e "$T_HUB_ENSURE_SOURCE_PAUSE_DIR/resume" ] || break
+    sleep 0.01
+    source_wait_count=$((source_wait_count + 1))
+  done
+  if [ ! -e "$T_HUB_ENSURE_SOURCE_PAUSE_DIR/resume" ]; then
+    echo "ensure-thub-codex: timed out at the binary-selection test boundary" >&2
+    exit 1
+  fi
+fi
+install -m 700 "/proc/$$/fd/8" "$BIN_SNAPSHOT"
+binary_matches_selection() {
+  [ ! -L "$BIN" ] \
+    && [ "$(readlink -f "$BIN")" = "$BIN_CANONICAL" ] \
+    && [ "$(stat -Lc %d "$BIN")" = "$BIN_DEVICE" ] \
+    && [ "$(stat -Lc %i "$BIN")" = "$BIN_INODE" ] \
+    && [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$BIN_DIGEST" ]
+}
+if [ "$(sha256sum "$BIN_SNAPSHOT" | awk '{print $1}')" != "$BIN_DIGEST" ] \
+  || ! binary_matches_selection; then
+  echo "ensure-thub-codex: t-hub MCP binary changed before its private snapshot was verified: $BIN" >&2
+  exit 1
+fi
+if ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
   echo "ensure-thub-codex: t-hub MCP binary lacks the exact cortana_bootstrap catalog contract: $BIN" >&2
   exit 1
 fi
+if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+  echo "ensure-thub-codex: installed binary changed after its verified catalog snapshot: $BIN" >&2
+  exit 1
+fi
+cleanup_binary_snapshot
+trap - EXIT
 
-CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
 ENV_VARS_JSON='["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"]'
 ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]'
 LEGACY_ENV_VARS_JSON='["T_HUB_CONTROL_ADDR","T_HUB_CONTROL_TOKEN","T_HUB_SESSION_TOKEN"]'
-install -d -m 700 "$(dirname "$CONFIG")"
-exec 9>"${CONFIG}.t-hub.lock"
-flock -x 9
-
 BACKUP=""
 HAD_CONFIG=false
 EXPECTED_HASH=absent
@@ -110,6 +161,10 @@ publish_before_state() {
   python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/codex-state.json" --value "$state"
 }
 publish_committed_state() {
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+    echo "ensure-thub-codex: installed binary changed before config commit" >&2
+    return 1
+  fi
   if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
   if [ -f "$CONFIG" ]; then
     post="$(python3 "$ATOMIC_HELPER" describe --path "$CONFIG")"
@@ -126,6 +181,10 @@ refresh_expected_hash() {
   if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
 }
 begin_config_transaction() {
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+    echo "ensure-thub-codex: installed binary changed before config mutation" >&2
+    return 1
+  fi
   if [ -f "$CONFIG" ]; then
     HAD_CONFIG=true
     BACKUP="$(mktemp "${CONFIG}.t-hub-backup.XXXXXX")"
@@ -153,6 +212,10 @@ rollback() {
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }
 commit_config_transaction() {
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+    echo "ensure-thub-codex: installed binary changed during config mutation" >&2
+    return 1
+  fi
   trap - EXIT
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }

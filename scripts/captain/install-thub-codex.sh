@@ -40,21 +40,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ -n "${T_HUB_MCP_SOURCE:-}" ]; then
-  SOURCE="$T_HUB_MCP_SOURCE"
-else
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "install-thub-codex: cargo is required to build t-hub-mcp" >&2
-    exit 1
-  fi
-  cargo build --release -p t-hub-mcp --manifest-path "$MANIFEST"
-  SOURCE="$REPO_ROOT/apps/desktop/src-tauri/target/release/t-hub-mcp"
-fi
-
-if [ ! -x "$SOURCE" ]; then
-  echo "install-thub-codex: source binary is not executable: $SOURCE" >&2
-  exit 1
-fi
 if ! command -v flock >/dev/null 2>&1; then
   echo "install-thub-codex: flock is required for safe installation" >&2
   exit 1
@@ -63,30 +48,6 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "install-thub-codex: jq is required to verify the MCP catalog" >&2
   exit 1
 fi
-
-SOURCE_CATALOG="$("$SOURCE" --list-tools 2>/dev/null)" || {
-  echo "install-thub-codex: source binary failed its offline catalog probe: $SOURCE" >&2
-  exit 1
-}
-if ! printf '%s' "$SOURCE_CATALOG" | jq -e '
-  [(.tools // .)[] | select(.name == "cortana_bootstrap")]
-  | length == 1
-    and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
-    and .[0].annotations["t-hubTier"] == "read"
-    and .[0].annotations.confirmationRequired == false
-    and .[0].annotations.readOnlyHint == true
-    and .[0].annotations.destructiveHint == false
-    and .[0].annotations.idempotentHint == true
-    and .[0].annotations.openWorldHint == false
-' >/dev/null; then
-  echo "install-thub-codex: source binary lacks the exact cortana_bootstrap catalog contract: $SOURCE" >&2
-  exit 1
-fi
-
-# Refuse every known skill conflict before replacing the MCP binary or changing
-# Codex registration. The installer repeats validation inside its own
-# transaction to cover races between preflight and commit.
-bash "$HERE/install-captain-skills.sh" --check "${SKILL_ARGS[@]}"
 
 install -d -m 700 "$BIN_DIR" "$CAPTAIN_DIR"
 exec 8>"$CAPTAIN_DIR/install.lock"
@@ -105,6 +66,97 @@ if [ "$(stat -c %u "$TRANSACTION_ROOT")" != "$(id -u)" ] \
   echo "install-thub-codex: transaction root must be current-user owned with mode 0700" >&2
   exit 1
 fi
+
+if [ -n "${T_HUB_MCP_SOURCE:-}" ]; then
+  SOURCE="$T_HUB_MCP_SOURCE"
+else
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "install-thub-codex: cargo is required to build t-hub-mcp" >&2
+    exit 1
+  fi
+  cargo build --release -p t-hub-mcp --manifest-path "$MANIFEST"
+  SOURCE="$REPO_ROOT/apps/desktop/src-tauri/target/release/t-hub-mcp"
+fi
+
+verify_cortana_catalog() {
+  local binary="$1" catalog
+  catalog="$("$binary" --list-tools 2>/dev/null)" || return 1
+  printf '%s' "$catalog" | jq -e '
+  [(.tools // .)[] | select(.name == "cortana_bootstrap")]
+  | length == 1
+    and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
+    and .[0].annotations["t-hubTier"] == "read"
+    and .[0].annotations.confirmationRequired == false
+    and .[0].annotations.readOnlyHint == true
+    and .[0].annotations.destructiveHint == false
+    and .[0].annotations.idempotentHint == true
+    and .[0].annotations.openWorldHint == false
+' >/dev/null
+}
+
+if [ ! -x "$SOURCE" ] || [ ! -f "$SOURCE" ] || [ -L "$SOURCE" ]; then
+  echo "install-thub-codex: source binary must be an executable regular file, not a symlink: $SOURCE" >&2
+  exit 1
+fi
+SOURCE_CANONICAL="$(readlink -f "$SOURCE")"
+exec 5<"$SOURCE"
+SOURCE_DEVICE="$(stat -Lc %d "/proc/$$/fd/5")"
+SOURCE_INODE="$(stat -Lc %i "/proc/$$/fd/5")"
+SOURCE_DIGEST="$(sha256sum "/proc/$$/fd/5" | awk '{print $1}')"
+if [ "$(stat -Lc %d "$SOURCE")" != "$SOURCE_DEVICE" ] \
+  || [ "$(stat -Lc %i "$SOURCE")" != "$SOURCE_INODE" ]; then
+  echo "install-thub-codex: source binary changed while it was selected: $SOURCE" >&2
+  exit 1
+fi
+SOURCE_SNAPSHOT_DIR="$(mktemp -d "$TRANSACTION_ROOT/.source-snapshot.XXXXXX")"
+chmod 700 "$SOURCE_SNAPSHOT_DIR"
+SOURCE_SNAPSHOT="$SOURCE_SNAPSHOT_DIR/t-hub-mcp"
+cleanup_source_snapshot() {
+  if [ -n "${SOURCE_SNAPSHOT:-}" ] && [ -f "$SOURCE_SNAPSHOT" ]; then
+    rm -f -- "$SOURCE_SNAPSHOT"
+  fi
+  if [ -n "${SOURCE_SNAPSHOT_DIR:-}" ] && [ -d "$SOURCE_SNAPSHOT_DIR" ]; then
+    rmdir -- "$SOURCE_SNAPSHOT_DIR"
+  fi
+  SOURCE_SNAPSHOT=
+  SOURCE_SNAPSHOT_DIR=
+}
+trap cleanup_source_snapshot EXIT
+if [ -n "${T_HUB_INSTALL_SOURCE_PAUSE_DIR:-}" ]; then
+  printf 'selected\n' > "$T_HUB_INSTALL_SOURCE_PAUSE_DIR/discovered"
+  source_wait_count=0
+  while [ "$source_wait_count" -lt 1000 ]; do
+    [ ! -e "$T_HUB_INSTALL_SOURCE_PAUSE_DIR/resume" ] || break
+    sleep 0.01
+    source_wait_count=$((source_wait_count + 1))
+  done
+  if [ ! -e "$T_HUB_INSTALL_SOURCE_PAUSE_DIR/resume" ]; then
+    echo "install-thub-codex: timed out at the source-selection test boundary" >&2
+    exit 1
+  fi
+fi
+install -m 700 "/proc/$$/fd/5" "$SOURCE_SNAPSHOT"
+source_matches_selection() {
+  [ ! -L "$SOURCE" ] \
+    && [ "$(readlink -f "$SOURCE")" = "$SOURCE_CANONICAL" ] \
+    && [ "$(stat -Lc %d "$SOURCE")" = "$SOURCE_DEVICE" ] \
+    && [ "$(stat -Lc %i "$SOURCE")" = "$SOURCE_INODE" ] \
+    && [ "$(sha256sum "$SOURCE" | awk '{print $1}')" = "$SOURCE_DIGEST" ]
+}
+if [ "$(sha256sum "$SOURCE_SNAPSHOT" | awk '{print $1}')" != "$SOURCE_DIGEST" ] \
+  || ! source_matches_selection; then
+  echo "install-thub-codex: source binary changed before its private snapshot was verified: $SOURCE" >&2
+  exit 1
+fi
+if ! verify_cortana_catalog "$SOURCE_SNAPSHOT"; then
+  echo "install-thub-codex: source binary lacks the exact cortana_bootstrap catalog contract: $SOURCE" >&2
+  exit 1
+fi
+
+# Refuse every known skill conflict before replacing the MCP binary or changing
+# Codex registration. The installer repeats validation inside its own
+# transaction to cover races between preflight and commit.
+bash "$HERE/install-captain-skills.sh" --check "${SKILL_ARGS[@]}"
 
 describe_digest() {
   if [ -f "$1" ]; then
@@ -403,8 +455,8 @@ recover_previous_transaction() {
     return 1
   fi
   status="$(jq -r .status "$TXN/manifest.json")"
-  if ! jq -e --arg source "$(readlink -f "$SOURCE")" \
-    --arg source_digest "$(sha256sum "$SOURCE" | awk '{print $1}')" \
+  if ! jq -e --arg source "$SOURCE_CANONICAL" \
+    --arg source_digest "$SOURCE_DIGEST" \
     --arg integration_digest "$(integration_source_digest)" \
     --argjson repair "$( [ "${SKILL_ARGS[*]:-}" = --repair ] && printf true || printf false )" \
     --argjson migrate "$( [ "${CODEX_ARGS[*]:-}" = --migrate-legacy-registration ] && printf true || printf false )" \
@@ -454,8 +506,8 @@ migrate_legacy=false
 [ "${CODEX_ARGS[*]:-}" != --migrate-legacy-registration ] || migrate_legacy=true
 manifest="$(jq -cn --arg status active --argjson repair "$repair_skills" \
   --argjson migrate "$migrate_legacy" --arg integration_digest "$(integration_source_digest)" \
-  --arg source "$(readlink -f "$SOURCE")" \
-  --arg source_digest "$(sha256sum "$SOURCE" | awk '{print $1}')" \
+  --arg source "$SOURCE_CANONICAL" \
+  --arg source_digest "$SOURCE_DIGEST" \
   --arg dest "$DEST" --arg captain_dir "$CAPTAIN_DIR" \
   --arg skills_source "$(readlink -f "$SKILLS_SOURCE")" \
   --arg codex_skills_dest "$CODEX_SKILLS_DEST" \
@@ -508,15 +560,29 @@ rollback_on_exit() {
   if [ "$code" -ne 0 ] && ! rollback_transaction; then
     echo "install-thub-codex: rollback safely refused; rerun for deterministic recovery" >&2
   fi
+  cleanup_source_snapshot
   exit "$code"
 }
 trap rollback_on_exit EXIT
 
-install_file_stage "$SOURCE" "$DEST" binary
+if ! source_matches_selection; then
+  echo "install-thub-codex: source binary changed before atomic installation" >&2
+  exit 1
+fi
+install_file_stage "$SOURCE_SNAPSHOT" "$DEST" binary
+if [ "$(sha256sum "$DEST" | awk '{print $1}')" != "$SOURCE_DIGEST" ]; then
+  echo "install-thub-codex: installed binary digest differs from the verified source snapshot" >&2
+  exit 1
+fi
+if ! verify_cortana_catalog "$DEST"; then
+  echo "install-thub-codex: installed binary lacks the exact cortana_bootstrap catalog contract: $DEST" >&2
+  exit 1
+fi
+cleanup_source_snapshot
+exec 5<&-
 install_file_stage "$HERE/ensure-thub-codex.sh" "$CAPTAIN_DIR/ensure-thub-codex.sh" codex-helper
 install_file_stage "$HERE/ensure-thub-claude.sh" "$CAPTAIN_DIR/ensure-thub-claude.sh" claude-helper
 install_file_stage "$HERE/atomic-config.py" "$CAPTAIN_DIR/atomic-config.py" atomic-helper
-"$DEST" --list-tools >/dev/null
 
 CHILD_ATOMIC_HELPER="${T_HUB_ATOMIC_CONFIG_HELPER:-$CAPTAIN_DIR/atomic-config.py}"
 publish_manifest_status claude-running
