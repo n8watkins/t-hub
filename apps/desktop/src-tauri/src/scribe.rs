@@ -89,6 +89,8 @@ struct ScribeEmitterState {
 
 static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterState>> =
     std::sync::OnceLock::new();
+static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
+    std::sync::OnceLock::new();
 
 fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
     SCRIBE_EMITTER_STATE.get_or_init(|| {
@@ -99,6 +101,10 @@ fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
             handle: None,
         })
     })
+}
+
+fn latest_scribe_status_store() -> &'static std::sync::Mutex<Option<(ScribeStatus, i64)>> {
+    SCRIBE_LATEST_STATUS.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
@@ -552,10 +558,14 @@ fn status_event_payload(
 }
 
 fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
+    let observed_at = now_ms();
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((status.clone(), observed_at));
     let generation = SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = app.emit(
         "scribe://status",
-        status_event_payload(status, generation, now_ms()),
+        status_event_payload(status, generation, observed_at),
     );
 }
 
@@ -664,6 +674,9 @@ pub fn stop_scribe_status_emitter() {
     if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
         return;
     }
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
     state.enabled = false;
     state.generation = state.generation.wrapping_add(1);
     if let Some(cancel) = state.cancel.take() {
@@ -688,6 +701,17 @@ pub fn scribe_status_stop() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn scribe_status() -> Result<ScribeStatus, String> {
+    if let Some((status, observed_at)) = latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        let now = now_ms();
+        if observed_at <= now && now - observed_at <= 3_000 {
+            return Ok(status);
+        }
+        return Ok(ScribeStatus::not_listening());
+    }
     let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
         .await
         .map_err(|e| format!("scribe_status task failed: {e}"))?;
