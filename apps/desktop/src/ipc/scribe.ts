@@ -29,6 +29,16 @@ export function scribeStatus(): Promise<ScribeStatus> {
   return invoke("scribe_status");
 }
 
+/** Start the native Scribe event producer for the enabled voice lifecycle. */
+export function startScribeStatusEmitter(): Promise<void> {
+  return invoke("scribe_status_start");
+}
+
+/** Stop the native Scribe event producer when voice announcements are disabled. */
+export function stopScribeStatusEmitter(): Promise<void> {
+  return invoke("scribe_status_stop");
+}
+
 /** Subscribe to Scribe's event-driven dictation state when the Scribe build
  * exposes its Tauri event bridge. The voice gate keeps a bounded one-second
  * fallback poll until the first event arrives, so older Scribe builds retain

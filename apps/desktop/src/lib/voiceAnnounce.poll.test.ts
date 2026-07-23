@@ -14,6 +14,8 @@ vi.mock("./voiceAudio", () => ({ playWavBase64: vi.fn() }));
 vi.mock("../ipc/scribe", () => ({
   scribeStatus: vi.fn(() => Promise.resolve({ listening: false })),
   onScribeStatus: vi.fn(() => Promise.resolve(() => {})),
+  startScribeStatusEmitter: vi.fn(() => Promise.resolve()),
+  stopScribeStatusEmitter: vi.fn(() => Promise.resolve()),
 }));
 
 import { onScribeStatus, scribeStatus } from "../ipc/scribe";

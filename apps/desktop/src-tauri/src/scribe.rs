@@ -80,7 +80,8 @@ const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
 static SCRIBE_EVENT_GENERATION: AtomicU64 = AtomicU64::new(0);
-static SCRIBE_STATUS_EMITTER_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static SCRIBE_STATUS_EMITTER_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
 /// sourced from the snapshot's `busy` flag (after the fail-open rules);
@@ -493,10 +494,18 @@ pub fn read_scribe_status() -> ScribeStatus {
 }
 
 fn status_event_payload(status: &ScribeStatus, generation: u64, observed_at_ms: i64) -> serde_json::Value {
+    let safe_status = status.status.as_deref().filter(|value| {
+        matches!(*value, "Idle" | "Recording" | "Transcribing" | "Pasting" | "Stopping")
+    });
+    let safe_since = status.since.as_ref().and_then(|value| {
+        value.as_str().and_then(|timestamp| {
+            parse_rfc3339_ms(timestamp).map(|_| serde_json::Value::String(timestamp.to_string()))
+        })
+    });
     serde_json::json!({
         "listening": status.listening,
-        "status": status.status,
-        "since": status.since,
+        "status": safe_status,
+        "since": safe_since,
         "source": status.source,
         "sourceIdentity": status.source.unwrap_or("unknown"),
         "generation": generation,
@@ -512,7 +521,7 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
     );
 }
 
-/// Start the backend event producer once Tauri has an AppHandle.
+/// Start the backend event producer while voice announcements are enabled.
 ///
 /// Scribe's v1 contract is currently a pull endpoint, so this producer uses
 /// the same bounded discovery + file fallback resolver as `scribe_status` and
@@ -520,26 +529,41 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
 /// events as the normal path while retaining a bounded poll watchdog when the
 /// producer is unavailable.  Discovery is re-read on every tick, so a Scribe
 /// restart with a new endpoint, token, or PID is observed without a T-Hub
-/// restart.  No endpoint token or raw Scribe payload is ever emitted.
+/// restart. No endpoint token or raw Scribe payload is ever emitted.
 pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
-    if SCRIBE_STATUS_EMITTER_STARTED.set(()).is_err() {
+    if SCRIBE_STATUS_EMITTER_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
     std::thread::Builder::new()
         .name("scribe-status-emitter".to_string())
-        .spawn(move || loop {
+        .spawn(move || while SCRIBE_STATUS_EMITTER_RUNNING.load(Ordering::Acquire) {
             emit_status_event(&app, &read_scribe_status());
             std::thread::sleep(Duration::from_secs(1));
         })
-        .expect("spawn scribe status emitter");
+        .ok();
+}
+
+pub fn stop_scribe_status_emitter() {
+    SCRIBE_STATUS_EMITTER_RUNNING.store(false, Ordering::Release);
 }
 
 #[tauri::command]
-pub async fn scribe_status(app: tauri::AppHandle) -> Result<ScribeStatus, String> {
+pub fn scribe_status_start(app: tauri::AppHandle) -> Result<(), String> {
+    start_scribe_status_emitter(app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn scribe_status_stop() -> Result<(), String> {
+    stop_scribe_status_emitter();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn scribe_status() -> Result<ScribeStatus, String> {
     let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
         .await
         .map_err(|e| format!("scribe_status task failed: {e}"))?;
-    emit_status_event(&app, &status);
     Ok(status)
 }
 

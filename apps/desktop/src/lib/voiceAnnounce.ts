@@ -28,7 +28,12 @@ import {
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
 import { onJournal } from "../ipc/client05";
-import { onScribeStatus, scribeStatus } from "../ipc/scribe";
+import {
+  onScribeStatus,
+  scribeStatus,
+  startScribeStatusEmitter,
+  stopScribeStatusEmitter,
+} from "../ipc/scribe";
 import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import { notify } from "./notify";
 import { useEngineRuntime } from "../store/engineRuntime";
@@ -643,6 +648,7 @@ function stopScribePoll(): void {
     clearTimeout(tailTimer);
     tailTimer = null;
   }
+  void stopScribeStatusEmitter().catch(() => {});
 }
 
 /** Arm the event-first Scribe voice gate.
@@ -652,6 +658,7 @@ function stopScribePoll(): void {
  * An IPC failure fails open and a slow read never stacks overlapping ticks. */
 function armScribePoll(): void {
   if (pollTimer) return;
+  void startScribeStatusEmitter().catch(() => {});
   const generation = ++pollGeneration;
   scribeStatusKnown = false;
   scribeListening = false;
