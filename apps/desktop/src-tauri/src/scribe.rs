@@ -922,6 +922,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_none());
+        std::env::set_var(
+            "T_HUB_SCRIBE_STATUS_FILE",
+            "/tmp/thub-missing-scribe-status.json",
+        );
+        let recovered = tauri::async_runtime::block_on(scribe_status()).expect("direct recovery");
+        std::env::remove_var("T_HUB_SCRIBE_STATUS_FILE");
+        assert!(
+            !recovered.listening,
+            "missing direct source must recover fail-open"
+        );
         *latest_scribe_status_store()
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some((status, now_ms()));
