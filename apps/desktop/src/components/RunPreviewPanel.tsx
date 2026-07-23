@@ -50,6 +50,7 @@ export function RunPreviewPanel({
         <WebPreview
           key={devUrl ? `managed:${devUrl}` : "manual"}
           initialUrl={devUrl ?? previewUrl ?? undefined}
+          initialUrlProvenance={devUrl ? "managed" : "manual"}
           onNavigate={rememberPreviewUrl}
         />
       </div>

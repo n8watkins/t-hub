@@ -75,6 +75,10 @@ export interface WebPreviewProps {
    *  Preview URL). Absent/empty => no auto-load; we show the empty state with
    *  the URL bar still available rather than loading a dead default address. */
   initialUrl?: string;
+  /** Authority for `initialUrl`.
+   * Managed URLs were already resolved and ownership-verified by the backend.
+   * Manual URLs retain the compatibility rewrite for Windows-hosted webviews. */
+  initialUrlProvenance?: "managed" | "manual";
   /** Called with the normalized URL each time the user commits a navigation (URL
    *  bar submit or managed runner update). Lets a host tile persist the last-viewed
    *  address so it survives a tab switch (e.g. usePanels.setPreviewUrl /
@@ -84,12 +88,14 @@ export interface WebPreviewProps {
 
 export function WebPreview({
   initialUrl = "",
+  initialUrlProvenance = "manual",
   onNavigate,
 }: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
   // the editable input value. Splitting them means typing doesn't reload on
   // every keystroke — only Enter / the Go button navigates.
   const [url, setUrl] = useState(initialUrl);
+  const [urlProvenance, setUrlProvenance] = useState(initialUrlProvenance);
   const [draft, setDraft] = useState(initialUrl);
   const [load, setLoad] = useState<LoadState>({ status: "idle" });
   // Bumped on every (re)navigation so the iframe remounts and the watchdog
@@ -114,10 +120,11 @@ export function WebPreview({
   }, []);
 
   const navigate = useCallback(
-    (raw: string) => {
+    (raw: string, provenance: "managed" | "manual" = "manual") => {
       const next = normalize(raw);
       if (!next) return;
       setUrl(next);
+      setUrlProvenance(provenance);
       setDraft(next);
       setLoad({ status: "loading" });
       setNav((n) => n + 1);
@@ -136,16 +143,27 @@ export function WebPreview({
   // value and the currently committed `url` (so a user override sticks). The
   // mount-time value is already adopted via useState above, so we seed the ref
   // with it and this effect is a no-op on the first render.
-  const adoptedInitialRef = useRef(initialUrl);
+  const adoptedInitialRef = useRef({
+    url: initialUrl,
+    provenance: initialUrlProvenance,
+  });
   useEffect(() => {
-    if (initialUrl === adoptedInitialRef.current) return; // unchanged prop
-    adoptedInitialRef.current = initialUrl;
+    if (
+      initialUrl === adoptedInitialRef.current.url &&
+      initialUrlProvenance === adoptedInitialRef.current.provenance
+    ) {
+      return;
+    }
+    adoptedInitialRef.current = {
+      url: initialUrl,
+      provenance: initialUrlProvenance,
+    };
     if (!initialUrl) return; // cleared (no dev URL yet) — leave the bar as-is
-    if (initialUrl === url) return; // already showing it (e.g. user typed it)
-    navigate(initialUrl);
+    if (initialUrl === url && initialUrlProvenance === urlProvenance) return;
+    navigate(initialUrl, initialUrlProvenance);
     // `navigate` is stable (useCallback); `url` is read to avoid a redundant
     // reload when we're already on the incoming URL.
-  }, [initialUrl, navigate, url]);
+  }, [initialUrl, initialUrlProvenance, navigate, url, urlProvenance]);
 
   // Resolve the reachable load URL whenever the committed `url` (or a manual
   // retry via `nav`) changes. On Windows this swaps a WSL `localhost` for the
@@ -158,7 +176,11 @@ export function WebPreview({
       setLoadUrl("");
       return;
     }
-    void reachablePreviewUrl(url).then((resolved) => {
+    const resolution =
+      urlProvenance === "managed"
+        ? Promise.resolve(url)
+        : reachablePreviewUrl(url);
+    void resolution.then((resolved) => {
       if (cancelled) return;
       setLoadUrl(resolved);
       // Ensure the watchdog can arm for the FIRST load too: on mount `url` is
@@ -171,7 +193,7 @@ export function WebPreview({
     return () => {
       cancelled = true;
     };
-  }, [url, nav]);
+  }, [url, urlProvenance, nav]);
 
   // Watchdog: when a navigation starts, assume framing was refused if no `load`
   // event lands within the window. The iframe's onLoad clears this by moving us

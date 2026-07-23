@@ -346,18 +346,24 @@ fn valid_derived_host(host: &str) -> bool {
     }
 }
 
-pub fn derived_wsl_host(snapshot: &WslNetworkSnapshot) -> Option<String> {
+pub fn derived_wsl_hosts(snapshot: &WslNetworkSnapshot) -> Vec<String> {
+    let mut hosts = Vec::new();
     snapshot
         .interfaces
         .iter()
         .flat_map(|interface| interface.split_whitespace())
-        .find(|host| {
+        .filter(|host| {
             valid_derived_host(host)
                 && host
                     .parse::<IpAddr>()
                     .is_ok_and(|address| !address.is_loopback())
         })
-        .map(str::to_string)
+        .for_each(|host| {
+            if !hosts.iter().any(|existing| existing == host) {
+                hosts.push(host.to_string());
+            }
+        });
+    hosts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -672,6 +678,6 @@ mod tests {
                 "172.30.1.2 192.168.1.5".into(),
             ],
         };
-        assert_eq!(derived_wsl_host(&snapshot).as_deref(), Some("172.30.1.2"));
+        assert_eq!(derived_wsl_hosts(&snapshot), ["172.30.1.2", "192.168.1.5"]);
     }
 }

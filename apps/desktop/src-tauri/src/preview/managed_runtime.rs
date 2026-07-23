@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use tauri_plugin_shell::ShellExt;
 
 use super::endpoint::{
-    derived_wsl_host, EndpointError, EndpointInspector, EndpointResolver, ListenerOwnership,
+    derived_wsl_hosts, EndpointError, EndpointInspector, EndpointResolver, ListenerOwnership,
     ManagedRunIdentity, PreviewEndpoint, ProbeCancellation, WslHostMappingCache,
     WslNetworkSnapshot,
 };
@@ -25,6 +25,7 @@ use super::supervisor::SupervisedPreviewChild;
 
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_WSL_HOST_CANDIDATES: usize = 8;
 #[cfg(windows)]
 const WSL_NETWORK_SNAPSHOT_LIMIT: usize = 4 * 1024;
 
@@ -121,12 +122,16 @@ impl ManagedPreviewRuntime {
         }
     }
 
-    fn resolved_wsl_host(&self) -> Option<ResolvedWslHost> {
+    fn resolved_wsl_host(&self, excluded: &HashSet<String>) -> Option<ResolvedWslHost> {
         let snapshot = self.wsl_network.snapshot()?;
         let fingerprint = snapshot.fingerprint();
         let host = self
             .wsl_hosts
-            .resolve(&snapshot, self.now_ms(), derived_wsl_host)?;
+            .resolve(&snapshot, self.now_ms(), |snapshot| {
+                derived_wsl_hosts(snapshot)
+                    .into_iter()
+                    .find(|host| !excluded.contains(host))
+            })?;
         Some(ResolvedWslHost { fingerprint, host })
     }
 
@@ -337,15 +342,17 @@ impl PreviewRuntime for ManagedPreviewRuntime {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut observed = output.to_vec();
         loop {
+            let mut excluded_hosts = HashSet::new();
             match resolve_with_wsl_remap(
                 &resolver,
                 &process.identity,
                 &observed,
                 cancellation,
-                self.resolved_wsl_host(),
+                self.resolved_wsl_host(&excluded_hosts),
                 |failed| {
+                    excluded_hosts.insert(failed.host.clone());
                     self.invalidate_wsl_host(failed);
-                    self.resolved_wsl_host()
+                    self.resolved_wsl_host(&excluded_hosts)
                 },
             ) {
                 Err(EndpointError::NoManagedHint | EndpointError::ListenerMissing)
@@ -383,8 +390,15 @@ where
     I: EndpointInspector,
     F: FnMut(&ResolvedWslHost) -> Option<ResolvedWslHost>,
 {
-    let mut remap_attempted = false;
+    let mut attempted_hosts = HashSet::new();
     loop {
+        if let Some(mapping) = mapping.as_ref() {
+            if !attempted_hosts.insert(mapping.host.clone())
+                || attempted_hosts.len() > MAX_WSL_HOST_CANDIDATES
+            {
+                return Err(EndpointError::Unreachable);
+            }
+        }
         match resolver.resolve(
             identity,
             output,
@@ -392,10 +406,9 @@ where
             cancellation,
         ) {
             Err(EndpointError::Unreachable)
-                if mapping.is_some() && !remap_attempted && !cancellation.is_cancelled() =>
+                if mapping.is_some() && !cancellation.is_cancelled() =>
             {
                 mapping = remap(mapping.as_ref().expect("checked above"));
-                remap_attempted = true;
             }
             result => return result,
         }
@@ -698,7 +711,7 @@ mod tests {
         assert_eq!(snapshot.distribution, "Ubuntu");
         assert_eq!(snapshot.boot_id, "7b99545f-67c0-4f0c-b91a-17486fd38233");
         assert_eq!(snapshot.interfaces, ["172.30.1.2", "127.0.0.1"]);
-        assert_eq!(derived_wsl_host(&snapshot).as_deref(), Some("172.30.1.2"));
+        assert_eq!(derived_wsl_hosts(&snapshot), ["172.30.1.2"]);
         assert!(parse_wsl_network_snapshot("Ubuntu", b"\n172.30.1.2\n").is_none());
     }
 
@@ -737,6 +750,32 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert!(calls.iter().any(|url| url.contains("172.30.1.2")));
         assert!(calls.iter().any(|url| url.contains("172.30.1.3")));
+    }
+
+    #[test]
+    fn unchanged_snapshot_excludes_failed_host_and_uses_next_candidate() {
+        let cache = WslHostMappingCache::default();
+        let snapshot = WslNetworkSnapshot {
+            distribution: "Ubuntu".into(),
+            boot_id: "same-boot".into(),
+            interfaces: vec!["172.30.1.2 172.30.1.3".into()],
+        };
+        let first = cache
+            .resolve(&snapshot, 1, |snapshot| {
+                derived_wsl_hosts(snapshot).into_iter().next()
+            })
+            .unwrap();
+        assert_eq!(first, "172.30.1.2");
+        cache.invalidate_failed_probe(&snapshot.fingerprint(), &first);
+        let excluded = HashSet::from([first]);
+        let second = cache
+            .resolve(&snapshot, 2, |snapshot| {
+                derived_wsl_hosts(snapshot)
+                    .into_iter()
+                    .find(|host| !excluded.contains(host))
+            })
+            .unwrap();
+        assert_eq!(second, "172.30.1.3");
     }
 
     fn fixture() -> (

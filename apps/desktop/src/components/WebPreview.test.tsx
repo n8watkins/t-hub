@@ -49,13 +49,34 @@ describe("WebPreview navigation boundary", () => {
   });
 
   it("adopts a URL reported by the managed runner", async () => {
-    render(<WebPreview initialUrl="http://localhost:5173" />);
+    render(
+      <WebPreview
+        initialUrl="http://localhost:5173"
+        initialUrlProvenance="managed"
+      />,
+    );
 
     await waitFor(() => {
       expect(screen.getByTitle("Web preview").getAttribute("src")).toBe(
         "http://localhost:5173",
       );
     });
-    expect(reachablePreviewUrl).toHaveBeenCalledWith("http://localhost:5173");
+    expect(reachablePreviewUrl).not.toHaveBeenCalled();
+  });
+
+  it("retains compatibility resolution for a manual initial URL", async () => {
+    render(
+      <WebPreview
+        initialUrl="http://localhost:4173"
+        initialUrlProvenance="manual"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTitle("Web preview").getAttribute("src")).toBe(
+        "http://localhost:4173",
+      );
+    });
+    expect(reachablePreviewUrl).toHaveBeenCalledWith("http://localhost:4173");
   });
 });

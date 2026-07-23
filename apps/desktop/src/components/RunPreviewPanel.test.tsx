@@ -6,6 +6,7 @@ import { RunPreviewPanel } from "./RunPreviewPanel";
 
 const previewProps: Array<{
   initialUrl?: string;
+  initialUrlProvenance?: "managed" | "manual";
   onNavigate?: (url: string) => void;
 }> = [];
 
@@ -18,6 +19,7 @@ vi.mock("./DevTab", () => ({
 vi.mock("./WebPreview", () => ({
   WebPreview: (props: {
     initialUrl?: string;
+    initialUrlProvenance?: "managed" | "manual";
     onNavigate?: (url: string) => void;
   }) => {
     const [url, setUrl] = useState(props.initialUrl);
@@ -52,11 +54,13 @@ describe("RunPreviewPanel", () => {
     expect(screen.getByRole("region", { name: "Preview" })).toBeTruthy();
     expect(screen.getByTestId("runner").textContent).toBe("terminal-1:/repo/t-hub");
     expect(screen.getByTestId("preview").textContent).toBe("http://localhost:5173");
+    expect(previewProps.at(-1)?.initialUrlProvenance).toBe("managed");
     expect(previewProps.at(-1)).not.toHaveProperty("detectedUrls");
   });
 
   it("persists a manual preview URL without treating terminal output as input", () => {
     render(<RunPreviewPanel terminalId="terminal-1" cwd="/repo/t-hub" />);
+    expect(previewProps.at(-1)?.initialUrlProvenance).toBe("manual");
 
     act(() => {
       previewProps.at(-1)?.onNavigate?.("http://localhost:4173");
