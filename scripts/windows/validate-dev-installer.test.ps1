@@ -126,6 +126,7 @@ SectionEnd
   Copy-Item -LiteralPath $extractedPath -Destination $installedPath
 
   $result = (Invoke-Validator $validScriptPath $rawPath $extractedPath $installedPath | Out-String) | ConvertFrom-Json
+  Assert-True ($result.passed -eq $true) "validator result must report passed=true."
   Assert-True ($result.productionMainBinary -ceq "t-hub") "production binary result is incorrect."
   Assert-True ($result.developmentMainBinary -ceq "t-hub-dev") "development binary result is incorrect."
   Assert-True ($result.rawSha256 -cne $result.extractedSha256) "raw and extracted fixture hashes must differ."
@@ -317,6 +318,7 @@ SectionEnd
   )) {
     Assert-True ($workflow.Contains($requiredWorkflowContract)) "release workflow is missing '$requiredWorkflowContract'."
   }
+  Assert-True (Test-Path -LiteralPath (Join-Path $PSScriptRoot "write-package5-provenance.ps1") -PathType Leaf) "Package 5 provenance generator is missing."
 
   Write-Host "PASS: Dev installer validator accepted $LineEndingMode and mixed-line-ending fixtures and rejected sixteen unsafe fixtures."
 } finally {

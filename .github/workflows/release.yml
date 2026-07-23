@@ -153,9 +153,15 @@ jobs:
         run: |
           $releaseDir = "apps/desktop/src-tauri/target/release"
           $nsisDir = "$releaseDir/bundle/nsis"
-          $installer = Get-ChildItem -Path $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
-          $installerScript = Get-ChildItem -Path "$releaseDir/nsis" -Filter "installer.nsi" -Recurse | Select-Object -First 1
-          $extracted = Get-ChildItem -Path "$releaseDir/dev-installer-extracted" -Filter "t-hub-dev.exe" -Recurse | Select-Object -First 1
+          $installers = @(Get-ChildItem -Path $nsisDir -Filter "*-setup.exe")
+          if ($installers.Count -ne 1) { throw "Expected exactly one development installer, found $($installers.Count)" }
+          $installer = $installers[0]
+          $installerScripts = @(Get-ChildItem -Path "$releaseDir/nsis" -Filter "installer.nsi" -Recurse)
+          if ($installerScripts.Count -ne 1) { throw "Expected exactly one generated installer.nsi, found $($installerScripts.Count)" }
+          $installerScript = $installerScripts[0]
+          $extractedBinaries = @(Get-ChildItem -Path "$releaseDir/dev-installer-extracted" -Filter "t-hub-dev.exe" -Recurse)
+          if ($extractedBinaries.Count -ne 1) { throw "Expected exactly one extracted t-hub-dev.exe, found $($extractedBinaries.Count)" }
+          $extracted = $extractedBinaries[0]
           & ./scripts/windows/write-package5-provenance.ps1 `
             -OutputPath "$releaseDir/dev-installer-evidence/package-5-evidence.json" `
             -RepositoryRoot (Get-Location).Path `

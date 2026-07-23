@@ -323,6 +323,7 @@ if ($InstalledBinaryPath) {
 }
 
 [ordered]@{
+  passed = $true
   productionMainBinary = $productionBinaryName
   developmentMainBinary = $developmentBinaryName
   rawSha256 = $rawHash
