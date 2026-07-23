@@ -658,11 +658,11 @@ function stopScribePoll(): void {
  * An IPC failure fails open and a slow read never stacks overlapping ticks. */
 function armScribePoll(): void {
   if (pollTimer) return;
-  void startScribeStatusEmitter().catch(() => {});
   const generation = ++pollGeneration;
   scribeStatusKnown = false;
   scribeListening = false;
   let polling = false;
+  let emitterStarted = false;
   lastValidScribeEventAt = 0;
   lastScribeEventGeneration = 0;
   void onScribeStatus((s) => {
@@ -712,6 +712,10 @@ function armScribePoll(): void {
       })
       .finally(() => {
         polling = false;
+        if (!emitterStarted && generation === pollGeneration) {
+          emitterStarted = true;
+          void startScribeStatusEmitter().catch(() => {});
+        }
       });
   };
   tick();

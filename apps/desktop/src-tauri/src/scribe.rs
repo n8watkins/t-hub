@@ -585,9 +585,17 @@ fn read_scribe_status_emitter_tick(
         scribe_control_file_for(control_name).as_deref(),
         scribe_status_file_for(bundle).as_deref(),
     );
+    let now = now_ms();
     let active: Vec<CandidateEval> = candidates
         .iter()
-        .filter_map(|candidate| candidate.clone())
+        .filter_map(|candidate| candidate.as_ref())
+        .filter(|candidate| {
+            candidate
+                .updated_at
+                .as_deref()
+                .is_some_and(|updated_at| snapshot_is_fresh(Some(updated_at), now))
+        })
+        .cloned()
         .collect();
     let status = combine_candidates(&active);
     status
