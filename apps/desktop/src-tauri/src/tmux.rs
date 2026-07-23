@@ -1448,6 +1448,20 @@ fn revalidate_python_identity(expected: &ManagedExecutableIdentity) -> Result<()
 }
 
 #[cfg(any(windows, test))]
+const WINDOWS_HELPER_CREATION_FLAGS: u32 = 0x0800_0000; // CREATE_NO_WINDOW
+
+#[cfg(any(windows, test))]
+fn apply_windows_helper_process_policy(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(WINDOWS_HELPER_CREATION_FLAGS);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+#[cfg(any(windows, test))]
 fn windows_helper_command(
     wsl: &std::path::Path,
     python: &str,
@@ -1465,6 +1479,10 @@ fn windows_helper_command(
     if let Some(identity) = identity {
         command.arg(serde_json::to_string(identity).expect("executable identity serializes"));
     }
+    // Keep the policy in this lowest-level constructor. trusted_python_identity
+    // uses it directly, before the higher-level exact/cgroup helpers exist, and
+    // Cortana reconciliation runs that probe immediately and every 30 seconds.
+    apply_windows_helper_process_policy(&mut command);
     command
 }
 
@@ -1479,12 +1497,13 @@ fn exact_effect_command_with_python(
     revalidate_python_identity(python)?;
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let wsl = trusted_wsl_path()?;
-        let mut command =
-            windows_helper_command(&wsl, &python.path, EXACT_SESSION_EFFECT_PY, Some(python));
-        command.creation_flags(0x0800_0000);
-        Ok(command)
+        Ok(windows_helper_command(
+            &wsl,
+            &python.path,
+            EXACT_SESSION_EFFECT_PY,
+            Some(python),
+        ))
     }
     #[cfg(unix)]
     {
@@ -1858,12 +1877,13 @@ fn managed_cgroup_effect_command(python: &ManagedExecutableIdentity) -> Result<C
     revalidate_python_identity(python)?;
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let wsl = trusted_wsl_path()?;
-        let mut command =
-            windows_helper_command(&wsl, &python.path, MANAGED_CGROUP_EFFECT_PY, Some(python));
-        command.creation_flags(0x0800_0000);
-        Ok(command)
+        Ok(windows_helper_command(
+            &wsl,
+            &python.path,
+            MANAGED_CGROUP_EFFECT_PY,
+            Some(python),
+        ))
     }
     #[cfg(unix)]
     {
@@ -2808,9 +2828,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn windows_helper_construction_cannot_select_wsl_or_python_from_path() {
+    fn windows_helper_construction_pins_tools_and_hidden_window_policy() {
         use std::os::unix::fs::PermissionsExt;
 
+        assert_eq!(WINDOWS_HELPER_CREATION_FLAGS, 0x0800_0000);
         let fixture = tempfile::tempdir().unwrap();
         let marker = fixture.path().join("intercepted");
         for helper in ["wsl.exe", "python3"] {
