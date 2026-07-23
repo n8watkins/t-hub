@@ -380,6 +380,7 @@ describe("provider-neutral journal announcements", () => {
     await flushPending(32_000);
     expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledTimes(2);
     expect(_pendingTextForTest()).toBeNull();
+    expect(useVoice.getState().deliveryFailure).toBeNull();
   });
 
   it("seeds replay-marked events and admits the next live event", async () => {

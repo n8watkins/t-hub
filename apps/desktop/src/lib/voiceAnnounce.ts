@@ -528,7 +528,18 @@ export async function flushPending(now: number = Date.now()): Promise<void> {
           "interrupted",
           "The requested input was resolved before the held announcement could be delivered.",
         );
-        if (pending?.attemptId === held.attemptId) pending = null;
+        if (pending?.attemptId === held.attemptId) {
+          pending = null;
+          const failure = useVoice.getState().deliveryFailure;
+          if (
+            failure?.kind === "interrupted" &&
+            failure.detail.startsWith(
+              "Could not persist the interrupted announcement outcome:",
+            )
+          ) {
+            useVoice.getState().clearDeliveryFailure();
+          }
+        }
       } catch (error) {
         if (pending?.attemptId === held.attemptId) {
           pending = { ...held, outcomeInFlight: false };

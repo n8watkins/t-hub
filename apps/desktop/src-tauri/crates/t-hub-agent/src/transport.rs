@@ -117,6 +117,7 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
                                 msg: AgentToCore::Journal {
                                     seq: entry.seq,
                                     entry,
+                                    replayed: false,
                                 },
                             };
                             if tail_tx.send(frame).is_err() {
@@ -273,6 +274,7 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                         msg: AgentToCore::Journal {
                             seq: entry.seq,
                             entry,
+                            replayed: true,
                         },
                     };
                     if tx.send(f).is_err() {
@@ -379,7 +381,11 @@ mod tests {
         };
         let frame = AgentFrame {
             channel: Channel::Events,
-            msg: AgentToCore::Journal { seq: 3, entry },
+            msg: AgentToCore::Journal {
+                seq: 3,
+                entry,
+                replayed: false,
+            },
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
@@ -387,9 +393,14 @@ mod tests {
         let back = t_hub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
         assert_eq!(back.channel, Channel::Events);
         match back.msg {
-            AgentToCore::Journal { seq, entry } => {
+            AgentToCore::Journal {
+                seq,
+                entry,
+                replayed,
+            } => {
                 assert_eq!(seq, 3);
                 assert_eq!(entry.entity_id.as_deref(), Some("sess-abc"));
+                assert!(!replayed);
             }
             other => panic!("expected Journal, got {other:?}"),
         }
@@ -434,6 +445,7 @@ mod tests {
                                 msg: AgentToCore::Journal {
                                     seq: entry.seq,
                                     entry,
+                                    replayed: false,
                                 },
                             };
                             if tx.send(frame).is_err() {

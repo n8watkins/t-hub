@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// History:
 ///   - `1` — initial 0.5 contract: registry/metrics/git/journal/hook + status.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Logical channel a [`Frame`] travels on. The single stdio pipe is multiplexed
 /// by this tag so the transport can prioritize control/metrics over bulk reads
@@ -262,7 +262,11 @@ pub enum AgentToCore {
     Pong { nonce: u64 },
     /// A durable journal entry, either streamed live (hook spine) or replayed.
     /// Carries the monotonic `seq` so the core can de-dupe and resume replay.
-    Journal { seq: u64, entry: EventJournalEntry },
+    Journal {
+        seq: u64,
+        entry: EventJournalEntry,
+        replayed: bool,
+    },
     /// Marks the end of a [`CoreToAgent::ReplayJournal`] batch; `last_seq` is the
     /// highest sequence replayed (so the core can advance its cursor).
     ReplayComplete { last_seq: u64 },
@@ -828,13 +832,22 @@ mod tests {
         };
         let frame = AgentFrame {
             channel: Channel::Events,
-            msg: AgentToCore::Journal { seq: 7, entry },
+            msg: AgentToCore::Journal {
+                seq: 7,
+                entry,
+                replayed: true,
+            },
         };
         let line = encode_agent(&frame).unwrap();
         let back = decode_agent(&line).unwrap();
         match back.msg {
-            AgentToCore::Journal { seq, entry } => {
+            AgentToCore::Journal {
+                seq,
+                entry,
+                replayed,
+            } => {
                 assert_eq!(seq, 7);
+                assert!(replayed);
                 assert_eq!(entry.event_type, JournalEventType::SessionStart);
                 assert_eq!(
                     entry.event_id.as_deref(),

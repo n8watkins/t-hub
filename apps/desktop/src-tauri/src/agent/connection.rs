@@ -260,8 +260,12 @@ pub(crate) fn spawn_reader(
                         }
                     }
 
-                    AgentToCore::Journal { seq, entry } => {
-                        bridge.consume_journal_entry(&entry);
+                    AgentToCore::Journal {
+                        seq,
+                        entry,
+                        replayed,
+                    } => {
+                        bridge.consume_journal_entry_with_provenance(&entry, replayed);
                         let _ = seq; // cursor advancement is done inside consume_journal_entry
                     }
 

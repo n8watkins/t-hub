@@ -784,6 +784,14 @@ impl AgentBridge {
     /// (so the unit tests that call this directly still pass). Returns the
     /// affected session id for callers/tests that want it.
     pub fn consume_journal_entry(&self, entry: &EventJournalEntry) -> Option<String> {
+        self.consume_journal_entry_with_provenance(entry, false)
+    }
+
+    fn consume_journal_entry_with_provenance(
+        &self,
+        entry: &EventJournalEntry,
+        replayed: bool,
+    ) -> Option<String> {
         // The journal sequence is the replay idempotency boundary. Reject an
         // already-consumed or out-of-order entry before every side effect,
         // including status ingestion, UI emission, title derivation, provider
@@ -792,8 +800,6 @@ impl AgentBridge {
         if !self.advance_cursor(entry.seq) {
             return None;
         }
-        let replayed = *self.inner.state.lock() == ConnectionState::Replaying;
-
         // StatusSnapshot entries get a DEDICATED minimal path. The statusline
         // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
         // ticks). On that path the full fan-out below is pure waste and a sustained
@@ -1588,23 +1594,33 @@ mod tests {
     }
 
     #[test]
-    fn journal_payload_marks_backend_replay_provenance() {
+    fn interleaved_replay_and_live_frames_keep_per_frame_provenance() {
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
         bridge.set_emitter(Arc::new(rec.clone()));
         rec.events.lock().clear();
-        *bridge.inner.state.lock() = ConnectionState::Replaying;
 
-        bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::PermissionRequest));
+        bridge.consume_journal_entry_with_provenance(
+            &entry(1, "o1", None, JournalEventType::PermissionRequest),
+            true,
+        );
+        bridge.consume_journal_entry_with_provenance(
+            &entry(2, "o1", None, JournalEventType::Elicitation),
+            false,
+        );
 
-        let journal = rec
+        let journal_flags = rec
             .events
             .lock()
             .iter()
-            .find(|(channel, _)| channel == super::EVT_JOURNAL)
-            .cloned()
-            .expect("replay must emit a journal payload");
-        assert_eq!(journal.1["replayed"], true);
+            .filter(|(channel, _)| channel == super::EVT_JOURNAL)
+            .map(|(_, payload)| payload["replayed"].as_bool().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal_flags,
+            vec![true, false],
+            "a live tail frame interleaved before ReplayComplete stays live"
+        );
     }
 
     #[test]
