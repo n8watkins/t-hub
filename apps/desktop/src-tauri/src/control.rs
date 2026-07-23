@@ -14629,11 +14629,11 @@ fn dispatch_with_caller(
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
-        "git_info" => git_info(ctx, args),
-        "index_project" => index_project(ctx, args),
-        "search_files" => search_files(ctx, args),
-        "list_dir" => list_dir(ctx, args),
-        "read_text_file" => read_text_file(ctx, args),
+        "git_info" => handlers_files::git_info(ctx, args),
+        "index_project" => handlers_files::index_project(ctx, args),
+        "search_files" => handlers_files::search_files(ctx, args),
+        "list_dir" => handlers_files::list_dir(ctx, args),
+        "read_text_file" => handlers_files::read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
@@ -18015,100 +18015,9 @@ fn local_host_metrics() -> t_hub_protocol::HostMetrics {
     }
 }
 
-/// `git_info` (server-split M3 overlay source): git awareness — branch / worktree
-/// root / linked-worktree flag / dirty count — for a project cwd, so a thin client
-/// gets the Files-panel git header remotely. Mirrors the `git_info` Tauri command
-/// (same `GitInfo` shape), reusing its per-cwd TTL cache (the freeze fix). Args:
-/// `path` (or `cwd`), the same cwd string the frontend passes.
-fn git_info(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let cwd = arg_str(args, "path")
-        .or_else(|| arg_str(args, "cwd"))
-        .ok_or("git_info requires a 'path' (cwd) argument")?;
-    // #27 follow-up: gate the peer-controlled cwd for a REMOTE peer to the operator
-    // allowlist — else it leaks whether an arbitrary host path is a git repo + its
-    // branch/dirty state. Loopback is unrestricted (scoped_create_path handles the
-    // existing cwd; substitute the scoped path so check and use can't diverge).
-    let cwd = if ctx.peer_is_loopback {
-        cwd
-    } else {
-        files::scoped_create_path(&cwd, true, files::remote_file_roots())?
-            .to_string_lossy()
-            .into_owned()
-    };
-    serde_json::to_value(crate::git::git_info_cached(&cwd)).map_err(|e| e.to_string())
-}
-
-/// `index_project` (server-split M3 — the file index, build half): walk `root`,
-/// (re)build the control channel's file index, and return its `IndexSummary`
-/// (`{root, count}`). Mirrors the `index_project` Tauri command (same shape), so
-/// the frontend's warmup flips onto the wire and a thin client indexes the REMOTE
-/// tree. Args: `root` (required). Paired with [`search_files`], which reuses the
-/// cache this warms (and self-indexes on demand if skipped).
-fn index_project(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let root = arg_str(args, "root").ok_or("index_project requires a 'root' argument")?;
-    let summary = files::control_index(
-        &ctx.files,
-        &root,
-        !ctx.peer_is_loopback,
-        files::remote_file_roots(),
-    )?;
-    serde_json::to_value(summary).map_err(|e| e.to_string())
-}
-
-/// `search_files`: fuzzy basename/path/extension search over a project root,
-/// using the control channel's own index cache. Args: `root` (required),
-/// `query` (required), `limit` (optional, default 20).
-fn search_files(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let root = arg_str(args, "root").ok_or("search_files requires a 'root' argument")?;
-    let query = arg_str(args, "query").unwrap_or_default();
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(20)
-        .clamp(1, 1000);
-    let hits = files::control_search(
-        &ctx.files,
-        &root,
-        &query,
-        limit,
-        !ctx.peer_is_loopback,
-        files::remote_file_roots(),
-    )?;
-    Ok(json!({ "root": root, "query": query, "hits": hits }))
-}
-
-/// `list_dir` (server-split #23 — the Files-panel TREE over the socket): a shallow
-/// directory listing (dirs first, the directory-only gitignore rule). Mirrors the
-/// `list_dir` Tauri command (same `DirEntry[]` shape). A REMOTE peer is SCOPED to
-/// indexed roots (`files::control_list_dir`); loopback is unrestricted. Args: `path`
-/// (required), `showIgnored` (optional, default false).
-fn list_dir(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let path = arg_str(args, "path").ok_or("list_dir requires a 'path' argument")?;
-    let show_ignored = args
-        .get("showIgnored")
-        .or_else(|| args.get("show_ignored"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let entries = files::control_list_dir(
-        &path,
-        show_ignored,
-        !ctx.peer_is_loopback,
-        files::remote_file_roots(),
-    )?;
-    serde_json::to_value(entries).map_err(|e| e.to_string())
-}
-
-/// `read_text_file` (server-split #23 — the Files-panel READER over the socket): a
-/// size-capped, binary-rejecting text read. Mirrors the `read_text_file` Tauri
-/// command (same `FileContents` shape). A REMOTE peer is SCOPED to indexed roots;
-/// loopback is unrestricted. WRITE stays in-process (deferred). Args: `path`.
-fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    let path = arg_str(args, "path").ok_or("read_text_file requires a 'path' argument")?;
-    let contents =
-        files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
-    serde_json::to_value(contents).map_err(|e| e.to_string())
-}
+// File/git read handlers live in the `handlers_files` submodule (below the
+// dispatch match that routes to them).
+mod handlers_files;
 
 /// `list_tabs`: the live workspace tabs from the CORE tab registry (TASK C / #22),
 /// each `{id, name, tileIds}`. The frontend reports its full tab layout up (the
