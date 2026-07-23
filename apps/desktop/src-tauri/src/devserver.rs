@@ -2834,9 +2834,19 @@ mod tests {
         assert!(command.get_program().to_string_lossy().starts_with('/'));
         assert_eq!(arguments[0], "-I");
         assert_eq!(arguments[1], "-c");
-        assert_eq!(arguments[2], crate::preview::supervisor::SUPERVISOR_PY);
-        assert_eq!(arguments[3], "run-test");
-        assert_eq!(arguments[5..], ["pnpm", "run", "odd; $(unsafe) ' name"]);
+        assert!(arguments[2].contains("os.fchdir(directory)"));
+        assert_eq!(arguments[3], "/tmp");
+        assert_eq!(arguments[4], "");
+        assert!(arguments[5].starts_with('/'));
+        assert_eq!(arguments[6], "-I");
+        assert_eq!(arguments[7], "-c");
+        assert_eq!(arguments[8], crate::preview::supervisor::SUPERVISOR_PY);
+        assert_eq!(arguments[9], "run-test");
+        assert_eq!(arguments[10].len(), 32);
+        assert!(arguments[10]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric()));
+        assert_eq!(arguments[11..], ["pnpm", "run", "odd; $(unsafe) ' name"]);
     }
 
     #[cfg(not(windows))]
