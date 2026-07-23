@@ -232,20 +232,30 @@ export function WebPreview({
 
   const openInBrowser = useCallback(() => {
     // The external browser is ALSO a Windows process, so it hits the same
-    // unreachable WSL loopback — hand it the reachable URL, not the raw one.
+    // unreachable WSL loopback. Managed URLs are already backend-resolved and
+    // ownership-verified; manual URLs retain the compatibility rewrite.
     if (!url) return;
-    void reachablePreviewUrl(url).then((u) => openExternal(u || url));
-  }, [url]);
+    const resolution =
+      urlProvenance === "managed"
+        ? Promise.resolve(url)
+        : reachablePreviewUrl(url);
+    void resolution.then((u) => openExternal(u || url));
+  }, [url, urlProvenance]);
   // (openExternal is async with its own internal fallback; we fire-and-forget.)
 
   // Pop the current preview out into its own OS window (TASK 3). The window is a
   // top-level load of the (reachable) dev URL — no iframe, so framing CSPs don't
   // apply — and each call opens a NEW window, so multiple previews can coexist
-  // (TASK 2). We resolve the reachable URL first for the same WSL reason.
+  // (TASK 2). Preserve backend authority for managed URLs and resolve manual
+  // URLs through the Windows/WSL compatibility path.
   const popOut = useCallback(() => {
     if (!url) return;
-    void reachablePreviewUrl(url).then((u) => popOutPreview(u || url));
-  }, [url]);
+    const resolution =
+      urlProvenance === "managed"
+        ? Promise.resolve(url)
+        : reachablePreviewUrl(url);
+    void resolution.then((u) => popOutPreview(u || url));
+  }, [url, urlProvenance]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
