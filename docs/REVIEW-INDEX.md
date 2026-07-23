@@ -26,7 +26,10 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 
 - [CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is the General-directed integration specification for scoped Captain grants, existing-repository self-bootstrap, and bounded routine delivery; the phased plan remains authoritative for ownership, order, and activation.
 - [PRODUCTION-READINESS.md](./PRODUCTION-READINESS.md) supplies release-quality gates that remain applicable where the phased plan has not superseded their sequencing.
-- [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the packaged runtime measurement procedure.
+- [UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md](./UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md) defines the active serialized Package 0 through Package 6 follow-up and its package-level gates.
+- [PACKAGE-5-LIVE-ACCEPTANCE.md](./PACKAGE-5-LIVE-ACCEPTANCE.md) defines exact artifact provenance, installation isolation, and live product acceptance for the packaged development candidate.
+- [PACKAGE-6-PERFORMANCE-CLOSURE.md](./PACKAGE-6-PERFORMANCE-CLOSURE.md) defines quantitative performance budgets, deterministic workloads, evidence, eligibility, and release-failure rules.
+- [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the existing process-tree measurement procedure used as one input to Package 6.
 - [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) is a historical compatibility reference for retired Powder data and profiles.
 - [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md) defines provider-neutral conversation identity, catalog, resume, recovery, archive, cache, and compatibility behavior.
 - [MCP.md](./MCP.md) documents the existing MCP and control-channel implementation, while the CLI-first roadmap governs its future surface.

@@ -46,9 +46,10 @@ There is no provider-neutral Preview control surface in the T-Hub control dispat
 
 Kokoro settings are enabled and both local text-to-speech health endpoints responded successfully during the audit.
 A real Kokoro request produced a valid WAV file, so synthesis is available.
-Interactive Codex is currently launched as telemetry-unobserved and does not produce the normalized permission and question transitions that the voice watcher consumes.
-T-Hub already contains a Codex hook normalizer, but it does not install or wire a T-Hub Codex lifecycle hook into interactive Codex sessions.
-Voice currently announces permission and question transitions, not completion or arbitrary command events.
+Package 4 source now installs and repairs supported Claude and Codex lifecycle hooks, normalizes both providers into the same durable event authority, and records redacted delivery outcomes.
+Permission and question announcements remain enabled through the legacy attention projection.
+Completion and failure announcements have independent settings and default off.
+This source behavior and audible Windows playback remain packaged-unproven until Package 5 passes.
 
 The reported Appturnity folder `/home/natkins/appturnity/monorepo-app` exists, is populated, and is a valid Git main worktree.
 The backend-equivalent WSL directory-list command currently returns its child folders.
@@ -118,7 +119,7 @@ Voice must consume normalized provider-neutral lifecycle events rather than Clau
 Codex hook integration must redact prompt and tool content before persistence or fanout.
 Replay and restart recovery must not repeat already-announced events.
 Permission, question, completion, and failure announcements need explicit per-event policy so "voice works" is testable rather than ambiguous.
-The implementation should preserve the current attention announcements and add completion or failure settings only through an intentional product contract.
+The selected product contract preserves the existing attention announcements and makes completion and failure separately configurable with disabled defaults.
 
 ## Serialized Execution
 
@@ -251,7 +252,17 @@ This package changes persisted control-plane state and requires migration review
 1. Use Settings Test Voice to separate synthesis and playback from lifecycle-hook behavior.
 2. Trigger equivalent permission and question states in Claude and interactive Codex.
 3. Compare normalized events, journal entries, frontend status transitions, synthesis requests, playback outcome, and deduplication.
-4. Decide and document whether completion and failure should speak by default or through separate settings.
+4. Exercise permission, question, completion, and failure with each resolved per-event policy both enabled and disabled.
+
+#### Resolved announcement policy
+
+Voice remains globally opt-in and the master `enabled` setting defaults to `false`.
+Permission, question, completion, and failure are four independent per-event settings.
+Every per-event setting defaults to `false`, including completion and failure.
+The legacy `announceOnAttention` field is a compatibility projection that is true when either permission or question is enabled.
+The legacy field does not enable completion or failure.
+Enabling one event kind must never enable another event kind.
+Replay suppression and durable delivery claims apply identically to all four event kinds.
 
 #### Implementation contract
 
@@ -268,7 +279,7 @@ This package changes persisted control-plane state and requires migration review
 - Test Voice is audible through the packaged Windows app.
 - Equivalent Claude and Codex attention events produce one announcement with equivalent wording and timing.
 - Restart and journal replay do not repeat an announcement.
-- Disabled voice, disabled attention, and per-event settings are respected.
+- The master switch and all four independent per-event settings are respected.
 - Hook install and uninstall preserve unrelated Codex configuration.
 - The journal remains bounded under noisy Codex tool activity.
 
@@ -279,6 +290,22 @@ This package affects provider configuration and potentially sensitive event data
 The first build should be an isolated T-Hub Dev build, not an immediate production replacement.
 Building before Packages 0 through 4 are integrated would prove that merged History and responsive-header source works, but it would become stale as soon as the remaining fixes land.
 The preferred sequence is one source-level reproduction baseline, serialized fixes, full automated verification, one isolated Dev build, live acceptance, and then an explicit production promotion decision.
+The authoritative operator matrix and evidence contract are in `docs/PACKAGE-5-LIVE-ACCEPTANCE.md`.
+
+#### Entry gate
+
+- Packages 0 through 4 are integrated into one exact clean canonical commit.
+- Every required independent source review approves that exact integrated ancestry.
+- The complete source, CLI, MCP, migration, browser, Rust, formatting, and lint gates pass at the candidate commit.
+- The Captain checkpoint records the candidate commit, Package 4 protocol version, remaining external prerequisites, and Package 5 as the next ordered action.
+- The candidate is available to the authorized Windows builder without changing its commit identity.
+
+#### Provenance contract
+
+- One immutable evidence manifest binds the source commit, workflow and run identity, lockfile hash, application and protocol versions, installer hash, raw binary hash, extracted binary hash, installed binary hash, validator output, installation target, and observation timestamps.
+- The evidence manifest and retained artifacts use SHA-256 and never contain control credentials, provider credentials, session credentials, or unredacted hook payloads.
+- Every live observation names the same installed binary hash and source commit.
+- A source change invalidates the candidate and requires a new build, installation record, and affected acceptance runs.
 
 #### Acceptance
 
@@ -290,6 +317,30 @@ The preferred sequence is one source-level reproduction baseline, serialized fix
 - Git and non-Git Captain creation pass.
 - Header, Preview, and voice acceptance pass in the real Windows WebView and audio path.
 - Production is not replaced until the General authorizes promotion after reviewing Dev evidence.
+- Every matrix row in `docs/PACKAGE-5-LIVE-ACCEPTANCE.md` has a passing result or an explicitly accepted, non-release-blocking exception.
+- An independent release-evidence reviewer approves the complete manifest and matrix against the exact installed artifact.
+
+### Package 6 - Performance closure
+
+Package 6 closes the quantitative release gates against the same installed T-Hub Dev artifact accepted by Package 5.
+Its authoritative budgets, workload definitions, evidence schema, validity rules, and failure policy are in `docs/PACKAGE-6-PERFORMANCE-CLOSURE.md`.
+Instrumentation that changes source must land before the Package 5 candidate freezes.
+Any performance remediation creates a new candidate and repeats the affected Package 5 and Package 6 gates.
+
+#### Entry gate
+
+- Package 5 has one installed and provenance-verified T-Hub Dev artifact.
+- The deterministic disposable benchmark workspace and every scenario driver are available.
+- The benchmark collector records the installed artifact identity and observes the declared in-app terminal count.
+- Instrumentation covers Windows and owned WSL processes, WebView responsiveness, operation latency, journal growth, Preview lifecycle, voice delivery, and endpoint recovery without recording sensitive content.
+
+#### Acceptance
+
+- One, four, eight, and sixteen-terminal matrices pass every mandatory budget in `docs/PACKAGE-6-PERFORMANCE-CLOSURE.md`.
+- Every matrix cell has three eligible repetitions with identical workload identity and installed binary identity.
+- No run contains an unexplained process leak, unbounded queue, reconnect loop, journal-growth violation, five-second UI stall, or ownership ambiguity.
+- The exact artifact remains within both the absolute budgets and the allowed paired-baseline regression limits.
+- An independent benchmark-method reviewer approves workload equivalence, sample eligibility, metric derivation, exclusions, and the final pass or fail decision.
 
 ## Performance Program
 
@@ -316,6 +367,8 @@ Measure idle, terminal-output, folder-browsing, Preview-starting, Preview-noisy,
 Record process-tree working set, private bytes, CPU, process count, thread count, input latency, panel-open latency, Preview-ready latency, voice latency, endpoint-recovery latency, and journal growth.
 Compare only identical workloads and installed binary identities.
 Any interval with process birth or death must follow the benchmark document's eligibility rules.
+The legacy process-tree collector is only one input to Package 6.
+It does not satisfy Package 6 until the additional metrics and deterministic scenario contract in `docs/PACKAGE-6-PERFORMANCE-CLOSURE.md` are present.
 
 ## Verification Gates Per Package
 
@@ -344,7 +397,13 @@ No package is considered live until verified against an exact packaged Windows b
 Only one implementation package may be active at a time.
 The next package starts only after the previous commit, test evidence, independent review where required, and Captain checkpoint are complete.
 
-## Open Product Decision
+## Resolved Product Decision
+
+There is no open voice-policy decision for this itinerary.
+Package 4 keeps four independent permission, question, completion, and failure settings.
+The master voice switch and all four per-event settings default off.
+The legacy attention field remains only a compatibility projection of permission or question.
+Package 5 must verify all four event policies in both states against the packaged Windows application.
 
 ## Audit Consolidation - 2026-07-21
 
@@ -359,7 +418,8 @@ These reports were produced against an older product snapshot and do not establi
 A new packaged browser audit is required for current UI regressions rather than reviving these native-client findings.
 The reports are therefore treated as completed historical evidence, while this itinerary remains the canonical source for actionable follow-up.
 
-The General reported that Kokoro is silent for Codex commands.
-The current policy speaks only permission and question events, so successful command completion is silent by design.
-The recommended contract is to keep permission and question announcements enabled by the existing attention setting and add separate configurable completion and failure announcements with conservative defaults.
-The live acceptance matrix must test whichever policy the General selects.
+The General reported that Kokoro was silent for Codex commands.
+Package 4 implemented provider-neutral permission, question, completion, and failure authority with durable replay and delivery outcomes.
+All four event kinds are independently configurable and default off.
+The legacy attention projection reflects permission or question and has no authority over completion or failure.
+Package 5 must prove that exact policy and audible delivery in the installed Windows application.
