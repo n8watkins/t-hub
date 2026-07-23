@@ -6,6 +6,7 @@
 
 pub mod discovery;
 pub mod endpoint;
+pub(crate) mod managed_runner;
 pub mod model;
 pub mod profile;
 pub mod runtime;

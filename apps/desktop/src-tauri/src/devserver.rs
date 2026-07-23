@@ -613,65 +613,14 @@ pub async fn discover_run_targets(cwd: String) -> Result<RunTargetDiscovery, Str
 /// project's cwd rather than over the slow UNC bridge.
 #[cfg(windows)]
 fn unc_to_posix(path: &str) -> Option<String> {
-    // Already a bare POSIX path: pass through.
-    if path.starts_with('/') {
-        return Some(path.to_string());
-    }
-    // Peel a verbatim extended-length prefix first (`\\?\UNC\...` / `\\?\C:\...`).
-    let s: std::borrow::Cow<str> = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
-        std::borrow::Cow::Owned(format!("\\\\{rest}"))
-    } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
-        std::borrow::Cow::Owned(rest.to_string())
-    } else {
-        std::borrow::Cow::Borrowed(path)
-    };
-    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            // `rest` is `<distro>\home\natkins\...`; drop the distro segment.
-            let tail = match rest.split_once('\\') {
-                Some((_distro, tail)) => tail,
-                None => "",
-            };
-            let posix = format!("/{}", tail.replace('\\', "/"));
-            return Some(posix);
-        }
-    }
-    None
+    crate::preview::managed_runner::unc_to_posix(path)
 }
 
 /// Supervise the complete package-manager process group behind a stdin
 /// lifeline. The package manager and validated script remain argv data after
 /// the fixed shell program. EOF from T-Hub triggers TERM, a bounded grace
 /// period, and KILL for the owned group. Natural child exit preserves its code.
-const PROCESS_TREE_SCRIPT: &str = r#"set -u
-MARKER="/tmp/t-hub-devserver-$1.pid"
-shift
-export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0
-exec 3<&0
-setsid "$@" 3<&- </dev/null &
-SRV=$!
-echo "$SRV" > "$MARKER" 2>/dev/null || true
-cleanup() {
-  kill -TERM -- -"$SRV" 2>/dev/null || true
-  i=0
-  while kill -0 "$SRV" 2>/dev/null && [ "$i" -lt 20 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  kill -KILL -- -"$SRV" 2>/dev/null || true
-  wait "$SRV" 2>/dev/null || true
-  rm -f "$MARKER" 2>/dev/null || true
-}
-trap 'cleanup; exit 0' TERM INT HUP
-(cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || true) &
-LIFE=$!
-wait "$SRV"
-CODE=$?
-kill "$LIFE" 2>/dev/null || true
-wait "$LIFE" 2>/dev/null || true
-cleanup
-exit "$CODE"
-"#;
+const PROCESS_TREE_SCRIPT: &str = crate::preview::managed_runner::PROCESS_TREE_SCRIPT;
 
 /// Wrap the user's dev command so the server binds to ALL interfaces
 /// (`0.0.0.0`) rather than only the WSL loopback (`127.0.0.1`).
@@ -704,48 +653,13 @@ fn build_command(
     package_manager: PackageManager,
     script: &str,
 ) -> Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let posix_cwd = unc_to_posix(cwd).unwrap_or_else(|| cwd.to_string());
-        let mut c = Command::new("wsl.exe");
-        c.arg("-d").arg(crate::files::host_distro());
-        if !posix_cwd.is_empty() {
-            c.arg("--cd").arg(&posix_cwd);
-        }
-        c.arg("-e")
-            .arg("bash")
-            .arg("-c")
-            .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-runner")
-            .arg(run_id)
-            .arg(package_manager.executable())
-            .arg("run")
-            .arg(script);
-        c.creation_flags(0x0800_0000);
-        c.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::piped());
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c")
-            .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-runner")
-            .arg(run_id)
-            .arg(package_manager.executable())
-            .arg("run")
-            .arg(script);
-        if !cwd.is_empty() {
-            c.current_dir(cwd);
-        }
-        c.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::piped());
-        c
-    }
+    crate::preview::managed_runner::package_command_with_marker(
+        Path::new(cwd),
+        run_id,
+        package_manager.executable(),
+        script,
+        "t-hub-devserver",
+    )
 }
 
 /// Drain a piped reader line-by-line, emitting each line on the dev-server
@@ -2400,7 +2314,7 @@ mod tests {
             [
                 "-c",
                 PROCESS_TREE_SCRIPT,
-                "t-hub-runner",
+                "t-hub-devserver",
                 "run-test",
                 "pnpm",
                 "run",
