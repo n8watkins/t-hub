@@ -24,6 +24,7 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 pub const LIFECYCLE_SCHEMA: &str = "t-hub.codex.lifecycle.v1";
 pub const PERMISSION_SCHEMA: &str = "t-hub.permission-request.v1";
+pub const QUESTION_SCHEMA: &str = "t-hub.question-request.v1";
 pub const VERIFIED_CODEX_VERSION: &str = "0.145.0";
 
 const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -287,6 +288,13 @@ fn map_app_server_message(
                 )
             })
         }
+        "item/tool/requestUserInput" => {
+            state.active_turn = true;
+            state.terminal_turn = false;
+            question_entry(value, state, binding).or_else(|| {
+                malformed_question_entry(state, binding, "invalid_question_request_identity")
+            })
+        }
         "serverRequest/resolved" => {
             let Some(request_id) = value_id(params.get("requestId")) else {
                 return health_entry(
@@ -341,6 +349,69 @@ fn map_app_server_message(
         ),
         _ => None,
     }
+}
+
+fn question_entry(
+    value: &Value,
+    state: &TapState,
+    binding: &TmuxBinding,
+) -> Option<EventJournalEntry> {
+    let params = value.get("params").unwrap_or(&Value::Null);
+    let request_id = value_id(value.get("id"))?;
+    let questions = params.get("questions").and_then(Value::as_array);
+    let mut entry = lifecycle_entry(
+        state,
+        binding,
+        JournalEventType::Elicitation,
+        "question_requested",
+    )?;
+    entry.payload["question_request"] = json!({
+        "schema_version": QUESTION_SCHEMA,
+        "provider": "codex",
+        "provider_request_id": request_id,
+        "session_id": state.session_id,
+        "turn_id": state.turn_id,
+        "item_id": exact_string(params.get("itemId"), MAX_ID_BYTES),
+        "question_count": questions.map_or(0, Vec::len),
+        "has_secret": questions.is_some_and(|questions| questions.iter().any(|question| {
+            question.get("isSecret").and_then(Value::as_bool) == Some(true)
+        })),
+        "has_options": questions.is_some_and(|questions| questions.iter().any(|question| {
+            question.get("options").is_some_and(|options| !options.is_null())
+        })),
+        "auto_resolution_configured": params
+            .get("autoResolutionMs")
+            .is_some_and(|value| !value.is_null()),
+    });
+    entry.payload["question_request_id"] =
+        entry.payload["question_request"]["provider_request_id"].clone();
+    assign_codex_event_identity(&mut entry, state);
+    Some(entry)
+}
+
+fn malformed_question_entry(
+    state: &TapState,
+    binding: &TmuxBinding,
+    detail: &str,
+) -> Option<EventJournalEntry> {
+    let mut entry = lifecycle_entry(
+        state,
+        binding,
+        JournalEventType::Elicitation,
+        "question_requested",
+    )?;
+    entry.payload["question_observation"] = json!({
+        "schema_version": QUESTION_SCHEMA,
+        "provider": "codex",
+        "valid": false,
+    });
+    entry.payload["telemetry"] = json!({
+        "transport": "structured",
+        "quality": "stale",
+        "runtime_health": "degraded",
+        "detail": detail,
+    });
+    Some(entry)
 }
 
 fn permission_entry(
@@ -557,6 +628,10 @@ fn assign_codex_event_identity(entry: &mut EventJournalEntry, state: &TapState) 
         .get("permission_request_id")
         .and_then(Value::as_str)
         .filter(|value| !value.starts_with("hook-opaque-v1:"));
+    let question_id = entry
+        .payload
+        .get("question_request_id")
+        .and_then(Value::as_str);
 
     let identity = match lifecycle {
         Some(kind @ ("thread_started" | "thread_closed")) if session_id.is_some() => {
@@ -582,6 +657,15 @@ fn assign_codex_event_identity(entry: &mut EventJournalEntry, state: &TapState) 
                 ],
             )
         }
+        Some("question_requested") if question_id.is_some() => crate::event_identity::derive(
+            "codex",
+            "question_requested",
+            &[
+                ("request_id", question_id),
+                ("session_id", session_id),
+                ("turn_id", turn_id),
+            ],
+        ),
         _ => None,
     };
     entry.event_id = identity;
@@ -632,7 +716,7 @@ fn entry_from_native_hook(
         exact_turn_id,
         ..TapState::default()
     };
-    match hook_name {
+    let mut entry = match hook_name {
         "SessionStart" => lifecycle_entry(
             &state,
             &binding,
@@ -708,7 +792,9 @@ fn entry_from_native_hook(
             "thread_closed",
         ),
         _ => health_entry(&state, &binding, "degraded", "unsupported_native_hook"),
-    }
+    }?;
+    entry.source = JournalSource::Hook;
+    Some(entry)
 }
 
 fn value_id(value: Option<&Value>) -> Option<String> {

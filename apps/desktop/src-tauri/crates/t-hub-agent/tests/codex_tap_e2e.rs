@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use t_hub_protocol::{EventJournalEntry, JournalEventType};
+use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 fn temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -125,8 +125,84 @@ fn codex_0145_native_hooks_preserve_lifecycle_without_private_content() {
     assert!(entries.iter().all(|entry| {
         entry.entity_id.as_deref() == Some("019c881d-6f54-7ec1-9516-0ca28d18f145")
     }));
+    assert!(entries
+        .iter()
+        .all(|entry| entry.source == JournalSource::Hook));
+    assert!(entries.iter().all(|entry| {
+        entry.payload["schema_version"] == "t-hub.codex.lifecycle.v1"
+            && entry.payload["provider"] == "codex"
+            && entry.payload["telemetry"]["transport"] == "structured"
+    }));
+    assert_eq!(entries[0].payload["lifecycle"], "thread_started");
+    assert_eq!(entries[1].payload["lifecycle"], "turn_started");
+    assert_eq!(entries[2].payload["lifecycle"], "permission_requested");
+    assert_eq!(
+        entries[2].payload["permission_request"]["schema_version"],
+        "t-hub.permission-request.v1"
+    );
+    assert_eq!(entries[3].payload["lifecycle"], "turn_completed");
+    assert_eq!(entries[4].payload["lifecycle"], "thread_closed");
+    assert!(entries[0].event_id.is_some());
+    assert!(entries[1].event_id.is_some());
+    assert!(entries[2].event_id.is_none());
+    assert!(entries[3].event_id.is_some());
+    assert!(entries[4].event_id.is_some());
     assert!(!journal.contains("credential-bearing"));
     assert!(!journal.contains("private-worktree"));
+
+    std::fs::remove_dir_all(journal_dir).ok();
+}
+
+#[test]
+fn codex_0145_structured_question_is_sanitized_needs_question() {
+    let journal_dir = temp_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-hub-agent"))
+        .args(["--codex-tap", "--journal-dir"])
+        .arg(&journal_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(include_bytes!(
+            "fixtures/codex-0.145.0-app-server-question.jsonl"
+        ))
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "question tap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let journal = std::fs::read_to_string(journal_dir.join("events.ndjson")).unwrap();
+    let entries: Vec<EventJournalEntry> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let question = entries
+        .iter()
+        .find(|entry| entry.event_type == JournalEventType::Elicitation)
+        .expect("structured question must become an elicitation");
+    assert_eq!(question.source, JournalSource::Agent);
+    assert_eq!(question.payload["lifecycle"], "question_requested");
+    assert_eq!(
+        question.payload["question_request"]["schema_version"],
+        "t-hub.question-request.v1"
+    );
+    assert_eq!(
+        question.payload["question_request"]["provider_request_id"],
+        "question-request-0145"
+    );
+    assert_eq!(question.payload["question_request"]["question_count"], 1);
+    assert_eq!(question.payload["question_request"]["has_secret"], true);
+    assert_eq!(question.payload["question_request"]["has_options"], true);
+    assert!(question.event_id.is_some());
+    assert!(!journal.contains("credential-bearing"));
 
     std::fs::remove_dir_all(journal_dir).ok();
 }
