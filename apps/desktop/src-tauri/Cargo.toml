@@ -92,6 +92,8 @@ base64 = "0.22"
 # (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
 # makes it a direct dependency (no lockfile resolution change).
 sha2 = "0.10"
+fs2 = "0.4"
+toml = "0.8.2"
 # Non-evaluating POSIX command tokenization for durable provider launch
 # provenance. This never performs expansion or executes the configured command.
 shell-words = "1"

@@ -167,6 +167,66 @@ pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
     crate::claude::install::managed_event_names().map_err(|e| e.to_string())
 }
 
+// --- Codex native lifecycle hook installer ---
+
+#[tauri::command]
+pub async fn install_codex_hooks(
+    agent_bin: String,
+    consent: bool,
+) -> Result<crate::codex::hooks_install::InstallReport, String> {
+    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    crate::codex::hooks_install::install(
+        &home,
+        &crate::codex::hooks_install::requirements_path(),
+        std::path::Path::new(&agent_bin),
+        consent,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn repair_codex_hooks(
+    agent_bin: String,
+    consent: bool,
+) -> Result<crate::codex::hooks_install::InstallReport, String> {
+    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    crate::codex::hooks_install::repair(
+        &home,
+        &crate::codex::hooks_install::requirements_path(),
+        std::path::Path::new(&agent_bin),
+        consent,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn uninstall_codex_hooks(
+    agent_bin: String,
+) -> Result<crate::codex::hooks_install::InstallReport, String> {
+    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    crate::codex::hooks_install::uninstall(
+        &home,
+        &crate::codex::hooks_install::requirements_path(),
+        std::path::Path::new(&agent_bin),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn codex_hooks_health(
+    agent_bin: String,
+    project_root: Option<String>,
+) -> Result<crate::codex::hooks_install::ProducerHealth, String> {
+    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    crate::codex::hooks_install::health_at_with_project(
+        &home,
+        &crate::codex::hooks_install::requirements_path(),
+        std::path::Path::new(&agent_bin),
+        project_root.as_deref().map(std::path::Path::new),
+    )
+    .map_err(|error| error.to_string())
+}
+
 // --- item-3 Pillar C: the BLOCKING PreToolUse gate - a DISTINCT opt-in (HIGH-1) ---
 //
 // The gate is a BLOCKING enforcement hook, separate from the observe-only hooks, so

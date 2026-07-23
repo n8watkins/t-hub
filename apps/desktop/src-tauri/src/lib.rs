@@ -967,6 +967,10 @@ pub fn run() {
             commands_05::uninstall_claude_hooks,
             commands_05::claude_hooks_installed,
             commands_05::claude_hooks_managed,
+            commands_05::install_codex_hooks,
+            commands_05::repair_codex_hooks,
+            commands_05::uninstall_codex_hooks,
+            commands_05::codex_hooks_health,
             // item-3 Pillar C: the blocking PreToolUse gate - a DISTINCT opt-in.
             commands_05::install_claude_gate,
             commands_05::uninstall_claude_gate,

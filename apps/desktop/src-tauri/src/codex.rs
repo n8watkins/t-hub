@@ -26,6 +26,8 @@
 use rusqlite::OpenFlags;
 use serde::Serialize;
 
+pub mod hooks_install;
+
 /// One rate-limit window (`primary` ≈ 5h, `secondary` ≈ weekly). `usedPercent` is
 /// 0..=100; the UI shows "left" = 100 - used. `resetsAt` is Unix-epoch seconds.
 #[derive(Debug, Clone, Default, Serialize)]
