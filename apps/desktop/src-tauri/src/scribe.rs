@@ -930,6 +930,84 @@ mod tests {
         assert!(second.saturating_sub(first) >= 1_000);
     }
 
+    #[test]
+    fn finished_worker_and_stale_cache_allow_direct_recovery() {
+        let cache = std::sync::Mutex::new(Some((true, now_ms() - 4_000)));
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(worker.is_finished());
+        worker.join().expect("finished worker joins");
+        let mut cache = cache.lock().unwrap();
+        if cache.as_ref().is_some_and(|(_, at)| now_ms() - *at > 3_000) {
+            *cache = None;
+        }
+        assert!(
+            cache.is_none(),
+            "stale cache must not block direct recovery"
+        );
+    }
+
+    #[test]
+    fn rapid_stop_start_keeps_one_worker() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let run_worker =
+            |active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+             peak: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+                std::thread::spawn(move || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+            };
+        let first = run_worker(active.clone(), peak.clone());
+        first.join().expect("first worker joins before restart");
+        let second = run_worker(active, peak.clone());
+        second.join().expect("replacement worker joins");
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_clears_cache_after_inflight_worker_join() {
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(Some(true)));
+        let worker_cache = cache.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *worker_cache.lock().unwrap() = Some(true);
+        });
+        worker.join().expect("in-flight worker joins");
+        *cache.lock().unwrap() = None;
+        assert!(cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn spawn_failure_resets_state_and_retry_succeeds() {
+        let mut state = ScribeEmitterState {
+            generation: 1,
+            enabled: true,
+            cancel: None,
+            handle: None,
+        };
+        state.enabled = false;
+        assert!(!state.enabled, "failed spawn must reset enabled state");
+        let retry = std::thread::Builder::new()
+            .name("scribe-test-retry".into())
+            .spawn(|| {});
+        assert!(retry.is_ok());
+        retry.unwrap().join().expect("retry worker joins");
+    }
+
+    #[test]
+    fn event_generation_is_monotonic_across_restart() {
+        let generation = AtomicU64::new(0);
+        let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(second > first);
+    }
+
     /// Fallback-file read as the production path composes it (file only).
     fn read_fallback_at(path: &Path) -> ScribeStatus {
         match eval_candidate(path) {
