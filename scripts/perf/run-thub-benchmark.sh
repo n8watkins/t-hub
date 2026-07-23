@@ -166,6 +166,10 @@ if [ -n "$wsl_version" ] && [[ ! "$wsl_version" =~ ^v[0-9]+(\.[0-9]+){0,2}$ ]]; 
 if [ -n "$wsl_distro" ] && [[ ! "$wsl_distro" =~ ^[A-Za-z0-9._-]+$ ]]; then echo "run-thub-benchmark: WSL distro is not canonical" >&2; exit 2; fi
 if [ -n "$power_mode" ] && [[ ! "$power_mode" =~ ^(ac|dc|balanced|high_performance)$ ]]; then echo "run-thub-benchmark: power mode is not canonical" >&2; exit 2; fi
 if [ -n "$reference_selection_reason" ] && [[ ! "$reference_selection_reason" =~ ^[A-Za-z0-9._/\ -]+$ ]]; then echo "run-thub-benchmark: reference reason is not canonical" >&2; exit 2; fi
+if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
+  echo "run-thub-benchmark: required Windows/WSL dependency is unavailable" >&2
+  exit 3
+fi
 
 if [ -z "$output" ]; then
   output="$REPO_ROOT/artifacts/perf/t-hub-${terminals}t-$(date -u +%Y%m%dT%H%M%SZ).json"

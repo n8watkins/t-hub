@@ -45,6 +45,13 @@ fi
 if "$RUNNER" --pid 0 --dry-run >/dev/null 2>&1; then
   fail "zero PID was accepted"
 fi
+set +e
+PATH="$HERE" /usr/bin/bash "$RUNNER" --terminals 1 >/dev/null 2>&1
+dependency_exit=$?
+set -e
+if [ "$dependency_exit" -ne 3 ]; then
+  fail "missing PowerShell dependency returned exit $dependency_exit instead of 3"
+fi
 if "$RUNNER" --scenario-kind unsupported --dry-run >/dev/null 2>&1; then
   fail "unsupported scenario kind was accepted"
 fi
