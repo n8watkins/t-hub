@@ -91,6 +91,7 @@ static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterS
     std::sync::OnceLock::new();
 static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
     std::sync::OnceLock::new();
+static SCRIBE_DIRECT_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
 
 fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
     SCRIBE_EMITTER_STATE.get_or_init(|| {
@@ -710,6 +711,15 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
         if observed_at <= now && now - observed_at <= 3_000 {
             return Ok(status);
         }
+        return Ok(ScribeStatus::not_listening());
+    }
+    let now = now_ms().max(0) as u64;
+    let previous = SCRIBE_DIRECT_LAST_REQUEST_MS.load(Ordering::Acquire);
+    if now.saturating_sub(previous) < 1_000
+        || SCRIBE_DIRECT_LAST_REQUEST_MS
+            .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
         return Ok(ScribeStatus::not_listening());
     }
     let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
