@@ -88,7 +88,57 @@ async function installTauriMock(page: Page): Promise<void> {
             return { seq: 0, activeTabId: null, tabs: [] };
           }
           if (args?.command === "list_captains") {
-            return { seq: 0, captains: [] };
+            const terminalIds = (
+              (host.__BROWSER_TERMINALS__ as
+                | Array<{ id?: string }>
+                | undefined) ?? []
+            ).flatMap((terminal) =>
+              typeof terminal.id === "string" ? [terminal.id] : [],
+            );
+            return {
+              seq: 0,
+              projects: [
+                {
+                  projectId: "browser-project",
+                  rootPath: "/home/natkins/projects",
+                  repoRoot: "/home/natkins/projects",
+                },
+              ],
+              workspaces: [
+                {
+                  id: "browser-workspace",
+                  kind: "work",
+                  owner: { projectId: "browser-project" },
+                  tileIds: terminalIds,
+                },
+              ],
+              captains: [],
+            };
+          }
+          if (args?.command === "preview_discover") {
+            return {
+              discoveryFingerprint: "browser-preview-fixture",
+              targets: [
+                {
+                  id: "browser-preview",
+                  label: "Browser Preview",
+                  kind: {
+                    type: "packageScript",
+                    packageManager: "pnpm",
+                    script: "dev",
+                  },
+                  relativeRoot: "",
+                  recommended: true,
+                },
+              ],
+            };
+          }
+          if (args?.command === "preview_status") {
+            return {
+              state: "stopped",
+              observedAtMs: 0,
+              output: [],
+            };
           }
           if (args?.command === "recent_sessions") return [];
         }
