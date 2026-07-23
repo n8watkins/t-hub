@@ -79,16 +79,22 @@ function Write-JsonNoClobber {
     param([string]$Path, [object]$Value, [int]$Depth = 12)
     $json = $Value | ConvertTo-Json -Depth $Depth
     $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
-    $stream = [System.IO.File]::Open($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $stream = $null
+    $published = $false
     try {
+        $stream = [System.IO.File]::Open($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
         $encoding = New-Object System.Text.UTF8Encoding($false)
         $writer = New-Object System.IO.StreamWriter($stream, $encoding, 1024, $true)
         try { $writer.Write($json); $writer.Flush() } finally { $writer.Dispose() }
         $stream.Flush($true)
-    } finally { $stream.Dispose() }
-    $published = $false
-    try { [System.IO.File]::Move($temp, $Path); $published = $true }
-    finally { if (-not $published -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force } }
+        $stream.Dispose()
+        $stream = $null
+        [System.IO.File]::Move($temp, $Path)
+        $published = $true
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (-not $published -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force }
+    }
 }
 
 trap {
