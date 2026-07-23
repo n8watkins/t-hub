@@ -48,6 +48,7 @@ pub enum PreviewIntentPhase {
     Prepared,
     EffectObserved,
     Committed,
+    RecoveryReserved,
     RecoveryBlocked,
 }
 
@@ -272,8 +273,22 @@ impl PreviewProfileStore {
             .filter(|intent| {
                 matches!(
                     intent.phase,
-                    PreviewIntentPhase::Prepared | PreviewIntentPhase::EffectObserved
+                    PreviewIntentPhase::Prepared
+                        | PreviewIntentPhase::EffectObserved
+                        | PreviewIntentPhase::RecoveryReserved
                 )
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn admission_reservations(&self, scope: &PreviewScope) -> Vec<PreviewIntent> {
+        self.state
+            .lock()
+            .idempotency_journal
+            .iter()
+            .filter(|intent| {
+                intent.phase == PreviewIntentPhase::RecoveryReserved && intent.scope == *scope
             })
             .cloned()
             .collect()
@@ -289,12 +304,24 @@ fn valid_phase_transition(from: PreviewIntentPhase, to: PreviewIntentPhase) -> b
                 PreviewIntentPhase::EffectObserved
             ) | (
                 PreviewIntentPhase::Prepared,
+                PreviewIntentPhase::RecoveryReserved
+            ) | (
+                PreviewIntentPhase::Prepared,
                 PreviewIntentPhase::RecoveryBlocked
             ) | (
                 PreviewIntentPhase::EffectObserved,
                 PreviewIntentPhase::Committed
             ) | (
                 PreviewIntentPhase::EffectObserved,
+                PreviewIntentPhase::RecoveryReserved
+            ) | (
+                PreviewIntentPhase::EffectObserved,
+                PreviewIntentPhase::RecoveryBlocked
+            ) | (
+                PreviewIntentPhase::RecoveryReserved,
+                PreviewIntentPhase::EffectObserved
+            ) | (
+                PreviewIntentPhase::RecoveryReserved,
                 PreviewIntentPhase::RecoveryBlocked
             )
         )
@@ -483,10 +510,10 @@ fn validate_intent(intent: &PreviewIntent) -> Result<(), String> {
         {
             return Err("observed Preview intent has no durable status".into());
         }
-        PreviewIntentPhase::RecoveryBlocked
+        PreviewIntentPhase::RecoveryReserved | PreviewIntentPhase::RecoveryBlocked
             if intent.detail.as_deref().is_none_or(str::is_empty) =>
         {
-            return Err("blocked Preview recovery has no detail".into());
+            return Err("reserved or blocked Preview recovery has no detail".into());
         }
         _ => {}
     }

@@ -187,6 +187,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         )? {
             return Ok(replayed);
         }
+        self.ensure_admission_available(scope)?;
         if cancellation.is_cancelled() {
             return Err("Preview start was cancelled before spawning".into());
         }
@@ -393,6 +394,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         )? {
             return Ok(replayed);
         }
+        self.ensure_admission_available(scope)?;
         if cancellation.is_cancelled() {
             return Err("Preview restart was cancelled before spawning".into());
         }
@@ -748,12 +750,17 @@ impl<R: PreviewRuntime> PreviewService<R> {
                                 return Ok(Some(status));
                             }
                             RuntimeRediscovery::Absent => {}
-                            RuntimeRediscovery::Exact(_)
-                            | RuntimeRediscovery::Ambiguous
-                            | RuntimeRediscovery::Foreign => {
+                            RuntimeRediscovery::Ambiguous => {
+                                self.reserve_intent(
+                                    &intent.request_id,
+                                    "existing Preview run cleanup remains ambiguous",
+                                )?;
+                                return Ok(None);
+                            }
+                            RuntimeRediscovery::Exact(_) | RuntimeRediscovery::Foreign => {
                                 self.block_intent(
                                     &intent.request_id,
-                                    "existing Preview run rediscovery was ambiguous or foreign",
+                                    "existing Preview run rediscovery was invalid or foreign",
                                 )?;
                                 return Ok(None);
                             }
@@ -766,10 +773,17 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 self.commit_intent(&intent.request_id, status.clone())?;
                 Ok(Some(status))
             }
-            RuntimeRediscovery::Ambiguous | RuntimeRediscovery::Foreign => {
+            RuntimeRediscovery::Ambiguous => {
+                self.reserve_intent(
+                    &intent.request_id,
+                    "Preview runtime cleanup remains ambiguous",
+                )?;
+                Ok(None)
+            }
+            RuntimeRediscovery::Foreign => {
                 self.block_intent(
                     &intent.request_id,
-                    "Preview runtime rediscovery was ambiguous or foreign",
+                    "Preview runtime rediscovery was foreign",
                 )?;
                 Ok(None)
             }
@@ -812,11 +826,12 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 }
             }
             RuntimeRediscovery::Absent => {}
-            RuntimeRediscovery::Ambiguous | RuntimeRediscovery::Foreign => {
-                self.block_intent(
-                    &intent.request_id,
-                    "Preview stop rediscovery was ambiguous or foreign",
-                )?;
+            RuntimeRediscovery::Ambiguous => {
+                self.reserve_intent(&intent.request_id, "Preview stop cleanup remains ambiguous")?;
+                return Ok(None);
+            }
+            RuntimeRediscovery::Foreign => {
+                self.block_intent(&intent.request_id, "Preview stop rediscovery was foreign")?;
                 return Ok(None);
             }
         }
@@ -1060,6 +1075,22 @@ impl<R: PreviewRuntime> PreviewService<R> {
         })
     }
 
+    fn ensure_admission_available(&self, scope: &PreviewScope) -> Result<(), String> {
+        if let Some(reservation) = self
+            .profiles
+            .admission_reservations(scope)
+            .into_iter()
+            .next()
+        {
+            return Err(format!(
+                "Preview admission is reserved by incomplete cleanup for request '{}' and run '{}'",
+                reservation.request_id,
+                reservation.run_id.as_deref().unwrap_or("unknown")
+            ));
+        }
+        Ok(())
+    }
+
     fn scope_lock(&self, scope: &PreviewScope) -> Arc<Mutex<()>> {
         self.scope_locks
             .lock()
@@ -1187,6 +1218,17 @@ impl<R: PreviewRuntime> PreviewService<R> {
         self.profiles.advance_intent(
             request_id,
             PreviewIntentPhase::RecoveryBlocked,
+            None,
+            Some(detail.into()),
+            self.runtime.now_ms(),
+        )?;
+        Ok(())
+    }
+
+    fn reserve_intent(&self, request_id: &str, detail: &str) -> Result<(), String> {
+        self.profiles.advance_intent(
+            request_id,
+            PreviewIntentPhase::RecoveryReserved,
             None,
             Some(detail.into()),
             self.runtime.now_ms(),
@@ -2137,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_service_blocks_ambiguous_process_rediscovery() {
+    fn fresh_service_reserves_ambiguous_process_and_prohibits_replacement() {
         let fixture = fixture("recover-ambiguous");
         fixture
             .profiles
@@ -2176,8 +2218,31 @@ mod tests {
         );
         assert_eq!(
             restarted_profiles.intent("ambiguous-start").unwrap().phase,
-            PreviewIntentPhase::RecoveryBlocked
+            PreviewIntentPhase::RecoveryReserved
         );
+        assert_eq!(fixture.runtime.spawn_count(), 0);
+
+        let second_restart_profiles =
+            Arc::new(PreviewProfileStore::open(&fixture.profile_path).unwrap());
+        let second_restart = PreviewService::new(
+            fixture.runtime.restart_facade(),
+            Arc::clone(&second_restart_profiles),
+        );
+        let error = second_restart
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                Some(&fixture.target_ref),
+                "replacement-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap_err();
+        assert!(error.contains("admission is reserved by incomplete cleanup"));
+        assert!(error.contains("ambiguous-start"));
+        assert!(second_restart_profiles
+            .intent("replacement-start")
+            .is_none());
+        assert_eq!(fixture.runtime.spawn_count(), 0);
     }
 
     #[test]
