@@ -65,9 +65,12 @@ describe("Scribe poll lifecycle", () => {
     await Promise.resolve();
     expect(scribeStatus).toHaveBeenCalledTimes(1);
     emit?.({ listening: true, generation: 1, observedAtMs: Date.now(), sourceIdentity: "v1" });
-    await vi.advanceTimersByTimeAsync(SCRIBE_POLL_MS * 3);
+    // The event remains authoritative while its age is strictly below the
+    // TTL. At the exact boundary the fallback coordinator is expected to
+    // resume, so keep this assertion just inside the freshness window.
+    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS - 1);
     expect(scribeStatus).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS);
+    await vi.advanceTimersByTimeAsync(1);
     expect(scribeStatus).toHaveBeenCalledTimes(2);
   });
 
@@ -88,7 +91,9 @@ describe("Scribe poll lifecycle", () => {
     emit?.({ listening: true, generation: 2, observedAtMs: Date.now() - SCRIBE_EVENT_TTL_MS - 1, sourceIdentity: "v1" });
     emit?.({ listening: true, generation: 2, observedAtMs: Date.now(), sourceIdentity: "v1" });
     emit?.({ listening: false, generation: 1, observedAtMs: Date.now(), sourceIdentity: "v1" });
-    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS + SCRIBE_POLL_MS);
+    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS - 1);
+    expect(scribeStatus).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
     expect(scribeStatus).toHaveBeenCalledTimes(2);
   });
 
