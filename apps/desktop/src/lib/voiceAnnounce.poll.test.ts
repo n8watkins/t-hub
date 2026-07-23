@@ -50,7 +50,16 @@ describe("Scribe poll lifecycle", () => {
 
   it("starts one poller when required and stops it when either gate turns off", async () => {
     startScribePoll();
-    useVoice.setState({ enabled: true, announceOnAttention: true });
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
     await Promise.resolve();
 
     expect(scribeStatus).toHaveBeenCalledTimes(1);
@@ -63,11 +72,27 @@ describe("Scribe poll lifecycle", () => {
     await vi.advanceTimersByTimeAsync(SCRIBE_POLL_MS);
     expect(scribeStatus).toHaveBeenCalledTimes(5);
 
-    useVoice.setState({ announceOnAttention: false });
+    useVoice.setState({
+      announceOnAttention: false,
+      announcementPolicy: {
+        permission: false,
+        question: false,
+        completion: false,
+        failure: false,
+      },
+    });
     await vi.advanceTimersByTimeAsync(SCRIBE_POLL_MS * 4);
     expect(scribeStatus).toHaveBeenCalledTimes(5);
 
-    useVoice.setState({ announceOnAttention: true });
+    useVoice.setState({
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
     await Promise.resolve();
     expect(scribeStatus).toHaveBeenCalledTimes(6);
 
@@ -85,7 +110,16 @@ describe("Scribe poll lifecycle", () => {
         }),
     );
     startScribePoll();
-    useVoice.setState({ enabled: true, announceOnAttention: true });
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
     expect(scribeStatus).toHaveBeenCalledTimes(1);
 
     useVoice.setState({ enabled: false });
@@ -103,7 +137,16 @@ describe("Scribe poll lifecycle", () => {
       () => new Promise((resolve) => { resolveStatus = resolve; }),
     );
     startScribePoll();
-    useVoice.setState({ enabled: true, announceOnAttention: true });
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
 
     const blocked = { session: "needsPermission" as const };
     useSupervision.setState({ statuses: blocked });
@@ -123,7 +166,16 @@ describe("Scribe poll lifecycle", () => {
       () => new Promise((resolve) => { resolvers.push(resolve); }),
     );
     startScribePoll();
-    useVoice.setState({ enabled: true, announceOnAttention: true });
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
     useVoice.setState({ enabled: false });
     useVoice.setState({ enabled: true });
     expect(resolvers).toHaveLength(2);
@@ -146,7 +198,16 @@ describe("Scribe poll lifecycle", () => {
       () => new Promise((_resolve, reject) => { rejectStatus = reject; }),
     );
     startScribePoll();
-    useVoice.setState({ enabled: true, announceOnAttention: true });
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
+    });
     const blocked = { session: "needsPermission" as const };
     useSupervision.setState({ statuses: blocked });
     handleStatusesChange(blocked);

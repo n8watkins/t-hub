@@ -308,7 +308,7 @@ describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () =>
     expect(_pendingTextForTest()).toBeNull();
   });
 
-  it("COALESCES multiple held transitions into one (latest wins, no backlog)", async () => {
+  it("COALESCES held transitions without replacing a higher-severity cue", async () => {
     // Two sessions map to two terminals so their (stable) labels differ.
     useSupervision.setState({
       statuses: {},
@@ -332,16 +332,16 @@ describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () =>
     );
     await flush();
     expect(synthesizeVoice).not.toHaveBeenCalled();
-    // Only the LATEST is held.
-    expect(_pendingTextForTest()).toContain("crewmate");
-    // Deliver: both still blocked -> exactly ONE cue (the latest).
+    // The higher-severity permission cue survives the later question cue.
+    expect(_pendingTextForTest()).toContain("captain");
+    // Deliver: both still blocked -> exactly ONE cue.
     useSupervision.setState({
       statuses: { "sess-1": "needsPermission", "sess-2": "needsQuestion" },
     });
     flushPending(1000);
     await flush();
     expect(synthesizeVoice).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(synthesizeVoice).mock.calls[0][0]).toContain("crewmate");
+    expect(vi.mocked(synthesizeVoice).mock.calls[0][0]).toContain("captain");
   });
 
   it("the true->false falling edge arms the tail flush (injected clock)", async () => {

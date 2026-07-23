@@ -89,6 +89,7 @@ describe("voice settings round-trip", () => {
     expect(s.loaded).toBe(true);
     expect(s.enabled).toBe(DEFAULT_VOICE_SETTINGS.enabled);
     expect(s.voice).toBe(DEFAULT_VOICE_SETTINGS.voice);
+    expect(s.settingsError).toBe("no backend");
   });
 
   it("a setter writes the FULL schema back (round-trips foreign sapiRate)", async () => {
@@ -142,6 +143,18 @@ describe("voice settings round-trip", () => {
     useVoice.getState().setVolume(0.4);
     await flushPersist();
     expect(useVoice.getState().settingsError).toBe("disk is read-only");
+  });
+
+  it("keeps the legacy attention field projected from input policies", async () => {
+    useVoice.getState().setAnnouncementPolicy("permission", true);
+    expect(useVoice.getState().announceOnAttention).toBe(true);
+    useVoice.getState().setAnnouncementPolicy("permission", false);
+    useVoice.getState().setAnnouncementPolicy("question", false);
+    expect(useVoice.getState().announceOnAttention).toBe(false);
+    await flushPersist();
+    expect(writeVoiceSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ announceOnAttention: false }),
+    );
   });
 });
 

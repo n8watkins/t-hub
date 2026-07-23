@@ -30,7 +30,7 @@ import {
 import { useEngineRuntime } from "../store/engineRuntime";
 import { effectiveTarget } from "../ipc/engine";
 import { synthesizeVoice, type VoiceEngine } from "../ipc/voice";
-import { playWavBase64 } from "../lib/voiceAudio";
+import { playWavBase64, VoiceAudioError } from "../lib/voiceAudio";
 import {
   Btn,
   Group,
@@ -160,10 +160,30 @@ export function VoiceSection() {
     // fallen back, route to the active engine + its valid voice (unmanaged =
     // the selected engine + voice, unchanged).
     const target = effectiveTarget(runtime, s.engine, s.voice);
-    void synthesizeVoice(VOICE_TEST_PHRASE, target.voice, target.engine)
-      .then((b64) => playWavBase64(b64, useVoice.getState().volume))
-      .catch(() => setTestError("Synthesis failed - is the voice server running?"))
-      .finally(() => setTesting(false));
+    void (async () => {
+      let b64: string;
+      try {
+        b64 = await synthesizeVoice(
+          VOICE_TEST_PHRASE,
+          target.voice,
+          target.engine,
+        );
+      } catch {
+        setTestError("Synthesis failed - is the voice server running?");
+        return;
+      }
+      try {
+        await playWavBase64(b64, useVoice.getState().volume);
+      } catch (error) {
+        const kind =
+          error instanceof VoiceAudioError ? error.kind : "playback";
+        setTestError(
+          kind === "device"
+            ? "Audio device failed - check the selected output device."
+            : "Playback failed - the synthesized clip could not be completed.",
+        );
+      }
+    })().finally(() => setTesting(false));
   };
 
   return (

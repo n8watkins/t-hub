@@ -39,6 +39,7 @@ import { useSupervision } from "../store/supervision";
 import { useWorkspace } from "../store/workspace";
 import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import {
+  _pendingTextForTest,
   _resetVoiceAnnounceForTest,
   _setScribeListeningForTest,
   handleJournalEvent,
@@ -54,6 +55,7 @@ function journal(
       seq,
       timestamp_ms: 1,
       source: "hook",
+      event_id: `provider-event:v1:${seq}`,
       entity_id: "session-1",
       event_type: eventType,
       payload,
@@ -122,6 +124,9 @@ describe("provider-neutral journal announcements", () => {
 
   for (const [eventType, kind, phrase] of cases) {
     it(`maps ${eventType} to the ${kind} policy`, async () => {
+      if (eventType === "stop") {
+        useSupervision.setState({ statuses: { "session-1": "completed" } });
+      }
       await handleJournalEvent(
         journal(10, eventType, {
           prompt: "SECRET provider content",
@@ -131,7 +136,11 @@ describe("provider-neutral journal announcements", () => {
       );
       await settle();
 
-      expect(claimVoiceAnnouncement).toHaveBeenCalledWith(10, kind);
+      expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+        10,
+        kind,
+        "provider-event:v1:10",
+      );
       const text = vi.mocked(synthesizeVoice).mock.calls[0][0];
       expect(text).toContain("Safe captain");
       expect(text).toContain(phrase);
@@ -159,6 +168,7 @@ describe("provider-neutral journal announcements", () => {
   });
 
   it("records audio device failures explicitly", async () => {
+    useSupervision.setState({ statuses: { "session-1": "completed" } });
     vi.mocked(playWavBase64).mockRejectedValue(
       new VoiceAudioError("device", "no output device"),
     );
@@ -168,5 +178,50 @@ describe("provider-neutral journal announcements", () => {
       kind: "device",
       detail: "no output device",
     });
+  });
+
+  it("observes Stop without announcing while the reducer is waiting on subagents", async () => {
+    useSupervision.setState({
+      statuses: { "session-1": "waitingOnSubagents" },
+    });
+    await handleJournalEvent(journal(14, "stop"), 10_000);
+    await settle();
+    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+      14,
+      null,
+      "provider-event:v1:14",
+    );
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+  });
+
+  it("maps clean and abnormal SessionEnd from reducer authority", async () => {
+    useSupervision.setState({ statuses: { "session-1": "completed" } });
+    await handleJournalEvent(journal(15, "sessionEnd"), 10_000);
+    await settle();
+    expect(claimVoiceAnnouncement).toHaveBeenLastCalledWith(
+      15,
+      "completion",
+      "provider-event:v1:15",
+    );
+
+    _resetVoiceAnnounceForTest();
+    _setScribeListeningForTest(false);
+    useSupervision.setState({ statuses: { "session-1": "failed" } });
+    await handleJournalEvent(journal(16, "sessionEnd"), 20_000);
+    await settle();
+    expect(claimVoiceAnnouncement).toHaveBeenLastCalledWith(
+      16,
+      "failure",
+      "provider-event:v1:16",
+    );
+  });
+
+  it("never overwrites a queued failure with a lower-severity completion", async () => {
+    _setScribeListeningForTest(true);
+    await handleJournalEvent(journal(17, "stopFailure"), 10_000);
+    useSupervision.setState({ statuses: { "session-1": "completed" } });
+    await handleJournalEvent(journal(18, "stop"), 10_001);
+    expect(_pendingTextForTest()).toContain("failed");
+    expect(_pendingTextForTest()).not.toContain("completed");
   });
 });

@@ -153,7 +153,8 @@ export const useVoice = create<VoiceState>((set, get) => {
       voice: s.voice,
       volume: s.volume,
       sapiRate: s.sapiRate,
-      announceOnAttention: s.announceOnAttention,
+      announceOnAttention:
+        s.announcementPolicy.permission || s.announcementPolicy.question,
       announcementPolicy: s.announcementPolicy,
     };
     const merged: VoiceSettings = fileSettings
@@ -242,8 +243,9 @@ export const useVoice = create<VoiceState>((set, get) => {
             ? current.announcementPolicy
             : policyFrom(file),
           loaded: true,
+          settingsError: null,
         });
-      } catch {
+      } catch (error) {
         if (generation !== loadGeneration) return;
         const current = get();
         set({
@@ -269,6 +271,8 @@ export const useVoice = create<VoiceState>((set, get) => {
             ? current.announcementPolicy
             : DEFAULT_VOICE_SETTINGS.announcementPolicy,
           loaded: true,
+          settingsError:
+            error instanceof Error ? error.message : String(error),
         });
       }
     },
@@ -354,12 +358,19 @@ export const useVoice = create<VoiceState>((set, get) => {
       schedulePersist();
     },
     setAnnouncementPolicy: (kind, v) => {
-      set((s) => ({
-        announcementPolicy: { ...s.announcementPolicy, [kind]: v },
-        deliveryFailure: null,
-      }));
+      set((s) => {
+        const announcementPolicy = { ...s.announcementPolicy, [kind]: v };
+        return {
+          announcementPolicy,
+          announceOnAttention:
+            announcementPolicy.permission || announcementPolicy.question,
+          deliveryFailure: null,
+        };
+      });
       fieldGenerations.announcementPolicy += 1;
+      fieldGenerations.announceOnAttention += 1;
       dirtyFields.add("announcementPolicy");
+      dirtyFields.add("announceOnAttention");
       schedulePersist();
     },
     recordDeliveryFailure: (kind, detail, occurredAt = Date.now()) =>

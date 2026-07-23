@@ -18,8 +18,9 @@
 // field added by a script survives a settings save from the UI.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -39,6 +40,8 @@ const MAX_TTS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 /// Both paths update the same JSON document, so allowing their read-modify-write
 /// cycles to overlap could lose a policy edit or replay cursor.
 static VOICE_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const MAX_HANDLED_ANNOUNCEMENTS: usize = 256;
+const ANNOUNCEMENT_REORDER_WINDOW: u64 = MAX_HANDLED_ANNOUNCEMENTS as u64;
 
 /// The selectable TTS backend. Serialized lowercase ("piper" / "kokoro") in
 /// voice.json and over IPC so external tooling reads the same token. Piper is
@@ -274,20 +277,28 @@ fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
 /// PRIMARY). `pub(crate)` so the engine supervisor picks the same engine the
 /// user chose in Settings. Lenient: defaults to Piper if the file is absent.
 pub(crate) fn current_engine() -> VoiceEngine {
-    read_settings().engine
+    read_settings().unwrap_or_default().engine
 }
 
-/// Read voice.json leniently: missing file or unparseable content yields the
-/// defaults.
-fn read_settings() -> VoiceSettings {
-    let raw = match std::fs::read_to_string(voice_settings_path()) {
+/// Read voice.json. A missing file is the default configuration, but malformed
+/// content is an explicit error so the UI can surface it and no writer silently
+/// replaces evidence that an external tool produced a broken file.
+fn read_settings() -> Result<VoiceSettings, String> {
+    let path = voice_settings_path();
+    let raw = match std::fs::read_to_string(&path) {
         Ok(s) if !s.trim().is_empty() => s,
-        _ => return VoiceSettings::default(),
+        Ok(_) => return Err(format!("{} is empty", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VoiceSettings::default())
+        }
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
-    match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) => parse_settings(&v),
-        Err(_) => VoiceSettings::default(),
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if !value.is_object() {
+        return Err(format!("{} must contain a JSON object", path.display()));
     }
+    Ok(parse_settings(&value))
 }
 
 /// Write the five owned fields into voice.json, PRESERVING any unknown keys an
@@ -301,11 +312,12 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
 
 fn write_settings_unlocked(settings: &VoiceSettings) -> Result<(), String> {
     let path = voice_settings_path();
-    let mut root = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut root = read_json_root(&path)?;
+    merge_settings(&mut root, settings)?;
+    write_json_root_unlocked(&path, &root)
+}
+
+fn merge_settings(root: &mut serde_json::Value, settings: &VoiceSettings) -> Result<(), String> {
     let obj = root.as_object_mut().expect("filtered to object above");
     obj.insert("enabled".into(), serde_json::json!(settings.enabled));
     obj.insert("engine".into(), serde_json::json!(settings.engine.token()));
@@ -317,50 +329,39 @@ fn write_settings_unlocked(settings: &VoiceSettings) -> Result<(), String> {
     obj.insert("sapiRate".into(), serde_json::json!(settings.sapi_rate));
     obj.insert(
         "announceOnAttention".into(),
-        serde_json::json!(settings.announce_on_attention),
+        serde_json::json!(
+            settings.announcement_policy.permission || settings.announcement_policy.question
+        ),
     );
     obj.insert(
         "announcementPolicy".into(),
         serde_json::to_value(&settings.announcement_policy)
             .map_err(|e| format!("serialize announcement policy: {e}"))?,
     );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let body =
-        serde_json::to_vec_pretty(&root).map_err(|e| format!("serialize voice.json: {e}"))?;
-    // Atomic replace (temp + rename): external tooling polls this file, and a
-    // plain in-place write could hand it a truncated read mid-write. std's
-    // rename replaces the destination on Windows too (MOVEFILE_REPLACE_EXISTING).
-    // The temp name carries pid + a process-wide counter so two concurrent
-    // writers (or two app instances) can never interleave on the same temp
-    // file - each renames its own complete body; last rename wins whole.
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let tmp = path.with_extension(format!(
-        "json.{}.{}.tmp",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))
+    Ok(())
 }
 
 fn claim_announcement(
     seq: u64,
-    kind: VoiceAnnouncementKind,
+    event_id: Option<String>,
+    kind: Option<VoiceAnnouncementKind>,
 ) -> Result<VoiceAnnouncementClaim, String> {
     let _guard = VOICE_FILE_LOCK
         .lock()
         .map_err(|_| "voice settings lock poisoned".to_string())?;
-    let path = voice_settings_path();
-    let mut root = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let claim = claim_announcement_in_root(&mut root, seq, kind);
+    claim_announcement_at(&voice_settings_path(), seq, event_id.as_deref(), kind)
+}
+
+fn claim_announcement_at(
+    path: &Path,
+    seq: u64,
+    event_id: Option<&str>,
+    kind: Option<VoiceAnnouncementKind>,
+) -> Result<VoiceAnnouncementClaim, String> {
+    let mut root = read_json_root(&path)?;
+    let claim = claim_announcement_in_root(&mut root, seq, event_id, kind);
     if claim.1 {
-        write_json_root_unlocked(&path, &root)?;
+        write_json_root_unlocked(path, &root)?;
     }
     Ok(claim.0)
 }
@@ -368,13 +369,28 @@ fn claim_announcement(
 fn claim_announcement_in_root(
     root: &mut serde_json::Value,
     seq: u64,
-    kind: VoiceAnnouncementKind,
+    event_id: Option<&str>,
+    kind: Option<VoiceAnnouncementKind>,
 ) -> (VoiceAnnouncementClaim, bool) {
-    let last_handled = root
+    let high_water = root
         .get("lastHandledJournalSeq")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
-    if seq <= last_handled {
+    let identity = event_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("journal-seq:{seq}"));
+    let mut handled = root
+        .get("handledAnnouncementEvents")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let too_old = seq.saturating_add(ANNOUNCEMENT_REORDER_WINDOW) < high_water;
+    if too_old || handled.iter().any(|known| known == &identity) {
         return (
             VoiceAnnouncementClaim {
                 should_announce: false,
@@ -384,40 +400,128 @@ fn claim_announcement_in_root(
     }
 
     let settings = parse_settings(&root);
-    root.as_object_mut()
-        .expect("filtered to object above")
-        .insert("lastHandledJournalSeq".into(), serde_json::json!(seq));
+    handled.push(identity);
+    if handled.len() > MAX_HANDLED_ANNOUNCEMENTS {
+        handled.drain(..handled.len() - MAX_HANDLED_ANNOUNCEMENTS);
+    }
+    let object = root.as_object_mut().expect("filtered to object above");
+    object.insert(
+        "lastHandledJournalSeq".into(),
+        serde_json::json!(high_water.max(seq)),
+    );
+    object.insert(
+        "handledAnnouncementEvents".into(),
+        serde_json::json!(handled),
+    );
     (
         VoiceAnnouncementClaim {
-            should_announce: settings.enabled && settings.announcement_policy.enabled(kind),
+            should_announce: settings.enabled
+                && kind.is_some_and(|kind| settings.announcement_policy.enabled(kind)),
         },
         true,
     )
 }
 
-fn write_json_root_unlocked(
-    path: &std::path::Path,
-    root: &serde_json::Value,
-) -> Result<(), String> {
+fn read_json_root(path: &Path) -> Result<serde_json::Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|error| format!("parse {}: {error}", path.display()))?;
+            if !value.is_object() {
+                return Err(format!("{} must contain a JSON object", path.display()));
+            }
+            Ok(value)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+fn write_json_root_unlocked(path: &Path, root: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let body = serde_json::to_vec_pretty(root).map_err(|e| format!("serialize voice.json: {e}"))?;
-    static CLAIM_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let tmp = path.with_extension(format!(
-        "json.claim.{}.{}.tmp",
+        "json.{}.{}.tmp",
         std::process::id(),
-        CLAIM_TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
-    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|error| format!("create {}: {error}", tmp.display()))?;
+        file.write_all(&body)
+            .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+        replace_file(&tmp, path).map_err(|error| format!("replace {}: {error}", path.display()))?;
+        sync_parent(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync {}: {error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn voice_settings_read() -> Result<VoiceSettings, String> {
     tauri::async_runtime::spawn_blocking(read_settings)
         .await
-        .map_err(|e| format!("voice_settings_read task failed: {e}"))
+        .map_err(|e| format!("voice_settings_read task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -430,9 +534,10 @@ pub async fn voice_settings_write(settings: VoiceSettings) -> Result<(), String>
 #[tauri::command]
 pub async fn voice_announcement_claim(
     seq: u64,
-    kind: VoiceAnnouncementKind,
+    event_id: Option<String>,
+    kind: Option<VoiceAnnouncementKind>,
 ) -> Result<VoiceAnnouncementClaim, String> {
-    tauri::async_runtime::spawn_blocking(move || claim_announcement(seq, kind))
+    tauri::async_runtime::spawn_blocking(move || claim_announcement(seq, event_id, kind))
         .await
         .map_err(|e| format!("voice_announcement_claim task failed: {e}"))?
 }
@@ -518,6 +623,45 @@ fn synthesize(text: &str, voice: &str, engine: VoiceEngine) -> Result<String, St
 fn validate_wav(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("tts response is not a RIFF/WAVE audio payload".to_string());
+    }
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")) as usize;
+    if declared
+        .checked_add(8)
+        .is_none_or(|total| total != bytes.len())
+    {
+        return Err("tts RIFF length does not match the response body".to_string());
+    }
+    let mut offset = 12usize;
+    let mut valid_fmt = false;
+    let mut data = false;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 8 {
+            return Err("tts RIFF contains a truncated chunk header".to_string());
+        }
+        let id = &bytes[offset..offset + 4];
+        let len = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let body_start = offset + 8;
+        let body_end = body_start
+            .checked_add(len)
+            .ok_or_else(|| "tts RIFF chunk length overflow".to_string())?;
+        if body_end > bytes.len() {
+            return Err("tts RIFF contains a truncated chunk".to_string());
+        }
+        if id == b"fmt " {
+            valid_fmt = len >= 16;
+        } else if id == b"data" {
+            data = len > 0;
+        }
+        offset = body_end
+            .checked_add(len % 2)
+            .ok_or_else(|| "tts RIFF padding overflow".to_string())?;
+    }
+    if offset != bytes.len() || !valid_fmt || !data {
+        return Err("tts RIFF must contain valid fmt and non-empty data chunks".to_string());
     }
     Ok(())
 }
@@ -729,6 +873,22 @@ mod tests {
     }
 
     #[test]
+    fn persisted_legacy_attention_is_the_input_policy_projection() {
+        let mut root = serde_json::json!({});
+        let mut settings = VoiceSettings::default();
+        settings.announce_on_attention = false;
+        settings.announcement_policy.permission = true;
+        merge_settings(&mut root, &settings).unwrap();
+        assert_eq!(root["announceOnAttention"], true);
+
+        settings.announcement_policy.permission = false;
+        settings.announcement_policy.question = false;
+        settings.announce_on_attention = true;
+        merge_settings(&mut root, &settings).unwrap();
+        assert_eq!(root["announceOnAttention"], false);
+    }
+
+    #[test]
     fn announcement_claim_advances_while_disabled_and_never_replays() {
         let mut root = serde_json::json!({
             "enabled": false,
@@ -739,15 +899,23 @@ mod tests {
                 "failure": true,
             }
         });
-        let (disabled, changed) =
-            claim_announcement_in_root(&mut root, 41, VoiceAnnouncementKind::Permission);
+        let (disabled, changed) = claim_announcement_in_root(
+            &mut root,
+            41,
+            None,
+            Some(VoiceAnnouncementKind::Permission),
+        );
         assert!(!disabled.should_announce);
         assert!(changed);
         assert_eq!(root["lastHandledJournalSeq"], 41);
 
         root["enabled"] = serde_json::json!(true);
-        let (replayed, changed) =
-            claim_announcement_in_root(&mut root, 41, VoiceAnnouncementKind::Permission);
+        let (replayed, changed) = claim_announcement_in_root(
+            &mut root,
+            41,
+            None,
+            Some(VoiceAnnouncementKind::Permission),
+        );
         assert!(!replayed.should_announce);
         assert!(!changed);
     }
@@ -763,21 +931,138 @@ mod tests {
                 "failure": true,
             }
         });
-        let (question, _) =
-            claim_announcement_in_root(&mut root, 1, VoiceAnnouncementKind::Question);
-        let (completion, _) =
-            claim_announcement_in_root(&mut root, 2, VoiceAnnouncementKind::Completion);
-        let (failure, _) = claim_announcement_in_root(&mut root, 3, VoiceAnnouncementKind::Failure);
+        let (question, _) = claim_announcement_in_root(
+            &mut root,
+            1,
+            Some("question-1"),
+            Some(VoiceAnnouncementKind::Question),
+        );
+        let (completion, _) = claim_announcement_in_root(
+            &mut root,
+            2,
+            Some("completion-1"),
+            Some(VoiceAnnouncementKind::Completion),
+        );
+        let (failure, _) = claim_announcement_in_root(
+            &mut root,
+            3,
+            Some("failure-1"),
+            Some(VoiceAnnouncementKind::Failure),
+        );
         assert!(question.should_announce);
         assert!(!completion.should_announce);
         assert!(failure.should_announce);
     }
 
     #[test]
-    fn wav_validation_rejects_empty_and_non_audio_responses() {
+    fn reversed_claim_order_preserves_both_distinct_events() {
+        let mut root = serde_json::json!({
+            "enabled": true,
+            "announcementPolicy": {
+                "permission": true,
+                "question": true,
+                "completion": true,
+                "failure": true,
+            }
+        });
+        let (later, _) = claim_announcement_in_root(
+            &mut root,
+            102,
+            Some("event-102"),
+            Some(VoiceAnnouncementKind::Failure),
+        );
+        let (earlier, _) = claim_announcement_in_root(
+            &mut root,
+            101,
+            Some("event-101"),
+            Some(VoiceAnnouncementKind::Permission),
+        );
+        let (duplicate, changed) = claim_announcement_in_root(
+            &mut root,
+            102,
+            Some("event-102"),
+            Some(VoiceAnnouncementKind::Failure),
+        );
+        assert!(later.should_announce);
+        assert!(earlier.should_announce);
+        assert!(!duplicate.should_announce);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn claim_is_returned_only_after_durable_file_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("voice.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "enabled": true,
+                "announcementPolicy": {
+                    "permission": true,
+                    "question": false,
+                    "completion": false,
+                    "failure": false,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let claim = claim_announcement_at(
+            &path,
+            7,
+            Some("provider-event:v1:test"),
+            Some(VoiceAnnouncementKind::Permission),
+        )
+        .unwrap();
+        assert!(claim.should_announce);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["lastHandledJournalSeq"], 7);
+        assert_eq!(
+            persisted["handledAnnouncementEvents"][0],
+            "provider-event:v1:test"
+        );
+    }
+
+    fn minimal_wav(data: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0, 1, 0, 0x40, 0x1f, 0, 0]);
+        bytes.extend_from_slice(&[0x80, 0x3e, 0, 0, 2, 0, 16, 0]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            bytes.push(0);
+        }
+        let riff_len = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn wav_validation_requires_consistent_chunks_fmt_and_data() {
         assert!(validate_wav(&[]).is_err());
         assert!(validate_wav(b"<html>upstream error</html>").is_err());
-        assert!(validate_wav(b"RIFF\x00\x00\x00\x00WAVE").is_ok());
+        assert!(validate_wav(&minimal_wav(&[0, 1])).is_ok());
+        let mut truncated = minimal_wav(&[0, 1]);
+        truncated.pop();
+        assert!(validate_wav(&truncated).is_err());
+        let mut missing_data = minimal_wav(&[0, 1]);
+        missing_data.truncate(36);
+        let riff_len = (missing_data.len() - 8) as u32;
+        missing_data[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert!(validate_wav(&missing_data).is_err());
+    }
+
+    #[test]
+    fn malformed_settings_are_reported_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("voice.json");
+        let malformed = b"{not valid json";
+        std::fs::write(&path, malformed).unwrap();
+        assert!(read_json_root(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
     }
 
     /// STRICT identity parse (engine supervisor D2): only the two known tokens

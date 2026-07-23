@@ -48,9 +48,10 @@ export function writeVoiceSettings(settings: VoiceSettings): Promise<void> {
  * policy is off, so disabled events never replay after restart or opt-in. */
 export function claimVoiceAnnouncement(
   seq: number,
-  kind: VoiceAnnouncementKind,
+  kind: VoiceAnnouncementKind | null,
+  eventId?: string,
 ): Promise<{ shouldAnnounce: boolean }> {
-  return invoke("voice_announcement_claim", { seq, kind });
+  return invoke("voice_announcement_claim", { seq, kind, eventId });
 }
 
 /** Installed voice names from the given engine's /voices (via the backend

@@ -94,7 +94,21 @@ let scribeListening = false;
 let scribeStatusKnown = false;
 /** The single held announcement while the general is dictating (coalesced to
  *  the latest transition - no backlog). Null when nothing is held. */
-let pending: { text: string; requireBlocked: boolean } | null = null;
+interface PendingAnnouncement {
+  text: string;
+  requireBlocked: boolean;
+  kind: VoiceAnnouncementKind;
+}
+
+const ANNOUNCEMENT_SEVERITY: Record<VoiceAnnouncementKind, number> = {
+  completion: 1,
+  question: 2,
+  permission: 3,
+  failure: 4,
+};
+
+let pending: PendingAnnouncement | null = null;
+let journalProcessing: Promise<void> = Promise.resolve();
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
 /** Incremented whenever the poller starts or stops.
@@ -185,14 +199,41 @@ function speak(text: string, now: number): boolean {
   return true;
 }
 
-const JOURNAL_KIND: Partial<
+const DIRECT_JOURNAL_KIND: Partial<
   Record<EventJournalEntry["event_type"], VoiceAnnouncementKind>
 > = {
   permissionRequest: "permission",
   elicitation: "question",
-  stop: "completion",
   stopFailure: "failure",
 };
+
+function resolvedJournalKind(
+  entry: EventJournalEntry,
+): VoiceAnnouncementKind | null {
+  const direct = DIRECT_JOURNAL_KIND[entry.event_type];
+  if (direct) return direct;
+  const status = entry.entity_id
+    ? useSupervision.getState().statuses[entry.entity_id]
+    : undefined;
+  if (entry.event_type === "stop") {
+    return status === "completed" ? "completion" : null;
+  }
+  if (entry.event_type === "sessionEnd") {
+    if (status === "completed") return "completion";
+    if (status === "failed") return "failure";
+  }
+  return null;
+}
+
+function queuePending(next: PendingAnnouncement): void {
+  if (
+    !pending ||
+    ANNOUNCEMENT_SEVERITY[next.kind] >=
+      ANNOUNCEMENT_SEVERITY[pending.kind]
+  ) {
+    pending = next;
+  }
+}
 
 function announcementText(
   kind: VoiceAnnouncementKind,
@@ -221,13 +262,29 @@ export async function handleJournalEvent(
   event: JournalEvent,
   now: number = Date.now(),
 ): Promise<void> {
-  const kind = JOURNAL_KIND[event.entry.event_type];
-  if (!kind) return;
+  if (
+    !DIRECT_JOURNAL_KIND[event.entry.event_type] &&
+    event.entry.event_type !== "stop" &&
+    event.entry.event_type !== "sessionEnd"
+  ) {
+    return;
+  }
+
+  // The journal event is emitted immediately before the reducer-derived status
+  // event. Claim persistence yields to that event, then classification reads the
+  // reducer authority. A Stop that is WaitingOnSubagents is observed and
+  // durably consumed, but never announced as complete.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const kind = resolvedJournalKind(event.entry);
 
   let shouldAnnounce = false;
   try {
     shouldAnnounce = (
-      await claimVoiceAnnouncement(event.entry.seq, kind)
+      await claimVoiceAnnouncement(
+        event.entry.seq,
+        kind,
+        event.entry.event_id,
+      )
     ).shouldAnnounce;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -238,12 +295,12 @@ export async function handleJournalEvent(
     );
     return;
   }
-  if (!shouldAnnounce) return;
+  if (!kind || !shouldAnnounce) return;
 
   const text = announcementText(kind, event.entry.entity_id);
   const requireBlocked = kind === "permission" || kind === "question";
   if (!scribeStatusKnown || scribeListening) {
-    pending = { text, requireBlocked };
+    queuePending({ text, requireBlocked, kind });
     return;
   }
   if (speaking || now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) {
@@ -251,7 +308,7 @@ export async function handleJournalEvent(
     // losing an event while another clip is playing or the burst gap is open.
     // The durable claim is intentionally at-most-once, so this one-slot queue
     // is the only retry and coalescing boundary.
-    pending = { text, requireBlocked };
+    queuePending({ text, requireBlocked, kind });
     if (!tailTimer) {
       const delay = Math.max(0, ANNOUNCE_MIN_GAP_MS - (now - lastSpokenAt));
       tailTimer = setTimeout(() => {
@@ -352,7 +409,9 @@ export function handleStatusesChange(
   // is delivered on the listening falling edge (flushPending). Reads the
   // cached boolean only; never blocks on IPC.
   if (!scribeStatusKnown || scribeListening) {
-    pending = { text, requireBlocked: true };
+    const kind =
+      entered[0][1] === "needsPermission" ? "permission" : "question";
+    queuePending({ text, requireBlocked: true, kind });
     return;
   }
 
@@ -448,7 +507,9 @@ export function flushPending(now: number = Date.now()): void {
 export function mountVoiceAnnounce(): void {
   if (mounted) return;
   mounted = true;
-  void onJournal((event) => void handleJournalEvent(event));
+  void onJournal((event) => {
+    journalProcessing = journalProcessing.then(() => handleJournalEvent(event));
+  });
 }
 
 function voiceAnnouncementsEnabled(): boolean {
@@ -472,6 +533,7 @@ function stopScribePoll(): void {
   scribeListening = false;
   scribeStatusKnown = false;
   pending = null;
+  journalProcessing = Promise.resolve();
   if (tailTimer) {
     clearTimeout(tailTimer);
     tailTimer = null;

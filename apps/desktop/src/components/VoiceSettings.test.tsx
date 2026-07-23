@@ -17,6 +17,14 @@ vi.mock("../ipc/voice", () => ({
 }));
 vi.mock("../lib/voiceAudio", () => ({
   playWavBase64: vi.fn(),
+  VoiceAudioError: class VoiceAudioError extends Error {
+    constructor(
+      public readonly kind: "playback" | "device",
+      message: string,
+    ) {
+      super(message);
+    }
+  },
 }));
 
 import {
@@ -28,7 +36,7 @@ import {
   type VoiceEngine,
   type VoiceSettings as VoiceSettingsShape,
 } from "../ipc/voice";
-import { playWavBase64 } from "../lib/voiceAudio";
+import { playWavBase64, VoiceAudioError } from "../lib/voiceAudio";
 import {
   VoiceSection,
   VOICE_TEST_PHRASE,
@@ -177,6 +185,24 @@ describe("VoiceSection with the server up", () => {
     );
     expect(await screen.findByRole("button", { name: /Test voice/ })).toBeTruthy();
     expect(playWavBase64).toHaveBeenCalledWith("d2F2", 0.8);
+  });
+
+  it("reports Test Voice synthesis and playback failures separately", async () => {
+    vi.mocked(synthesizeVoice).mockRejectedValueOnce(new Error("tts down"));
+    const first = render(<VoiceSection />);
+    await screen.findByRole("option", { name: "en_US-lessac-medium.onnx" });
+    fireEvent.click(screen.getByRole("button", { name: /Test voice/ }));
+    expect(await screen.findByText(/Synthesis failed/)).toBeTruthy();
+    first.unmount();
+
+    vi.mocked(synthesizeVoice).mockResolvedValueOnce("d2F2");
+    vi.mocked(playWavBase64).mockRejectedValueOnce(
+      new VoiceAudioError("device", "missing output"),
+    );
+    render(<VoiceSection />);
+    await screen.findByRole("option", { name: "en_US-lessac-medium.onnx" });
+    fireEvent.click(screen.getByRole("button", { name: /Test voice/ }));
+    expect(await screen.findByText(/Audio device failed/)).toBeTruthy();
   });
 
   it("controls dim while the master enable is off (dependent settings)", async () => {
