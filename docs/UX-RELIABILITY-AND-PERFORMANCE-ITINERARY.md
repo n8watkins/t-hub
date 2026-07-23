@@ -258,8 +258,9 @@ This package changes persisted control-plane state and requires migration review
 
 Voice remains globally opt-in and the master `enabled` setting defaults to `false`.
 Permission, question, completion, and failure are four independent per-event settings.
-Every per-event setting defaults to `false`, including completion and failure.
-The legacy `announceOnAttention` field is a compatibility projection that is true when either permission or question is enabled.
+Permission and question preserve an enabled legacy `announceOnAttention` value through the compatibility projection.
+Completion and failure default to `false`.
+The legacy `announceOnAttention` field is also written as true when either permission or question is enabled.
 The legacy field does not enable completion or failure.
 Enabling one event kind must never enable another event kind.
 Replay suppression and durable delivery claims apply identically to all four event kinds.
@@ -401,8 +402,9 @@ The next package starts only after the previous commit, test evidence, independe
 
 There is no open voice-policy decision for this itinerary.
 Package 4 keeps four independent permission, question, completion, and failure settings.
-The master voice switch and all four per-event settings default off.
-The legacy attention field remains only a compatibility projection of permission or question.
+The master voice switch, completion, and failure default off.
+An enabled legacy attention value projects to enabled permission and question settings.
+The legacy attention field otherwise remains only a compatibility projection of permission or question.
 Package 5 must verify all four event policies in both states against the packaged Windows application.
 
 ## Audit Consolidation - 2026-07-21
@@ -420,6 +422,7 @@ The reports are therefore treated as completed historical evidence, while this i
 
 The General reported that Kokoro was silent for Codex commands.
 Package 4 implemented provider-neutral permission, question, completion, and failure authority with durable replay and delivery outcomes.
-All four event kinds are independently configurable and default off.
+All four event kinds are independently configurable.
+Permission and question preserve an enabled legacy attention value, while completion and failure default off.
 The legacy attention projection reflects permission or question and has no authority over completion or failure.
 Package 5 must prove that exact policy and audible delivery in the installed Windows application.

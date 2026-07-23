@@ -282,6 +282,25 @@ The worst repetition determines the matrix-cell decision.
 Missing data is a failure unless the run is declared ineligible and repeated.
 Results may not be averaged across terminal counts, scenario kinds, target types, binary identities, or host power modes.
 
+## Runner Exit Codes
+
+The Package 6 runner must use the following stable process exit codes.
+
+| Exit code | Meaning |
+| ---: | --- |
+| `0` | Every required cell has three eligible passing repetitions, every schema and evidence check passes, and independent review approves the result |
+| `2` | Invalid invocation, unsupported flag, or malformed runner configuration |
+| `3` | The exact Package 5 artifact or a required benchmark environment dependency is unavailable |
+| `4` | An absolute budget, paired-regression budget, cleanup invariant, evidence requirement, or mandatory scenario assertion failed |
+| `5` | The run is invalid because of environment drift, fixture drift, process churn, dropped samples, collector failure, missing correlation, or sensitive-content detection |
+| `6` | The result cannot satisfy the required Package 6 evidence schema |
+
+The runner must emit a schema-valid result for exit codes `0`, `4`, and `5`.
+The runner must retain a bounded diagnostic artifact for exit codes `2`, `3`, and `6`.
+Missing cells, missing repetitions, mixed installed hashes, pooled repetitions, stale evidence, and unreferenced raw artifacts must exit `4`.
+An ineligible run exits `5`, remains retained, and does not count toward the three required repetitions.
+No retry may overwrite or delete a prior failed or invalid result.
+
 ## Exit Gate
 
 Package 6 passes only when every mandatory matrix cell has three eligible passing repetitions.

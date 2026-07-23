@@ -59,7 +59,11 @@ The manifest must use this minimum shape.
 {
   "schemaVersion": 1,
   "candidate": {
+    "artifactId": "immutable candidate identity",
+    "branch": "exact integrated branch",
+    "sourceBaseline": "full baseline Git commit",
     "sourceCommit": "full Git commit",
+    "gitTree": "full Git tree",
     "repository": "repository identity",
     "pnpmLockSha256": "sha256",
     "cargoLockSha256": "sha256",
@@ -71,11 +75,25 @@ The manifest must use this minimum shape.
     "runId": "run identity",
     "runAttempt": 1,
     "runnerImage": "Windows runner identity",
+    "windowsVersion": "Windows build",
+    "webView2Version": "runtime version",
+    "nodeVersion": "version",
+    "pnpmVersion": "version",
+    "rustVersion": "version",
+    "targetTriple": "x86_64-pc-windows-msvc",
+    "featureSet": ["devbuild"],
+    "tauriConfigSha256": "sha256",
+    "tauriOverlaySha256": "sha256",
     "startedAt": "RFC 3339",
     "finishedAt": "RFC 3339"
   },
   "artifacts": {
-    "installer": { "path": "relative evidence path", "sha256": "sha256" },
+    "installer": {
+      "path": "relative evidence path",
+      "sha256": "sha256",
+      "signatureStatus": "updater and Authenticode status",
+      "reference": "durable artifact reference"
+    },
     "rawBinary": { "path": "relative evidence path", "sha256": "sha256" },
     "expectedBinary": { "path": "relative evidence path", "sha256": "sha256" },
     "extractedBinary": { "path": "relative evidence path", "sha256": "sha256" },
@@ -93,7 +111,16 @@ The manifest must use this minimum shape.
     "installedAt": "RFC 3339",
     "productName": "T-Hub Dev",
     "bundleIdentifier": "com.t-hub.dev",
-    "executableName": "t-hub-dev.exe"
+    "executableName": "t-hub-dev.exe",
+    "installationTarget": "absolute installation directory"
+  },
+  "environment": {
+    "tHubDistro": "WSL distribution identity",
+    "wslVersion": "version",
+    "wslKernelVersion": "version",
+    "agentVersion": "version",
+    "claudeVersion": "version",
+    "codexVersion": "version"
   },
   "matrix": [],
   "review": {
@@ -105,6 +132,7 @@ The manifest must use this minimum shape.
 ```
 
 The manifest must bind the installed hash to the extracted and expected binary hashes required by `docs/DEV-BUILD.md`.
+The manifest must bind `sourceCommit` to `gitTree` using retained `git rev-parse <sourceCommit>^{tree}` output.
 The workflow artifact must retain the manifest beside the installer and validator evidence.
 The manifest must never contain a control token, read token, session credential, provider credential, transcript content, prompt content, tool arguments, or unredacted hook payload.
 Discovery files may be represented only by redacted structural fields and a content hash computed after secret fields are removed.
@@ -174,6 +202,16 @@ Every live matrix row records these fields.
 
 An accepted exception must identify the approving authority, scope, reason, expiry, and why it does not weaken a release-critical guarantee.
 
+## Cross-Package Evidence Index
+
+| Evidence row | Mandatory evidence | Pass decision |
+| --- | --- | --- |
+| `P5-P0-CONTINUITY` | Durable Captain, Project, Assignment, terminal, session, listener generation, discovery hash, capability, lease result, timestamps, and redacted request and response records across endpoint, app, WSL, and MCP restarts | The same Captain regains `control`, no durable identity duplicates, stale discovery cannot win, and every invalid identity class fails closed |
+| `P5-P3-PREVIEW` | Target, canonical-root fingerprint, request ID, run ID, process tree, bounded output, advertised URL, reachable URL, lifecycle timestamps, screenshots, CLI JSON, MCP results, and cleanup snapshot for all four fixture classes | UI, CLI, and MCP observe one serialized lifecycle, exact owned processes stop, unrelated processes survive, and every adversarial input fails before mutation |
+| `P5-P4-VOICE` | Provider version, hook health, before and after configuration hashes, normalized type, journal sequence, provider event identity, replay flag, claim result, durable delivery state, redacted announcement class, synthesis and playback timing, engine health, device result, and redacted journal excerpt | Equivalent events have equivalent behavior, every accepted event delivers at most once, every disabled policy remains silent, replay never redelivers, unrelated configuration remains byte-identical, and every delivery failure is visible |
+| `P5-HISTORY-DUAL-HARNESS` | Exact Claude and Codex conversation identities, cwd, timestamps, labels, selected tile, resume and archive results, provider-file hashes, and History screenshots across app and WSL restart | Each conversation resumes exactly, one archive affects only its target, Harness identities remain distinct, and provider files remain intact |
+| `P5-CORTANA-EXACTLY-ONCE` | Cortana identity, terminal, tmux target, process identity, listener generation, reconciliation reason and result, event timestamps, and roster snapshots across clean start, repeat reconciliation, app restart, and WSL restart | Exactly one live development Cortana exists, valid recovery reuses its durable identity, and no duplicate terminal or process survives |
+
 ## History Matrix
 
 Use disposable Claude and Codex sessions with known identities.
@@ -235,16 +273,20 @@ Use disposable registered Projects for Vite, Next.js, static content, and a conf
 ## Package 4 Voice Matrix
 
 The packaged policy contract is exact.
-Permission and question announcements are enabled by the existing attention projection.
-Completion and failure are separate settings and default off.
+The master voice switch defaults off.
+Permission, question, completion, and failure are independent settings.
+An enabled legacy attention value projects to enabled permission and question settings.
+Completion and failure default off.
+The legacy attention field is otherwise only a compatibility projection of permission or question.
 
 - Use Test Voice with Kokoro and verify a valid synthesis response reaches the selected Windows audio device.
 - Record cold and warm synthesis plus playback latency for Package 6.
 - Trigger equivalent Claude and Codex permission events and verify one announcement with equivalent wording and timing.
 - Trigger equivalent Claude and Codex question events and verify one announcement with equivalent wording and timing.
 - Verify completion and failure are silent at their defaults.
-- Enable completion and failure separately and verify exactly one matching announcement for each provider and event.
-- Disable the master switch, attention projection, and each individual event policy and verify the corresponding cue remains silent.
+- Verify the enabled legacy attention projection enables permission and question without enabling completion or failure.
+- Enable and disable each policy separately and verify exactly one matching announcement or silence for each provider and event.
+- Disable the master switch and each individual event policy and verify the corresponding cue remains silent.
 - Restart during replay and verify historical events are not announced.
 - Exercise synthesis, playback, audio-device, interrupted, and application-exit outcomes and verify each is visible and durable.
 - Verify held cues remain session-bound, respect Scribe state, and recover or interrupt durably.
