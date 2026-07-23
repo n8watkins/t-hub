@@ -111,6 +111,8 @@ export interface AgentStateInfo {
 /** Payload of the `agent://journal` event: a journal entry the core consumed. */
 export interface JournalEvent {
   entry: EventJournalEntry;
+  /** True only while the backend is consuming a reconnect/startup replay. */
+  replayed: boolean;
   /** Exact post-reducer announcement authority correlated to `entry`. */
   voice_announcement?: {
     kind: import("./voice").VoiceAnnouncementKind;

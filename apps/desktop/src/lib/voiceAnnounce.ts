@@ -32,7 +32,7 @@ import {
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
-import { agentState, onJournal } from "../ipc/client05";
+import { onJournal } from "../ipc/client05";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import { notify } from "./notify";
@@ -103,7 +103,9 @@ interface PendingAnnouncement {
   text: string;
   requireBlocked: boolean;
   kind: VoiceAnnouncementKind;
+  sessionId?: string;
   attemptId?: string;
+  outcomeInFlight?: boolean;
 }
 
 const ANNOUNCEMENT_SEVERITY: Record<VoiceAnnouncementKind, number> = {
@@ -318,7 +320,13 @@ export async function handleJournalEvent(
   const text = announcementText(kind, authority.sessionId);
   const requireBlocked = kind === "permission" || kind === "question";
   if (!scribeStatusKnown || scribeListening) {
-    queuePending({ text, requireBlocked, kind, attemptId });
+    queuePending({
+      text,
+      requireBlocked,
+      kind,
+      sessionId: authority.sessionId,
+      attemptId,
+    });
     return;
   }
   if (speaking || now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) {
@@ -326,7 +334,13 @@ export async function handleJournalEvent(
     // losing an event while another clip is playing or the burst gap is open.
     // The durable claim is intentionally at-most-once, so this one-slot queue
     // is the only retry and coalescing boundary.
-    queuePending({ text, requireBlocked, kind, attemptId });
+    queuePending({
+      text,
+      requireBlocked,
+      kind,
+      sessionId: authority.sessionId,
+      attemptId,
+    });
     if (!tailTimer) {
       const delay = Math.max(0, ANNOUNCE_MIN_GAP_MS - (now - lastSpokenAt));
       tailTimer = setTimeout(() => {
@@ -429,7 +443,7 @@ export function handleStatusesChange(
   if (!scribeStatusKnown || scribeListening) {
     const kind =
       entered[0][1] === "needsPermission" ? "permission" : "question";
-    queuePending({ text, requireBlocked: true, kind });
+    queuePending({ text, requireBlocked: true, kind, sessionId: sid });
     return;
   }
 
@@ -497,18 +511,42 @@ export function applyScribeListening(
  * during the tail), we keep `pending` and re-arm the tail rather than DROP the
  * very cue this feature exists to preserve.
  */
-export function flushPending(now: number = Date.now()): void {
+export async function flushPending(now: number = Date.now()): Promise<void> {
   const held = pending;
   if (!held) return;
   const statuses = useSupervision.getState().statuses;
-  const stillBlocked = Object.values(statuses).some((st) => NEEDS_INPUT.has(st));
+  const stillBlocked = held.sessionId
+    ? NEEDS_INPUT.has(statuses[held.sessionId])
+    : Object.values(statuses).some((st) => NEEDS_INPUT.has(st));
   if (held.requireBlocked && !stillBlocked) {
     if (held.attemptId) {
-      void recordVoiceAnnouncementOutcome(
-        held.attemptId,
-        "interrupted",
-        "The requested input was resolved before the held announcement could be delivered.",
-      ).catch(() => {});
+      if (held.outcomeInFlight) return;
+      pending = { ...held, outcomeInFlight: true };
+      try {
+        await recordVoiceAnnouncementOutcome(
+          held.attemptId,
+          "interrupted",
+          "The requested input was resolved before the held announcement could be delivered.",
+        );
+        if (pending?.attemptId === held.attemptId) pending = null;
+      } catch (error) {
+        if (pending?.attemptId === held.attemptId) {
+          pending = { ...held, outcomeInFlight: false };
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        useVoice.getState().recordDeliveryFailure(
+          "interrupted",
+          `Could not persist the interrupted announcement outcome: ${detail}`,
+          now,
+        );
+        if (!tailTimer) {
+          tailTimer = setTimeout(() => {
+            tailTimer = null;
+            void flushPending(Date.now());
+          }, SCRIBE_TAIL_MS);
+        }
+      }
+      return;
     }
     pending = null;
     return;
@@ -532,26 +570,22 @@ export function flushPending(now: number = Date.now()): void {
 export function mountVoiceAnnounce(): void {
   if (mounted) return;
   mounted = true;
-  const buffered: JournalEvent[] = [];
-  let boundaryReady = false;
-  const enqueue = (event: JournalEvent) => {
-    journalProcessing = journalProcessing.then(() => handleJournalEvent(event));
-  };
   void onJournal((event) => {
-    if (boundaryReady) enqueue(event);
-    else buffered.push(event);
-  }).then(async () => {
-    const state = await agentState();
-    const firstObservedSeq = buffered.reduce(
-      (minimum, event) => Math.min(minimum, event.entry.seq),
-      Number.POSITIVE_INFINITY,
-    );
-    const boundary = Number.isFinite(firstObservedSeq)
-      ? Math.min(state.journalCursor, Math.max(0, firstObservedSeq - 1))
-      : state.journalCursor;
-    await seedVoiceAnnouncementBoundary(boundary);
-    boundaryReady = true;
-    for (const event of buffered.splice(0)) enqueue(event);
+    journalProcessing = journalProcessing.then(async () => {
+      if (!event.replayed) {
+        await handleJournalEvent(event);
+        return;
+      }
+      try {
+        await seedVoiceAnnouncementBoundary(event.entry.seq);
+      } catch (error) {
+        notify(
+          "error",
+          "Voice announcement replay boundary unavailable",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    });
   }).catch((error) => {
     notify(
       "error",

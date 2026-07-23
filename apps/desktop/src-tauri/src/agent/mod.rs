@@ -792,6 +792,7 @@ impl AgentBridge {
         if !self.advance_cursor(entry.seq) {
             return None;
         }
+        let replayed = *self.inner.state.lock() == ConnectionState::Replaying;
 
         // StatusSnapshot entries get a DEDICATED minimal path. The statusline
         // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
@@ -913,6 +914,7 @@ impl AgentBridge {
             EVT_JOURNAL,
             &JournalEventPayload {
                 entry,
+                replayed,
                 voice_announcement,
             },
         );
@@ -1583,6 +1585,26 @@ mod tests {
             .unwrap();
         assert_eq!(tree_ev.1["sessionId"], "o1");
         assert_eq!(tree_ev.1["status"], "working");
+    }
+
+    #[test]
+    fn journal_payload_marks_backend_replay_provenance() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        *bridge.inner.state.lock() = ConnectionState::Replaying;
+
+        bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::PermissionRequest));
+
+        let journal = rec
+            .events
+            .lock()
+            .iter()
+            .find(|(channel, _)| channel == super::EVT_JOURNAL)
+            .cloned()
+            .expect("replay must emit a journal payload");
+        assert_eq!(journal.1["replayed"], true);
     }
 
     #[test]

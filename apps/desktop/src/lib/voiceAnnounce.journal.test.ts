@@ -10,9 +10,6 @@ vi.mock("../ipc/voice", () => ({
   seedVoiceAnnouncementBoundary: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("../ipc/client05", () => ({
-  agentState: vi.fn(() =>
-    Promise.resolve({ connection: "live", journalCursor: 0 }),
-  ),
   onJournal: vi.fn(),
 }));
 vi.mock("./voiceAudio", () => {
@@ -40,7 +37,7 @@ import {
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
-import { agentState, onJournal } from "../ipc/client05";
+import { onJournal } from "../ipc/client05";
 import type { JournalEvent, JournalEventType } from "../ipc/protocol";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
 import { useEngineRuntime } from "../store/engineRuntime";
@@ -63,6 +60,7 @@ function journal(
   authorityKind: VoiceAnnouncementKind | null = defaultAuthority(eventType),
 ): JournalEvent {
   return {
+    replayed: false,
     entry: {
       seq,
       timestamp_ms: 1,
@@ -315,8 +313,7 @@ describe("provider-neutral journal announcements", () => {
     expect(_pendingTextForTest()).toContain("needs permission");
 
     useSupervision.setState({ statuses: { "session-1": "working" } });
-    flushPending(31_000);
-    await settle();
+    await flushPending(31_000);
 
     expect(synthesizeVoice).not.toHaveBeenCalled();
     expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledWith(
@@ -327,33 +324,84 @@ describe("provider-neutral journal announcements", () => {
     expect(_pendingTextForTest()).toBeNull();
   });
 
-  it("seeds the startup cursor before admitting later journal events", async () => {
+  it("resolves a held cue against its exact authority session", async () => {
+    vi.mocked(claimVoiceAnnouncement).mockResolvedValue({
+      shouldAnnounce: true,
+      attemptId: "voice-attempt:v1:22",
+    });
+    _setScribeListeningForTest(true);
+    useSupervision.setState({
+      statuses: {
+        "session-1": "needsPermission",
+        "session-2": "needsQuestion",
+      },
+    });
+    await handleJournalEvent(journal(22, "permissionRequest"), 30_000);
+
+    useSupervision.setState({
+      statuses: {
+        "session-1": "working",
+        "session-2": "needsQuestion",
+      },
+    });
+    await flushPending(31_000);
+
+    expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledWith(
+      "voice-attempt:v1:22",
+      "interrupted",
+      expect.any(String),
+    );
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+  });
+
+  it("retains a resolved cue until its interrupted outcome is durable", async () => {
+    vi.mocked(claimVoiceAnnouncement).mockResolvedValue({
+      shouldAnnounce: true,
+      attemptId: "voice-attempt:v1:23",
+    });
+    vi.mocked(recordVoiceAnnouncementOutcome)
+      .mockRejectedValueOnce(new Error("disk unavailable"))
+      .mockResolvedValueOnce();
+    _setScribeListeningForTest(true);
+    useSupervision.setState({
+      statuses: { "session-1": "needsPermission" },
+    });
+    await handleJournalEvent(journal(23, "permissionRequest"), 30_000);
+    useSupervision.setState({ statuses: { "session-1": "working" } });
+
+    flushPending(31_000);
+    await settle();
+    expect(_pendingTextForTest()).not.toBeNull();
+    expect(useVoice.getState().deliveryFailure).toMatchObject({
+      kind: "interrupted",
+      detail: expect.stringContaining("disk unavailable"),
+    });
+
+    await flushPending(32_000);
+    expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledTimes(2);
+    expect(_pendingTextForTest()).toBeNull();
+  });
+
+  it("seeds replay-marked events and admits the next live event", async () => {
     let listener: ((event: JournalEvent) => void) | undefined;
     vi.mocked(onJournal).mockImplementation((callback) => {
       listener = callback;
       return Promise.resolve(() => {});
     });
-    vi.mocked(agentState).mockResolvedValue({
-      connection: "live",
-      journalCursor: 50,
-    });
-    vi.mocked(claimVoiceAnnouncement).mockImplementation((seq) =>
-      Promise.resolve({ shouldAnnounce: seq > 50 }),
-    );
 
     mountVoiceAnnounce();
     await settle();
-    expect(seedVoiceAnnouncementBoundary).toHaveBeenCalledWith(50);
 
-    listener?.(journal(50, "permissionRequest"));
+    listener?.({ ...journal(50, "permissionRequest"), replayed: true });
     listener?.(journal(51, "permissionRequest"));
     await settle();
     await settle();
 
-    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+    expect(seedVoiceAnnouncementBoundary).toHaveBeenCalledWith(50);
+    expect(claimVoiceAnnouncement).not.toHaveBeenCalledWith(
       50,
-      "permission",
-      "provider-event:v1:50",
+      expect.anything(),
+      expect.anything(),
     );
     expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
       51,

@@ -65,6 +65,7 @@ pub const EVT_TITLE: &str = "agent://title";
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalEventPayload<'a> {
     pub entry: &'a t_hub_protocol::EventJournalEntry,
+    pub replayed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice_announcement: Option<JournalVoiceAnnouncement>,
 }
