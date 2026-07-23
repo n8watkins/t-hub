@@ -28,6 +28,110 @@ def digest(value: bytes) -> str:
 
 
 class AtomicConfigTest(unittest.TestCase):
+    def test_snapshot_executable_copies_verified_fd_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            destination = root / "snapshot"
+            source.write_bytes(b"verified executable\n")
+            source.chmod(0o750)
+            result = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable,
+                        str(HELPER),
+                        "snapshot-executable",
+                        "--source",
+                        str(source),
+                        "--destination",
+                        str(destination),
+                    ],
+                    text=True,
+                )
+            )
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
+            self.assertEqual(result["source"]["inode"], source.stat().st_ino)
+            self.assertEqual(result["snapshot"]["inode"], destination.stat().st_ino)
+            self.assertEqual(
+                result["source"]["content_sha256"],
+                digest(b"verified executable\n"),
+            )
+
+    def test_snapshot_executable_rejects_nonregular_paths_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            real = root / "real"
+            real.write_bytes(b"executable\n")
+            real.chmod(0o700)
+            symlink = root / "symlink"
+            symlink.symlink_to(real.name)
+            fifo = root / "fifo"
+            os.mkfifo(fifo, 0o700)
+            acquired_type_mismatch = root / "directory"
+            acquired_type_mismatch.mkdir(mode=0o700)
+            for source in (symlink, fifo, acquired_type_mismatch):
+                with self.subTest(source=source.name):
+                    destination = root / f"{source.name}.snapshot"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(HELPER),
+                            "snapshot-executable",
+                            "--source",
+                            str(source),
+                            "--destination",
+                            str(destination),
+                        ],
+                        check=False,
+                        timeout=2,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(destination.exists())
+
+    def test_snapshot_executable_rejects_unsafe_modes_and_existing_destination(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            destination = root / "snapshot"
+            source.write_bytes(b"executable\n")
+            for mode in (0o600, 0o722, 0o4700):
+                with self.subTest(mode=oct(mode)):
+                    source.chmod(mode)
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(HELPER),
+                            "snapshot-executable",
+                            "--source",
+                            str(source),
+                            "--destination",
+                            str(destination),
+                        ],
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(destination.exists())
+            source.chmod(0o700)
+            destination.write_bytes(b"known good\n")
+            destination.chmod(0o700)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HELPER),
+                    "snapshot-executable",
+                    "--source",
+                    str(source),
+                    "--destination",
+                    str(destination),
+                ],
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), b"known good\n")
+
     def test_release_unlinks_running_executable_without_truncation(self) -> None:
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

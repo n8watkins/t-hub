@@ -98,30 +98,38 @@ if [ ! -x "$SOURCE" ] || [ ! -f "$SOURCE" ] || [ -L "$SOURCE" ]; then
   echo "install-thub-codex: source binary must be an executable regular file, not a symlink: $SOURCE" >&2
   exit 1
 fi
-SOURCE_CANONICAL="$(readlink -f "$SOURCE")"
-exec 5<"$SOURCE"
-SOURCE_DEVICE="$(stat -Lc %d "/proc/$$/fd/5")"
-SOURCE_INODE="$(stat -Lc %i "/proc/$$/fd/5")"
-SOURCE_DIGEST="$(sha256sum "/proc/$$/fd/5" | awk '{print $1}')"
-if [ "$(stat -Lc %d "$SOURCE")" != "$SOURCE_DEVICE" ] \
-  || [ "$(stat -Lc %i "$SOURCE")" != "$SOURCE_INODE" ]; then
-  echo "install-thub-codex: source binary changed while it was selected: $SOURCE" >&2
-  exit 1
-fi
 SOURCE_SNAPSHOT_DIR="$(mktemp -d "$TRANSACTION_ROOT/.source-snapshot.XXXXXX")"
 chmod 700 "$SOURCE_SNAPSHOT_DIR"
+SOURCE_SELECTION="$SOURCE_SNAPSHOT_DIR/selected"
 SOURCE_SNAPSHOT="$SOURCE_SNAPSHOT_DIR/t-hub-mcp"
 cleanup_source_snapshot() {
+  if [ -n "${SOURCE_SELECTION:-}" ] && [ -f "$SOURCE_SELECTION" ]; then
+    rm -f -- "$SOURCE_SELECTION"
+  fi
   if [ -n "${SOURCE_SNAPSHOT:-}" ] && [ -f "$SOURCE_SNAPSHOT" ]; then
     rm -f -- "$SOURCE_SNAPSHOT"
   fi
   if [ -n "${SOURCE_SNAPSHOT_DIR:-}" ] && [ -d "$SOURCE_SNAPSHOT_DIR" ]; then
     rmdir -- "$SOURCE_SNAPSHOT_DIR"
   fi
+  SOURCE_SELECTION=
   SOURCE_SNAPSHOT=
   SOURCE_SNAPSHOT_DIR=
 }
 trap cleanup_source_snapshot EXIT
+if ! SOURCE_SELECTION_INFO="$(
+  python3 "$ATOMIC_SOURCE" snapshot-executable \
+    --source "$SOURCE" \
+    --destination "$SOURCE_SELECTION"
+)"; then
+  echo "install-thub-codex: failed to select a verified source binary: $SOURCE" >&2
+  exit 1
+fi
+SOURCE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.path)"
+SOURCE_CANONICAL="$SOURCE"
+SOURCE_DEVICE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.device)"
+SOURCE_INODE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.inode)"
+SOURCE_DIGEST="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.content_sha256)"
 if [ -n "${T_HUB_INSTALL_SOURCE_PAUSE_DIR:-}" ]; then
   printf 'selected\n' > "$T_HUB_INSTALL_SOURCE_PAUSE_DIR/discovered"
   source_wait_count=0
@@ -135,7 +143,17 @@ if [ -n "${T_HUB_INSTALL_SOURCE_PAUSE_DIR:-}" ]; then
     exit 1
   fi
 fi
-install -m 700 "/proc/$$/fd/5" "$SOURCE_SNAPSHOT"
+if ! SOURCE_SNAPSHOT_INFO="$(
+  python3 "$ATOMIC_SOURCE" snapshot-executable \
+    --source "$SOURCE" \
+    --destination "$SOURCE_SNAPSHOT"
+)"; then
+  echo "install-thub-codex: failed to acquire a verified source binary: $SOURCE" >&2
+  exit 1
+fi
+ACQUIRED_SOURCE_DEVICE="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.device)"
+ACQUIRED_SOURCE_INODE="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.inode)"
+ACQUIRED_SOURCE_DIGEST="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
 source_matches_selection() {
   [ ! -L "$SOURCE" ] \
     && [ "$(readlink -f "$SOURCE")" = "$SOURCE_CANONICAL" ] \
@@ -143,7 +161,10 @@ source_matches_selection() {
     && [ "$(stat -Lc %i "$SOURCE")" = "$SOURCE_INODE" ] \
     && [ "$(sha256sum "$SOURCE" | awk '{print $1}')" = "$SOURCE_DIGEST" ]
 }
-if [ "$(sha256sum "$SOURCE_SNAPSHOT" | awk '{print $1}')" != "$SOURCE_DIGEST" ] \
+if [ "$ACQUIRED_SOURCE_DEVICE" != "$SOURCE_DEVICE" ] \
+  || [ "$ACQUIRED_SOURCE_INODE" != "$SOURCE_INODE" ] \
+  || [ "$ACQUIRED_SOURCE_DIGEST" != "$SOURCE_DIGEST" ] \
+  || [ "$(sha256sum "$SOURCE_SNAPSHOT" | awk '{print $1}')" != "$SOURCE_DIGEST" ] \
   || ! source_matches_selection; then
   echo "install-thub-codex: source binary changed before its private snapshot was verified: $SOURCE" >&2
   exit 1
@@ -579,7 +600,6 @@ if ! verify_cortana_catalog "$DEST"; then
   exit 1
 fi
 cleanup_source_snapshot
-exec 5<&-
 install_file_stage "$HERE/ensure-thub-codex.sh" "$CAPTAIN_DIR/ensure-thub-codex.sh" codex-helper
 install_file_stage "$HERE/ensure-thub-claude.sh" "$CAPTAIN_DIR/ensure-thub-claude.sh" claude-helper
 install_file_stage "$HERE/atomic-config.py" "$CAPTAIN_DIR/atomic-config.py" atomic-helper

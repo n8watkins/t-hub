@@ -111,6 +111,44 @@ else
   fail "binary inode swap crossed the verified config boundary"
 fi
 
+for raced_type in fifo symlink; do
+  TYPE_HOME="$WORK/source-$raced_type-race"
+  TYPE_BIN="$TYPE_HOME/t-hub-mcp"
+  TYPE_PAUSE="$TYPE_HOME/pause"
+  mkdir -p "$TYPE_HOME" "$TYPE_PAUSE"
+  cp "$FAKE_BIN" "$TYPE_BIN"
+  printf 'model = "operator-model"\n' > "$TYPE_HOME/config.toml"
+  type_config_before="$(sha256sum "$TYPE_HOME/config.toml" | awk '{print $1}')"
+  timeout 15s env CODEX_HOME="$TYPE_HOME" T_HUB_MCP_BIN="$TYPE_BIN" \
+    T_HUB_ENSURE_SOURCE_PAUSE_DIR="$TYPE_PAUSE" bash "$SCRIPT" \
+    >/dev/null 2>&1 &
+  type_pid=$!
+  type_wait=0
+  while [ ! -e "$TYPE_PAUSE/discovered" ] && [ "$type_wait" -lt 1000 ]; do
+    sleep 0.01
+    type_wait=$((type_wait + 1))
+  done
+  mv "$TYPE_BIN" "$TYPE_BIN.original"
+  if [ "$raced_type" = fifo ]; then
+    mkfifo "$TYPE_BIN"
+    chmod 700 "$TYPE_BIN"
+  else
+    ln -s "$TYPE_BIN.original" "$TYPE_BIN"
+  fi
+  : > "$TYPE_PAUSE/resume"
+  wait "$type_pid"
+  type_status=$?
+  if [ "$type_status" -ne 0 ] && [ "$type_status" -ne 124 ] \
+    && [ "$(sha256sum "$TYPE_HOME/config.toml" | awk '{print $1}')" = "$type_config_before" ] \
+    && ! grep -q 'mcp_servers.t-hub' "$TYPE_HOME/config.toml" \
+    && ! find "$TYPE_HOME" -maxdepth 1 -name '.t-hub-mcp-probe.*' -print -quit \
+      | grep -q .; then
+    pass "binary $raced_type swap before open fails fast without changing config"
+  else
+    fail "binary $raced_type swap blocked or changed config"
+  fi
+done
+
 HARDLINK_HOME="$WORK/hardlink-race"
 HARDLINK_BIN="$HARDLINK_HOME/t-hub-mcp"
 HARDLINK_SIBLING="$HARDLINK_HOME/t-hub-mcp-sibling"

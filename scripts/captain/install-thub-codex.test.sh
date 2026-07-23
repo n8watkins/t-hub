@@ -129,6 +129,56 @@ else
   fail "source inode swap crossed the verified snapshot boundary"
 fi
 
+for raced_type in fifo symlink; do
+  TYPE_WORK="$WORK/source-$raced_type-race"
+  TYPE_HOME="$TYPE_WORK/home"
+  TYPE_CODEX="$TYPE_WORK/codex"
+  TYPE_CLAUDE="$TYPE_WORK/claude"
+  TYPE_BIN="$TYPE_WORK/install/bin"
+  TYPE_CAPTAIN="$TYPE_WORK/install/captain"
+  TYPE_SOURCE="$TYPE_WORK/source-t-hub-mcp"
+  TYPE_PAUSE="$TYPE_WORK/pause"
+  mkdir -p "$TYPE_HOME" "$TYPE_CODEX" "$TYPE_CLAUDE" "$TYPE_BIN" \
+    "$TYPE_CAPTAIN" "$TYPE_PAUSE"
+  cp "$SOURCE" "$TYPE_SOURCE"
+  printf 'known-good %s binary\n' "$raced_type" > "$TYPE_BIN/t-hub-mcp"
+  chmod 700 "$TYPE_BIN/t-hub-mcp"
+  printf 'operator config\n' > "$TYPE_CODEX/config.toml"
+  type_binary_before="$(sha256sum "$TYPE_BIN/t-hub-mcp" | awk '{print $1}')"
+  type_config_before="$(sha256sum "$TYPE_CODEX/config.toml" | awk '{print $1}')"
+  timeout 15s env HOME="$TYPE_HOME" CODEX_HOME="$TYPE_CODEX" \
+    CLAUDE_HOME="$TYPE_CLAUDE" T_HUB_MCP_SOURCE="$TYPE_SOURCE" \
+    T_HUB_BIN_DIR="$TYPE_BIN" T_HUB_CAPTAIN_DIR="$TYPE_CAPTAIN" \
+    T_HUB_INSTALL_SOURCE_PAUSE_DIR="$TYPE_PAUSE" bash "$SCRIPT" \
+    >/dev/null 2>&1 &
+  type_pid=$!
+  type_wait=0
+  while [ ! -e "$TYPE_PAUSE/discovered" ] && [ "$type_wait" -lt 1000 ]; do
+    sleep 0.01
+    type_wait=$((type_wait + 1))
+  done
+  mv "$TYPE_SOURCE" "$TYPE_SOURCE.original"
+  if [ "$raced_type" = fifo ]; then
+    mkfifo "$TYPE_SOURCE"
+    chmod 700 "$TYPE_SOURCE"
+  else
+    ln -s "$TYPE_SOURCE.original" "$TYPE_SOURCE"
+  fi
+  : > "$TYPE_PAUSE/resume"
+  wait "$type_pid"
+  type_status=$?
+  if [ "$type_status" -ne 0 ] && [ "$type_status" -ne 124 ] \
+    && [ "$(sha256sum "$TYPE_BIN/t-hub-mcp" | awk '{print $1}')" = "$type_binary_before" ] \
+    && [ "$(sha256sum "$TYPE_CODEX/config.toml" | awk '{print $1}')" = "$type_config_before" ] \
+    && [ ! -e "$TYPE_HOME/.t-hub/transactions/install-current/manifest.json" ] \
+    && ! find "$TYPE_HOME/.t-hub/transactions" -name '.source-snapshot.*' -print -quit \
+      | grep -q .; then
+    pass "source $raced_type swap before open fails fast without changing install state"
+  else
+    fail "source $raced_type swap blocked or changed install state"
+  fi
+done
+
 HARDLINK_WORK="$WORK/source-hardlink-race"
 HARDLINK_HOME="$HARDLINK_WORK/home"
 HARDLINK_CODEX="$HARDLINK_WORK/codex"

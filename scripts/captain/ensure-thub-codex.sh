@@ -79,24 +79,38 @@ if [ ! -x "$BIN" ] || [ ! -f "$BIN" ] || [ -L "$BIN" ]; then
   echo "ensure-thub-codex: run install-thub-codex.sh first" >&2
   exit 1
 fi
-BIN_CANONICAL="$(readlink -f "$BIN")"
-exec 8<"$BIN"
-BIN_DEVICE="$(stat -Lc %d "/proc/$$/fd/8")"
-BIN_INODE="$(stat -Lc %i "/proc/$$/fd/8")"
-BIN_DIGEST="$(sha256sum "/proc/$$/fd/8" | awk '{print $1}')"
-if [ "$(stat -Lc %d "$BIN")" != "$BIN_DEVICE" ] \
-  || [ "$(stat -Lc %i "$BIN")" != "$BIN_INODE" ]; then
-  echo "ensure-thub-codex: t-hub MCP binary changed while it was selected: $BIN" >&2
-  exit 1
-fi
-BIN_SNAPSHOT="$(mktemp "$(dirname "$CONFIG")/.t-hub-mcp-probe.XXXXXX")"
+BIN_SNAPSHOT_DIR="$(mktemp -d "$(dirname "$CONFIG")/.t-hub-mcp-probe.XXXXXX")"
+chmod 700 "$BIN_SNAPSHOT_DIR"
+BIN_SELECTION="$BIN_SNAPSHOT_DIR/selected"
+BIN_SNAPSHOT="$BIN_SNAPSHOT_DIR/t-hub-mcp"
 cleanup_binary_snapshot() {
+  if [ -n "${BIN_SELECTION:-}" ] && [ -f "$BIN_SELECTION" ]; then
+    rm -f -- "$BIN_SELECTION"
+  fi
   if [ -n "${BIN_SNAPSHOT:-}" ] && [ -f "$BIN_SNAPSHOT" ]; then
     rm -f -- "$BIN_SNAPSHOT"
   fi
+  if [ -n "${BIN_SNAPSHOT_DIR:-}" ] && [ -d "$BIN_SNAPSHOT_DIR" ]; then
+    rmdir -- "$BIN_SNAPSHOT_DIR"
+  fi
+  BIN_SELECTION=
   BIN_SNAPSHOT=
+  BIN_SNAPSHOT_DIR=
 }
 trap cleanup_binary_snapshot EXIT
+if ! BIN_SELECTION_INFO="$(
+  python3 "$ATOMIC_HELPER" snapshot-executable \
+    --source "$BIN" \
+    --destination "$BIN_SELECTION"
+)"; then
+  echo "ensure-thub-codex: failed to select a verified MCP binary: $BIN" >&2
+  exit 1
+fi
+BIN="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.path)"
+BIN_CANONICAL="$BIN"
+BIN_DEVICE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.device)"
+BIN_INODE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.inode)"
+BIN_DIGEST="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.content_sha256)"
 if [ -n "${T_HUB_ENSURE_SOURCE_PAUSE_DIR:-}" ]; then
   printf 'selected\n' > "$T_HUB_ENSURE_SOURCE_PAUSE_DIR/discovered"
   source_wait_count=0
@@ -110,7 +124,17 @@ if [ -n "${T_HUB_ENSURE_SOURCE_PAUSE_DIR:-}" ]; then
     exit 1
   fi
 fi
-install -m 700 "/proc/$$/fd/8" "$BIN_SNAPSHOT"
+if ! BIN_SNAPSHOT_INFO="$(
+  python3 "$ATOMIC_HELPER" snapshot-executable \
+    --source "$BIN" \
+    --destination "$BIN_SNAPSHOT"
+)"; then
+  echo "ensure-thub-codex: failed to acquire a verified MCP binary: $BIN" >&2
+  exit 1
+fi
+ACQUIRED_BIN_DEVICE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.device)"
+ACQUIRED_BIN_INODE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.inode)"
+ACQUIRED_BIN_DIGEST="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
 binary_matches_selection() {
   [ ! -L "$BIN" ] \
     && [ "$(readlink -f "$BIN")" = "$BIN_CANONICAL" ] \
@@ -118,7 +142,10 @@ binary_matches_selection() {
     && [ "$(stat -Lc %i "$BIN")" = "$BIN_INODE" ] \
     && [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$BIN_DIGEST" ]
 }
-if [ "$(sha256sum "$BIN_SNAPSHOT" | awk '{print $1}')" != "$BIN_DIGEST" ] \
+if [ "$ACQUIRED_BIN_DEVICE" != "$BIN_DEVICE" ] \
+  || [ "$ACQUIRED_BIN_INODE" != "$BIN_INODE" ] \
+  || [ "$ACQUIRED_BIN_DIGEST" != "$BIN_DIGEST" ] \
+  || [ "$(sha256sum "$BIN_SNAPSHOT" | awk '{print $1}')" != "$BIN_DIGEST" ] \
   || ! binary_matches_selection; then
   echo "ensure-thub-codex: t-hub MCP binary changed before its private snapshot was verified: $BIN" >&2
   exit 1

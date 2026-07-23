@@ -107,6 +107,123 @@ def content_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def snapshot_executable(source: str, destination: str) -> Dict[str, Any]:
+    """Copy a verified executable FD into a new private snapshot."""
+    source = os.path.abspath(source)
+    destination = os.path.abspath(destination)
+    destination_directory = restricted_directory(os.path.dirname(destination), False)
+    source_descriptor = -1
+    destination_descriptor = -1
+    destination_created = False
+    try:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        source_before = os.fstat(source_descriptor)
+        source_mode = stat.S_IMODE(source_before.st_mode)
+        if not stat.S_ISREG(source_before.st_mode):
+            raise AtomicError(f"refusing non-regular executable: {source}")
+        if source_before.st_uid != os.geteuid():
+            raise AtomicError(f"executable must be owned by the current user: {source}")
+        if not source_mode & stat.S_IXUSR:
+            raise AtomicError(f"executable must have its owner execute bit set: {source}")
+        if source_mode & 0o022:
+            raise AtomicError(f"executable must not be writable by group or others: {source}")
+        if source_mode & 0o7000:
+            raise AtomicError(f"executable must not have special mode bits set: {source}")
+
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o700,
+        )
+        destination_created = True
+        os.fchmod(destination_descriptor, 0o700)
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(destination_descriptor, chunk[offset:])
+        os.fsync(destination_descriptor)
+
+        source_after = os.fstat(source_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(source_before, field) != getattr(source_after, field)
+            for field in stable_fields
+        ):
+            raise AtomicError(f"executable changed while it was read: {source}")
+        if size != source_before.st_size:
+            raise AtomicError(f"executable size changed while it was read: {source}")
+
+        path_metadata = os.lstat(source)
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_dev != source_before.st_dev
+            or path_metadata.st_ino != source_before.st_ino
+        ):
+            raise AtomicError(f"executable path changed while it was read: {source}")
+
+        destination_metadata = os.fstat(destination_descriptor)
+        snapshot_digest = digest.hexdigest()
+        fsync_directory(destination_directory)
+        return {
+            "source": {
+                "path": source,
+                "device": source_before.st_dev,
+                "inode": source_before.st_ino,
+                "uid": source_before.st_uid,
+                "mode": source_mode,
+                "size": size,
+                "content_sha256": snapshot_digest,
+            },
+            "snapshot": {
+                "path": destination,
+                "device": destination_metadata.st_dev,
+                "inode": destination_metadata.st_ino,
+                "mode": stat.S_IMODE(destination_metadata.st_mode),
+                "size": destination_metadata.st_size,
+                "content_sha256": snapshot_digest,
+            },
+        }
+    except BaseException:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+            destination_descriptor = -1
+        if destination_created:
+            try:
+                os.unlink(destination)
+                fsync_directory(destination_directory)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+
+
 def description(path: str) -> Dict[str, Any]:
     metadata = require_regular(path)
     return {
@@ -1000,6 +1117,9 @@ def main() -> int:
     release_parser.add_argument("--expected-digest", required=True)
     release_parser.add_argument("--expected-device", type=int)
     release_parser.add_argument("--expected-inode", type=int)
+    snapshot_parser = subparsers.add_parser("snapshot-executable")
+    snapshot_parser.add_argument("--source", required=True)
+    snapshot_parser.add_argument("--destination", required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "exchange":
@@ -1062,6 +1182,13 @@ def main() -> int:
                     "inode": arguments.expected_inode,
                 }
             release(arguments.path, arguments.expected_digest, expected_identity)
+        elif arguments.command == "snapshot-executable":
+            print(
+                json.dumps(
+                    snapshot_executable(arguments.source, arguments.destination),
+                    sort_keys=True,
+                )
+            )
         else:
             discard(arguments.path)
     except (OSError, AtomicError, ValueError, json.JSONDecodeError) as error:
