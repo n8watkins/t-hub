@@ -59,12 +59,12 @@ function Write-DiagnosticArtifact {
             reference = [ordered]@{ installedBinarySha256 = $null; selectionReason = $null }
             host = [ordered]@{ windowsVersion = $null; wslVersion = $null; distro = $null; logicalProcessors = $null; memoryBytes = $null; powerMode = $null; displayScale = $null }
             scenario = [ordered]@{ kind = $ScenarioKind; terminalCount = $DeclaredScenarioTerminals; observedTerminalCount = $null; workloadVersion = $null; workloadSeed = $null; repetition = $Repetition; startedAt = $null; finishedAt = $null }
-            resources = [ordered]@{ windows = $null; wslOwned = [ordered]@{ available = $false; reason = "diagnostic artifact" }; samples = @() }
+            resources = [ordered]@{ windows = $null; wslOwned = [ordered]@{ available = $false; reason = "diagnostic artifact" }; webview = @{}; samples = @() }
             operations = @{}
             preview = @{}
             voice = @{}
             journal = @{}
-            diagnostics = [ordered]@{ errorCode = "collector_exception"; redactionCount = 0 }
+            diagnostics = [ordered]@{ errorCode = "collector_exception"; heartbeatStalls = @(); longTasks = @(); resizeObserverErrors = @(); redactionCount = 0 }
             validity = [ordered]@{ eligible = $false; reasons = @("collector_exception"); processBirthIntervalsExcluded = 0 }
             budgets = @()
             decision = "ineligible"
@@ -522,9 +522,12 @@ function Read-SafeRuntimeEvidence {
 }
 
 function Assert-BoundedCliString {
-    param([string]$Value, [string]$Name, [int]$Maximum = 256)
+    param([string]$Value, [string]$Name, [int]$Maximum = 256, [switch]$RejectSensitive)
     if ($Value.Length -gt $Maximum -or $Value -match '[\x00-\x1f]') {
         throw "$Name exceeds the bounded CLI string contract"
+    }
+    if ($RejectSensitive -and $Value -match '(?i)(token|secret|password|credential|transcript|prompt|payload|content|command)') {
+        throw "$Name contains a prohibited sensitive-content marker"
     }
 }
 
@@ -534,13 +537,13 @@ if ($FunctionsOnly) {
 if ($OutputPath.Length -eq 0) {
     throw "OutputPath is required."
 }
-Assert-BoundedCliString $WorkloadVersion "workload version" 64
-Assert-BoundedCliString $WorkloadSeed "workload seed" 128
-Assert-BoundedCliString $ReferenceSelectionReason "reference selection reason" 256
-Assert-BoundedCliString $PowerMode "power mode" 128
-Assert-BoundedCliString $WslVersion "WSL version" 128
-Assert-BoundedCliString $WslDistro "WSL distro" 128
-Assert-BoundedCliString $SetupNote "setup note" 256
+Assert-BoundedCliString $WorkloadVersion "workload version" 64 -RejectSensitive
+Assert-BoundedCliString $WorkloadSeed "workload seed" 128 -RejectSensitive
+Assert-BoundedCliString $ReferenceSelectionReason "reference selection reason" 256 -RejectSensitive
+Assert-BoundedCliString $PowerMode "power mode" 128 -RejectSensitive
+Assert-BoundedCliString $WslVersion "WSL version" 128 -RejectSensitive
+Assert-BoundedCliString $WslDistro "WSL distro" 128 -RejectSensitive
+Assert-BoundedCliString $SetupNote "setup note" 256 -RejectSensitive
 Assert-BoundedCliString $ProcessName "process name" 128
 Assert-BoundedCliString $CollectorRepositoryCommit "collector repository commit" 128
 Assert-BoundedCliString $ExecutablePath "executable path" 1024
