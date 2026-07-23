@@ -53,10 +53,10 @@
 // talking over the general once; the cost of a false "listening" is losing an
 // announcement forever - so we err toward speaking.
 use serde::Serialize;
-use tauri::Emitter;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tauri::Emitter;
 
 /// Scribe's production + dev Tauri bundle ids: the app_cache_dir subfolder
 /// where each flavor's fallback status.json lives.
@@ -329,8 +329,7 @@ fn eval_v1_snapshot(v: &serde_json::Value, now: i64) -> Option<CandidateEval> {
             source_identity: v
                 .get("pid")
                 .and_then(|pid| pid.as_u64())
-                .map(|pid| format!("v1-pid-{pid}"))
-                .or_else(|| v.get("instanceId").and_then(|id| id.as_str()).map(|id| format!("v1-{id}"))),
+                .map(|pid| format!("v1-pid-{pid}")),
         },
         updated_at: updated_at.map(str::to_string),
     })
@@ -525,9 +524,16 @@ pub fn read_scribe_status() -> ScribeStatus {
     combine_candidates(&cands)
 }
 
-fn status_event_payload(status: &ScribeStatus, generation: u64, observed_at_ms: i64) -> serde_json::Value {
+fn status_event_payload(
+    status: &ScribeStatus,
+    generation: u64,
+    observed_at_ms: i64,
+) -> serde_json::Value {
     let safe_status = status.status.as_deref().filter(|value| {
-        matches!(*value, "Idle" | "Recording" | "Transcribing" | "Pasting" | "Stopping")
+        matches!(
+            *value,
+            "Idle" | "Recording" | "Transcribing" | "Pasting" | "Stopping"
+        )
     });
     let safe_since = status.since.as_ref().and_then(|value| {
         value.as_str().and_then(|timestamp| {
@@ -555,6 +561,7 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
 
 fn read_scribe_status_emitter_tick(
     candidates: &mut [Option<CandidateEval>; 2],
+    last_checked: &mut [std::time::Instant; 2],
     flavor: usize,
 ) -> ScribeStatus {
     if std::env::var("T_HUB_SCRIBE_CONTROL_FILE").is_ok()
@@ -567,11 +574,21 @@ fn read_scribe_status_emitter_tick(
     } else {
         (SCRIBE_CONTROL_DEV, SCRIBE_BUNDLE_DEV)
     };
+    let now = std::time::Instant::now();
+    for index in 0..candidates.len() {
+        if now.duration_since(last_checked[index]) > Duration::from_secs(3) {
+            candidates[index] = None;
+        }
+    }
+    last_checked[flavor] = now;
     candidates[flavor] = eval_flavor(
         scribe_control_file_for(control_name).as_deref(),
         scribe_status_file_for(bundle).as_deref(),
     );
-    let active: Vec<CandidateEval> = candidates.iter().filter_map(|candidate| candidate.clone()).collect();
+    let active: Vec<CandidateEval> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.clone())
+        .collect();
     let status = combine_candidates(&active);
     status
 }
@@ -586,7 +603,9 @@ fn read_scribe_status_emitter_tick(
 /// restart with a new endpoint, token, or PID is observed without a T-Hub
 /// restart. No endpoint token or raw Scribe payload is ever emitted.
 pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
-    let mut state = scribe_emitter_state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if state.enabled && state.handle.is_some() {
         return;
     }
@@ -604,9 +623,14 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
         .name(format!("scribe-status-emitter-{generation}"))
         .spawn(move || {
             let mut candidates: [Option<CandidateEval>; 2] = [None, None];
+            let expired = std::time::Instant::now() - Duration::from_secs(4);
+            let mut last_checked = [expired, expired];
             let mut flavor = 0usize;
             while !cancel_for_thread.load(Ordering::Acquire) {
-                emit_status_event(&app, &read_scribe_status_emitter_tick(&mut candidates, flavor));
+                emit_status_event(
+                    &app,
+                    &read_scribe_status_emitter_tick(&mut candidates, &mut last_checked, flavor),
+                );
                 flavor = (flavor + 1) % 2;
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -626,7 +650,9 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
 }
 
 pub fn stop_scribe_status_emitter() {
-    let mut state = scribe_emitter_state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     state.enabled = false;
     state.generation = state.generation.wrapping_add(1);
     if let Some(cancel) = state.cancel.take() {
@@ -856,6 +882,30 @@ mod tests {
         assert!(
             eval_v1_snapshot(&v, t0_ms()).is_none(),
             "missing app -> not a Scribe snapshot -> fall through",
+        );
+    }
+
+    #[test]
+    fn event_identity_does_not_echo_unbounded_instance_id() {
+        let instance = "x".repeat(4096);
+        let candidate = eval_v1_snapshot(
+            &json!({
+                "schemaVersion": 1,
+                "app": "scribe",
+                "busy": false,
+                "updatedAt": T0,
+                "instanceId": instance,
+            }),
+            t0_ms(),
+        )
+        .expect("valid snapshot");
+        let payload = status_event_payload(&candidate.status, 1, 1);
+        assert_eq!(payload["sourceIdentity"], json!("v1"));
+        assert!(
+            serde_json::to_string(&payload)
+                .expect("payload serializes")
+                .len()
+                < 512
         );
     }
 
