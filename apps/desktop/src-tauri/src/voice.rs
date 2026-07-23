@@ -161,7 +161,7 @@ impl Default for VoiceAnnouncementPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VoiceAnnouncementKind {
     Permission,
@@ -188,6 +188,35 @@ pub struct VoiceAnnouncementClaim {
     /// True only for the first observation of a sequence whose master switch
     /// and per-event policy are both enabled.
     pub should_announce: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceAnnouncementOutcomeStatus {
+    Attempted,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceAnnouncementOutcomeRecord {
+    attempt_id: String,
+    seq: u64,
+    kind: VoiceAnnouncementKind,
+    status: VoiceAnnouncementOutcomeStatus,
+    detail: Option<String>,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceRecoveredInterruption {
+    pub attempt_id: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,18 +418,19 @@ fn claim_announcement_in_root(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let too_old = seq.saturating_add(ANNOUNCEMENT_REORDER_WINDOW) < high_water;
+    let too_old = seq.saturating_add(ANNOUNCEMENT_REORDER_WINDOW) <= high_water;
     if too_old || handled.iter().any(|known| known == &identity) {
         return (
             VoiceAnnouncementClaim {
                 should_announce: false,
+                attempt_id: None,
             },
             false,
         );
     }
 
     let settings = parse_settings(&root);
-    handled.push(identity);
+    handled.push(identity.clone());
     if handled.len() > MAX_HANDLED_ANNOUNCEMENTS {
         handled.drain(..handled.len() - MAX_HANDLED_ANNOUNCEMENTS);
     }
@@ -413,13 +443,132 @@ fn claim_announcement_in_root(
         "handledAnnouncementEvents".into(),
         serde_json::json!(handled),
     );
+    let should_announce =
+        settings.enabled && kind.is_some_and(|kind| settings.announcement_policy.enabled(kind));
+    let attempt_id = should_announce.then(|| format!("voice-attempt:v1:{identity}"));
+    if let (Some(attempt_id), Some(kind)) = (attempt_id.as_ref(), kind) {
+        let mut outcomes = root
+            .get("announcementOutcomes")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<Vec<VoiceAnnouncementOutcomeRecord>>(value).ok()
+            })
+            .unwrap_or_default();
+        outcomes.push(VoiceAnnouncementOutcomeRecord {
+            attempt_id: attempt_id.clone(),
+            seq,
+            kind,
+            status: VoiceAnnouncementOutcomeStatus::Attempted,
+            detail: None,
+            updated_at_ms: now_ms(),
+        });
+        if outcomes.len() > MAX_HANDLED_ANNOUNCEMENTS {
+            outcomes.drain(..outcomes.len() - MAX_HANDLED_ANNOUNCEMENTS);
+        }
+        root.as_object_mut()
+            .expect("filtered to object above")
+            .insert(
+                "announcementOutcomes".into(),
+                serde_json::to_value(outcomes).expect("outcome records serialize"),
+            );
+    }
     (
         VoiceAnnouncementClaim {
-            should_announce: settings.enabled
-                && kind.is_some_and(|kind| settings.announcement_policy.enabled(kind)),
+            should_announce,
+            attempt_id,
         },
         true,
     )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn update_announcement_outcome(
+    attempt_id: &str,
+    status: VoiceAnnouncementOutcomeStatus,
+    detail: Option<String>,
+) -> Result<(), String> {
+    let _guard = VOICE_FILE_LOCK
+        .lock()
+        .map_err(|_| "voice settings lock poisoned".to_string())?;
+    update_announcement_outcome_at(&voice_settings_path(), attempt_id, status, detail)
+}
+
+fn update_announcement_outcome_at(
+    path: &Path,
+    attempt_id: &str,
+    status: VoiceAnnouncementOutcomeStatus,
+    detail: Option<String>,
+) -> Result<(), String> {
+    let mut root = read_json_root(&path)?;
+    let mut outcomes = root
+        .get("announcementOutcomes")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<VoiceAnnouncementOutcomeRecord>>(value).ok())
+        .unwrap_or_default();
+    let record = outcomes
+        .iter_mut()
+        .rev()
+        .find(|record| record.attempt_id == attempt_id)
+        .ok_or_else(|| format!("unknown voice announcement attempt {attempt_id}"))?;
+    record.status = status;
+    record.detail = detail.map(|value| value.chars().take(512).collect());
+    record.updated_at_ms = now_ms();
+    root.as_object_mut()
+        .expect("voice settings root is an object")
+        .insert(
+            "announcementOutcomes".into(),
+            serde_json::to_value(outcomes)
+                .map_err(|error| format!("serialize announcement outcomes: {error}"))?,
+        );
+    write_json_root_unlocked(path, &root)
+}
+
+fn recover_interrupted_announcements() -> Result<Option<VoiceRecoveredInterruption>, String> {
+    let _guard = VOICE_FILE_LOCK
+        .lock()
+        .map_err(|_| "voice settings lock poisoned".to_string())?;
+    recover_interrupted_announcements_at(&voice_settings_path())
+}
+
+fn recover_interrupted_announcements_at(
+    path: &Path,
+) -> Result<Option<VoiceRecoveredInterruption>, String> {
+    let mut root = read_json_root(&path)?;
+    let mut outcomes = root
+        .get("announcementOutcomes")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<VoiceAnnouncementOutcomeRecord>>(value).ok())
+        .unwrap_or_default();
+    let mut recovered = None;
+    for record in outcomes.iter_mut() {
+        if record.status == VoiceAnnouncementOutcomeStatus::Attempted {
+            record.status = VoiceAnnouncementOutcomeStatus::Interrupted;
+            record.detail = Some("The app exited before voice delivery finished.".to_string());
+            record.updated_at_ms = now_ms();
+            recovered = Some(VoiceRecoveredInterruption {
+                attempt_id: record.attempt_id.clone(),
+                detail: record.detail.clone().expect("set above"),
+            });
+        }
+    }
+    if recovered.is_some() {
+        root.as_object_mut()
+            .expect("voice settings root is an object")
+            .insert(
+                "announcementOutcomes".into(),
+                serde_json::to_value(outcomes)
+                    .map_err(|error| format!("serialize announcement outcomes: {error}"))?,
+            );
+        write_json_root_unlocked(path, &root)?;
+    }
+    Ok(recovered)
 }
 
 fn read_json_root(path: &Path) -> Result<serde_json::Value, String> {
@@ -540,6 +689,26 @@ pub async fn voice_announcement_claim(
     tauri::async_runtime::spawn_blocking(move || claim_announcement(seq, event_id, kind))
         .await
         .map_err(|e| format!("voice_announcement_claim task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn voice_announcement_outcome(
+    attempt_id: String,
+    status: VoiceAnnouncementOutcomeStatus,
+    detail: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        update_announcement_outcome(&attempt_id, status, detail)
+    })
+    .await
+    .map_err(|e| format!("voice_announcement_outcome task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn voice_announcement_recover() -> Result<Option<VoiceRecoveredInterruption>, String> {
+    tauri::async_runtime::spawn_blocking(recover_interrupted_announcements)
+        .await
+        .map_err(|e| format!("voice_announcement_recover task failed: {e}"))?
 }
 
 /// Pull one voice name out of a /voices entry: a bare string, or the first
@@ -990,6 +1159,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_reorder_eviction_boundary_is_treated_as_stale_replay() {
+        let high_water = 1000;
+        let mut root = serde_json::json!({
+            "enabled": true,
+            "lastHandledJournalSeq": high_water,
+            "handledAnnouncementEvents": [],
+            "announcementPolicy": {
+                "permission": true,
+                "question": true,
+                "completion": true,
+                "failure": true,
+            }
+        });
+        let (boundary, changed) = claim_announcement_in_root(
+            &mut root,
+            high_water - ANNOUNCEMENT_REORDER_WINDOW,
+            Some("evicted-boundary"),
+            Some(VoiceAnnouncementKind::Permission),
+        );
+        assert!(!boundary.should_announce);
+        assert!(!changed);
+
+        let (inside, changed) = claim_announcement_in_root(
+            &mut root,
+            high_water - ANNOUNCEMENT_REORDER_WINDOW + 1,
+            Some("inside-window"),
+            Some(VoiceAnnouncementKind::Permission),
+        );
+        assert!(inside.should_announce);
+        assert!(changed);
+    }
+
+    #[test]
     fn claim_is_returned_only_after_durable_file_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("voice.json");
@@ -1022,6 +1224,80 @@ mod tests {
             persisted["handledAnnouncementEvents"][0],
             "provider-event:v1:test"
         );
+    }
+
+    #[test]
+    fn unacknowledged_attempt_is_recovered_as_interrupted_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("voice.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "enabled": true,
+                "announcementPolicy": {
+                    "permission": true,
+                    "question": false,
+                    "completion": false,
+                    "failure": false,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let claim = claim_announcement_at(
+            &path,
+            9,
+            Some("provider-event:v1:crash"),
+            Some(VoiceAnnouncementKind::Permission),
+        )
+        .unwrap();
+        let attempt_id = claim.attempt_id.unwrap();
+        let recovered = recover_interrupted_announcements_at(&path)
+            .unwrap()
+            .expect("attempt is recovered");
+        assert_eq!(recovered.attempt_id, attempt_id);
+        assert!(recover_interrupted_announcements_at(&path)
+            .unwrap()
+            .is_none());
+        let root = read_json_root(&path).unwrap();
+        assert_eq!(root["announcementOutcomes"][0]["status"], "interrupted");
+    }
+
+    #[test]
+    fn acknowledged_attempt_is_not_recovered_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("voice.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "enabled": true,
+                "announcementPolicy": {
+                    "permission": true,
+                    "question": false,
+                    "completion": false,
+                    "failure": false,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let claim = claim_announcement_at(
+            &path,
+            10,
+            Some("provider-event:v1:success"),
+            Some(VoiceAnnouncementKind::Permission),
+        )
+        .unwrap();
+        update_announcement_outcome_at(
+            &path,
+            claim.attempt_id.as_deref().unwrap(),
+            VoiceAnnouncementOutcomeStatus::Succeeded,
+            None,
+        )
+        .unwrap();
+        assert!(recover_interrupted_announcements_at(&path)
+            .unwrap()
+            .is_none());
     }
 
     fn minimal_wav(data: &[u8]) -> Vec<u8> {

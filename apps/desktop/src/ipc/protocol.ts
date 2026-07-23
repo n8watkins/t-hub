@@ -111,6 +111,12 @@ export interface AgentStateInfo {
 /** Payload of the `agent://journal` event: a journal entry the core consumed. */
 export interface JournalEvent {
   entry: EventJournalEntry;
+  /** Exact post-reducer announcement authority correlated to `entry`. */
+  voice_announcement?: {
+    kind: import("./voice").VoiceAnnouncementKind;
+    sessionId: string;
+    status: import("./model").SessionStatus;
+  };
 }
 
 /** Payload of the `session://status` event. */

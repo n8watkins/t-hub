@@ -27,6 +27,7 @@ import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import {
   claimVoiceAnnouncement,
+  recordVoiceAnnouncementOutcome,
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
@@ -37,9 +38,12 @@ import { notify } from "./notify";
 import { useEngineRuntime } from "../store/engineRuntime";
 import { effectiveTarget } from "../ipc/engine";
 import { createWarmup } from "./warmup";
-import { captainSubjectForSession } from "./captainAttribution";
+import {
+  captainSubjectForSession,
+  terminalIdForSession,
+} from "./captainAttribution";
 import type { SessionStatus } from "../ipc/model";
-import type { EventJournalEntry, JournalEvent } from "../ipc/protocol";
+import type { JournalEvent } from "../ipc/protocol";
 
 /** Minimum gap between spoken announcements (the burst debounce). */
 export const ANNOUNCE_MIN_GAP_MS = 5000;
@@ -98,6 +102,7 @@ interface PendingAnnouncement {
   text: string;
   requireBlocked: boolean;
   kind: VoiceAnnouncementKind;
+  attemptId?: string;
 }
 
 const ANNOUNCEMENT_SEVERITY: Record<VoiceAnnouncementKind, number> = {
@@ -123,7 +128,7 @@ let unsubscribePollLifecycle: (() => void) | null = null;
  *  Scribe-flush path. Returns false when a request was ALREADY in flight (the
  *  caller then knows nothing was started - the flush path uses this to retry a
  *  held cue instead of dropping it). */
-function speak(text: string, now: number): boolean {
+function speak(text: string, now: number, attemptId?: string): boolean {
   if (speaking) return false;
   speaking = true;
   const voice = useVoice.getState();
@@ -136,8 +141,15 @@ function speak(text: string, now: number): boolean {
     voice.voice,
   );
   const engine = target.engine;
-  const onSynthesisFailure = (error: unknown) => {
+  const onSynthesisFailure = async (error: unknown) => {
     const detail = error instanceof Error ? error.message : String(error);
+    if (attemptId) {
+      await recordVoiceAnnouncementOutcome(
+        attemptId,
+        "failed",
+        `synthesis: ${detail}`,
+      ).catch(() => {});
+    }
     useVoice
       .getState()
       .recordDeliveryFailure("synthesis", detail || "Synthesis failed", now);
@@ -151,10 +163,17 @@ function speak(text: string, now: number): boolean {
       );
     }
   };
-  const onPlaybackFailure = (error: unknown) => {
+  const onPlaybackFailure = async (error: unknown) => {
     const kind =
       error instanceof VoiceAudioError ? error.kind : ("playback" as const);
     const detail = error instanceof Error ? error.message : String(error);
+    if (attemptId) {
+      await recordVoiceAnnouncementOutcome(
+        attemptId,
+        "failed",
+        `${kind}: ${detail}`,
+      ).catch(() => {});
+    }
     useVoice
       .getState()
       .recordDeliveryFailure(kind, detail || "Audio delivery failed", now);
@@ -170,9 +189,15 @@ function speak(text: string, now: number): boolean {
     .then(
       (b64) =>
         Promise.resolve(playWavBase64(b64, useVoice.getState().volume)).then(
-          () => {
+          async () => {
             lastSpokenAt = now;
             useVoice.getState().clearDeliveryFailure();
+            if (attemptId) {
+              await recordVoiceAnnouncementOutcome(
+                attemptId,
+                "succeeded",
+              ).catch(() => {});
+            }
           },
           onPlaybackFailure,
         ),
@@ -199,39 +224,26 @@ function speak(text: string, now: number): boolean {
   return true;
 }
 
-const DIRECT_JOURNAL_KIND: Partial<
-  Record<EventJournalEntry["event_type"], VoiceAnnouncementKind>
-> = {
-  permissionRequest: "permission",
-  elicitation: "question",
-  stopFailure: "failure",
-};
-
-function resolvedJournalKind(
-  entry: EventJournalEntry,
-): VoiceAnnouncementKind | null {
-  const direct = DIRECT_JOURNAL_KIND[entry.event_type];
-  if (direct) return direct;
-  const status = entry.entity_id
-    ? useSupervision.getState().statuses[entry.entity_id]
-    : undefined;
-  if (entry.event_type === "stop") {
-    return status === "completed" ? "completion" : null;
-  }
-  if (entry.event_type === "sessionEnd") {
-    if (status === "completed") return "completion";
-    if (status === "failed") return "failure";
-  }
-  return null;
-}
-
 function queuePending(next: PendingAnnouncement): void {
   if (
     !pending ||
     ANNOUNCEMENT_SEVERITY[next.kind] >=
       ANNOUNCEMENT_SEVERITY[pending.kind]
   ) {
+    if (pending?.attemptId) {
+      void recordVoiceAnnouncementOutcome(
+        pending.attemptId,
+        "interrupted",
+        "A higher-priority announcement replaced this queued cue.",
+      ).catch(() => {});
+    }
     pending = next;
+  } else if (next.attemptId) {
+    void recordVoiceAnnouncementOutcome(
+      next.attemptId,
+      "interrupted",
+      "A higher-priority announcement was already queued.",
+    ).catch(() => {});
   }
 }
 
@@ -262,30 +274,20 @@ export async function handleJournalEvent(
   event: JournalEvent,
   now: number = Date.now(),
 ): Promise<void> {
-  if (
-    !DIRECT_JOURNAL_KIND[event.entry.event_type] &&
-    event.entry.event_type !== "stop" &&
-    event.entry.event_type !== "sessionEnd"
-  ) {
-    return;
-  }
-
-  // The journal event is emitted immediately before the reducer-derived status
-  // event. Claim persistence yields to that event, then classification reads the
-  // reducer authority. A Stop that is WaitingOnSubagents is observed and
-  // durably consumed, but never announced as complete.
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  const kind = resolvedJournalKind(event.entry);
+  const authority = event.voice_announcement;
+  if (!authority) return;
+  const kind = authority.kind;
 
   let shouldAnnounce = false;
+  let attemptId: string | undefined;
   try {
-    shouldAnnounce = (
-      await claimVoiceAnnouncement(
-        event.entry.seq,
-        kind,
-        event.entry.event_id,
-      )
-    ).shouldAnnounce;
+    const claim = await claimVoiceAnnouncement(
+      event.entry.seq,
+      kind,
+      event.entry.event_id,
+    );
+    shouldAnnounce = claim.shouldAnnounce;
+    attemptId = claim.attemptId;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     notify(
@@ -295,12 +297,27 @@ export async function handleJournalEvent(
     );
     return;
   }
-  if (!kind || !shouldAnnounce) return;
+  if (!shouldAnnounce) return;
 
-  const text = announcementText(kind, event.entry.entity_id);
+  // Voice is intentionally scoped to sessions represented in the user's
+  // Captain/Crew/Assignment workspace. Provider-internal sessions are claimed
+  // so replay stays suppressed, but never spoken.
+  const terminalId = terminalIdForSession(authority.sessionId);
+  if (!terminalId || !useWorkspace.getState().terminals[terminalId]) {
+    if (attemptId) {
+      await recordVoiceAnnouncementOutcome(
+        attemptId,
+        "interrupted",
+        "The event was outside the active Captain, Crew, or Assignment workspace.",
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  const text = announcementText(kind, authority.sessionId);
   const requireBlocked = kind === "permission" || kind === "question";
   if (!scribeStatusKnown || scribeListening) {
-    queuePending({ text, requireBlocked, kind });
+    queuePending({ text, requireBlocked, kind, attemptId });
     return;
   }
   if (speaking || now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) {
@@ -308,7 +325,7 @@ export async function handleJournalEvent(
     // losing an event while another clip is playing or the burst gap is open.
     // The durable claim is intentionally at-most-once, so this one-slot queue
     // is the only retry and coalescing boundary.
-    queuePending({ text, requireBlocked, kind });
+    queuePending({ text, requireBlocked, kind, attemptId });
     if (!tailTimer) {
       const delay = Math.max(0, ANNOUNCE_MIN_GAP_MS - (now - lastSpokenAt));
       tailTimer = setTimeout(() => {
@@ -318,7 +335,7 @@ export async function handleJournalEvent(
     }
     return;
   }
-  speak(text, now);
+  speak(text, now, attemptId);
 }
 
 /** A STABLE spoken name for a session, via the statusline's tmux index (the
@@ -488,7 +505,7 @@ export function flushPending(now: number = Date.now()): void {
     pending = null; // resolved during dictation - drop silently
     return;
   }
-  if (speak(held.text, now)) {
+  if (speak(held.text, now, held.attemptId)) {
     pending = null; // delivered
     return;
   }
@@ -532,6 +549,13 @@ function stopScribePoll(): void {
   }
   scribeListening = false;
   scribeStatusKnown = false;
+  if (pending?.attemptId) {
+    void recordVoiceAnnouncementOutcome(
+      pending.attemptId,
+      "interrupted",
+      "Voice announcements were disabled before delivery.",
+    ).catch(() => {});
+  }
   pending = null;
   journalProcessing = Promise.resolve();
   if (tailTimer) {

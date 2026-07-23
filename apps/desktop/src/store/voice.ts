@@ -13,6 +13,7 @@ import { create } from "zustand";
 import {
   listVoices,
   readVoiceSettings,
+  recoverVoiceAnnouncements,
   voiceHealth,
   writeVoiceSettings,
   type VoiceEngine,
@@ -52,7 +53,11 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings & {
  *  enough that an external reader sees the change near-immediately. */
 export const VOICE_PERSIST_DEBOUNCE_MS = 300;
 
-export type VoiceDeliveryFailureKind = "synthesis" | "playback" | "device";
+export type VoiceDeliveryFailureKind =
+  | "synthesis"
+  | "playback"
+  | "device"
+  | "interrupted";
 
 export interface VoiceDeliveryFailure {
   kind: VoiceDeliveryFailureKind;
@@ -245,6 +250,23 @@ export const useVoice = create<VoiceState>((set, get) => {
           loaded: true,
           settingsError: null,
         });
+        try {
+          const interrupted = await recoverVoiceAnnouncements();
+          if (interrupted) {
+            set({
+              deliveryFailure: {
+                kind: "interrupted",
+                detail: interrupted.detail,
+                occurredAt: Date.now(),
+              },
+            });
+          }
+        } catch (error) {
+          set({
+            settingsError:
+              error instanceof Error ? error.message : String(error),
+          });
+        }
       } catch (error) {
         if (generation !== loadGeneration) return;
         const current = get();

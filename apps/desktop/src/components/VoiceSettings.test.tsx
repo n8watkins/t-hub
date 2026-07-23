@@ -14,6 +14,7 @@ vi.mock("../ipc/voice", () => ({
   listVoices: vi.fn(),
   synthesizeVoice: vi.fn(() => Promise.resolve("d2F2")),
   voiceHealth: vi.fn(),
+  recoverVoiceAnnouncements: vi.fn(() => Promise.resolve(null)),
 }));
 vi.mock("../lib/voiceAudio", () => ({
   playWavBase64: vi.fn(),

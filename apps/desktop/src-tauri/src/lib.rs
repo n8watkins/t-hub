@@ -1048,6 +1048,8 @@ pub fn run() {
             voice::voice_settings_read,
             voice::voice_settings_write,
             voice::voice_announcement_claim,
+            voice::voice_announcement_outcome,
+            voice::voice_announcement_recover,
             voice::voice_list_voices,
             voice::voice_tts,
             // Bounded /health probe (2s) per engine - the Settings dual-engine

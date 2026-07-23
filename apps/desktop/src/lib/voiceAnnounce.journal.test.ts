@@ -5,6 +5,8 @@ vi.mock("../ipc/voice", () => ({
     Promise.resolve({ shouldAnnounce: true }),
   ),
   synthesizeVoice: vi.fn(() => Promise.resolve("d2F2")),
+  recordVoiceAnnouncementOutcome: vi.fn(() => Promise.resolve()),
+  recoverVoiceAnnouncements: vi.fn(() => Promise.resolve(null)),
 }));
 vi.mock("../ipc/client05", () => ({
   onJournal: vi.fn(),
@@ -29,6 +31,7 @@ vi.mock("./notify", () => ({
 
 import {
   claimVoiceAnnouncement,
+  recordVoiceAnnouncementOutcome,
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
@@ -49,6 +52,7 @@ function journal(
   seq: number,
   eventType: JournalEventType,
   payload: unknown = {},
+  authorityKind: VoiceAnnouncementKind | null = defaultAuthority(eventType),
 ): JournalEvent {
   return {
     entry: {
@@ -60,7 +64,37 @@ function journal(
       event_type: eventType,
       payload,
     },
+    ...(authorityKind
+      ? {
+          voice_announcement: {
+            kind: authorityKind,
+            sessionId: "session-1",
+            status:
+              authorityKind === "failure"
+                ? ("failed" as const)
+                : authorityKind === "completion"
+                  ? ("completed" as const)
+                  : authorityKind === "permission"
+                    ? ("needsPermission" as const)
+                    : ("needsQuestion" as const),
+          },
+        }
+      : {}),
   };
+}
+
+function defaultAuthority(
+  eventType: JournalEventType,
+): VoiceAnnouncementKind | null {
+  const authorityByEvent: Partial<
+    Record<JournalEventType, VoiceAnnouncementKind>
+  > = {
+    permissionRequest: "permission",
+    elicitation: "question",
+    stop: "completion",
+    stopFailure: "failure",
+  };
+  return authorityByEvent[eventType] ?? null;
 }
 
 async function settle(): Promise<void> {
@@ -184,19 +218,18 @@ describe("provider-neutral journal announcements", () => {
     useSupervision.setState({
       statuses: { "session-1": "waitingOnSubagents" },
     });
-    await handleJournalEvent(journal(14, "stop"), 10_000);
+    await handleJournalEvent(journal(14, "stop", {}, null), 10_000);
     await settle();
-    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
-      14,
-      null,
-      "provider-event:v1:14",
-    );
+    expect(claimVoiceAnnouncement).not.toHaveBeenCalled();
     expect(synthesizeVoice).not.toHaveBeenCalled();
   });
 
   it("maps clean and abnormal SessionEnd from reducer authority", async () => {
     useSupervision.setState({ statuses: { "session-1": "completed" } });
-    await handleJournalEvent(journal(15, "sessionEnd"), 10_000);
+    await handleJournalEvent(
+      journal(15, "sessionEnd", {}, "completion"),
+      10_000,
+    );
     await settle();
     expect(claimVoiceAnnouncement).toHaveBeenLastCalledWith(
       15,
@@ -207,7 +240,7 @@ describe("provider-neutral journal announcements", () => {
     _resetVoiceAnnounceForTest();
     _setScribeListeningForTest(false);
     useSupervision.setState({ statuses: { "session-1": "failed" } });
-    await handleJournalEvent(journal(16, "sessionEnd"), 20_000);
+    await handleJournalEvent(journal(16, "sessionEnd", {}, "failure"), 20_000);
     await settle();
     expect(claimVoiceAnnouncement).toHaveBeenLastCalledWith(
       16,
@@ -223,5 +256,41 @@ describe("provider-neutral journal announcements", () => {
     await handleJournalEvent(journal(18, "stop"), 10_001);
     expect(_pendingTextForTest()).toContain("failed");
     expect(_pendingTextForTest()).not.toContain("completed");
+  });
+
+  it("announces completion authority carried by a child drain event", async () => {
+    await handleJournalEvent(
+      journal(19, "subagentStop", {}, "completion"),
+      30_000,
+    );
+    await settle();
+    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+      19,
+      "completion",
+      "provider-event:v1:19",
+    );
+    expect(synthesizeVoice).toHaveBeenCalledWith(
+      expect.stringContaining("completed"),
+      expect.any(String),
+      expect.any(String),
+    );
+  });
+
+  it("interrupts claimed authority for a provider session outside the visible crew", async () => {
+    vi.mocked(claimVoiceAnnouncement).mockResolvedValue({
+      shouldAnnounce: true,
+      attemptId: "voice-attempt:v1:20",
+    });
+    useSupervision.setState({ sessionIdByTmux: {} });
+
+    await handleJournalEvent(journal(20, "permissionRequest"), 30_000);
+    await settle();
+
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledWith(
+      "voice-attempt:v1:20",
+      "interrupted",
+      expect.stringContaining("active Captain, Crew, or Assignment"),
+    );
   });
 });

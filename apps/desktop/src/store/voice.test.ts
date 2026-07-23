@@ -11,10 +11,12 @@ vi.mock("../ipc/voice", () => ({
   listVoices: vi.fn(),
   synthesizeVoice: vi.fn(),
   voiceHealth: vi.fn(),
+  recoverVoiceAnnouncements: vi.fn(() => Promise.resolve(null)),
 }));
 
 import {
   readVoiceSettings,
+  recoverVoiceAnnouncements,
   writeVoiceSettings,
   listVoices,
   voiceHealth,
@@ -51,6 +53,8 @@ beforeEach(() => {
   vi.mocked(writeVoiceSettings).mockClear();
   vi.mocked(listVoices).mockReset();
   vi.mocked(voiceHealth).mockReset();
+  vi.mocked(recoverVoiceAnnouncements).mockReset();
+  vi.mocked(recoverVoiceAnnouncements).mockResolvedValue(null);
   _resetVoicePersistForTest();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
@@ -80,6 +84,21 @@ describe("voice settings round-trip", () => {
     expect(s.volume).toBe(0.55);
     expect(s.sapiRate).toBe(2);
     expect(s.announceOnAttention).toBe(true);
+  });
+
+  it("surfaces an interrupted in-flight announcement recovered at startup", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue(FILE_SETTINGS);
+    vi.mocked(recoverVoiceAnnouncements).mockResolvedValue({
+      attemptId: "voice-attempt:v1:event-1",
+      detail: "Delivery was interrupted before an outcome was recorded.",
+    });
+
+    await useVoice.getState().load();
+
+    expect(useVoice.getState().deliveryFailure).toMatchObject({
+      kind: "interrupted",
+      detail: "Delivery was interrupted before an outcome was recorded.",
+    });
   });
 
   it("load() falls back to defaults when the read command fails", async () => {

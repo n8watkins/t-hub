@@ -377,7 +377,7 @@ impl Journal {
             .len();
         Self::ensure_scan_bound(file_len)?;
         let mut reader = BufReader::new(file);
-        let mut count: u64 = 0;
+        let mut head_seq: u64 = 0;
         let mut valid_len = 0_u64;
         let mut scanned = 0_u64;
         let mut recent_event_ids = Vec::new();
@@ -393,15 +393,15 @@ impl Journal {
                 continue;
             }
             if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                count += 1;
+                head_seq = entry.seq.max(head_seq.saturating_add(1));
                 if let Some(event_id) = entry.event_id.as_deref() {
-                    Self::remember_event_id(&mut recent_event_ids, event_id, count);
+                    Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
                 }
             }
         }
         Ok(HeadState {
             version: HEAD_VERSION,
-            head_seq: count,
+            head_seq,
             journal_len: valid_len.min(file_len),
             recent_event_ids,
         })
@@ -687,7 +687,7 @@ impl Journal {
             }
             match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 Ok(mut entry) => {
-                    seq += 1;
+                    seq = entry.seq.max(seq.saturating_add(1));
                     if seq > after_seq {
                         entry.seq = seq;
                         out.push(entry);
@@ -788,7 +788,7 @@ impl Journal {
             // Skip torn/garbage lines but still advance past them (same tolerance
             // as recovery/replay); only count parseable entries toward `seq`.
             if let Ok(mut e) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
-                seq += 1;
+                seq = e.seq.max(seq.saturating_add(1));
                 e.seq = seq;
                 out.push(e);
             }
@@ -800,12 +800,9 @@ impl Journal {
     /// snapshots, shrinking it back down. Returns `(before_bytes, after_bytes,
     /// kept_entries)`.
     ///
-    /// **When to call:** this renumbers sequences (they are 1-based line
-    /// positions), so it MUST run while no core is attached — i.e. at agent
-    /// startup, before [`crate::transport::serve_stdio`]. Running it
-    /// mid-connection would push subsequent seqs *below* the core's replay cursor
-    /// and silently stall delivery. At startup there is no cursor yet, so the
-    /// core simply handshakes against the freshly-compacted head.
+    /// Sequence numbers remain monotonic across compaction. Kept records retain
+    /// their persisted sequence, and the next append advances from the highest
+    /// retained sequence rather than the number of retained lines.
     ///
     /// Append and compaction use the same interprocess transaction lock.
     /// A hook that opened the journal before compaction therefore reopens the
@@ -840,6 +837,7 @@ impl Journal {
             .with_file_name(format!("{JOURNAL_FILE}.compact.{}", std::process::id()));
 
         let mut kept: u64 = 0;
+        let mut head_seq: u64 = 0;
         let mut recent_event_ids = Vec::new();
         {
             let file = Self::open_private_truncate(&tmp)
@@ -857,17 +855,21 @@ impl Journal {
                 if line.bytes.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let is_status = serde_json::from_slice::<EventJournalEntry>(&line.bytes)
-                    .map(|e| e.source == JournalSource::Status)
-                    .unwrap_or(false);
+                let parsed = serde_json::from_slice::<EventJournalEntry>(&line.bytes).ok();
+                if let Some(entry) = parsed.as_ref() {
+                    head_seq = entry.seq.max(head_seq.saturating_add(1));
+                }
+                let is_status = parsed
+                    .as_ref()
+                    .is_some_and(|entry| entry.source == JournalSource::Status);
                 if !is_status {
                     out.write_all(&line.bytes)
                         .context("writing compaction entry")?;
                     out.write_all(b"\n")?;
-                    if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
+                    if let Some(entry) = parsed {
                         kept += 1;
                         if let Some(event_id) = entry.event_id.as_deref() {
-                            Self::remember_event_id(&mut recent_event_ids, event_id, kept);
+                            Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
                         }
                     }
                 }
@@ -880,12 +882,12 @@ impl Journal {
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("publishing compacted journal {:?}", self.path))?;
         self.sync_directory("syncing journal directory after compaction")?;
-        guard.head_seq = kept;
+        guard.head_seq = head_seq;
 
         let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         self.publish_head_state_locked(&HeadState {
             version: HEAD_VERSION,
-            head_seq: kept,
+            head_seq,
             journal_len: after,
             recent_event_ids,
         })?;
@@ -1681,13 +1683,28 @@ mod tests {
         assert_eq!(before, before_len);
         assert!(after < before, "file must shrink after dropping status");
         assert_eq!(kept, 2, "only the 2 durable entries remain");
-        assert_eq!(j.head_seq(), 2, "in-memory head resyncs to the kept count");
+        assert_eq!(
+            j.head_seq(),
+            4,
+            "compaction preserves the high-water sequence of dropped records"
+        );
 
-        // The reopened handle still appends correctly, and no Status survives.
-        let next = j.append(entry(JournalEventType::SessionEnd, "s1")).unwrap();
-        assert_eq!(next.seq, 3);
-        let remaining = j.replay(0).unwrap();
+        // A fresh process recovers the dropped record's high-water sequence
+        // from the sidecar before appending, and no Status survives.
+        drop(j);
+        let reopened = Journal::open(&dir).unwrap();
+        assert_eq!(reopened.head_seq(), 4);
+        let next = reopened
+            .append(entry(JournalEventType::SessionEnd, "s1"))
+            .unwrap();
+        assert_eq!(next.seq, 5);
+        let remaining = reopened.replay(0).unwrap();
         assert_eq!(remaining.len(), 3);
+        assert_eq!(
+            remaining.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 3, 5],
+            "retained and new events keep globally monotonic sequence ids"
+        );
         assert!(remaining.iter().all(|e| e.source != JournalSource::Status));
 
         std::fs::remove_dir_all(&dir).ok();

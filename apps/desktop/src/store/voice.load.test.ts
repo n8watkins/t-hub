@@ -6,6 +6,7 @@ vi.mock("../ipc/voice", () => ({
   writeVoiceSettings: vi.fn(() => Promise.resolve()),
   listVoices: vi.fn(),
   voiceHealth: vi.fn(),
+  recoverVoiceAnnouncements: vi.fn(() => Promise.resolve(null)),
 }));
 
 import { readVoiceSettings } from "../ipc/voice";

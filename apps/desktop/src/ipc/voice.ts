@@ -50,8 +50,28 @@ export function claimVoiceAnnouncement(
   seq: number,
   kind: VoiceAnnouncementKind | null,
   eventId?: string,
-): Promise<{ shouldAnnounce: boolean }> {
+): Promise<{ shouldAnnounce: boolean; attemptId?: string }> {
   return invoke("voice_announcement_claim", { seq, kind, eventId });
+}
+
+export type VoiceAnnouncementOutcomeStatus =
+  | "succeeded"
+  | "failed"
+  | "interrupted";
+
+export function recordVoiceAnnouncementOutcome(
+  attemptId: string,
+  status: VoiceAnnouncementOutcomeStatus,
+  detail?: string,
+): Promise<void> {
+  return invoke("voice_announcement_outcome", { attemptId, status, detail });
+}
+
+export function recoverVoiceAnnouncements(): Promise<{
+  attemptId: string;
+  detail: string;
+} | null> {
+  return invoke("voice_announcement_recover");
 }
 
 /** Installed voice names from the given engine's /voices (via the backend

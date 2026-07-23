@@ -65,6 +65,25 @@ pub const EVT_TITLE: &str = "agent://title";
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalEventPayload<'a> {
     pub entry: &'a t_hub_protocol::EventJournalEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_announcement: Option<JournalVoiceAnnouncement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalVoiceAnnouncement {
+    pub kind: JournalVoiceAnnouncementKind,
+    pub session_id: String,
+    pub status: crate::model::SessionStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JournalVoiceAnnouncementKind {
+    Permission,
+    Question,
+    Completion,
+    Failure,
 }
 
 /// Payload of the `session://status` event (mirrors `SessionStatusEvent` in

@@ -40,8 +40,9 @@ use t_hub_protocol::{
 use crate::supervision::Supervisor;
 use connection::{spawn_child, spawn_reader, write_frame, TransportHandles};
 use emit::{
-    JournalEventPayload, SessionStatusPayload, SessionTitlePayload, EVT_AGENT_STATE, EVT_JOURNAL,
-    EVT_SESSION_STATUS, EVT_STATUS_SNAPSHOT, EVT_SUPERVISION, EVT_TITLE,
+    JournalEventPayload, JournalVoiceAnnouncement, JournalVoiceAnnouncementKind,
+    SessionStatusPayload, SessionTitlePayload, EVT_AGENT_STATE, EVT_JOURNAL, EVT_SESSION_STATUS,
+    EVT_STATUS_SNAPSHOT, EVT_SUPERVISION, EVT_TITLE,
 };
 
 /// How the core reaches the agent on this platform.
@@ -819,11 +820,7 @@ impl AgentBridge {
             });
         }
 
-        // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
-        //    the protocol type). Serialize once and reuse the value.
-        self.inner.emit(EVT_JOURNAL, &JournalEventPayload { entry });
-
-        // 2. The replay cursor moved, so the health area's journalCursor changed.
+        // 1. The replay cursor moved, so the health area's journalCursor changed.
         self.emit_agent_state();
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
@@ -855,6 +852,7 @@ impl AgentBridge {
             .payload
             .get("notification_type")
             .and_then(|v| v.as_str());
+        let previous_status = session_id.map(|sid| self.with_supervisor(|s| s.status(sid)));
 
         // Structured provider lifecycle events carry the exact tmux binding.
         // Feed that binding into the existing session-to-terminal authority so
@@ -878,7 +876,48 @@ impl AgentBridge {
             )
         });
 
-        // 5. Emit the fresh tree + status for the affected session so the sidebar
+        // Emit the committed journal entry only after its exact reducer result
+        // is known. Voice consumes this correlated authority instead of racing a
+        // later session-status event. Completion is a status edge, so a Stop
+        // with outstanding children is silent and the eventual child/task drain
+        // owns the single completion announcement.
+        let authority_session = affected.as_deref().or(session_id);
+        let voice_announcement = authority_session.and_then(|sid| {
+            let status = self.with_supervisor(|s| s.status(sid));
+            let kind = if status == crate::model::SessionStatus::Failed
+                && previous_status != Some(crate::model::SessionStatus::Failed)
+            {
+                Some(JournalVoiceAnnouncementKind::Failure)
+            } else if status == crate::model::SessionStatus::Completed
+                && previous_status != Some(crate::model::SessionStatus::Completed)
+            {
+                Some(JournalVoiceAnnouncementKind::Completion)
+            } else if entry.event_type == t_hub_protocol::JournalEventType::PermissionRequest
+                && status == crate::model::SessionStatus::NeedsPermission
+            {
+                Some(JournalVoiceAnnouncementKind::Permission)
+            } else if entry.event_type == t_hub_protocol::JournalEventType::Elicitation
+                && status == crate::model::SessionStatus::NeedsQuestion
+            {
+                Some(JournalVoiceAnnouncementKind::Question)
+            } else {
+                None
+            };
+            kind.map(|kind| JournalVoiceAnnouncement {
+                kind,
+                session_id: sid.to_string(),
+                status,
+            })
+        });
+        self.inner.emit(
+            EVT_JOURNAL,
+            &JournalEventPayload {
+                entry,
+                voice_announcement,
+            },
+        );
+
+        // Emit the fresh tree + status for the affected session so the sidebar
         //    re-renders live (this is the headline FR-012 path).
         if let Some(sid) = affected.as_deref() {
             self.emit_session(sid);
@@ -1887,6 +1926,40 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(last_status.1["status"], "waitingOnSubagents");
+
+        let stop_journal = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, payload)| {
+                channel == super::EVT_JOURNAL && payload["entry"]["seq"] == 3
+            })
+            .cloned()
+            .expect("Stop must emit its correlated journal payload");
+        assert!(
+            stop_journal.1.get("voice_announcement").is_none(),
+            "Stop cannot announce completion while children are still running"
+        );
+
+        bridge.consume_journal_entry(&entry(4, "o1", Some("a1"), JournalEventType::SubagentStop));
+        let drain_journal = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, payload)| {
+                channel == super::EVT_JOURNAL && payload["entry"]["seq"] == 4
+            })
+            .cloned()
+            .expect("the child drain must emit its correlated journal payload");
+        assert_eq!(
+            drain_journal.1["voice_announcement"],
+            serde_json::json!({
+                "kind": "completion",
+                "sessionId": "o1",
+                "status": "completed"
+            }),
+            "the exact drain event owns completion authority"
+        );
     }
 
     #[test]
