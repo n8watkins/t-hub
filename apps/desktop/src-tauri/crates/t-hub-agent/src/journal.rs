@@ -39,8 +39,11 @@ const JOURNAL_LOCK_FILE: &str = "events.lock";
 /// Atomically replaced allocation state for the journal head.
 const JOURNAL_HEAD_FILE: &str = "head.json";
 /// Hook processes must never wait indefinitely behind a stalled writer.
-const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_LOCK_RETRY: Duration = Duration::from_millis(2);
+const MAX_ENTRY_BYTES: usize = 1024 * 1024;
+const MAX_HEAD_BYTES: usize = 4096;
+const MAX_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 
 /// At agent startup, compact the journal once it exceeds this size. The
 /// incremental tail (see [`Journal::tail_from`]) keeps live delivery cheap at
@@ -103,6 +106,11 @@ struct HeadState {
     journal_len: u64,
 }
 
+struct BoundedLine {
+    bytes: Vec<u8>,
+    complete: bool,
+}
+
 struct InterprocessLock<'a> {
     #[cfg(unix)]
     file: &'a File,
@@ -139,11 +147,7 @@ impl Journal {
 
         {
             let _lock = journal.lock_exclusive()?;
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&journal.path)
+            Self::open_private_file(&journal.path, true)
                 .with_context(|| format!("opening journal file {:?}", journal.path))?;
             let head = journal.authoritative_head_locked()?;
             journal
@@ -157,15 +161,7 @@ impl Journal {
 
     #[cfg(unix)]
     fn open_private_file(path: &Path, create: bool) -> Result<File> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        OpenOptions::new()
-            .create(create)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("opening private journal file {path:?}"))
+        Self::open_private_file_with(path, create, false, false)
     }
 
     #[cfg(not(unix))]
@@ -176,6 +172,94 @@ impl Journal {
             .write(true)
             .open(path)
             .with_context(|| format!("opening private journal file {path:?}"))
+    }
+
+    #[cfg(unix)]
+    fn open_private_file_with(
+        path: &Path,
+        create: bool,
+        append: bool,
+        truncate: bool,
+    ) -> Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .create(create)
+            .read(true)
+            .write(true)
+            .append(append)
+            .truncate(truncate)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("opening private journal file {path:?}"))?;
+        Self::enforce_private_regular_file(&file, path)?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn open_private_file_with(
+        path: &Path,
+        create: bool,
+        append: bool,
+        truncate: bool,
+    ) -> Result<File> {
+        OpenOptions::new()
+            .create(create)
+            .read(true)
+            .write(true)
+            .append(append)
+            .truncate(truncate)
+            .open(path)
+            .with_context(|| format!("opening private journal file {path:?}"))
+    }
+
+    #[cfg(unix)]
+    fn enforce_private_regular_file(file: &File, path: &Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading private journal metadata {path:?}"))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "private journal path is not a regular file: {path:?}"
+        );
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "private journal path is not owned by the current user: {path:?}"
+        );
+        let rc = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("restricting private journal permissions {path:?}"));
+        }
+        let mode = file
+            .metadata()
+            .with_context(|| format!("verifying private journal permissions {path:?}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        anyhow::ensure!(
+            mode == 0o600,
+            "private journal permissions are {mode:o}, expected 600: {path:?}"
+        );
+        Ok(())
+    }
+
+    fn open_private_append(path: &Path) -> Result<File> {
+        Self::open_private_file_with(path, true, true, false)
+    }
+
+    fn open_private_truncate(path: &Path) -> Result<File> {
+        Self::open_private_file_with(path, true, false, true)
+    }
+
+    fn sync_directory(&self, context: &'static str) -> Result<()> {
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .context(context)
     }
 
     fn lock_exclusive(&self) -> Result<InterprocessLock<'_>> {
@@ -233,42 +317,92 @@ impl Journal {
     /// Scan the file and return its complete, parseable line count plus the byte
     /// boundary before any torn trailing line.
     fn recover_head(path: &Path) -> Result<(u64, u64, u64)> {
-        let file = match File::open(path) {
+        let file = match Self::open_private_file(path, false) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, 0)),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok((0, 0, 0));
+            }
             Err(e) => return Err(e).with_context(|| format!("reading journal {path:?}")),
         };
-        let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("reading journal metadata {path:?}"))?
+            .len();
+        Self::ensure_scan_bound(file_len)?;
         let mut reader = BufReader::new(file);
         let mut count: u64 = 0;
         let mut valid_len = 0_u64;
-        let mut bytes = Vec::new();
+        let mut scanned = 0_u64;
         loop {
-            bytes.clear();
-            let read = reader.read_until(b'\n', &mut bytes)?;
-            if read == 0 {
+            let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
+                break;
+            };
+            if !line.complete {
                 break;
             }
-            if bytes.last() != Some(&b'\n') {
-                break;
-            }
-            valid_len = valid_len.saturating_add(read as u64);
-            let line = std::str::from_utf8(&bytes[..read - 1]).unwrap_or("");
-            if line.trim().is_empty() {
+            valid_len = scanned;
+            if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if serde_json::from_str::<EventJournalEntry>(line).is_ok() {
+            if serde_json::from_slice::<EventJournalEntry>(&line.bytes).is_ok() {
                 count += 1;
             }
         }
         Ok((count, valid_len, file_len))
     }
 
+    fn ensure_scan_bound(len: u64) -> Result<()> {
+        anyhow::ensure!(
+            len <= MAX_SCAN_BYTES,
+            "journal is {len} bytes, exceeding the {MAX_SCAN_BYTES}-byte scan limit"
+        );
+        Ok(())
+    }
+
+    fn read_bounded_line<R: BufRead>(
+        reader: &mut R,
+        scanned: &mut u64,
+    ) -> Result<Option<BoundedLine>> {
+        let mut bytes = Vec::new();
+        let limit = MAX_ENTRY_BYTES
+            .checked_add(2)
+            .context("journal entry read limit overflow")?;
+        let read = reader
+            .take(limit as u64)
+            .read_until(b'\n', &mut bytes)
+            .context("reading journal line")?;
+        if read == 0 {
+            return Ok(None);
+        }
+        *scanned = scanned
+            .checked_add(read as u64)
+            .context("journal scan byte count overflow")?;
+        anyhow::ensure!(
+            *scanned <= MAX_SCAN_BYTES,
+            "journal scan exceeded the {MAX_SCAN_BYTES}-byte limit"
+        );
+        let complete = bytes.last() == Some(&b'\n');
+        let content_len = bytes.len().saturating_sub(usize::from(complete));
+        anyhow::ensure!(
+            content_len <= MAX_ENTRY_BYTES,
+            "journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
+        );
+        if complete {
+            bytes.pop();
+        }
+        Ok(Some(BoundedLine { bytes, complete }))
+    }
+
     fn read_head_state(&self) -> Option<HeadState> {
         let file = Self::open_private_file(&self.dir.join(JOURNAL_HEAD_FILE), false).ok()?;
         let mut bytes = Vec::new();
-        file.take(4097).read_to_end(&mut bytes).ok()?;
-        if bytes.len() > 4096 {
+        file.take((MAX_HEAD_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > MAX_HEAD_BYTES {
             return None;
         }
         serde_json::from_slice(&bytes).ok()
@@ -287,9 +421,7 @@ impl Journal {
 
         let (head_seq, valid_len, file_len) = Self::recover_head(&self.path)?;
         if valid_len < file_len {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
+            let file = Self::open_private_file(&self.path, false)
                 .context("opening journal to remove torn tail")?;
             file.set_len(valid_len)
                 .context("truncating torn journal tail")?;
@@ -306,11 +438,21 @@ impl Journal {
 
     fn publish_head_state_locked(&self, state: HeadState) -> Result<()> {
         let path = self.dir.join(JOURNAL_HEAD_FILE);
-        let mut file = Self::open_private_file(&path, true)?;
-        file.set_len(0).context("truncating journal head")?;
+        let tmp = self
+            .dir
+            .join(format!("{JOURNAL_HEAD_FILE}.tmp.{}", std::process::id()));
         let bytes = serde_json::to_vec(&state).context("serializing journal head")?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_HEAD_BYTES,
+            "serialized journal head exceeds the {MAX_HEAD_BYTES}-byte limit"
+        );
+        let mut file = Self::open_private_truncate(&tmp)?;
         file.write_all(&bytes).context("writing journal head")?;
-        file.sync_data().context("syncing journal head")?;
+        file.flush().context("flushing journal head")?;
+        file.sync_all().context("syncing journal head")?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("publishing journal head {path:?}"))?;
+        self.sync_directory("syncing journal directory after head publication")?;
         Ok(())
     }
 
@@ -364,16 +506,23 @@ impl Journal {
         entry.seq = seq;
 
         let mut line = serde_json::to_vec(&entry).context("serializing journal entry")?;
+        anyhow::ensure!(
+            line.len() <= MAX_ENTRY_BYTES,
+            "serialized journal entry exceeds the {MAX_ENTRY_BYTES}-byte limit"
+        );
         line.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.path)
+        let next_len = state
+            .journal_len
+            .checked_add(line.len() as u64)
+            .context("journal length overflow")?;
+        Self::ensure_scan_bound(next_len)?;
+        let mut file = Self::open_private_append(&self.path)
             .with_context(|| format!("opening journal append target {:?}", self.path))?;
         file.write_all(&line).context("writing journal line")?;
         file.flush().context("flushing journal")?;
         file.sync_data().context("fsync journal")?;
+        #[cfg(test)]
+        Self::pause_after_journal_sync_for_test();
 
         let journal_len = file
             .metadata()
@@ -397,25 +546,40 @@ impl Journal {
         // file via a fresh handle so we don't disturb the append cursor.
         let _guard = self.inner.lock().expect("journal mutex poisoned");
         let _lock = self.lock_shared()?;
-        let file = match File::open(&self.path) {
+        let file = match Self::open_private_file(&self.path, false) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(Vec::new());
+            }
             Err(e) => return Err(e).context("opening journal for replay"),
         };
+        Self::ensure_scan_bound(
+            file.metadata()
+                .context("reading journal replay metadata")?
+                .len(),
+        )?;
         let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(0)).ok();
+        reader
+            .seek(SeekFrom::Start(0))
+            .context("seeking journal replay to start")?;
 
         let mut out = Vec::new();
         let mut seq: u64 = 0;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
+        let mut scanned = 0_u64;
+        loop {
+            let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
+                break;
             };
-            if line.trim().is_empty() {
+            if !line.complete {
+                break;
+            }
+            if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_str::<EventJournalEntry>(&line) {
+            match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 Ok(mut entry) => {
                     seq += 1;
                     if seq > after_seq {
@@ -468,14 +632,21 @@ impl Journal {
     ) -> Result<(Vec<EventJournalEntry>, u64, u64)> {
         let _guard = self.inner.lock().expect("journal mutex poisoned");
         let _lock = self.lock_shared()?;
-        let file = match File::open(&self.path) {
+        let file = match Self::open_private_file(&self.path, false) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
                 return Ok((Vec::new(), 0, 0));
             }
             Err(e) => return Err(e).context("opening journal for tail"),
         };
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let len = file
+            .metadata()
+            .context("reading journal tail metadata")?
+            .len();
+        Self::ensure_scan_bound(len)?;
         // Compaction/rotation/truncation: the file is smaller than where we were,
         // so our byte offset is stale — restart from the top with a fresh seq.
         let (mut pos, mut seq) = if len < offset {
@@ -490,26 +661,26 @@ impl Journal {
             .with_context(|| format!("seeking journal to {pos}"))?;
 
         let mut out = Vec::new();
-        let mut buf = Vec::new();
+        let mut scanned = pos;
         loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf)?;
-            if n == 0 {
-                break; // EOF
-            }
+            let before = scanned;
+            let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
+                break;
+            };
             // Only consume a line terminated by '\n'; leave a partial trailing
             // line for the next call (don't advance past it).
-            if buf.last() != Some(&b'\n') {
+            if !line.complete {
                 break;
             }
-            pos += n as u64;
-            let line = std::str::from_utf8(&buf[..n - 1]).unwrap_or("").trim();
-            if line.is_empty() {
+            pos = pos
+                .checked_add(scanned - before)
+                .context("journal tail offset overflow")?;
+            if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             // Skip torn/garbage lines but still advance past them (same tolerance
             // as recovery/replay); only count parseable entries toward `seq`.
-            if let Ok(mut e) = serde_json::from_str::<EventJournalEntry>(line) {
+            if let Ok(mut e) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 seq += 1;
                 e.seq = seq;
                 out.push(e);
@@ -540,11 +711,21 @@ impl Journal {
         let _ = self.authoritative_head_locked()?;
         let before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
 
-        let src = match File::open(&self.path) {
+        let src = match Self::open_private_file(&self.path, false) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, 0)),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok((0, 0, 0));
+            }
             Err(e) => return Err(e).context("opening journal for compaction"),
         };
+        Self::ensure_scan_bound(
+            src.metadata()
+                .context("reading journal compaction metadata")?
+                .len(),
+        )?;
         // Unique, pid-tagged temp name so a concurrent compaction in another
         // process can't clobber ours; the atomic rename publishes the result.
         let tmp = self
@@ -553,41 +734,39 @@ impl Journal {
 
         let mut kept: u64 = 0;
         {
-            let mut out = std::io::BufWriter::new(
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&tmp)
-                    .with_context(|| format!("creating compaction temp {tmp:?}"))?,
-            );
-            for line in BufReader::new(src).lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break, // torn tail — stop, keep the consistent prefix
+            let file = Self::open_private_truncate(&tmp)
+                .with_context(|| format!("creating compaction temp {tmp:?}"))?;
+            let mut out = std::io::BufWriter::new(file);
+            let mut reader = BufReader::new(src);
+            let mut scanned = 0_u64;
+            loop {
+                let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
+                    break;
                 };
-                if line.trim().is_empty() {
+                if !line.complete {
+                    break;
+                }
+                if line.bytes.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let is_status = serde_json::from_str::<EventJournalEntry>(&line)
+                let is_status = serde_json::from_slice::<EventJournalEntry>(&line.bytes)
                     .map(|e| e.source == JournalSource::Status)
                     .unwrap_or(false);
                 if !is_status {
-                    out.write_all(line.as_bytes())?;
+                    out.write_all(&line.bytes)
+                        .context("writing compaction entry")?;
                     out.write_all(b"\n")?;
                     kept += 1;
                 }
             }
-            let mut f = out.into_inner().context("flushing compaction temp")?;
-            f.flush().ok();
-            f.sync_data().ok();
+            out.flush().context("flushing compaction temp")?;
+            let f = out.into_inner().context("finishing compaction temp")?;
+            f.sync_all().context("syncing compaction temp")?;
         }
 
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("publishing compacted journal {:?}", self.path))?;
-        File::open(&self.dir)
-            .and_then(|dir| dir.sync_all())
-            .context("syncing journal directory after compaction")?;
+        self.sync_directory("syncing journal directory after compaction")?;
         guard.head_seq = kept;
 
         let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
@@ -598,12 +777,24 @@ impl Journal {
         })?;
         Ok((before, after, kept))
     }
+
+    #[cfg(test)]
+    fn pause_after_journal_sync_for_test() {
+        let Some(marker) = std::env::var_os("T_HUB_TEST_PAUSE_AFTER_JOURNAL_SYNC") else {
+            return;
+        };
+        std::fs::write(marker, b"synced").expect("writing journal sync test marker");
+        loop {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Barrier};
     use t_hub_protocol::{JournalEventType, JournalSource};
 
@@ -625,6 +816,73 @@ mod tests {
             event_type: kind,
             payload: serde_json::json!({"k": entity}),
             result: None,
+        }
+    }
+
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for test marker {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn spawn_helper(
+        dir: &Path,
+        operation: &str,
+        entity: &str,
+        opened: Option<&Path>,
+        go: Option<&Path>,
+        pause_after_sync: Option<&Path>,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("journal::tests::journal_subprocess_helper")
+            .arg("--nocapture")
+            .env("T_HUB_TEST_JOURNAL_HELPER", operation)
+            .env("T_HUB_TEST_JOURNAL_DIR", dir)
+            .env("T_HUB_TEST_JOURNAL_ENTITY", entity)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(path) = opened {
+            command.env("T_HUB_TEST_JOURNAL_OPENED", path);
+        }
+        if let Some(path) = go {
+            command.env("T_HUB_TEST_JOURNAL_GO", path);
+        }
+        if let Some(path) = pause_after_sync {
+            command.env("T_HUB_TEST_PAUSE_AFTER_JOURNAL_SYNC", path);
+        }
+        command.spawn().expect("spawning journal test helper")
+    }
+
+    #[test]
+    fn journal_subprocess_helper() {
+        let Ok(operation) = std::env::var("T_HUB_TEST_JOURNAL_HELPER") else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var_os("T_HUB_TEST_JOURNAL_DIR").unwrap());
+        let entity = std::env::var("T_HUB_TEST_JOURNAL_ENTITY").unwrap();
+        let journal = Journal::open(&dir).unwrap();
+        if let Some(path) = std::env::var_os("T_HUB_TEST_JOURNAL_OPENED") {
+            std::fs::write(path, b"opened").unwrap();
+        }
+        if let Some(path) = std::env::var_os("T_HUB_TEST_JOURNAL_GO") {
+            let path = PathBuf::from(path);
+            wait_for_path(&path);
+        }
+        match operation.as_str() {
+            "append" => {
+                journal
+                    .append(entry(JournalEventType::Notification, &entity))
+                    .unwrap();
+            }
+            other => panic!("unknown journal subprocess operation: {other}"),
         }
     }
 
@@ -727,6 +985,49 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_short_lived_processes_allocate_one_monotonic_sequence() {
+        const WRITERS: usize = 12;
+
+        let dir = temp_dir("concurrent-processes");
+        let go = dir.join("go");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut children = (0..WRITERS)
+            .map(|index| {
+                spawn_helper(
+                    &dir,
+                    "append",
+                    &format!("process-{index}"),
+                    None,
+                    Some(&go),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&go, b"go").unwrap();
+
+        for child in children.drain(..) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "journal helper failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let entries = Journal::open(&dir).unwrap().replay(0).unwrap();
+        assert_eq!(entries.len(), WRITERS);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<BTreeSet<_>>(),
+            (1..=WRITERS as u64).collect()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn noisy_hook_writer_fails_within_the_lock_budget() {
         let dir = temp_dir("bounded-lock");
         let blocker = Journal::open(&dir).unwrap();
@@ -743,9 +1044,101 @@ mod tests {
             "unexpected lock error: {error:#}"
         );
         assert!(
-            elapsed >= JOURNAL_LOCK_TIMEOUT && elapsed < Duration::from_secs(3),
+            elapsed >= JOURNAL_LOCK_TIMEOUT && elapsed < Duration::from_secs(6),
             "lock wait must be bounded near {:?}, got {elapsed:?}",
             JOURNAL_LOCK_TIMEOUT
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_journal_files_are_restricted_to_owner_access() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = temp_dir("private-permissions");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [JOURNAL_FILE, JOURNAL_LOCK_FILE, JOURNAL_HEAD_FILE] {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o666)
+                .open(dir.join(name))
+                .unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o666))
+                .unwrap();
+        }
+
+        Journal::open(&dir)
+            .unwrap()
+            .append(entry(JournalEventType::Notification, "private"))
+            .unwrap();
+
+        for name in [JOURNAL_FILE, JOURNAL_LOCK_FILE, JOURNAL_HEAD_FILE] {
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name} must remain private");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_append_is_rejected_without_mutating_the_journal() {
+        let dir = temp_dir("oversized-append");
+        let journal = Journal::open(&dir).unwrap();
+        let before = journal.byte_len();
+        let mut oversized = entry(JournalEventType::Notification, "oversized");
+        oversized.payload = serde_json::json!({"data": "x".repeat(MAX_ENTRY_BYTES)});
+
+        let error = journal.append(oversized).unwrap_err();
+        assert!(
+            error.to_string().contains("entry exceeds"),
+            "unexpected oversized append error: {error:#}"
+        );
+        assert_eq!(journal.byte_len(), before);
+        assert_eq!(journal.head_seq(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_persisted_line_is_rejected_during_recovery() {
+        let dir = temp_dir("oversized-line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(JOURNAL_FILE);
+        let mut file = Journal::open_private_append(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_ENTRY_BYTES + 1]).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        let error = Journal::open(&dir).err().expect("oversized line must fail");
+        assert!(
+            error.to_string().contains("entry exceeds"),
+            "unexpected oversized line error: {error:#}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_journal_is_rejected_before_scanning() {
+        let dir = temp_dir("oversized-scan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = Journal::open_private_file(&dir.join(JOURNAL_FILE), true).unwrap();
+        file.set_len(MAX_SCAN_BYTES + 1).unwrap();
+
+        let error = Journal::open(&dir)
+            .err()
+            .expect("oversized journal must fail");
+        assert!(
+            error.to_string().contains("scan limit"),
+            "unexpected oversized journal error: {error:#}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -935,6 +1328,82 @@ mod tests {
                 .any(|entry| entry.entity_id.as_deref() == Some("concurrent-hook")),
             "a hook append must never land on the retired pre-compaction inode"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn short_lived_process_opened_before_compaction_appends_to_published_journal() {
+        let dir = temp_dir("compact-concurrent-process");
+        let compactor = Journal::open(&dir).unwrap();
+        compactor
+            .append(entry(JournalEventType::SessionStart, "seed"))
+            .unwrap();
+
+        let opened = dir.join("opened");
+        let go = dir.join("go");
+        let child = spawn_helper(
+            &dir,
+            "append",
+            "concurrent-process-hook",
+            Some(&opened),
+            Some(&go),
+            None,
+        );
+        wait_for_path(&opened);
+        compactor.compact_dropping_status().unwrap();
+        std::fs::write(&go, b"go").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "journal helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let published = Journal::open(&dir).unwrap().replay(0).unwrap();
+        assert!(
+            published
+                .iter()
+                .any(|entry| entry.entity_id.as_deref() == Some("concurrent-process-hook")),
+            "a subprocess append must never land on the retired pre-compaction inode"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_after_journal_sync_recovers_durable_entry_and_sequence() {
+        let dir = temp_dir("sigkill-recovery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let synced = dir.join("synced");
+        let mut child = spawn_helper(
+            &dir,
+            "append",
+            "killed-after-sync",
+            None,
+            None,
+            Some(&synced),
+        );
+        wait_for_path(&synced);
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(rc, 0, "failed to SIGKILL journal helper");
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "SIGKILLed helper unexpectedly succeeded");
+
+        let recovered = Journal::open(&dir).unwrap();
+        assert_eq!(
+            recovered.head_seq(),
+            1,
+            "the fsynced entry must survive a stale head"
+        );
+        let next = recovered
+            .append(entry(JournalEventType::SessionEnd, "after-kill"))
+            .unwrap();
+        assert_eq!(next.seq, 2);
+        let entries = recovered.replay(0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entity_id.as_deref(), Some("killed-after-sync"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
