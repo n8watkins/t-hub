@@ -78,16 +78,20 @@ function Write-DiagnosticArtifact {
 function Write-JsonNoClobber {
     param([string]$Path, [object]$Value, [int]$Depth = 12)
     $json = $Value | ConvertTo-Json -Depth $Depth
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    $stream = [System.IO.File]::Open($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     try {
         $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
         try { $writer.Write($json) } finally { $writer.Dispose() }
+        $stream.Flush($true)
     } finally { $stream.Dispose() }
+    try { [System.IO.File]::Move($temp, $Path) } catch { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }; throw }
 }
 
 trap {
     Write-DiagnosticArtifact $_.Exception.Message
-    exit 5
+    if (-not [string]::IsNullOrWhiteSpace($OutputPath) -and (Test-Path -LiteralPath $OutputPath -PathType Leaf)) { exit 5 }
+    exit 6
 }
 
 function Get-ProcessSnapshot {
