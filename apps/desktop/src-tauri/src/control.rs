@@ -13897,6 +13897,25 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             Err(error) => ControlResponse::err(error),
         };
     }
+    // Internal MCP discovery proof. The ambient read token authenticates the
+    // handshake, while the echoed nonce prevents replay and the live instance /
+    // generation binds the response to this listener. The caller never needs to
+    // present a durable Captain session secret.
+    if req.command == "control_discovery_proof" {
+        let Some(nonce) =
+            arg_str(&req.args, "nonce").filter(|value| !value.is_empty() && value.len() <= 256)
+        else {
+            return ControlResponse::err(
+                "control_discovery_proof requires a bounded non-empty nonce",
+            );
+        };
+        return ControlResponse::ok(json!({
+            "nonce": nonce,
+            "protocolVersion": PROTOCOL_VERSION,
+            "instanceId": ctx.listener_instance_id,
+            "listenerGeneration": ctx.listener_generation.load(Ordering::Acquire),
+        }));
+    }
     let delegated_control_access = if tier == CommandTier::Read
         || inbox_self_ack
         || crew_self_work_log
@@ -57822,6 +57841,30 @@ int main(int argc, char **argv) {
         assert_eq!(control.result.unwrap()["capability"], "control");
         let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
         assert_eq!(read.result.unwrap()["capability"], "read");
+    }
+
+    #[test]
+    fn discovery_proof_echoes_nonce_and_live_listener_identity_at_read_tier() {
+        let mut ctx = test_ctx("t");
+        ctx.listener_instance_id = "proof-instance".into();
+        ctx.listener_generation.store(7, Ordering::Release);
+        let proof = dispatch_authenticated(
+            &ctx,
+            req(
+                "read-t",
+                "control_discovery_proof",
+                json!({"nonce": "fresh-proof-nonce"}),
+            ),
+        );
+        let result = proof.result.unwrap();
+        assert_eq!(result["nonce"], "fresh-proof-nonce");
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(result["instanceId"], "proof-instance");
+        assert_eq!(result["listenerGeneration"], 7);
+
+        let missing =
+            dispatch_authenticated(&ctx, req("read-t", "control_discovery_proof", json!({})));
+        assert!(missing.error.unwrap().contains("bounded non-empty nonce"));
     }
 
     #[test]
