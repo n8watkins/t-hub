@@ -6616,6 +6616,7 @@ impl CaptainsRegistry {
                 .is_none_or(|legacy| {
                     legacy.version != 2
                         || legacy.launch_policy_sha256.is_some()
+                        || legacy.semantic_argv_sha256.is_some()
                         || !same_bound_entry(legacy)
                 })
             {
@@ -19494,6 +19495,17 @@ fn cortana_bootstrap(
     {
         return Err("cortana_bootstrap: bounded response ceiling exceeded".into());
     }
+    #[cfg(test)]
+    if !ctx
+        .captains
+        .pause_dispatch("cortana-bootstrap-response-built")
+    {
+        return Err("cortana_bootstrap: response revalidation was interrupted".into());
+    }
+    let confirmed = authorize_cortana_bootstrap(ctx, caller)?;
+    if confirmed != durable {
+        return Err("cortana_bootstrap: Cortana basis changed while building the response".into());
+    }
     Ok(response)
 }
 
@@ -20048,6 +20060,13 @@ fn synthetic_cortana_harness_process(
 fn synthetic_cortana_expected_harness_launch(
     harness: &str,
 ) -> crate::harness::ExpectedHarnessLaunchProvenance {
+    let codex_arguments = vec![
+        "--sandbox".into(),
+        "read-only".into(),
+        "-c".into(),
+        crate::harness::CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE.into(),
+        "restore".into(),
+    ];
     crate::harness::ExpectedHarnessLaunchProvenance {
         version: crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
         provider: harness.into(),
@@ -20062,6 +20081,8 @@ fn synthetic_cortana_expected_harness_launch(
         argv_layout_sha256: None,
         launch_policy_sha256: (harness == "codex")
             .then(crate::harness::cortana_codex_launch_policy_sha256),
+        semantic_argv_sha256: (harness == "codex")
+            .then(|| crate::harness::cortana_codex_semantic_argv_sha256(&codex_arguments)),
     }
 }
 
@@ -46707,6 +46728,43 @@ int main(int argc, char **argv) {
         );
         assert!(!denied_missing.ok);
 
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        ctx.captains.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "cortana-bootstrap-response-built",
+            reached: reached_tx,
+            resume: resume_rx,
+        }));
+        let raced = std::thread::scope(|scope| {
+            let request_ctx = ctx.clone();
+            let request_bearer = bearer.clone();
+            let request = scope.spawn(move || {
+                dispatch_authenticated(
+                    &request_ctx,
+                    req_session(
+                        &request_ctx.read_token,
+                        &request_bearer,
+                        "cortana_bootstrap",
+                        json!({}),
+                    ),
+                )
+            });
+            assert_eq!(
+                reached_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "cortana-bootstrap-response-built"
+            );
+            ctx.captains
+                .begin_cortana_recovery("cortana-bootstrap-raced-basis")
+                .unwrap();
+            resume_tx.send(()).unwrap();
+            request.join().unwrap()
+        });
+        assert!(!raced.ok);
+        assert!(raced.error.as_deref().is_some_and(|error| {
+            error.contains("not healthy or in an admitted launch phase")
+                || error.contains("basis changed")
+        }));
+
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         std::fs::remove_dir_all(harness_bin_dir).unwrap();
         std::fs::remove_dir_all(home).unwrap();
@@ -49435,6 +49493,7 @@ int main(int argc, char **argv) {
             .unwrap();
         legacy_expected.version = 2;
         legacy_expected.launch_policy_sha256 = None;
+        legacy_expected.semantic_argv_sha256 = None;
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
         let legacy = CaptainsRegistry::load(path.clone());
@@ -49458,6 +49517,7 @@ int main(int argc, char **argv) {
             .unwrap();
         assert_eq!(reloaded_expected.version, 2);
         assert!(reloaded_expected.launch_policy_sha256.is_none());
+        assert!(reloaded_expected.semantic_argv_sha256.is_none());
         assert!(crate::harness::valid_expected_harness_launch_provenance(
             reloaded_expected
         ));
@@ -49523,6 +49583,12 @@ int main(int argc, char **argv) {
                 .launch_policy_sha256,
             Some(crate::harness::cortana_codex_launch_policy_sha256())
         );
+        assert!(enriched_launch
+            .expected_harness_launch_provenance
+            .as_ref()
+            .unwrap()
+            .semantic_argv_sha256
+            .is_some());
         assert_eq!(
             CaptainsRegistry::load(path.clone()).cortana_identity(),
             enriched

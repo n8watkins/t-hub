@@ -118,6 +118,23 @@ pub enum PermMode {
 pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 pub const CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE: &str =
     "mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"";
+const WSL_OBSERVATION_SHELL: &str = "/bin/sh";
+
+#[cfg(any(windows, test))]
+fn wsl_observation_command() -> Command {
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("--cd")
+        .arg("~")
+        .arg("-e")
+        .arg(WSL_OBSERVATION_SHELL);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
 
 impl PermMode {
     pub fn as_str(self) -> &'static str {
@@ -191,6 +208,8 @@ pub struct ExpectedHarnessLaunchProvenance {
     pub argv_layout_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_policy_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_argv_sha256: Option<String>,
 }
 
 /// Credential-safe, durable identity for the exact provider process accepted
@@ -642,19 +661,13 @@ cat "$cmdline"
         .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
     #[cfg(windows)]
     let command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
+        let mut command = wsl_observation_command();
         command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("sh")
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-permission-attestation")
             .arg(tmux_socket)
             .arg(tmux_target);
-        command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(unix)]
@@ -742,18 +755,12 @@ cat "$cmdline"
 
     #[cfg(windows)]
     let command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
+        let mut command = wsl_observation_command();
         command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("sh")
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-scoped-harness-attestation")
             .arg(pid.to_string());
-        command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(unix)]
@@ -914,10 +921,7 @@ done
     let mut command = Command::new("sh");
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        command = Command::new("wsl.exe");
-        command.arg("--cd").arg("~").arg("-e").arg("sh");
-        command.creation_flags(0x0800_0000);
+        command = wsl_observation_command();
     }
     command
         .arg("-c")
@@ -1221,22 +1225,15 @@ fn observe_atomic_scoped_harness_until(
     tmux_target: &str,
     deadline: Instant,
 ) -> Result<(HarnessProcessEvidence, Vec<ScopedProcessDetails>), LaunchAttestationError> {
-    use std::os::windows::process::CommandExt;
-
     let tmux_socket = crate::tmux::validated_socket_name()
         .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
-    let mut command = Command::new("wsl.exe");
+    let mut command = wsl_observation_command();
     command
-        .arg("--cd")
-        .arg("~")
-        .arg("-e")
-        .arg("sh")
         .arg("-c")
         .arg(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT)
         .arg("t-hub-atomic-scoped-harness-attestation")
         .arg(tmux_socket)
-        .arg(tmux_target)
-        .creation_flags(0x0800_0000);
+        .arg(tmux_target);
     let output = crate::bounded_exec::output_with_timeout_and_limit(
         command,
         observation_time_remaining(deadline)?.min(SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT),
@@ -1454,19 +1451,13 @@ esac
     }
     #[cfg(windows)]
     let command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
+        let mut command = wsl_observation_command();
         command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("sh")
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-provider-provenance")
             .arg(candidate)
             .arg(login_shell_override.unwrap_or_default());
-        command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(unix)]
@@ -1544,9 +1535,13 @@ pub fn cortana_codex_launch_policy_sha256() -> String {
     )
 }
 
-fn codex_launch_policy_sha256(
+pub fn cortana_codex_semantic_argv_sha256(arguments: &[String]) -> String {
+    framed_sha256(b"t-hub-cortana-codex-semantic-argv-v1\0", arguments.iter())
+}
+
+fn codex_launch_contract(
     arguments: &[String],
-) -> Result<Option<String>, LaunchAttestationError> {
+) -> Result<(Option<String>, Option<String>), LaunchAttestationError> {
     let mut sandbox_values = Vec::new();
     let mut bootstrap_approval_count = 0usize;
     let mut index = 0usize;
@@ -1593,12 +1588,36 @@ fn codex_launch_policy_sha256(
         index += 1;
     }
     if bootstrap_approval_count == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
     if bootstrap_approval_count != 1 || sandbox_values.as_slice() != ["read-only"] {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
-    Ok(Some(cortana_codex_launch_policy_sha256()))
+    let exact_shape = match arguments {
+        [sandbox, sandbox_value, config, approval, prompt] => {
+            sandbox == "--sandbox"
+                && sandbox_value == "read-only"
+                && config == "-c"
+                && approval == CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE
+                && !prompt.is_empty()
+        }
+        [resume, sandbox, sandbox_value, config, approval, session_id] => {
+            resume == "resume"
+                && sandbox == "--sandbox"
+                && sandbox_value == "read-only"
+                && config == "-c"
+                && approval == CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE
+                && !session_id.is_empty()
+        }
+        _ => false,
+    };
+    if !exact_shape {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    Ok((
+        Some(cortana_codex_launch_policy_sha256()),
+        Some(cortana_codex_semantic_argv_sha256(arguments)),
+    ))
 }
 
 fn codex_native_layout(os: &str, arch: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -1693,18 +1712,12 @@ printf 'THLC1\n%s\n%s\n%s\n%s\n%s\n%s\n' "$os" "$arch" "$candidate" "$canonical"
 "#;
     #[cfg(windows)]
     let command = {
-        use std::os::windows::process::CommandExt;
-        let mut command = Command::new("wsl.exe");
+        let mut command = wsl_observation_command();
         command
-            .arg("--cd")
-            .arg("~")
-            .arg("-e")
-            .arg("sh")
             .arg("-c")
             .arg(SCRIPT)
             .arg("t-hub-codex-native-child")
             .arg(package_root);
-        command.creation_flags(0x0800_0000);
         command
     };
     #[cfg(unix)]
@@ -1789,10 +1802,10 @@ pub fn resolve_expected_harness_launch_provenance(
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
     let entry = resolve_launch_executable(executable_argument)?;
-    let launch_policy_sha256 = if expected_provider == Harness::Codex {
-        codex_launch_policy_sha256(&argv[1..])?
+    let (launch_policy_sha256, semantic_argv_sha256) = if expected_provider == Harness::Codex {
+        codex_launch_contract(&argv[1..])?
     } else {
-        None
+        (None, None)
     };
     let Some(shebang) = entry.shebang.as_deref() else {
         return Ok(ExpectedHarnessLaunchProvenance {
@@ -1804,6 +1817,7 @@ pub fn resolve_expected_harness_launch_provenance(
             trusted_child_executable: None,
             argv_layout_sha256: None,
             launch_policy_sha256,
+            semantic_argv_sha256,
         });
     };
     let shebang_argv =
@@ -1843,6 +1857,7 @@ pub fn resolve_expected_harness_launch_provenance(
         trusted_child_executable,
         argv_layout_sha256: Some(argv_layout_sha256(&argv[1..])),
         launch_policy_sha256,
+        semantic_argv_sha256,
     })
 }
 
@@ -1868,12 +1883,19 @@ pub fn valid_expected_harness_launch_provenance(
         1 | 2 | EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
     ) && (expected.version >= 2 || expected.trusted_child_executable.is_none())
         && (expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
-            || expected.launch_policy_sha256.is_none())
+            || expected.launch_policy_sha256.is_none() && expected.semantic_argv_sha256.is_none())
         && matches!(expected.provider.as_str(), "codex" | "claude")
         && expected
             .launch_policy_sha256
             .as_deref()
             .is_none_or(valid_digest)
+        && expected
+            .semantic_argv_sha256
+            .as_deref()
+            .is_none_or(valid_digest)
+        && (expected.provider != "codex"
+            || expected.launch_policy_sha256.is_none()
+            || expected.semantic_argv_sha256.is_some())
         && valid_executable(&expected.executable)
         && match expected.kind.as_str() {
             "direct" => {
@@ -1929,15 +1951,20 @@ fn scoped_process_matches_expected_launch(
     if !shape_matches {
         return Ok(false);
     }
-    let observed_policy = match expected.provider.as_str() {
-        "codex" => codex_launch_policy_sha256(
+    let (observed_policy, observed_semantic_argv) = match expected.provider.as_str() {
+        "codex" => codex_launch_contract(
             provider_arguments.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?,
         )
         .map_err(|_| LaunchAttestationError::ExpectedProvenanceMismatch)?,
-        "claude" => None,
+        "claude" => (None, None),
         _ => return Err(LaunchAttestationError::ExpectedProvenanceMismatch),
     };
-    Ok(observed_policy == expected.launch_policy_sha256)
+    if observed_policy != expected.launch_policy_sha256
+        || observed_semantic_argv != expected.semantic_argv_sha256
+    {
+        return Err(LaunchAttestationError::ExpectedProvenanceMismatch);
+    }
+    Ok(true)
 }
 
 fn scoped_process_matches_executable(
@@ -2820,6 +2847,24 @@ mod tests {
             scoped_process_matches_expected_launch(&resume_process, &resume_expected).unwrap(),
             "resume options after the subcommand must be bound before authority publication"
         );
+        let mut substituted_prompt = process.clone();
+        *substituted_prompt.argv.last_mut().unwrap() = "different prompt".into();
+        let mut legacy_v2 = expected.clone();
+        legacy_v2.version = 2;
+        legacy_v2.launch_policy_sha256 = None;
+        legacy_v2.semantic_argv_sha256 = None;
+        assert!(valid_expected_harness_launch_provenance(&legacy_v2));
+        assert_eq!(
+            scoped_process_matches_expected_launch(&substituted_prompt, &expected),
+            Err(LaunchAttestationError::ExpectedProvenanceMismatch),
+            "v2-to-v3 enrichment must not bless a live prompt substitution"
+        );
+        let mut substituted_resume = resume_process.clone();
+        *substituted_resume.argv.last_mut().unwrap() = "replayed-thread".into();
+        assert_eq!(
+            scoped_process_matches_expected_launch(&substituted_resume, &resume_expected),
+            Err(LaunchAttestationError::ExpectedProvenanceMismatch)
+        );
 
         for invalid_suffix in [
             "--sandbox workspace-write -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
@@ -2828,6 +2873,9 @@ mod tests {
             "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
             "--sandbox read-only --ask-for-approval never -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
             "--sandbox read-only --ask-for-approval approve -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' -c 'features.unrelated=true' restore",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' restore unexpected",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' --search restore",
             "--dangerously-bypass-approvals-and-sandbox -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
             "--yolo -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
             "--full-auto -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
@@ -3307,6 +3355,23 @@ mod tests {
         assert_eq!(scoped[0].executable_device, 8);
         assert_eq!(scoped[0].executable_inode, 1234);
         assert_eq!(scoped[0].session_token.as_deref(), Some("session-token"));
+    }
+
+    #[test]
+    fn wsl_observation_construction_pins_the_absolute_shell_against_path_substitution() {
+        let mut command = wsl_observation_command();
+        command.env("PATH", "/tmp/hostile-shell-shadow");
+        assert_eq!(command.get_program(), "wsl.exe");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["--cd", "~", "-e", "/bin/sh"]
+        );
+        assert!(!command
+            .get_args()
+            .any(|argument| argument == std::ffi::OsStr::new("sh")));
     }
 
     #[test]
