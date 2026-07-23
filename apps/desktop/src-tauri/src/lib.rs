@@ -267,6 +267,7 @@ fn report_workspace_tabs(
 fn start_control_listener(
     state: &AppState,
     app: &tauri::AppHandle,
+    preview_service: std::sync::Arc<preview::adapter::DesktopPreviewService>,
     fanout: std::sync::Arc<control::EventFanout>,
     tab_registry: std::sync::Arc<control::TabRegistry>,
     captains_registry: std::sync::Arc<control::CaptainsRegistry>,
@@ -350,12 +351,16 @@ fn start_control_listener(
 
     // Share the event fanout (server-split M1) so a subscribed control connection
     // receives the same stream the backend emits through the SocketEmitter.
+    let preview_control = preview_service;
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
         .with_read_token(read_token)
         .with_audit(audit)
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
         .with_metrics(metrics)
+        .with_preview_control(move |command, args, root| {
+            preview::adapter::dispatch(&preview_control, command, args, root)
+        })
         // TASK C (#22): share the addressable tab registry with the control listener
         // so `list_tabs` reads what the `report_workspace_tabs` command writes.
         .with_tab_registry(tab_registry)
@@ -861,9 +866,29 @@ pub fn run() {
                     std::sync::Arc::new(move |uuid: &str, status| notifier.on_status(uuid, status));
                 state.agent.set_status_observer(observer);
             }
+            let preview_service =
+                preview::adapter::build(app.handle().clone(), state.agent.clone()).map_err(
+                    |error| {
+                        std::io::Error::other(format!(
+                            "durable Preview service could not be loaded safely: {error}"
+                        ))
+                    },
+                )?;
+            for result in preview_service.recover_incomplete().map_err(|error| {
+                std::io::Error::other(format!(
+                    "durable Preview recovery could not complete safely: {error}"
+                ))
+            })? {
+                eprintln!(
+                    "t-hub: recovered Preview request {} ({:?})",
+                    result.request_id, result.outcome
+                );
+            }
+            app.manage(preview_service.clone());
             if let Some(handshake) = start_control_listener(
                 &state,
                 app.handle(),
+                preview_service,
                 control_fanout,
                 tab_registry,
                 captains_registry,
