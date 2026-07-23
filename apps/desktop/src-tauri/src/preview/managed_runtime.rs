@@ -12,8 +12,9 @@ use parking_lot::Mutex;
 use tauri_plugin_shell::ShellExt;
 
 use super::endpoint::{
-    EndpointInspector, EndpointResolver, ListenerOwnership, ManagedRunIdentity, PreviewEndpoint,
-    ProbeCancellation,
+    derived_wsl_host, EndpointError, EndpointInspector, EndpointResolver, ListenerOwnership,
+    ManagedRunIdentity, PreviewEndpoint, ProbeCancellation, WslHostMappingCache,
+    WslNetworkSnapshot,
 };
 use super::managed_runner::{self, BoundedOutput};
 use super::model::{PreviewScope, PreviewTarget, PreviewTargetKind, PreviewTargetRef};
@@ -24,6 +25,26 @@ use super::supervisor::SupervisedPreviewChild;
 
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(windows)]
+const WSL_NETWORK_SNAPSHOT_LIMIT: usize = 4 * 1024;
+
+trait WslNetworkProvider: Send + Sync {
+    fn snapshot(&self) -> Option<WslNetworkSnapshot>;
+}
+
+struct SystemWslNetworkProvider;
+
+impl WslNetworkProvider for SystemWslNetworkProvider {
+    fn snapshot(&self) -> Option<WslNetworkSnapshot> {
+        system_wsl_network_snapshot()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedWslHost {
+    fingerprint: String,
+    host: String,
+}
 
 struct LiveRun {
     target: PreviewTargetRef,
@@ -45,6 +66,8 @@ pub struct ManagedPreviewRuntime {
     runs: Arc<Mutex<HashMap<String, Arc<LiveRun>>>>,
     admission: Arc<Mutex<Admission>>,
     open_url: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+    wsl_network: Arc<dyn WslNetworkProvider>,
+    wsl_hosts: Arc<WslHostMappingCache>,
 }
 
 impl ManagedPreviewRuntime {
@@ -60,6 +83,8 @@ impl ManagedPreviewRuntime {
             runs: Arc::new(Mutex::new(HashMap::new())),
             admission: Arc::new(Mutex::new(Admission::default())),
             open_url,
+            wsl_network: Arc::new(SystemWslNetworkProvider),
+            wsl_hosts: Arc::new(WslHostMappingCache::default()),
         }
     }
 
@@ -70,6 +95,8 @@ impl ManagedPreviewRuntime {
             runs: Arc::new(Mutex::new(HashMap::new())),
             admission: Arc::new(Mutex::new(Admission::default())),
             open_url: Arc::new(|_| Ok(())),
+            wsl_network: Arc::new(SystemWslNetworkProvider),
+            wsl_hosts: Arc::new(WslHostMappingCache::default()),
         }
     }
 
@@ -92,6 +119,20 @@ impl ManagedPreviewRuntime {
         {
             runs.remove(run_id);
         }
+    }
+
+    fn resolved_wsl_host(&self) -> Option<ResolvedWslHost> {
+        let snapshot = self.wsl_network.snapshot()?;
+        let fingerprint = snapshot.fingerprint();
+        let host = self
+            .wsl_hosts
+            .resolve(&snapshot, self.now_ms(), derived_wsl_host)?;
+        Some(ResolvedWslHost { fingerprint, host })
+    }
+
+    fn invalidate_wsl_host(&self, mapping: &ResolvedWslHost) {
+        self.wsl_hosts
+            .invalidate_failed_probe(&mapping.fingerprint, &mapping.host);
     }
 }
 
@@ -282,10 +323,10 @@ impl PreviewRuntime for ManagedPreviewRuntime {
         process: &ManagedPreviewProcess,
         output: &[u8],
         cancellation: &ProbeCancellation,
-    ) -> Result<PreviewEndpoint, super::endpoint::EndpointError> {
+    ) -> Result<PreviewEndpoint, EndpointError> {
         let live = self
             .live_exact(process)
-            .ok_or(super::endpoint::EndpointError::ForeignListener)?;
+            .ok_or(EndpointError::ForeignListener)?;
         let generation = live.child.lock().generation.clone();
         let inspector = RuntimeEndpointInspector {
             agent: self.agent.clone(),
@@ -296,11 +337,20 @@ impl PreviewRuntime for ManagedPreviewRuntime {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut observed = output.to_vec();
         loop {
-            match resolver.resolve(&process.identity, &observed, None, cancellation) {
-                Err(
-                    super::endpoint::EndpointError::NoManagedHint
-                    | super::endpoint::EndpointError::ListenerMissing,
-                ) if std::time::Instant::now() < deadline && !cancellation.is_cancelled() => {
+            match resolve_with_wsl_remap(
+                &resolver,
+                &process.identity,
+                &observed,
+                cancellation,
+                self.resolved_wsl_host(),
+                |failed| {
+                    self.invalidate_wsl_host(failed);
+                    self.resolved_wsl_host()
+                },
+            ) {
+                Err(EndpointError::NoManagedHint | EndpointError::ListenerMissing)
+                    if std::time::Instant::now() < deadline && !cancellation.is_cancelled() =>
+                {
                     std::thread::sleep(Duration::from_millis(25));
                     observed = live.output.snapshot();
                 }
@@ -319,6 +369,94 @@ impl PreviewRuntime for ManagedPreviewRuntime {
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0)
     }
+}
+
+fn resolve_with_wsl_remap<I, F>(
+    resolver: &EndpointResolver<I>,
+    identity: &ManagedRunIdentity,
+    output: &[u8],
+    cancellation: &ProbeCancellation,
+    mut mapping: Option<ResolvedWslHost>,
+    mut remap: F,
+) -> Result<PreviewEndpoint, EndpointError>
+where
+    I: EndpointInspector,
+    F: FnMut(&ResolvedWslHost) -> Option<ResolvedWslHost>,
+{
+    let mut remap_attempted = false;
+    loop {
+        match resolver.resolve(
+            identity,
+            output,
+            mapping.as_ref().map(|mapping| mapping.host.as_str()),
+            cancellation,
+        ) {
+            Err(EndpointError::Unreachable)
+                if mapping.is_some() && !remap_attempted && !cancellation.is_cancelled() =>
+            {
+                mapping = remap(mapping.as_ref().expect("checked above"));
+                remap_attempted = true;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn system_wsl_network_snapshot() -> Option<WslNetworkSnapshot> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const SNAPSHOT_SCRIPT: &str = "cat /proc/sys/kernel/random/boot_id; printf '\\n'; hostname -I";
+    let distribution = crate::files::host_distro();
+    let mut command = Command::new(super::supervisor::trusted_wsl_path().ok()?);
+    command
+        .arg("-d")
+        .arg(&distribution)
+        .arg("-e")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(SNAPSHOT_SCRIPT)
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        WSL_NETWORK_SNAPSHOT_LIMIT,
+    )
+    .ok()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return None;
+    }
+    parse_wsl_network_snapshot(&distribution, &output.stdout)
+}
+
+#[cfg(not(windows))]
+fn system_wsl_network_snapshot() -> Option<WslNetworkSnapshot> {
+    None
+}
+
+#[cfg(any(windows, test))]
+fn parse_wsl_network_snapshot(distribution: &str, output: &[u8]) -> Option<WslNetworkSnapshot> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut lines = text.lines();
+    let boot_id = lines.next()?.trim();
+    if boot_id.is_empty() || boot_id.len() > 128 {
+        return None;
+    }
+    let interfaces = lines
+        .flat_map(str::split_whitespace)
+        .filter(|address| address.len() <= 64 && address.parse::<std::net::IpAddr>().is_ok())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if interfaces.is_empty() {
+        return None;
+    }
+    Some(WslNetworkSnapshot {
+        distribution: distribution.to_string(),
+        boot_id: boot_id.to_string(),
+        interfaces,
+    })
 }
 
 impl ManagedPreviewRuntime {
@@ -528,6 +666,78 @@ fn parse_http_socket(url: &str) -> Option<SocketAddr> {
 mod tests {
     use super::*;
     use crate::preview::model::{PreviewPackageManager, PreviewTargetId, PreviewTargetSource};
+    use std::sync::Mutex as StdMutex;
+
+    struct MappingInspector {
+        calls: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl EndpointInspector for MappingInspector {
+        fn listener_ownership(&self, _port: u16) -> Result<Option<ListenerOwnership>, String> {
+            Ok(Some(ListenerOwnership {
+                process_group_id: 42,
+                process_group_started_at: 100,
+            }))
+        }
+
+        fn probe(&self, url: &str, _timeout: Duration, _cancellation: &ProbeCancellation) -> bool {
+            self.calls.lock().unwrap().push(url.to_string());
+            url.contains("172.30.1.3")
+        }
+
+        fn backoff(&self, _duration: Duration, _cancellation: &ProbeCancellation) {}
+    }
+
+    #[test]
+    fn parses_bounded_wsl_network_identity_for_host_mapping() {
+        let snapshot = parse_wsl_network_snapshot(
+            "Ubuntu",
+            b"7b99545f-67c0-4f0c-b91a-17486fd38233\n172.30.1.2 127.0.0.1\n",
+        )
+        .unwrap();
+        assert_eq!(snapshot.distribution, "Ubuntu");
+        assert_eq!(snapshot.boot_id, "7b99545f-67c0-4f0c-b91a-17486fd38233");
+        assert_eq!(snapshot.interfaces, ["172.30.1.2", "127.0.0.1"]);
+        assert_eq!(derived_wsl_host(&snapshot).as_deref(), Some("172.30.1.2"));
+        assert!(parse_wsl_network_snapshot("Ubuntu", b"\n172.30.1.2\n").is_none());
+    }
+
+    #[test]
+    fn stale_wsl_address_is_invalidated_and_retried_with_fresh_mapping() {
+        let inspector = MappingInspector {
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let calls = Arc::clone(&inspector.calls);
+        let resolver = EndpointResolver::new(inspector);
+        let identity = ManagedRunIdentity {
+            run_id: "run-mapping".into(),
+            process_group_id: 42,
+            process_group_started_at: 100,
+        };
+        let endpoint = resolve_with_wsl_remap(
+            &resolver,
+            &identity,
+            b"ready at http://127.0.0.1:5173/app",
+            &ProbeCancellation::default(),
+            Some(ResolvedWslHost {
+                fingerprint: "old-network".into(),
+                host: "172.30.1.2".into(),
+            }),
+            |failed| {
+                assert_eq!(failed.fingerprint, "old-network");
+                assert_eq!(failed.host, "172.30.1.2");
+                Some(ResolvedWslHost {
+                    fingerprint: "new-network".into(),
+                    host: "172.30.1.3".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(endpoint.reachable_url, "http://172.30.1.3:5173/app");
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|url| url.contains("172.30.1.2")));
+        assert!(calls.iter().any(|url| url.contains("172.30.1.3")));
+    }
 
     fn fixture() -> (
         tempfile::TempDir,

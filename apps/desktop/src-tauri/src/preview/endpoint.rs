@@ -346,6 +346,20 @@ fn valid_derived_host(host: &str) -> bool {
     }
 }
 
+pub fn derived_wsl_host(snapshot: &WslNetworkSnapshot) -> Option<String> {
+    snapshot
+        .interfaces
+        .iter()
+        .flat_map(|interface| interface.split_whitespace())
+        .find(|host| {
+            valid_derived_host(host)
+                && host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| !address.is_loopback())
+        })
+        .map(str::to_string)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WslNetworkSnapshot {
     pub distribution: String,
@@ -645,5 +659,19 @@ mod tests {
             cache.resolve(&rebooted, 22, |_| Some("172.30.1.3".into())),
             Some("172.30.1.3".into())
         );
+    }
+
+    #[test]
+    fn mapped_host_is_derived_only_from_private_non_loopback_snapshot_addresses() {
+        let snapshot = WslNetworkSnapshot {
+            distribution: "Ubuntu".into(),
+            boot_id: "boot-1".into(),
+            interfaces: vec![
+                "127.0.0.1".into(),
+                "8.8.8.8".into(),
+                "172.30.1.2 192.168.1.5".into(),
+            ],
+        };
+        assert_eq!(derived_wsl_host(&snapshot).as_deref(), Some("172.30.1.2"));
     }
 }

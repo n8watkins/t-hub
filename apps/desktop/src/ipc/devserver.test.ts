@@ -213,6 +213,23 @@ describe("reachablePreviewUrl", () => {
     expect(tauri.invoke).toHaveBeenNthCalledWith(2, "preview_host");
   });
 
+  it("refreshes the backend-derived host after a WSL address change", async () => {
+    tauri.invoke
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce("172.24.16.1")
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce("172.24.32.1");
+    const { reachablePreviewUrl } = await loadDevServer();
+
+    await expect(
+      reachablePreviewUrl("http://127.0.0.1:5173/first"),
+    ).resolves.toBe("http://172.24.16.1:5173/first");
+    await expect(
+      reachablePreviewUrl("http://127.0.0.1:5173/second"),
+    ).resolves.toBe("http://172.24.32.1:5173/second");
+    expect(tauri.invoke).toHaveBeenNthCalledWith(4, "preview_host");
+  });
+
   it("does not probe or rewrite a non-loopback URL", async () => {
     const { reachablePreviewUrl } = await loadDevServer();
 

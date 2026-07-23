@@ -558,7 +558,7 @@ fn read_bounded_bytes(path: &str, max: usize) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(windows)]
-fn trusted_wsl_path() -> Result<PathBuf, String> {
+pub(super) fn trusted_wsl_path() -> Result<PathBuf, String> {
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 
     let mut buffer = vec![0u16; 32_768];

@@ -98,6 +98,7 @@ fn discover_forwards_only_the_typed_root() {
 
 #[test]
 fn start_forwards_exact_scope_target_and_idempotency_identity() {
+    let authoritative_url = "http://172.30.1.3:5173/app";
     let (output, request) = call_with_server(
         &[
             "preview",
@@ -116,7 +117,13 @@ fn start_forwards_exact_scope_target_and_idempotency_identity() {
             "--confirm",
             "--json",
         ],
-        json!({ "outcome": "applied", "status": { "state": "starting" } }),
+        json!({
+            "outcome": "applied",
+            "status": {
+                "state": "running",
+                "previewUrl": authoritative_url
+            }
+        }),
     );
     assert!(output.status.success());
     assert_eq!(request["command"], "preview_start");
@@ -138,6 +145,11 @@ fn start_forwards_exact_scope_target_and_idempotency_identity() {
             },
             "requestId": "request-1",
         })
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["status"]["previewUrl"],
+        authoritative_url
     );
 }
 

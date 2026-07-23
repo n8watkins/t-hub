@@ -254,6 +254,24 @@ mod tests {
             .contains("dispatch_preflight:"));
     }
 
+    #[test]
+    fn tool_result_preserves_backend_authoritative_preview_url() {
+        let authoritative_url = "http://172.30.1.3:5173/app";
+        let result = tool_ok(&serde_json::json!({
+            "outcome": "applied",
+            "status": {
+                "state": "running",
+                "previewUrl": authoritative_url
+            }
+        }));
+        assert_eq!(
+            result["structuredContent"]["status"]["previewUrl"],
+            authoritative_url
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(authoritative_url));
+    }
+
     /// Drive the server with one or more request lines and collect the response
     /// lines (parsed as JSON). Uses a `Discovery` that points at a nonexistent
     /// handshake file so no request can reach a real control channel — and,

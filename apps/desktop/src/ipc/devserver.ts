@@ -422,24 +422,19 @@ function legacySnapshot(
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]);
 
 /**
- * The host to substitute for a loopback in a preview URL, resolved once and
- * cached (the value is stable for a WSL session and the lookup spawns a process
- * backend-side). Resolves to `null` on unix / when no rewrite is needed, or when
- * the backend isn't present (plain browser dev) — callers then keep the URL.
+ * The host to substitute for a loopback in a preview URL.
+ * Managed Preview lifecycle responses already contain the backend-authoritative
+ * reachable URL.
+ * This compatibility lookup remains fresh for manually entered loopback URLs so
+ * a WSL restart cannot leave the webview pinned to an obsolete interface address.
  */
-let previewHostPromise: Promise<string | null> | null = null;
-export function previewHost(): Promise<string | null> {
-  if (!previewHostPromise) {
-    previewHostPromise = (async () => {
-      try {
-        return (await invoke<string | null>(CommandsDevServer.previewHost)) ?? null;
-      } catch {
-        // No Tauri backend (plain `vite`) or the command is missing: no rewrite.
-        return null;
-      }
-    })();
+export async function previewHost(): Promise<string | null> {
+  try {
+    return (await invoke<string | null>(CommandsDevServer.previewHost)) ?? null;
+  } catch {
+    // No Tauri backend (plain `vite`) or the command is missing: no rewrite.
+    return null;
   }
-  return previewHostPromise;
 }
 
 /**

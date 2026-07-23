@@ -34,9 +34,7 @@ fn wsl_host_ip() -> Option<String> {
 pub async fn preview_host() -> Result<Option<String>, String> {
     #[cfg(windows)]
     {
-        use std::sync::OnceLock;
-        static CACHE: OnceLock<Option<String>> = OnceLock::new();
-        Ok(CACHE.get_or_init(wsl_host_ip).clone())
+        Ok(wsl_host_ip())
     }
     #[cfg(not(windows))]
     {
