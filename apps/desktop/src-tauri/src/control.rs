@@ -14573,7 +14573,9 @@ fn dispatch_with_caller(
         "recent_sessions" => recent_sessions(),
         "invalidate_recent_cache" => invalidate_recent_cache(),
         "history_list" => history_list(ctx, args, caller, trusted_internal),
-        "preview_discover" | "preview_status" => (ctx.preview_control)(command, args),
+        "preview_discover" | "preview_status" => {
+            preview_control(ctx, command, args, caller, trusted_internal)
+        }
         "invalidate_history_cache" => invalidate_history_cache(ctx),
         // "Is the general dictating?" - reads the Scribe voice-gate status file
         // (fails open to listening=false when it can't tell). Lets agents defer
@@ -14639,7 +14641,7 @@ fn dispatch_with_caller(
         }
         "history_focus" => history_focus(ctx, args, caller, trusted_internal),
         "preview_select" | "preview_refresh" | "preview_open" => {
-            (ctx.preview_control)(command, args)
+            preview_control(ctx, command, args, caller, trusted_internal)
         }
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
@@ -14715,7 +14717,7 @@ fn dispatch_with_caller(
         "spawn_terminal" => spawn_terminal(ctx, args, caller, trusted_internal),
         "history_resume" => history_resume(ctx, args, caller, trusted_internal),
         "preview_start" | "preview_stop" | "preview_restart" => {
-            (ctx.preview_control)(command, args)
+            preview_control(ctx, command, args, caller, trusted_internal)
         }
         "start_agent" => start_agent(ctx, args, caller, trusted_internal),
         "reconcile_cortana" => reconcile_cortana(ctx, args, trusted_internal),
@@ -14772,6 +14774,117 @@ fn dispatch_with_caller(
             "control: command '{other}' is not exposed over the control channel \
              (process-changing/destructive commands are gated; see PRD §11.2)"
         )),
+    }
+}
+
+fn preview_control(
+    ctx: &ControlContext,
+    command: &str,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let requested_root = ["rootPath", "repoRoot", "repo_root"]
+        .into_iter()
+        .filter_map(|field| arg_str(args, field).map(|value| (field, value)))
+        .collect::<Vec<_>>();
+    let requested_project_id = args
+        .pointer("/scope/projectId")
+        .or_else(|| args.pointer("/target/scope/projectId"))
+        .and_then(Value::as_str);
+    let projects = ctx.captains.projects();
+    let project = if let Some(project_id) = requested_project_id {
+        let matches = projects
+            .iter()
+            .filter(|project| project.project_id == project_id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [project] => *project,
+            [] => {
+                return Err(format!(
+                    "Preview scope names unknown projectId '{project_id}'"
+                ))
+            }
+            _ => return Err(format!("Preview projectId '{project_id}' is ambiguous")),
+        }
+    } else if command == "preview_discover" {
+        let root = requested_project_root(args, command)?;
+        let matches = projects
+            .iter()
+            .filter(|project| project_identity_matches(project, &root))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [project] => *project,
+            [] => return Err("Preview discovery requires a registered Project root".into()),
+            _ => return Err("Preview discovery Project root is ambiguous".into()),
+        }
+    } else {
+        return Err(format!("{command} requires a typed scope with a projectId"));
+    };
+    let authoritative_root = project
+        .root_path
+        .as_deref()
+        .unwrap_or(project.repo_root.as_str());
+    for (field, supplied) in &requested_root {
+        let supplied = canonical_project_identity(supplied)?;
+        if supplied != authoritative_root {
+            return Err(format!(
+                "{command} {field} does not match registered Project '{}'",
+                project.project_id
+            ));
+        }
+    }
+    enforce_preview_project_authority(ctx, caller, trusted_internal, &project.project_id, command)?;
+
+    let mut authorized = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("{command} arguments must be an object"))?;
+    authorized.remove("repoRoot");
+    authorized.remove("repo_root");
+    if !requested_root.is_empty() {
+        authorized.insert(
+            "rootPath".into(),
+            Value::String(authoritative_root.to_string()),
+        );
+    }
+    (ctx.preview_control)(command, &Value::Object(authorized))
+}
+
+fn enforce_preview_project_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    project_id: &str,
+    command: &str,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a Fleet identity"))?;
+    let terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or_else(|| format!("acl: '{command}' caller has no terminal binding"))?;
+    let matches = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .filter(|captain| {
+            captain.role == FleetRole::Captain
+                && captain.state == ClaimState::Active
+                && captain.project_id.as_deref() == Some(project_id)
+                && captain.terminal_id.as_deref() == Some(terminal_id)
+                && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
+        })
+        .count();
+    if caller.fleet_role == Some(FleetRole::Captain) && matches == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' requires General/Cortana or the owning Project Captain"
+        ))
     }
 }
 
@@ -56564,7 +56677,9 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn preview_commands_forward_unchanged_to_one_backend_adapter() {
+    fn preview_commands_forward_registry_authorized_arguments_to_one_backend_adapter() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_string_lossy().into_owned();
         let calls = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
         let recorded = calls.clone();
         let ctx = test_ctx("preview-control").with_preview_control(move |command, args| {
@@ -56574,19 +56689,39 @@ int main(int argc, char **argv) {
                 .push((command.to_string(), args.clone()));
             Ok(json!({"command": command, "args": args}))
         });
-        let args = json!({
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-1".into(),
+                name: "Preview Project".into(),
+                repo_root: root_path.clone(),
+                root_path: Some(root_path.clone()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let scoped = json!({
             "scope": {"projectId": "project-1"},
             "requestId": "request-1"
         });
-        for command in [
-            "preview_discover",
-            "preview_status",
-            "preview_select",
-            "preview_refresh",
-            "preview_open",
-            "preview_start",
-            "preview_stop",
-            "preview_restart",
+        let rooted = json!({
+            "rootPath": root_path,
+            "scope": {"projectId": "project-1"},
+            "requestId": "request-1"
+        });
+        for (command, args) in [
+            ("preview_discover", json!({"rootPath": root_path})),
+            ("preview_status", scoped.clone()),
+            ("preview_select", rooted.clone()),
+            ("preview_refresh", scoped.clone()),
+            ("preview_open", scoped.clone()),
+            ("preview_start", rooted.clone()),
+            ("preview_stop", scoped.clone()),
+            ("preview_restart", rooted.clone()),
         ] {
             let result = dispatch(&ctx, command, &args).unwrap();
             assert_eq!(result["command"], command);
@@ -56594,7 +56729,113 @@ int main(int argc, char **argv) {
         }
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 8);
-        assert!(calls.iter().all(|(_, forwarded)| forwarded == &args));
+    }
+
+    #[test]
+    fn preview_control_rejects_unknown_projects_and_forged_roots_before_adapter() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_string_lossy().into_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let ctx = test_ctx("preview-authority").with_preview_control(move |_, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        });
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-1".into(),
+                name: "Preview Project".into(),
+                repo_root: root_path.clone(),
+                root_path: Some(root_path),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let unknown = dispatch(
+            &ctx,
+            "preview_status",
+            &json!({"scope": {"projectId": "unknown"}}),
+        )
+        .unwrap_err();
+        assert!(unknown.contains("unknown projectId"));
+        let forged = dispatch(
+            &ctx,
+            "preview_start",
+            &json!({
+                "rootPath": "/tmp/not-the-registered-project",
+                "scope": {"projectId": "project-1"},
+                "requestId": "request-1"
+            }),
+        )
+        .unwrap_err();
+        assert!(forged.contains("does not match registered Project"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preview_control_allows_only_the_owning_project_captain() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_string_lossy().into_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let ctx = test_ctx("preview-captain-authority").with_preview_control(move |_, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"authorized": true}))
+        });
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-1".into(),
+                name: "Preview Project".into(),
+                repo_root: root_path.clone(),
+                root_path: Some(root_path),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-tile", Some("preview-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context("preview-ship", "project-1", "Package 3", "codex")
+            .unwrap();
+        let owning_captain = ResolvedIdentity {
+            session_id: "captain-session".into(),
+            mint_role: crate::identity::Role::Captain,
+            tile: Some("captain-tile".into()),
+            ship_slug: Some("preview-ship".into()),
+            fleet_role: Some(FleetRole::Captain),
+            claude_uuid: None,
+        };
+        let args = json!({"scope": {"projectId": "project-1"}});
+
+        assert_eq!(
+            preview_control(&ctx, "preview_status", &args, Some(&owning_captain), false).unwrap(),
+            json!({"authorized": true})
+        );
+        let unrelated = ResolvedIdentity {
+            ship_slug: Some("another-ship".into()),
+            ..owning_captain
+        };
+        assert!(
+            preview_control(&ctx, "preview_status", &args, Some(&unrelated), false)
+                .unwrap_err()
+                .contains("owning Project Captain")
+        );
+        assert!(preview_control(&ctx, "preview_status", &args, None, false)
+            .unwrap_err()
+            .contains("requires a Fleet identity"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
