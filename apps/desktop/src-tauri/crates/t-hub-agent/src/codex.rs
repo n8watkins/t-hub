@@ -14,7 +14,6 @@
 //! presence flags are sufficient for replay, deduplication, attention routing,
 //! and a later typed approval surface.
 
-use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +47,6 @@ struct TapState {
     terminal_turn: bool,
     recognized_events: usize,
     turn_failed: bool,
-    seen: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -493,16 +491,7 @@ fn append_deduplicated(
     state: &mut TapState,
     entry: EventJournalEntry,
 ) -> anyhow::Result<()> {
-    if let Some(event_id) = entry.event_id.as_ref() {
-        if state.seen.contains(event_id) {
-            return Ok(());
-        }
-    }
-    let event_id = entry.event_id.clone();
     let outcome = journal.append(entry).context("appending Codex lifecycle")?;
-    if let Some(event_id) = event_id {
-        state.seen.insert(event_id);
-    }
     if !outcome.is_appended() {
         return Ok(());
     }

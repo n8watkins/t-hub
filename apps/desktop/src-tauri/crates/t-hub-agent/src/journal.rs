@@ -1200,6 +1200,60 @@ mod tests {
     }
 
     #[test]
+    fn noisy_identity_window_has_matching_live_and_restart_eviction_policy() {
+        let dir = temp_dir("dedup-window-policy");
+        let journal = Journal::open(&dir).unwrap();
+        let mut event_ids = Vec::new();
+        for index in 0..=MAX_RECENT_EVENT_IDS {
+            let provider_id = format!("noisy-event-{index}");
+            let event_id = crate::event_identity::derive(
+                "codex",
+                "permission_requested",
+                &[("request_id", Some(&provider_id))],
+            )
+            .unwrap();
+            assert!(journal
+                .append(identified_entry(&event_id, index as u64))
+                .unwrap()
+                .is_appended());
+            event_ids.push(event_id);
+        }
+
+        let oldest_retry = journal
+            .append(identified_entry(&event_ids[0], 10_000))
+            .unwrap();
+        assert!(
+            oldest_retry.is_appended(),
+            "an ID evicted from the bounded durable window must not remain in a live-only cache"
+        );
+        drop(journal);
+
+        let restarted = Journal::open(&dir).unwrap();
+        let next_evicted_retry = restarted
+            .append(identified_entry(&event_ids[1], 10_001))
+            .unwrap();
+        assert!(
+            next_evicted_retry.is_appended(),
+            "restart must enforce the same bounded eviction policy"
+        );
+        let newest_retry = restarted
+            .append(identified_entry(event_ids.last().unwrap(), 10_002))
+            .unwrap();
+        assert!(
+            !newest_retry.is_appended(),
+            "an identity still inside the durable window must be suppressed"
+        );
+        assert_eq!(restarted.replay(0).unwrap().len(), MAX_RECENT_EVENT_IDS + 3);
+        assert!(
+            std::fs::metadata(dir.join(JOURNAL_HEAD_FILE))
+                .unwrap()
+                .len()
+                <= MAX_HEAD_BYTES as u64
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn invalid_provider_identity_is_rejected_without_journal_mutation() {
         let dir = temp_dir("invalid-event-id");
         let journal = Journal::open(&dir).unwrap();
