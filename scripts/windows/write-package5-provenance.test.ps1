@@ -68,12 +68,18 @@ try {
   Assert-True ($manifest.installation.status -eq "not_installed" -and $null -eq $manifest.installation.installedAt -and $null -eq $manifest.installation.installationTarget) "uninstalled manifest fabricated installation evidence"
   Assert-True ($null -ne $manifest.artifacts.validator -and $manifest.artifacts.validator.passed -eq $true) "validator artifact binding is missing"
 
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; installedSha256 = $null; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
+  $nullManifestPath = Join-Path ([System.IO.Path]::GetTempPath()) ("package-5-null-installed-" + [guid]::NewGuid().ToString("N") + ".json")
+  & $scriptPath -OutputPath $nullManifestPath -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator | Out-Null
+  Assert-True ((Get-Content $nullManifestPath -Raw | ConvertFrom-Json).installation.status -eq "not_installed") "null installed hash should be accepted pre-install"
+
   @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; installedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
   $installedManifestPath = Join-Path ([System.IO.Path]::GetTempPath()) ("package-5-installed-" + [guid]::NewGuid().ToString("N") + ".json")
   $installedAt = "2026-07-23T12:00:00.000Z"
   & $scriptPath -OutputPath $installedManifestPath -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -InstalledBinaryPath $installed -InstalledAt $installedAt -ValidatorPath $validator -ValidationPath $validator | Out-Null
   $installedManifest = Get-Content $installedManifestPath -Raw | ConvertFrom-Json
   Assert-True ($installedManifest.installation.status -eq "installed" -and $installedManifest.installation.installedAt -eq $installedAt -and $installedManifest.installation.installationTarget -eq (Split-Path -Parent $installed) -and $installedManifest.artifacts.installedBinary.sha256 -eq $hash) "installed manifest does not bind installation hash"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-installed-at.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -InstalledBinaryPath $installed -InstalledAt "not-a-timestamp" -ValidatorPath $validator -ValidationPath $validator } "RFC3339"
 
   $badSource = "0" * 40
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-source.json") -RepositoryRoot $root -SourceCommit $badSource -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "SourceCommit"

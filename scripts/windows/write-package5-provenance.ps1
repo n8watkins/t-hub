@@ -121,13 +121,17 @@ if ($expectedHash -cne $extractedHash) { throw "expected binary hash must equal 
 if ($installedHash -and $installedHash -cne $expectedHash) { throw "installed binary hash must equal expected/extracted binary hash" }
 $expectedValidation = [ordered]@{ rawSha256 = $rawHash; installerSha256 = $installerHash; expectedSha256 = $expectedHash; extractedSha256 = $extractedHash }
 if ($installedHash) { $expectedValidation.installedSha256 = $installedHash }
-if ($InstalledBinaryPath -and [string]::IsNullOrWhiteSpace($InstalledAt)) { throw "InstalledAt is required when InstalledBinaryPath is provided" }
+if ($InstalledBinaryPath) {
+  if ([string]::IsNullOrWhiteSpace($InstalledAt)) { throw "InstalledAt is required when InstalledBinaryPath is provided" }
+  try { [DateTimeOffset]::Parse($InstalledAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) | Out-Null } catch { throw "InstalledAt must be an RFC3339 timestamp" }
+}
 if ($ValidationPath) {
   $validationResolved = Resolve-File $ValidationPath "validation evidence"
   if ($validationResolved -cne $ValidatorPath) { throw "ValidationPath must equal ValidatorPath" }
 }
 $validation = Read-SafeValidation $ValidatorPath $expectedValidation
-if (-not $ExpectedValidation.Contains("installedSha256") -and $null -ne $validation.PSObject.Properties["installedSha256"]) { throw "validator evidence installedSha256 is not allowed for an uninstalled manifest" }
+$installedProperty = $validation.PSObject.Properties["installedSha256"]
+if (-not $ExpectedValidation.Contains("installedSha256") -and $null -ne $installedProperty -and $null -ne $installedProperty.Value) { throw "validator evidence installedSha256 is not allowed for an uninstalled manifest" }
 $now = (Get-Date).ToUniversalTime().ToString("o")
 
 $manifest = [ordered]@{
