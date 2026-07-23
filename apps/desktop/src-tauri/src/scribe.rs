@@ -406,6 +406,7 @@ fn evaluate_fallback(
 /// One candidate's evaluation plus its `updatedAt` (for the prod-vs-dev
 /// freshest tiebreak). `updatedAt` is Scribe's ISO-8601 timestamp string,
 /// which sorts lexicographically in chronological order.
+#[derive(Clone)]
 struct CandidateEval {
     status: ScribeStatus,
     updated_at: Option<String>,
@@ -552,6 +553,29 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
     );
 }
 
+fn read_scribe_status_emitter_tick(
+    candidates: &mut [Option<CandidateEval>; 2],
+    flavor: usize,
+) -> ScribeStatus {
+    if std::env::var("T_HUB_SCRIBE_CONTROL_FILE").is_ok()
+        || std::env::var("T_HUB_SCRIBE_STATUS_FILE").is_ok()
+    {
+        return read_scribe_status();
+    }
+    let (control_name, bundle) = if flavor == 0 {
+        (SCRIBE_CONTROL_PROD, SCRIBE_BUNDLE_PROD)
+    } else {
+        (SCRIBE_CONTROL_DEV, SCRIBE_BUNDLE_DEV)
+    };
+    candidates[flavor] = eval_flavor(
+        scribe_control_file_for(control_name).as_deref(),
+        scribe_status_file_for(bundle).as_deref(),
+    );
+    let active: Vec<CandidateEval> = candidates.iter().filter_map(|candidate| candidate.clone()).collect();
+    let status = combine_candidates(&active);
+    status
+}
+
 /// Start the backend event producer while voice announcements are enabled.
 ///
 /// Scribe's v1 contract is currently a pull endpoint, so this producer uses
@@ -579,8 +603,11 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
     let thread_result = std::thread::Builder::new()
         .name(format!("scribe-status-emitter-{generation}"))
         .spawn(move || {
+            let mut candidates: [Option<CandidateEval>; 2] = [None, None];
+            let mut flavor = 0usize;
             while !cancel_for_thread.load(Ordering::Acquire) {
-                emit_status_event(&app, &read_scribe_status());
+                emit_status_event(&app, &read_scribe_status_emitter_tick(&mut candidates, flavor));
+                flavor = (flavor + 1) % 2;
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
