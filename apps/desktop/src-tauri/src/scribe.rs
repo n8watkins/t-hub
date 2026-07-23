@@ -590,11 +590,15 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
     *latest_scribe_status_store()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some((status.clone(), observed_at));
-    let generation = SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let generation = next_scribe_event_generation();
     let _ = app.emit(
         "scribe://status",
         status_event_payload(status, generation, observed_at),
     );
+}
+
+fn next_scribe_event_generation() -> u64 {
+    SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn read_scribe_status_emitter_tick(
@@ -1056,9 +1060,8 @@ mod tests {
     #[test]
     fn event_generation_is_monotonic_across_restart() {
         let _test_lock = lifecycle_test_lock();
-        let generation = AtomicU64::new(0);
-        let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let first = next_scribe_event_generation();
+        let second = next_scribe_event_generation();
         assert!(second > first);
     }
 
