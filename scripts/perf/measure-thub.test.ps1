@@ -77,6 +77,17 @@ try {
     if (Test-Path -LiteralPath $artifactPath) { Remove-Item -LiteralPath $artifactPath -Force }
 }
 
+$diagnosticPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-diagnostic-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    $OutputPath = $diagnosticPath
+    Write-DiagnosticArtifact "secret C:\\Users\\natha\\token"
+    $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw | ConvertFrom-Json
+    Assert-True ($diagnostic.schemaVersion -eq 3 -and $diagnostic.diagnostics.errorCode -eq "collector_exception") "diagnostic artifact shape is invalid"
+    Assert-True ((Get-Content -LiteralPath $diagnosticPath -Raw) -notmatch "secret|token|natha") "diagnostic artifact leaked exception detail"
+} finally {
+    if (Test-Path -LiteralPath $diagnosticPath) { Remove-Item -LiteralPath $diagnosticPath -Force }
+}
+
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
 $incomplete = Get-TreeTotals $withBirth $next 1.0 @($root)
 Assert-True (-not $incomplete.cpu_interval_complete) "birth interval was marked complete"
