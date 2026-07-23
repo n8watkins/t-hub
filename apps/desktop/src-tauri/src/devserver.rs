@@ -159,58 +159,109 @@ struct CleanupCompletion {
 struct BackgroundCleanup {
     process: DevProcess,
     completion: Option<CleanupCompletion>,
+    wait_error_reported: bool,
 }
 
-static CLEANUP_REAPER: LazyLock<mpsc::Sender<BackgroundCleanup>> = LazyLock::new(|| {
+fn cleanup_owner(name: &str) -> mpsc::Sender<BackgroundCleanup> {
     let (sender, receiver) = mpsc::channel::<BackgroundCleanup>();
     std::thread::Builder::new()
-        .name("t-hub-preview-cleanup-owner".to_string())
-        .spawn(move || {
-            while let Ok(cleanup) = receiver.recv() {
-                finish_owned_cleanup(cleanup);
-            }
-        })
+        .name(name.to_string())
+        .spawn(move || cleanup_owner_loop(receiver))
         .expect("spawn persistent Preview cleanup owner");
     sender
-});
+}
 
-fn finish_owned_cleanup(mut cleanup: BackgroundCleanup) {
-    let _authority = cleanup.process._job.take();
+static CLEANUP_REAPER: LazyLock<mpsc::Sender<BackgroundCleanup>> =
+    LazyLock::new(|| cleanup_owner("t-hub-preview-cleanup-owner"));
+static CLEANUP_REAPER_FALLBACK: LazyLock<mpsc::Sender<BackgroundCleanup>> =
+    LazyLock::new(|| cleanup_owner("t-hub-preview-cleanup-owner-fallback"));
+
+fn cleanup_owner_loop(receiver: mpsc::Receiver<BackgroundCleanup>) {
+    let mut active = Vec::<BackgroundCleanup>::new();
     loop {
-        match cleanup.process.child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) => {}
+        match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(cleanup) => active.push(cleanup),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if active.is_empty() => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        match cleanup
-            .process
-            .cleanup_acknowledgements
-            .recv_timeout(std::time::Duration::from_millis(100))
-        {
-            Ok(CleanupAcknowledgement::Stopped) => {
-                if let Some(completion) = cleanup.completion.take() {
+        active.extend(receiver.try_iter());
+        let mut index = 0;
+        while index < active.len() {
+            if poll_owned_cleanup(&mut active[index]) {
+                let mut completed = active.swap_remove(index);
+                completed
+                    .process
+                    .join_finished_readers(std::time::Duration::from_secs(1));
+                if let Some(completion) = completed.completion {
                     finish_background_cleanup(
                         &completion.terminal_id,
                         completion.operation,
-                        &cleanup.process.run_id,
+                        &completed.process.run_id,
                     );
                 }
-            }
-            Ok(CleanupAcknowledgement::Pending) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            } else {
+                index += 1;
             }
         }
     }
-    cleanup
-        .process
-        .join_finished_readers(std::time::Duration::from_secs(1));
-    if let Some(completion) = cleanup.completion {
-        finish_background_cleanup(
-            &completion.terminal_id,
-            completion.operation,
-            &cleanup.process.run_id,
-        );
+}
+
+fn poll_owned_cleanup(cleanup: &mut BackgroundCleanup) -> bool {
+    while let Ok(acknowledgement) = cleanup.process.cleanup_acknowledgements.try_recv() {
+        if acknowledgement == CleanupAcknowledgement::Stopped {
+            if let Some(completion) = cleanup.completion.take() {
+                finish_background_cleanup(
+                    &completion.terminal_id,
+                    completion.operation,
+                    &cleanup.process.run_id,
+                );
+            }
+        }
     }
+    cleanup_wait_completed(
+        cleanup.process.child.try_wait(),
+        &mut cleanup.wait_error_reported,
+    )
+}
+
+fn cleanup_wait_completed(
+    result: std::io::Result<Option<std::process::ExitStatus>>,
+    wait_error_reported: &mut bool,
+) -> bool {
+    match result {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            if !*wait_error_reported {
+                eprintln!(
+                    "t-hub-preview: retained cleanup authority after relay wait error: {error}"
+                );
+                *wait_error_reported = true;
+            }
+            false
+        }
+    }
+}
+
+fn handoff_cleanup_with(
+    primary: &mpsc::Sender<BackgroundCleanup>,
+    fallback: &mpsc::Sender<BackgroundCleanup>,
+    cleanup: BackgroundCleanup,
+) {
+    let cleanup = match primary.send(cleanup) {
+        Ok(()) => return,
+        Err(error) => error.0,
+    };
+    if let Err(error) = fallback.send(cleanup) {
+        Box::leak(Box::new(error.0));
+    }
+}
+
+fn handoff_cleanup(cleanup: BackgroundCleanup) {
+    handoff_cleanup_with(&CLEANUP_REAPER, &CLEANUP_REAPER_FALLBACK, cleanup);
 }
 
 impl DevProcess {
@@ -254,10 +305,9 @@ impl DevProcess {
         let cleanup = BackgroundCleanup {
             process: self,
             completion,
+            wait_error_reported: false,
         };
-        if let Err(error) = CLEANUP_REAPER.send(cleanup) {
-            finish_owned_cleanup(error.0);
-        }
+        handoff_cleanup(cleanup);
         StopOutcome::CleanupPending { acknowledgement }
     }
 
@@ -332,6 +382,17 @@ fn reserve_operation(registry: &mut DevRegistry, terminal_id: &str) -> u64 {
     let token = registry.operation_sequence;
     registry.operations.insert(terminal_id.to_string(), token);
     token
+}
+
+fn reserve_start_operation(registry: &mut DevRegistry, terminal_id: &str) -> Result<u64, String> {
+    if registry
+        .snapshots
+        .get(terminal_id)
+        .is_some_and(|snapshot| snapshot.state == "cleanupPending")
+    {
+        return Err("the previous Preview cleanup is still pending".to_string());
+    }
+    Ok(reserve_operation(registry, terminal_id))
 }
 
 fn owns_operation(registry: &DevRegistry, terminal_id: &str, token: u64) -> bool {
@@ -523,6 +584,9 @@ fn finish_background_cleanup_in(
         return false;
     }
     registry.operations.remove(terminal_id);
+    if registry.generations.get(terminal_id).map(String::as_str) == Some(run_id) {
+        registry.generations.remove(terminal_id);
+    }
     let revision = next_revision(registry);
     let snapshot = idle_snapshot(terminal_id, revision);
     registry.snapshots.insert(terminal_id.to_string(), snapshot);
@@ -1427,17 +1491,7 @@ pub async fn start_dev_server(
     let gate = operation_gate(&terminal_id);
     let _operation_guard = gate.lock().await;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let operation = {
-        let mut registry = REGISTRY.lock();
-        if registry
-            .snapshots
-            .get(&terminal_id)
-            .is_some_and(|snapshot| snapshot.state == "cleanupPending")
-        {
-            return Err("the previous Preview cleanup is still pending".to_string());
-        }
-        reserve_operation(&mut registry, &terminal_id)
-    };
+    let operation = reserve_start_operation(&mut REGISTRY.lock(), &terminal_id)?;
 
     let discovery = match discover_run_targets(cwd.clone()).await {
         Ok(discovery) => discovery,
@@ -1479,6 +1533,40 @@ pub async fn start_dev_server(
         if !owns_operation(&registry, &terminal_id, operation) {
             return Err("the start request was superseded".to_string());
         }
+        (
+            registry.processes.remove(&terminal_id),
+            registry.static_servers.remove(&terminal_id),
+        )
+    };
+    if let Some(process) = existing {
+        let outcome = process.stop_with_timeout(
+            std::time::Duration::from_secs(4),
+            Some(CleanupCompletion {
+                terminal_id: terminal_id.clone(),
+                operation,
+            }),
+        );
+        if let StopOutcome::CleanupPending { acknowledgement } = outcome {
+            if let Some(server) = existing_static {
+                server.stop();
+            }
+            let _ = cleanup_pending_snapshot(
+                &mut REGISTRY.lock(),
+                &terminal_id,
+                operation,
+                acknowledgement,
+            )?;
+            return Err("the previous Preview cleanup is still pending".to_string());
+        }
+    }
+    if let Some(server) = existing_static {
+        server.stop();
+    }
+    {
+        let mut registry = REGISTRY.lock();
+        if !owns_operation(&registry, &terminal_id, operation) {
+            return Err("the start request was superseded".to_string());
+        }
         registry
             .generations
             .insert(terminal_id.clone(), run_id.clone());
@@ -1497,16 +1585,6 @@ pub async fn start_dev_server(
                 observed_at: observed_at(),
             },
         );
-        (
-            registry.processes.remove(&terminal_id),
-            registry.static_servers.remove(&terminal_id),
-        )
-    };
-    if let Some(process) = existing {
-        process.stop();
-    }
-    if let Some(server) = existing_static {
-        server.stop();
     }
     if !owns_operation(&REGISTRY.lock(), &terminal_id, operation) {
         return Err("the start request was superseded".to_string());
@@ -2609,6 +2687,9 @@ mod tests {
     fn cleanup_pending_snapshot_stays_owned_until_correlated_completion() {
         let mut registry = DevRegistry::default();
         registry.operations.insert("tile".to_string(), 7);
+        registry
+            .generations
+            .insert("tile".to_string(), "run-1".to_string());
         let mut stopping = idle_snapshot("tile", 1);
         stopping.run_id = Some("run-1".to_string());
         stopping.state = "stopping".to_string();
@@ -2632,12 +2713,61 @@ mod tests {
         ));
         assert_eq!(registry.snapshots["tile"].state, "idle");
         assert!(!owns_operation(&registry, "tile", 7));
+        assert!(!owns_generation(&registry, "tile", "run-1"));
         assert!(!finish_background_cleanup_in(
             &mut registry,
             "tile",
             7,
             "run-1"
         ));
+    }
+
+    #[test]
+    fn start_over_cleanup_pending_preserves_old_generation_and_refuses_admission() {
+        let mut registry = DevRegistry::default();
+        registry
+            .generations
+            .insert("tile".to_string(), "run-old".to_string());
+        registry.operations.insert("tile".to_string(), 7);
+        let mut old = idle_snapshot("tile", 1);
+        old.run_id = Some("run-old".to_string());
+        old.state = "stopping".to_string();
+        registry.snapshots.insert("tile".to_string(), old);
+
+        let pending = cleanup_pending_snapshot(
+            &mut registry,
+            "tile",
+            7,
+            Some(CleanupAcknowledgement::Pending),
+        )
+        .unwrap();
+        assert_eq!(pending.run_id.as_deref(), Some("run-old"));
+        assert_eq!(pending.state, "cleanupPending");
+        assert_eq!(registry.generations["tile"], "run-old");
+        assert_eq!(
+            reserve_start_operation(&mut registry, "tile"),
+            Err("the previous Preview cleanup is still pending".to_string())
+        );
+        assert_eq!(registry.generations["tile"], "run-old");
+        assert_eq!(
+            registry.snapshots["tile"].run_id.as_deref(),
+            Some("run-old")
+        );
+    }
+
+    #[test]
+    fn cleanup_wait_error_is_diagnosed_and_never_completes_ownership() {
+        let mut reported = false;
+        assert!(!cleanup_wait_completed(
+            Err(std::io::Error::other("injected wait failure")),
+            &mut reported,
+        ));
+        assert!(reported);
+        assert!(!cleanup_wait_completed(
+            Err(std::io::Error::other("repeated wait failure")),
+            &mut reported,
+        ));
+        assert!(reported);
     }
 
     #[cfg(not(windows))]
@@ -2872,6 +3002,139 @@ mod tests {
             0,
             "background cleanup owner did not release authority after final exit"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cleanup_owner_progresses_later_run_while_first_never_completes() {
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let first_release = fixture.path().join("first-release");
+        let first_script = format!(
+            "while test ! -e '{}'; do sleep 0.02; done",
+            first_release.display()
+        );
+        let first_child = Command::new("sh")
+            .arg("-c")
+            .arg(first_script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let first_pid = first_child.id();
+        let first = BackgroundCleanup {
+            process: DevProcess {
+                run_id: "first-pending".to_string(),
+                child: first_child,
+                stdin: None,
+                readers: Vec::new(),
+                cleanup_acknowledgements: mpsc::channel().1,
+                _job: None,
+            },
+            completion: None,
+            wait_error_reported: false,
+        };
+
+        let generation = "b".repeat(32);
+        let mut second_child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("echo 'T_HUB_PREVIEW_STOPPED {generation}' >&2"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let second_pid = second_child.id();
+        let second_stderr = second_child.stderr.take().unwrap();
+        let (second_acknowledgements, second_acknowledgement_rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_reader = Arc::clone(&stopped);
+        let second_reader = std::thread::spawn(move || {
+            for line in BufReader::new(second_stderr).lines().map_while(Result::ok) {
+                if cleanup_acknowledgement(&line, &generation)
+                    == Some(CleanupAcknowledgement::Stopped)
+                {
+                    stopped_reader.store(true, Ordering::SeqCst);
+                    let _ = second_acknowledgements.send(CleanupAcknowledgement::Stopped);
+                }
+            }
+        });
+        let second = BackgroundCleanup {
+            process: DevProcess {
+                run_id: "second-stopped".to_string(),
+                child: second_child,
+                stdin: None,
+                readers: vec![second_reader],
+                cleanup_acknowledgements: second_acknowledgement_rx,
+                _job: None,
+            },
+            completion: None,
+            wait_error_reported: false,
+        };
+
+        let owner = cleanup_owner("t-hub-preview-cleanup-owner-concurrency-test");
+        assert!(owner.send(first).is_ok());
+        assert!(owner.send(second).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (Path::new(&format!("/proc/{second_pid}")).exists()
+            || !stopped.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Path::new(&format!("/proc/{first_pid}")).exists());
+        assert!(!Path::new(&format!("/proc/{second_pid}")).exists());
+        assert!(stopped.load(Ordering::SeqCst));
+
+        std::fs::write(first_release, b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Path::new(&format!("/proc/{first_pid}")).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_primary_handoff_retains_authority_in_fallback_owner() {
+        use std::process::Stdio;
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let cleanup = BackgroundCleanup {
+            process: DevProcess {
+                run_id: "fallback-owned".to_string(),
+                child,
+                stdin: None,
+                readers: Vec::new(),
+                cleanup_acknowledgements: mpsc::channel().1,
+                _job: None,
+            },
+            completion: None,
+            wait_error_reported: false,
+        };
+        let (failed_primary, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        let (fallback, fallback_receiver) = mpsc::channel();
+
+        handoff_cleanup_with(&failed_primary, &fallback, cleanup);
+        let mut retained = fallback_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fallback owner must receive intact cleanup authority");
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        retained.process.child.kill().unwrap();
+        retained.process.child.wait().unwrap();
     }
 
     #[test]
