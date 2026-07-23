@@ -3,6 +3,7 @@ import {
   beginTerminalDetach,
   resetTerminalDetachmentsForTests,
   TerminalLifecycleController,
+  TERMINAL_COLD_AFTER_MS,
   waitForTerminalDetach,
 } from "./terminalLifecycle";
 
@@ -48,6 +49,22 @@ describe("TerminalLifecycleController", () => {
 
     lifecycle.reconcile(["term"], new Set(["term"]));
     expect(lifecycle.temperature("term", false)).toBe("warm");
+  });
+
+  it("uses the generous default grace so routine tab-switching stays warm", () => {
+    // The default (no coldAfterMs override, as TerminalPool constructs it) keeps a
+    // parked terminal warm well past a typical switch-away-and-back, so revisiting
+    // a tab doesn't reload it. Guards against silently shortening the grace back to
+    // the old 30s that made terminals feel like they "constantly refreshed".
+    expect(TERMINAL_COLD_AFTER_MS).toBeGreaterThanOrEqual(120_000);
+
+    const lifecycle = new TerminalLifecycleController(() => {});
+    lifecycle.reconcile(["term"], new Set());
+    vi.advanceTimersByTime(60_000);
+    expect(lifecycle.temperature("term", false)).toBe("warm");
+
+    vi.advanceTimersByTime(TERMINAL_COLD_AFTER_MS - 60_000);
+    expect(lifecycle.temperature("term", false)).toBe("cold");
   });
 
   it("forgets removed terminals and cancels their timers", () => {
