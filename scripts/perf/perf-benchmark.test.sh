@@ -48,6 +48,15 @@ fi
 if "$RUNNER" --scenario-kind unsupported --dry-run >/dev/null 2>&1; then
   fail "unsupported scenario kind was accepted"
 fi
+if "$RUNNER" --workload-version "release candidate" --dry-run >/dev/null 2>&1; then
+  fail "non-canonical workload version was accepted"
+fi
+if "$RUNNER" --workload-seed "bearer token" --dry-run >/dev/null 2>&1; then
+  fail "sensitive workload seed was accepted"
+fi
+if "$RUNNER" --power-mode turbo --dry-run >/dev/null 2>&1; then
+  fail "non-canonical power mode was accepted"
+fi
 if "$RUNNER" --source-commit bad --dry-run >/dev/null 2>&1; then
   fail "invalid source commit was accepted"
 fi
