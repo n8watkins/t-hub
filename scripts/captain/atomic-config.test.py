@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -208,6 +209,42 @@ class AtomicConfigTest(unittest.TestCase):
             valid.chmod(0o700)
             helper.verify_cortana_catalog(str(valid))
 
+            def assert_descendant_gone(pid_file: pathlib.Path) -> None:
+                pid = int(pid_file.read_text())
+                for _ in range(100):
+                    try:
+                        state = pathlib.Path(f"/proc/{pid}/stat").read_text().split()[2]
+                    except (FileNotFoundError, ProcessLookupError):
+                        return
+                    if state == "Z":
+                        return
+                    time.sleep(0.01)
+                self.fail(f"catalog descendant remained alive: {pid}")
+
+            valid_fork = root / "valid-fork"
+            valid_fork_pid = root / "valid-fork.pid"
+            valid_fork.write_text(
+                "#!/bin/sh\n"
+                "sleep 30 >/dev/null 2>&1 &\n"
+                f"printf '%s\\n' \"$!\" > '{valid_fork_pid}'\n"
+                f"{valid.read_text().splitlines()[1]}\n"
+            )
+            valid_fork.chmod(0o700)
+            helper.verify_cortana_catalog(str(valid_fork))
+            assert_descendant_gone(valid_fork_pid)
+
+            held_pipe = root / "held-pipe"
+            held_pipe_pid = root / "held-pipe.pid"
+            held_pipe.write_text(
+                "#!/bin/sh\n"
+                "sleep 30 &\n"
+                f"printf '%s\\n' \"$!\" > '{held_pipe_pid}'\n"
+            )
+            held_pipe.chmod(0o700)
+            with self.assertRaises(helper.AtomicError):
+                helper.verify_cortana_catalog(str(held_pipe))
+            assert_descendant_gone(held_pipe_pid)
+
             for name, body in (
                 ("hang", "#!/bin/sh\nsleep 30\n"),
                 ("flood", "#!/bin/sh\nyes x\n"),
@@ -225,6 +262,40 @@ class AtomicConfigTest(unittest.TestCase):
                     with self.assertRaises(helper.AtomicError):
                         helper.verify_cortana_catalog(str(executable))
                     self.assertLess(time.monotonic() - started, 2)
+
+    def test_snapshot_executable_rejects_continuous_same_inode_growth_promptly(
+        self,
+    ) -> None:
+        helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            destination = root / "snapshot"
+            source.write_bytes(b"x" * (1024 * 1024))
+            source.chmod(0o700)
+            original_inode = source.stat().st_ino
+            stop = threading.Event()
+            started = threading.Event()
+
+            def append_continuously() -> None:
+                with source.open("ab", buffering=0) as output:
+                    started.set()
+                    while not stop.is_set():
+                        output.write(b"y" * 4096)
+
+            writer = threading.Thread(target=append_continuously)
+            writer.start()
+            started.wait(timeout=1)
+            began = time.monotonic()
+            try:
+                with self.assertRaises(helper.AtomicError):
+                    helper.snapshot_executable(str(source), str(destination))
+            finally:
+                stop.set()
+                writer.join(timeout=2)
+            self.assertLess(time.monotonic() - began, 2)
+            self.assertEqual(source.stat().st_ino, original_inode)
+            self.assertFalse(destination.exists())
 
     def test_release_unlinks_running_executable_without_truncation(self) -> None:
         helper = load_helper()

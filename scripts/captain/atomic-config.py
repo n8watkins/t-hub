@@ -29,6 +29,7 @@ LIBC = ctypes.CDLL(None, use_errno=True)
 VERSION = 1
 CATALOG_OUTPUT_LIMIT = 128 * 1024
 CATALOG_TIMEOUT_SECONDS = 5.0
+EXECUTABLE_SIZE_LIMIT = 256 * 1024 * 1024
 
 
 class AtomicError(RuntimeError):
@@ -138,6 +139,8 @@ def snapshot_executable(source: str, destination: str) -> Dict[str, Any]:
             raise AtomicError(f"executable must not be writable by group or others: {source}")
         if source_mode & 0o7000:
             raise AtomicError(f"executable must not have special mode bits set: {source}")
+        if source_before.st_size > EXECUTABLE_SIZE_LIMIT:
+            raise AtomicError(f"executable exceeds the size limit: {source}")
 
         destination_descriptor = os.open(
             destination,
@@ -152,15 +155,19 @@ def snapshot_executable(source: str, destination: str) -> Dict[str, Any]:
         os.fchmod(destination_descriptor, 0o700)
         digest = hashlib.sha256()
         size = 0
-        while True:
-            chunk = os.read(source_descriptor, 1024 * 1024)
+        remaining = source_before.st_size
+        while remaining:
+            chunk = os.read(source_descriptor, min(remaining, 1024 * 1024))
             if not chunk:
-                break
+                raise AtomicError(f"executable ended before its selected size: {source}")
             digest.update(chunk)
             size += len(chunk)
+            remaining -= len(chunk)
             offset = 0
             while offset < len(chunk):
                 offset += os.write(destination_descriptor, chunk[offset:])
+        if os.read(source_descriptor, 1):
+            raise AtomicError(f"executable grew while it was read: {source}")
         os.fsync(destination_descriptor)
 
         source_after = os.fstat(source_descriptor)
@@ -249,14 +256,20 @@ def verify_executable(source: str, expected: Dict[str, Any]) -> Dict[str, Any]:
             raise AtomicError(f"executable must be owned by the current user: {source}")
         if not mode & stat.S_IXUSR or mode & 0o7022:
             raise AtomicError(f"executable mode is unsafe: {source}")
+        if before.st_size > EXECUTABLE_SIZE_LIMIT:
+            raise AtomicError(f"executable exceeds the size limit: {source}")
         digest = hashlib.sha256()
         size = 0
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
             if not chunk:
-                break
+                raise AtomicError(f"executable ended before its selected size: {source}")
             digest.update(chunk)
             size += len(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise AtomicError(f"executable grew while it was verified: {source}")
         after = os.fstat(descriptor)
         observed = {
             "device": before.st_dev,
@@ -389,12 +402,13 @@ def verify_cortana_catalog(executable: str) -> None:
             raise AtomicError("catalog executable lacks the exact cortana_bootstrap contract")
     finally:
         selector.close()
-        if process is not None and process.poll() is None:
+        if process is not None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait()
+            if process.poll() is None:
+                process.wait()
         if process is not None and process.stdout is not None:
             process.stdout.close()
         if process is not None and process.stderr is not None:
