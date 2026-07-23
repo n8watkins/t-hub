@@ -212,6 +212,7 @@ impl TestLifecycleGuard {
             let path = std::env::temp_dir().join("t-hub-test-tmux-lifecycle.lock");
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(path)

@@ -1023,7 +1023,7 @@ mod tests {
             let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
                 .as_u64()
                 .unwrap();
-            write!(server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            writeln!(server, "{{\"probeAck\":{nonce}}}").unwrap();
             server.flush().unwrap();
             let mut tail = Vec::new();
             input.read_to_end(&mut tail).unwrap();
@@ -1068,7 +1068,7 @@ mod tests {
                 .unwrap();
             probe_seen_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            write!(stalled_server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            writeln!(stalled_server, "{{\"probeAck\":{nonce}}}").unwrap();
             stalled_server.flush().unwrap();
             let mut tail = Vec::new();
             input.read_to_end(&mut tail).unwrap();
@@ -1152,7 +1152,7 @@ mod tests {
             let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
                 .as_u64()
                 .unwrap();
-            write!(server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            writeln!(server, "{{\"probeAck\":{nonce}}}").unwrap();
             server.flush().unwrap();
             server.shutdown(Shutdown::Both).unwrap();
         });

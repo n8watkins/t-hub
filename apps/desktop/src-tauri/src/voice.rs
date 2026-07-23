@@ -141,24 +141,13 @@ fn voice_settings_path() -> PathBuf {
 
 /// The shared voice.json schema (camelCase on disk and over IPC - external
 /// scripts read the same field names).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceAnnouncementPolicy {
     pub permission: bool,
     pub question: bool,
     pub completion: bool,
     pub failure: bool,
-}
-
-impl Default for VoiceAnnouncementPolicy {
-    fn default() -> Self {
-        Self {
-            permission: false,
-            question: false,
-            completion: false,
-            failure: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -409,7 +398,7 @@ fn claim_announcement_at(
     event_id: Option<&str>,
     kind: Option<VoiceAnnouncementKind>,
 ) -> Result<VoiceAnnouncementClaim, String> {
-    let mut root = read_json_root(&path)?;
+    let mut root = read_json_root(path)?;
     let claim = claim_announcement_in_root(&mut root, seq, event_id, kind);
     if claim.1 {
         write_json_root_unlocked(path, &root)?;
@@ -455,7 +444,7 @@ fn claim_announcement_in_root(
         );
     }
 
-    let settings = parse_settings(&root);
+    let settings = parse_settings(root);
     handled.push(identity.clone());
     if handled.len() > MAX_HANDLED_ANNOUNCEMENTS {
         handled.drain(..handled.len() - MAX_HANDLED_ANNOUNCEMENTS);
@@ -532,7 +521,7 @@ fn update_announcement_outcome_at(
     status: VoiceAnnouncementOutcomeStatus,
     detail: Option<String>,
 ) -> Result<(), String> {
-    let mut root = read_json_root(&path)?;
+    let mut root = read_json_root(path)?;
     let mut outcomes = root
         .get("announcementOutcomes")
         .cloned()
@@ -566,7 +555,7 @@ fn recover_interrupted_announcements() -> Result<Option<VoiceRecoveredInterrupti
 fn recover_interrupted_announcements_at(
     path: &Path,
 ) -> Result<Option<VoiceRecoveredInterruption>, String> {
-    let mut root = read_json_root(&path)?;
+    let mut root = read_json_root(path)?;
     let mut outcomes = root
         .get("announcementOutcomes")
         .cloned()
@@ -1077,8 +1066,10 @@ mod tests {
     #[test]
     fn persisted_legacy_attention_is_the_input_policy_projection() {
         let mut root = serde_json::json!({});
-        let mut settings = VoiceSettings::default();
-        settings.announce_on_attention = false;
+        let mut settings = VoiceSettings {
+            announce_on_attention: false,
+            ..VoiceSettings::default()
+        };
         settings.announcement_policy.permission = true;
         merge_settings(&mut root, &settings).unwrap();
         assert_eq!(root["announceOnAttention"], true);

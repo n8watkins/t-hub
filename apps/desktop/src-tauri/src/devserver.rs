@@ -1900,7 +1900,7 @@ pub async fn stop_dev_server(
                 return Err("the requested run is no longer active".to_string());
             }
         }
-        if registry.processes.get(&terminal_id).is_none() {
+        if !registry.processes.contains_key(&terminal_id) {
             if let Some(snapshot) = registry
                 .snapshots
                 .get(&terminal_id)

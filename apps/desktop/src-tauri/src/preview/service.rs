@@ -1731,7 +1731,7 @@ mod tests {
         )
         .unwrap();
         let profiles =
-            Arc::new(PreviewProfileStore::open(&root.join("state/profiles.json")).unwrap());
+            Arc::new(PreviewProfileStore::open(root.join("state/profiles.json")).unwrap());
         let service = PreviewService::new(FakeRuntime::default(), Arc::clone(&profiles));
         let posix_identity = "/home/natkins/projects/stable-preview";
         let direct_authority = PreviewProjectRoot::new(posix_identity, root.clone()).unwrap();

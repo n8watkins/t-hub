@@ -692,8 +692,7 @@ fn read_scribe_status_emitter_tick(
         })
         .cloned()
         .collect();
-    let status = combine_candidates(&active);
-    status
+    combine_candidates(&active)
 }
 
 fn read_scribe_status_direct_tick() -> ScribeStatus {
@@ -723,14 +722,13 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
     let mut state = scribe_emitter_state()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if state.enabled {
-        if state
+    if state.enabled
+        && state
             .handle
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
-        {
-            return;
-        }
+    {
+        return;
     }
     let generation = prepare_scribe_worker(&mut state).expect("live worker handled above");
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -796,9 +794,7 @@ fn take_fresh_latest_status() -> Option<ScribeStatus> {
     let mut latest = latest_scribe_status_store()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let Some((status, observed_at)) = latest.as_ref() else {
-        return None;
-    };
+    let (status, observed_at) = latest.as_ref()?;
     let now = now_ms();
     if observed_at <= &now && now - observed_at <= 3_000 {
         return Some(status.clone());
