@@ -133,30 +133,136 @@ struct DevProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     readers: Vec<JoinHandle<()>>,
+    cleanup_acknowledgements: mpsc::Receiver<CleanupAcknowledgement>,
     _job: Option<crate::engine_supervisor::platform::KillOnCloseJob>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupAcknowledgement {
+    Pending,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    Complete,
+    CleanupPending {
+        acknowledgement: Option<CleanupAcknowledgement>,
+    },
+}
+
+struct CleanupCompletion {
+    terminal_id: String,
+    operation: u64,
+}
+
+struct BackgroundCleanup {
+    process: DevProcess,
+    completion: Option<CleanupCompletion>,
+}
+
+static CLEANUP_REAPER: LazyLock<mpsc::Sender<BackgroundCleanup>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel::<BackgroundCleanup>();
+    std::thread::Builder::new()
+        .name("t-hub-preview-cleanup-owner".to_string())
+        .spawn(move || {
+            while let Ok(cleanup) = receiver.recv() {
+                finish_owned_cleanup(cleanup);
+            }
+        })
+        .expect("spawn persistent Preview cleanup owner");
+    sender
+});
+
+fn finish_owned_cleanup(mut cleanup: BackgroundCleanup) {
+    let _authority = cleanup.process._job.take();
+    loop {
+        match cleanup.process.child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        match cleanup
+            .process
+            .cleanup_acknowledgements
+            .recv_timeout(std::time::Duration::from_millis(100))
+        {
+            Ok(CleanupAcknowledgement::Stopped) => {
+                if let Some(completion) = cleanup.completion.take() {
+                    finish_background_cleanup(
+                        &completion.terminal_id,
+                        completion.operation,
+                        &cleanup.process.run_id,
+                    );
+                }
+            }
+            Ok(CleanupAcknowledgement::Pending) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    cleanup
+        .process
+        .join_finished_readers(std::time::Duration::from_secs(1));
+    if let Some(completion) = cleanup.completion {
+        finish_background_cleanup(
+            &completion.terminal_id,
+            completion.operation,
+            &cleanup.process.run_id,
+        );
+    }
+}
+
 impl DevProcess {
-    /// Close the process-tree lifeline, wait for its bounded TERM/KILL cleanup,
-    /// and then reap the relay. Reader joins are also bounded so a broken child
-    /// cannot wedge Stop by retaining one inherited pipe forever.
-    fn stop(mut self) {
+    /// Close the process-tree lifeline and wait for bounded cleanup.
+    ///
+    /// A relay still alive at the deadline is transferred intact to the
+    /// process-lifetime cleanup owner. Stop never kills or drops the authenticated
+    /// watchdog, its Windows job, or its protocol readers.
+    fn stop(self) {
+        let _ = self.stop_with_timeout(std::time::Duration::from_secs(4), None);
+    }
+
+    fn stop_with_timeout(
+        mut self,
+        timeout: std::time::Duration,
+        completion: Option<CleanupCompletion>,
+    ) -> StopOutcome {
         self.stdin.take();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut acknowledgement = None;
         loop {
+            while let Ok(observed) = self.cleanup_acknowledgements.try_recv() {
+                acknowledgement = Some(observed);
+            }
             match self.child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    self.join_finished_readers(std::time::Duration::from_secs(1));
+                    return StopOutcome::Complete;
+                }
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    break;
-                }
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
-        let reader_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while let Ok(observed) = self.cleanup_acknowledgements.try_recv() {
+            acknowledgement = Some(observed);
+        }
+
+        let cleanup = BackgroundCleanup {
+            process: self,
+            completion,
+        };
+        if let Err(error) = CLEANUP_REAPER.send(cleanup) {
+            finish_owned_cleanup(error.0);
+        }
+        StopOutcome::CleanupPending { acknowledgement }
+    }
+
+    fn join_finished_readers(&mut self, timeout: std::time::Duration) {
+        let reader_deadline = std::time::Instant::now() + timeout;
         for handle in self.readers.drain(..) {
             while !handle.is_finished() && std::time::Instant::now() < reader_deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -357,6 +463,70 @@ fn finish_stop_snapshot(
         .snapshots
         .insert(terminal_id.to_string(), snapshot.clone());
     Ok(snapshot)
+}
+
+fn cleanup_pending_snapshot(
+    registry: &mut DevRegistry,
+    terminal_id: &str,
+    operation: u64,
+    acknowledgement: Option<CleanupAcknowledgement>,
+) -> Result<DevServerSnapshot, String> {
+    if !owns_operation(registry, terminal_id, operation) {
+        return registry
+            .snapshots
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| "the replacement run has no lifecycle snapshot".to_string());
+    }
+    let revision = next_revision(registry);
+    let mut snapshot = registry
+        .snapshots
+        .get(terminal_id)
+        .cloned()
+        .unwrap_or_else(|| idle_snapshot(terminal_id, revision));
+    snapshot.revision = revision;
+    snapshot.state = "cleanupPending".to_string();
+    snapshot.reason = Some(match acknowledgement {
+        Some(CleanupAcknowledgement::Pending) => {
+            "Preview cleanup is still pending in the authenticated watchdog".to_string()
+        }
+        Some(CleanupAcknowledgement::Stopped) => {
+            "Preview cleanup completed; waiting for the relay to exit".to_string()
+        }
+        None => "Preview cleanup acknowledgement is still pending".to_string(),
+    });
+    snapshot.observed_at = observed_at();
+    registry
+        .snapshots
+        .insert(terminal_id.to_string(), snapshot.clone());
+    Ok(snapshot)
+}
+
+fn finish_background_cleanup(terminal_id: &str, operation: u64, run_id: &str) {
+    let mut registry = REGISTRY.lock();
+    finish_background_cleanup_in(&mut registry, terminal_id, operation, run_id);
+}
+
+fn finish_background_cleanup_in(
+    registry: &mut DevRegistry,
+    terminal_id: &str,
+    operation: u64,
+    run_id: &str,
+) -> bool {
+    if !owns_operation(registry, terminal_id, operation)
+        || registry
+            .snapshots
+            .get(terminal_id)
+            .and_then(|snapshot| snapshot.run_id.as_deref())
+            != Some(run_id)
+    {
+        return false;
+    }
+    registry.operations.remove(terminal_id);
+    let revision = next_revision(registry);
+    let snapshot = idle_snapshot(terminal_id, revision);
+    registry.snapshots.insert(terminal_id.to_string(), snapshot);
+    true
 }
 
 fn parse_package_manager(value: &str) -> Option<PackageManager> {
@@ -662,7 +832,21 @@ fn build_command(
 /// Lines are emitted as soon as they complete a newline; partial trailing data at
 /// EOF is flushed too. Reads bytes (not `String`) and lossily decodes so a stray
 /// non-UTF-8 byte can't kill the stream.
-fn pump<R: std::io::Read>(app: &AppHandle, id: &str, run_id: &str, reader: R) {
+fn cleanup_acknowledgement(line: &str, generation: &str) -> Option<CleanupAcknowledgement> {
+    match line.strip_suffix(generation) {
+        Some("T_HUB_PREVIEW_CLEANUP_PENDING ") => Some(CleanupAcknowledgement::Pending),
+        Some("T_HUB_PREVIEW_STOPPED ") => Some(CleanupAcknowledgement::Stopped),
+        _ => None,
+    }
+}
+
+fn pump<R: std::io::Read>(
+    app: &AppHandle,
+    id: &str,
+    run_id: &str,
+    reader: R,
+    cleanup_protocol: Option<(&str, &mpsc::Sender<CleanupAcknowledgement>)>,
+) {
     let ch = channel(id);
     let mut buf = BufReader::new(reader);
     let mut line = Vec::<u8>::new();
@@ -678,6 +862,11 @@ fn pump<R: std::io::Read>(app: &AppHandle, id: &str, run_id: &str, reader: R) {
                     line.pop();
                 }
                 let text = String::from_utf8_lossy(&line).into_owned();
+                if let Some((generation, acknowledgements)) = cleanup_protocol {
+                    if let Some(acknowledgement) = cleanup_acknowledgement(&text, generation) {
+                        let _ = acknowledgements.send(acknowledgement);
+                    }
+                }
                 let revision = {
                     let mut registry = REGISTRY.lock();
                     let is_current = registry
@@ -685,7 +874,7 @@ fn pump<R: std::io::Read>(app: &AppHandle, id: &str, run_id: &str, reader: R) {
                         .get(id)
                         .is_some_and(|process| process.run_id == run_id);
                     if !is_current {
-                        return;
+                        continue;
                     }
                     let revision = next_revision(&mut registry);
                     if let Some(snapshot) = registry.snapshots.get_mut(id) {
@@ -1238,7 +1427,17 @@ pub async fn start_dev_server(
     let gate = operation_gate(&terminal_id);
     let _operation_guard = gate.lock().await;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let operation = reserve_operation(&mut REGISTRY.lock(), &terminal_id);
+    let operation = {
+        let mut registry = REGISTRY.lock();
+        if registry
+            .snapshots
+            .get(&terminal_id)
+            .is_some_and(|snapshot| snapshot.state == "cleanupPending")
+        {
+            return Err("the previous Preview cleanup is still pending".to_string());
+        }
+        reserve_operation(&mut registry, &terminal_id)
+    };
 
     let discovery = match discover_run_targets(cwd.clone()).await {
         Ok(discovery) => discovery,
@@ -1427,6 +1626,7 @@ pub async fn start_dev_server(
             return Err(reason);
         }
     };
+    let generation = supervised.generation;
     let child = supervised.child;
 
     // Take the piped handles BEFORE moving `child` into the registry. Each is
@@ -1435,12 +1635,14 @@ pub async fn start_dev_server(
     let stdout = supervised.stdout;
     let stderr = supervised.stderr;
     let job = crate::engine_supervisor::platform::assign_kill_on_close_job(&child).ok();
+    let (cleanup_acknowledgements, cleanup_acknowledgement_rx) = mpsc::channel();
 
     let mut pending_process = Some(DevProcess {
         run_id: run_id.clone(),
         child,
         stdin,
         readers: Vec::new(),
+        cleanup_acknowledgements: cleanup_acknowledgement_rx,
         _job: job,
     });
     let snapshot = {
@@ -1498,7 +1700,7 @@ pub async fn start_dev_server(
         let run_reader = run_id.clone();
         if let Ok(handle) = std::thread::Builder::new()
             .name(format!("t-hub-devserver-out-{terminal_id}"))
-            .spawn(move || pump(&app_reader, &id_reader, &run_reader, stream))
+            .spawn(move || pump(&app_reader, &id_reader, &run_reader, stream, None))
         {
             readers.push(handle);
         }
@@ -1507,9 +1709,19 @@ pub async fn start_dev_server(
         let app_reader = app.clone();
         let id_reader = terminal_id.clone();
         let run_reader = run_id.clone();
+        let generation_reader = generation.clone();
+        let acknowledgements = cleanup_acknowledgements.clone();
         if let Ok(handle) = std::thread::Builder::new()
             .name(format!("t-hub-devserver-err-{terminal_id}"))
-            .spawn(move || pump(&app_reader, &id_reader, &run_reader, stream))
+            .spawn(move || {
+                pump(
+                    &app_reader,
+                    &id_reader,
+                    &run_reader,
+                    stream,
+                    Some((&generation_reader, &acknowledgements)),
+                )
+            })
         {
             readers.push(handle);
         }
@@ -1609,6 +1821,15 @@ pub async fn stop_dev_server(
                 return Err("the requested run is no longer active".to_string());
             }
         }
+        if registry.processes.get(&terminal_id).is_none() {
+            if let Some(snapshot) = registry
+                .snapshots
+                .get(&terminal_id)
+                .filter(|snapshot| snapshot.state == "cleanupPending")
+            {
+                return Ok(snapshot.clone());
+            }
+        }
         let operation = reserve_operation(&mut registry, &terminal_id);
         if let Some(mut snapshot) = registry.snapshots.get(&terminal_id).cloned() {
             if snapshot.run_id.is_some() {
@@ -1627,7 +1848,24 @@ pub async fn stop_dev_server(
         )
     };
     if let Some(process) = process {
-        process.stop();
+        let outcome = process.stop_with_timeout(
+            std::time::Duration::from_secs(4),
+            Some(CleanupCompletion {
+                terminal_id: terminal_id.clone(),
+                operation,
+            }),
+        );
+        if let StopOutcome::CleanupPending { acknowledgement } = outcome {
+            if let Some(server) = static_server {
+                server.stop();
+            }
+            return cleanup_pending_snapshot(
+                &mut REGISTRY.lock(),
+                &terminal_id,
+                operation,
+                acknowledgement,
+            );
+        }
     }
     if let Some(server) = static_server {
         server.stop();
@@ -2367,6 +2605,41 @@ mod tests {
         assert!(owns_generation(&registry, "tile", "run-new"));
     }
 
+    #[test]
+    fn cleanup_pending_snapshot_stays_owned_until_correlated_completion() {
+        let mut registry = DevRegistry::default();
+        registry.operations.insert("tile".to_string(), 7);
+        let mut stopping = idle_snapshot("tile", 1);
+        stopping.run_id = Some("run-1".to_string());
+        stopping.state = "stopping".to_string();
+        registry.snapshots.insert("tile".to_string(), stopping);
+
+        let pending = cleanup_pending_snapshot(
+            &mut registry,
+            "tile",
+            7,
+            Some(CleanupAcknowledgement::Pending),
+        )
+        .unwrap();
+        assert_eq!(pending.state, "cleanupPending");
+        assert!(owns_operation(&registry, "tile", 7));
+
+        assert!(finish_background_cleanup_in(
+            &mut registry,
+            "tile",
+            7,
+            "run-1"
+        ));
+        assert_eq!(registry.snapshots["tile"].state, "idle");
+        assert!(!owns_operation(&registry, "tile", 7));
+        assert!(!finish_background_cleanup_in(
+            &mut registry,
+            "tile",
+            7,
+            "run-1"
+        ));
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn stale_waiter_and_stop_cannot_own_a_replacement_run() {
@@ -2383,6 +2656,7 @@ mod tests {
                 child,
                 stdin: None,
                 readers: Vec::new(),
+                cleanup_acknowledgements: mpsc::channel().1,
                 _job: None,
             },
         );
@@ -2499,6 +2773,7 @@ mod tests {
             child,
             stdin,
             readers: vec![reader],
+            cleanup_acknowledgements: mpsc::channel().1,
             _job: None,
         }
         .stop();
@@ -2512,15 +2787,137 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn cleanup_pending_transfers_authority_until_correlated_stop_and_exit() {
+        use std::os::fd::AsRawFd;
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let release = fixture.path().join("release");
+        let lock_path = fixture.path().join("authority-lock");
+        let generation = "a".repeat(32);
+        let script = format!(
+            "exec 9>'{lock}'; flock -x 9; \
+             echo 'T_HUB_PREVIEW_CLEANUP_PENDING {generation}' >&2; \
+             while test ! -e '{release}'; do sleep 0.02; done; \
+             echo 'T_HUB_PREVIEW_STOPPED {generation}' >&2",
+            lock = lock_path.display(),
+            release = release.display(),
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stderr = child.stderr.take().unwrap();
+        let (acknowledgements, acknowledgement_rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_reader = Arc::clone(&stopped);
+        let generation_reader = generation.clone();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(acknowledgement) = cleanup_acknowledgement(&line, &generation_reader) {
+                    if acknowledgement == CleanupAcknowledgement::Stopped {
+                        stopped_reader.store(true, Ordering::SeqCst);
+                    }
+                    let _ = acknowledgements.send(acknowledgement);
+                }
+            }
+        });
+        let outcome = DevProcess {
+            run_id: "pending-run".to_string(),
+            child,
+            stdin: None,
+            readers: vec![reader],
+            cleanup_acknowledgements: acknowledgement_rx,
+            _job: None,
+        }
+        .stop_with_timeout(Duration::from_millis(150), None);
+        assert_eq!(
+            outcome,
+            StopOutcome::CleanupPending {
+                acknowledgement: Some(CleanupAcknowledgement::Pending)
+            }
+        );
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_ne!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "cleanup owner dropped process authority at the stop deadline"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (Path::new(&format!("/proc/{pid}")).exists() || !stopped.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "background cleanup owner did not release authority after final exit"
+        );
+    }
+
+    #[test]
+    fn cleanup_acknowledgement_requires_exact_generation_and_shape() {
+        let generation = "a".repeat(32);
+        assert_eq!(
+            cleanup_acknowledgement(
+                &format!("T_HUB_PREVIEW_CLEANUP_PENDING {generation}"),
+                &generation
+            ),
+            Some(CleanupAcknowledgement::Pending)
+        );
+        assert_eq!(
+            cleanup_acknowledgement(&format!("T_HUB_PREVIEW_STOPPED {generation}"), &generation),
+            Some(CleanupAcknowledgement::Stopped)
+        );
+        assert_eq!(
+            cleanup_acknowledgement(
+                &format!("T_HUB_PREVIEW_STOPPED {} extra", generation),
+                &generation
+            ),
+            None
+        );
+        assert_eq!(
+            cleanup_acknowledgement(
+                &format!("T_HUB_PREVIEW_STOPPED {}", "b".repeat(32)),
+                &generation
+            ),
+            None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn natural_parent_exit_reaps_its_surviving_descendant() {
         use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
 
         let fixture = tempfile::tempdir().unwrap();
         let lock_path = fixture.path().join("descendant-lock");
+        let ready_path = fixture.path().join("descendant-ready");
         let script = format!(
-            "(flock -x 9; echo ready; sleep 30) 9>'{}' & exit 0",
-            lock_path.display()
+            "(flock -x 9; echo ready > '{1}'; sleep 30) 9>'{0}' & \
+             while test ! -e '{1}'; do sleep 0.01; done; cat '{1}'; exit 0",
+            lock_path.display(),
+            ready_path.display()
         );
         let supervised = crate::preview::managed_runner::prepare_supervised_preview_command(
             fixture.path(),

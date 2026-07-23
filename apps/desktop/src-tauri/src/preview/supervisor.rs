@@ -39,7 +39,7 @@ pub(crate) struct SupervisedPreviewChild {
     #[allow(dead_code)]
     pub identity: ManagedRunIdentity,
     #[allow(dead_code)]
-    generation: String,
+    pub(crate) generation: String,
 }
 
 struct AuthenticationGuard {
