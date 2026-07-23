@@ -6,11 +6,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNNER="$HERE/run-thub-benchmark.sh"
 COLLECTOR="$HERE/measure-thub.ps1"
 COLLECTOR_TEST="$HERE/measure-thub.test.ps1"
+MATRIX_PREFLIGHT="$HERE/package6-matrix-preflight.sh"
+MATRIX_PREFLIGHT_TEST="$HERE/package6-matrix-preflight.test.sh"
 
 fail() { echo "perf-benchmark.test: FAIL - $*" >&2; exit 1; }
 
 bash -n "$RUNNER"
+bash -n "$MATRIX_PREFLIGHT"
 test -r "$COLLECTOR" || fail "PowerShell collector is missing"
+test -x "$MATRIX_PREFLIGHT" || fail "Package 6 matrix preflight is not executable"
 
 for scenario in 1 4 8 16; do
   output="$("$RUNNER" --terminals "$scenario" --warmup-seconds 0 --sample-seconds 1 --interval-ms 100 --dry-run)"
@@ -182,6 +186,8 @@ elif command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 
 else
   fail "PowerShell is required to execute collector behavior tests"
 fi
+
+"$MATRIX_PREFLIGHT_TEST"
 
 grep -Fq 'Get-CimInstance Win32_Process' "$COLLECTOR" || fail "collector does not enumerate Windows processes"
 grep -Fq 'parent_process_id' "$COLLECTOR" || fail "collector does not retain process ancestry"
