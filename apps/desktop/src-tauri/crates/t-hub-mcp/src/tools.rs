@@ -214,6 +214,116 @@ fn schema_history_resume() -> Value {
     })
 }
 
+fn schema_preview_discover() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rootPath": { "type": "string", "minLength": 1, "description": "Canonical registered Project root to inspect." }
+        },
+        "required": ["rootPath"],
+        "additionalProperties": false
+    })
+}
+
+fn preview_scope_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "workspaceId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["projectId"],
+        "additionalProperties": false
+    })
+}
+
+fn preview_target_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "scope": preview_scope_schema(),
+            "targetId": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "discoveryFingerprint": { "type": "string", "minLength": 1 }
+        },
+        "required": ["scope", "targetId", "discoveryFingerprint"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_status() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "scope": preview_scope_schema() },
+        "required": ["scope"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_select() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rootPath": { "type": "string", "minLength": 1 },
+            "target": preview_target_ref_schema(),
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["rootPath", "target", "requestId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_start() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rootPath": { "type": "string", "minLength": 1 },
+            "scope": preview_scope_schema(),
+            "target": preview_target_ref_schema(),
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["rootPath", "scope", "requestId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_stop() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "scope": preview_scope_schema(),
+            "expectedRunId": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["scope", "requestId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_restart() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "rootPath": { "type": "string", "minLength": 1 },
+            "scope": preview_scope_schema(),
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["rootPath", "scope", "requestId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_preview_effect() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "scope": preview_scope_schema(),
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 160 }
+        },
+        "required": ["scope", "requestId"],
+        "additionalProperties": false
+    })
+}
+
 /// `move_tile` schema.
 fn schema_move_tile() -> Value {
     json!({
@@ -1229,6 +1339,18 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "preview_discover",
+            tier: Tier::Read,
+            summary: "Discover bounded typed Preview targets for one exact Project root.",
+            input_schema: schema_preview_discover,
+        },
+        ToolDef {
+            name: "preview_status",
+            tier: Tier::Read,
+            summary: "Read the authoritative backend Preview lifecycle status for one Project or Workspace scope.",
+            input_schema: schema_preview_status,
+        },
+        ToolDef {
             name: "list_agents",
             tier: Tier::Read,
             summary: "List bounded durable agent-session summaries for one Captain or Project.",
@@ -1300,6 +1422,24 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Focus the unique live terminal for one exact active History identity.",
             input_schema: schema_history_focus,
+        },
+        ToolDef {
+            name: "preview_select",
+            tier: Tier::Organization,
+            summary: "Persist one exact discovered Preview target for a Project or Workspace scope.",
+            input_schema: schema_preview_select,
+        },
+        ToolDef {
+            name: "preview_refresh",
+            tier: Tier::Organization,
+            summary: "Revalidate the backend-owned endpoint for one active Preview run.",
+            input_schema: schema_preview_effect,
+        },
+        ToolDef {
+            name: "preview_open",
+            tier: Tier::Organization,
+            summary: "Open only the backend-verified URL for one active Preview run.",
+            input_schema: schema_preview_effect,
         },
         ToolDef {
             name: "focus_session",
@@ -1440,6 +1580,24 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Resume one exact provider conversation using backend-owned Harness, identity, cwd, and command selection.",
             input_schema: schema_history_resume,
+        },
+        ToolDef {
+            name: "preview_start",
+            tier: Tier::ProcessChanging,
+            summary: "Start one backend-selected typed Preview target with an idempotent request ID.",
+            input_schema: schema_preview_start,
+        },
+        ToolDef {
+            name: "preview_stop",
+            tier: Tier::ProcessChanging,
+            summary: "Stop only the exact backend-owned Preview process identity.",
+            input_schema: schema_preview_stop,
+        },
+        ToolDef {
+            name: "preview_restart",
+            tier: Tier::ProcessChanging,
+            summary: "Restart one exact backend-owned Preview target after revalidating ownership.",
+            input_schema: schema_preview_restart,
         },
         ToolDef {
             name: "start_agent",
@@ -2190,6 +2348,29 @@ mod tests {
                 "{name} must accept startupCommand"
             );
         }
+    }
+
+    #[test]
+    fn preview_catalog_preserves_shared_lifecycle_tiers_and_confirmation() {
+        for name in ["preview_discover", "preview_status"] {
+            let tool = find(name).unwrap().to_mcp();
+            assert_eq!(tool["annotations"]["t-hubTier"], "read");
+            assert_eq!(tool["annotations"]["confirmationRequired"], false);
+        }
+        for name in ["preview_select", "preview_refresh", "preview_open"] {
+            let tool = find(name).unwrap().to_mcp();
+            assert_eq!(tool["annotations"]["t-hubTier"], "organization");
+            assert_eq!(tool["annotations"]["confirmationRequired"], false);
+        }
+        for name in ["preview_start", "preview_stop", "preview_restart"] {
+            let tool = find(name).unwrap().to_mcp();
+            assert_eq!(tool["annotations"]["t-hubTier"], "process-changing");
+            assert_eq!(tool["annotations"]["confirmationRequired"], true);
+        }
+        assert_eq!(
+            (find("preview_start").unwrap().input_schema)()["required"],
+            json!(["rootPath", "scope", "requestId"])
+        );
     }
 
     #[test]

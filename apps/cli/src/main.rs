@@ -16,6 +16,7 @@ mod args;
 mod control;
 mod history;
 mod powder;
+mod preview;
 mod projects;
 mod render;
 mod worktree;
@@ -283,6 +284,7 @@ fn command_label(args: &[String]) -> String {
         Some("powder") => powder::command_label(&args[1..]),
         Some("agents") => agents::command_label(&args[1..]),
         Some("history") => history::command_label(&args[1..]),
+        Some("preview") => preview::command_label(&args[1..]),
         Some("admin") => admin::command_label(&args[1..]),
         Some("projects") => projects::command_label(&args[1..]),
         Some(c) => c.to_string(),
@@ -307,6 +309,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "powder" => powder::run(rest),
         "agents" => agents::run(rest),
         "history" => history::run(rest),
+        "preview" => preview::run(rest),
         "admin" => admin::run(rest),
         "projects" => projects::run(rest),
         other => Err(CliError::usage(format!(
@@ -1021,6 +1024,7 @@ commands:\n\
   history [list]            list provider-neutral conversation History [--json]\n\
   history focus <historyId> focus one exact active conversation\n\
   history resume <historyId> --request-id ID --confirm [--tab TAB] [--json]\n\
+  preview                   discover, select, and control typed project previews\n\
   admin                     manage durable Ship and Fleet Admin grants\n\
   projects list              list registered Projects                  [--json]\n\
   projects register <root>  register a Git or non-Git Project          --name NAME [--json]\n\
