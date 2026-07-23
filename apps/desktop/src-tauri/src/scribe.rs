@@ -653,6 +653,9 @@ pub fn stop_scribe_status_emitter() {
     let mut state = scribe_emitter_state()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+    if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
+        return;
+    }
     state.enabled = false;
     state.generation = state.generation.wrapping_add(1);
     if let Some(cancel) = state.cancel.take() {
@@ -736,6 +739,24 @@ mod tests {
         let encoded = serde_json::to_string(&payload).expect("payload serializes");
         assert!(!encoded.contains("readToken"));
         assert!(!encoded.contains("Authorization"));
+    }
+
+    #[test]
+    fn emitter_stop_is_idempotent_when_not_running() {
+        stop_scribe_status_emitter();
+        let before = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        stop_scribe_status_emitter();
+        let after = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        assert_eq!(
+            before, after,
+            "repeated disable must not advance lifecycle generation"
+        );
     }
 
     /// Fallback-file read as the production path composes it (file only).
