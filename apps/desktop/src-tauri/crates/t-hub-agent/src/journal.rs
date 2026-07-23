@@ -694,8 +694,9 @@ impl Journal {
                     }
                 }
                 Err(_) => {
-                    // Torn tail — stop; everything after is unreliable.
-                    break;
+                    // A complete unknown/future record does not consume an
+                    // event sequence and must not hide later valid entries.
+                    continue;
                 }
             }
         }
@@ -863,8 +864,8 @@ impl Journal {
                     out.write_all(&line.bytes)
                         .context("writing compaction entry")?;
                     out.write_all(b"\n")?;
-                    kept += 1;
                     if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
+                        kept += 1;
                         if let Some(event_id) = entry.event_id.as_deref() {
                             Self::remember_event_id(&mut recent_event_ids, event_id, kept);
                         }
@@ -1689,6 +1690,38 @@ mod tests {
         assert_eq!(remaining.len(), 3);
         assert!(remaining.iter().all(|e| e.source != JournalSource::Status));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_preserves_unknown_bytes_without_consuming_event_sequence() {
+        let dir = temp_dir("compact-garbage-sequence");
+        let journal = Journal::open(&dir).unwrap();
+        journal
+            .append(entry(JournalEventType::SessionStart, "first"))
+            .unwrap();
+        drop(journal);
+
+        let path = dir.join(JOURNAL_FILE);
+        let mut file = Journal::open_private_append(&path).unwrap();
+        file.write_all(b"future-non-json-record\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let journal = Journal::open(&dir).unwrap();
+        let (_, _, kept) = journal.compact_dropping_status().unwrap();
+        assert_eq!(kept, 1, "only parseable events consume sequence numbers");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("future-non-json-record"));
+
+        let appended = journal
+            .append(entry(JournalEventType::SessionEnd, "second"))
+            .unwrap();
+        assert_eq!(appended.seq, 2);
+        let replayed = journal.replay(0).unwrap();
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].seq, appended.seq);
         std::fs::remove_dir_all(&dir).ok();
     }
 
