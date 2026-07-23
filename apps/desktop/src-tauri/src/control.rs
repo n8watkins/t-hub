@@ -10327,6 +10327,7 @@ const PROVIDER_SESSION_ENV: &str = "T_HUB_PROVIDER_SESSION";
 /// The indirection is a failure-injection seam. A failed enumeration is an
 /// unavailable capacity observation, never an observation of zero sessions.
 type LiveSessionsFn = Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>;
+type PreviewControlFn = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnPurpose {
@@ -10625,6 +10626,10 @@ pub struct ControlContext {
     /// Provider-neutral conversation catalog. One cache is shared across every
     /// control connection so History scans never become per-request WSL churn.
     history: Arc<crate::history::HistoryService>,
+    /// Shared provider-neutral Preview operation seam.
+    /// Control dispatch forwards exact command arguments and owns no Preview
+    /// discovery, lifecycle, endpoint, or process-ownership policy.
+    preview_control: PreviewControlFn,
     /// A snapshot accessor over the supervision reducer. Boxed closure so this
     /// module does not need to name the `AgentBridge` internals; the closure
     /// borrows the shared `Mutex<Supervisor>` inside the bridge.
@@ -12154,7 +12159,8 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "history_resume" | "start_agent" | "reconcile_cortana"
+        "spawn_terminal" | "history_resume" | "preview_start" | "preview_stop"
+        | "preview_restart" | "start_agent" | "reconcile_cortana"
         | "commission_captain" | "attach_captain" | "dispatch_crew"
         | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
@@ -12164,7 +12170,8 @@ fn required_tier(command: &str) -> CommandTier {
         | "abort_session" | "plane_admin" => {
             CommandTier::ProcessChanging
         }
-        "focus_session" | "history_focus" | "history_list" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
+        "focus_session" | "history_focus" | "history_list" | "preview_select"
+        | "preview_refresh" | "preview_open" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "initialize_git" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "rename_captain" | "captain_checkpoint" | "agent_checkpoint" | "report_workspace_tabs" | "watch_fleet"
@@ -12194,6 +12201,7 @@ fn required_tier(command: &str) -> CommandTier {
         | "authorize" | "appoint_admin" | "approve_admin_action" | "execute_admin_operation" | "revoke_admin" | "record_agent_delivery" | "agent_followup" => {
             CommandTier::Organization
         }
+        "preview_discover" | "preview_status" => CommandTier::Read,
         // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
         // (least-privilege read token) can send up to its captain; the handler REQUIRES a
         // resolved session identity (or a Full host) and the `can_message` ACL is the real
@@ -14565,6 +14573,7 @@ fn dispatch_with_caller(
         "recent_sessions" => recent_sessions(),
         "invalidate_recent_cache" => invalidate_recent_cache(),
         "history_list" => history_list(ctx, args, caller, trusted_internal),
+        "preview_discover" | "preview_status" => (ctx.preview_control)(command, args),
         "invalidate_history_cache" => invalidate_history_cache(ctx),
         // "Is the general dictating?" - reads the Scribe voice-gate status file
         // (fails open to listening=false when it can't tell). Lets agents defer
@@ -14629,6 +14638,9 @@ fn dispatch_with_caller(
             organization_apply(ctx, "focus_session", args)
         }
         "history_focus" => history_focus(ctx, args, caller, trusted_internal),
+        "preview_select" | "preview_refresh" | "preview_open" => {
+            (ctx.preview_control)(command, args)
+        }
         // Headless-org: the organization mutations below apply to the SERVER tab
         // registry first (authoritative; hard error on an invalid target) and then
         // forward the registry snapshot for the UI to render from.
@@ -14702,6 +14714,9 @@ fn dispatch_with_caller(
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args, caller, trusted_internal),
         "history_resume" => history_resume(ctx, args, caller, trusted_internal),
+        "preview_start" | "preview_stop" | "preview_restart" => {
+            (ctx.preview_control)(command, args)
+        }
         "start_agent" => start_agent(ctx, args, caller, trusted_internal),
         "reconcile_cortana" => reconcile_cortana(ctx, args, trusted_internal),
         "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
@@ -33374,6 +33389,11 @@ impl ControlContext {
         Self {
             status,
             history: crate::history::HistoryService::from_env(),
+            preview_control: Arc::new(|command, _| {
+                Err(format!(
+                    "Preview operation '{command}' is unavailable until a backend runtime is attached"
+                ))
+            }),
             supervisor,
             files: Arc::new(files::FileIndexState::new()),
             apply_sink: None,
@@ -33512,6 +33532,16 @@ impl ControlContext {
     /// keeps the provider-home service created by [`new`](Self::new).
     pub fn with_history_service(mut self, history: Arc<crate::history::HistoryService>) -> Self {
         self.history = history;
+        self
+    }
+
+    /// Attach the single backend Preview service adapter shared by desktop,
+    /// control, CLI, and MCP callers.
+    pub fn with_preview_control(
+        mut self,
+        preview_control: impl Fn(&str, &Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.preview_control = Arc::new(preview_control);
         self
     }
 
@@ -56503,6 +56533,15 @@ int main(int argc, char **argv) {
             required_tier("history_resume"),
             CommandTier::ProcessChanging
         );
+        for command in ["preview_start", "preview_stop", "preview_restart"] {
+            assert_eq!(required_tier(command), CommandTier::ProcessChanging);
+        }
+        for command in ["preview_select", "preview_refresh", "preview_open"] {
+            assert_eq!(required_tier(command), CommandTier::Organization);
+        }
+        for command in ["preview_discover", "preview_status"] {
+            assert_eq!(required_tier(command), CommandTier::Read);
+        }
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
         assert_eq!(
             required_tier("complete_crew_powder"),
@@ -56522,6 +56561,40 @@ int main(int argc, char **argv) {
         // and stays Read.
         assert_eq!(required_tier("inbox_ack"), CommandTier::Organization);
         assert_eq!(required_tier("inbox_status"), CommandTier::Read);
+    }
+
+    #[test]
+    fn preview_commands_forward_unchanged_to_one_backend_adapter() {
+        let calls = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let recorded = calls.clone();
+        let ctx = test_ctx("preview-control").with_preview_control(move |command, args| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((command.to_string(), args.clone()));
+            Ok(json!({"command": command, "args": args}))
+        });
+        let args = json!({
+            "scope": {"projectId": "project-1"},
+            "requestId": "request-1"
+        });
+        for command in [
+            "preview_discover",
+            "preview_status",
+            "preview_select",
+            "preview_refresh",
+            "preview_open",
+            "preview_start",
+            "preview_stop",
+            "preview_restart",
+        ] {
+            let result = dispatch(&ctx, command, &args).unwrap();
+            assert_eq!(result["command"], command);
+            assert_eq!(result["args"], args);
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 8);
+        assert!(calls.iter().all(|(_, forwarded)| forwarded == &args));
     }
 
     #[test]
