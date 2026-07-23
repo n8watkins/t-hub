@@ -21,5 +21,6 @@ name = "t-hub-mcp"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }

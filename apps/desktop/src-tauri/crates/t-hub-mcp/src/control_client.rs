@@ -44,7 +44,9 @@ fn response_timeout_for_command(command: &str) -> Duration {
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const WINDOWS_DISCOVERY_DEADLINE: Duration = Duration::from_secs(1);
 const WINDOWS_DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-const MAX_WINDOWS_PROFILE_CANDIDATES: usize = 64;
+const MAX_WINDOWS_PROFILE_ENTRIES: usize = 64;
+const MAX_HANDSHAKE_BYTES: u64 = 64 * 1024;
+const DISCOVERY_PROOF_COMMAND: &str = "control_discovery_proof";
 
 /// Every control client accepts at most 1 MiB before the NDJSON response newline.
 /// This bounds memory, parsing work, and any structured error derived from a peer.
@@ -117,6 +119,7 @@ enum EndpointIdentity {
     LegacyEnv,
     Handshake {
         path: PathBuf,
+        protocol_version: u32,
         instance_id: Option<String>,
         listener_generation: Option<u64>,
     },
@@ -160,6 +163,7 @@ struct Handshake {
 pub(crate) struct CachedLease {
     token: String,
     expires_at: u64,
+    identity: EndpointIdentity,
 }
 
 /// The inputs used to locate the control channel, captured up front so that
@@ -292,6 +296,9 @@ impl Discovery {
         if lease.expires_at <= epoch_ms().saturating_add(5_000) {
             return None;
         }
+        if lease.identity != endpoint.identity {
+            return None;
+        }
         Some(ControlEndpoint {
             addr: endpoint.addr.clone(),
             token: lease.token,
@@ -299,12 +306,15 @@ impl Discovery {
         })
     }
 
-    fn cache_lease(&self, _endpoint: &ControlEndpoint, token: String, expires_at: u64) {
+    fn cache_lease(&self, endpoint: &ControlEndpoint, token: String, expires_at: u64) {
         *self
             .lease
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(CachedLease { token, expires_at });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedLease {
+            token,
+            expires_at,
+            identity: endpoint.identity.clone(),
+        });
     }
 
     /// Whether an explicit env pin (`$T_HUB_CONTROL_ADDR` + `$T_HUB_CONTROL_TOKEN`)
@@ -335,14 +345,12 @@ impl Discovery {
 }
 
 fn read_handshake_endpoint(path: &std::path::Path) -> Result<ControlEndpoint, String> {
-    let body = std::fs::read_to_string(path).map_err(|e| {
-        format!(
-            "T-Hub control channel not found at {} ({e}). Is the T-Hub app \
-                 running? (set T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN to override.)",
-            path.display()
-        )
-    })?;
-    let hs: Handshake = serde_json::from_str(&body)
+    let body = read_stable_handshake(path)?;
+    parse_handshake_endpoint(path, &body)
+}
+
+fn parse_handshake_endpoint(path: &std::path::Path, body: &str) -> Result<ControlEndpoint, String> {
+    let hs: Handshake = serde_json::from_str(body)
         .map_err(|e| format!("malformed control handshake at {}: {e}", path.display()))?;
     let socket: SocketAddr = hs.addr.parse().map_err(|_| {
         format!(
@@ -401,9 +409,145 @@ fn read_handshake_endpoint(path: &std::path::Path) -> Result<ControlEndpoint, St
         token: hs.token,
         identity: EndpointIdentity::Handshake {
             path: path.to_path_buf(),
+            protocol_version: hs.protocol_version,
             instance_id: (!hs.instance_id.is_empty()).then_some(hs.instance_id),
             listener_generation: (hs.listener_generation != 0).then_some(hs.listener_generation),
         },
+    })
+}
+
+#[cfg(unix)]
+fn open_handshake_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_handshake_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "symbolic link handshake is not allowed",
+        ));
+    }
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn read_stable_handshake(path: &std::path::Path) -> Result<String, String> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "T-Hub control channel not found at {} ({error}). Is the T-Hub app running?",
+            path.display()
+        )
+    })?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(format!(
+            "unsafe control handshake at {}: expected a regular non-symlink file",
+            path.display()
+        ));
+    }
+    if path_metadata.len() > MAX_HANDSHAKE_BYTES {
+        return Err(format!(
+            "invalid control handshake at {}: file exceeds {MAX_HANDSHAKE_BYTES} bytes",
+            path.display()
+        ));
+    }
+
+    let file = open_handshake_no_follow(path).map_err(|error| {
+        format!(
+            "could not safely open control handshake at {} ({error})",
+            path.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        format!(
+            "could not inspect control handshake at {} ({error})",
+            path.display()
+        )
+    })?;
+    if !opened_metadata.is_file() || !same_file_identity(&path_metadata, &opened_metadata) {
+        return Err(format!(
+            "control handshake changed while opening {}",
+            path.display()
+        ));
+    }
+    read_opened_handshake(path, file)
+}
+
+fn read_opened_handshake(
+    path: &std::path::Path,
+    mut file: std::fs::File,
+) -> Result<String, String> {
+    let opened_metadata = file.metadata().map_err(|error| {
+        format!(
+            "could not inspect control handshake at {} ({error})",
+            path.display()
+        )
+    })?;
+    if !opened_metadata.is_file() {
+        return Err(format!(
+            "unsafe control handshake at {}: expected a regular file",
+            path.display()
+        ));
+    }
+    if opened_metadata.len() > MAX_HANDSHAKE_BYTES {
+        return Err(format!(
+            "invalid control handshake at {}: file exceeds {MAX_HANDSHAKE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_HANDSHAKE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "could not read control handshake at {} ({error})",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_HANDSHAKE_BYTES {
+        return Err(format!(
+            "invalid control handshake at {}: file exceeds {MAX_HANDSHAKE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let after_metadata = file.metadata().map_err(|error| {
+        format!(
+            "could not re-inspect control handshake at {} ({error})",
+            path.display()
+        )
+    })?;
+    if !same_file_identity(&opened_metadata, &after_metadata) {
+        return Err(format!(
+            "control handshake changed while reading {}",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "malformed control handshake at {}: not UTF-8",
+            path.display()
+        )
     })
 }
 
@@ -422,47 +566,170 @@ fn kernel_text_indicates_wsl(value: &str) -> bool {
     lower.contains("microsoft") || lower.contains("wsl")
 }
 
+#[cfg(unix)]
+fn open_directory_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn openat_no_follow(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path component contains NUL",
+        )
+    })?;
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: `parent` owns a live directory descriptor, `name` is NUL-terminated,
+    // and a successful descriptor is transferred exactly once into `File`.
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor and no other owner exists.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn read_trusted_profile_handshake(
+    users_root: &std::fs::File,
+    entry: &std::fs::DirEntry,
+    display_path: &std::path::Path,
+) -> Result<ControlEndpoint, String> {
+    let profile = openat_no_follow(users_root, &entry.file_name(), true)
+        .map_err(|_| "Windows profile is not a trusted directory".to_string())?;
+    let control_dir = openat_no_follow(&profile, std::ffi::OsStr::new(".t-hub"), true)
+        .map_err(|_| "Windows profile has no trusted Production control directory".to_string())?;
+    let handshake = openat_no_follow(&control_dir, std::ffi::OsStr::new("control.json"), false)
+        .map_err(|_| "Windows profile has no trusted Production handshake".to_string())?;
+    let body = read_opened_handshake(display_path, handshake)?;
+    parse_handshake_endpoint(display_path, &body)
+}
+
+#[cfg(not(unix))]
+fn read_trusted_profile_handshake(
+    _users_root: &std::fs::File,
+    entry: &std::fs::DirEntry,
+    display_path: &std::path::Path,
+) -> Result<ControlEndpoint, String> {
+    let profile_metadata = std::fs::symlink_metadata(entry.path())
+        .map_err(|_| "Windows profile cannot be inspected".to_string())?;
+    if profile_metadata.file_type().is_symlink() || !profile_metadata.is_dir() {
+        return Err("Windows profile is not a trusted directory".into());
+    }
+    let control_dir = entry.path().join(".t-hub");
+    let control_metadata = std::fs::symlink_metadata(&control_dir)
+        .map_err(|_| "Windows profile has no Production control directory".to_string())?;
+    if control_metadata.file_type().is_symlink() || !control_metadata.is_dir() {
+        return Err("Windows Production control directory is not trusted".into());
+    }
+    read_handshake_endpoint(display_path)
+}
+
+/// Legacy WSL recovery trusts only immediate, non-symlink profile directories
+/// below the fixed Windows Users mount and non-symlink `.t-hub` directories.
+/// The nonce proof rejects stale or unrelated listeners without disclosing the
+/// durable session secret. It does not defend against a malicious process already
+/// running as the same local Windows user, which can read that user's ambient
+/// handshake credential; the control channel's local-user boundary treats that
+/// principal as trusted. Any filesystem or proof uncertainty fails closed.
 fn resolve_unique_live_windows_production(
     users_root: &std::path::Path,
 ) -> Result<ControlEndpoint, String> {
+    let root_metadata = std::fs::symlink_metadata(users_root).map_err(|error| {
+        format!(
+            "T-Hub Windows Production discovery unavailable under {} ({error})",
+            users_root.display()
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!(
+            "T-Hub Windows Production discovery root is not a trusted directory: {}",
+            users_root.display()
+        ));
+    }
+    #[cfg(unix)]
+    let users_root_descriptor = open_directory_no_follow(users_root).map_err(|error| {
+        format!(
+            "T-Hub Windows Production discovery could not safely open {} ({error})",
+            users_root.display()
+        )
+    })?;
+    #[cfg(not(unix))]
+    let users_root_descriptor = std::fs::File::open(users_root).map_err(|error| {
+        format!(
+            "T-Hub Windows Production discovery could not open {} ({error})",
+            users_root.display()
+        )
+    })?;
+    let opened_root_metadata = users_root_descriptor.metadata().map_err(|error| {
+        format!(
+            "T-Hub Windows Production discovery could not inspect {} ({error})",
+            users_root.display()
+        )
+    })?;
+    if !opened_root_metadata.is_dir() || !same_file_identity(&root_metadata, &opened_root_metadata)
+    {
+        return Err(format!(
+            "T-Hub Windows Production discovery root changed while opening {}",
+            users_root.display()
+        ));
+    }
     let entries = std::fs::read_dir(users_root).map_err(|error| {
         format!(
             "T-Hub Windows Production discovery unavailable under {} ({error})",
             users_root.display()
         )
     })?;
-    let mut candidates = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join(".t-hub").join("control.json"))
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    if candidates.len() > MAX_WINDOWS_PROFILE_CANDIDATES {
-        return Err(format!(
-            "T-Hub Windows Production discovery found too many candidate handshakes under {}",
-            users_root.display()
-        ));
+    let mut candidates = Vec::new();
+    let mut entry_count = 0_usize;
+    for entry_result in entries {
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_WINDOWS_PROFILE_ENTRIES {
+            return Err(format!(
+                "T-Hub Windows Production discovery found too many profile entries under {}",
+                users_root.display()
+            ));
+        }
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+        candidates.push((entry.path().join(".t-hub/control.json"), entry));
     }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
 
     let deadline = Instant::now() + WINDOWS_DISCOVERY_DEADLINE;
     let mut live = Vec::new();
-    for path in candidates {
+    for (path, entry) in candidates {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Err(
                 "T-Hub Windows Production discovery did not complete bounded liveness validation"
                     .to_string(),
             );
         };
-        let Ok(endpoint) = read_handshake_endpoint(&path) else {
+        let Ok(endpoint) = read_trusted_profile_handshake(&users_root_descriptor, &entry, &path)
+        else {
             continue;
         };
-        let Ok(socket) = endpoint.addr.parse::<SocketAddr>() else {
-            continue;
-        };
-        if TcpStream::connect_timeout(&socket, remaining.min(WINDOWS_DISCOVERY_CONNECT_TIMEOUT))
-            .is_ok()
-        {
-            live.push(endpoint);
+        if let Ok(proven) = prove_windows_production_listener(
+            endpoint,
+            remaining.min(WINDOWS_DISCOVERY_CONNECT_TIMEOUT),
+        ) {
+            live.push(proven);
         }
     }
     match live.len() {
@@ -475,6 +742,82 @@ fn resolve_unique_live_windows_production(
             "T-Hub Windows Production discovery is ambiguous: found {count} live validated control handshakes"
         )),
     }
+}
+
+fn prove_windows_production_listener(
+    mut endpoint: ControlEndpoint,
+    timeout: Duration,
+) -> Result<ControlEndpoint, String> {
+    if timeout.is_zero() {
+        return Err("control discovery proof deadline expired".into());
+    }
+    let nonce = new_request_id();
+    // An explicit empty Discovery prevents `call_classified` from inheriting
+    // T_HUB_SESSION_TOKEN. Candidate proof uses only the ambient read credential
+    // from the candidate handshake.
+    let unauthenticated_identity = Discovery::default();
+    let proof = call_classified(
+        &endpoint,
+        DISCOVERY_PROOF_COMMAND,
+        &serde_json::json!({ "nonce": nonce }),
+        CallBudget {
+            deadline: Instant::now() + timeout,
+            attempt_timeout: timeout,
+        },
+        Some(&unauthenticated_identity),
+    )
+    .map_err(|_| "candidate did not provide a valid T-Hub discovery proof".to_string())?;
+    if proof.get("nonce").and_then(Value::as_str) != Some(nonce.as_str()) {
+        return Err("candidate discovery proof nonce mismatch".into());
+    }
+    let instance_id = proof
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_whitespace)
+        })
+        .ok_or("candidate discovery proof omitted a valid listener instance")?;
+    let listener_generation = proof
+        .get("listenerGeneration")
+        .and_then(Value::as_u64)
+        .filter(|value| *value != 0)
+        .ok_or("candidate discovery proof omitted a valid listener generation")?;
+    let protocol_version = proof
+        .get("protocolVersion")
+        .and_then(Value::as_u64)
+        .filter(|value| *value != 0 && *value <= 2)
+        .ok_or("candidate discovery proof omitted a supported protocol version")?
+        as u32;
+    if proof.get("listenerAddr").and_then(Value::as_str) != Some(endpoint.addr.as_str()) {
+        return Err("candidate discovery proof listener address mismatch".into());
+    }
+
+    let EndpointIdentity::Handshake {
+        path,
+        protocol_version: expected_protocol,
+        instance_id: expected_instance,
+        listener_generation: expected_generation,
+    } = &endpoint.identity
+    else {
+        return Err("candidate discovery proof requires a handshake endpoint".into());
+    };
+    if *expected_protocol != 0 && *expected_protocol != protocol_version {
+        return Err("candidate discovery proof protocol mismatch".into());
+    }
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != instance_id)
+        || expected_generation.is_some_and(|expected| expected != listener_generation)
+    {
+        return Err("candidate discovery proof listener identity mismatch".into());
+    }
+    endpoint.identity = EndpointIdentity::Handshake {
+        path: path.clone(),
+        protocol_version,
+        instance_id: Some(instance_id.to_string()),
+        listener_generation: Some(listener_generation),
+    };
+    Ok(endpoint)
 }
 
 fn endpoint_replaced(previous: &ControlEndpoint, current: &ControlEndpoint) -> bool {
@@ -1402,9 +1745,7 @@ fn call_classified(
     // a session that never minted one (a legacy/host context) - the server then treats
     // the caller as the trusted control-token host and the cross-ship ACL fails open.
     let session = discovery
-        .map(Discovery::session_token)
-        .filter(|token| !token.is_empty())
-        .map(str::to_string)
+        .map(|source| source.session_token().to_string())
         .unwrap_or_else(|| std::env::var("T_HUB_SESSION_TOKEN").unwrap_or_default());
     let request = serde_json::json!({
         "token": endpoint.token,
@@ -1775,6 +2116,66 @@ mod tests {
         (addr, captured)
     }
 
+    fn discovery_proof_server(
+        instance_id: &'static str,
+        listener_generation: u64,
+        replies: Vec<Option<&'static str>>,
+        max_connections: usize,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let proof_addr = addr.clone();
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            for _ in 0..max_connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(line.trim_end()) else {
+                    continue;
+                };
+                cap.lock().unwrap().push(request.clone());
+                if request["command"] == DISCOVERY_PROOF_COMMAND {
+                    assert!(request["token"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()));
+                    assert_eq!(
+                        request["session"], "",
+                        "discovery proof must not send the durable session secret"
+                    );
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "nonce": request["args"]["nonce"],
+                            "protocolVersion": 2,
+                            "instanceId": instance_id,
+                            "listenerGeneration": listener_generation,
+                            "listenerAddr": proof_addr,
+                        }
+                    });
+                    let _ = writer.write_all(serde_json::to_string(&response).unwrap().as_bytes());
+                    let _ = writer.write_all(b"\n");
+                    let _ = writer.flush();
+                    continue;
+                }
+                if let Some(Some(body)) = replies.next() {
+                    let _ = writer.write_all(body.as_bytes());
+                    let _ = writer.write_all(b"\n");
+                    let _ = writer.flush();
+                }
+            }
+        });
+        (addr, captured)
+    }
+
     fn write_test_handshake(
         path: &std::path::Path,
         addr: &str,
@@ -1970,7 +2371,7 @@ mod tests {
         let mut child = Command::new(mcp_binary())
             .env("T_HUB_CONTROL_ADDR", addr)
             .env("T_HUB_CONTROL_TOKEN", token)
-            .env("T_HUB_CONTROL_FILE", "/nonexistent/th-control.json")
+            .env_remove("T_HUB_CONTROL_FILE")
             .env_remove("T_HUB_SESSION_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3372,14 +3773,17 @@ mod tests {
         )
         .unwrap();
 
-        // Discovery and lease renewal each perform a bounded liveness probe.
+        // Discovery and lease renewal each perform a nonce-bound listener proof.
         // The remaining two connections model the scoped lease and command.
-        let (live_addr, captured) = scripted_server(vec![
-            None,
-            None,
-            Some(r#"{"ok":true,"result":{"lease":"scoped-lease","expiresAt":9999999999999}}"#),
-            Some(r#"{"ok":true,"result":{"capability":"control"}}"#),
-        ]);
+        let (live_addr, captured) = discovery_proof_server(
+            "production-instance",
+            1,
+            vec![
+                Some(r#"{"ok":true,"result":{"lease":"scoped-lease","expiresAt":9999999999999}}"#),
+                Some(r#"{"ok":true,"result":{"capability":"control"}}"#),
+            ],
+            4,
+        );
         std::fs::write(
             &production,
             format!(
@@ -3400,9 +3804,11 @@ mod tests {
 
         assert_eq!(value["capability"], "control");
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["command"], "renew_captain_control_lease");
-        assert_eq!(requests[1]["command"], "my_capability");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["command"], DISCOVERY_PROOF_COMMAND);
+        assert_eq!(requests[1]["command"], DISCOVERY_PROOF_COMMAND);
+        assert_eq!(requests[2]["command"], "renew_captain_control_lease");
+        assert_eq!(requests[3]["command"], "my_capability");
         assert!(requests
             .iter()
             .all(|request| request["token"] != "durable-captain-session"));
@@ -3442,7 +3848,8 @@ mod tests {
             EndpointIdentity::Handshake {
                 path,
                 instance_id: None,
-                listener_generation: None
+                listener_generation: None,
+                ..
             } if path == file
         ));
         let _ = std::fs::remove_dir_all(dir);
@@ -3459,9 +3866,8 @@ mod tests {
         let users = dir.join("users");
         let production = users.join("natha/.t-hub/control.json");
         let dev = users.join("natha/.t-hub-dev/control.json");
-        let production_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (production_addr, _captured) = discovery_proof_server("production", 1, vec![], 1);
         let dev_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let production_addr = production_listener.local_addr().unwrap().to_string();
         let dev_addr = dev_listener.local_addr().unwrap().to_string();
         write_test_handshake(&production, &production_addr, Some("production"), 1);
         write_test_handshake(&dev, &dev_addr, Some("development"), 1);
@@ -3523,8 +3929,7 @@ mod tests {
         let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_addr = dead_listener.local_addr().unwrap().to_string();
         drop(dead_listener);
-        let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let live_addr = live_listener.local_addr().unwrap().to_string();
+        let (live_addr, _captured) = discovery_proof_server("live-instance", 1, vec![], 1);
         write_test_handshake(&stale, &dead_addr, Some("stale-instance"), 1);
         write_test_handshake(&live, &live_addr, Some("live-instance"), 1);
         let discovery = Discovery {
@@ -3547,17 +3952,17 @@ mod tests {
             epoch_ms()
         ));
         let users = dir.join("users");
-        let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (first_addr, _first) = discovery_proof_server("first-instance", 1, vec![], 1);
+        let (second_addr, _second) = discovery_proof_server("second-instance", 1, vec![], 1);
         write_test_handshake(
             &users.join("first/.t-hub/control.json"),
-            &first_listener.local_addr().unwrap().to_string(),
+            &first_addr,
             Some("first-instance"),
             1,
         );
         write_test_handshake(
             &users.join("second/.t-hub/control.json"),
-            &second_listener.local_addr().unwrap().to_string(),
+            &second_addr,
             Some("second-instance"),
             1,
         );
@@ -3571,6 +3976,198 @@ mod tests {
         assert!(error.contains("ambiguous"));
         assert!(error.contains("2 live validated"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsl_discovery_rejects_a_non_t_hub_listener_on_a_reused_port() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-fake-listener-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let users = dir.join("users");
+        let file = users.join("natha/.t-hub/control.json");
+        let (addr, captured) = scripted_server(vec![Some(
+            r#"{"ok":true,"result":{"service":"not-t-hub"}}"#,
+        )]);
+        write_test_handshake(&file, &addr, Some("expected-instance"), 1);
+        let discovery = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(users),
+            session: Some("must-not-cross-proof".into()),
+            ..Default::default()
+        };
+
+        let error = discovery.resolve_from_file().unwrap_err();
+        assert!(error.contains("no live validated"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["command"], DISCOVERY_PROOF_COMMAND);
+        assert_eq!(requests[0]["session"], "");
+        assert_ne!(requests[0]["session"], "must-not-cross-proof");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsl_discovery_rejects_replayed_nonce_and_cross_instance_proofs() {
+        let replay_dir = std::env::temp_dir().join(format!(
+            "th-mcp-replayed-proof-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let replay_users = replay_dir.join("users");
+        let replay_file = replay_users.join("natha/.t-hub/control.json");
+        let (replay_addr, _captured) = scripted_server(vec![Some(
+            r#"{"ok":true,"result":{"nonce":"old-nonce","protocolVersion":2,"instanceId":"expected-instance","listenerGeneration":1}}"#,
+        )]);
+        write_test_handshake(&replay_file, &replay_addr, Some("expected-instance"), 1);
+        let replay = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(replay_users),
+            ..Default::default()
+        };
+        assert!(replay
+            .resolve_from_file()
+            .unwrap_err()
+            .contains("no live validated"));
+
+        let cross_dir = std::env::temp_dir().join(format!(
+            "th-mcp-cross-instance-proof-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let cross_users = cross_dir.join("users");
+        let cross_file = cross_users.join("natha/.t-hub/control.json");
+        let (cross_addr, _captured) = discovery_proof_server("different-instance", 1, vec![], 1);
+        write_test_handshake(&cross_file, &cross_addr, Some("expected-instance"), 1);
+        let cross = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(cross_users),
+            ..Default::default()
+        };
+        assert!(cross
+            .resolve_from_file()
+            .unwrap_err()
+            .contains("no live validated"));
+        let _ = std::fs::remove_dir_all(replay_dir);
+        let _ = std::fs::remove_dir_all(cross_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsl_discovery_adopts_proven_identity_for_a_legacy_handshake_shape() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-legacy-proof-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let users = dir.join("users");
+        let file = users.join("natha/.t-hub/control.json");
+        let (addr, _captured) = discovery_proof_server("proven-instance", 9, vec![], 1);
+        write_test_handshake(&file, &addr, None, 0);
+        let discovery = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(users),
+            ..Default::default()
+        };
+
+        let endpoint = discovery.resolve_from_file().unwrap();
+        assert!(matches!(
+            endpoint.identity,
+            EndpointIdentity::Handshake {
+                protocol_version: 2,
+                instance_id: Some(ref instance),
+                listener_generation: Some(9),
+                ..
+            } if instance == "proven-instance"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_reader_rejects_symlink_nonregular_and_oversize_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-handshake-file-safety-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular.json");
+        write_test_handshake(&regular, "127.0.0.1:41998", None, 0);
+        let linked = dir.join("linked.json");
+        symlink(&regular, &linked).unwrap();
+        assert!(read_handshake_endpoint(&linked)
+            .unwrap_err()
+            .contains("regular non-symlink"));
+
+        let directory = dir.join("directory.json");
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(read_handshake_endpoint(&directory)
+            .unwrap_err()
+            .contains("regular non-symlink"));
+
+        let oversized = dir.join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_HANDSHAKE_BYTES as usize + 1]).unwrap();
+        assert!(read_handshake_endpoint(&oversized)
+            .unwrap_err()
+            .contains("exceeds"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_discovery_rejects_untrusted_profile_links_and_entry_floods() {
+        use std::os::unix::fs::symlink;
+
+        let link_dir = std::env::temp_dir().join(format!(
+            "th-mcp-profile-link-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let link_users = link_dir.join("users");
+        let outside = link_dir.join("outside");
+        std::fs::create_dir_all(outside.join(".t-hub")).unwrap();
+        std::fs::create_dir_all(&link_users).unwrap();
+        symlink(&outside, link_users.join("linked-profile")).unwrap();
+        let real_profile = link_users.join("real-profile");
+        std::fs::create_dir_all(&real_profile).unwrap();
+        symlink(outside.join(".t-hub"), real_profile.join(".t-hub")).unwrap();
+        let linked = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(link_users),
+            ..Default::default()
+        };
+        assert!(linked
+            .resolve_from_file()
+            .unwrap_err()
+            .contains("no live validated"));
+
+        let flood_dir = std::env::temp_dir().join(format!(
+            "th-mcp-profile-flood-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let flood_users = flood_dir.join("users");
+        std::fs::create_dir_all(&flood_users).unwrap();
+        for index in 0..=MAX_WINDOWS_PROFILE_ENTRIES {
+            std::fs::write(flood_users.join(format!("entry-{index}")), b"x").unwrap();
+        }
+        let flooded = Discovery {
+            structural_wsl: true,
+            windows_users_root: Some(flood_users),
+            ..Default::default()
+        };
+        assert!(flooded
+            .resolve_from_file()
+            .unwrap_err()
+            .contains("too many profile entries"));
+        let _ = std::fs::remove_dir_all(link_dir);
+        let _ = std::fs::remove_dir_all(flood_dir);
     }
 
     #[test]
@@ -3596,6 +4193,7 @@ mod tests {
     fn endpoint_replacement_ignores_credential_rotation_only() {
         let identity = EndpointIdentity::Handshake {
             path: PathBuf::from("/tmp/control.json"),
+            protocol_version: 2,
             instance_id: Some("instance".into()),
             listener_generation: Some(3),
         };
@@ -3649,12 +4247,42 @@ mod tests {
     }
 
     #[test]
+    fn cached_lease_is_not_reused_across_endpoint_identity_changes() {
+        let discovery = Discovery::default();
+        let first = ControlEndpoint {
+            addr: "127.0.0.1:41999".into(),
+            token: "ambient-one".into(),
+            identity: EndpointIdentity::Handshake {
+                path: PathBuf::from("/tmp/control.json"),
+                protocol_version: 2,
+                instance_id: Some("instance-one".into()),
+                listener_generation: Some(1),
+            },
+        };
+        discovery.cache_lease(&first, "scoped-first".into(), 9_999_999_999_999);
+        assert_eq!(
+            discovery.cached_lease_endpoint(&first).unwrap().token,
+            "scoped-first"
+        );
+
+        let mut replacement = first.clone();
+        replacement.identity = EndpointIdentity::Handshake {
+            path: PathBuf::from("/tmp/control.json"),
+            protocol_version: 2,
+            instance_id: Some("instance-two".into()),
+            listener_generation: Some(1),
+        };
+        assert!(discovery.cached_lease_endpoint(&replacement).is_none());
+    }
+
+    #[test]
     fn endpoint_replacement_tracks_path_listener_instance_and_generation() {
         let previous = ControlEndpoint {
             addr: "127.0.0.1:41995".into(),
             token: "test-ambient".into(),
             identity: EndpointIdentity::Handshake {
                 path: PathBuf::from("/tmp/one/control.json"),
+                protocol_version: 2,
                 instance_id: Some("instance-one".into()),
                 listener_generation: Some(1),
             },
@@ -3666,6 +4294,7 @@ mod tests {
         changed = previous.clone();
         changed.identity = EndpointIdentity::Handshake {
             path: PathBuf::from("/tmp/two/control.json"),
+            protocol_version: 2,
             instance_id: Some("instance-one".into()),
             listener_generation: Some(1),
         };
@@ -3674,6 +4303,7 @@ mod tests {
         changed = previous.clone();
         changed.identity = EndpointIdentity::Handshake {
             path: PathBuf::from("/tmp/one/control.json"),
+            protocol_version: 2,
             instance_id: Some("instance-two".into()),
             listener_generation: Some(1),
         };
@@ -3682,6 +4312,7 @@ mod tests {
         changed = previous.clone();
         changed.identity = EndpointIdentity::Handshake {
             path: PathBuf::from("/tmp/one/control.json"),
+            protocol_version: 2,
             instance_id: Some("instance-one".into()),
             listener_generation: Some(2),
         };
@@ -3819,7 +4450,7 @@ mod tests {
     }
 
     #[test]
-    fn port_only_rebind_reuses_identity_lease_at_fresh_address() {
+    fn port_only_rebind_rejects_a_cached_lease_from_another_endpoint_identity() {
         let dir = std::env::temp_dir().join(format!(
             "th-mcp-lease-rebind-{}-{}",
             std::process::id(),
@@ -3861,7 +4492,10 @@ mod tests {
             1,
             "port-only rebind must not mint a new lease"
         );
-        assert_eq!(requests[0]["token"], "SCOPED-port-lease");
+        assert_eq!(
+            requests[0]["token"], "OLD-global",
+            "a lease cached against the legacy endpoint must not cross to the file endpoint"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

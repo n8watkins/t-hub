@@ -4234,6 +4234,7 @@ dependencies = [
 name = "t-hub-mcp"
 version = "0.5.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]
