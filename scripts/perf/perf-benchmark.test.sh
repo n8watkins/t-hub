@@ -21,10 +21,14 @@ for scenario in 1 4 8 16; do
 done
 pid_output="$("$RUNNER" --pid 1234 --dry-run)"
 grep -Fq -- "-RootProcessId 1234" <<<"$pid_output" || fail "explicit PID was not forwarded"
-evidence_output="$("$RUNNER" --scenario-kind voice_synthesis --evidence artifacts/perf/evidence.json --reference-sha256 abc --dry-run)"
+reference_hash="$(printf 'a%.0s' {1..64})"
+evidence_output="$("$RUNNER" --scenario-kind voice_synthesis --evidence artifacts/perf/evidence.json --reference-sha256 "$reference_hash" --reference-reason 'predeclared baseline' --dry-run)"
 grep -Fq -- "-ScenarioKind voice_synthesis" <<<"$evidence_output" || fail "scenario kind override was not forwarded"
 grep -Fq -- "-RuntimeEvidencePath" <<<"$evidence_output" || fail "runtime evidence was not forwarded"
-grep -Fq -- "-ReferenceBinarySha256 abc" <<<"$evidence_output" || fail "reference hash was not forwarded"
+grep -Fq -- "-ReferenceBinarySha256 $reference_hash" <<<"$evidence_output" || fail "reference hash was not forwarded"
+if "$RUNNER" --reference-sha256 abc --reference-reason bad --dry-run >/dev/null 2>&1; then
+  fail "invalid reference SHA-256 was accepted"
+fi
 
 if "$RUNNER" --terminals 2 --dry-run >/dev/null 2>&1; then
   fail "invalid terminal scenario was accepted"
@@ -44,6 +48,9 @@ fi
 if "$RUNNER" --scenario-kind unsupported --dry-run >/dev/null 2>&1; then
   fail "unsupported scenario kind was accepted"
 fi
+if "$RUNNER" --source-commit bad --dry-run >/dev/null 2>&1; then
+  fail "invalid source commit was accepted"
+fi
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -File "$COLLECTOR_TEST"
@@ -61,6 +68,10 @@ grep -Fq 'working_set_bytes' "$COLLECTOR" || fail "collector does not expose wor
 grep -Fq 'private_bytes' "$COLLECTOR" || fail "collector does not expose private bytes"
 grep -Fq 'thread_count' "$COLLECTOR" || fail "collector does not expose thread counts"
 grep -Fq 'schema_version = 3' "$COLLECTOR" || fail "collector schema is not versioned"
+grep -Fq 'schemaVersion = 3' "$COLLECTOR" || fail "camelCase schemaVersion is missing"
+for required_field in candidate reference host scenario resources operations preview voice journal diagnostics validity budgets decision rawEvidence; do
+  grep -Fq "$required_field" "$COLLECTOR" || fail "schema field $required_field is missing"
+done
 grep -Fq 'wsl_descendants' "$COLLECTOR" || fail "collector does not expose WSL descendant metrics"
 grep -Fq 'Read-SafeRuntimeEvidence' "$COLLECTOR" || fail "collector does not sanitize runtime evidence"
 grep -Fq 'preview' "$COLLECTOR" || fail "collector does not retain preview evidence section"

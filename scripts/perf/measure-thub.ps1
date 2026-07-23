@@ -28,6 +28,14 @@ param(
     [string]$SetupNote = "",
     [string]$CollectorRepositoryCommit = "unknown",
     [string]$ReferenceBinarySha256 = "",
+    [string]$ReferenceSelectionReason = "",
+    [string]$SourceCommit = "",
+    [string]$InstallerSha256 = "",
+    [int]$ProtocolVersion = 2,
+    [ValidateRange(0, 16)]
+    [int]$ObservedTerminalCount = 0,
+    [string]$PowerMode = "",
+    [int]$DisplayScale = 0,
     [string]$RuntimeEvidencePath = "",
     [switch]$FunctionsOnly
 )
@@ -171,6 +179,11 @@ function Get-ProcessCategory {
     return "other_descendant"
 }
 
+function Assert-Sha256([string]$Value, [string]$Label) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch '^[0-9a-fA-F]{64}$') { throw "$Label must be a 64-hex SHA-256" }
+    return $Value.ToLowerInvariant()
+}
+
 function Get-TreeTotals {
     param([object[]]$Processes, [object[]]$PreviousProcesses, [double]$ElapsedSeconds, [object[]]$Roots)
 
@@ -199,7 +212,7 @@ function Get-TreeTotals {
             cpu_interval_complete = $true
         }
     }
-    $wslNames = @("wsl.exe", "wslhost.exe", "conhost.exe", "OpenConsole.exe")
+    $wslNames = @("wsl.exe", "wslhost.exe")
     $wslTotals = [ordered]@{
         process_count = 0
         thread_count = 0
@@ -434,6 +447,7 @@ function Convert-SafeEvidenceNode {
 function Read-SafeRuntimeEvidence {
     if ([string]::IsNullOrWhiteSpace($RuntimeEvidencePath)) { return [ordered]@{} }
     if (-not (Test-Path -LiteralPath $RuntimeEvidencePath -PathType Leaf)) { throw "runtime evidence file is missing" }
+    if ((Get-Item -LiteralPath $RuntimeEvidencePath).Length -gt 1048576) { throw "runtime evidence file exceeds the 1 MiB bound" }
     $root = Get-Content -LiteralPath $RuntimeEvidencePath -Raw | ConvertFrom-Json
     $allowed = @("operations", "preview", "voice", "journal", "recovery", "diagnostics", "metrics")
     $result = [ordered]@{}
@@ -481,6 +495,11 @@ if ($firstRoot.executable_path.Length -gt 0 -and (Test-Path -LiteralPath $firstR
         sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $firstRoot.executable_path).Hash.ToLowerInvariant()
     }
 }
+$installedBinarySha256 = if ($binary) { Assert-Sha256 $binary.sha256 "installed binary hash" } else { $null }
+if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256 = Assert-Sha256 $ReferenceBinarySha256 "reference binary hash" }
+if ($InstallerSha256.Length -gt 0) { $InstallerSha256 = Assert-Sha256 $InstallerSha256 "installer hash" }
+if ($SourceCommit.Length -eq 0) { $SourceCommit = $CollectorRepositoryCommit }
+if ($SourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "source commit must be a full 40-hex Git commit" }
 
 $os = Get-CimInstance Win32_OperatingSystem
 $startedAt = (Get-Date).ToUniversalTime()
@@ -528,6 +547,23 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $SampleSeconds) {
 
 $finishedAt = (Get-Date).ToUniversalTime()
 $runtimeEvidence = Read-SafeRuntimeEvidence
+$runtimeEvidenceHash = if ($RuntimeEvidencePath.Length -gt 0) { (Get-FileHash -LiteralPath $RuntimeEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+$validityReasons = @()
+if ($ObservedTerminalCount -eq 0) { $validityReasons += "observed_terminal_count_missing" }
+elseif ($ObservedTerminalCount -ne $DeclaredScenarioTerminals) { $validityReasons += "observed_terminal_count_mismatch" }
+if ($samples.Count -eq 0) { $validityReasons += "no_samples" }
+if (@($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count -gt 0) { $validityReasons += "incomplete_cpu_interval" }
+if ($ReferenceBinarySha256.Length -gt 0 -and $ReferenceSelectionReason.Length -eq 0) { $validityReasons += "reference_selection_reason_missing" }
+$eligible = $validityReasons.Count -eq 0
+$decision = if ($eligible) { "pass" } else { "ineligible" }
+$evidenceSection = {
+    param([string]$Name)
+    if ($runtimeEvidence.Contains($Name)) { return $runtimeEvidence[$Name] }
+    return [ordered]@{}
+}
+$rawEvidence = @()
+if ($runtimeEvidenceHash) { $rawEvidence += [ordered]@{ kind = "redacted_runtime_metrics"; sha256 = $runtimeEvidenceHash } }
+$summary = Get-ArtifactSummary $samples
 $rootMetadata = @($initialTree.roots | ForEach-Object {
     [ordered]@{
         process_id = $_.process_id
@@ -537,6 +573,7 @@ $rootMetadata = @($initialTree.roots | ForEach-Object {
     }
 })
 $artifact = [ordered]@{
+    schemaVersion = 3
     schema_version = 3
     benchmark = "t-hub-packaged-runtime"
     metadata = [ordered]@{
@@ -552,6 +589,47 @@ $artifact = [ordered]@{
         installed_binary = $binary
         reference_binary_sha256 = if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256.ToLowerInvariant() } else { $null }
     }
+    candidate = [ordered]@{
+        sourceCommit = $SourceCommit
+        installedBinarySha256 = $installedBinarySha256
+        installerSha256 = if ($InstallerSha256.Length -gt 0) { $InstallerSha256 } else { $null }
+        protocolVersion = $ProtocolVersion
+    }
+    reference = [ordered]@{
+        installedBinarySha256 = if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256 } else { $null }
+        selectionReason = if ($ReferenceSelectionReason.Length -gt 0) { $ReferenceSelectionReason } else { $null }
+    }
+    host = [ordered]@{
+        windowsVersion = [string]$os.Version
+        logicalProcessors = [int]$env:NUMBER_OF_PROCESSORS
+        powerMode = if ($PowerMode) { $PowerMode } else { $null }
+        displayScale = if ($DisplayScale -gt 0) { $DisplayScale } else { $null }
+    }
+    scenario = [ordered]@{
+        kind = $ScenarioKind
+        terminalCount = $DeclaredScenarioTerminals
+        observedTerminalCount = if ($ObservedTerminalCount -gt 0) { $ObservedTerminalCount } else { $null }
+        workloadVersion = $WorkloadVersion
+        workloadSeed = $WorkloadSeed
+        repetition = $Repetition
+        startedAt = $startedAt.ToString("o")
+        finishedAt = $finishedAt.ToString("o")
+    }
+    resources = [ordered]@{
+        windows = $summary
+        windowsWslBridges = $summary.wsl_descendants
+        wslOwned = [ordered]@{ available = $false; reason = "authoritative Linux-side ownership evidence was not supplied" }
+        samples = $samples | ForEach-Object { $_.metrics }
+    }
+    operations = & $evidenceSection "operations"
+    preview = & $evidenceSection "preview"
+    voice = & $evidenceSection "voice"
+    journal = & $evidenceSection "journal"
+    diagnostics = & $evidenceSection "diagnostics"
+    validity = [ordered]@{ eligible = $eligible; reasons = $validityReasons; processBirthIntervalsExcluded = @($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count }
+    budgets = @()
+    decision = $decision
+    rawEvidence = $rawEvidence
     configuration = [ordered]@{
         declared_scenario_terminals = $DeclaredScenarioTerminals
         scenario_kind = $ScenarioKind
@@ -582,7 +660,7 @@ $artifact = [ordered]@{
     )
     roots = $rootMetadata
     samples = $samples
-    summary = Get-ArtifactSummary $samples
+    summary = $summary
     evidence = $runtimeEvidence
 }
 

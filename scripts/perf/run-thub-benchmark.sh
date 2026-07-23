@@ -19,6 +19,11 @@ executable=""
 pid=""
 runtime_evidence=""
 reference_binary_sha256=""
+reference_selection_reason=""
+source_commit=""
+installer_sha256=""
+observed_terminals=""
+protocol_version=2
 setup_note="idle terminals at shell prompts"
 dry_run=false
 
@@ -40,6 +45,10 @@ Options:
   --pid PID           Exact T-Hub root PID; required when multiple roots match
   --evidence PATH     Optional redacted numeric runtime evidence JSON
   --reference-sha256 H Reference installed binary SHA-256 for paired comparison
+  --reference-reason T Predeclared reference selection reason
+  --source-commit H   Full source Git commit bound to the installed artifact
+  --installer-sha256 H Package 5 installer SHA-256
+  --observed-terminals N Authoritative observed terminal count (required for eligibility)
   --setup-note TEXT   Workload and tab-layout note stored in benchmark metadata
   --dry-run           Validate arguments and print the PowerShell invocation only
   --help              Show this help
@@ -76,6 +85,10 @@ while [ "$#" -gt 0 ]; do
     --pid) require_value "$@"; pid="$2"; shift 2 ;;
     --evidence) require_value "$@"; runtime_evidence="$2"; shift 2 ;;
     --reference-sha256) require_value "$@"; reference_binary_sha256="$2"; shift 2 ;;
+    --reference-reason) require_value "$@"; reference_selection_reason="$2"; shift 2 ;;
+    --source-commit) require_value "$@"; source_commit="$2"; shift 2 ;;
+    --installer-sha256) require_value "$@"; installer_sha256="$2"; shift 2 ;;
+    --observed-terminals) require_value "$@"; observed_terminals="$2"; shift 2 ;;
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -89,12 +102,18 @@ case "$repetition" in ''|*[!0-9]*) echo "run-thub-benchmark: --repetition must b
 if [ "$repetition" -lt 1 ] || [ "$repetition" -gt 3 ]; then echo "run-thub-benchmark: --repetition must be between 1 and 3" >&2; exit 2; fi
 case "$warmup_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --warmup-seconds must be an integer" >&2; exit 2 ;; esac
 case "$sample_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --sample-seconds must be an integer" >&2; exit 2 ;; esac
+case "$observed_terminals" in ''|*[!0-9]*) [ -z "$observed_terminals" ] || { echo "run-thub-benchmark: --observed-terminals must be an integer" >&2; exit 2; } ;; esac
 case "$interval_ms" in ''|*[!0-9]*) echo "run-thub-benchmark: --interval-ms must be an integer" >&2; exit 2 ;; esac
 case "$pid" in ''|*[!0-9]*) [ -z "$pid" ] || { echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; } ;; esac
 if [ -n "$pid" ] && [ "$pid" -lt 1 ]; then echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; fi
 if [ "$sample_seconds" -lt 1 ]; then echo "run-thub-benchmark: --sample-seconds must be at least 1" >&2; exit 2; fi
 if [ "$warmup_seconds" -gt 3600 ]; then echo "run-thub-benchmark: --warmup-seconds must not exceed 3600" >&2; exit 2; fi
 if [ "$sample_seconds" -gt 86400 ]; then echo "run-thub-benchmark: --sample-seconds must not exceed 86400" >&2; exit 2; fi
+if [ -n "$observed_terminals" ] && { [ "$observed_terminals" -lt 1 ] || [ "$observed_terminals" -gt 16 ]; }; then echo "run-thub-benchmark: --observed-terminals must be between 1 and 16" >&2; exit 2; fi
+if [ -n "$reference_binary_sha256" ] && [[ ! "$reference_binary_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --reference-sha256 must be 64 hex characters" >&2; exit 2; fi
+if [ -n "$reference_binary_sha256" ] && [ -z "$reference_selection_reason" ]; then echo "run-thub-benchmark: --reference-reason is required with --reference-sha256" >&2; exit 2; fi
+if [ -n "$installer_sha256" ] && [[ ! "$installer_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --installer-sha256 must be 64 hex characters" >&2; exit 2; fi
+if [ -n "$source_commit" ] && [[ ! "$source_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then echo "run-thub-benchmark: --source-commit must be a full 40-hex commit" >&2; exit 2; fi
 if [ "$interval_ms" -lt 100 ] || [ "$interval_ms" -gt 60000 ]; then
   echo "run-thub-benchmark: --interval-ms must be between 100 and 60000" >&2
   exit 2
@@ -139,6 +158,18 @@ fi
 if [ -n "$reference_binary_sha256" ]; then
   command+=( -ReferenceBinarySha256 "$reference_binary_sha256" )
 fi
+if [ -n "$reference_selection_reason" ]; then
+  command+=( -ReferenceSelectionReason "$reference_selection_reason" )
+fi
+if [ -n "$source_commit" ]; then
+  command+=( -SourceCommit "$source_commit" )
+fi
+if [ -n "$installer_sha256" ]; then
+  command+=( -InstallerSha256 "$installer_sha256" )
+fi
+if [ -n "$observed_terminals" ]; then
+  command+=( -ObservedTerminalCount "$observed_terminals" )
+fi
 
 if "$dry_run"; then
   printf '%q ' "${command[@]}"
@@ -156,4 +187,13 @@ fi
 
 echo "Benchmark scenario: $terminals terminals"
 echo "Do not create, close, or change terminal workloads until collection completes."
+set +e
 "${command[@]}"
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+  # Collector/runtime drift is an ineligible run and must not be confused with
+  # invalid invocation (2) or unavailable packaged dependencies (3).
+  exit 5
+fi
+exit 0
