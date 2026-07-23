@@ -4,10 +4,48 @@
 //! Process reservation, durable identity, bounded output, endpoint ownership,
 //! and cleanup remain the caller's responsibility.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use cap_fs_ext::{ambient_authority, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
+use parking_lot::Mutex;
+
+use super::endpoint::ManagedRunIdentity;
 use super::model::{PreviewPackageManager, PreviewTarget, PreviewTargetKind};
+
+const MAX_MANAGED_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_MARKER_BYTES: u64 = 512;
+const MAX_PROC_STAT_BYTES: u64 = 4096;
+
+#[derive(Default)]
+pub(crate) struct BoundedOutput {
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl BoundedOutput {
+    pub(crate) fn append(&self, chunk: &[u8]) {
+        let mut bytes = self.bytes.lock();
+        if chunk.len() >= MAX_MANAGED_OUTPUT_BYTES {
+            bytes.clear();
+            bytes.extend_from_slice(&chunk[chunk.len() - MAX_MANAGED_OUTPUT_BYTES..]);
+            return;
+        }
+        let excess = bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(MAX_MANAGED_OUTPUT_BYTES);
+        if excess > 0 {
+            bytes.drain(..excess);
+        }
+        bytes.extend_from_slice(chunk);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        self.bytes.lock().clone()
+    }
+}
 
 /// Supervise the complete package-manager process group behind a stdin
 /// lifeline.
@@ -165,6 +203,94 @@ fn validate_run_id(run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_marker_identity(run_id: &str) -> Result<ManagedRunIdentity, String> {
+    validate_run_id(run_id)?;
+    let temporary = CapDir::open_ambient_dir("/tmp", ambient_authority())
+        .map_err(|error| format!("open managed Preview marker directory: {error}"))?;
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let marker_name = format!("t-hub-preview-{run_id}.pid");
+    let marker = temporary
+        .open_with(&marker_name, &options)
+        .map_err(|error| format!("open managed Preview identity marker: {error}"))?;
+    let metadata = marker
+        .metadata()
+        .map_err(|error| format!("inspect managed Preview identity marker: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_MARKER_BYTES {
+        return Err("managed Preview identity marker is not a bounded regular file".into());
+    }
+    let mut marker_bytes = Vec::new();
+    marker
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut marker_bytes)
+        .map_err(|error| format!("read managed Preview identity marker: {error}"))?;
+    if marker_bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err("managed Preview identity marker exceeds its bound".into());
+    }
+    let marker_text = std::str::from_utf8(&marker_bytes)
+        .map_err(|_| "managed Preview identity marker is not UTF-8")?;
+    let fields = marker_text.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 2 {
+        return Err("managed Preview identity marker has an invalid shape".into());
+    }
+    let process_group_id = fields[0]
+        .parse::<u32>()
+        .map_err(|_| "managed Preview identity marker has an invalid process group")?;
+    let process_group_started_at = fields[1]
+        .parse::<u64>()
+        .map_err(|_| "managed Preview identity marker has invalid start ticks")?;
+    let identity = ManagedRunIdentity {
+        run_id: run_id.to_string(),
+        process_group_id,
+        process_group_started_at,
+    };
+    identity.validate()?;
+    revalidate_process_identity(&identity)?;
+    Ok(identity)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn revalidate_process_identity(identity: &ManagedRunIdentity) -> Result<(), String> {
+    identity.validate()?;
+    let stat_path = format!("/proc/{}/stat", identity.process_group_id);
+    let file = std::fs::File::open(&stat_path)
+        .map_err(|error| format!("open managed Preview process identity: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect managed Preview process identity: {error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_PROC_STAT_BYTES {
+        return Err("managed Preview process stat is not a bounded regular file".into());
+    }
+    let mut stat = String::new();
+    file.take(MAX_PROC_STAT_BYTES + 1)
+        .read_to_string(&mut stat)
+        .map_err(|error| format!("read managed Preview process identity: {error}"))?;
+    if stat.len() as u64 > MAX_PROC_STAT_BYTES {
+        return Err("managed Preview process stat exceeds its bound".into());
+    }
+    let fields = stat
+        .rsplit_once(") ")
+        .ok_or("managed Preview process stat has an invalid shape")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let process_group = fields
+        .get(2)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or("managed Preview process stat has an invalid process group")?;
+    let start_ticks = fields
+        .get(19)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("managed Preview process stat has invalid start ticks")?;
+    if process_group != identity.process_group_id
+        || start_ticks != identity.process_group_started_at
+    {
+        return Err("managed Preview process identity no longer matches".into());
+    }
+    Ok(())
+}
+
 fn package_manager_executable(manager: PreviewPackageManager) -> &'static str {
     match manager {
         PreviewPackageManager::Npm => "npm",
@@ -243,6 +369,19 @@ mod tests {
         assert!(typed_package_command(root.path(), &target(""), "../marker-escape").is_err());
     }
 
+    #[test]
+    fn managed_output_retains_only_the_bounded_tail() {
+        let output = BoundedOutput::default();
+        output.append(&vec![b'a'; MAX_MANAGED_OUTPUT_BYTES - 4]);
+        output.append(b"0123456789");
+        let snapshot = output.snapshot();
+        assert_eq!(snapshot.len(), MAX_MANAGED_OUTPUT_BYTES);
+        assert!(snapshot.ends_with(b"0123456789"));
+
+        output.append(&vec![b'z'; MAX_MANAGED_OUTPUT_BYTES + 20]);
+        assert_eq!(output.snapshot(), vec![b'z'; MAX_MANAGED_OUTPUT_BYTES]);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_wrapper_publishes_exact_group_start_ticks_and_cleans_marker() {
@@ -285,10 +424,15 @@ mod tests {
         assert_eq!(fields.len(), 2);
         let process_group_id = fields[0].parse::<u32>().unwrap();
         let start_ticks = fields[1].parse::<u64>().unwrap();
-        let stat = std::fs::read_to_string(format!("/proc/{process_group_id}/stat")).unwrap();
-        let observed = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19);
-        assert_eq!(observed, Some(fields[1]));
+        let observed = observe_marker_identity(&run_id).unwrap();
+        assert_eq!(observed.process_group_id, process_group_id);
+        assert_eq!(observed.process_group_started_at, start_ticks);
         assert!(start_ticks > 0);
+        let stale = ManagedRunIdentity {
+            process_group_started_at: start_ticks + 1,
+            ..observed
+        };
+        assert!(revalidate_process_identity(&stale).is_err());
 
         drop(stdin);
         assert!(child.wait().unwrap().success());
