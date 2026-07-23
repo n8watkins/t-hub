@@ -739,6 +739,45 @@ pub fn stop_scribe_status_emitter() {
         .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+fn retire_finished_scribe_emitter() {
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let finished = state
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished());
+    if !finished {
+        return;
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn take_fresh_latest_status() -> Option<ScribeStatus> {
+    let mut latest = latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some((status, observed_at)) = latest.as_ref() else {
+        return None;
+    };
+    let now = now_ms();
+    if observed_at <= &now && now - observed_at <= 3_000 {
+        return Some(status.clone());
+    }
+    *latest = None;
+    None
+}
+
 #[tauri::command]
 pub fn scribe_status_start(app: tauri::AppHandle) -> Result<(), String> {
     start_scribe_status_emitter(app);
@@ -753,17 +792,10 @@ pub fn scribe_status_stop() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn scribe_status() -> Result<ScribeStatus, String> {
-    if let Some((status, observed_at)) = latest_scribe_status_store()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-    {
-        let now = now_ms();
-        if observed_at <= now && now - observed_at <= 3_000 {
-            return Ok(status);
-        }
-        return Ok(ScribeStatus::not_listening());
+    if let Some(status) = take_fresh_latest_status() {
+        return Ok(status);
     }
+    retire_finished_scribe_emitter();
     let emitter_running = {
         let state = scribe_emitter_state()
             .lock()
@@ -859,6 +891,29 @@ mod tests {
             before, after,
             "repeated disable must not advance lifecycle generation"
         );
+    }
+
+    #[test]
+    fn stale_latest_status_is_cleared_and_fresh_status_recovers() {
+        let status = ScribeStatus {
+            listening: true,
+            status: Some("Recording".into()),
+            since: None,
+            source: Some("v1"),
+            source_identity: None,
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((status.clone(), now_ms() - 4_000));
+        assert!(take_fresh_latest_status().is_none());
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((status, now_ms()));
+        assert!(take_fresh_latest_status().is_some());
     }
 
     /// Fallback-file read as the production path composes it (file only).
