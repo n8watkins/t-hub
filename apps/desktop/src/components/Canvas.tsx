@@ -184,12 +184,17 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
 
   // Keep the focused terminal's live cwd (which roots the Files tree) + tile
   // labels fresh. cwd is captured only by the mount-time listTerminals(), so the
-  // tree wouldn't follow a terminal that `cd`s elsewhere, nor update when you
-  // switch focus to a terminal in a different project. Re-list immediately on a
-  // focus change (this effect re-runs via focusedId) and when the window regains
-  // focus, plus a light 5s poll so an in-place `cd` is picked up too. Skipped
-  // while the window is hidden; updateTerminalsMeta only touches cwd/title/state
-  // (no order/focus churn, not persisted). (#6)
+  // tree wouldn't follow a terminal that `cd`s elsewhere. A light 15s poll picks
+  // up an in-place `cd`, and a window-refocus re-list makes the set fresh on
+  // return. Skipped while the window is hidden; updateTerminalsMeta only touches
+  // cwd/title/state (no order/focus churn, not persisted). (#6)
+  //
+  // Set up ONCE: updateTerminalsMeta is a stable store action, so this effect no
+  // longer depends on focusedId. It used to, which meant every tile click tore
+  // down and rebuilt the 15s interval AND fired an immediate `wsl.exe tmux
+  // list-sessions` — a subprocess spawn per click, plus the resulting per-terminal
+  // state churn that nudged the terminal reattach path. The focus-follow re-list
+  // now lives in its own debounced effect below.
   useEffect(() => {
     const refresh = () => {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") {
@@ -211,6 +216,24 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
+  }, [updateTerminalsMeta]);
+
+  // Follow focus: when the focused tile changes, re-list so the Files tree re-roots
+  // on the newly-focused terminal's CURRENT directory (e.g. switching focus to a
+  // terminal in another project). Debounced so rapid focus-hopping coalesces into a
+  // single `wsl.exe` spawn instead of one per click; the trailing edge wins, so the
+  // final resting focus is what gets refreshed.
+  useEffect(() => {
+    if (focusedId == null) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void listTerminals()
+        .then(updateTerminalsMeta)
+        .catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(timer);
   }, [focusedId, updateTerminalsMeta]);
 
   // Whether the "+" spawn-preset menu is open (anchored to the FAB).
