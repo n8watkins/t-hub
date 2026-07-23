@@ -73,6 +73,14 @@ fi
 if "$RUNNER" --source-commit bad --dry-run >/dev/null 2>&1; then
   fail "invalid source commit was accepted"
 fi
+runner_diag="/tmp/thub-runner-diagnostic-${PPID}.json"
+set +e
+"$RUNNER" --output "$runner_diag" --unknown-flag >/dev/null 2>&1
+runner_exit=$?
+set -e
+if [ "$runner_exit" -ne 2 ] || [ ! -s "$runner_diag" ] || ! grep -Fq '"schemaVersion":3' "$runner_diag"; then
+  fail "invalid invocation did not publish a schema-valid exit2 diagnostic"
+fi
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -File "$COLLECTOR_TEST"
