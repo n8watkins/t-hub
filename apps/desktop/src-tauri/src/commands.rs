@@ -476,8 +476,9 @@ pub async fn attach_terminal(
         let reusable = conns.get(&id).map(|conn| conn.is_alive()).unwrap_or(false);
         if reusable {
             if let Some(conn) = conns.get_mut(&id) {
-                let resize_ok = conn.resize(cols, rows).is_ok();
-                if remote_reuse_is_healthy(reusable, resize_ok, conn.is_alive()) {
+                let probe_ok = conn.probe().is_ok();
+                let resize_ok = probe_ok && conn.resize(cols, rows).is_ok();
+                if remote_reuse_is_healthy(reusable, probe_ok, resize_ok, conn.is_alive()) {
                     drop(conns);
                     let _ = app.emit(
                         events::STATE,
@@ -532,8 +533,13 @@ pub async fn attach_terminal(
     Ok(String::new())
 }
 
-fn remote_reuse_is_healthy(initially_alive: bool, resize_ok: bool, alive_after: bool) -> bool {
-    initially_alive && resize_ok && alive_after
+fn remote_reuse_is_healthy(
+    initially_alive: bool,
+    probe_ok: bool,
+    resize_ok: bool,
+    alive_after: bool,
+) -> bool {
+    initially_alive && probe_ok && resize_ok && alive_after
 }
 
 /// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
@@ -1018,10 +1024,11 @@ mod tests {
 
     #[test]
     fn remote_reuse_rejects_health_changes_and_resize_failures() {
-        assert!(remote_reuse_is_healthy(true, true, true));
-        assert!(!remote_reuse_is_healthy(true, false, true));
-        assert!(!remote_reuse_is_healthy(true, true, false));
-        assert!(!remote_reuse_is_healthy(false, true, true));
+        assert!(remote_reuse_is_healthy(true, true, true, true));
+        assert!(!remote_reuse_is_healthy(true, false, true, true));
+        assert!(!remote_reuse_is_healthy(true, true, false, true));
+        assert!(!remote_reuse_is_healthy(true, true, true, false));
+        assert!(!remote_reuse_is_healthy(false, true, true, true));
     }
     use std::cell::Cell;
     use std::collections::HashSet;

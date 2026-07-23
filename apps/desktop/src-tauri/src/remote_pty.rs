@@ -206,6 +206,36 @@ impl RemotePty {
         ))
     }
 
+    /// Whether the reader thread is still running. It blocks on the live socket for
+    /// the whole connection and returns only on EOF/error/`shutdown` (a dropped or
+    /// rebound control server, a server-side detach, or our own teardown). Once it
+    /// has returned, this connection's `writer` points at a dead socket: a `write`/
+    /// `resize` would fail (or silently no-op if geometry is unchanged) and no output
+    /// would ever arrive again. `attach_terminal` uses this to PURGE a stale cached
+    /// connection instead of reporting a frozen tile as `Live` (the disconnect-needs-
+    /// restart bug: a control rebind rotated the port, the reader hit EOF and exited,
+    /// but the dead `RemotePty` lingered in the manager map and got reused).
+    pub fn is_alive(&self) -> bool {
+        self.reader
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Perform an actual transport write before a cached connection is reused.
+    ///
+    /// A reader-thread check alone has a check-to-use window, and `resize` cannot
+    /// serve as the probe because unchanged geometry deliberately performs no I/O.
+    /// The v1 attach server ignores unknown well-formed frames, so this empty probe
+    /// has no PTY side effect while still forcing the socket to report a known
+    /// broken write path. `attach_terminal` checks the reader again after this.
+    pub fn probe(&mut self) -> Result<(), String> {
+        self.writer
+            .write_all(b"{\"probe\":true}\n")
+            .and_then(|()| self.writer.flush())
+            .map_err(|e| format!("remote_pty: probe terminal {} failed: {e}", self.id))
+    }
+
     /// Send keystrokes to the remote PTY: `{"write":"<b64>"}`.
     pub fn write(&mut self, data: &[u8]) -> Result<(), String> {
         let mut frame = serde_json::to_vec(&json!({ "write": STANDARD.encode(data) }))
