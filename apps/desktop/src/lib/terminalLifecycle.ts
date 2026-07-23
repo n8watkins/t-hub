@@ -1,15 +1,33 @@
 import type { TerminalTemperature } from "./terminalResources";
 
-export const TERMINAL_COLD_AFTER_MS = 30_000;
+// How long a terminal stays WARM (mounted + attached to tmux, output flushed on
+// the throttled background path) after it leaves the foreground before it goes
+// COLD (xterm disposed, detached from tmux). Returning to a WARM terminal is
+// instant; returning to a COLD one remounts and replays the tmux capture — a
+// visible reload/flash.
+//
+// This was 30s, which made routine tab-switching feel like the terminals were
+// "constantly refreshing": revisit any tab more than 30s after you last looked
+// at it and it reloaded. A terminal held warm is cheap (an idle tmux attach +
+// a background-throttled renderer), so we keep it warm generously and only cold
+// out the genuinely-abandoned ones. 5 minutes comfortably covers real
+// switching cadence while still eventually freeing terminals you've walked away
+// from. (If the warm set ever needs a hard memory ceiling for users with many
+// tabs, bound it by count on top of this timer rather than shortening it.)
+export const TERMINAL_COLD_AFTER_MS = 300_000;
+export const TERMINAL_MAX_WARM = 12;
 
 export class TerminalLifecycleController {
   private readonly known = new Set<string>();
   private readonly cold = new Set<string>();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly parkedOrder = new Map<string, number>();
+  private sequence = 0;
 
   constructor(
     private readonly onChange: () => void,
     private readonly coldAfterMs = TERMINAL_COLD_AFTER_MS,
+    private readonly maxWarm = TERMINAL_MAX_WARM,
   ) {}
 
   reconcile(ids: Iterable<string>, hotIds: ReadonlySet<string>): void {
@@ -18,14 +36,17 @@ export class TerminalLifecycleController {
       if (current.has(id)) continue;
       this.clearTimer(id);
       this.cold.delete(id);
+      this.parkedOrder.delete(id);
     }
 
     for (const id of current) {
       if (hotIds.has(id)) {
         this.clearTimer(id);
         this.cold.delete(id);
+        this.parkedOrder.delete(id);
         continue;
       }
+      if (!this.parkedOrder.has(id)) this.parkedOrder.set(id, this.sequence++);
       if (this.cold.has(id) || this.timers.has(id)) continue;
       const timer = setTimeout(() => {
         this.timers.delete(id);
@@ -35,6 +56,19 @@ export class TerminalLifecycleController {
       }, this.coldAfterMs);
       this.timers.set(id, timer);
     }
+    const warm = [...current].filter(
+      (id) => !hotIds.has(id) && !this.cold.has(id),
+    );
+    warm
+      .sort(
+        (a, b) =>
+          (this.parkedOrder.get(a) ?? 0) - (this.parkedOrder.get(b) ?? 0),
+      )
+      .slice(0, Math.max(0, warm.length - this.maxWarm))
+      .forEach((id) => {
+        this.clearTimer(id);
+        this.cold.add(id);
+      });
     this.known.clear();
     for (const id of current) this.known.add(id);
   }
@@ -49,6 +83,7 @@ export class TerminalLifecycleController {
     this.timers.clear();
     this.known.clear();
     this.cold.clear();
+    this.parkedOrder.clear();
   }
 
   private clearTimer(id: string): void {

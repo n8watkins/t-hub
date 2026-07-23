@@ -90,11 +90,75 @@ pub(crate) fn validated_socket_name() -> Result<&'static str, TmuxError> {
     validate_socket_name(socket())
 }
 
+/// One-time sweep of leaked sessions on the ISOLATED `-L t-hub-test` socket.
+///
+/// A test that PANICS before its explicit `reap_test_tmux_session` skips cleanup
+/// and leaks its tmux session. Across many `cargo test` runs these accrete (a dev
+/// box was found carrying 111 ghost `th_*` sessions), and a crowded socket makes
+/// the spawn governor read "headroom 0" (refusing every spawn) and duplicate-named
+/// fixtures collide ("duplicate session: th_admin-al") - exactly why the real-tmux
+/// control suite failed on a developer machine yet passed on always-clean CI.
+///
+/// Reap only sessions OLDER than a generous grace: the slowest real-tmux test runs
+/// for tens of seconds, so nothing this old can belong to a live (possibly
+/// concurrent) test - only stale leaks from PRIOR processes qualify, so a
+/// sibling fixture is never swept out from under a running test. `cfg(test)` only
+/// and always on the test socket, so it can never reach the live app's `-L t-hub`
+/// sessions.
+// Comfortably longer than any single test; a leak from a prior run is minutes to
+// days old, while a live test's session is only seconds old.
+#[cfg(test)]
+const STALE_TEST_SESSION_AFTER_SECS: u64 = 120;
+
+/// Pure decision half of the sweep: given the `list-sessions -F "#{session_name}
+/// #{session_created}"` output, `now` (unix secs), and the staleness grace, return
+/// the names old enough to reap. Malformed lines are skipped. Extracted so the
+/// age/parse logic is unit-tested without touching real tmux.
+#[cfg(test)]
+fn stale_session_names(listing: &str, now: u64, stale_after_secs: u64) -> Vec<&str> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (name, created) = (fields.next()?, fields.next()?);
+            let created: u64 = created.parse().ok()?;
+            (name.starts_with("th_") && now.saturating_sub(created) >= stale_after_secs)
+                .then_some(name)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn sweep_stale_test_sessions() {
+    if socket() != default_socket_name() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let Ok(command) = tmux(&["list-sessions", "-F", "#{session_name} #{session_created}"]) else {
+        return;
+    };
+    let Ok(output) = output_with_timeout(command, tmux_cmd_timeout()) else {
+        return;
+    };
+    if !output.status.success() {
+        return; // no server yet: nothing to sweep.
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for name in stale_session_names(&listing, now, STALE_TEST_SESSION_AFTER_SECS) {
+        let _ = kill_session(name);
+    }
+}
+
 /// Serialize tests that exercise real tmux process ownership and keep an
 /// independent anchor alive while the shared isolated server is in use.
 #[cfg(test)]
 pub(crate) struct TestLifecycleGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
+    #[cfg(unix)]
+    _process_lock: std::fs::File,
     anchor: String,
 }
 
@@ -106,6 +170,24 @@ impl TestLifecycleGuard {
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(unix)]
+        let process_lock = {
+            use std::os::fd::AsRawFd;
+            let path = std::env::temp_dir().join("t-hub-test-tmux-lifecycle.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("open cross-process test tmux lock");
+            assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+            file
+        };
+        // Once per test process, under the serialization lock, clear leaked ghost
+        // sessions from PRIOR runs so they can't starve the governor or collide with
+        // a fixture name. Age-bounded (see the helper) so a live sibling is safe.
+        static SWEPT: std::sync::Once = std::sync::Once::new();
+        SWEPT.call_once(sweep_stale_test_sessions);
         let anchor = format!(
             "th_test_anchor_{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -113,10 +195,22 @@ impl TestLifecycleGuard {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match new_session_with_env(&anchor, "/tmp", None, &[]) {
-                Ok(()) => return Self { _lock: lock, anchor },
+                Ok(()) => return Self {
+                    _lock: lock,
+                    #[cfg(unix)]
+                    _process_lock: process_lock,
+                    anchor,
+                },
                 Err(error) if error.message == "server exited unexpectedly" => {
                     match session_liveness(&anchor) {
-                        SessionLiveness::Alive => return Self { _lock: lock, anchor },
+                        SessionLiveness::Alive => {
+                            return Self {
+                                _lock: lock,
+                                #[cfg(unix)]
+                                _process_lock: process_lock,
+                                anchor,
+                            }
+                        }
                         SessionLiveness::Gone if std::time::Instant::now() < deadline => {
                             std::thread::sleep(Duration::from_millis(10));
                         }
@@ -3914,6 +4008,39 @@ while True:
         }
         // Whether or not a server is running, this must not error.
         let _ = list_sessions().expect("list_sessions must tolerate no-server");
+    }
+
+    /// The stale-session sweep reaps only sessions older than the grace, parsing
+    /// the `#{session_name} #{session_created}` listing and skipping malformed rows.
+    /// This guards the age math that keeps the sweep from ever touching a live
+    /// (possibly concurrent) test's fresh session while still clearing prior-run
+    /// ghost leaks.
+    #[test]
+    fn stale_session_names_reaps_only_the_aged() {
+        let now = 1_000_000u64;
+        let listing = "\
+th_leak_old 999000
+th_fresh 999950
+th_exact_edge 999880
+th_anchor_recent 999999
+not_enough_fields
+th_bad_ts notanumber";
+        // 120s grace: 1_000_000 - created >= 120 ⇒ reap.
+        let stale = stale_session_names(listing, now, 120);
+        assert_eq!(stale, vec!["th_leak_old", "th_exact_edge"]);
+        // A wide-open grace of 0 reaps every well-formed row (used by no caller, but
+        // proves the threshold plumbs through); malformed rows still drop out.
+        assert_eq!(
+            stale_session_names(listing, now, 0),
+            vec![
+                "th_leak_old",
+                "th_fresh",
+                "th_exact_edge",
+                "th_anchor_recent"
+            ],
+        );
+        // A grace larger than any age keeps everything.
+        assert!(stale_session_names(listing, now, 10_000).is_empty());
     }
 
     /// De-conflation guard (spawn-wedge): the transfer-/reap-grade death signal is

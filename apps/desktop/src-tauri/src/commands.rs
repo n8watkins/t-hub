@@ -465,18 +465,37 @@ pub async fn attach_terminal(
     // write of a tiny frame), never across a connect.
     {
         let mut conns = remote.conns.lock();
-        if let Some(conn) = conns.get_mut(&id) {
-            let _ = conn.resize(cols, rows);
-            // Already streaming — re-affirm Live (idempotent) and return empty
-            // scrollback (no re-seed), exactly as the in-process path did.
-            let _ = app.emit(
-                events::STATE,
-                &StateEvent {
-                    id: id.clone(),
-                    state: TerminalState::Live,
-                },
-            );
-            return Ok(String::new());
+        // Only REUSE a cached connection whose reader thread is still running. A
+        // dropped/rebound control server (the port rotates on `rebind_control`
+        // self-heal) makes the reader hit EOF and exit, but the dead `RemotePty`
+        // stays in the map — its `writer` now points at a dead socket. Reusing it
+        // here (the old unconditional branch) re-affirmed `Live` and returned empty
+        // scrollback, so the tile read "Live" while attached to nothing: frozen
+        // until an app restart cleared the map. Purge the stale conn and fall
+        // through to a fresh connect so the tile actually re-attaches.
+        let reusable = conns.get(&id).map(|conn| conn.is_alive()).unwrap_or(false);
+        if reusable {
+            if let Some(conn) = conns.get_mut(&id) {
+                let resize_ok = conn.resize(cols, rows).is_ok();
+                if remote_reuse_is_healthy(reusable, resize_ok, conn.is_alive()) {
+                    drop(conns);
+                    let _ = app.emit(
+                        events::STATE,
+                        &StateEvent {
+                            id: id.clone(),
+                            state: TerminalState::Live,
+                        },
+                    );
+                    return Ok(String::new());
+                }
+            }
+        }
+        // A stale (dead-reader) connection is present: detach it (joins the already-
+        // exited thread, best-effort shuts the dead socket) so the fresh connect
+        // below is the sole streamer for this id.
+        if let Some(stale) = conns.remove(&id) {
+            drop(conns);
+            stale.detach();
         }
     }
 
@@ -511,6 +530,10 @@ pub async fn attach_terminal(
     );
 
     Ok(String::new())
+}
+
+fn remote_reuse_is_healthy(initially_alive: bool, resize_ok: bool, alive_after: bool) -> bool {
+    initially_alive && resize_ok && alive_after
 }
 
 /// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
@@ -992,6 +1015,14 @@ fn select_terminal_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_reuse_rejects_health_changes_and_resize_failures() {
+        assert!(remote_reuse_is_healthy(true, true, true));
+        assert!(!remote_reuse_is_healthy(true, false, true));
+        assert!(!remote_reuse_is_healthy(true, true, false));
+        assert!(!remote_reuse_is_healthy(false, true, true));
+    }
     use std::cell::Cell;
     use std::collections::HashSet;
 

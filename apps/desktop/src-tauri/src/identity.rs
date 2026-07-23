@@ -435,6 +435,38 @@ impl IdentityStore {
         Ok(removed)
     }
 
+    pub fn prune_generation(&self) -> HashMap<String, Option<String>> {
+        self.lock()
+            .identities
+            .iter()
+            .map(|(id, identity)| (id.clone(), identity.session_tile.clone()))
+            .collect()
+    }
+
+    pub fn prune_dead_generation(
+        &self,
+        generation: &HashMap<String, Option<String>>,
+        is_live: impl Fn(&str) -> bool,
+    ) -> Result<usize, String> {
+        let mut snap = self.lock();
+        let previous = snap.clone();
+        let before = snap.identities.len();
+        snap.identities.retain(|id, identity| {
+            if generation.get(id) != Some(&identity.session_tile) {
+                return true;
+            }
+            identity.session_tile.as_deref().is_some_and(&is_live)
+        });
+        let removed = before - snap.identities.len();
+        if removed > 0 {
+            if let Err(error) = self.persist(&snap) {
+                *snap = previous;
+                return Err(error);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Explicitly REVOKE an identity by its minted id (item-3 Pillar B): record it in
     /// the durable revocation set AND drop its secret from the store, so a compromised
     /// or burned credential stops resolving immediately and forever. Distinct from
@@ -953,6 +985,19 @@ mod tests {
         store.bind_tile(&a.id, "t").unwrap();
         assert_eq!(store.prune_dead(|_| true).unwrap(), 0);
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn prune_generation_preserves_identity_rebound_after_snapshot() {
+        let store = IdentityStore::ephemeral();
+        let identity = store.mint(Role::Crew).unwrap();
+        let generation = store.prune_generation();
+        store.bind_tile(&identity.id, "new-live-tile").unwrap();
+        assert_eq!(
+            store.prune_dead_generation(&generation, |_| false).unwrap(),
+            0
+        );
+        assert!(store.resolve(&identity.secret).is_some());
     }
 
     #[test]

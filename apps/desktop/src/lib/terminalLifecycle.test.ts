@@ -60,6 +60,15 @@ describe("TerminalLifecycleController", () => {
     expect(changed).not.toHaveBeenCalled();
     expect(lifecycle.temperature("term", false)).toBe("warm");
   });
+
+  it("caps parked warm terminals while preserving hot headroom", () => {
+    const lifecycle = new TerminalLifecycleController(() => {}, 300_000, 2);
+    lifecycle.reconcile(["hot", "a", "b", "c"], new Set(["hot"]));
+    expect(lifecycle.temperature("hot", true)).toBe("hot");
+    expect(lifecycle.temperature("a", false)).toBe("cold");
+    expect(lifecycle.temperature("b", false)).toBe("warm");
+    expect(lifecycle.temperature("c", false)).toBe("warm");
+  });
 });
 
 describe("terminal detach barrier", () => {
