@@ -1873,17 +1873,28 @@ finally:
     os.close(directory)
 "##;
 
+#[cfg(any(windows, test))]
+const WINDOWS_MANAGED_CGROUP_HELPERS_PER_EFFECT: usize = 1;
+
+#[cfg(any(windows, test))]
+fn windows_managed_cgroup_effect_command(
+    wsl: &std::path::Path,
+    python: &ManagedExecutableIdentity,
+) -> Command {
+    windows_helper_command(wsl, &python.path, MANAGED_CGROUP_EFFECT_PY, Some(python))
+}
+
 fn managed_cgroup_effect_command(python: &ManagedExecutableIdentity) -> Result<Command, TmuxError> {
+    #[cfg(unix)]
     revalidate_python_identity(python)?;
     #[cfg(windows)]
     {
         let wsl = trusted_wsl_path()?;
-        Ok(windows_helper_command(
-            &wsl,
-            &python.path,
-            MANAGED_CGROUP_EFFECT_PY,
-            Some(python),
-        ))
+        // The helper validates sys.executable against this exact root-owned
+        // path/device/inode tuple before inspecting or changing any managed
+        // runtime state. Keep that validation and the cgroup operation in the
+        // same WSL process so owner observation has one bounded helper.
+        Ok(windows_managed_cgroup_effect_command(&wsl, python))
     }
     #[cfg(unix)]
     {
@@ -2858,6 +2869,48 @@ mod tests {
             .any(|argument| argument == std::ffi::OsStr::new(&python.path)));
         assert!(command.output().is_err());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn windows_managed_owner_observation_is_one_bounded_self_validating_helper() {
+        const MEASURED_WSL_HELPER_LATENCY: Duration = Duration::from_millis(1_100);
+
+        let python = ManagedExecutableIdentity {
+            path: "/usr/bin/python3".into(),
+            device: 8,
+            inode: 1234,
+        };
+        let trusted_wsl = std::path::Path::new("C:\\Windows\\System32\\wsl.exe");
+        let command = windows_managed_cgroup_effect_command(trusted_wsl, &python);
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), trusted_wsl.as_os_str());
+        assert_eq!(WINDOWS_MANAGED_CGROUP_HELPERS_PER_EFFECT, 1);
+        assert!(MEASURED_WSL_HELPER_LATENCY < TMUX_CMD_TIMEOUT_DEFAULT);
+        assert_eq!(
+            &args[..6],
+            [
+                "--cd",
+                "~",
+                "-e",
+                "/usr/bin/python3",
+                "-c",
+                MANAGED_CGROUP_EFFECT_PY
+            ]
+        );
+        assert_eq!(
+            serde_json::from_str::<ManagedExecutableIdentity>(&args[6]).unwrap(),
+            python
+        );
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("os.path.realpath(sys.executable)"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("actual_python != expected_python"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("details.st_uid != 0"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("stat.S_IWGRP | stat.S_IWOTH"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("details.st_dev"));
+        assert!(MANAGED_CGROUP_EFFECT_PY.contains("details.st_ino"));
     }
 
     #[cfg(unix)]

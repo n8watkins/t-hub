@@ -20294,6 +20294,11 @@ fn revalidate_cortana_managed_owner_after_process_observation(
     })
 }
 
+const CORTANA_HARNESS_CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
+const CORTANA_HARNESS_REQUIRED_CONFIRMATIONS: usize = 2;
+const CORTANA_HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const CORTANA_HARNESS_MAX_ATTEMPTS: usize = 64;
+
 /// Require a newly observed Harness process generation to remain identical
 /// across a bounded startup window before its identity can enter the durable
 /// managed-launch WAL. A script runtime with a prebound native child is only a
@@ -20305,14 +20310,9 @@ fn observe_stable_cortana_harness_process(
     launch: &crate::cortana_reconcile::CortanaManagedLaunchIntent,
     owner: &crate::cortana_reconcile::CortanaManagedOwnerToken,
 ) -> Result<crate::harness::HarnessProcessIdentity, String> {
-    const CONFIRM_INTERVAL: Duration = Duration::from_millis(100);
-    const REQUIRED_CONFIRMATIONS: usize = 2;
-    const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-    const MAX_ATTEMPTS: usize = 64;
-
     let (harness, expected, secret) = cortana_harness_attestation_scope(ctx, launch)?;
     let required_child = expected.trusted_child_executable.as_ref();
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let deadline = Instant::now() + CORTANA_HARNESS_STARTUP_TIMEOUT;
     let observe = || {
         crate::harness::observe_scoped_harness_process(
             &launch.tmux_target,
@@ -20335,7 +20335,7 @@ fn observe_stable_cortana_harness_process(
     };
     let mut baseline = None;
     let mut confirmations = 0;
-    for _ in 0..MAX_ATTEMPTS {
+    for _ in 0..CORTANA_HARNESS_MAX_ATTEMPTS {
         if Instant::now() >= deadline {
             break;
         }
@@ -20349,7 +20349,7 @@ fn observe_stable_cortana_harness_process(
                     confirmations = 0;
                 } else if baseline.as_ref() == Some(&observed) {
                     confirmations += 1;
-                    if confirmations == REQUIRED_CONFIRMATIONS {
+                    if confirmations == CORTANA_HARNESS_REQUIRED_CONFIRMATIONS {
                         return Ok(observed);
                     }
                 } else {
@@ -20371,7 +20371,7 @@ fn observe_stable_cortana_harness_process(
         if remaining.is_zero() {
             break;
         }
-        std::thread::sleep(CONFIRM_INTERVAL.min(remaining));
+        std::thread::sleep(CORTANA_HARNESS_CONFIRM_INTERVAL.min(remaining));
     }
     Err(
         "reconcile_cortana: managed Harness process did not reach a stable startup generation"
@@ -49491,6 +49491,40 @@ int main(int argc, char **argv) {
         std::fs::remove_dir_all(expected_dir).unwrap();
         std::fs::remove_dir_all(foreign_dir).unwrap();
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cortana_startup_budget_covers_atomic_windows_observation_contract() {
+        const MEASURED_WSL_HELPER_LATENCY: Duration = Duration::from_millis(1_100);
+        const LEGACY_WINDOWS_HELPERS_PER_OBSERVATION: usize = 2;
+        const LEGACY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let observations = CORTANA_HARNESS_REQUIRED_CONFIRMATIONS + 1;
+        let legacy_measured_floor = MEASURED_WSL_HELPER_LATENCY
+            * (observations * LEGACY_WINDOWS_HELPERS_PER_OBSERVATION) as u32
+            + CORTANA_HARNESS_CONFIRM_INTERVAL * (observations - 1) as u32;
+        assert!(
+            legacy_measured_floor > LEGACY_STARTUP_TIMEOUT,
+            "the measured two-helper contract must reproduce the five-second startup failure"
+        );
+
+        let atomic_measured_floor = MEASURED_WSL_HELPER_LATENCY
+            * (observations * crate::harness::WINDOWS_SCOPED_HARNESS_HELPERS_PER_OBSERVATION)
+                as u32
+            + CORTANA_HARNESS_CONFIRM_INTERVAL * (observations - 1) as u32;
+        assert!(atomic_measured_floor < CORTANA_HARNESS_STARTUP_TIMEOUT);
+
+        let bounded_cold_start_contract = crate::harness::SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT
+            * observations as u32
+            + CORTANA_HARNESS_CONFIRM_INTERVAL * (observations - 1) as u32;
+        assert!(
+            bounded_cold_start_contract < CORTANA_HARNESS_STARTUP_TIMEOUT,
+            "the hard startup budget must contain baseline plus two maximally bounded observations"
+        );
+        assert_eq!(
+            crate::harness::WINDOWS_SCOPED_HARNESS_HELPERS_PER_OBSERVATION,
+            1
+        );
     }
 
     #[cfg(unix)]

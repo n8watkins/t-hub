@@ -920,7 +920,13 @@ done
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
-    let bytes = output.stdout;
+    parse_scoped_process_batch(&output.stdout, identities)
+}
+
+fn parse_scoped_process_batch(
+    bytes: &[u8],
+    identities: &[ProcessIdentity],
+) -> Result<Vec<ScopedProcessDetails>, LaunchAttestationError> {
     let mut cursor = 0usize;
     let take_line = |cursor: &mut usize| -> Result<&[u8], LaunchAttestationError> {
         let rest = bytes
@@ -976,6 +982,258 @@ done
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     Ok(observed)
+}
+
+#[cfg(any(windows, test))]
+const ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT: &str = r#"
+set -eu
+tmux_socket=$1
+tmux_target=$2
+pane=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+set -- $pane
+[ "$#" -eq 5 ]
+session_id=$1
+session_created=$2
+window_id=$3
+pane_id=$4
+pane_pid=$5
+case "$session_created:$pane_pid" in *[!0-9:]*) exit 21;; esac
+foreground_pid=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
+case "$foreground_pid" in ''|*[!0-9]*|0) exit 22;; esac
+process_stat=$(cat "/proc/$foreground_pid/stat")
+rest=${process_stat##*) }
+set -- $rest
+[ "$#" -ge 20 ]
+start_ticks=${20}
+set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+[ "$#" -eq 2 ]
+case "$1:$2" in *[!0-9:]*) exit 24;; esac
+executable_device=$1
+executable_inode=$2
+ancestry=
+ancestry_count=0
+current_pid=$foreground_pid
+while :; do
+    current_stat=$(cat "/proc/$current_pid/stat")
+    rest=${current_stat##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    parent_pid=$2
+    current_start_ticks=${20}
+    case "$parent_pid:$current_start_ticks" in *[!0-9:]*) exit 25;; esac
+    if [ -z "$ancestry" ]; then
+        ancestry="$current_pid:$current_start_ticks"
+    else
+        ancestry="$ancestry,$current_pid:$current_start_ticks"
+    fi
+    ancestry_count=$((ancestry_count + 1))
+    [ "$ancestry_count" -le 64 ]
+    [ "$current_pid" = "$pane_pid" ] && break
+    [ "$parent_pid" -gt 0 ]
+    [ "$parent_pid" != "$current_pid" ]
+    current_pid=$parent_pid
+done
+cmdline="/proc/$foreground_pid/cmdline"
+cmdline_size=$(wc -c < "$cmdline" | tr -d ' ')
+case "$cmdline_size" in ''|*[!0-9]*|0) exit 23;; esac
+[ "$cmdline_size" -le 65536 ]
+
+printf 'THPC1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    "$session_id" "$session_created" "$window_id" "$pane_id" "$pane_pid" \
+    "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode" \
+    "$ancestry" "$cmdline_size"
+cat "$cmdline"
+printf '\nTHPB1\n%s\n' "$ancestry_count"
+
+old_ifs=$IFS
+IFS=,
+set -- $ancestry
+IFS=$old_ifs
+[ "$#" -eq "$ancestry_count" ]
+pinned_processes=
+for expected in "$@"; do
+    pid=${expected%%:*}
+    expected_start=${expected#*:}
+    case "$pid:$expected_start" in ''|*[!0-9:]*) exit 52;; esac
+    stat_before=$(cat "/proc/$pid/stat")
+    rest=${stat_before##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    parent_pid=$2
+    process_group_id=$3
+    process_session_id=$4
+    observed_start=${20}
+    [ "$observed_start" = "$expected_start" ]
+    case "$parent_pid:$process_group_id:$process_session_id:$observed_start" in *[!0-9:]*) exit 53;; esac
+    executable_path=$(readlink -f "/proc/$pid/exe")
+    [ -n "$executable_path" ]
+    case "$executable_path" in *' (deleted)') exit 54;; esac
+    [ "$(printf '%s\n' "$executable_path" | wc -l | tr -d ' ')" -eq 1 ]
+    set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+    [ "$#" -eq 2 ]
+    process_device=$1
+    process_inode=$2
+    case "$process_device:$process_inode" in *[!0-9:]*) exit 55;; esac
+    cgroup=$(cat "/proc/$pid/cgroup")
+    case "$cgroup" in 0::/*) ;; *) exit 56;; esac
+    [ "$(printf '%s\n' "$cgroup" | wc -l | tr -d ' ')" -eq 1 ]
+    cgroup_path=${cgroup#0::}
+    token_line=$(tr '\0' '\n' < "/proc/$pid/environ" | awk 'BEGIN { found=0 } /^T_HUB_SESSION_TOKEN=/ { if (found) exit 62; found=1; value=substr($0, length("T_HUB_SESSION_TOKEN=") + 1) } END { if (found) printf "%s", value }')
+    [ "${#token_line}" -le 4096 ]
+    [ "$(printf '%s\n' "$token_line" | wc -l | tr -d ' ')" -eq 1 ]
+    process_cmdline="/proc/$pid/cmdline"
+    process_cmdline_size=$(wc -c < "$process_cmdline" | tr -d ' ')
+    case "$process_cmdline_size" in ''|*[!0-9]*|0) exit 57;; esac
+    [ "$process_cmdline_size" -le 65536 ]
+    stat_after=$(cat "/proc/$pid/stat")
+    [ "$stat_after" = "$stat_before" ]
+    set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+    [ "$#" -eq 2 ]
+    [ "$1" = "$process_device" ]
+    [ "$2" = "$process_inode" ]
+    if [ -z "$pinned_processes" ]; then
+        pinned_processes="$pid:$observed_start:$process_device:$process_inode"
+    else
+        pinned_processes="$pinned_processes,$pid:$observed_start:$process_device:$process_inode"
+    fi
+    printf 'THPI1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$pid" "$parent_pid" "$observed_start" "$process_group_id" "$process_session_id" \
+        "$process_device" "$process_inode" "$executable_path" "$cgroup_path" \
+        "$token_line" "$process_cmdline_size"
+    cat "$process_cmdline"
+    printf '\n'
+done
+
+old_ifs=$IFS
+IFS=,
+set -- $pinned_processes
+IFS=$old_ifs
+[ "$#" -eq "$ancestry_count" ]
+for expected in "$@"; do
+    old_ifs=$IFS
+    IFS=:
+    set -- $expected
+    IFS=$old_ifs
+    [ "$#" -eq 4 ]
+    pid=$1
+    expected_start=$2
+    expected_device=$3
+    expected_inode=$4
+    process_stat=$(cat "/proc/$pid/stat")
+    rest=${process_stat##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    [ "${20}" = "$expected_start" ]
+    set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
+    [ "$#" -eq 2 ]
+    [ "$1" = "$expected_device" ]
+    [ "$2" = "$expected_inode" ]
+done
+
+pane_after=$(tmux -L "$tmux_socket" list-panes -t "$tmux_target" -F '#{session_id} #{session_created} #{window_id} #{pane_id} #{pane_pid}')
+[ "$pane_after" = "$pane" ]
+foreground_after=$(ps -o tpgid= -p "$pane_pid" | tr -d ' ')
+[ "$foreground_after" = "$foreground_pid" ]
+process_stat=$(cat "/proc/$foreground_pid/stat")
+rest=${process_stat##*) }
+set -- $rest
+[ "$#" -ge 20 ]
+[ "${20}" = "$start_ticks" ]
+set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+[ "$#" -eq 2 ]
+[ "$1" = "$executable_device" ]
+[ "$2" = "$executable_inode" ]
+"#;
+
+pub(crate) const WINDOWS_SCOPED_HARNESS_HELPERS_PER_OBSERVATION: usize = 1;
+pub(crate) const SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(any(windows, test))]
+fn parse_atomic_scoped_harness_observation(
+    bytes: &[u8],
+) -> Result<(HarnessProcessEvidence, Vec<ScopedProcessDetails>), LaunchAttestationError> {
+    let mut cursor = 0usize;
+    let take_line = |cursor: &mut usize| -> Result<&[u8], LaunchAttestationError> {
+        let rest = bytes
+            .get(*cursor..)
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        let end = rest
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+        *cursor = cursor.saturating_add(end + 1);
+        Ok(&rest[..end])
+    };
+    if take_line(&mut cursor)? != b"THPC1" {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let mut foreground_frame = b"THPA3\n".to_vec();
+    for _ in 0..10 {
+        foreground_frame.extend_from_slice(take_line(&mut cursor)?);
+        foreground_frame.push(b'\n');
+    }
+    let cmdline_size = usize::try_from(parse_ascii_number(Some(take_line(&mut cursor)?))?)
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if cmdline_size == 0 || cmdline_size > 65_536 {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let cmdline_end = cursor
+        .checked_add(cmdline_size)
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    foreground_frame.extend_from_slice(
+        bytes
+            .get(cursor..cmdline_end)
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+    );
+    cursor = cmdline_end;
+    if bytes.get(cursor) != Some(&b'\n') {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    cursor += 1;
+    let foreground = parse_process_evidence(&foreground_frame)?;
+    let details = parse_scoped_process_batch(
+        bytes
+            .get(cursor..)
+            .ok_or(LaunchAttestationError::UnreadableEvidence)?,
+        &foreground.ancestry,
+    )?;
+    Ok((foreground, details))
+}
+
+#[cfg(windows)]
+fn observe_atomic_scoped_harness_until(
+    tmux_target: &str,
+    deadline: Instant,
+) -> Result<(HarnessProcessEvidence, Vec<ScopedProcessDetails>), LaunchAttestationError> {
+    use std::os::windows::process::CommandExt;
+
+    let tmux_socket = crate::tmux::validated_socket_name()
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    let mut command = Command::new("wsl.exe");
+    command
+        .arg("--cd")
+        .arg("~")
+        .arg("-e")
+        .arg("sh")
+        .arg("-c")
+        .arg(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT)
+        .arg("t-hub-atomic-scoped-harness-attestation")
+        .arg(tmux_socket)
+        .arg(tmux_target)
+        .creation_flags(0x0800_0000);
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        observation_time_remaining(deadline)?.min(SCOPED_HARNESS_SINGLE_HELPER_TIMEOUT),
+        64usize
+            .saturating_mul(70_000)
+            .saturating_add(70_000)
+            .saturating_add(2048),
+    )
+    .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    parse_atomic_scoped_harness_observation(&output.stdout)
 }
 
 #[cfg(test)]
@@ -1601,8 +1859,14 @@ pub fn observe_scoped_harness_process(
     {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
-    let foreground = observe_harness_process_until(tmux_target, deadline)?;
-    let details = observe_scoped_processes_until(&foreground.ancestry, deadline)?;
+    #[cfg(windows)]
+    let (foreground, details) = observe_atomic_scoped_harness_until(tmux_target, deadline)?;
+    #[cfg(not(windows))]
+    let (foreground, details) = {
+        let foreground = observe_harness_process_until(tmux_target, deadline)?;
+        let details = observe_scoped_processes_until(&foreground.ancestry, deadline)?;
+        (foreground, details)
+    };
     for (index, process) in details.iter().enumerate() {
         if index + 1 < details.len() && process.parent_pid != details[index + 1].pid {
             return Err(LaunchAttestationError::AncestryChanged);
@@ -2785,6 +3049,68 @@ mod tests {
             parse_process_evidence(&oversized),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
+    }
+
+    fn atomic_scoped_harness_fixture() -> Vec<u8> {
+        let foreground_cmdline = b"codex\0--sandbox\0read-only\0";
+        let scoped_cmdline = b"/usr/bin/codex\0--sandbox\0read-only\0";
+        let mut bytes = format!(
+            "THPC1\n$17\n123456\n@9\n%42\n42\n42\n900\n8\n1234\n42:900\n{}\n",
+            foreground_cmdline.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(foreground_cmdline);
+        bytes.extend_from_slice(
+            format!(
+                "\nTHPB1\n1\nTHPI1\n42\n1\n900\n42\n42\n8\n1234\n/usr/bin/codex\n/user.slice/t-hub.scope\nsession-token\n{}\n",
+                scoped_cmdline.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(scoped_cmdline);
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn atomic_scoped_harness_parser_preserves_pinned_process_evidence() {
+        let syntax = Command::new("sh")
+            .args(["-n", "-c", ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT])
+            .status()
+            .unwrap();
+        assert!(syntax.success());
+        assert!(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT.contains("pinned_processes"));
+
+        let (foreground, scoped) =
+            parse_atomic_scoped_harness_observation(&atomic_scoped_harness_fixture()).unwrap();
+        assert_eq!(foreground.identity(), (42, 900));
+        assert_eq!(foreground.executable_identity(), (8, 1234));
+        assert_eq!(foreground.argv, ["codex", "--sandbox", "read-only"]);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].pid, 42);
+        assert_eq!(scoped[0].start_ticks, 900);
+        assert_eq!(scoped[0].executable_device, 8);
+        assert_eq!(scoped[0].executable_inode, 1234);
+        assert_eq!(scoped[0].session_token.as_deref(), Some("session-token"));
+    }
+
+    #[test]
+    fn atomic_scoped_harness_parser_rejects_substitution_and_trailing_evidence() {
+        let fixture = atomic_scoped_harness_fixture();
+        let substituted = String::from_utf8_lossy(&fixture)
+            .replacen("THPI1\n42\n1\n900\n", "THPI1\n42\n1\n901\n", 1)
+            .into_bytes();
+        assert!(matches!(
+            parse_atomic_scoped_harness_observation(&substituted),
+            Err(LaunchAttestationError::ProcessChanged)
+        ));
+
+        let mut trailing = fixture;
+        trailing.push(b'x');
+        assert!(matches!(
+            parse_atomic_scoped_harness_observation(&trailing),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        ));
     }
 
     #[test]
