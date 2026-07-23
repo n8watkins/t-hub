@@ -93,6 +93,10 @@ try {
     $threw = $false
     try { Read-SafeRuntimeEvidence | Out-Null } catch { $threw = $true }
     Assert-True $threw "runtime evidence accepted prohibited prompt content"
+    @{ voice = @{ name = "arbitrary-string" } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $threw = $false
+    try { Read-SafeRuntimeEvidence | Out-Null } catch { $threw = $true }
+    Assert-True $threw "runtime evidence accepted a non-canonical string field"
 } finally {
     if (Test-Path -LiteralPath $evidencePath) { Remove-Item -LiteralPath $evidencePath -Force }
 }

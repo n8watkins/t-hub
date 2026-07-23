@@ -32,6 +32,9 @@ param(
     [string]$SourceCommit = "",
     [string]$InstallerSha256 = "",
     [int]$ProtocolVersion = 2,
+    [string]$WslVersion = "",
+    [string]$WslDistro = "",
+    [int64]$WslMemoryBytes = 0,
     [ValidateRange(0, 16)]
     [int]$ObservedTerminalCount = 0,
     [string]$PowerMode = "",
@@ -424,9 +427,25 @@ function Convert-SafeEvidenceNode {
     param([object]$Node, [string]$Key = "root", [int]$Depth = 0)
     if ($Depth -gt 8) { throw "runtime evidence nesting exceeds the bound" }
     if ($null -eq $Node) { return $null }
-    if ($Node -is [bool] -or $Node -is [byte] -or $Node -is [sbyte] -or $Node -is [int16] -or $Node -is [uint16] -or $Node -is [int32] -or $Node -is [uint32] -or $Node -is [int64] -or $Node -is [uint64] -or $Node -is [single] -or $Node -is [double] -or $Node -is [decimal]) { return $Node }
+    if ($Node -is [bool] -or $Node -is [byte] -or $Node -is [sbyte] -or $Node -is [int16] -or $Node -is [uint16] -or $Node -is [int32] -or $Node -is [uint32] -or $Node -is [int64] -or $Node -is [uint64] -or $Node -is [single] -or $Node -is [double] -or $Node -is [decimal]) {
+        if (($Node -is [single] -or $Node -is [double] -or $Node -is [decimal]) -and ([double]::IsNaN([double]$Node) -or [double]::IsInfinity([double]$Node))) { throw "runtime evidence contains a non-finite number" }
+        return $Node
+    }
     if ($Node -is [string]) {
-        if ($Key -notmatch '(?i)(id|kind|status|source|reason|version|unit|name|type|outcome|engine|device)$') { throw "runtime evidence string field '$Key' is not allowlisted" }
+        $enum = @{
+            kind = @("operation", "preview", "voice", "journal", "recovery", "diagnostic", "metric")
+            status = @("ok", "ready", "running", "stopped", "failed", "unavailable", "succeeded", "idle", "busy")
+            source = @("tauri", "scribe", "rust", "frontend", "backend", "windows", "linux", "wsl")
+            type = @("static", "vite", "nextjs", "monorepo")
+            outcome = @("succeeded", "failed", "unavailable", "skipped")
+            engine = @("kokoro", "piper")
+            device = @("default", "unknown")
+            unit = @("ms", "bytes", "count", "fraction", "seconds")
+        }
+        if (-not $enum.ContainsKey($Key) -or $enum[$Key] -notcontains $Node) {
+            if ($Key -eq "version" -and $Node -match '^v[0-9]+(?:\.[0-9]+){0,2}$') { return $Node }
+            throw "runtime evidence string field '$Key' is not a canonical enum"
+        }
         if ($Node.Length -gt 128 -or $Node -match '[\x00-\x1f]') { throw "runtime evidence string field '$Key' is invalid" }
         return $Node
     }
@@ -449,7 +468,7 @@ function Read-SafeRuntimeEvidence {
     if (-not (Test-Path -LiteralPath $RuntimeEvidencePath -PathType Leaf)) { throw "runtime evidence file is missing" }
     if ((Get-Item -LiteralPath $RuntimeEvidencePath).Length -gt 1048576) { throw "runtime evidence file exceeds the 1 MiB bound" }
     $root = Get-Content -LiteralPath $RuntimeEvidencePath -Raw | ConvertFrom-Json
-    $allowed = @("operations", "preview", "voice", "journal", "recovery", "diagnostics", "metrics")
+    $allowed = @("operations", "preview", "voice", "journal", "recovery", "diagnostics", "metrics", "paired", "cleanup", "wslOwned")
     $result = [ordered]@{}
     foreach ($property in $root.PSObject.Properties) {
         if ($property.Name -notin $allowed) { throw "runtime evidence root field '$($property.Name)' is not allowlisted" }
@@ -498,8 +517,7 @@ if ($firstRoot.executable_path.Length -gt 0 -and (Test-Path -LiteralPath $firstR
 $installedBinarySha256 = if ($binary) { Assert-Sha256 $binary.sha256 "installed binary hash" } else { $null }
 if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256 = Assert-Sha256 $ReferenceBinarySha256 "reference binary hash" }
 if ($InstallerSha256.Length -gt 0) { $InstallerSha256 = Assert-Sha256 $InstallerSha256 "installer hash" }
-if ($SourceCommit.Length -eq 0) { $SourceCommit = $CollectorRepositoryCommit }
-if ($SourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "source commit must be a full 40-hex Git commit" }
+if ($SourceCommit.Length -gt 0 -and $SourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "source commit must be a full 40-hex Git commit" }
 
 $os = Get-CimInstance Win32_OperatingSystem
 $startedAt = (Get-Date).ToUniversalTime()
@@ -548,22 +566,64 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $SampleSeconds) {
 $finishedAt = (Get-Date).ToUniversalTime()
 $runtimeEvidence = Read-SafeRuntimeEvidence
 $runtimeEvidenceHash = if ($RuntimeEvidencePath.Length -gt 0) { (Get-FileHash -LiteralPath $RuntimeEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+$trustedObservedTerminalCount = $null
+if ($runtimeEvidence.Contains("metrics")) {
+    $metricsEvidence = $runtimeEvidence["metrics"]
+    if ($metricsEvidence -is [System.Collections.IDictionary] -and $metricsEvidence.Contains("observed_terminal_count")) {
+        $observedValue = $metricsEvidence["observed_terminal_count"]
+        if ($observedValue -is [int] -or $observedValue -is [long] -or $observedValue -is [double]) {
+            $trustedObservedTerminalCount = [int]$observedValue
+        }
+    }
+}
+$summary = Get-ArtifactSummary $samples
 $validityReasons = @()
-if ($ObservedTerminalCount -eq 0) { $validityReasons += "observed_terminal_count_missing" }
-elseif ($ObservedTerminalCount -ne $DeclaredScenarioTerminals) { $validityReasons += "observed_terminal_count_mismatch" }
+if ($null -eq $trustedObservedTerminalCount) { $validityReasons += "observed_terminal_count_unavailable" }
+elseif ($trustedObservedTerminalCount -ne $DeclaredScenarioTerminals) { $validityReasons += "observed_terminal_count_mismatch" }
 if ($samples.Count -eq 0) { $validityReasons += "no_samples" }
 if (@($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count -gt 0) { $validityReasons += "incomplete_cpu_interval" }
-if ($ReferenceBinarySha256.Length -gt 0 -and $ReferenceSelectionReason.Length -eq 0) { $validityReasons += "reference_selection_reason_missing" }
+if ($installedBinarySha256.Length -eq 0) { $validityReasons += "installed_binary_hash_missing" }
+if ($SourceCommit.Length -eq 0) { $validityReasons += "source_commit_binding_missing" }
+if ($InstallerSha256.Length -eq 0) { $validityReasons += "installer_hash_missing" }
+if ($ReferenceBinarySha256.Length -eq 0) { $validityReasons += "reference_binary_hash_missing" }
+if ($ReferenceSelectionReason.Length -eq 0) { $validityReasons += "reference_selection_reason_missing" }
+if ($ProtocolVersion -lt 1) { $validityReasons += "protocol_version_missing" }
+if ($PowerMode.Length -eq 0) { $validityReasons += "power_mode_missing" }
+if ($DisplayScale -le 0) { $validityReasons += "display_scale_missing" }
+if ($WslVersion.Length -eq 0) { $validityReasons += "wsl_version_missing" }
+if ($WslDistro.Length -eq 0) { $validityReasons += "wsl_distro_missing" }
+if ($WslMemoryBytes -le 0) { $validityReasons += "wsl_memory_missing" }
+if (-not $runtimeEvidence.Contains("wslOwned")) { $validityReasons += "wsl_owned_evidence_unavailable" }
+
+$absoluteLimit = switch ($DeclaredScenarioTerminals) {
+    1 { [ordered]@{ cpuRun = 0.15; cpuP95 = 0.30; privateBytes = 700MB; workingSet = 850MB; processes = 24 } }
+    4 { [ordered]@{ cpuRun = 0.25; cpuP95 = 0.45; privateBytes = 1000MB; workingSet = 1200MB; processes = 36 } }
+    8 { [ordered]@{ cpuRun = 0.40; cpuP95 = 0.70; privateBytes = 1500MB; workingSet = 1800MB; processes = 52 } }
+    16 { [ordered]@{ cpuRun = 0.70; cpuP95 = 1.10; privateBytes = 2300MB; workingSet = 2800MB; processes = 84 } }
+}
+$absoluteMetricsAvailable = $null -ne $summary.cpu.run_total_core_fraction -and $null -ne $summary.cpu.statistics -and $null -ne $summary.private_bytes -and $null -ne $summary.working_set_bytes -and $null -ne $summary.process_count
+$absoluteStatus = if (-not $absoluteMetricsAvailable) { "unavailable" } elseif ($summary.cpu.run_total_core_fraction -gt $absoluteLimit.cpuRun -or $summary.cpu.statistics.p95 -gt $absoluteLimit.cpuP95 -or $summary.private_bytes.p95 -gt $absoluteLimit.privateBytes -or $summary.working_set_bytes.p95 -gt $absoluteLimit.workingSet -or $summary.process_count.p95 -gt $absoluteLimit.processes) { "fail" } else { "pass" }
+$scenarioStatus = if ($null -eq $trustedObservedTerminalCount -or $trustedObservedTerminalCount -ne $DeclaredScenarioTerminals -or $Repetition -lt 1 -or $Repetition -gt 3) { "unavailable" } else { "pass" }
+$pairedStatus = if ($runtimeEvidence.Contains("paired")) { "unavailable" } else { "unavailable" }
+$cleanupStatus = if ($runtimeEvidence.Contains("cleanup")) { "unavailable" } else { "unavailable" }
+$budgets = @(
+    [ordered]@{ id = "absolute.resources"; kind = "absolute"; status = $absoluteStatus; observed = $summary; limits = $absoluteLimit },
+    [ordered]@{ id = "paired.regression"; kind = "paired"; status = $pairedStatus; observed = $null; limits = $null },
+    [ordered]@{ id = "cleanup.invariant"; kind = "cleanup"; status = $cleanupStatus; observed = $null; limits = $null },
+    [ordered]@{ id = "scenario.matrix"; kind = "scenario"; status = $scenarioStatus; observedTerminalCount = $trustedObservedTerminalCount; declaredTerminalCount = $DeclaredScenarioTerminals; repetition = $Repetition }
+)
+$budgetFailure = @($budgets | Where-Object { $_.status -eq "fail" }).Count -gt 0
+$budgetUnavailable = @($budgets | Where-Object { $_.status -eq "unavailable" }).Count -gt 0
+if ($budgetUnavailable) { $validityReasons += "budget_evidence_unavailable" }
 $eligible = $validityReasons.Count -eq 0
-$decision = if ($eligible) { "pass" } else { "ineligible" }
+$decision = if (-not $eligible) { "ineligible" } elseif ($budgetFailure) { "fail" } else { "pass" }
 $evidenceSection = {
     param([string]$Name)
     if ($runtimeEvidence.Contains($Name)) { return $runtimeEvidence[$Name] }
     return [ordered]@{}
 }
 $rawEvidence = @()
-if ($runtimeEvidenceHash) { $rawEvidence += [ordered]@{ kind = "redacted_runtime_metrics"; sha256 = $runtimeEvidenceHash } }
-$summary = Get-ArtifactSummary $samples
+if ($runtimeEvidenceHash) { $rawEvidence += [ordered]@{ kind = "redacted_runtime_metrics"; sha256 = $runtimeEvidenceHash; redactionCount = 0 } }
 $rootMetadata = @($initialTree.roots | ForEach-Object {
     [ordered]@{
         process_id = $_.process_id
@@ -601,14 +661,17 @@ $artifact = [ordered]@{
     }
     host = [ordered]@{
         windowsVersion = [string]$os.Version
+        wslVersion = if ($WslVersion.Length -gt 0) { $WslVersion } else { $null }
+        distro = if ($WslDistro.Length -gt 0) { $WslDistro } else { $null }
         logicalProcessors = [int]$env:NUMBER_OF_PROCESSORS
+        memoryBytes = if ($WslMemoryBytes -gt 0) { $WslMemoryBytes } else { $null }
         powerMode = if ($PowerMode) { $PowerMode } else { $null }
         displayScale = if ($DisplayScale -gt 0) { $DisplayScale } else { $null }
     }
     scenario = [ordered]@{
         kind = $ScenarioKind
         terminalCount = $DeclaredScenarioTerminals
-        observedTerminalCount = if ($ObservedTerminalCount -gt 0) { $ObservedTerminalCount } else { $null }
+        observedTerminalCount = $trustedObservedTerminalCount
         workloadVersion = $WorkloadVersion
         workloadSeed = $WorkloadSeed
         repetition = $Repetition
@@ -618,7 +681,7 @@ $artifact = [ordered]@{
     resources = [ordered]@{
         windows = $summary
         windowsWslBridges = $summary.wsl_descendants
-        wslOwned = [ordered]@{ available = $false; reason = "authoritative Linux-side ownership evidence was not supplied" }
+        wslOwned = if ($runtimeEvidence.Contains("wslOwned")) { $runtimeEvidence["wslOwned"] } else { [ordered]@{ available = $false; reason = "authoritative Linux-side ownership evidence was not supplied" } }
         samples = $samples | ForEach-Object { $_.metrics }
     }
     operations = & $evidenceSection "operations"
@@ -627,7 +690,7 @@ $artifact = [ordered]@{
     journal = & $evidenceSection "journal"
     diagnostics = & $evidenceSection "diagnostics"
     validity = [ordered]@{ eligible = $eligible; reasons = $validityReasons; processBirthIntervalsExcluded = @($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count }
-    budgets = @()
+    budgets = $budgets
     decision = $decision
     rawEvidence = $rawEvidence
     configuration = [ordered]@{
@@ -636,8 +699,8 @@ $artifact = [ordered]@{
         workload_version = $WorkloadVersion
         workload_seed = $WorkloadSeed
         repetition = $Repetition
-        observed_terminal_count = $null
-        observed_terminal_metadata = $null
+        observed_terminal_count = $trustedObservedTerminalCount
+        observed_terminal_metadata = if ($runtimeEvidence.Contains("metrics")) { $runtimeEvidence["metrics"] } else { $null }
         warmup_seconds = $WarmupSeconds
         requested_sample_seconds = $SampleSeconds
         actual_sample_seconds = $stopwatch.Elapsed.TotalSeconds
@@ -653,7 +716,7 @@ $artifact = [ordered]@{
     }
     setup_assumptions = @(
         "The installed T-Hub app was already running before collection began.",
-        "The terminal scenario count is declared by the operator and was not verified through T-Hub control.",
+        "The terminal scenario count is eligible only when redacted trusted runtime evidence reports the observed T-Hub count; the CLI declaration is never treated as authoritative.",
         "Terminal creation, closure, and workload changes were avoided during warmup and sampling.",
         "Unrelated WSL, agent-browser, Next.js, and Codex processes are excluded unless they are descendants of the selected T-Hub root.",
         "WSL descendant metrics include only Windows WSL bridge descendants visible from the pinned T-Hub root; Linux-side process metrics require a separate redacted runtime evidence source."
@@ -670,3 +733,5 @@ if ($parent.Length -gt 0) {
 }
 $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 Write-Host "Wrote benchmark artifact: $OutputPath"
+if (-not $eligible) { exit 5 }
+if ($budgetFailure) { exit 4 }

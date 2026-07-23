@@ -24,6 +24,9 @@ source_commit=""
 installer_sha256=""
 observed_terminals=""
 protocol_version=2
+wsl_version=""
+wsl_distro=""
+wsl_memory_bytes=""
 setup_note="idle terminals at shell prompts"
 dry_run=false
 
@@ -49,6 +52,9 @@ Options:
   --source-commit H   Full source Git commit bound to the installed artifact
   --installer-sha256 H Package 5 installer SHA-256
   --observed-terminals N Authoritative observed terminal count (required for eligibility)
+  --wsl-version V      Observed WSL version (required for eligibility)
+  --wsl-distro NAME    Observed WSL distro identity (required for eligibility)
+  --wsl-memory-bytes N Observed WSL memory bytes (required for eligibility)
   --setup-note TEXT   Workload and tab-layout note stored in benchmark metadata
   --dry-run           Validate arguments and print the PowerShell invocation only
   --help              Show this help
@@ -89,6 +95,9 @@ while [ "$#" -gt 0 ]; do
     --source-commit) require_value "$@"; source_commit="$2"; shift 2 ;;
     --installer-sha256) require_value "$@"; installer_sha256="$2"; shift 2 ;;
     --observed-terminals) require_value "$@"; observed_terminals="$2"; shift 2 ;;
+    --wsl-version) require_value "$@"; wsl_version="$2"; shift 2 ;;
+    --wsl-distro) require_value "$@"; wsl_distro="$2"; shift 2 ;;
+    --wsl-memory-bytes) require_value "$@"; wsl_memory_bytes="$2"; shift 2 ;;
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -103,6 +112,7 @@ if [ "$repetition" -lt 1 ] || [ "$repetition" -gt 3 ]; then echo "run-thub-bench
 case "$warmup_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --warmup-seconds must be an integer" >&2; exit 2 ;; esac
 case "$sample_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --sample-seconds must be an integer" >&2; exit 2 ;; esac
 case "$observed_terminals" in ''|*[!0-9]*) [ -z "$observed_terminals" ] || { echo "run-thub-benchmark: --observed-terminals must be an integer" >&2; exit 2; } ;; esac
+case "$wsl_memory_bytes" in ''|*[!0-9]*) [ -z "$wsl_memory_bytes" ] || { echo "run-thub-benchmark: --wsl-memory-bytes must be an integer" >&2; exit 2; } ;; esac
 case "$interval_ms" in ''|*[!0-9]*) echo "run-thub-benchmark: --interval-ms must be an integer" >&2; exit 2 ;; esac
 case "$pid" in ''|*[!0-9]*) [ -z "$pid" ] || { echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; } ;; esac
 if [ -n "$pid" ] && [ "$pid" -lt 1 ]; then echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; fi
@@ -110,6 +120,7 @@ if [ "$sample_seconds" -lt 1 ]; then echo "run-thub-benchmark: --sample-seconds 
 if [ "$warmup_seconds" -gt 3600 ]; then echo "run-thub-benchmark: --warmup-seconds must not exceed 3600" >&2; exit 2; fi
 if [ "$sample_seconds" -gt 86400 ]; then echo "run-thub-benchmark: --sample-seconds must not exceed 86400" >&2; exit 2; fi
 if [ -n "$observed_terminals" ] && { [ "$observed_terminals" -lt 1 ] || [ "$observed_terminals" -gt 16 ]; }; then echo "run-thub-benchmark: --observed-terminals must be between 1 and 16" >&2; exit 2; fi
+if [ -n "$wsl_memory_bytes" ] && [ "$wsl_memory_bytes" -lt 1 ]; then echo "run-thub-benchmark: --wsl-memory-bytes must be positive" >&2; exit 2; fi
 if [ -n "$reference_binary_sha256" ] && [[ ! "$reference_binary_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --reference-sha256 must be 64 hex characters" >&2; exit 2; fi
 if [ -n "$reference_binary_sha256" ] && [ -z "$reference_selection_reason" ]; then echo "run-thub-benchmark: --reference-reason is required with --reference-sha256" >&2; exit 2; fi
 if [ -n "$installer_sha256" ] && [[ ! "$installer_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --installer-sha256 must be 64 hex characters" >&2; exit 2; fi
@@ -170,6 +181,15 @@ fi
 if [ -n "$observed_terminals" ]; then
   command+=( -ObservedTerminalCount "$observed_terminals" )
 fi
+if [ -n "$wsl_version" ]; then
+  command+=( -WslVersion "$wsl_version" )
+fi
+if [ -n "$wsl_distro" ]; then
+  command+=( -WslDistro "$wsl_distro" )
+fi
+if [ -n "$wsl_memory_bytes" ]; then
+  command+=( -WslMemoryBytes "$wsl_memory_bytes" )
+fi
 
 if "$dry_run"; then
   printf '%q ' "${command[@]}"
@@ -178,11 +198,11 @@ if "$dry_run"; then
 fi
 if ! command -v powershell.exe >/dev/null 2>&1; then
   echo "run-thub-benchmark: powershell.exe is unavailable; run this script from WSL on Windows" >&2
-  exit 1
+  exit 3
 fi
 if ! command -v wslpath >/dev/null 2>&1; then
   echo "run-thub-benchmark: wslpath is unavailable; run this script from WSL on Windows" >&2
-  exit 1
+  exit 3
 fi
 
 echo "Benchmark scenario: $terminals terminals"
@@ -192,8 +212,9 @@ set +e
 status=$?
 set -e
 if [ "$status" -ne 0 ]; then
-  # Collector/runtime drift is an ineligible run and must not be confused with
-  # invalid invocation (2) or unavailable packaged dependencies (3).
-  exit 5
+  case "$status" in
+    4|5|6) exit "$status" ;;
+    *) exit 5 ;;
+  esac
 fi
 exit 0
