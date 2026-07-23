@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use super::discovery::{PreviewDiscovery, PreviewDiscoveryCache};
+use super::discovery::{PreviewDiscovery, PreviewDiscoveryCache, PreviewProjectRoot};
 use super::endpoint::{EndpointError, ProbeCancellation};
 use super::model::{
     PreviewOperation, PreviewOperationOutcome, PreviewOperationResult, PreviewScope, PreviewState,
@@ -48,7 +48,14 @@ impl<R: PreviewRuntime> PreviewService<R> {
     }
 
     pub fn discover(&self, root: &Path) -> Result<PreviewDiscovery, String> {
-        self.discovery.discover(root)
+        self.discover_authorized(&PreviewProjectRoot::from_host_path(root)?)
+    }
+
+    pub fn discover_authorized(
+        &self,
+        authority: &PreviewProjectRoot,
+    ) -> Result<PreviewDiscovery, String> {
+        self.discovery.discover_authorized(authority)
     }
 
     pub fn status(&self, scope: &PreviewScope) -> Result<PreviewStatus, String> {
@@ -63,13 +70,26 @@ impl<R: PreviewRuntime> PreviewService<R> {
         target_ref: &PreviewTargetRef,
         request_id: &str,
     ) -> Result<PreviewOperationResult, String> {
+        self.select_authorized(
+            &PreviewProjectRoot::from_host_path(root)?,
+            target_ref,
+            request_id,
+        )
+    }
+
+    pub fn select_authorized(
+        &self,
+        authority: &PreviewProjectRoot,
+        target_ref: &PreviewTargetRef,
+        request_id: &str,
+    ) -> Result<PreviewOperationResult, String> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(&target_ref.scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(replayed) = self.replay(request_id, PreviewOperation::Select, target_ref)? {
             return Ok(replayed);
         }
-        let discovery = self.discovery.discover(root)?;
+        let discovery = self.discovery.discover_authorized(authority)?;
         let _ = resolve_target(&discovery, target_ref)?;
         self.prepare_intent(request_id, PreviewOperation::Select, target_ref, None, None)?;
 
@@ -127,6 +147,23 @@ impl<R: PreviewRuntime> PreviewService<R> {
         request_id: &str,
         cancellation: &ProbeCancellation,
     ) -> Result<PreviewOperationResult, String> {
+        self.start_authorized(
+            &PreviewProjectRoot::from_host_path(root)?,
+            scope,
+            requested,
+            request_id,
+            cancellation,
+        )
+    }
+
+    pub fn start_authorized(
+        &self,
+        authority: &PreviewProjectRoot,
+        scope: &PreviewScope,
+        requested: Option<&PreviewTargetRef>,
+        request_id: &str,
+        cancellation: &ProbeCancellation,
+    ) -> Result<PreviewOperationResult, String> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -149,7 +186,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         if cancellation.is_cancelled() {
             return Err("Preview start was cancelled before spawning".into());
         }
-        let discovery = self.discovery.discover(root)?;
+        let discovery = self.discovery.discover_authorized(authority)?;
         if requested.is_none() {
             let _ = self.selected_ref(scope, &discovery)?;
         }
@@ -314,6 +351,21 @@ impl<R: PreviewRuntime> PreviewService<R> {
         request_id: &str,
         cancellation: &ProbeCancellation,
     ) -> Result<PreviewOperationResult, String> {
+        self.restart_authorized(
+            &PreviewProjectRoot::from_host_path(root)?,
+            scope,
+            request_id,
+            cancellation,
+        )
+    }
+
+    pub fn restart_authorized(
+        &self,
+        authority: &PreviewProjectRoot,
+        scope: &PreviewScope,
+        request_id: &str,
+        cancellation: &ProbeCancellation,
+    ) -> Result<PreviewOperationResult, String> {
         validate_request_id(request_id)?;
         let scope_lock = self.scope_lock(scope);
         let _guard = scope_lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -339,7 +391,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         if cancellation.is_cancelled() {
             return Err("Preview restart was cancelled before spawning".into());
         }
-        let discovery = self.discovery.discover(root)?;
+        let discovery = self.discovery.discover_authorized(authority)?;
         if active.is_none() {
             let _ = self.selected_ref(scope, &discovery)?;
         }
@@ -1567,6 +1619,55 @@ mod tests {
         assert_eq!(replayed.status, failed.status);
         assert_eq!(replayed.status.run_id, None);
         assert_eq!(fixture.runtime.spawn_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_root_fingerprint_is_stable_across_host_path_mappings() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-preview-service-authorized-root-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let mapped = root.with_file_name(format!(
+            "{}-simulated-unc",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&root, &mapped).unwrap();
+        let profiles =
+            Arc::new(PreviewProfileStore::open(&root.join("state/profiles.json")).unwrap());
+        let service = PreviewService::new(FakeRuntime::default(), Arc::clone(&profiles));
+        let posix_identity = "/home/natkins/projects/stable-preview";
+        let direct_authority = PreviewProjectRoot::new(posix_identity, root.clone()).unwrap();
+        let mapped_authority = PreviewProjectRoot::new(posix_identity, mapped).unwrap();
+        let direct = service.discover_authorized(&direct_authority).unwrap();
+        let mapped = service.discover_authorized(&mapped_authority).unwrap();
+        assert_eq!(
+            direct.canonical_root_fingerprint,
+            mapped.canonical_root_fingerprint
+        );
+        let scope = PreviewScope::new("project-stable", None).unwrap();
+        let target_ref = PreviewTargetRef {
+            scope: scope.clone(),
+            target_id: direct.targets[0].id.clone(),
+            discovery_fingerprint: direct.discovery_fingerprint,
+        };
+        service
+            .select_authorized(&mapped_authority, &target_ref, "select-stable")
+            .unwrap();
+        assert_eq!(
+            profiles
+                .project("project-stable")
+                .unwrap()
+                .canonical_root_fingerprint,
+            mapped.canonical_root_fingerprint
+        );
     }
 
     #[test]

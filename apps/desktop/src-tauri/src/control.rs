@@ -14858,7 +14858,13 @@ fn preview_control(
             ));
         }
     }
-    enforce_preview_project_authority(ctx, caller, trusted_internal, &project.project_id, command)?;
+    let caller_authority = enforce_preview_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        &project.project_id,
+        command,
+    )?;
     if let Some(workspace_id) = requested_scope.and_then(|scope| scope.workspace_id.as_deref()) {
         enforce_preview_workspace_authority(
             ctx,
@@ -14867,6 +14873,7 @@ fn preview_control(
             &project.project_id,
             workspace_id,
             command,
+            caller_authority.as_ref(),
         )?;
     }
 
@@ -14910,9 +14917,9 @@ fn enforce_preview_project_authority(
     trusted_internal: bool,
     project_id: &str,
     command: &str,
-) -> Result<(), String> {
+) -> Result<Option<FleetWorkspaceOwner>, String> {
     if caller_is_apex(caller, trusted_internal) {
-        return Ok(());
+        return Ok(None);
     }
     let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a Fleet identity"))?;
     let terminal_id = caller
@@ -14931,14 +14938,18 @@ fn enforce_preview_project_authority(
                 && captain.terminal_id.as_deref() == Some(terminal_id)
                 && caller.ship_slug.as_deref() == Some(captain.ship_slug.as_str())
         })
-        .count();
-    if caller.fleet_role == Some(FleetRole::Captain) && matches == 1 {
-        Ok(())
-    } else {
-        Err(format!(
+        .collect::<Vec<_>>();
+    if caller.fleet_role != Some(FleetRole::Captain) || matches.len() != 1 {
+        return Err(format!(
             "acl: '{command}' requires General/Cortana or the owning Project Captain"
-        ))
+        ));
     }
+    let captain = &matches[0];
+    Ok(Some(FleetWorkspaceOwner {
+        project_id: project_id.to_string(),
+        assignment_id: captain.assignment_id.clone(),
+        ship_slug: captain.ship_slug.clone(),
+    }))
 }
 
 fn enforce_preview_workspace_authority(
@@ -14948,6 +14959,7 @@ fn enforce_preview_workspace_authority(
     project_id: &str,
     workspace_id: &str,
     command: &str,
+    caller_authority: Option<&FleetWorkspaceOwner>,
 ) -> Result<(), String> {
     let matches = ctx
         .captains
@@ -14977,17 +14989,14 @@ fn enforce_preview_workspace_authority(
             "{command} workspaceId '{workspace_id}' belongs to another Project"
         ));
     }
-    if caller_is_apex(caller, trusted_internal) {
+    if caller_is_apex(caller, trusted_internal) && caller_authority.is_none() {
         return Ok(());
     }
-    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a Fleet identity"))?;
-    if caller.fleet_role == Some(FleetRole::Captain)
-        && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str())
-    {
+    if caller_authority == Some(owner) {
         Ok(())
     } else {
         Err(format!(
-            "acl: '{command}' workspace belongs to another Captain"
+            "acl: '{command}' workspace belongs to another Captain Assignment"
         ))
     }
 }
@@ -56853,7 +56862,7 @@ int main(int argc, char **argv) {
                 project_id: "project-1".into(),
                 name: "Preview Project".into(),
                 repo_root: root_path.clone(),
-                root_path: Some(root_path),
+                root_path: Some(root_path.clone()),
                 vcs_capability: Some("none".into()),
                 git_main_root: None,
                 remote_url: None,
@@ -56900,7 +56909,7 @@ int main(int argc, char **argv) {
                 project_id: "project-1".into(),
                 name: "Preview Project".into(),
                 repo_root: root_path.clone(),
-                root_path: Some(root_path),
+                root_path: Some(root_path.clone()),
                 vcs_capability: Some("none".into()),
                 git_main_root: None,
                 remote_url: None,
@@ -56915,6 +56924,24 @@ int main(int argc, char **argv) {
             .unwrap();
         ctx.captains
             .bind_ship_context("preview-ship", "project-1", "Package 3", "codex")
+            .unwrap();
+        let captain = ctx
+            .captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|captain| captain.ship_slug == "preview-ship")
+            .unwrap();
+        ctx.captains
+            .create_workspace(
+                "workspace-1",
+                "Work",
+                Some(&FleetWorkspaceOwner {
+                    project_id: "project-1".into(),
+                    assignment_id: captain.assignment_id,
+                    ship_slug: "preview-ship".into(),
+                }),
+            )
             .unwrap();
         let owning_captain = ResolvedIdentity {
             session_id: "captain-session".into(),
@@ -56932,7 +56959,7 @@ int main(int argc, char **argv) {
         );
         let unrelated = ResolvedIdentity {
             ship_slug: Some("another-ship".into()),
-            ..owning_captain
+            ..owning_captain.clone()
         };
         assert!(
             preview_control(&ctx, "preview_status", &args, Some(&unrelated), false)
@@ -56942,7 +56969,51 @@ int main(int argc, char **argv) {
         assert!(preview_control(&ctx, "preview_status", &args, None, false)
             .unwrap_err()
             .contains("requires a Fleet identity"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let workspace_scope = json!({"projectId": "project-1", "workspaceId": "workspace-1"});
+        for (command, args) in [
+            ("preview_status", json!({"scope": workspace_scope})),
+            (
+                "preview_select",
+                json!({"rootPath": root_path, "target": {"scope": workspace_scope}}),
+            ),
+            ("preview_refresh", json!({"scope": workspace_scope})),
+            ("preview_open", json!({"scope": workspace_scope})),
+            (
+                "preview_start",
+                json!({"rootPath": root_path, "scope": workspace_scope}),
+            ),
+            ("preview_stop", json!({"scope": workspace_scope})),
+            (
+                "preview_restart",
+                json!({"rootPath": root_path, "scope": workspace_scope}),
+            ),
+        ] {
+            preview_control(&ctx, command, &args, Some(&owning_captain), false).unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+
+        {
+            let mut registry = ctx.captains.lock();
+            registry
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == "workspace-1")
+                .unwrap()
+                .owner
+                .as_mut()
+                .unwrap()
+                .assignment_id = "different-assignment".into();
+        }
+        let error = preview_control(
+            &ctx,
+            "preview_status",
+            &json!({"scope": workspace_scope}),
+            Some(&owning_captain),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("another Captain Assignment"));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
     }
 
     #[test]

@@ -38,10 +38,46 @@ const LOCK_FILES: [&str; 5] = [
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewDiscovery {
+    pub registered_posix_root: String,
     pub canonical_root: PathBuf,
     pub canonical_root_fingerprint: String,
     pub discovery_fingerprint: String,
     pub targets: Vec<PreviewTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewProjectRoot {
+    pub registered_posix_identity: String,
+    pub host_open_path: PathBuf,
+}
+
+impl PreviewProjectRoot {
+    pub fn new(
+        registered_posix_identity: impl Into<String>,
+        host_open_path: PathBuf,
+    ) -> Result<Self, String> {
+        let registered_posix_identity = registered_posix_identity.into();
+        if registered_posix_identity.is_empty()
+            || !registered_posix_identity.starts_with('/')
+            || registered_posix_identity.starts_with("//")
+            || registered_posix_identity.contains('\0')
+            || registered_posix_identity
+                .split('/')
+                .any(|segment| segment == "..")
+        {
+            return Err("Preview registered root must be an absolute normalized POSIX path".into());
+        }
+        Ok(Self {
+            registered_posix_identity,
+            host_open_path,
+        })
+    }
+
+    pub(crate) fn from_host_path(root: &Path) -> Result<Self, String> {
+        let canonical = fs::canonicalize(root)
+            .map_err(|error| format!("canonicalize Preview root {}: {error}", root.display()))?;
+        Self::new(canonical.to_string_lossy().replace('\\', "/"), canonical)
+    }
 }
 
 #[derive(Default)]
@@ -51,7 +87,15 @@ pub struct PreviewDiscoveryCache {
 
 impl PreviewDiscoveryCache {
     pub fn discover(&self, root: &Path) -> Result<PreviewDiscovery, String> {
-        let discovered = discover(root)?;
+        let authority = PreviewProjectRoot::from_host_path(root)?;
+        self.discover_authorized(&authority)
+    }
+
+    pub fn discover_authorized(
+        &self,
+        authority: &PreviewProjectRoot,
+    ) -> Result<PreviewDiscovery, String> {
+        let discovered = discover_authorized(authority)?;
         let key = (
             discovered.canonical_root.clone(),
             discovered.discovery_fingerprint.clone(),
@@ -67,13 +111,24 @@ impl PreviewDiscoveryCache {
 }
 
 pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|error| format!("canonicalize Preview root {}: {error}", root.display()))?;
+    let authority = PreviewProjectRoot::from_host_path(root)?;
+    discover_authorized(&authority)
+}
+
+pub fn discover_authorized(authority: &PreviewProjectRoot) -> Result<PreviewDiscovery, String> {
+    let canonical_root = fs::canonicalize(&authority.host_open_path).map_err(|error| {
+        format!(
+            "canonicalize Preview root {}: {error}",
+            authority.host_open_path.display()
+        )
+    })?;
     let root_directory = open_root(&canonical_root)?;
 
     let mut fingerprint = Sha256::new();
-    let root_identity = canonical_root.to_string_lossy().replace('\\', "/");
-    let canonical_root_fingerprint = format!("sha256:{:x}", Sha256::digest(root_identity));
+    let canonical_root_fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(authority.registered_posix_identity.as_bytes())
+    );
     let root_manifest =
         read_relative_optional(&root_directory, Path::new("package.json"), &mut fingerprint)?;
     let config = read_relative_optional(
@@ -185,6 +240,7 @@ pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
         fingerprint.update(encoded);
     }
     Ok(PreviewDiscovery {
+        registered_posix_root: authority.registered_posix_identity.clone(),
         canonical_root,
         canonical_root_fingerprint,
         discovery_fingerprint: format!("sha256:{:x}", fingerprint.finalize()),
@@ -961,6 +1017,35 @@ mod tests {
         let second = discover(&root).unwrap();
         assert_ne!(first.discovery_fingerprint, second.discovery_fingerprint);
         assert_ne!(first.targets, second.targets);
+    }
+
+    #[test]
+    fn registered_posix_identity_drives_root_fingerprint_not_host_mapping() {
+        let root = fixture("stable-posix-root");
+        let alternate_host_mapping = root.with_file_name(format!(
+            "{}-simulated-unc",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, &alternate_host_mapping).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&alternate_host_mapping).unwrap();
+
+        let posix_identity = "/home/natkins/projects/stable-preview";
+        let direct =
+            discover_authorized(&PreviewProjectRoot::new(posix_identity, root.clone()).unwrap())
+                .unwrap();
+        let mapped = discover_authorized(
+            &PreviewProjectRoot::new(posix_identity, alternate_host_mapping).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(direct.registered_posix_root, posix_identity);
+        assert_eq!(mapped.registered_posix_root, posix_identity);
+        assert_eq!(
+            direct.canonical_root_fingerprint,
+            mapped.canonical_root_fingerprint
+        );
+        assert_eq!(direct.discovery_fingerprint, mapped.discovery_fingerprint);
     }
 
     #[test]
