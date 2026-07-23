@@ -46,6 +46,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
+$script:ArtifactWrittenByThisRun = $false
 
 function Write-DiagnosticArtifact {
     param([string]$Reason)
@@ -60,7 +61,7 @@ function Write-DiagnosticArtifact {
             host = [ordered]@{ windowsVersion = $null; wslVersion = $null; distro = $null; logicalProcessors = $null; memoryBytes = $null; powerMode = $null; displayScale = $null }
             scenario = [ordered]@{ kind = $ScenarioKind; terminalCount = $DeclaredScenarioTerminals; observedTerminalCount = $null; workloadVersion = $null; workloadSeed = $null; repetition = $Repetition; startedAt = $null; finishedAt = $null }
             resources = [ordered]@{ windows = $null; wslOwned = [ordered]@{ available = $false; reason = "diagnostic artifact" }; webview = @{}; samples = @() }
-            operations = @{}
+            operations = @()
             preview = @{}
             voice = @{}
             journal = @{}
@@ -91,6 +92,7 @@ function Write-JsonNoClobber {
         $stream = $null
         [System.IO.File]::Move($temp, $Path)
         $published = $true
+        $script:ArtifactWrittenByThisRun = $true
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
         if (-not $published -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force }
@@ -99,7 +101,7 @@ function Write-JsonNoClobber {
 
 trap {
     Write-DiagnosticArtifact $_.Exception.Message
-    if (-not [string]::IsNullOrWhiteSpace($OutputPath) -and (Test-Path -LiteralPath $OutputPath -PathType Leaf)) { exit 5 }
+    if ($script:ArtifactWrittenByThisRun) { exit 5 }
     exit 6
 }
 
@@ -539,7 +541,7 @@ function Assert-BoundedCliString {
     if ($Value.Length -gt $Maximum -or $Value -match '[\x00-\x1f]') {
         throw "$Name exceeds the bounded CLI string contract"
     }
-    if ($RejectSensitive -and $Value -match '(?i)\b(token|secret|password|credential|transcript|prompt|payload|content|command)\b') {
+    if ($RejectSensitive -and $Value -match '(?i)\b(token|secret|password|credential|transcript|prompt|payload|content|command|bearer|authorization|api_key|session)\b') {
         throw "$Name contains a prohibited sensitive-content marker"
     }
 }

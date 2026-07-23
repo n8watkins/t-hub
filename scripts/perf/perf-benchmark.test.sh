@@ -54,6 +54,12 @@ fi
 if "$RUNNER" --workload-seed "bearer token" --dry-run >/dev/null 2>&1; then
   fail "sensitive workload seed was accepted"
 fi
+if "$RUNNER" --workload-seed "Bearer Token" --dry-run >/dev/null 2>&1; then
+  fail "uppercase sensitive workload seed was accepted"
+fi
+if "$RUNNER" --setup-note "Authorization: Bearer abc" --dry-run >/dev/null 2>&1; then
+  fail "authorization setup note was accepted"
+fi
 if "$RUNNER" --power-mode turbo --dry-run >/dev/null 2>&1; then
   fail "non-canonical power mode was accepted"
 fi

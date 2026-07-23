@@ -88,6 +88,19 @@ try {
     if (Test-Path -LiteralPath $diagnosticPath) { Remove-Item -LiteralPath $diagnosticPath -Force }
 }
 
+$trapPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-trap-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+    $firstExit = $LASTEXITCODE
+    Assert-True ($firstExit -eq 5 -and (Test-Path -LiteralPath $trapPath -PathType Leaf)) "collector failure did not publish exit5 diagnostic"
+    $firstRaw = Get-Content -LiteralPath $trapPath -Raw
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+    Assert-True ($LASTEXITCODE -eq 6) "unpublishable diagnostic did not return exit6"
+    Assert-True ((Get-Content -LiteralPath $trapPath -Raw) -ceq $firstRaw) "unpublishable diagnostic clobbered prior evidence"
+} finally {
+    if (Test-Path -LiteralPath $trapPath) { Remove-Item -LiteralPath $trapPath -Force }
+}
+
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
 $incomplete = Get-TreeTotals $withBirth $next 1.0 @($root)
 Assert-True (-not $incomplete.cpu_interval_complete) "birth interval was marked complete"

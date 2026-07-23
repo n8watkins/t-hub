@@ -80,7 +80,8 @@ validate_text() {
     echo "run-thub-benchmark: $name exceeds its bounded text contract" >&2
     exit 2
   fi
-  if [[ "$value" =~ (^|[^[:alnum:]])(token|secret|password|credential|transcript|prompt|payload|content|command)([^[:alnum:]]|$) ]]; then
+  local lowered="${value,,}"
+  if [[ "$lowered" =~ (^|[^[:alnum:]])(token|secret|password|credential|transcript|prompt|payload|content|command|bearer|authorization|api_key|session)([^[:alnum:]]|$) ]]; then
     echo "run-thub-benchmark: $name contains a prohibited sensitive-content marker" >&2
     exit 2
   fi
