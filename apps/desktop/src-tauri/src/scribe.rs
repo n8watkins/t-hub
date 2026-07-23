@@ -92,6 +92,12 @@ static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterS
 static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
     std::sync::OnceLock::new();
 static SCRIBE_DIRECT_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_REQUEST_COORDINATOR: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn scribe_request_coordinator() -> &'static std::sync::Mutex<()> {
+    SCRIBE_REQUEST_COORDINATOR.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
     SCRIBE_EMITTER_STATE.get_or_init(|| {
@@ -646,10 +652,13 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
             let mut last_checked = [expired, expired];
             let mut flavor = 0usize;
             while !cancel_for_thread.load(Ordering::Acquire) {
-                emit_status_event(
-                    &app,
-                    &read_scribe_status_emitter_tick(&mut candidates, &mut last_checked, flavor),
-                );
+                let status = {
+                    let _request_guard = scribe_request_coordinator()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    read_scribe_status_emitter_tick(&mut candidates, &mut last_checked, flavor)
+                };
+                emit_status_event(&app, &status);
                 flavor = (flavor + 1) % 2;
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -731,9 +740,14 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
     {
         return Ok(ScribeStatus::not_listening());
     }
-    let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
-        .await
-        .map_err(|e| format!("scribe_status task failed: {e}"))?;
+    let status = tauri::async_runtime::spawn_blocking(|| {
+        let _request_guard = scribe_request_coordinator()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        read_scribe_status()
+    })
+    .await
+    .map_err(|e| format!("scribe_status task failed: {e}"))?;
     Ok(status)
 }
 
