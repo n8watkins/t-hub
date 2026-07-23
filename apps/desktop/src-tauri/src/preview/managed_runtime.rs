@@ -292,7 +292,21 @@ impl PreviewRuntime for ManagedPreviewRuntime {
             identity: process.identity.clone(),
             generation,
         };
-        EndpointResolver::new(inspector).resolve(&process.identity, output, None, cancellation)
+        let resolver = EndpointResolver::new(inspector);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut observed = output.to_vec();
+        loop {
+            match resolver.resolve(&process.identity, &observed, None, cancellation) {
+                Err(
+                    super::endpoint::EndpointError::NoManagedHint
+                    | super::endpoint::EndpointError::ListenerMissing,
+                ) if std::time::Instant::now() < deadline && !cancellation.is_cancelled() => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    observed = live.output.snapshot();
+                }
+                result => return result,
+            }
+        }
     }
 
     fn open(&self, url: &str) -> Result<(), String> {
