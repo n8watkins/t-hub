@@ -10,7 +10,8 @@ bash -n "$PREFLIGHT"
 command -v jq >/dev/null 2>&1 || fail "jq is required"
 
 src="0123456789abcdef0123456789abcdef01234567"
-hash="$(printf 'a%.0s' {1..64})"
+installed_hash="$(printf 'a%.0s' {1..64})"
+installer_hash="$(printf 'b%.0s' {1..64})"
 scenarios=(idle terminal_output folder_browsing preview_starting preview_noisy preview_refreshing voice_synthesis endpoint_recovery history_open)
 terminal_counts=(1 4 8 16)
 repetitions=(1 2 3)
@@ -19,16 +20,16 @@ trap '/bin/rm -rf "$tmp"' EXIT
 
 make_manifest() {
   local path="$1"
-  jq -n --arg src "$src" --arg hash "$hash" \
-    '{schemaVersion:1,candidate:{sourceCommit:$src},artifacts:{installer:{sha256:$hash},installedBinary:{sha256:$hash}}}' \
+  jq -n --arg src "$src" --arg installer "$installer_hash" --arg installed "$installed_hash" \
+    '{schemaVersion:1,candidate:{sourceCommit:$src},artifacts:{installer:{sha256:$installer},installedBinary:{sha256:$installed}}}' \
     > "$path"
 }
 
 make_artifact() {
   local path="$1" kind="$2" terminals="$3" repetition="$4"
-  jq -n --arg src "$src" --arg hash "$hash" --arg kind "$kind" \
+  jq -n --arg src "$src" --arg installer "$installer_hash" --arg installed "$installed_hash" --arg kind "$kind" \
     --argjson terminals "$terminals" --argjson repetition "$repetition" \
-    '{schemaVersion:3,candidate:{sourceCommit:$src,installedBinarySha256:$hash,installerSha256:$hash},scenario:{kind:$kind,terminalCount:$terminals,observedTerminalCount:$terminals,repetition:$repetition},validity:{eligible:true,reasons:[]},decision:"pass",budgets:[{id:"absolute.resources",status:"pass"},{id:"paired.regression",status:"pass"},{id:"cleanup.invariant",status:"pass"},{id:"scenario.matrix",status:"pass"}]}' \
+    '{schemaVersion:3,candidate:{sourceCommit:$src,installedBinarySha256:$installed,installerSha256:$installer},scenario:{kind:$kind,terminalCount:$terminals,observedTerminalCount:$terminals,repetition:$repetition},validity:{eligible:true,reasons:[]},decision:"pass",budgets:[{id:"absolute.resources",status:"pass"},{id:"paired.regression",status:"pass"},{id:"cleanup.invariant",status:"pass"},{id:"scenario.matrix",status:"pass"}]}' \
     > "$path"
 }
 
@@ -67,8 +68,8 @@ jq -e '
   (.matrix.cells | length) == 108 and
   (.matrix.cells | map([.scenario,.terminalCount,.repetition] | join("|")) | unique | length) == 108 and
   .candidate.sourceCommit == "0123456789abcdef0123456789abcdef01234567" and
-  (.candidate.installedBinarySha256 | test("^[a-f0-9]{64}$")) and
-  (.candidate.installerSha256 | test("^[a-f0-9]{64}$"))
+  .candidate.installedBinarySha256 == ("a" * 64) and
+  .candidate.installerSha256 == ("b" * 64)
 ' "$valid_summary" >/dev/null || fail "valid summary did not prove the complete matrix"
 valid_hash="$(sha256sum "$valid_summary" | awk '{print $1}')"
 run_case 4 "$valid_dir" "$valid_manifest" "$valid_summary"
@@ -109,10 +110,44 @@ jq -e '.decision == "invalid" and (.validity.reasons | index("invalid_evidence_s
 
 identity_dir="$tmp/identity"
 cp -R "$valid_dir" "$identity_dir"
-jq '.candidate.installedBinarySha256=("b" * 64)' "$identity_dir/idle-1t-r1.json" > "$identity_dir/changed.json"
+jq '.candidate.installedBinarySha256=("c" * 64)' "$identity_dir/idle-1t-r1.json" > "$identity_dir/changed.json"
 mv "$identity_dir/changed.json" "$identity_dir/idle-1t-r1.json"
 run_case 4 "$identity_dir" "$valid_manifest" "$tmp/identity-summary.json"
 jq -e '.decision == "fail" and (.validity.reasons | index("identity_binding_mismatch") != null)' "$tmp/identity-summary.json" >/dev/null || fail "identity mismatch was not reported"
+
+budget_missing_dir="$tmp/budget-missing"
+cp -R "$valid_dir" "$budget_missing_dir"
+jq '.budgets=[{id:"absolute.resources",status:"pass"}]' "$budget_missing_dir/idle-1t-r1.json" > "$budget_missing_dir/changed.json"
+mv "$budget_missing_dir/changed.json" "$budget_missing_dir/idle-1t-r1.json"
+run_case 6 "$budget_missing_dir" "$valid_manifest" "$tmp/budget-missing-summary.json"
+jq -e '.decision == "invalid" and (.validity.reasons | index("invalid_evidence_schema") != null)' "$tmp/budget-missing-summary.json" >/dev/null || fail "missing budget ID was not reported"
+
+budget_duplicate_dir="$tmp/budget-duplicate"
+cp -R "$valid_dir" "$budget_duplicate_dir"
+jq '.budgets[1].id="absolute.resources"' "$budget_duplicate_dir/idle-1t-r1.json" > "$budget_duplicate_dir/changed.json"
+mv "$budget_duplicate_dir/changed.json" "$budget_duplicate_dir/idle-1t-r1.json"
+run_case 6 "$budget_duplicate_dir" "$valid_manifest" "$tmp/budget-duplicate-summary.json"
+jq -e '.decision == "invalid" and (.validity.reasons | index("invalid_evidence_schema") != null)' "$tmp/budget-duplicate-summary.json" >/dev/null || fail "duplicate budget ID was not reported"
+
+reason_type_dir="$tmp/reason-type"
+cp -R "$valid_dir" "$reason_type_dir"
+jq '.validity.reasons=[1]' "$reason_type_dir/idle-1t-r1.json" > "$reason_type_dir/changed.json"
+mv "$reason_type_dir/changed.json" "$reason_type_dir/idle-1t-r1.json"
+run_case 6 "$reason_type_dir" "$valid_manifest" "$tmp/reason-type-summary.json"
+jq -e '.decision == "invalid" and (.validity.reasons | index("invalid_evidence_schema") != null)' "$tmp/reason-type-summary.json" >/dev/null || fail "non-string validity reason was not reported"
+
+reason_consistency_dir="$tmp/reason-consistency"
+cp -R "$valid_dir" "$reason_consistency_dir"
+jq '.validity.reasons=["unexpected"]' "$reason_consistency_dir/idle-1t-r1.json" > "$reason_consistency_dir/changed.json"
+mv "$reason_consistency_dir/changed.json" "$reason_consistency_dir/idle-1t-r1.json"
+run_case 6 "$reason_consistency_dir" "$valid_manifest" "$tmp/reason-consistency-summary.json"
+jq -e '.decision == "invalid" and (.validity.reasons | index("pass_with_validity_reasons") != null)' "$tmp/reason-consistency-summary.json" >/dev/null || fail "pass with validity reasons was not reported"
+
+set +e
+"$PREFLIGHT" --artifacts-dir "$valid_dir" --package5-manifest "$valid_manifest" --source-commit "$src" --output "/proc/p6-preflight/unwritable.json" >/dev/null 2>&1
+output_failure=$?
+set -e
+[ "$output_failure" -eq 4 ] || fail "output publication failure returned $output_failure instead of 4"
 
 set +e
 "$PREFLIGHT" >/dev/null 2>&1

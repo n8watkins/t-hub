@@ -161,9 +161,12 @@ for artifact in "${artifacts[@]}"; do
     (.scenario.repetition | type == "number" and IN(1,2,3)) and
     (.validity | type == "object") and
     (.validity.eligible | type == "boolean") and
-    (.validity.reasons | type == "array") and
+    (.validity.reasons | type == "array" and all(.[]; type == "string")) and
     (.decision | type == "string" and IN("pass","fail","ineligible")) and
-    (.budgets | type == "array" and length > 0 and all(.[]; .status | type == "string" and IN("pass","fail","unavailable")))) as $valid |
+    (.budgets | type == "array" and length == 4 and
+      (map(.id) | sort == ["absolute.resources","cleanup.invariant","paired.regression","scenario.matrix"]) and
+      all(.[]; .id | type == "string") and
+      all(.[]; .status | type == "string" and IN("pass","fail","unavailable")))) as $valid |
     if $valid then [
       .candidate.sourceCommit,
       .candidate.installedBinarySha256,
@@ -173,7 +176,8 @@ for artifact in "${artifacts[@]}"; do
       (.scenario.repetition | tostring),
       (.validity.eligible | tostring),
       .decision,
-      ([.budgets[] | .status] | join(","))
+      ([.budgets[] | .status] | join(",")),
+      (.validity.reasons | length | tostring)
     ] | @tsv else error("invalid evidence schema") end
   ' "$artifact")"; then
     schema_error=true
@@ -182,7 +186,7 @@ for artifact in "${artifacts[@]}"; do
     continue
   fi
 
-  IFS=$'\t' read -r artifact_source artifact_installer artifact_installed kind terminals repetition eligible decision budget_statuses <<<"$metadata"
+  IFS=$'\t' read -r artifact_source artifact_installed artifact_installer kind terminals repetition eligible decision budget_statuses reasons_count <<<"$metadata"
   artifact_source="${artifact_source,,}"
   artifact_installer="${artifact_installer,,}"
   artifact_installed="${artifact_installed,,}"
@@ -200,7 +204,11 @@ for artifact in "${artifacts[@]}"; do
     add_reason "identity_binding_mismatch"
     add_diagnostic "$artifact" "identity_binding_mismatch"
   fi
-  if [ "$eligible" != true ] || [ "$decision" = "ineligible" ]; then
+  if [ "$eligible" = true ] && [ "$decision" = pass ] && [ "$reasons_count" -ne 0 ]; then
+    schema_error=true
+    add_reason "pass_with_validity_reasons"
+    add_diagnostic "$artifact" "pass_with_validity_reasons"
+  elif [ "$eligible" != true ] || [ "$decision" = "ineligible" ]; then
     ineligible_error=true
     add_reason "ineligible_matrix_run"
     add_diagnostic "$artifact" "ineligible_matrix_run"
@@ -259,8 +267,14 @@ summary="$(jq -n \
   --argjson observed "$observed_cells" \
   '{schemaVersion:1,package:6,candidate:{sourceCommit:$source,installedBinarySha256:$installed,installerSha256:$installer,package5ManifestSha256:$manifest},matrix:{requiredCellCount:$required,observedCellCount:$observed,cells:$cells},validity:{eligible:($decision=="pass"),reasons:$reasons},decision:$decision,diagnostics:{errorCode:(if $decision=="pass" then "none" else "matrix_preflight_failure" end),artifacts:$diagnostics}}')"
 
-output_parent="$(dirname "$output")"
-mkdir -p "$output_parent"
+if ! output_parent="$(dirname "$output")"; then
+  echo "package6-matrix-preflight: unable to resolve output parent" >&2
+  exit 4
+fi
+if ! mkdir -p "$output_parent" 2>/dev/null; then
+  echo "package6-matrix-preflight: unable to create output parent: $output_parent" >&2
+  exit 4
+fi
 if [ -e "$output" ]; then
   echo "package6-matrix-preflight: refusing to overwrite existing output: $output" >&2
   exit 4
