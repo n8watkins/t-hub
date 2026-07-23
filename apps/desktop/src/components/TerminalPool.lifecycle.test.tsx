@@ -61,6 +61,39 @@ afterEach(() => {
 });
 
 describe("TerminalPool lifecycle", () => {
+  it("unmounts overflow parked TerminalViews on the cap follow-up render", () => {
+    const parkedIds = Array.from({ length: 14 }, (_, index) => `parked-${index}`);
+    useWorkspace.setState({
+      tabs: [
+        { id: "active", name: "Active", order: ["hot"] },
+        ...parkedIds.map((id) => ({
+          id: `tab-${id}`,
+          name: id,
+          order: [id],
+        })),
+      ],
+      activeTabId: "active",
+      focusedId: "hot",
+    });
+
+    const { container } = render(
+      <TerminalPoolProvider>
+        <div />
+      </TerminalPoolProvider>,
+    );
+
+    expect(container.querySelector('[data-testid="terminal-hot"]')).toBeTruthy();
+    expect(
+      container.querySelector('[data-testid="terminal-parked-0"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="terminal-parked-1"]'),
+    ).toBeNull();
+    for (const id of parkedIds.slice(2)) {
+      expect(container.querySelector(`[data-testid="terminal-${id}"]`)).toBeTruthy();
+    }
+  });
+
   it("keeps wrappers stable while warm terminals cool and rehydrate", () => {
     const { container } = render(
       <TerminalPoolProvider>
