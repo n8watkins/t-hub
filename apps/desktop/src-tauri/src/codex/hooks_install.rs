@@ -124,16 +124,17 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
 
 #[cfg(windows)]
 pub fn host_project_path(path: &str) -> Result<PathBuf> {
-    if path.starts_with('/') {
-        wsl_posix_to_unc(&wsl_distro(), path)
-    } else {
-        Ok(PathBuf::from(path))
-    }
+    host_project_path_for_distro(path, &wsl_distro())
 }
 
 #[cfg(not(windows))]
 pub fn host_project_path(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
+}
+
+#[cfg(any(windows, test))]
+fn host_project_path_for_distro(path: &str, distro: &str) -> Result<PathBuf> {
+    wsl_posix_to_unc(distro, path)
 }
 
 #[cfg(unix)]
@@ -175,34 +176,58 @@ fn wsl_distro() -> String {
 
 #[cfg(any(windows, test))]
 fn normalize_wsl_home(output: &[u8]) -> Result<String> {
-    let home = String::from_utf8_lossy(output).trim().to_string();
-    if home.starts_with('/') && home.len() > 1 && !home.split('/').any(|part| part == "..") {
-        Ok(home.trim_end_matches('/').to_string())
-    } else {
+    let home = normalize_single_wsl_path_output(output)?;
+    if home.len() <= 1 {
         bail!("WSL home is not an absolute POSIX path");
     }
+    Ok(home)
 }
 
 #[cfg(any(windows, test))]
 fn normalize_wsl_executable(output: &[u8]) -> Result<String> {
-    let path = String::from_utf8_lossy(output).trim().to_string();
-    if path.starts_with('/')
-        && path.len() > 1
-        && !path.contains('\0')
-        && !path.split('/').any(|part| part == "..")
-    {
-        Ok(path)
-    } else {
+    let path = normalize_single_wsl_path_output(output)?;
+    if path.len() <= 1 {
         bail!("WSL t-hub-agent path is not an absolute POSIX path");
     }
+    Ok(path)
+}
+
+#[cfg(any(windows, test))]
+fn normalize_single_wsl_path_output(output: &[u8]) -> Result<String> {
+    let output = std::str::from_utf8(output).context("WSL path output is not valid UTF-8")?;
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    let output = output.strip_suffix('\r').unwrap_or(output);
+    validate_canonical_absolute_posix(output)?;
+    Ok(output.to_string())
+}
+
+#[cfg(any(windows, test))]
+fn validate_canonical_absolute_posix(path: &str) -> Result<()> {
+    if !path.starts_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || (path.len() > 1 && path.ends_with('/'))
+    {
+        bail!("WSL path must be a canonical absolute POSIX path");
+    }
+    for component in path.split('/').skip(1) {
+        if component.is_empty() || component == "." || component == ".." {
+            bail!("WSL path must be a canonical absolute POSIX path");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
 fn wsl_posix_to_unc(distro: &str, path: &str) -> Result<PathBuf> {
-    if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
-        bail!("WSL path must be an absolute POSIX path without traversal");
-    }
-    if distro.is_empty() || distro.contains(['\\', '/']) {
+    validate_canonical_absolute_posix(path)?;
+    if distro.is_empty()
+        || distro == "."
+        || distro == ".."
+        || distro
+            .chars()
+            .any(|character| character.is_control() || r#"\/:*?"<>|"#.contains(character))
+    {
         bail!("WSL distribution name is invalid");
     }
     let relative = path.trim_start_matches('/').replace('/', "\\");
@@ -1131,10 +1156,11 @@ mod tests {
     #[test]
     fn windows_wsl_paths_keep_host_io_separate_from_runtime_commands() {
         let distro = "Ubuntu-24.04";
-        let home = normalize_wsl_home(b" /home/natkins/\r\n").unwrap();
+        let home = normalize_wsl_home(b"/home/natkins").unwrap();
         let codex_home = wsl_posix_to_unc(distro, &format!("{home}/.codex")).unwrap();
         let requirements = wsl_posix_to_unc(distro, "/etc/codex/requirements.toml").unwrap();
         let agent = normalize_wsl_executable(b"/home/natkins/.local/bin/t-hub-agent\r\n").unwrap();
+        let project = host_project_path_for_distro("/home/natkins/project", distro).unwrap();
 
         assert_eq!(home, "/home/natkins");
         assert_eq!(
@@ -1144,6 +1170,10 @@ mod tests {
         assert_eq!(
             requirements.to_string_lossy(),
             r"\\wsl.localhost\Ubuntu-24.04\etc\codex\requirements.toml"
+        );
+        assert_eq!(
+            project.to_string_lossy(),
+            r"\\wsl.localhost\Ubuntu-24.04\home\natkins\project"
         );
         assert_eq!(agent, "/home/natkins/.local/bin/t-hub-agent");
         let command = managed_command(Path::new(&agent), "Stop");
@@ -1156,10 +1186,39 @@ mod tests {
     fn windows_wsl_path_contract_rejects_host_paths_and_traversal() {
         assert!(normalize_wsl_home(b"C:\\Users\\natha").is_err());
         assert!(normalize_wsl_home(b"/home/../root").is_err());
+        assert!(normalize_wsl_home(b"/home\\..\\root").is_err());
+        assert!(normalize_wsl_home(b"/home/natkins\n/root").is_err());
+        assert!(normalize_wsl_home(b"/home/natkins\0").is_err());
         assert!(normalize_wsl_executable(b"t-hub-agent").is_err());
         assert!(normalize_wsl_executable(b"/home/natkins/../bin/t-hub-agent").is_err());
+        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\n/root/bin/evil").is_err());
+        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\revil").is_err());
+        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\0").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", r"C:\Users\natha").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", "/home/../root").is_err());
+        assert!(wsl_posix_to_unc("Ubuntu-24.04", "/a\\..\\b").is_err());
+        assert!(wsl_posix_to_unc("Ubuntu-24.04", "/home/\0/root").is_err());
         assert!(wsl_posix_to_unc(r"Ubuntu\other", "/home/natkins").is_err());
+        assert!(host_project_path_for_distro(r"C:\Users\natha", "Ubuntu-24.04").is_err());
+        assert!(host_project_path_for_distro("relative/project", "Ubuntu-24.04").is_err());
+        assert!(host_project_path_for_distro(
+            r"\\wsl.localhost\Debian\home\natkins",
+            "Ubuntu-24.04"
+        )
+        .is_err());
+        assert!(host_project_path_for_distro("/a\\..\\b", "Ubuntu-24.04").is_err());
+        assert!(host_project_path_for_distro("/home/\n/root", "Ubuntu-24.04").is_err());
+        assert!(host_project_path_for_distro("/home/\0/root", "Ubuntu-24.04").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_windows_project_path_is_fail_closed() {
+        assert!(host_project_path(r"C:\Users\natha").is_err());
+        assert!(host_project_path("relative/project").is_err());
+        assert!(host_project_path(r"\\wsl.localhost\Debian\home\natkins").is_err());
+        assert!(host_project_path("/a\\..\\b").is_err());
+        assert!(host_project_path("/home/\n/root").is_err());
+        assert!(host_project_path("/home/\0/root").is_err());
     }
 }
