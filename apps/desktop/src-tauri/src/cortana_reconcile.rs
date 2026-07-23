@@ -188,6 +188,25 @@ pub struct CortanaLegacyQuarantine {
     pub quarantined_at: u64,
 }
 
+pub const MANAGED_QUARANTINE_BASIS_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CortanaManagedQuarantineBasis {
+    pub version: u32,
+    pub claim_ship_slug: String,
+    pub claim_assignment_id: String,
+    pub claim_terminal_id: String,
+    pub claim_harness: String,
+    pub owner: CortanaManagedOwnerToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_harness_attestation: Option<CortanaActiveHarnessAttestation>,
+    pub replacement_generation: u64,
+    pub prior_ledger_count: usize,
+    pub prior_ledger_sha256: String,
+    pub workspace_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CortanaDurableIdentity {
@@ -206,8 +225,8 @@ pub struct CortanaDurableIdentity {
     pub active_harness_attestation: Option<CortanaActiveHarnessAttestation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_harness_attestation_recovery: Option<CortanaActiveHarnessAttestationRecovery>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_quarantine: Option<CortanaLegacyQuarantine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantine_ledger: Vec<CortanaLegacyQuarantine>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_orphan_provenance: Option<CortanaLegacyOrphanProvenance>,
     #[serde(default)]
@@ -236,6 +255,8 @@ pub enum CortanaRecoveryState {
         orphan_generation: u64,
         harness: String,
         effect_identity: CortanaOrphanEffectIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        managed_basis: Option<Box<CortanaManagedQuarantineBasis>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replacement_identity_id: Option<String>,
     },
@@ -615,7 +636,7 @@ mod tests {
             managed_launch: None,
             active_harness_attestation: None,
             active_harness_attestation_recovery: None,
-            legacy_quarantine: None,
+            quarantine_ledger: Vec::new(),
             legacy_orphan_provenance: None,
             recovery: CortanaRecoveryState::Healthy {
                 operation_id: "startup-3".into(),

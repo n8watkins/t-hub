@@ -1241,7 +1241,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// provider-native Harness process identity before singleton publication.
 /// v27 binds the independently resolved provider entry point in Prepared before
 /// any managed effect and requires the first live observation to match it.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 30;
+/// v31 replaces the singular Cortana quarantine record with a bounded ledger so
+/// every still-live no-signal exclusion retains its exact identity and process
+/// generation while a later managed generation is replaced.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 31;
+const MAX_CORTANA_QUARANTINE_RECORDS: usize = 64;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 const MAX_CAPTAIN_DISPLAY_NAME_BYTES: usize = 120;
 const MAX_PENDING_FLEET_OPERATIONS: usize = 128;
@@ -3427,7 +3431,7 @@ impl CaptainsRegistry {
         let body = std::fs::read_to_string(path).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' could not be read: {error}", path.display()))
         })?;
-        let document: Value = serde_json::from_str(&body).map_err(|error| {
+        let mut document: Value = serde_json::from_str(&body).map_err(|error| {
             SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
         })?;
         let schema_version = document
@@ -3477,6 +3481,7 @@ impl CaptainsRegistry {
         let has_cortana_active_harness_attestation_recovery = document
             .pointer("/cortana/activeHarnessAttestationRecovery")
             .is_some();
+        let has_cortana_quarantine_ledger = document.pointer("/cortana/quarantineLedger").is_some();
         let has_trusted_harness_child = document
             .pointer(
                 "/cortana/managedLaunch/expectedHarnessLaunchProvenance/trustedChildExecutable",
@@ -3541,6 +3546,27 @@ impl CaptainsRegistry {
                 path: path.to_path_buf(),
             });
         }
+        if has_cortana_quarantine_ledger && schema_version < 31 {
+            return Err(SnapshotReadError::IncompatibleRecovery {
+                path: path.to_path_buf(),
+            });
+        }
+        if !has_cortana_quarantine_ledger {
+            if let Some(legacy_quarantine) = document.pointer("/cortana/legacyQuarantine").cloned()
+            {
+                let cortana = document
+                    .get_mut("cortana")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| SnapshotReadError::IncompatibleRecovery {
+                        path: path.to_path_buf(),
+                    })?;
+                cortana.insert(
+                    "quarantineLedger".into(),
+                    Value::Array(vec![legacy_quarantine]),
+                );
+                cortana.remove("legacyQuarantine");
+            }
+        }
         let has_recovery = has_release_recovery
             || has_cortana_orphan_recovery
             || has_cortana_legacy_provenance
@@ -3548,6 +3574,7 @@ impl CaptainsRegistry {
             || has_cortana_managed_launch
             || has_cortana_active_harness_attestation
             || has_cortana_active_harness_attestation_recovery
+            || has_cortana_quarantine_ledger
             || has_cortana_legacy_quarantine;
         let mut snapshot: CaptainsSnapshot = serde_json::from_value(document).map_err(|error| {
             if has_recovery {
@@ -4146,6 +4173,28 @@ impl CaptainsRegistry {
                     "durable Cortana has an invalid active Harness attestation recovery".into(),
                 );
             }
+            if durable.quarantine_ledger.len() > MAX_CORTANA_QUARANTINE_RECORDS {
+                return Err("durable Cortana quarantine ledger exceeds its bound".into());
+            }
+            for (index, quarantine) in durable.quarantine_ledger.iter().enumerate() {
+                if quarantine.terminal_id.trim().is_empty()
+                    || quarantine.identity_id.trim().is_empty()
+                    || quarantine.generation == 0
+                    || quarantine.harness.trim().is_empty()
+                    || !quarantine.authority_revoked
+                    || quarantine.quarantined_at == 0
+                    || !valid_cortana_effect_identity(&quarantine.tmux)
+                {
+                    return Err("durable Cortana quarantine ledger has invalid evidence".into());
+                }
+                if durable.quarantine_ledger[..index].iter().any(|prior| {
+                    prior.terminal_id == quarantine.terminal_id
+                        || prior.identity_id == quarantine.identity_id
+                        || prior.tmux == quarantine.tmux
+                }) {
+                    return Err("durable Cortana quarantine ledger has conflicting evidence".into());
+                }
+            }
             if let Some(launch) = durable.managed_launch.as_ref() {
                 let recovery_operation_id = match &durable.recovery {
                     crate::cortana_reconcile::CortanaRecoveryState::Recovering {
@@ -4234,8 +4283,56 @@ impl CaptainsRegistry {
                     orphan_generation,
                     harness,
                     effect_identity,
+                    managed_basis,
                     replacement_identity_id,
                 } => {
+                    let managed_basis_valid = managed_basis.as_ref().is_none_or(|basis| {
+                        basis.version == crate::cortana_reconcile::MANAGED_QUARANTINE_BASIS_VERSION
+                            && basis.claim_ship_slug == CORTANA_SLUG
+                            && !basis.claim_assignment_id.trim().is_empty()
+                            && basis.claim_terminal_id == *orphan_terminal_id
+                            && basis.claim_harness == *harness
+                            && same_cortana_tmux_generation(&basis.owner.tmux, effect_identity)
+                            && valid_cortana_managed_owner(&basis.owner)
+                            && basis.active_harness_attestation
+                                == durable.active_harness_attestation
+                            && basis.replacement_generation == orphan_generation.saturating_add(1)
+                            && basis.prior_ledger_count == durable.quarantine_ledger.len()
+                            && basis.prior_ledger_sha256
+                                == cortana_quarantine_ledger_sha256(&durable.quarantine_ledger)
+                            && durable.owner.as_ref() == Some(&basis.owner)
+                            && snapshot
+                                .captains
+                                .iter()
+                                .filter(|captain| {
+                                    captain.role == FleetRole::Cortana
+                                        && captain.state == ClaimState::Active
+                                })
+                                .count()
+                                == 1
+                            && snapshot.captains.iter().any(|captain| {
+                                captain.role == FleetRole::Cortana
+                                    && captain.state == ClaimState::Active
+                                    && captain.ship_slug == basis.claim_ship_slug
+                                    && captain.assignment_id == basis.claim_assignment_id
+                                    && captain.terminal_id.as_deref()
+                                        == Some(basis.claim_terminal_id.as_str())
+                                    && captain.harness.as_deref()
+                                        == Some(basis.claim_harness.as_str())
+                            })
+                            && basis.workspace_ids
+                                == snapshot
+                                    .workspaces
+                                    .iter()
+                                    .filter(|workspace| {
+                                        workspace
+                                            .tile_ids
+                                            .iter()
+                                            .any(|tile| tile == &basis.claim_terminal_id)
+                                    })
+                                    .map(|workspace| workspace.id.clone())
+                                    .collect::<Vec<_>>()
+                    });
                     if operation_id.trim().is_empty()
                         || *started_at == 0
                         || orphan_terminal_id.trim().is_empty()
@@ -4251,6 +4348,10 @@ impl CaptainsRegistry {
                         || durable.harness.as_deref() != Some(harness.as_str())
                         || snapshot.schema_version < 23
                         || !valid_cortana_effect_identity(effect_identity)
+                        || !managed_basis_valid
+                        || snapshot.schema_version >= 31
+                            && durable.owner.is_some()
+                            && managed_basis.is_none()
                     {
                         return Err(
                             "durable Cortana has an invalid orphan replacement operation".into(),
@@ -4264,7 +4365,11 @@ impl CaptainsRegistry {
                     legacy_generation,
                     replacement_identity_id,
                 } => {
-                    let quarantine = durable.legacy_quarantine.as_ref();
+                    let quarantine = durable.quarantine_ledger.iter().find(|quarantine| {
+                        quarantine.terminal_id == *legacy_terminal_id
+                            && quarantine.generation == *legacy_generation
+                            && quarantine.quarantined_at == *quarantined_at
+                    });
                     if operation_id.trim().is_empty()
                         || *quarantined_at == 0
                         || legacy_terminal_id.trim().is_empty()
@@ -5697,7 +5802,6 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
-    #[cfg(test)]
     fn prepare_cortana_orphan_replacement(
         &self,
         operation_id: &str,
@@ -5722,6 +5826,53 @@ impl CaptainsRegistry {
         {
             return Err("test orphan replacement evidence changed before prepare".into());
         }
+        let managed_basis = if let Some(owner) = current.cortana.owner.as_ref() {
+            if !same_cortana_tmux_generation(&owner.tmux, &effect_identity) {
+                return Err(
+                    "managed orphan replacement owner evidence changed before prepare".into(),
+                );
+            }
+            let claims = current
+                .captains
+                .iter()
+                .filter(|captain| {
+                    captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
+                })
+                .collect::<Vec<_>>();
+            if claims.len() != 1
+                || claims[0].terminal_id.as_deref() != Some(terminal_id)
+                || claims[0].harness.as_deref() != Some(harness)
+            {
+                return Err("managed orphan replacement claim changed before prepare".into());
+            }
+            let claim = claims[0];
+            Some(Box::new(
+                crate::cortana_reconcile::CortanaManagedQuarantineBasis {
+                    version: crate::cortana_reconcile::MANAGED_QUARANTINE_BASIS_VERSION,
+                    claim_ship_slug: claim.ship_slug.clone(),
+                    claim_assignment_id: claim.assignment_id.clone(),
+                    claim_terminal_id: terminal_id.to_string(),
+                    claim_harness: harness.to_string(),
+                    owner: owner.clone(),
+                    active_harness_attestation: current.cortana.active_harness_attestation.clone(),
+                    replacement_generation: generation.saturating_add(1),
+                    prior_ledger_count: current.cortana.quarantine_ledger.len(),
+                    prior_ledger_sha256: cortana_quarantine_ledger_sha256(
+                        &current.cortana.quarantine_ledger,
+                    ),
+                    workspace_ids: current
+                        .workspaces
+                        .iter()
+                        .filter(|workspace| {
+                            workspace.tile_ids.iter().any(|tile| tile == terminal_id)
+                        })
+                        .map(|workspace| workspace.id.clone())
+                        .collect(),
+                },
+            ))
+        } else {
+            None
+        };
         let previous = current.clone();
         current.cortana.terminal_id = Some(terminal_id.to_string());
         current.cortana.legacy_orphan_provenance = None;
@@ -5734,6 +5885,7 @@ impl CaptainsRegistry {
                 orphan_generation: generation,
                 harness: harness.to_string(),
                 effect_identity,
+                managed_basis,
                 replacement_identity_id: None,
             };
         current.seq = current.seq.saturating_add(1);
@@ -5772,6 +5924,14 @@ impl CaptainsRegistry {
             if active == operation_id
                 && legacy_terminal_id == terminal_id
                 && *legacy_generation == generation
+                && current.cortana.quarantine_ledger.iter().any(|quarantine| {
+                    quarantine.terminal_id == terminal_id
+                        && quarantine.identity_id == identity_id
+                        && quarantine.generation == generation
+                        && quarantine.harness == harness
+                        && quarantine.tmux == tmux
+                        && quarantine.authority_revoked
+                })
             {
                 return Ok(current.cortana.clone());
             }
@@ -5790,8 +5950,102 @@ impl CaptainsRegistry {
         if !matches_durable && !adopts_uninitialized {
             return Err("legacy Cortana identity changed before quarantine".into());
         }
+        if current.cortana.quarantine_ledger.len() >= MAX_CORTANA_QUARANTINE_RECORDS {
+            return Err("Cortana quarantine ledger is full; no authority was changed".into());
+        }
+        if current.cortana.quarantine_ledger.iter().any(|quarantine| {
+            quarantine.terminal_id == terminal_id
+                || quarantine.identity_id == identity_id
+                || quarantine.tmux == tmux
+        }) {
+            return Err("Cortana quarantine evidence conflicts with an existing record".into());
+        }
+        let managed_basis = match &current.cortana.recovery {
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                operation_id: active,
+                orphan_terminal_id,
+                orphan_identity_id,
+                orphan_generation,
+                harness: prepared_harness,
+                effect_identity,
+                managed_basis,
+                ..
+            } if active == operation_id
+                && orphan_terminal_id == terminal_id
+                && orphan_identity_id == identity_id
+                && *orphan_generation == generation
+                && prepared_harness == harness
+                && *effect_identity == tmux =>
+            {
+                managed_basis.clone()
+            }
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. } => {
+                return Err("Cortana quarantine WAL evidence changed before commit".into());
+            }
+            _ => None,
+        };
+        if let Some(basis) = managed_basis.as_ref() {
+            let workspace_ids = current
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.tile_ids.iter().any(|tile| tile == terminal_id))
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>();
+            if !same_cortana_tmux_generation(&basis.owner.tmux, &tmux)
+                || current.cortana.owner.as_ref() != Some(&basis.owner)
+                || basis.prior_ledger_count != current.cortana.quarantine_ledger.len()
+                || basis.prior_ledger_sha256
+                    != cortana_quarantine_ledger_sha256(&current.cortana.quarantine_ledger)
+                || basis.workspace_ids != workspace_ids
+            {
+                return Err("managed Cortana quarantine basis changed before commit".into());
+            }
+        }
         let quarantined_at = now_ms().max(1);
+        let active_cortana_claims = current
+            .captains
+            .iter()
+            .enumerate()
+            .filter(|(_, captain)| {
+                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if active_cortana_claims.len() > 1
+            || active_cortana_claims.first().is_some_and(|index| {
+                current.captains[*index].terminal_id.as_deref() != Some(terminal_id)
+            })
+        {
+            return Err("legacy Cortana quarantine Fleet claim is ambiguous".into());
+        }
         let previous = current.clone();
+        if let Some(index) = active_cortana_claims.first().copied() {
+            let claim = &mut current.captains[index];
+            claim.state = ClaimState::Orphaned {
+                since: quarantined_at,
+            };
+            claim.terminal_id = None;
+            for crew in claim.crew.iter_mut() {
+                if matches!(crew.state, CrewState::Active) {
+                    crew.state = CrewState::Orphaned {
+                        since: quarantined_at,
+                    };
+                }
+            }
+        }
+        for workspace in &mut current.workspaces {
+            workspace.tile_ids.retain(|tile| tile != terminal_id);
+        }
+        if !current
+            .retired_fleet_tile_ids
+            .iter()
+            .any(|tile| tile == terminal_id)
+        {
+            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
+                current.retired_fleet_tile_ids.remove(0);
+            }
+            current.retired_fleet_tile_ids.push(terminal_id.to_string());
+        }
         current.cortana.identity_id = Some(identity_id.to_string());
         current.cortana.generation = generation;
         current.cortana.harness = Some(harness.to_string());
@@ -5800,8 +6054,10 @@ impl CaptainsRegistry {
         current.cortana.active_harness_attestation_recovery = None;
         current.cortana.terminal_id = None;
         current.cortana.legacy_orphan_provenance = None;
-        current.cortana.legacy_quarantine =
-            Some(crate::cortana_reconcile::CortanaLegacyQuarantine {
+        current
+            .cortana
+            .quarantine_ledger
+            .push(crate::cortana_reconcile::CortanaLegacyQuarantine {
                 terminal_id: terminal_id.to_string(),
                 identity_id: identity_id.to_string(),
                 generation,
@@ -10150,6 +10406,19 @@ impl CaptainControlLeases {
             .iter()
             .find(|(candidate, _)| ct_token_eq(candidate, secret))
             .map(|(_, lease)| lease.clone())
+    }
+
+    fn revoke_identity(&self, identity_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(secret) = state.by_identity.remove(identity_id) {
+            state.by_secret.remove(&secret);
+        }
+        state
+            .by_secret
+            .retain(|_, lease| lease.identity_id != identity_id);
     }
 
     #[cfg(test)]
@@ -19030,6 +19299,14 @@ fn valid_cortana_effect_identity(
         && identity.foreground_process_session_id == identity.pane_process_session_id
 }
 
+fn cortana_quarantine_ledger_sha256(
+    ledger: &[crate::cortana_reconcile::CortanaLegacyQuarantine],
+) -> String {
+    let canonical = serde_json::to_vec(ledger)
+        .expect("Cortana quarantine evidence is always JSON serializable");
+    format!("{:x}", Sha256::digest(canonical))
+}
+
 fn valid_cortana_python_tool(tool: &crate::cortana_reconcile::CortanaExecutableIdentity) -> bool {
     (tool.path == "/usr/bin/python3"
         || tool
@@ -19647,13 +19924,51 @@ fn discover_cortana_runtimes(
             },
         );
     }
-    let quarantined_terminal = durable
-        .legacy_quarantine
-        .as_ref()
-        .map(|quarantine| quarantine.terminal_id.as_str());
+    for quarantine in &durable.quarantine_ledger {
+        match by_terminal.get(&quarantine.terminal_id) {
+            Some(candidate)
+                if candidate.generation == quarantine.generation
+                    && candidate.harness == quarantine.harness
+                    && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+                    && candidate.harness_process
+                        == crate::cortana_reconcile::RuntimeEvidence::Alive
+                    && candidate.identity_id.is_none()
+                    && !candidate.identity_bound_to_terminal
+                    && candidate.unresolved_session_bearer
+                    && candidate.effect_identity.as_ref() == Some(&quarantine.tmux)
+                    && !candidate.current_control_capability
+                    && !candidate.trusted_cortana_identity => {}
+            Some(_) => {
+                return Err(format!(
+                    "reconcile_cortana: quarantined runtime '{}' changed identity, authority, liveness, or process generation",
+                    quarantine.terminal_id
+                ));
+            }
+            None => match tmux::session_liveness(&tmux_target(&quarantine.terminal_id)) {
+                tmux::SessionLiveness::Gone => {}
+                tmux::SessionLiveness::Alive => {
+                    return Err(format!(
+                        "reconcile_cortana: quarantined runtime '{}' moved outside its reserved scope",
+                        quarantine.terminal_id
+                    ));
+                }
+                tmux::SessionLiveness::Unknown => {
+                    return Err(retryable_error(format!(
+                        "reconcile_cortana: quarantined runtime '{}' has uncertain liveness",
+                        quarantine.terminal_id
+                    )));
+                }
+            },
+        }
+    }
     Ok(by_terminal
         .into_values()
-        .filter(|candidate| Some(candidate.terminal_id.as_str()) != quarantined_terminal)
+        .filter(|candidate| {
+            !durable
+                .quarantine_ledger
+                .iter()
+                .any(|quarantine| quarantine.terminal_id == candidate.terminal_id)
+        })
         .collect())
 }
 
@@ -19712,8 +20027,12 @@ fn observed_launch_matches_recovery(
                 && launch.generation == legacy_generation.saturating_add(1)
                 && launch.terminal_id != *legacy_terminal_id
                 && durable
-                    .legacy_quarantine
-                    .as_ref()
+                    .quarantine_ledger
+                    .iter()
+                    .find(|quarantine| {
+                        quarantine.terminal_id == *legacy_terminal_id
+                            && quarantine.generation == *legacy_generation
+                    })
                     .is_some_and(|quarantine| quarantine.harness == launch.harness)
         }
         _ => false,
@@ -20085,6 +20404,57 @@ fn revalidate_active_cortana_authority(
     }
 }
 
+fn revalidate_unresolved_cortana_attestation(
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+) -> Result<(), String> {
+    let Some(attestation) = durable.active_harness_attestation.as_ref() else {
+        return Ok(());
+    };
+    let identity_id = durable
+        .identity_id
+        .as_deref()
+        .ok_or("unresolved Cortana attestation has no durable identity")?;
+    let terminal_id = durable
+        .terminal_id
+        .as_deref()
+        .ok_or("unresolved Cortana attestation has no durable terminal")?;
+    let harness = match durable.harness.as_deref() {
+        Some("codex") => Harness::Codex,
+        Some("claude") => Harness::Claude,
+        _ => return Err("unresolved Cortana attestation has an unsupported Harness".into()),
+    };
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("unresolved Cortana attestation has no managed owner")?;
+    if !valid_cortana_active_harness_attestation(durable, attestation) {
+        return Err("unresolved Cortana Harness attestation is structurally invalid".into());
+    }
+    let target = tmux_target(terminal_id);
+    tmux::revalidate_managed_runtime_owner(&target, &tmux_cortana_owner(owner))
+        .map_err(|error| format!("unresolved Cortana managed owner changed: {error}"))?;
+    let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
+        .map_err(|error| format!("unresolved Cortana bearer inspection failed: {error}"))?
+        .filter(|bearer| !bearer.is_empty())
+        .ok_or("unresolved Cortana runtime has no retained session bearer")?;
+    let observed = crate::harness::observe_scoped_harness_process(
+        &target,
+        harness,
+        &attestation.expected_launch_provenance,
+        identity_id,
+        &bearer,
+        &owner.cgroup_path,
+        owner.tmux.pane_start_ticks,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .map_err(|error| format!("unresolved Cortana Harness attestation failed: {error}"))?;
+    if observed == attestation.process {
+        Ok(())
+    } else {
+        Err("unresolved Cortana Harness process identity changed".into())
+    }
+}
+
 fn observe_live_cortana_with_expected_provenance(
     ctx: &ControlContext,
     durable: &crate::cortana_reconcile::CortanaDurableIdentity,
@@ -20293,7 +20663,7 @@ fn finalize_observed_cortana_launch(
     }
     let action = if durable.identity_id.is_none()
         && durable.generation == 0
-        && durable.legacy_quarantine.is_none()
+        && durable.quarantine_ledger.is_empty()
     {
         crate::cortana_reconcile::CortanaReconcileAction::Create
     } else {
@@ -20309,10 +20679,10 @@ fn finalize_observed_cortana_launch(
         provider_session_id.as_deref(),
     )?;
     let quarantined = durable
-        .legacy_quarantine
-        .as_ref()
-        .map(|quarantine| vec![quarantine.terminal_id.clone()])
-        .unwrap_or_default();
+        .quarantine_ledger
+        .iter()
+        .map(|quarantine| quarantine.terminal_id.clone())
+        .collect();
     let _ = captains_sync_apply(ctx);
     Ok(cortana_reconcile_response(
         operation_id,
@@ -20847,6 +21217,55 @@ fn retirable_legacy_cortana_orphan(
         .then(|| candidate.clone())
 }
 
+fn retirable_unattested_managed_cortana_incumbent(
+    ctx: &ControlContext,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+    candidates: &[crate::cortana_reconcile::CortanaRuntimeCandidate],
+) -> Option<crate::cortana_reconcile::CortanaRuntimeCandidate> {
+    let identity_id = durable.identity_id.as_deref()?;
+    let terminal_id = durable.terminal_id.as_deref()?;
+    let harness = durable.harness.as_deref()?;
+    let owner = durable.owner.as_ref()?;
+    if durable.generation == 0
+        || durable.managed_launch.is_some()
+        || durable.active_harness_attestation_recovery.is_some()
+        || ctx.identity.get(identity_id).is_some()
+        || candidates.len() != 1
+    {
+        return None;
+    }
+    let active_claims = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .filter(|captain| captain.role == FleetRole::Cortana && captain.state == ClaimState::Active)
+        .collect::<Vec<_>>();
+    if active_claims.len() != 1 || active_claims[0].terminal_id.as_deref() != Some(terminal_id) {
+        return None;
+    }
+    let candidate = &candidates[0];
+    (candidate.terminal_id == terminal_id
+        && candidate.identity_id.is_none()
+        && candidate.generation == durable.generation
+        && candidate.harness == harness
+        && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+        && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
+        && !candidate.identity_bound_to_terminal
+        && candidate.unresolved_session_bearer
+        && candidate
+            .effect_identity
+            .as_ref()
+            .is_some_and(|effect| same_cortana_tmux_generation(effect, &owner.tmux))
+        && valid_cortana_effect_identity(&owner.tmux)
+        && candidate.canonical_control_file
+        && candidate.rotating_control_env_scrubbed
+        && !candidate.stale_legacy_control_env
+        && !candidate.current_control_capability
+        && !candidate.trusted_cortana_identity)
+        .then(|| candidate.clone())
+}
+
 fn reconcile_cortana_inner(
     ctx: &ControlContext,
     args: &Value,
@@ -21080,18 +21499,83 @@ fn reconcile_cortana_inner(
         }
     }
 
+    if !matches!(
+        durable.recovery,
+        crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan { .. }
+    ) {
+        if let Some(incumbent) =
+            retirable_unattested_managed_cortana_incumbent(ctx, &durable, &candidates)
+        {
+            revalidate_unresolved_cortana_attestation(&durable)?;
+            let identity_id = durable
+                .identity_id
+                .as_deref()
+                .expect("managed quarantine requires a durable identity");
+            let harness = durable
+                .harness
+                .as_deref()
+                .expect("managed quarantine requires a durable harness");
+            let effect_identity = incumbent
+                .effect_identity
+                .expect("managed quarantine requires exact process evidence");
+            durable = ctx.captains.prepare_cortana_orphan_replacement(
+                operation_id,
+                &incumbent.terminal_id,
+                identity_id,
+                durable.generation,
+                harness,
+                effect_identity,
+            )?;
+        }
+    }
+
     if let crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
         orphan_terminal_id,
         orphan_identity_id,
         orphan_generation,
         harness,
         effect_identity,
+        managed_basis,
         ..
     } = durable.recovery.clone()
     {
-        if ctx.captains.snapshot().captains.iter().any(|captain| {
-            captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
-        }) {
+        let snapshot = ctx.captains.snapshot();
+        let active_claims = snapshot
+            .captains
+            .iter()
+            .filter(|captain| {
+                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
+            })
+            .collect::<Vec<_>>();
+        if let Some(basis) = managed_basis.as_ref() {
+            if active_claims.len() != 1
+                || active_claims[0].ship_slug != basis.claim_ship_slug
+                || active_claims[0].assignment_id != basis.claim_assignment_id
+                || active_claims[0].terminal_id.as_deref() != Some(basis.claim_terminal_id.as_str())
+                || active_claims[0].harness.as_deref() != Some(basis.claim_harness.as_str())
+                || basis.claim_terminal_id != orphan_terminal_id
+                || basis.claim_harness != harness
+                || !same_cortana_tmux_generation(&basis.owner.tmux, &effect_identity)
+                || basis.replacement_generation != orphan_generation.saturating_add(1)
+                || basis.prior_ledger_count != durable.quarantine_ledger.len()
+                || basis.prior_ledger_sha256
+                    != cortana_quarantine_ledger_sha256(&durable.quarantine_ledger)
+            {
+                return Err(
+                    "reconcile_cortana: prepared managed quarantine authority is ambiguous".into(),
+                );
+            }
+            tmux::revalidate_managed_runtime_owner(
+                &tmux_target(&orphan_terminal_id),
+                &tmux_cortana_owner(&basis.owner),
+            )
+            .map_err(|error| {
+                format!(
+                    "reconcile_cortana: prepared managed incumbent owner changed after WAL: {error}"
+                )
+            })?;
+            revalidate_unresolved_cortana_attestation(&durable)?;
+        } else if !active_claims.is_empty() {
             return Err(
                 "reconcile_cortana: prepared legacy quarantine authority is ambiguous".into(),
             );
@@ -21117,6 +21601,13 @@ fn reconcile_cortana_inner(
                     .into(),
             );
         }
+        ctx.identity.revoke(&orphan_identity_id)?;
+        ctx.control_leases.revoke_identity(&orphan_identity_id);
+        if ctx.identity.get(&orphan_identity_id).is_some()
+            || !ctx.identity.is_revoked(&orphan_identity_id)
+        {
+            return Err("reconcile_cortana: prepared quarantine identity burn is ambiguous".into());
+        }
         durable = ctx.captains.quarantine_legacy_cortana(
             operation_id,
             &orphan_terminal_id,
@@ -21126,7 +21617,14 @@ fn reconcile_cortana_inner(
             effect_identity,
         )?;
         ctx.tabs.retire_tile_locked(&orphan_terminal_id);
-        let _ = ctx.captains.remove_session(&orphan_terminal_id)?;
+        audit_cortana_runtime_mutation(
+            ctx,
+            "managed-unattested-quarantined-no-signal",
+            operation_id,
+            std::slice::from_ref(&orphan_terminal_id),
+            &[],
+            None,
+        );
     } else if durable.owner.is_none() && durable.terminal_id.is_some() {
         let terminal_id = durable.terminal_id.clone().unwrap();
         let identity_id = durable
@@ -21261,23 +21759,31 @@ fn reconcile_cortana_inner(
         );
     }
 
-    let replacement = durable.legacy_quarantine.as_ref().and_then(|quarantine| {
-        let replacement_identity_id = match &durable.recovery {
-            crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
-                replacement_identity_id,
-                ..
-            } => replacement_identity_id.clone(),
-            _ => return None,
-        };
-        Some((
-            quarantine.terminal_id.clone(),
-            quarantine.identity_id.clone(),
-            quarantine.generation,
-            quarantine.harness.clone(),
-            quarantine.tmux,
+    let replacement = match &durable.recovery {
+        crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined {
+            legacy_terminal_id,
+            legacy_generation,
             replacement_identity_id,
-        ))
-    });
+            ..
+        } => durable
+            .quarantine_ledger
+            .iter()
+            .find(|quarantine| {
+                quarantine.terminal_id == *legacy_terminal_id
+                    && quarantine.generation == *legacy_generation
+            })
+            .map(|quarantine| {
+                (
+                    quarantine.terminal_id.clone(),
+                    quarantine.identity_id.clone(),
+                    quarantine.generation,
+                    quarantine.harness.clone(),
+                    quarantine.tmux,
+                    replacement_identity_id.clone(),
+                )
+            }),
+        _ => None,
+    };
     if let Some((orphan_terminal_id, _, orphan_generation, harness, _, replacement_identity_id)) =
         &replacement
     {
@@ -30446,7 +30952,7 @@ fn evaluate_spawn_capacity(
                 message: format!("spawn refused: {message}"),
             }
         })?;
-    let capacity = runtime_capacity_from_evidence(
+    let mut capacity = runtime_capacity_from_evidence(
         ctx,
         &snapshot,
         &live,
@@ -30456,6 +30962,85 @@ fn evaluate_spawn_capacity(
         code: "refused-provider",
         message: format!("spawn refused: {message}"),
     })?;
+    let actual_live_sessions = capacity.live_sessions;
+    let configured_recovery_exclusions = if matches!(purpose, SpawnPurpose::Cortana)
+        && actual_live_sessions >= ctx.governor.max_sessions()
+        && matches!(
+            snapshot.cortana.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::LegacyUnownedQuarantined { .. }
+        ) {
+        let mut exclusions = 0usize;
+        for quarantine in &snapshot.cortana.quarantine_ledger {
+            let target = tmux_target(&quarantine.terminal_id);
+            if live.tmux_sessions.iter().any(|session| session == &target) {
+                let observed = tmux::observe_session_effect_identity(&target)
+                    .map(durable_cortana_effect_identity)
+                    .map_err(|error| crate::governor::Refusal {
+                        code: "refused-evidence",
+                        message: format!(
+                            "spawn refused: quarantined Cortana '{}' process evidence is unavailable: {error}",
+                            quarantine.terminal_id
+                        ),
+                    })?;
+                if observed != quarantine.tmux
+                    || !ctx.identity.is_revoked(&quarantine.identity_id)
+                    || tmux::harness_liveness(&target, &quarantine.harness)
+                        != tmux::SessionLiveness::Alive
+                {
+                    return Err(crate::governor::Refusal {
+                        code: "refused-evidence",
+                        message: format!(
+                            "spawn refused: quarantined Cortana '{}' no longer matches its exact revoked process evidence",
+                            quarantine.terminal_id
+                        ),
+                    });
+                }
+                exclusions = exclusions.saturating_add(1);
+            } else if tmux::session_liveness(&target) != tmux::SessionLiveness::Gone {
+                return Err(crate::governor::Refusal {
+                    code: "refused-evidence",
+                    message: format!(
+                        "spawn refused: quarantined Cortana '{}' has uncertain liveness",
+                        quarantine.terminal_id
+                    ),
+                });
+            }
+        }
+        exclusions
+    } else {
+        0
+    };
+    if configured_recovery_exclusions > 0 {
+        if actual_live_sessions.saturating_add(1) > crate::governor::HARD_SESSION_CEILING {
+            return Err(crate::governor::Refusal {
+                code: "refused-ceiling",
+                message: "spawn refused: Cortana recovery would exceed the hard session ceiling"
+                    .into(),
+            });
+        }
+        if !capacity.machine_healthy
+            || actual_live_sessions.saturating_add(1) > capacity.machine_session_capacity
+        {
+            return Err(crate::governor::Refusal {
+                code: "refused-machine",
+                message: "spawn refused: Cortana recovery exceeds healthy machine capacity".into(),
+            });
+        }
+        if requested_provider_lanes
+            > capacity
+                .provider_session_capacity
+                .saturating_sub(capacity.provider_live_sessions)
+        {
+            return Err(crate::governor::Refusal {
+                code: "refused-provider",
+                message: "spawn refused: Cortana recovery exceeds provider capacity".into(),
+            });
+        }
+        capacity.live_sessions = capacity
+            .live_sessions
+            .saturating_sub(configured_recovery_exclusions);
+    }
+    let configured_live_sessions = capacity.live_sessions;
     let request = crate::governor::DispatchPreflight {
         requested_lanes: vec![crate::governor::LaneClaim {
             lane_id: "spawn-admission".into(),
@@ -30481,7 +31066,7 @@ fn evaluate_spawn_capacity(
             message: refusal.message,
         })?;
     ctx.governor
-        .check_spawn(live.total_live_sessions, Instant::now())?;
+        .check_spawn(configured_live_sessions, Instant::now())?;
     Ok(capacity)
 }
 
@@ -45340,7 +45925,9 @@ int main(int argc, char **argv) {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let mut ctx = test_ctx("cortana-control").with_apply_sink(sink);
+        let mut ctx = test_ctx("cortana-control")
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_apply_sink(sink);
         ctx.addr = "127.0.0.1:4242".into();
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
@@ -45418,6 +46005,478 @@ int main(int argc, char **argv) {
         .unwrap();
         let _ = std::fs::remove_dir_all(harness_bin_dir);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_cortana_with_lost_session_authority_is_replaced_after_restart_without_signal() {
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let registry_path = captains_tmp("cortana-lost-session-authority");
+        let identity_path = captains_tmp("cortana-lost-session-authority-identities");
+        let captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let identities = Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let mut ctx = test_ctx("cortana-lost-session-authority-control")
+            .with_governor(Arc::new(SpawnGovernor::new(64, 600.0, 8.0)))
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_captains_registry(Arc::clone(&captains))
+            .with_identity_store(Arc::clone(&identities))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:4260".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![],
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-lost-session-authority-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let first = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "lost-session-authority-initial",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(first["healthy"], true);
+        let incumbent_terminal = first["terminalId"].as_str().unwrap().to_string();
+        let incumbent_identity = first["identityId"].as_str().unwrap().to_string();
+        let incumbent_target = exact_cortana_tmux_target(&incumbent_terminal).unwrap();
+        let incumbent_effect = tmux::observe_session_effect_identity(&incumbent_target).unwrap();
+        let incumbent_bearer =
+            tmux::session_environment(&incumbent_target, crate::identity::SESSION_TOKEN_ENV)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            tmux::session_environment(&incumbent_target, "T_HUB_CONTROL_ADDR").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            tmux::session_environment(&incumbent_target, "T_HUB_CONTROL_TOKEN").unwrap(),
+            Some(String::new())
+        );
+        let healthy_before_negative = captains.snapshot();
+        let healthy_candidates = discover_cortana_runtimes(
+            &ctx,
+            &files::posix_form(&home.to_string_lossy()),
+            &healthy_before_negative.cortana,
+        )
+        .unwrap();
+        assert!(retirable_unattested_managed_cortana_incumbent(
+            &ctx,
+            &healthy_before_negative.cortana,
+            &healthy_candidates,
+        )
+        .is_none());
+        assert_eq!(captains.snapshot().seq, healthy_before_negative.seq);
+        assert!(!identities.is_revoked(&incumbent_identity));
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect
+        );
+
+        identities.revoke(&incumbent_identity).unwrap();
+        assert!(identities.resolve(&incumbent_bearer).is_none());
+        drop(ctx);
+        drop(captains);
+        drop(identities);
+
+        let restarted_captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let restarted_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let mut restarted = test_ctx("cortana-lost-session-authority-restart")
+            .with_governor(Arc::new(SpawnGovernor::new(64, 600.0, 8.0)))
+            .with_live_sessions({
+                let incumbent_target = incumbent_target.clone();
+                move || Ok(vec![incumbent_target.clone()])
+            })
+            .with_captains_registry(Arc::clone(&restarted_captains))
+            .with_identity_store(Arc::clone(&restarted_identities))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        restarted.addr = "127.0.0.1:4261".into();
+        restarted.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![incumbent_terminal.clone()],
+        }]);
+        let durable_before_recovery = restarted_captains.cortana_identity();
+        let candidates_before_recovery = discover_cortana_runtimes(
+            &restarted,
+            &files::posix_form(&home.to_string_lossy()),
+            &durable_before_recovery,
+        )
+        .unwrap();
+        let prepared_incumbent = retirable_unattested_managed_cortana_incumbent(
+                &restarted,
+                &durable_before_recovery,
+                &candidates_before_recovery,
+            )
+            .unwrap_or_else(|| panic!(
+                "durable={durable_before_recovery:#?} candidates={candidates_before_recovery:#?} claims={:#?}",
+                restarted_captains.snapshot().captains,
+            ));
+        let seq_before_mismatch = restarted_captains.snapshot().seq;
+        let mut mismatched_candidates = candidates_before_recovery.clone();
+        mismatched_candidates[0]
+            .effect_identity
+            .as_mut()
+            .unwrap()
+            .pane_start_ticks = mismatched_candidates[0]
+            .effect_identity
+            .as_ref()
+            .unwrap()
+            .pane_start_ticks
+            .saturating_add(1);
+        assert!(retirable_unattested_managed_cortana_incumbent(
+            &restarted,
+            &durable_before_recovery,
+            &mismatched_candidates,
+        )
+        .is_none());
+        let mut mismatched_attestation = durable_before_recovery.clone();
+        mismatched_attestation
+            .active_harness_attestation
+            .as_mut()
+            .unwrap()
+            .process
+            .start_ticks = mismatched_attestation
+            .active_harness_attestation
+            .as_ref()
+            .unwrap()
+            .process
+            .start_ticks
+            .saturating_add(1);
+        assert!(revalidate_unresolved_cortana_attestation(&mismatched_attestation).is_err());
+        assert_eq!(restarted_captains.snapshot().seq, seq_before_mismatch);
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect
+        );
+        revalidate_unresolved_cortana_attestation(&durable_before_recovery).unwrap();
+        restarted_captains
+            .begin_cortana_recovery("lost-session-authority-replacement")
+            .unwrap();
+        restarted_captains
+            .prepare_cortana_orphan_replacement(
+                "lost-session-authority-replacement",
+                &prepared_incumbent.terminal_id,
+                durable_before_recovery.identity_id.as_deref().unwrap(),
+                durable_before_recovery.generation,
+                durable_before_recovery.harness.as_deref().unwrap(),
+                prepared_incumbent.effect_identity.unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            restarted_captains.cortana_identity().recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                managed_basis: Some(_),
+                ..
+            }
+        ));
+        drop(restarted);
+        drop(restarted_captains);
+        drop(restarted_identities);
+
+        let restarted_captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let restarted_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let mut restarted = test_ctx("cortana-lost-session-authority-wal-restart")
+            .with_governor(Arc::new(SpawnGovernor::new(64, 600.0, 8.0)))
+            .with_live_sessions({
+                let incumbent_target = incumbent_target.clone();
+                move || Ok(vec![incumbent_target.clone()])
+            })
+            .with_captains_registry(Arc::clone(&restarted_captains))
+            .with_identity_store(Arc::clone(&restarted_identities))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        restarted.addr = "127.0.0.1:4261".into();
+        restarted.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![incumbent_terminal.clone()],
+        }]);
+        let recovered = dispatch(
+            &restarted,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "lost-session-authority-replacement",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(recovered["action"], "recover", "{recovered:#}");
+        assert_eq!(recovered["healthy"], true);
+        assert_eq!(recovered["generation"], 2);
+        assert_ne!(recovered["terminalId"], incumbent_terminal);
+        assert_eq!(
+            tmux::session_liveness(&incumbent_target),
+            tmux::SessionLiveness::Alive,
+            "the exact invalid incumbent must be quarantined without a signal"
+        );
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect,
+            "the quarantined process generation must remain unchanged"
+        );
+        let denied = dispatch_authenticated(
+            &restarted,
+            req_session(
+                &restarted.token,
+                &incumbent_bearer,
+                "register_project",
+                json!({"rootPath": "/tmp/lost-session-authority-must-not-register"}),
+            ),
+        );
+        assert!(!denied.ok);
+        let replacement_terminal = recovered["terminalId"].as_str().unwrap().to_string();
+        let replacement_identity = recovered["identityId"].as_str().unwrap().to_string();
+        let replacement_target = exact_cortana_tmux_target(&replacement_terminal).unwrap();
+        let replacement_effect =
+            tmux::observe_session_effect_identity(&replacement_target).unwrap();
+        let replacement_bearer =
+            tmux::session_environment(&replacement_target, crate::identity::SESSION_TOKEN_ENV)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            restarted_captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana
+                    && captain.state == ClaimState::Active)
+                .count(),
+            1
+        );
+        assert_eq!(
+            restarted_captains
+                .cortana_identity()
+                .quarantine_ledger
+                .len(),
+            1
+        );
+
+        restarted_identities.revoke(&replacement_identity).unwrap();
+        assert!(restarted_identities.resolve(&replacement_bearer).is_none());
+        drop(restarted);
+        drop(restarted_captains);
+        drop(restarted_identities);
+
+        let mut native_document: Value =
+            serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        let native_cortana = native_document
+            .get_mut("cortana")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        native_cortana.remove("activeHarnessAttestation");
+        native_cortana.insert("providerSessionId".into(), Value::Null);
+        native_cortana.insert("conversationId".into(), Value::Null);
+        native_cortana.insert(
+            "recovery".into(),
+            json!({
+                "kind": "degraded",
+                "operation_id": "native-lost-session-authority",
+                "reason": "live managed runtime lost authoritative session identity and control evidence",
+                "detected_at": now_ms().max(1),
+            }),
+        );
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&native_document).unwrap(),
+        )
+        .unwrap();
+
+        let native_captains = Arc::new(CaptainsRegistry::load(registry_path.clone()));
+        let native_identities =
+            Arc::new(crate::identity::IdentityStore::load(identity_path.clone()));
+        let mut native = test_ctx("cortana-native-lost-session-authority")
+            .with_governor(Arc::new(SpawnGovernor::new(2, 600.0, 8.0)))
+            .with_live_sessions({
+                let incumbent_target = incumbent_target.clone();
+                let replacement_target = replacement_target.clone();
+                move || Ok(vec![incumbent_target.clone(), replacement_target.clone()])
+            })
+            .with_metrics(Arc::new(|| {
+                Ok(t_hub_protocol::HostMetrics {
+                    mem_total_kib: 16_000_000,
+                    mem_available_kib: 8_000_000,
+                    swap_total_kib: 2_000_000,
+                    swap_free_kib: 1_500_000,
+                    cpu_count: 12,
+                    load_avg: [1.0, 0.5, 0.25],
+                    process_count: 432,
+                    distro: Some("test".into()),
+                    captured_at_ms: now_ms(),
+                })
+            }))
+            .with_captains_registry(Arc::clone(&native_captains))
+            .with_identity_store(Arc::clone(&native_identities))
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        native.addr = "127.0.0.1:4262".into();
+        native.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: vec![replacement_terminal.clone()],
+        }]);
+        let native = Arc::new(native);
+        let concurrent_start = Arc::new(std::sync::Barrier::new(5));
+        let mut concurrent_workers = Vec::new();
+        for _ in 0..4 {
+            let native = Arc::clone(&native);
+            let concurrent_start = Arc::clone(&concurrent_start);
+            let home = home.clone();
+            let harness_command = harness_command.clone();
+            concurrent_workers.push(std::thread::spawn(move || {
+                concurrent_start.wait();
+                dispatch(
+                    &native,
+                    "reconcile_cortana",
+                    &json!({
+                        "operationId": "native-lost-session-authority-replacement",
+                        "testOrchestratorHome": home,
+                        "testStartupCommand": harness_command,
+                    }),
+                )
+                .unwrap()
+            }));
+        }
+        concurrent_start.wait();
+        let concurrent_results = concurrent_workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let native_recovered = concurrent_results
+            .iter()
+            .find(|result| result["action"] == "recover")
+            .cloned()
+            .expect("one concurrent caller must perform the recovery");
+        assert_eq!(
+            concurrent_results
+                .iter()
+                .filter(|result| result["action"] == "recover")
+                .count(),
+            1
+        );
+        assert!(concurrent_results.iter().all(|result| {
+            result["generation"] == 3
+                && result["terminalId"] == native_recovered["terminalId"]
+                && matches!(result["action"].as_str(), Some("recover" | "keep"))
+        }));
+        assert_eq!(
+            native_recovered["action"], "recover",
+            "{native_recovered:#}"
+        );
+        assert_eq!(native_recovered["healthy"], true);
+        assert_eq!(native_recovered["generation"], 3);
+        let generation_three_terminal =
+            native_recovered["terminalId"].as_str().unwrap().to_string();
+        assert_ne!(generation_three_terminal, replacement_terminal);
+        assert_eq!(
+            tmux::session_liveness(&incumbent_target),
+            tmux::SessionLiveness::Alive
+        );
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect
+        );
+        assert_eq!(
+            tmux::session_liveness(&replacement_target),
+            tmux::SessionLiveness::Alive
+        );
+        assert_eq!(
+            tmux::observe_session_effect_identity(&replacement_target).unwrap(),
+            replacement_effect
+        );
+        let native_durable = native_captains.cortana_identity();
+        assert_eq!(native_durable.quarantine_ledger.len(), 2);
+        assert_eq!(
+            native_durable.quarantine_ledger[0].terminal_id,
+            incumbent_terminal
+        );
+        assert_eq!(
+            native_durable.quarantine_ledger[1].terminal_id,
+            replacement_terminal
+        );
+        assert!(native_identities.is_revoked(&incumbent_identity));
+        assert!(native_identities.is_revoked(&replacement_identity));
+        for bearer in [&incumbent_bearer, &replacement_bearer] {
+            let denied = dispatch_authenticated(
+                &native,
+                req_session(
+                    &native.token,
+                    bearer,
+                    "register_project",
+                    json!({"rootPath": "/tmp/quarantined-cortana-must-not-register"}),
+                ),
+            );
+            assert!(!denied.ok);
+        }
+        let stale_workspace_report = dispatch(
+            &native,
+            "report_workspace_tabs",
+            &json!({
+                "tabs": [{
+                    "id": CAPTAIN_WORKSPACE_ID,
+                    "name": CAPTAIN_WORKSPACE_NAME,
+                    "tileIds": [replacement_terminal.clone()],
+                }]
+            }),
+        );
+        assert!(stale_workspace_report.is_err());
+        assert_eq!(
+            native_captains.cortana_identity().terminal_id.as_deref(),
+            Some(generation_three_terminal.as_str())
+        );
+        assert_eq!(
+            native_captains
+                .snapshot()
+                .captains
+                .iter()
+                .filter(|captain| captain.role == FleetRole::Cortana
+                    && captain.state == ClaimState::Active)
+                .filter_map(|captain| captain.terminal_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![generation_three_terminal.as_str()]
+        );
+
+        let after_restart = dispatch(
+            &native,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "lost-session-authority-after-restart",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        assert_eq!(after_restart["action"], "keep");
+        assert_eq!(after_restart["terminalId"], generation_three_terminal);
+        assert_eq!(after_restart["generation"], 3);
+
+        dispatch(
+            &native,
+            "close_terminal",
+            &json!({ "sessionId": generation_three_terminal }),
+        )
+        .unwrap();
+        reap_test_tmux_session_and_assert_absent(&incumbent_target);
+        reap_test_tmux_session_and_assert_absent(&replacement_target);
+        std::fs::remove_dir_all(harness_bin_dir).ok();
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_file(registry_path).ok();
+        std::fs::remove_file(identity_path).ok();
     }
 
     #[test]
@@ -45514,6 +46573,7 @@ int main(int argc, char **argv) {
             calls: StdMutex::new(Vec::new()),
         });
         let mut ctx = test_ctx("schema18-orphan-control")
+            .with_live_sessions(|| Ok(Vec::new()))
             .with_captains_registry(captains.clone())
             .with_identity_store(identities.clone())
             .with_apply_sink(sink);
@@ -45604,8 +46664,8 @@ int main(int argc, char **argv) {
         assert_eq!(
             durable
                 .cortana
-                .legacy_quarantine
-                .as_ref()
+                .quarantine_ledger
+                .last()
                 .map(|quarantine| quarantine.terminal_id.as_str()),
             Some(orphan_terminal.as_str())
         );
@@ -45705,6 +46765,7 @@ int main(int argc, char **argv) {
 
         let build_ctx = |token: &str| {
             let mut ctx = test_ctx(token)
+                .with_live_sessions(|| Ok(Vec::new()))
                 .with_captains_registry(captains.clone())
                 .with_identity_store(identities.clone())
                 .with_apply_sink(Arc::new(RecordingSink {
@@ -45796,8 +46857,8 @@ int main(int argc, char **argv) {
         assert_eq!(
             captains
                 .cortana_identity()
-                .legacy_quarantine
-                .as_ref()
+                .quarantine_ledger
+                .last()
                 .map(|quarantine| quarantine.terminal_id.as_str()),
             Some(terminal_id)
         );
@@ -45918,6 +46979,111 @@ int main(int argc, char **argv) {
             foreground_start_ticks: u64::from(seed) + 7,
             foreground_process_group_id: seed + 6,
             foreground_process_session_id: seed + 4,
+        }
+    }
+
+    #[test]
+    fn schema30_singular_cortana_quarantine_migrates_to_canonical_ledger() {
+        let path = captains_tmp("schema30-singular-cortana-quarantine");
+        let effect = test_cortana_effect_identity(31);
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 30,
+                "seq": 9,
+                "captains": [],
+                "workspaces": [{
+                    "id": CAPTAIN_WORKSPACE_ID,
+                    "name": CAPTAIN_WORKSPACE_NAME,
+                    "kind": "captain",
+                    "tileIds": [],
+                }],
+                "cortana": {
+                    "identityId": "schema30-burned-identity",
+                    "generation": 1,
+                    "terminalId": null,
+                    "harness": "codex",
+                    "legacyQuarantine": {
+                        "terminalId": "deadbeef",
+                        "identityId": "schema30-burned-identity",
+                        "generation": 1,
+                        "harness": "codex",
+                        "tmux": effect,
+                        "authorityRevoked": true,
+                        "quarantinedAt": 8,
+                    },
+                    "recovery": {
+                        "kind": "legacyUnownedQuarantined",
+                        "operation_id": "schema30-quarantine",
+                        "quarantined_at": 8,
+                        "legacy_terminal_id": "deadbeef",
+                        "legacy_generation": 1,
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let registry = CaptainsRegistry::load(path.clone());
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.cortana.quarantine_ledger.len(), 1);
+        assert_eq!(
+            snapshot.cortana.quarantine_ledger[0].terminal_id,
+            "deadbeef"
+        );
+        let canonical = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(canonical["schemaVersion"], CAPTAINS_SCHEMA_VERSION);
+        assert!(canonical.pointer("/cortana/quarantineLedger").is_some());
+        assert!(canonical.pointer("/cortana/legacyQuarantine").is_none());
+        let conflict_path = captains_tmp("schema31-conflicting-cortana-quarantine");
+        let mut conflicting = canonical;
+        let duplicate = conflicting["cortana"]["quarantineLedger"][0].clone();
+        conflicting["cortana"]["quarantineLedger"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        std::fs::write(
+            &conflict_path,
+            serde_json::to_vec_pretty(&conflicting).unwrap(),
+        )
+        .unwrap();
+        assert!(CaptainsRegistry::read_snapshot(&conflict_path).is_err());
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(conflict_path).ok();
+    }
+
+    #[test]
+    fn managed_quarantine_generation_allows_only_foreground_transition() {
+        let owner = test_cortana_effect_identity(41);
+        let mut harness = owner;
+        harness.foreground_pid = harness.foreground_pid.saturating_add(100);
+        harness.foreground_start_ticks = harness.foreground_start_ticks.saturating_add(100);
+        harness.foreground_process_group_id = harness.foreground_pid;
+        assert!(same_cortana_tmux_generation(&owner, &harness));
+        let mutations: [fn(&mut crate::cortana_reconcile::CortanaOrphanEffectIdentity); 6] = [
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.tmux_session_id = value.tmux_session_id.saturating_add(1)
+            },
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.tmux_session_created = value.tmux_session_created.saturating_add(1)
+            },
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.tmux_window_id = value.tmux_window_id.saturating_add(1)
+            },
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.tmux_pane_id = value.tmux_pane_id.saturating_add(1)
+            },
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.pane_pid = value.pane_pid.saturating_add(1)
+            },
+            |value: &mut crate::cortana_reconcile::CortanaOrphanEffectIdentity| {
+                value.pane_start_ticks = value.pane_start_ticks.saturating_add(1)
+            },
+        ];
+        for mutate in mutations {
+            let mut changed = harness;
+            mutate(&mut changed);
+            assert!(!same_cortana_tmux_generation(&owner, &changed));
         }
     }
 
@@ -46847,6 +48013,7 @@ int main(int argc, char **argv) {
             calls: StdMutex::new(Vec::new()),
         });
         let mut ctx = test_ctx("cortana-no-spawn-rate")
+            .with_live_sessions(|| Ok(Vec::new()))
             .with_apply_sink(sink)
             .with_governor(Arc::new(SpawnGovernor::new(64, 0.0, 1.0)));
         ctx.addr = "127.0.0.1:4249".into();
@@ -46922,7 +48089,9 @@ int main(int argc, char **argv) {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let mut ctx = test_ctx("cortana-concurrent").with_apply_sink(sink);
+        let mut ctx = test_ctx("cortana-concurrent")
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_apply_sink(sink);
         ctx.addr = "127.0.0.1:4243".into();
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
@@ -48691,7 +49860,9 @@ int main(int argc, char **argv) {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
-        let mut context = test_ctx("cortana-ancestry-deadline").with_apply_sink(sink);
+        let mut context = test_ctx("cortana-ancestry-deadline")
+            .with_live_sessions(|| Ok(Vec::new()))
+            .with_apply_sink(sink);
         context.addr = "127.0.0.1:4260".into();
         context.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
@@ -49731,6 +50902,7 @@ int main(int argc, char **argv) {
             calls: StdMutex::new(Vec::new()),
         });
         let mut context = test_ctx("ordered-provisioning")
+            .with_live_sessions(|| Ok(Vec::new()))
             .with_apply_sink(sink)
             .with_governor(Arc::new(SpawnGovernor::new(64, 600.0, 8.0)));
         context.addr = "127.0.0.1:4251".into();

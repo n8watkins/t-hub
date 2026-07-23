@@ -1540,7 +1540,7 @@ fn continuity_control_fixture() -> (
         managed_launch: None,
         active_harness_attestation: None,
         active_harness_attestation_recovery: None,
-        legacy_quarantine: None,
+        quarantine_ledger: Vec::new(),
         legacy_orphan_provenance: None,
         recovery: control::CortanaRecoveryState::Healthy {
             operation_id: "continuity-e2e".into(),
