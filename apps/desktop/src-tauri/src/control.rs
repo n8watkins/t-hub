@@ -5985,19 +5985,15 @@ impl CaptainsRegistry {
             _ => None,
         };
         if let Some(basis) = managed_basis.as_ref() {
-            let workspace_ids = current
-                .workspaces
-                .iter()
-                .filter(|workspace| workspace.tile_ids.iter().any(|tile| tile == terminal_id))
-                .map(|workspace| workspace.id.clone())
-                .collect::<Vec<_>>();
-            if !same_cortana_tmux_generation(&basis.owner.tmux, &tmux)
-                || current.cortana.owner.as_ref() != Some(&basis.owner)
-                || basis.prior_ledger_count != current.cortana.quarantine_ledger.len()
-                || basis.prior_ledger_sha256
-                    != cortana_quarantine_ledger_sha256(&current.cortana.quarantine_ledger)
-                || basis.workspace_ids != workspace_ids
-            {
+            if !managed_cortana_quarantine_basis_matches(
+                &current,
+                basis,
+                terminal_id,
+                identity_id,
+                generation,
+                harness,
+                &tmux,
+            ) {
                 return Err("managed Cortana quarantine basis changed before commit".into());
             }
         }
@@ -6011,7 +6007,8 @@ impl CaptainsRegistry {
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        if active_cortana_claims.len() > 1
+        if managed_basis.is_some() && active_cortana_claims.len() != 1
+            || managed_basis.is_none() && active_cortana_claims.len() > 1
             || active_cortana_claims.first().is_some_and(|index| {
                 current.captains[*index].terminal_id.as_deref() != Some(terminal_id)
             })
@@ -6078,6 +6075,83 @@ impl CaptainsRegistry {
         let result = current.cortana.clone();
         self.commit_mutation(current, previous)?;
         Ok(result)
+    }
+
+    fn validate_cortana_managed_quarantine_basis(
+        &self,
+        operation_id: &str,
+        terminal_id: &str,
+        identity_id: &str,
+        generation: u64,
+        harness: &str,
+        effect_identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+        basis: &crate::cortana_reconcile::CortanaManagedQuarantineBasis,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let current = self.lock();
+        let wal_matches = matches!(
+            &current.cortana.recovery,
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                operation_id: active,
+                orphan_terminal_id,
+                orphan_identity_id,
+                orphan_generation,
+                harness: prepared_harness,
+                effect_identity: prepared_effect,
+                managed_basis: Some(prepared_basis),
+                ..
+            } if active == operation_id
+                && orphan_terminal_id == terminal_id
+                && orphan_identity_id == identity_id
+                && *orphan_generation == generation
+                && prepared_harness == harness
+                && prepared_effect == effect_identity
+                && prepared_basis.as_ref() == basis
+        );
+        if wal_matches
+            && managed_cortana_quarantine_basis_matches(
+                &current,
+                basis,
+                terminal_id,
+                identity_id,
+                generation,
+                harness,
+                effect_identity,
+            )
+        {
+            Ok(())
+        } else {
+            Err("managed Cortana quarantine basis changed before authority burn".into())
+        }
+    }
+
+    #[cfg(test)]
+    fn set_cortana_quarantine_claim_assignment_for_test(
+        &self,
+        assignment_id: &str,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let claim = current
+            .captains
+            .iter_mut()
+            .find(|captain| {
+                captain.role == FleetRole::Cortana && captain.state == ClaimState::Active
+            })
+            .ok_or("test managed quarantine claim disappeared")?;
+        claim.assignment_id = assignment_id.to_string();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_cortana_quarantine_attestation_for_test(
+        &self,
+        attestation: Option<crate::cortana_reconcile::CortanaActiveHarnessAttestation>,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        current.cortana.active_harness_attestation = attestation;
+        Ok(())
     }
 
     fn mark_cortana_degraded(&self, operation_id: &str, reason: &str) -> Result<(), String> {
@@ -19307,6 +19381,61 @@ fn cortana_quarantine_ledger_sha256(
     format!("{:x}", Sha256::digest(canonical))
 }
 
+fn managed_cortana_quarantine_basis_matches(
+    current: &CaptainsInner,
+    basis: &crate::cortana_reconcile::CortanaManagedQuarantineBasis,
+    terminal_id: &str,
+    identity_id: &str,
+    generation: u64,
+    harness: &str,
+    effect_identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+) -> bool {
+    if basis.version != crate::cortana_reconcile::MANAGED_QUARANTINE_BASIS_VERSION
+        || basis.claim_terminal_id != terminal_id
+        || basis.claim_harness != harness
+        || !same_cortana_tmux_generation(&basis.owner.tmux, effect_identity)
+        || basis.replacement_generation != generation.saturating_add(1)
+        || current.cortana.identity_id.as_deref() != Some(identity_id)
+        || current.cortana.generation != generation
+        || current.cortana.terminal_id.as_deref() != Some(terminal_id)
+        || current.cortana.harness.as_deref() != Some(harness)
+        || current.cortana.owner.as_ref() != Some(&basis.owner)
+        || current.cortana.active_harness_attestation != basis.active_harness_attestation
+        || current
+            .cortana
+            .active_harness_attestation_recovery
+            .is_some()
+        || basis.prior_ledger_count != current.cortana.quarantine_ledger.len()
+        || basis.prior_ledger_sha256
+            != cortana_quarantine_ledger_sha256(&current.cortana.quarantine_ledger)
+    {
+        return false;
+    }
+    let claims = current
+        .captains
+        .iter()
+        .filter(|captain| captain.role == FleetRole::Cortana && captain.state == ClaimState::Active)
+        .collect::<Vec<_>>();
+    if claims.len() != 1 {
+        return false;
+    }
+    let claim = claims[0];
+    if claim.ship_slug != basis.claim_ship_slug
+        || claim.assignment_id != basis.claim_assignment_id
+        || claim.terminal_id.as_deref() != Some(basis.claim_terminal_id.as_str())
+        || claim.harness.as_deref() != Some(basis.claim_harness.as_str())
+    {
+        return false;
+    }
+    basis.workspace_ids
+        == current
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.tile_ids.iter().any(|tile| tile == terminal_id))
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>()
+}
+
 fn valid_cortana_python_tool(tool: &crate::cortana_reconcile::CortanaExecutableIdentity) -> bool {
     (tool.path == "/usr/bin/python3"
         || tool
@@ -21266,6 +21395,29 @@ fn retirable_unattested_managed_cortana_incumbent(
         .then(|| candidate.clone())
 }
 
+fn exact_unresolved_managed_cortana_candidate(
+    candidate: &crate::cortana_reconcile::CortanaRuntimeCandidate,
+    terminal_id: &str,
+    generation: u64,
+    harness: &str,
+    effect_identity: &crate::cortana_reconcile::CortanaOrphanEffectIdentity,
+) -> bool {
+    candidate.terminal_id == terminal_id
+        && candidate.identity_id.is_none()
+        && candidate.generation == generation
+        && candidate.harness == harness
+        && candidate.terminal == crate::cortana_reconcile::RuntimeEvidence::Alive
+        && candidate.harness_process == crate::cortana_reconcile::RuntimeEvidence::Alive
+        && !candidate.identity_bound_to_terminal
+        && candidate.unresolved_session_bearer
+        && candidate.effect_identity.as_ref() == Some(effect_identity)
+        && candidate.canonical_control_file
+        && candidate.rotating_control_env_scrubbed
+        && !candidate.stale_legacy_control_env
+        && !candidate.current_control_capability
+        && !candidate.trusted_cortana_identity
+}
+
 fn reconcile_cortana_inner(
     ctx: &ControlContext,
     args: &Value,
@@ -21580,10 +21732,29 @@ fn reconcile_cortana_inner(
                 "reconcile_cortana: prepared legacy quarantine authority is ambiguous".into(),
             );
         }
-        let candidate = candidates
+        let fresh_candidates = discover_cortana_runtimes(ctx, &home, &durable)?;
+        let candidate = fresh_candidates
             .iter()
             .find(|candidate| candidate.terminal_id == orphan_terminal_id);
-        if let Some(candidate) = candidate {
+        if managed_basis.is_some() {
+            if fresh_candidates.len() != 1
+                || candidate.is_none_or(|candidate| {
+                    !exact_unresolved_managed_cortana_candidate(
+                        candidate,
+                        &orphan_terminal_id,
+                        orphan_generation,
+                        &harness,
+                        &effect_identity,
+                    )
+                })
+                || ctx.identity.get(&orphan_identity_id).is_some()
+            {
+                return Err(
+                    "reconcile_cortana: prepared managed quarantine runtime changed after WAL"
+                        .into(),
+                );
+            }
+        } else if let Some(candidate) = candidate {
             if candidate.effect_identity.as_ref() != Some(&effect_identity)
                 || candidate.current_control_capability
                 || candidate.trusted_cortana_identity
@@ -21600,6 +21771,20 @@ fn reconcile_cortana_inner(
                 "reconcile_cortana: prepared legacy quarantine target is unavailable or ambiguous"
                     .into(),
             );
+        }
+        if let Some(basis) = managed_basis.as_deref() {
+            #[cfg(test)]
+            ctx.captains
+                .pause_dispatch("cortana_managed_quarantine_revalidated");
+            ctx.captains.validate_cortana_managed_quarantine_basis(
+                operation_id,
+                &orphan_terminal_id,
+                &orphan_identity_id,
+                orphan_generation,
+                &harness,
+                &effect_identity,
+                basis,
+            )?;
         }
         ctx.identity.revoke(&orphan_identity_id)?;
         ctx.control_leases.revoke_identity(&orphan_identity_id);
@@ -46205,6 +46390,152 @@ int main(int argc, char **argv) {
             name: CAPTAIN_WORKSPACE_NAME.into(),
             tile_ids: vec![incumbent_terminal.clone()],
         }]);
+        let gained_identity = restarted_identities
+            .mint(crate::identity::Role::Cortana)
+            .unwrap();
+        restarted_identities
+            .bind_tile(&gained_identity.id, &incumbent_terminal)
+            .unwrap();
+        tmux::set_session_environment(
+            &incumbent_target,
+            crate::identity::SESSION_TOKEN_ENV,
+            &gained_identity.secret,
+        )
+        .unwrap();
+        let seq_before_capability_gain = restarted_captains.snapshot().seq;
+        let capability_gain_error = dispatch(
+            &restarted,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "lost-session-authority-replacement",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            capability_gain_error.contains("runtime changed after WAL")
+                || capability_gain_error.contains("attestation failed"),
+            "{capability_gain_error}"
+        );
+        assert!(!restarted_identities.is_revoked(&gained_identity.id));
+        assert_eq!(
+            restarted_captains.snapshot().seq,
+            seq_before_capability_gain
+        );
+        assert!(restarted_captains
+            .cortana_identity()
+            .quarantine_ledger
+            .is_empty());
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect
+        );
+        tmux::set_session_environment(
+            &incumbent_target,
+            crate::identity::SESSION_TOKEN_ENV,
+            &incumbent_bearer,
+        )
+        .unwrap();
+        restarted_identities.retire(&gained_identity.id).unwrap();
+        let wal_durable = restarted_captains.cortana_identity();
+        let (
+            wal_effect,
+            wal_basis,
+            wal_identity,
+            wal_generation,
+            wal_harness,
+            original_assignment,
+            original_attestation,
+        ) = match &wal_durable.recovery {
+            crate::cortana_reconcile::CortanaRecoveryState::ReplacingOrphan {
+                orphan_identity_id,
+                orphan_generation,
+                harness,
+                effect_identity,
+                managed_basis: Some(basis),
+                ..
+            } => (
+                *effect_identity,
+                basis.clone(),
+                orphan_identity_id.clone(),
+                *orphan_generation,
+                harness.clone(),
+                basis.claim_assignment_id.clone(),
+                basis.active_harness_attestation.clone(),
+            ),
+            other => panic!("expected managed quarantine WAL, got {other:#?}"),
+        };
+        revalidate_unresolved_cortana_attestation(&wal_durable).unwrap();
+        let post_wal_candidates = discover_cortana_runtimes(
+            &restarted,
+            &files::posix_form(&home.to_string_lossy()),
+            &wal_durable,
+        )
+        .unwrap();
+        assert_eq!(post_wal_candidates.len(), 1);
+        assert!(exact_unresolved_managed_cortana_candidate(
+            &post_wal_candidates[0],
+            &incumbent_terminal,
+            wal_generation,
+            &wal_harness,
+            &wal_effect,
+        ));
+
+        restarted_captains
+            .set_cortana_quarantine_claim_assignment_for_test("changed-after-revalidation")
+            .unwrap();
+        assert!(restarted_captains
+            .validate_cortana_managed_quarantine_basis(
+                "lost-session-authority-replacement",
+                &incumbent_terminal,
+                &wal_identity,
+                wal_generation,
+                &wal_harness,
+                &wal_effect,
+                &wal_basis,
+            )
+            .is_err());
+        assert!(restarted_captains
+            .cortana_identity()
+            .quarantine_ledger
+            .is_empty());
+        restarted_captains
+            .set_cortana_quarantine_claim_assignment_for_test(&original_assignment)
+            .unwrap();
+
+        restarted_captains
+            .set_cortana_quarantine_attestation_for_test(None)
+            .unwrap();
+        assert!(restarted_captains
+            .validate_cortana_managed_quarantine_basis(
+                "lost-session-authority-replacement",
+                &incumbent_terminal,
+                &wal_identity,
+                wal_generation,
+                &wal_harness,
+                &wal_effect,
+                &wal_basis,
+            )
+            .is_err());
+        restarted_captains
+            .set_cortana_quarantine_attestation_for_test(original_attestation)
+            .unwrap();
+        assert!(restarted_captains
+            .validate_cortana_managed_quarantine_basis(
+                "lost-session-authority-replacement",
+                &incumbent_terminal,
+                &wal_identity,
+                wal_generation,
+                &wal_harness,
+                &wal_effect,
+                &wal_basis,
+            )
+            .is_ok());
+        assert_eq!(
+            tmux::observe_session_effect_identity(&incumbent_target).unwrap(),
+            incumbent_effect
+        );
         let recovered = dispatch(
             &restarted,
             "reconcile_cortana",
@@ -46330,6 +46661,78 @@ int main(int argc, char **argv) {
             name: CAPTAIN_WORKSPACE_NAME.into(),
             tile_ids: vec![replacement_terminal.clone()],
         }]);
+        let native_durable_before_wal = native_captains.cortana_identity();
+        let native_candidates_before_wal = discover_cortana_runtimes(
+            &native,
+            &files::posix_form(&home.to_string_lossy()),
+            &native_durable_before_wal,
+        )
+        .unwrap();
+        let native_incumbent = retirable_unattested_managed_cortana_incumbent(
+            &native,
+            &native_durable_before_wal,
+            &native_candidates_before_wal,
+        )
+        .expect("native invalid incumbent must have exact managed evidence");
+        native_captains
+            .begin_cortana_recovery("native-lost-session-authority-replacement")
+            .unwrap();
+        native_captains
+            .prepare_cortana_orphan_replacement(
+                "native-lost-session-authority-replacement",
+                &native_incumbent.terminal_id,
+                native_durable_before_wal.identity_id.as_deref().unwrap(),
+                native_durable_before_wal.generation,
+                native_durable_before_wal.harness.as_deref().unwrap(),
+                native_incumbent.effect_identity.unwrap(),
+            )
+            .unwrap();
+        let gained_native_identity = native_identities
+            .mint(crate::identity::Role::Cortana)
+            .unwrap();
+        native_identities
+            .bind_tile(&gained_native_identity.id, &replacement_terminal)
+            .unwrap();
+        tmux::set_session_environment(
+            &replacement_target,
+            crate::identity::SESSION_TOKEN_ENV,
+            &gained_native_identity.secret,
+        )
+        .unwrap();
+        let native_seq_before_gain = native_captains.snapshot().seq;
+        let native_gain_error = dispatch(
+            &native,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "native-lost-session-authority-replacement",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            native_gain_error.contains("runtime changed after WAL"),
+            "{native_gain_error}"
+        );
+        assert_eq!(native_captains.snapshot().seq, native_seq_before_gain);
+        assert!(!native_identities.is_revoked(&gained_native_identity.id));
+        assert_eq!(
+            native_captains.cortana_identity().quarantine_ledger.len(),
+            1
+        );
+        assert_eq!(
+            tmux::observe_session_effect_identity(&replacement_target).unwrap(),
+            replacement_effect
+        );
+        tmux::set_session_environment(
+            &replacement_target,
+            crate::identity::SESSION_TOKEN_ENV,
+            &replacement_bearer,
+        )
+        .unwrap();
+        native_identities
+            .retire(&gained_native_identity.id)
+            .unwrap();
         let native = Arc::new(native);
         let concurrent_start = Arc::new(std::sync::Barrier::new(5));
         let mut concurrent_workers = Vec::new();
