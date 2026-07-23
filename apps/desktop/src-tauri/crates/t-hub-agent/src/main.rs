@@ -63,6 +63,9 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 /// - `--codex-tap`     Structured Codex lifecycle ingest: read Codex `exec
 ///                     --json` or mirrored app-server JSONL from stdin and append
 ///                     normalized, credential-safe lifecycle events.
+/// - `--codex-hook <EVENT>` Native Codex hook ingest with an explicit provider
+///                          boundary, including payloads such as `SessionEnd`
+///                          that do not carry provider-distinguishing fields.
 /// - `--codex-unobserved` Record one credential-safe degraded marker for an
 ///                        interactive Codex TUI in its exact owning tmux pane
 ///                        when structured telemetry is unavailable.
@@ -91,6 +94,10 @@ enum Mode {
     Statusline,
     /// Structured Codex lifecycle ingest for headless and interactive telemetry.
     CodexTap,
+    /// Native interactive Codex lifecycle hook ingest.
+    CodexHook {
+        event: String,
+    },
     /// Explicit degraded marker for an interactive Codex TUI without lifecycle
     /// telemetry, bound to its exact owning tmux pane.
     CodexUnobserved,
@@ -118,6 +125,13 @@ fn parse_args() -> Args {
             },
             "--statusline" => mode = Mode::Statusline,
             "--codex-tap" => mode = Mode::CodexTap,
+            "--codex-hook" => match it.next() {
+                Some(event) => mode = Mode::CodexHook { event },
+                None => {
+                    eprintln!("t-hub-agent: --codex-hook requires an EVENT name argument");
+                    std::process::exit(1);
+                }
+            },
             "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
@@ -176,6 +190,17 @@ fn main() {
                 std::process::exit(1);
             }
         },
+
+        // ------------------------------------------------------------------
+        // --codex-hook <EVENT>: short-lived native hook ingest.
+        // ------------------------------------------------------------------
+        Mode::CodexHook { event } => {
+            if let Err(error) = codex::run_hook(&event, args.journal_dir.as_deref()) {
+                eprintln!("t-hub-agent --codex-hook {event}: unexpected error: {error:#}");
+            }
+            // Observation hooks must never block Codex.
+            std::process::exit(0);
+        }
 
         // ------------------------------------------------------------------
         // --codex-unobserved: record an explicit, pane-bound degraded marker.
@@ -246,7 +271,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, --codex-tap, or --codex-unobserved.",
+                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, --codex-tap, --codex-hook <EVENT>, or --codex-unobserved.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);

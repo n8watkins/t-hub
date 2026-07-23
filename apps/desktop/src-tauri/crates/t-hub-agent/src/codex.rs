@@ -14,7 +14,7 @@
 //! presence flags are sufficient for replay, deduplication, attention routing,
 //! and a later typed approval surface.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,7 +24,7 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 pub const LIFECYCLE_SCHEMA: &str = "t-hub.codex.lifecycle.v1";
 pub const PERMISSION_SCHEMA: &str = "t-hub.permission-request.v1";
-pub const VERIFIED_CODEX_VERSION: &str = "0.144.4";
+pub const VERIFIED_CODEX_VERSION: &str = "0.145.0";
 
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_ID_BYTES: usize = 512;
@@ -65,6 +65,47 @@ pub fn run(journal_dir: Option<&str>) -> anyhow::Result<TapOutcome> {
     let binding = TmuxBinding { pane, session };
     let stdin = std::io::stdin();
     ingest_reader(stdin.lock(), &journal, &binding)
+}
+
+/// Run one native Codex lifecycle hook through an explicit provider boundary.
+///
+/// Codex's `SessionEnd` payload intentionally omits `turn_id`, `model`, and
+/// `permission_mode`, so payload-shape detection cannot distinguish it from a
+/// Claude hook. Installed Codex hooks use this entrypoint instead of the shared
+/// `--hook` mode.
+pub fn run_hook(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
+    let mut raw = String::new();
+    std::io::stdin()
+        .lock()
+        .read_to_string(&mut raw)
+        .context("reading Codex hook JSON")?;
+    let payload: Value = match serde_json::from_str(&raw) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("t-hub-agent --codex-hook {hook_name}: failed parsing hook JSON: {error:#}");
+            Value::Null
+        }
+    };
+    let (pane, tmux_session) = crate::hook::resolve_tmux_pane();
+    let entry = entry_from_native_hook(hook_name, &payload, pane, tmux_session);
+    let dir = crate::journal::resolve_journal_dir(journal_dir);
+    let journal = match crate::journal::Journal::open(&dir) {
+        Ok(journal) => journal,
+        Err(error) => {
+            eprintln!(
+                "t-hub-agent --codex-hook {hook_name}: failed to open journal at {dir:?}: {error:#}"
+            );
+            return Ok(());
+        }
+    };
+    if let Some(entry) = entry {
+        if let Err(error) = journal.append(entry) {
+            eprintln!(
+                "t-hub-agent --codex-hook {hook_name}: failed to append journal entry: {error:#}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ingest_reader(
@@ -567,6 +608,15 @@ pub fn entry_from_hook(
     if !is_codex_hook(raw) {
         return None;
     }
+    entry_from_native_hook(hook_name, raw, pane, tmux_session)
+}
+
+fn entry_from_native_hook(
+    hook_name: &str,
+    raw: &Value,
+    pane: Option<String>,
+    tmux_session: Option<String>,
+) -> Option<EventJournalEntry> {
     let session_id = bounded_string(raw.get("session_id"), MAX_ID_BYTES);
     let turn_id = bounded_string(raw.get("turn_id"), MAX_ID_BYTES);
     let exact_session_id = exact_string(raw.get("session_id"), MAX_ID_BYTES);
