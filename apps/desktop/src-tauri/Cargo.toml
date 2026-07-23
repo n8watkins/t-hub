@@ -84,6 +84,7 @@ serde_json = { workspace = true }
 portable-pty = "0.8"
 anyhow = { workspace = true }
 parking_lot = "0.12"
+libc = "0.2"
 async-lock = "3"
 base64 = "0.22"
 # SHA-256 for the control-socket audit log's tamper-evident hash chain

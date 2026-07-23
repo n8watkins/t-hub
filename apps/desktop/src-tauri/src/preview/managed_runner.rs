@@ -28,6 +28,121 @@ pub(crate) struct BoundedOutput {
     bytes: Mutex<Vec<u8>>,
 }
 
+#[cfg(unix)]
+pub(crate) struct PreparedPreviewCommand {
+    command: Command,
+    identity_reader: std::os::unix::net::UnixStream,
+    identity_writer: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+pub(crate) struct PreparedPreviewChild {
+    pub child: std::process::Child,
+    identity_reader: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+impl PreparedPreviewCommand {
+    pub(crate) fn spawn(mut self) -> Result<PreparedPreviewChild, String> {
+        let child = self
+            .command
+            .spawn()
+            .map_err(|error| format!("spawn supervised Preview wrapper: {error}"))?;
+        drop(self.identity_writer);
+        Ok(PreparedPreviewChild {
+            child,
+            identity_reader: self.identity_reader,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl PreparedPreviewChild {
+    pub(crate) fn read_identity(
+        &mut self,
+        run_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ManagedRunIdentity, String> {
+        validate_run_id(run_id)?;
+        self.identity_reader
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("bound supervised Preview identity timeout: {error}"))?;
+        let mut bytes = Vec::new();
+        self.identity_reader
+            .by_ref()
+            .take(MAX_MARKER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read supervised Preview identity pipe: {error}"))?;
+        if bytes.len() as u64 > MAX_MARKER_BYTES {
+            return Err("supervised Preview identity pipe exceeds its bound".into());
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| "supervised Preview identity pipe is not UTF-8")?;
+        let fields = text.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0].parse::<u32>().ok() != Some(self.child.id()) {
+            return Err("supervised Preview identity is not bound to its wrapper child".into());
+        }
+        let identity = ManagedRunIdentity {
+            run_id: run_id.to_string(),
+            process_group_id: fields[1]
+                .parse()
+                .map_err(|_| "supervised Preview identity has an invalid process group")?,
+            process_group_started_at: fields[2]
+                .parse()
+                .map_err(|_| "supervised Preview identity has invalid start ticks")?,
+        };
+        if identity.process_group_id == 0 || identity.process_group_started_at == 0 {
+            return Err("supervised Preview process identity must be nonzero".into());
+        }
+        Ok(identity)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn prepare_supervised_preview_command(
+    cwd: &Path,
+    run_id: &str,
+    executable: &str,
+    arguments: &[&str],
+) -> Result<PreparedPreviewCommand, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    validate_run_id(run_id)?;
+    let (identity_reader, identity_writer) = std::os::unix::net::UnixStream::pair()
+        .map_err(|error| format!("create supervised Preview identity pipe: {error}"))?;
+    let writer_fd = identity_writer.as_raw_fd();
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(PROCESS_TREE_SCRIPT)
+        .arg("t-hub-preview")
+        .arg(run_id)
+        .arg(executable)
+        .args(arguments)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(writer_fd, 4) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(4, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(4, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(PreparedPreviewCommand {
+        command,
+        identity_reader,
+        identity_writer,
+    })
+}
+
 impl BoundedOutput {
     pub(crate) fn append(&self, chunk: &[u8]) {
         let mut bytes = self.bytes.lock();
@@ -60,7 +175,8 @@ impl BoundedOutput {
 /// owned process group.
 pub(crate) const PROCESS_TREE_SCRIPT: &str = r#"set -u
 case "$0" in
-  t-hub-preview|t-hub-devserver) ;;
+  t-hub-preview) IDENTITY_FD=4 ;;
+  t-hub-devserver) IDENTITY_FD= ;;
   *) exit 64 ;;
 esac
 case "$1" in
@@ -70,18 +186,27 @@ MARKER="/tmp/$0-$1.pid"
 shift
 export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0
 exec 3<&0
-setsid "$@" 3<&- </dev/null &
+setsid "$@" 3<&- 4>&- </dev/null &
 SRV=$!
+START_TICKS=
+identity_matches() {
+  [ -n "$START_TICKS" ] || return 1
+  CURRENT=$(cat "/proc/$SRV/stat" 2>/dev/null) || return 1
+  CURRENT_REST=${CURRENT##*) }
+  set -- $CURRENT_REST
+  [ "${3:-}" = "$SRV" ] && [ "${20:-}" = "$START_TICKS" ]
+}
 cleanup() {
-  kill -TERM -- -"$SRV" 2>/dev/null || true
+  identity_matches && kill -TERM -- -"$SRV" 2>/dev/null || true
   i=0
   while kill -0 "$SRV" 2>/dev/null && [ "$i" -lt 20 ]; do
     sleep 0.1
     i=$((i + 1))
   done
-  kill -KILL -- -"$SRV" 2>/dev/null || true
+  identity_matches && kill -KILL -- -"$SRV" 2>/dev/null || true
   wait "$SRV" 2>/dev/null || true
-  rm -f "$MARKER" 2>/dev/null || true
+  CURRENT_MARKER=$(cat "$MARKER" 2>/dev/null || true)
+  [ "$CURRENT_MARKER" = "${IDENTITY:-}" ] && rm -f "$MARKER" 2>/dev/null || true
 }
 STAT=$(cat "/proc/$SRV/stat" 2>/dev/null) || { cleanup; exit 66; }
 REST=${STAT##*) }
@@ -91,11 +216,16 @@ case "$START_TICKS" in
   ""|*[!0-9]*) cleanup; exit 67 ;;
 esac
 umask 077
-TMP=$(mktemp "${MARKER}.XXXXXX") || { cleanup; exit 68; }
-if ! printf '%s %s\n' "$SRV" "$START_TICKS" > "$TMP" || ! mv -f "$TMP" "$MARKER"; then
-  rm -f "$TMP" 2>/dev/null || true
+IDENTITY="$SRV $START_TICKS"
+set -C
+if ! printf '%s\n' "$IDENTITY" > "$MARKER"; then
   cleanup
   exit 69
+fi
+set +C
+if [ -n "$IDENTITY_FD" ]; then
+  printf '%s %s %s\n' "$$" "$SRV" "$START_TICKS" >&4 || { cleanup; exit 70; }
+  exec 4>&-
 fi
 trap 'cleanup; exit 0' TERM INT HUP
 (cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || true) &
@@ -292,6 +422,33 @@ pub(crate) fn revalidate_process_identity(identity: &ManagedRunIdentity) -> Resu
     {
         return Err("managed Preview process identity no longer matches".into());
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_exact_process_group(
+    identity: &ManagedRunIdentity,
+    signal: i32,
+) -> Result<(), String> {
+    revalidate_process_identity(identity)?;
+    let result = unsafe { libc::kill(-(identity.process_group_id as i32), signal) };
+    if result == -1 {
+        return Err(format!(
+            "signal exact managed Preview process group: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn signal_exact_process_group_with(
+    identity: &ManagedRunIdentity,
+    observe: impl FnOnce(&ManagedRunIdentity) -> Result<(), String>,
+    signal: impl FnOnce(u32),
+) -> Result<(), String> {
+    observe(identity)?;
+    signal(identity.process_group_id);
     Ok(())
 }
 
@@ -559,21 +716,22 @@ mod tests {
 
         let run_id = format!("identity-{}", uuid::Uuid::new_v4().simple());
         let marker = Path::new("/tmp").join(format!("t-hub-preview-{run_id}.pid"));
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-preview")
-            .arg(&run_id)
-            .arg("sh")
-            .arg("-c")
-            .arg("echo ready; sleep 30")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        let stdin = child.stdin.take();
-        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let prepared = prepare_supervised_preview_command(
+            Path::new("/tmp"),
+            &run_id,
+            "sh",
+            &["-c", "echo '999 888 777'; echo ready; sleep 30"],
+        )
+        .unwrap();
+        let mut supervised = prepared.spawn().unwrap();
+        let observed = supervised
+            .read_identity(&run_id, Duration::from_secs(2))
+            .unwrap();
+        let stdin = supervised.child.stdin.take();
+        let mut output = std::io::BufReader::new(supervised.child.stdout.take().unwrap());
+        let mut spoof = String::new();
+        output.read_line(&mut spoof).unwrap();
+        assert_eq!(spoof.trim(), "999 888 777");
         let mut ready = String::new();
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready.trim(), "ready");
@@ -593,9 +751,9 @@ mod tests {
         assert_eq!(fields.len(), 2);
         let process_group_id = fields[0].parse::<u32>().unwrap();
         let start_ticks = fields[1].parse::<u64>().unwrap();
-        let observed = observe_marker_identity(&run_id).unwrap();
         assert_eq!(observed.process_group_id, process_group_id);
         assert_eq!(observed.process_group_started_at, start_ticks);
+        assert_eq!(observe_marker_identity(&run_id).unwrap(), observed);
         assert!(start_ticks > 0);
         let stale = ManagedRunIdentity {
             process_group_started_at: start_ticks + 1,
@@ -604,7 +762,50 @@ mod tests {
         assert!(revalidate_process_identity(&stale).is_err());
 
         drop(stdin);
-        assert!(child.wait().unwrap().success());
+        assert!(supervised.child.wait().unwrap().success());
         assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_wrapper_refuses_to_replace_an_existing_recovery_marker() {
+        let run_id = format!("reserved-{}", uuid::Uuid::new_v4().simple());
+        let marker = Path::new("/tmp").join(format!("t-hub-preview-{run_id}.pid"));
+        std::fs::write(&marker, "1 1\n").unwrap();
+        let prepared = prepare_supervised_preview_command(
+            Path::new("/tmp"),
+            &run_id,
+            "sh",
+            &["-c", "sleep 30"],
+        )
+        .unwrap();
+        let mut supervised = prepared.spawn().unwrap();
+        assert!(supervised
+            .read_identity(&run_id, std::time::Duration::from_secs(2))
+            .is_err());
+        assert!(!supervised.child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1 1\n");
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn reused_process_identity_is_refused_before_any_signal() {
+        let identity = ManagedRunIdentity {
+            run_id: "reused-run".into(),
+            process_group_id: 4242,
+            process_group_started_at: 99,
+        };
+        let signals = std::sync::atomic::AtomicUsize::new(0);
+        let result = signal_exact_process_group_with(
+            &identity,
+            |_| Err("process-group start ticks changed".into()),
+            |_| {
+                signals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(PROCESS_TREE_SCRIPT.contains("identity_matches && kill -TERM -- -\"$SRV\""));
+        assert!(PROCESS_TREE_SCRIPT.contains("identity_matches && kill -KILL -- -\"$SRV\""));
     }
 }
