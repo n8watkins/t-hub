@@ -830,12 +830,12 @@ impl AgentBridge {
         // at the top of this method onto a dedicated minimal path (status bridge +
         // cursor only, no fan-out). See the early return above.
 
-        // 3b. Derive a Claude-suggested title for the session (GOAL NAMES) and
-        //     emit `agent://title`. The strongest signal is `UserPromptSubmit`'s
-        //     prompt (what the user just asked Claude to do); `SessionStart`
-        //     gives the project/cwd as a fallback. The UI prefers this over the
-        //     raw command·cwd label. Carries `cwd` so the frontend can correlate
-        //     the Claude session id to a T-Hub terminal.
+        // 3b. Derive a credential-safe title for the session (GOAL NAMES) and
+        //     emit `agent://title`. Current hook producers redact prompt text
+        //     before persistence, so cwd basename is their safe title signal.
+        //     Legacy entries that already contain a prompt remain readable.
+        //     Carries `cwd` so the frontend can correlate the Claude session id
+        //     to a T-Hub terminal.
         self.emit_session_title(entry);
 
         // 4. Feed the supervision reducer. Pull the subagent base fields out of
@@ -1049,26 +1049,30 @@ const TITLE_MAX_CHARS: usize = 60;
 /// Derive a short, human-readable title for a session from a lifecycle hook
 /// payload (GOAL NAMES). Pure (no I/O), so it is unit-tested directly.
 ///
-/// Signal preference, strongest first:
-///   - **`UserPromptSubmit`**: the user's `prompt` — what they just asked Claude
-///     to do. Its first non-empty line, trimmed + capped, is the best label.
-///   - **`SessionStart`**: the project basename (last path segment of `cwd`) —
-///     a stable fallback so a fresh session still gets a meaningful name before
-///     the first prompt.
+/// Signal preference:
+///   - **`UserPromptSubmit`**: a legacy stored `prompt`, when present; otherwise
+///     the project basename from credential-safe `cwd` metadata.
+///   - **`SessionStart`**: the project basename from `cwd`.
 ///
 /// Returns `None` for events we don't title or when no usable text is present
 /// (the caller then emits nothing and the existing command·cwd label stands).
 ///
-// TODO(claude-title): when a per-session summary signal is available (e.g. a
-// `Stop`/`SessionEnd` payload carrying a model-written one-line summary, or a
-// transcript tail), prefer it here over the raw prompt's first line.
+// TODO(claude-title): when a provider supplies a credential-safe one-line title
+// distinct from prompt/tool content, prefer it over cwd basename.
 fn derive_session_title(
     event_type: t_hub_protocol::JournalEventType,
     payload: &serde_json::Value,
 ) -> Option<String> {
     use t_hub_protocol::JournalEventType as E;
     let raw = match event_type {
-        E::UserPromptSubmit => payload.get("prompt").and_then(|v| v.as_str()),
+        E::UserPromptSubmit => {
+            if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+                Some(prompt)
+            } else {
+                let cwd = payload.get("cwd").and_then(|v| v.as_str())?;
+                return cwd_basename(cwd).map(str::to_string);
+            }
+        }
         E::SessionStart => {
             // Fallback to the project (cwd basename) so a brand-new session is
             // labelled before the user's first prompt arrives.
@@ -2080,6 +2084,21 @@ mod tests {
     }
 
     #[test]
+    fn redacted_user_prompt_falls_back_to_cwd_basename() {
+        let payload = serde_json::json!({
+            "session_id": "s1",
+            "cwd": "/home/natkins/projects/t-hub/",
+            "redacted_field_count": 1
+        });
+        let title =
+            super::derive_session_title(JournalEventType::UserPromptSubmit, &payload).unwrap();
+        assert_eq!(title, "t-hub");
+        assert!(!serde_json::to_string(&payload)
+            .unwrap()
+            .contains("prompt-secret-canary"));
+    }
+
+    #[test]
     fn no_title_for_unrelated_events_or_empty_signal() {
         // Stop carries no title signal.
         assert!(super::derive_session_title(
@@ -2117,7 +2136,7 @@ mod tests {
             payload: serde_json::json!({
                 "session_id": "sess-7",
                 "cwd": "/home/u/proj",
-                "prompt": "Wire the hook titles\nmore"
+                "redacted_field_count": 1
             }),
             result: None,
         };
@@ -2132,6 +2151,6 @@ mod tests {
             .expect("agent://title must be emitted");
         assert_eq!(title_ev.1["sessionId"], "sess-7");
         assert_eq!(title_ev.1["cwd"], "/home/u/proj");
-        assert_eq!(title_ev.1["title"], "Wire the hook titles");
+        assert_eq!(title_ev.1["title"], "proj");
     }
 }
