@@ -572,20 +572,14 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $SampleSeconds) {
 $finishedAt = (Get-Date).ToUniversalTime()
 $runtimeEvidence = Read-SafeRuntimeEvidence
 $runtimeEvidenceHash = if ($RuntimeEvidencePath.Length -gt 0) { (Get-FileHash -LiteralPath $RuntimeEvidencePath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+# A caller-supplied JSON file is redacted evidence, not an authority source.
+# Until the T-Hub control/runtime producer writes an attested DTO, none of its
+# terminal, WSL, paired, or cleanup claims may influence eligibility.
 $trustedObservedTerminalCount = $null
-if ($runtimeEvidence.Contains("metrics")) {
-    $metricsEvidence = $runtimeEvidence["metrics"]
-    if ($metricsEvidence -is [System.Collections.IDictionary] -and $metricsEvidence.Contains("observed_terminal_count")) {
-        $observedValue = $metricsEvidence["observed_terminal_count"]
-        if ($observedValue -is [int] -or $observedValue -is [long] -or $observedValue -is [double]) {
-            $trustedObservedTerminalCount = [int]$observedValue
-        }
-    }
-}
 $summary = Get-ArtifactSummary $samples
 $validityReasons = @()
 if ($null -eq $trustedObservedTerminalCount) { $validityReasons += "observed_terminal_count_unavailable" }
-elseif ($trustedObservedTerminalCount -ne $DeclaredScenarioTerminals) { $validityReasons += "observed_terminal_count_mismatch" }
+if ($runtimeEvidence.Contains("metrics")) { $validityReasons += "runtime_evidence_attestation_missing" }
 if ($samples.Count -eq 0) { $validityReasons += "no_samples" }
 if (@($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count -gt 0) { $validityReasons += "incomplete_cpu_interval" }
 if ($installedBinarySha256.Length -eq 0) { $validityReasons += "installed_binary_hash_missing" }
@@ -599,6 +593,7 @@ if ($DisplayScale -le 0) { $validityReasons += "display_scale_missing" }
 if ($WslVersion.Length -eq 0) { $validityReasons += "wsl_version_missing" }
 if ($WslDistro.Length -eq 0) { $validityReasons += "wsl_distro_missing" }
 if ($WslMemoryBytes -le 0) { $validityReasons += "wsl_memory_missing" }
+if ($PowerMode.Length -gt 0 -or $DisplayScale -gt 0 -or $WslVersion.Length -gt 0 -or $WslDistro.Length -gt 0 -or $WslMemoryBytes -gt 0) { $validityReasons += "host_context_attestation_missing" }
 $manifestCandidate = if ($null -ne $package5Manifest) { $package5Manifest.candidate } else { $null }
 $manifestInstalled = if ($null -ne $package5Manifest) { $package5Manifest.artifacts.installedBinary } else { $null }
 $manifestInstaller = if ($null -ne $package5Manifest) { $package5Manifest.artifacts.installer } else { $null }
@@ -608,10 +603,6 @@ elseif ($null -eq $manifestInstalled -or $manifestInstalled.sha256 -ne $installe
 elseif ($null -eq $manifestInstaller -or $manifestInstaller.sha256 -ne $InstallerSha256) { $validityReasons += "package5_installer_binding_mismatch" }
 elseif ($manifestCandidate.protocolVersion -ne $ProtocolVersion) { $validityReasons += "package5_protocol_binding_mismatch" }
 $wslOwnedObserved = $false
-if ($runtimeEvidence.Contains("wslOwned") -and $runtimeEvidence["wslOwned"] -is [System.Collections.IDictionary]) {
-    $wslOwnedEvidence = $runtimeEvidence["wslOwned"]
-    $wslOwnedObserved = $wslOwnedEvidence.Contains("available") -and [bool]$wslOwnedEvidence["available"]
-}
 if (-not $wslOwnedObserved) { $validityReasons += "wsl_owned_evidence_unavailable" }
 
 $absoluteLimit = switch ($DeclaredScenarioTerminals) {
@@ -623,8 +614,8 @@ $absoluteLimit = switch ($DeclaredScenarioTerminals) {
 $absoluteMetricsAvailable = $null -ne $summary.cpu.run_total_core_fraction -and $null -ne $summary.cpu.statistics -and $null -ne $summary.private_bytes -and $null -ne $summary.working_set_bytes -and $null -ne $summary.process_count
 $absoluteStatus = if (-not $absoluteMetricsAvailable) { "unavailable" } elseif ($summary.cpu.run_total_core_fraction -gt $absoluteLimit.cpuRun -or $summary.cpu.statistics.p95 -gt $absoluteLimit.cpuP95 -or $summary.private_bytes.p95 -gt $absoluteLimit.privateBytes -or $summary.working_set_bytes.p95 -gt $absoluteLimit.workingSet -or $summary.process_count.p95 -gt $absoluteLimit.processes) { "fail" } else { "pass" }
 $scenarioStatus = if ($null -eq $trustedObservedTerminalCount -or $trustedObservedTerminalCount -ne $DeclaredScenarioTerminals -or $Repetition -lt 1 -or $Repetition -gt 3) { "unavailable" } else { "pass" }
-$pairedStatus = if ($runtimeEvidence.Contains("paired") -and $runtimeEvidence["paired"] -is [System.Collections.IDictionary] -and $runtimeEvidence["paired"].Contains("status") -and $runtimeEvidence["paired"]["status"] -in @("pass", "fail")) { $runtimeEvidence["paired"]["status"] } else { "unavailable" }
-$cleanupStatus = if ($runtimeEvidence.Contains("cleanup") -and $runtimeEvidence["cleanup"] -is [System.Collections.IDictionary] -and $runtimeEvidence["cleanup"].Contains("status") -and $runtimeEvidence["cleanup"]["status"] -in @("pass", "fail")) { $runtimeEvidence["cleanup"]["status"] } else { "unavailable" }
+$pairedStatus = "unavailable"
+$cleanupStatus = "unavailable"
 $budgets = @(
     [ordered]@{ id = "absolute.resources"; kind = "absolute"; status = $absoluteStatus; observed = $summary; limits = $absoluteLimit },
     [ordered]@{ id = "paired.regression"; kind = "paired"; status = $pairedStatus; observed = $null; limits = $null },
@@ -635,7 +626,7 @@ $budgetFailure = @($budgets | Where-Object { $_.status -eq "fail" }).Count -gt 0
 $budgetUnavailable = @($budgets | Where-Object { $_.status -eq "unavailable" }).Count -gt 0
 if ($budgetUnavailable) { $validityReasons += "budget_evidence_unavailable" }
 $eligible = $validityReasons.Count -eq 0
-$decision = if (-not $eligible) { "ineligible" } elseif ($budgetFailure) { "fail" } else { "pass" }
+$decision = if ($budgetFailure) { "fail" } elseif (-not $eligible) { "ineligible" } else { "pass" }
 $evidenceSection = {
     param([string]$Name)
     if ($runtimeEvidence.Contains($Name)) { return $runtimeEvidence[$Name] }
@@ -753,5 +744,5 @@ if ($parent.Length -gt 0) {
 }
 $artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 Write-Host "Wrote benchmark artifact: $OutputPath"
-if (-not $eligible) { exit 5 }
 if ($budgetFailure) { exit 4 }
+if (-not $eligible) { exit 5 }
