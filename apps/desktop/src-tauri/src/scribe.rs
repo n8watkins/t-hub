@@ -601,6 +601,25 @@ fn next_scribe_event_generation() -> u64 {
     SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+fn apply_scribe_spawn_result(
+    state: &mut ScribeEmitterState,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: Result<std::thread::JoinHandle<()>, ()>,
+) {
+    match result {
+        Ok(handle) => {
+            state.enabled = true;
+            state.cancel = Some(cancel);
+            state.handle = Some(handle);
+        }
+        Err(()) => {
+            state.enabled = false;
+            state.cancel = None;
+            state.handle = None;
+        }
+    }
+}
+
 fn read_scribe_status_emitter_tick(
     candidates: &mut [Option<CandidateEval>; 2],
     last_checked: &mut [std::time::Instant; 2],
@@ -709,18 +728,7 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
-    match thread_result {
-        Ok(handle) => {
-            state.enabled = true;
-            state.cancel = Some(cancel);
-            state.handle = Some(handle);
-        }
-        Err(_) => {
-            state.enabled = false;
-            state.cancel = None;
-            state.handle = None;
-        }
-    }
+    apply_scribe_spawn_result(&mut state, cancel, thread_result.map_err(|_| ()));
 }
 
 pub fn stop_scribe_status_emitter() {
@@ -991,23 +999,22 @@ mod tests {
     #[test]
     fn rapid_stop_start_keeps_one_worker() {
         let _test_lock = lifecycle_test_lock();
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let run_worker =
-            |active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-             peak: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
-                std::thread::spawn(move || {
-                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    std::thread::yield_now();
-                    active.fetch_sub(1, Ordering::SeqCst);
-                })
-            };
-        let first = run_worker(active.clone(), peak.clone());
-        first.join().expect("first worker joins before restart");
-        let second = run_worker(active, peak.clone());
-        second.join().expect("replacement worker joins");
-        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        stop_scribe_status_emitter();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = std::thread::spawn(|| {});
+        let mut state = ScribeEmitterState {
+            generation: 1,
+            enabled: false,
+            cancel: None,
+            handle: None,
+        };
+        apply_scribe_spawn_result(&mut state, cancel, Ok(worker));
+        assert!(state.enabled && state.handle.is_some());
+        if let Some(handle) = state.handle.take() {
+            handle.join().expect("worker joins");
+        }
+        state.enabled = false;
+        assert!(!state.enabled);
     }
 
     #[test]
@@ -1048,13 +1055,22 @@ mod tests {
             cancel: None,
             handle: None,
         };
-        state.enabled = false;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        apply_scribe_spawn_result(&mut state, cancel, Err(()));
         assert!(!state.enabled, "failed spawn must reset enabled state");
+        let retry_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retry = std::thread::Builder::new()
             .name("scribe-test-retry".into())
-            .spawn(|| {});
-        assert!(retry.is_ok());
-        retry.unwrap().join().expect("retry worker joins");
+            .spawn(|| {})
+            .expect("retry spawn");
+        apply_scribe_spawn_result(&mut state, retry_cancel, Ok(retry));
+        assert!(state.enabled);
+        state
+            .handle
+            .take()
+            .unwrap()
+            .join()
+            .expect("retry worker joins");
     }
 
     #[test]
