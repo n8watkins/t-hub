@@ -705,6 +705,7 @@ impl AgentBridge {
             response,
             run_id,
             generation,
+            port,
             expected_process_group_id,
             expected_process_group_started_at,
         )
@@ -716,6 +717,7 @@ fn map_preview_listener_response(
     response: AgentResponse,
     run_id: &str,
     generation: &str,
+    port: u16,
     expected_process_group_id: u32,
     expected_process_group_started_at: u64,
 ) -> Result<Option<PreviewListenerOwnership>, String> {
@@ -723,11 +725,13 @@ fn map_preview_listener_response(
         AgentResponse::PreviewListener {
             run_id: echoed_run_id,
             generation: echoed_generation,
+            port: echoed_port,
             expected_process_group_id: echoed_group,
             expected_process_group_started_at: echoed_started,
             ownership,
         } if echoed_run_id == run_id
             && echoed_generation == generation
+            && echoed_port == port
             && echoed_group == expected_process_group_id
             && echoed_started == expected_process_group_started_at =>
         {
@@ -1126,6 +1130,7 @@ mod tests {
         let response = |generation: &str| AgentResponse::PreviewListener {
             run_id: "run-1".into(),
             generation: generation.into(),
+            port: 4177,
             expected_process_group_id: 42,
             expected_process_group_started_at: 99,
             ownership: Some(PreviewListenerOwnership {
@@ -1134,16 +1139,17 @@ mod tests {
             }),
         };
         assert_eq!(
-            map_preview_listener_response(response("a"), "run-1", "a", 42, 99).unwrap(),
+            map_preview_listener_response(response("a"), "run-1", "a", 4177, 42, 99).unwrap(),
             Some(PreviewListenerOwnership {
                 process_group_id: 42,
                 process_group_started_at: 99,
             })
         );
-        assert!(map_preview_listener_response(response("b"), "run-1", "a", 42, 99).is_err());
-        assert!(map_preview_listener_response(response("a"), "run-2", "a", 42, 99).is_err());
-        assert!(map_preview_listener_response(response("a"), "run-1", "a", 41, 99).is_err());
-        assert!(map_preview_listener_response(response("a"), "run-1", "a", 42, 98).is_err());
+        assert!(map_preview_listener_response(response("b"), "run-1", "a", 4177, 42, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-2", "a", 4177, 42, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-1", "a", 4178, 42, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-1", "a", 4177, 41, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-1", "a", 4177, 42, 98).is_err());
     }
 
     fn entry(

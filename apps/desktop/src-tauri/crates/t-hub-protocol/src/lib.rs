@@ -317,6 +317,7 @@ pub enum AgentResponse {
     PreviewListener {
         run_id: String,
         generation: String,
+        port: u16,
         expected_process_group_id: u32,
         expected_process_group_started_at: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -727,6 +728,7 @@ mod tests {
                 body: AgentResponse::PreviewListener {
                     run_id: "run-1".into(),
                     generation: "a".repeat(32),
+                    port: 4177,
                     expected_process_group_id: 42,
                     expected_process_group_started_at: 99,
                     ownership: Some(PreviewListenerOwnership {
@@ -745,6 +747,7 @@ mod tests {
                 body: AgentResponse::PreviewListener {
                     ref run_id,
                     ref generation,
+                    port: 4177,
                     ownership: Some(PreviewListenerOwnership {
                         process_group_id: 42,
                         process_group_started_at: 99,

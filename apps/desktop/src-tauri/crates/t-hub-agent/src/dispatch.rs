@@ -92,6 +92,7 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
                 Ok(ownership) => AgentResponse::PreviewListener {
                     run_id,
                     generation,
+                    port,
                     expected_process_group_id,
                     expected_process_group_started_at,
                     ownership: ownership.map(|ownership| PreviewListenerOwnership {
@@ -232,12 +233,14 @@ mod tests {
             AgentResponse::PreviewListener {
                 run_id,
                 generation,
+                port: echoed_port,
                 expected_process_group_id,
                 expected_process_group_started_at,
                 ownership,
             } => {
                 assert_eq!(run_id, "run-1");
                 assert_eq!(generation, "a".repeat(32));
+                assert_eq!(echoed_port, port);
                 assert_eq!(expected_process_group_id, expected.process_group_id);
                 assert_eq!(
                     expected_process_group_started_at,
