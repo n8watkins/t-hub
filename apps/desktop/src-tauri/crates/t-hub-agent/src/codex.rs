@@ -42,6 +42,8 @@ pub struct TapOutcome {
 struct TapState {
     session_id: Option<String>,
     turn_id: Option<String>,
+    exact_session_id: Option<String>,
+    exact_turn_id: Option<String>,
     active_turn: bool,
     terminal_turn: bool,
     recognized_events: usize,
@@ -149,7 +151,11 @@ fn map_exec_event(
 ) -> Option<EventJournalEntry> {
     match event_type {
         "thread.started" => {
-            state.session_id = bounded_string(value.get("thread_id"), MAX_ID_BYTES);
+            observe_provider_id(
+                value.get("thread_id"),
+                &mut state.session_id,
+                &mut state.exact_session_id,
+            );
             state.terminal_turn = false;
             lifecycle_entry(
                 state,
@@ -190,21 +196,21 @@ fn map_app_server_message(
     binding: &TmuxBinding,
 ) -> Option<EventJournalEntry> {
     let params = value.get("params").unwrap_or(&Value::Null);
-    if let Some(thread_id) = bounded_string(
-        params
-            .get("threadId")
-            .or_else(|| params.get("thread").and_then(|thread| thread.get("id"))),
-        MAX_ID_BYTES,
-    ) {
-        state.session_id = Some(thread_id);
+    if let Some(value) = params
+        .get("threadId")
+        .or_else(|| params.get("thread").and_then(|thread| thread.get("id")))
+    {
+        observe_provider_id(
+            Some(value),
+            &mut state.session_id,
+            &mut state.exact_session_id,
+        );
     }
-    if let Some(turn_id) = bounded_string(
-        params
-            .get("turnId")
-            .or_else(|| params.get("turn").and_then(|turn| turn.get("id"))),
-        MAX_ID_BYTES,
-    ) {
-        state.turn_id = Some(turn_id);
+    if let Some(value) = params
+        .get("turnId")
+        .or_else(|| params.get("turn").and_then(|turn| turn.get("id")))
+    {
+        observe_provider_id(Some(value), &mut state.turn_id, &mut state.exact_turn_id);
     }
 
     match method {
@@ -256,7 +262,7 @@ fn map_app_server_message(
                 "permission_resolved",
             )?;
             entry.payload["permission_request_id"] = Value::String(request_id);
-            assign_codex_event_identity(&mut entry);
+            assign_codex_event_identity(&mut entry, state);
             Some(entry)
         }
         "turn/completed" => {
@@ -343,7 +349,7 @@ fn permission_entry(
             .is_some_and(|value| !value.is_null()),
     });
     entry.payload["permission_request_id"] = entry.payload["permission_request"]["id"].clone();
-    assign_codex_event_identity(&mut entry);
+    assign_codex_event_identity(&mut entry, state);
     Some(entry)
 }
 
@@ -400,14 +406,16 @@ fn lifecycle_entry(
     lifecycle: &str,
 ) -> Option<EventJournalEntry> {
     state.session_id.as_ref()?;
-    Some(base_entry(
+    let mut entry = base_entry(
         state.session_id.clone(),
         state.turn_id.clone(),
         binding,
         event_type,
         lifecycle,
         now_ms(),
-    ))
+    );
+    assign_codex_event_identity(&mut entry, state);
+    Some(entry)
 }
 
 fn base_entry(
@@ -434,7 +442,7 @@ fn base_entry(
             "runtime_health": "ready",
         }
     });
-    let mut entry = EventJournalEntry {
+    EventJournalEntry {
         seq: 0,
         timestamp_ms,
         source: JournalSource::Agent,
@@ -443,9 +451,7 @@ fn base_entry(
         event_type,
         payload,
         result: None,
-    };
-    assign_codex_event_identity(&mut entry);
-    entry
+    }
 }
 
 fn health_entry(
@@ -504,10 +510,16 @@ fn append_deduplicated(
     Ok(())
 }
 
-fn assign_codex_event_identity(entry: &mut EventJournalEntry) {
+fn assign_codex_event_identity(entry: &mut EventJournalEntry, state: &TapState) {
     let lifecycle = entry.payload.get("lifecycle").and_then(Value::as_str);
-    let session_id = entry.payload.get("session_id").and_then(Value::as_str);
-    let turn_id = entry.payload.get("turn_id").and_then(Value::as_str);
+    let session_id = state.exact_session_id.as_deref();
+    let turn_id = state.exact_turn_id.as_deref();
+    if (state.session_id.is_some() && session_id.is_none())
+        || (state.turn_id.is_some() && turn_id.is_none())
+    {
+        entry.event_id = None;
+        return;
+    }
     let request_id = entry
         .payload
         .get("permission_request_id")
@@ -566,6 +578,8 @@ pub fn entry_from_hook(
     }
     let session_id = bounded_string(raw.get("session_id"), MAX_ID_BYTES);
     let turn_id = bounded_string(raw.get("turn_id"), MAX_ID_BYTES);
+    let exact_session_id = exact_string(raw.get("session_id"), MAX_ID_BYTES);
+    let exact_turn_id = exact_string(raw.get("turn_id"), MAX_ID_BYTES);
     let binding = TmuxBinding {
         pane,
         session: tmux_session,
@@ -573,6 +587,8 @@ pub fn entry_from_hook(
     let state = TapState {
         session_id,
         turn_id,
+        exact_session_id,
+        exact_turn_id,
         ..TapState::default()
     };
     match hook_name {
@@ -634,6 +650,7 @@ pub fn entry_from_hook(
                 "permission_resolved",
             )?;
             entry.payload["permission_request_id"] = Value::String(request_id);
+            assign_codex_event_identity(&mut entry, &state);
             Some(entry)
         }
         "Stop" => lifecycle_entry(&state, &binding, JournalEventType::Stop, "turn_completed"),
@@ -669,6 +686,15 @@ fn exact_string(value: Option<&Value>, max: usize) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| value.len() <= max)
         .map(str::to_string)
+}
+
+fn observe_provider_id(
+    value: Option<&Value>,
+    bounded: &mut Option<String>,
+    exact: &mut Option<String>,
+) {
+    *bounded = bounded_string(value, MAX_ID_BYTES);
+    *exact = exact_string(value, MAX_ID_BYTES);
 }
 
 fn bounded_string(value: Option<&Value>, max: usize) -> Option<String> {
@@ -881,6 +907,8 @@ mod tests {
         let state = TapState {
             session_id: Some("thread-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            exact_session_id: Some("thread-1".to_string()),
+            exact_turn_id: Some("turn-1".to_string()),
             ..TapState::default()
         };
         let started = lifecycle_entry(
@@ -932,6 +960,97 @@ mod tests {
         assert!(!serde_json::to_string(&native_hook.payload)
             .unwrap()
             .contains("secret-command-canary"));
+    }
+
+    #[test]
+    fn oversized_session_ids_preserve_events_without_identity_aliases() {
+        let shared = "s".repeat(MAX_ID_BYTES);
+        let first = entry_from_hook(
+            "SessionStart",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": format!("{shared}x")
+            }),
+            None,
+            None,
+        )
+        .expect("oversized session event must remain observable");
+        let second = entry_from_hook(
+            "SessionStart",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": format!("{shared}y")
+            }),
+            None,
+            None,
+        )
+        .expect("distinct oversized session event must remain observable");
+
+        assert_eq!(first.event_id, None);
+        assert_eq!(second.event_id, None);
+        assert_eq!(first.entity_id.as_deref(), Some(shared.as_str()));
+        assert_eq!(second.entity_id.as_deref(), Some(shared.as_str()));
+    }
+
+    #[test]
+    fn oversized_turn_ids_preserve_events_without_identity_aliases() {
+        let shared = "t".repeat(MAX_ID_BYTES);
+        let first = entry_from_hook(
+            "Stop",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": format!("{shared}x")
+            }),
+            None,
+            None,
+        )
+        .expect("oversized turn event must remain observable");
+        let second = entry_from_hook(
+            "Stop",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": format!("{shared}y")
+            }),
+            None,
+            None,
+        )
+        .expect("distinct oversized turn event must remain observable");
+
+        assert_eq!(first.event_id, None);
+        assert_eq!(second.event_id, None);
+        assert_eq!(first.payload["turn_id"], shared);
+        assert_eq!(second.payload["turn_id"], shared);
+    }
+
+    #[test]
+    fn native_permission_resolution_gets_stable_exact_identity() {
+        let raw = serde_json::json!({
+            "provider": "codex",
+            "session_id": "thread-1",
+            "turn_id": "turn-1",
+            "tool_use_id": "request-1"
+        });
+        let first = entry_from_hook("PostToolUse", &raw, None, None).unwrap();
+        let retry = entry_from_hook("PostToolUse", &raw, None, None).unwrap();
+        let distinct = entry_from_hook(
+            "PostToolUse",
+            &serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "tool_use_id": "request-2"
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(first.event_id.is_some());
+        assert_eq!(first.event_id, retry.event_id);
+        assert_ne!(first.event_id, distinct.event_id);
+        assert_eq!(first.payload["permission_request_id"], "request-1");
     }
 
     #[test]
