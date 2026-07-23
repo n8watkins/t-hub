@@ -13,9 +13,9 @@
 // is NEVER cached: every call re-reads control.json and re-connects, so a
 // restarted Scribe (new port + token) is picked up immediately and a stale
 // cached address can never wedge the gate (the same lesson as t-hub's own
-// control.json). scribe_status is a per-request pull polled at ~250ms, so a
-// plain GET per call is the right shape; the SSE stream (/v1/events) would
-// only add connection state without making the gate faster. The v1 snapshot is
+// control.json). scribe_status remains the bounded compatibility pull for
+// older clients. The frontend prefers Scribe's event bridge and uses this
+// snapshot only for initial state and fallback. The v1 snapshot is
 // held to the same 15s `updatedAt` TTL as the fallback (below): a
 // wedged-but-serving Scribe frozen on `busy:true` must not hold voice forever
 // - stronger than contract s7.1's intrinsic-liveness, per the fail-open
@@ -54,7 +54,9 @@
 // announcement forever - so we err toward speaking.
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tauri::Emitter;
 
 /// Scribe's production + dev Tauri bundle ids: the app_cache_dir subfolder
 /// where each flavor's fallback status.json lives.
@@ -73,10 +75,65 @@ const SCRIBE_CONTROL_DEV: &str = "control.dev.json";
 const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 
 /// HTTP budget for the loopback GET /v1/status. Tight on purpose: the endpoint
-/// is 127.0.0.1-only and voiceAnnounce polls this whole gate at ~250ms, so a
-/// hung server must resolve to fail-open quickly, not park the poll.
+/// is 127.0.0.1-only and the compatibility fallback is bounded at one second,
+/// so a hung server must resolve to fail-open quickly, not park the fallback.
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
+static SCRIBE_EVENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+struct ScribeEmitterState {
+    generation: u64,
+    enabled: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterState>> =
+    std::sync::OnceLock::new();
+static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
+    std::sync::OnceLock::new();
+static SCRIBE_DIRECT_FLAVOR: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_COORDINATOR_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_DIRECT_CANDIDATES: std::sync::OnceLock<
+    std::sync::Mutex<([Option<CandidateEval>; 2], [std::time::Instant; 2])>,
+> = std::sync::OnceLock::new();
+static SCRIBE_REQUEST_COORDINATOR: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn scribe_request_coordinator() -> &'static std::sync::Mutex<()> {
+    SCRIBE_REQUEST_COORDINATOR.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn reserve_scribe_request_slot() {
+    let now = now_ms().max(0) as u64;
+    let previous = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+    if now.saturating_sub(previous) < 1_000 {
+        std::thread::sleep(Duration::from_millis(1_000 - now.saturating_sub(previous)));
+    }
+    SCRIBE_COORDINATOR_LAST_REQUEST_MS.store(now_ms().max(0) as u64, Ordering::Release);
+}
+
+fn scribe_direct_candidates(
+) -> &'static std::sync::Mutex<([Option<CandidateEval>; 2], [std::time::Instant; 2])> {
+    SCRIBE_DIRECT_CANDIDATES.get_or_init(|| {
+        let expired = std::time::Instant::now() - Duration::from_secs(4);
+        std::sync::Mutex::new(([None, None], [expired, expired]))
+    })
+}
+
+fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
+    SCRIBE_EMITTER_STATE.get_or_init(|| {
+        std::sync::Mutex::new(ScribeEmitterState {
+            generation: 0,
+            enabled: false,
+            cancel: None,
+            handle: None,
+        })
+    })
+}
+
+fn latest_scribe_status_store() -> &'static std::sync::Mutex<Option<(ScribeStatus, i64)>> {
+    SCRIBE_LATEST_STATUS.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
 /// sourced from the snapshot's `busy` flag (after the fail-open rules);
@@ -93,6 +150,8 @@ pub struct ScribeStatus {
     pub since: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    #[serde(skip)]
+    source_identity: Option<String>,
 }
 
 impl ScribeStatus {
@@ -301,6 +360,10 @@ fn eval_v1_snapshot(v: &serde_json::Value, now: i64) -> Option<CandidateEval> {
             status: v.get("status").and_then(|x| x.as_str()).map(str::to_string),
             since: v.get("since").cloned(),
             source: Some("v1"),
+            source_identity: v
+                .get("pid")
+                .and_then(|pid| pid.as_u64())
+                .map(|pid| format!("v1-pid-{pid}")),
         },
         updated_at: updated_at.map(str::to_string),
     })
@@ -333,6 +396,7 @@ fn evaluate_fallback(
         status: status.clone(),
         since: since.clone(),
         source: Some("file"),
+        source_identity: None,
     };
 
     // Step 2: the pid kill-switch. A checkable-and-dead pid overrides
@@ -365,12 +429,17 @@ fn evaluate_fallback(
         status,
         since,
         source: Some("file"),
+        source_identity: v
+            .get("pid")
+            .and_then(|pid| pid.as_u64())
+            .map(|pid| format!("file-pid-{pid}")),
     }
 }
 
 /// One candidate's evaluation plus its `updatedAt` (for the prod-vs-dev
 /// freshest tiebreak). `updatedAt` is Scribe's ISO-8601 timestamp string,
 /// which sorts lexicographically in chronological order.
+#[derive(Clone)]
 struct CandidateEval {
     status: ScribeStatus,
     updated_at: Option<String>,
@@ -434,6 +503,7 @@ fn combine_candidates(cands: &[CandidateEval]) -> ScribeStatus {
         status: chosen.status.status.clone(),
         since: chosen.status.since.clone(),
         source: chosen.status.source,
+        source_identity: chosen.status.source_identity.clone(),
     }
 }
 
@@ -464,7 +534,7 @@ pub fn read_scribe_status() -> ScribeStatus {
 
     // Resolve prod + dev CONCURRENTLY. Each flavor's v1 GET can park up to the
     // HTTP timeout, so a sequential resolve would sum them (~1.5s worst case)
-    // against the ~250ms poll; two scoped threads bound the wait to a single
+    // against the bounded fallback; two scoped threads bound the wait to a single
     // flavor's timeout. The intermediate collect() starts BOTH threads before
     // either is joined (a lazy map+filter_map would spawn-then-join serially).
     // Order is preserved (prod first) so combine_candidates keeps its
@@ -488,11 +558,295 @@ pub fn read_scribe_status() -> ScribeStatus {
     combine_candidates(&cands)
 }
 
+fn status_event_payload(
+    status: &ScribeStatus,
+    generation: u64,
+    observed_at_ms: i64,
+) -> serde_json::Value {
+    let safe_status = status.status.as_deref().filter(|value| {
+        matches!(
+            *value,
+            "Idle" | "Recording" | "Transcribing" | "Pasting" | "Stopping"
+        )
+    });
+    let safe_since = status.since.as_ref().and_then(|value| {
+        value.as_str().and_then(|timestamp| {
+            parse_rfc3339_ms(timestamp).map(|_| serde_json::Value::String(timestamp.to_string()))
+        })
+    });
+    serde_json::json!({
+        "listening": status.listening,
+        "status": safe_status,
+        "since": safe_since,
+        "source": status.source,
+        "sourceIdentity": status.source_identity.as_deref().unwrap_or(status.source.unwrap_or("unknown")),
+        "generation": generation,
+        "observedAtMs": observed_at_ms,
+    })
+}
+
+fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
+    let observed_at = now_ms();
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((status.clone(), observed_at));
+    let generation = next_scribe_event_generation();
+    let _ = app.emit(
+        "scribe://status",
+        status_event_payload(status, generation, observed_at),
+    );
+}
+
+fn next_scribe_event_generation() -> u64 {
+    SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn apply_scribe_spawn_result(
+    state: &mut ScribeEmitterState,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: Result<std::thread::JoinHandle<()>, ()>,
+) {
+    match result {
+        Ok(handle) => {
+            state.enabled = true;
+            state.cancel = Some(cancel);
+            state.handle = Some(handle);
+        }
+        Err(()) => {
+            state.enabled = false;
+            state.cancel = None;
+            state.handle = None;
+        }
+    }
+}
+
+fn prepare_scribe_worker(state: &mut ScribeEmitterState) -> Option<u64> {
+    if state.enabled
+        && state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    {
+        return None;
+    }
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    Some(state.generation)
+}
+
+fn stop_scribe_worker(state: &mut ScribeEmitterState) {
+    if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
+        return;
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+}
+
+fn read_scribe_status_emitter_tick(
+    candidates: &mut [Option<CandidateEval>; 2],
+    last_checked: &mut [std::time::Instant; 2],
+    flavor: usize,
+) -> ScribeStatus {
+    if std::env::var("T_HUB_SCRIBE_CONTROL_FILE").is_ok()
+        || std::env::var("T_HUB_SCRIBE_STATUS_FILE").is_ok()
+    {
+        return read_scribe_status();
+    }
+    let (control_name, bundle) = if flavor == 0 {
+        (SCRIBE_CONTROL_PROD, SCRIBE_BUNDLE_PROD)
+    } else {
+        (SCRIBE_CONTROL_DEV, SCRIBE_BUNDLE_DEV)
+    };
+    let now = std::time::Instant::now();
+    for index in 0..candidates.len() {
+        if now.duration_since(last_checked[index]) > Duration::from_secs(3) {
+            candidates[index] = None;
+        }
+    }
+    last_checked[flavor] = now;
+    candidates[flavor] = eval_flavor(
+        scribe_control_file_for(control_name).as_deref(),
+        scribe_status_file_for(bundle).as_deref(),
+    );
+    let now = now_ms();
+    let active: Vec<CandidateEval> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.as_ref())
+        .filter(|candidate| {
+            candidate
+                .updated_at
+                .as_deref()
+                .is_some_and(|updated_at| snapshot_is_fresh(Some(updated_at), now))
+        })
+        .cloned()
+        .collect();
+    let status = combine_candidates(&active);
+    status
+}
+
+fn read_scribe_status_direct_tick() -> ScribeStatus {
+    if std::env::var("T_HUB_SCRIBE_CONTROL_FILE").is_ok()
+        || std::env::var("T_HUB_SCRIBE_STATUS_FILE").is_ok()
+    {
+        return read_scribe_status();
+    }
+    let flavor = (SCRIBE_DIRECT_FLAVOR.fetch_add(1, Ordering::Relaxed) % 2) as usize;
+    let mut state = scribe_direct_candidates()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (candidates, last_checked) = &mut *state;
+    read_scribe_status_emitter_tick(candidates, last_checked, flavor)
+}
+
+/// Start the backend event producer while voice announcements are enabled.
+///
+/// Scribe's v1 contract is currently a pull endpoint, so this producer uses
+/// the same bounded discovery + file fallback resolver as `scribe_status` and
+/// publishes a sanitized snapshot at 1 Hz.  Frontend consumers therefore use
+/// events as the normal path while retaining a bounded poll watchdog when the
+/// producer is unavailable.  Discovery is re-read on every tick, so a Scribe
+/// restart with a new endpoint, token, or PID is observed without a T-Hub
+/// restart. No endpoint token or raw Scribe payload is ever emitted.
+pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if state.enabled {
+        if state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+    }
+    let generation = prepare_scribe_worker(&mut state).expect("live worker handled above");
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_for_thread = cancel.clone();
+    let thread_result = std::thread::Builder::new()
+        .name(format!("scribe-status-emitter-{generation}"))
+        .spawn(move || {
+            let mut candidates: [Option<CandidateEval>; 2] = [None, None];
+            let expired = std::time::Instant::now() - Duration::from_secs(4);
+            let mut last_checked = [expired, expired];
+            let mut flavor = 0usize;
+            while !cancel_for_thread.load(Ordering::Acquire) {
+                let status = {
+                    let _request_guard = scribe_request_coordinator()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    reserve_scribe_request_slot();
+                    read_scribe_status_emitter_tick(&mut candidates, &mut last_checked, flavor)
+                };
+                emit_status_event(&app, &status);
+                flavor = (flavor + 1) % 2;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    apply_scribe_spawn_result(&mut state, cancel, thread_result.map_err(|_| ()));
+}
+
+pub fn stop_scribe_status_emitter() {
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    stop_scribe_worker(&mut state);
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn retire_finished_scribe_emitter() {
+    let mut state = scribe_emitter_state()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let finished = state
+        .handle
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished());
+    if !finished {
+        return;
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    *latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn take_fresh_latest_status() -> Option<ScribeStatus> {
+    let mut latest = latest_scribe_status_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some((status, observed_at)) = latest.as_ref() else {
+        return None;
+    };
+    let now = now_ms();
+    if observed_at <= &now && now - observed_at <= 3_000 {
+        return Some(status.clone());
+    }
+    *latest = None;
+    None
+}
+
+#[tauri::command]
+pub fn scribe_status_start(app: tauri::AppHandle) -> Result<(), String> {
+    start_scribe_status_emitter(app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn scribe_status_stop() -> Result<(), String> {
+    stop_scribe_status_emitter();
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn scribe_status() -> Result<ScribeStatus, String> {
-    tauri::async_runtime::spawn_blocking(read_scribe_status)
-        .await
-        .map_err(|e| format!("scribe_status task failed: {e}"))
+    if let Some(status) = take_fresh_latest_status() {
+        return Ok(status);
+    }
+    retire_finished_scribe_emitter();
+    let emitter_running = {
+        let state = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| state.enabled && !handle.is_finished())
+    };
+    if emitter_running {
+        return Ok(ScribeStatus::not_listening());
+    }
+    let status = tauri::async_runtime::spawn_blocking(|| {
+        let _request_guard = scribe_request_coordinator()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reserve_scribe_request_slot();
+        read_scribe_status_direct_tick()
+    })
+    .await
+    .map_err(|e| format!("scribe_status task failed: {e}"))?;
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -501,6 +855,16 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LIFECYCLE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn lifecycle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        LIFECYCLE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -526,6 +890,245 @@ mod tests {
     /// fallback files that must read as fresh through the real clock.
     fn iso_now() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    #[test]
+    fn status_event_payload_is_bounded_and_generation_tagged() {
+        let payload = status_event_payload(
+            &ScribeStatus {
+                listening: true,
+                status: Some("Recording".to_string()),
+                since: Some(json!("2026-07-08T12:00:00.000Z")),
+                source: Some("v1"),
+                source_identity: Some("v1-pid-42".to_string()),
+            },
+            42,
+            1234,
+        );
+        assert_eq!(payload["listening"], json!(true));
+        assert_eq!(payload["generation"], json!(42));
+        assert_eq!(payload["observedAtMs"], json!(1234));
+        assert_eq!(payload["sourceIdentity"], json!("v1-pid-42"));
+        let encoded = serde_json::to_string(&payload).expect("payload serializes");
+        assert!(!encoded.contains("readToken"));
+        assert!(!encoded.contains("Authorization"));
+    }
+
+    #[test]
+    fn emitter_stop_is_idempotent_when_not_running() {
+        let _test_lock = lifecycle_test_lock();
+        stop_scribe_status_emitter();
+        let before = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        stop_scribe_status_emitter();
+        let after = scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
+        assert_eq!(
+            before, after,
+            "repeated disable must not advance lifecycle generation"
+        );
+    }
+
+    #[test]
+    fn stale_latest_status_is_cleared_and_fresh_status_recovers() {
+        let _test_lock = lifecycle_test_lock();
+        let status = ScribeStatus {
+            listening: true,
+            status: Some("Recording".into()),
+            since: None,
+            source: Some("v1"),
+            source_identity: None,
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((status.clone(), now_ms() - 4_000));
+        assert!(take_fresh_latest_status().is_none());
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
+        std::env::set_var(
+            "T_HUB_SCRIBE_STATUS_FILE",
+            "/tmp/thub-missing-scribe-status.json",
+        );
+        let recovered = tauri::async_runtime::block_on(scribe_status()).expect("direct recovery");
+        std::env::remove_var("T_HUB_SCRIBE_STATUS_FILE");
+        assert!(
+            !recovered.listening,
+            "missing direct source must recover fail-open"
+        );
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((status, now_ms()));
+        assert!(take_fresh_latest_status().is_some());
+    }
+
+    #[test]
+    fn request_coordinator_records_actual_request_start() {
+        let _test_lock = lifecycle_test_lock();
+        let guard = scribe_request_coordinator()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reserve_scribe_request_slot();
+        let first = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+        reserve_scribe_request_slot();
+        let second = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+        drop(guard);
+        assert!(first > 0);
+        assert!(second.saturating_sub(first) >= 1_000);
+    }
+
+    #[test]
+    fn finished_worker_and_stale_cache_allow_direct_recovery() {
+        let _test_lock = lifecycle_test_lock();
+        stop_scribe_status_emitter();
+        let worker = std::thread::spawn(|| {});
+        while !worker.is_finished() {
+            std::thread::yield_now();
+        }
+        *scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ScribeEmitterState {
+            generation: 4,
+            enabled: true,
+            cancel: None,
+            handle: Some(worker),
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms() - 4_000));
+        retire_finished_scribe_emitter();
+        assert!(scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .handle
+            .is_none());
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
+    }
+
+    #[test]
+    fn rapid_stop_start_keeps_one_worker() {
+        let _test_lock = lifecycle_test_lock();
+        stop_scribe_status_emitter();
+        let mut state = ScribeEmitterState {
+            generation: 1,
+            enabled: false,
+            cancel: None,
+            handle: None,
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_active = active.clone();
+        let first_peak = peak.clone();
+        let first_cancel = cancel.clone();
+        let first_started = started.clone();
+        let first = std::thread::spawn(move || {
+            let count = first_active.fetch_add(1, Ordering::SeqCst) + 1;
+            first_peak.fetch_max(count, Ordering::SeqCst);
+            first_started.wait();
+            while !first_cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            first_active.fetch_sub(1, Ordering::SeqCst);
+        });
+        apply_scribe_spawn_result(&mut state, cancel, Ok(first));
+        started.wait();
+        assert!(state.enabled && state.handle.is_some());
+        stop_scribe_worker(&mut state);
+        let generation = prepare_scribe_worker(&mut state).expect("replacement generation");
+        let second_active = active.clone();
+        let second_peak = peak.clone();
+        let second_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_cancel_worker = second_cancel.clone();
+        let second_started_worker = second_started.clone();
+        let second = std::thread::spawn(move || {
+            let count = second_active.fetch_add(1, Ordering::SeqCst) + 1;
+            second_peak.fetch_max(count, Ordering::SeqCst);
+            second_started_worker.wait();
+            while !second_cancel_worker.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            second_active.fetch_sub(1, Ordering::SeqCst);
+        });
+        apply_scribe_spawn_result(&mut state, second_cancel, Ok(second));
+        second_started.wait();
+        assert!(state.enabled && state.generation == generation);
+        stop_scribe_worker(&mut state);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_clears_cache_after_inflight_worker_join() {
+        let _test_lock = lifecycle_test_lock();
+        stop_scribe_status_emitter();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *latest_scribe_status_store()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms()));
+        });
+        *scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ScribeEmitterState {
+            generation: 5,
+            enabled: true,
+            cancel: Some(cancel),
+            handle: Some(worker),
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms()));
+        stop_scribe_status_emitter();
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
+    }
+
+    #[test]
+    fn spawn_failure_resets_state_and_retry_succeeds() {
+        let _test_lock = lifecycle_test_lock();
+        let mut state = ScribeEmitterState {
+            generation: 1,
+            enabled: true,
+            cancel: None,
+            handle: None,
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        apply_scribe_spawn_result(&mut state, cancel, Err(()));
+        assert!(!state.enabled, "failed spawn must reset enabled state");
+        let retry_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retry = std::thread::Builder::new()
+            .name("scribe-test-retry".into())
+            .spawn(|| {})
+            .expect("retry spawn");
+        apply_scribe_spawn_result(&mut state, retry_cancel, Ok(retry));
+        assert!(state.enabled);
+        state
+            .handle
+            .take()
+            .unwrap()
+            .join()
+            .expect("retry worker joins");
+    }
+
+    #[test]
+    fn event_generation_is_monotonic_across_restart() {
+        let _test_lock = lifecycle_test_lock();
+        let first = next_scribe_event_generation();
+        let second = next_scribe_event_generation();
+        assert!(second > first);
     }
 
     /// Fallback-file read as the production path composes it (file only).
@@ -672,6 +1275,30 @@ mod tests {
         assert!(
             eval_v1_snapshot(&v, t0_ms()).is_none(),
             "missing app -> not a Scribe snapshot -> fall through",
+        );
+    }
+
+    #[test]
+    fn event_identity_does_not_echo_unbounded_instance_id() {
+        let instance = "x".repeat(4096);
+        let candidate = eval_v1_snapshot(
+            &json!({
+                "schemaVersion": 1,
+                "app": "scribe",
+                "busy": false,
+                "updatedAt": T0,
+                "instanceId": instance,
+            }),
+            t0_ms(),
+        )
+        .expect("valid snapshot");
+        let payload = status_event_payload(&candidate.status, 1, 1);
+        assert_eq!(payload["sourceIdentity"], json!("v1"));
+        assert!(
+            serde_json::to_string(&payload)
+                .expect("payload serializes")
+                .len()
+                < 512
         );
     }
 
@@ -1036,6 +1663,7 @@ mod tests {
                 status: Some("Ready".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T01:00:00Z".into()),
         };
@@ -1045,6 +1673,7 @@ mod tests {
                 status: Some("Recording".into()),
                 since: None,
                 source: Some("file"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
@@ -1070,6 +1699,7 @@ mod tests {
                 status: Some("prod".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
@@ -1079,6 +1709,7 @@ mod tests {
                 status: Some("dev".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };

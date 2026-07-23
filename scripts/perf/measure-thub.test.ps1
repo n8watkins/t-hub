@@ -9,6 +9,89 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Assert-FieldType {
+    param(
+        [object]$Object,
+        [string]$Path,
+        [ValidateSet("string", "number", "boolean", "object", "array")]
+        [string]$Kind,
+        [switch]$AllowNull
+    )
+    $value = $Object
+    foreach ($segment in $Path.Split(".")) {
+        $property = $value.PSObject.Properties[$segment]
+        Assert-True ($null -ne $property) "schema field $Path is missing"
+        $value = $property.Value
+    }
+    if ($null -eq $value) {
+        Assert-True $AllowNull.IsPresent "schema field $Path is null"
+        return
+    }
+    $matches = switch ($Kind) {
+        "string" { $value -is [string] }
+        "number" { $value -is [byte] -or $value -is [int16] -or $value -is [int32] -or $value -is [int64] -or $value -is [single] -or $value -is [double] -or $value -is [decimal] }
+        "boolean" { $value -is [bool] }
+        "object" { $value -is [psobject] -and $value -isnot [array] -and $value -isnot [string] }
+        "array" { $value -is [array] }
+    }
+    Assert-True $matches "schema field $Path is not a $Kind"
+}
+
+function Assert-DiagnosticSchema {
+    param([object]$Artifact)
+    Assert-FieldType $Artifact "schemaVersion" "number"
+    Assert-FieldType $Artifact "candidate" "object"
+    Assert-FieldType $Artifact "candidate.sourceCommit" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.installedBinarySha256" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.installerSha256" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.protocolVersion" "number"
+    Assert-FieldType $Artifact "reference" "object"
+    Assert-FieldType $Artifact "reference.installedBinarySha256" "string" -AllowNull
+    Assert-FieldType $Artifact "reference.selectionReason" "string" -AllowNull
+    Assert-FieldType $Artifact "host" "object"
+    Assert-FieldType $Artifact "host.windowsVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "host.wslVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "host.distro" "string" -AllowNull
+    Assert-FieldType $Artifact "host.logicalProcessors" "number" -AllowNull
+    Assert-FieldType $Artifact "host.memoryBytes" "number" -AllowNull
+    Assert-FieldType $Artifact "host.powerMode" "string" -AllowNull
+    Assert-FieldType $Artifact "host.displayScale" "number" -AllowNull
+    Assert-FieldType $Artifact "scenario" "object"
+    Assert-FieldType $Artifact "scenario.kind" "string"
+    Assert-FieldType $Artifact "scenario.terminalCount" "number"
+    Assert-FieldType $Artifact "scenario.observedTerminalCount" "number" -AllowNull
+    Assert-FieldType $Artifact "scenario.workloadVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.workloadSeed" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.repetition" "number"
+    Assert-FieldType $Artifact "scenario.startedAt" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.finishedAt" "string" -AllowNull
+    Assert-FieldType $Artifact "resources" "object"
+    Assert-FieldType $Artifact "resources.windows" "object" -AllowNull
+    Assert-FieldType $Artifact "resources.wslOwned" "object"
+    Assert-FieldType $Artifact "resources.wslOwned.available" "boolean"
+    Assert-FieldType $Artifact "resources.wslOwned.reason" "string"
+    Assert-FieldType $Artifact "resources.webview" "object"
+    Assert-FieldType $Artifact "resources.samples" "array"
+    Assert-FieldType $Artifact "operations" "array"
+    Assert-FieldType $Artifact "preview" "object"
+    Assert-FieldType $Artifact "voice" "object"
+    Assert-FieldType $Artifact "journal" "object"
+    Assert-FieldType $Artifact "diagnostics" "object"
+    Assert-FieldType $Artifact "diagnostics.errorCode" "string"
+    Assert-FieldType $Artifact "diagnostics.heartbeatStalls" "array"
+    Assert-FieldType $Artifact "diagnostics.longTasks" "array"
+    Assert-FieldType $Artifact "diagnostics.resizeObserverErrors" "array"
+    Assert-FieldType $Artifact "diagnostics.redactionCount" "number"
+    Assert-FieldType $Artifact "validity" "object"
+    Assert-FieldType $Artifact "validity.eligible" "boolean"
+    Assert-FieldType $Artifact "validity.reasons" "array"
+    Assert-FieldType $Artifact "validity.processBirthIntervalsExcluded" "number"
+    Assert-FieldType $Artifact "budgets" "array"
+    Assert-FieldType $Artifact "decision" "string"
+    Assert-FieldType $Artifact "rawEvidence" "array"
+    Assert-FieldType $Artifact "redactionCount" "number"
+}
+
 function New-ProcessRow {
     param(
         [int]$Id,
@@ -61,6 +144,46 @@ $next = @(
 $stable = Get-TreeTotals $next $tree.processes 2.0 @($root)
 Assert-True $stable.cpu_interval_complete "stable interval was marked incomplete"
 Assert-True ([Math]::Abs($stable.cpu_core_fraction - 0.75) -lt 0.000001) "stable CPU delta was incorrect"
+Assert-True ($stable.wsl_descendants.process_count -eq 1) "WSL descendant process metrics were incorrect"
+Assert-True $stable.wsl_descendants.cpu_interval_complete "WSL descendant CPU completeness was incorrect"
+
+$artifactPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-write-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    Write-JsonNoClobber $artifactPath ([ordered]@{ schemaVersion = 3; decision = "ineligible" }) 4
+    Assert-True (Test-Path -LiteralPath $artifactPath -PathType Leaf) "atomic artifact publication did not create the destination"
+    $collision = $false
+    try { Write-JsonNoClobber $artifactPath ([ordered]@{ schemaVersion = 3 }) 4 } catch { $collision = $true }
+    Assert-True $collision "atomic artifact publication overwrote an existing destination"
+    $temporary = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetDirectoryName($artifactPath)) -Filter (([System.IO.Path]::GetFileName($artifactPath)) + ".*.tmp") -ErrorAction SilentlyContinue)
+    Assert-True ($temporary.Count -eq 0) "atomic artifact publication left temporary files"
+} finally {
+    if (Test-Path -LiteralPath $artifactPath) { Remove-Item -LiteralPath $artifactPath -Force }
+}
+
+$diagnosticPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-diagnostic-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    $OutputPath = $diagnosticPath
+    Write-DiagnosticArtifact "secret C:\\Users\\natha\\token"
+    $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw | ConvertFrom-Json
+    Assert-True ($diagnostic.schemaVersion -eq 3 -and $diagnostic.diagnostics.errorCode -eq "collector_exception") "diagnostic artifact shape is invalid"
+    Assert-DiagnosticSchema $diagnostic
+    Assert-True ((Get-Content -LiteralPath $diagnosticPath -Raw) -notmatch "secret|token|natha") "diagnostic artifact leaked exception detail"
+} finally {
+    if (Test-Path -LiteralPath $diagnosticPath) { Remove-Item -LiteralPath $diagnosticPath -Force }
+}
+
+$trapPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-trap-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+    $firstExit = $LASTEXITCODE
+    Assert-True ($firstExit -eq 5 -and (Test-Path -LiteralPath $trapPath -PathType Leaf)) "collector failure did not publish exit5 diagnostic"
+    $firstRaw = Get-Content -LiteralPath $trapPath -Raw
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+    Assert-True ($LASTEXITCODE -eq 6) "unpublishable diagnostic did not return exit6"
+    Assert-True ((Get-Content -LiteralPath $trapPath -Raw) -ceq $firstRaw) "unpublishable diagnostic clobbered prior evidence"
+} finally {
+    if (Test-Path -LiteralPath $trapPath) { Remove-Item -LiteralPath $trapPath -Force }
+}
 
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
 $incomplete = Get-TreeTotals $withBirth $next 1.0 @($root)
@@ -79,5 +202,24 @@ $cpu = Get-CpuSummary @($sampleA, $sampleB, $sampleC)
 Assert-True ($cpu.complete_interval_count -eq 2 -and $cpu.incomplete_interval_count -eq 1) "CPU completeness summary was incorrect"
 Assert-True (-not $cpu.release_acceptance_eligible) "incomplete run was release-eligible"
 Assert-True ([Math]::Abs($cpu.run_total_core_fraction - 1.5) -lt 0.000001) "duration-weighted CPU was incorrect"
+
+$evidencePath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-runtime-evidence-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    @{ preview = @{ ready_ms = 125.5; probe_count = 2 }; voice = @{ outcome = "succeeded"; synthesis_ms = 42.0 }; journal = @{ duplicate_count = 1 }; recovery = @{ latency_ms = 250.0 } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $RuntimeEvidencePath = $evidencePath
+    $safe = Read-SafeRuntimeEvidence
+    Assert-True ([double]$safe.preview.ready_ms -eq 125.5) "safe runtime evidence did not retain numeric Preview metrics"
+    Assert-True ([double]$safe.voice.synthesis_ms -eq 42.0) "safe runtime evidence did not retain numeric voice metrics"
+    @{ voice = @{ prompt = "must-not-ingest" } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $threw = $false
+    try { Read-SafeRuntimeEvidence | Out-Null } catch { $threw = $true }
+    Assert-True $threw "runtime evidence accepted prohibited prompt content"
+    @{ voice = @{ name = "arbitrary-string" } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $threw = $false
+    try { Read-SafeRuntimeEvidence | Out-Null } catch { $threw = $true }
+    Assert-True $threw "runtime evidence accepted a non-canonical string field"
+} finally {
+    if (Test-Path -LiteralPath $evidencePath) { Remove-Item -LiteralPath $evidencePath -Force }
+}
 
 Write-Host "measure-thub.test: PASS"

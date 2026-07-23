@@ -13,14 +13,18 @@ vi.mock("./voiceAudio", () => ({ playWavBase64: vi.fn() }));
 
 vi.mock("../ipc/scribe", () => ({
   scribeStatus: vi.fn(() => Promise.resolve({ listening: false })),
+  onScribeStatus: vi.fn(() => Promise.resolve(() => {})),
+  startScribeStatusEmitter: vi.fn(() => Promise.resolve()),
+  stopScribeStatusEmitter: vi.fn(() => Promise.resolve()),
 }));
 
-import { scribeStatus } from "../ipc/scribe";
+import { onScribeStatus, scribeStatus } from "../ipc/scribe";
 import { synthesizeVoice } from "../ipc/voice";
 import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useSupervision } from "../store/supervision";
 import {
   SCRIBE_POLL_MS,
+  SCRIBE_EVENT_TTL_MS,
   SCRIBE_TAIL_MS,
   _pendingTextForTest,
   _resetVoiceAnnounceForTest,
@@ -33,6 +37,8 @@ beforeEach(() => {
   _resetVoiceAnnounceForTest();
   vi.mocked(scribeStatus).mockReset();
   vi.mocked(scribeStatus).mockResolvedValue({ listening: false });
+  vi.mocked(onScribeStatus).mockReset();
+  vi.mocked(onScribeStatus).mockImplementation(() => Promise.resolve(() => {}));
   vi.mocked(synthesizeVoice).mockClear();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
@@ -42,6 +48,50 @@ beforeEach(() => {
 });
 
 describe("Scribe poll lifecycle", () => {
+  it("switches to event-driven updates after the first Scribe event", async () => {
+    let emit: ((status: { listening: boolean }) => void) | undefined;
+    vi.mocked(onScribeStatus).mockImplementation(
+      (callback) => {
+        emit = callback;
+        return Promise.resolve(() => {});
+      },
+    );
+    startScribePoll();
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: { permission: true, question: true, completion: false, failure: false },
+    });
+    await Promise.resolve();
+    expect(scribeStatus).toHaveBeenCalledTimes(1);
+    emit?.({ listening: true, generation: 1, observedAtMs: Date.now(), sourceIdentity: "v1" });
+    await vi.advanceTimersByTimeAsync(SCRIBE_POLL_MS * 3);
+    expect(scribeStatus).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS);
+    expect(scribeStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores malformed, stale, and out-of-order Scribe events", async () => {
+    let emit: ((status: { listening: boolean; generation?: number; observedAtMs?: number; sourceIdentity?: string }) => void) | undefined;
+    vi.mocked(onScribeStatus).mockImplementation((callback) => {
+      emit = callback;
+      return Promise.resolve(() => {});
+    });
+    startScribePoll();
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: { permission: true, question: true, completion: false, failure: false },
+    });
+    await Promise.resolve();
+    emit?.({ listening: true });
+    emit?.({ listening: true, generation: 2, observedAtMs: Date.now() - SCRIBE_EVENT_TTL_MS - 1, sourceIdentity: "v1" });
+    emit?.({ listening: true, generation: 2, observedAtMs: Date.now(), sourceIdentity: "v1" });
+    emit?.({ listening: false, generation: 1, observedAtMs: Date.now(), sourceIdentity: "v1" });
+    await vi.advanceTimersByTimeAsync(SCRIBE_EVENT_TTL_MS + SCRIBE_POLL_MS);
+    expect(scribeStatus).toHaveBeenCalledTimes(2);
+  });
+
   it("does not call Scribe while voice announcements are disabled", async () => {
     startScribePoll();
 

@@ -1077,6 +1077,8 @@ pub fn run() {
             engine_supervisor::engine_runtime_status,
             // Scribe voice-gate: "is the general dictating?" (fails open).
             scribe::scribe_status,
+            scribe::scribe_status_start,
+            scribe::scribe_status_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");
