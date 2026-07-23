@@ -1,8 +1,6 @@
 //! Bounded Linux listener ownership inspection.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -156,12 +154,12 @@ fn listener_ownership_with(
         .into_iter()
         .map(|socket| socket.inode)
         .collect::<BTreeSet<_>>();
-    let mut owners = BTreeSet::new();
+    let mut inode_owners = BTreeMap::<String, BTreeSet<(u32, u64)>>::new();
     for pid in view.pids(MAX_PROCESSES)? {
         let Some(targets) = view.fd_targets(pid, MAX_FDS)? else {
             continue;
         };
-        if !owns_listener(&targets, &inodes) {
+        if matched_listener_inodes(&targets, &inodes).is_empty() {
             continue;
         }
         let before =
@@ -169,20 +167,40 @@ fn listener_ownership_with(
         if before.uid != view.expected_uid() {
             return Err("Preview listener belongs to another WSL uid".into());
         }
-        let repeated_targets = view
+        let before_targets = view
             .fd_targets(pid, MAX_FDS)?
             .ok_or("Preview listener owner descriptors disappeared during scan")?;
-        if !owns_listener(&repeated_targets, &inodes) {
+        let before_inodes = matched_listener_inodes(&before_targets, &inodes);
+        if before_inodes.is_empty() {
             return Err("Preview listener ownership changed during scan".into());
         }
         let identity = process_group_identity_with(view, &before)?;
+        let after_targets = view
+            .fd_targets(pid, MAX_FDS)?
+            .ok_or("Preview listener owner descriptors disappeared during scan")?;
+        let after_inodes = matched_listener_inodes(&after_targets, &inodes);
+        if after_inodes.is_empty() || after_inodes != before_inodes {
+            return Err("Preview listener inode ownership changed during scan".into());
+        }
         let after =
             process_identity(view, pid)?.ok_or("Preview listener owner disappeared during scan")?;
         if after != before {
             return Err("Preview listener owner identity changed during scan".into());
         }
-        owners.insert((identity.process_group_id, identity.process_group_started_at));
+        for inode in before_inodes {
+            inode_owners
+                .entry(inode)
+                .or_default()
+                .insert((identity.process_group_id, identity.process_group_started_at));
+        }
     }
+    if inode_owners.keys().cloned().collect::<BTreeSet<_>>() != inodes {
+        return Err("Preview listener inode has no stable same-uid owner evidence".into());
+    }
+    let owners = inode_owners
+        .into_values()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     match owners.into_iter().collect::<Vec<_>>().as_slice() {
         [] => Ok(None),
         [(group, started)] => Ok(Some(ListenerOwnership {
@@ -193,13 +211,21 @@ fn listener_ownership_with(
     }
 }
 
-fn owns_listener(targets: &[Option<String>], inodes: &BTreeSet<String>) -> bool {
-    targets.iter().flatten().any(|target| {
-        target
-            .strip_prefix("socket:[")
-            .and_then(|value| value.strip_suffix(']'))
-            .is_some_and(|inode| inodes.contains(inode))
-    })
+fn matched_listener_inodes(
+    targets: &[Option<String>],
+    inodes: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    targets
+        .iter()
+        .flatten()
+        .filter_map(|target| {
+            target
+                .strip_prefix("socket:[")
+                .and_then(|value| value.strip_suffix(']'))
+        })
+        .filter(|inode| inodes.contains(*inode))
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -244,9 +270,9 @@ fn parse_listener_sockets(
                 .map_err(|_| "Preview listener socket uid is malformed")?;
             if observed_port == port && fields[3] == "0A" {
                 let inode = fields[9];
-                if !inode.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err("Preview listener socket inode is malformed".into());
-                }
+                let inode = inode
+                    .parse::<u64>()
+                    .map_err(|_| "Preview listener socket inode is malformed")?;
                 result.insert(ListenerSocket {
                     inode: inode.to_string(),
                     uid,
@@ -345,6 +371,7 @@ mod tests {
         scripted_files: RefCell<BTreeMap<String, VecDeque<Option<Vec<u8>>>>>,
         pids: Vec<u32>,
         fds: BTreeMap<u32, Option<Vec<Option<String>>>>,
+        scripted_fds: RefCell<BTreeMap<u32, VecDeque<Option<Vec<Option<String>>>>>>,
         uids: BTreeMap<u32, Option<u32>>,
         scripted_uids: RefCell<BTreeMap<u32, VecDeque<Option<u32>>>>,
         expected_uid: u32,
@@ -370,7 +397,12 @@ mod tests {
             Ok(self.pids.clone())
         }
         fn fd_targets(&self, pid: u32, max: usize) -> Result<Option<Vec<Option<String>>>, String> {
-            let value = self.fds.get(&pid).cloned().flatten();
+            let value = self
+                .scripted_fds
+                .borrow_mut()
+                .get_mut(&pid)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| self.fds.get(&pid).cloned().flatten());
             if value.as_ref().is_some_and(|value| value.len() > max) {
                 return Err("too many fds".into());
             }
@@ -504,6 +536,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unresolved_same_uid_inode_and_inode_switch() {
+        let mut view = owned_fixture("0100007F:1051");
+        view.files.insert(
+            "net/tcp".into(),
+            table(&[("0100007F:1051", 1000, 55), ("00000000:1051", 1000, 56)]),
+        );
+        assert!(listener_ownership_with(&view, 4177)
+            .unwrap_err()
+            .contains("no stable same-uid owner"));
+
+        let view = owned_fixture("0100007F:1051");
+        view.scripted_fds.borrow_mut().insert(
+            20,
+            VecDeque::from([
+                Some(vec![Some("socket:[55]".into())]),
+                Some(vec![Some("socket:[55]".into())]),
+                Some(vec![Some("socket:[56]".into())]),
+            ]),
+        );
+        assert!(listener_ownership_with(&view, 4177)
+            .unwrap_err()
+            .contains("inode ownership changed"));
+    }
+
+    #[test]
     fn rejects_owner_reuse_disappearance_and_foreign_leader() {
         let view = owned_fixture("0100007F:1051");
         view.scripted_files.borrow_mut().insert(
@@ -557,7 +614,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn live_ipv6_and_child_group_ownership_resolve() {
+    fn live_ipv6_and_separate_child_group_ownership_resolve() {
         let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let expected = process_group_identity_for_pid(std::process::id()).unwrap();
@@ -565,21 +622,33 @@ mod tests {
         drop(listener);
 
         use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        let mut child = Command::new("/usr/bin/python3")
+        let mut command = Command::new("/usr/bin/python3");
+        command
             .args([
                 "-c",
                 "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(s.getsockname()[1],flush=True); time.sleep(30)",
             ])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
         let port = line.trim().parse::<u16>().unwrap();
-        assert_eq!(listener_ownership(port).unwrap(), Some(expected));
+        let child_identity = process_group_identity_for_pid(child.id()).unwrap();
+        assert_ne!(child_identity, expected);
+        assert_eq!(listener_ownership(port).unwrap(), Some(child_identity));
         let _ = child.kill();
         let _ = child.wait();
     }
