@@ -2,7 +2,7 @@
 # Run the packaged Windows T-Hub benchmark from WSL without sampling unrelated processes.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 POWERSHELL_SCRIPT="$HERE/measure-thub.ps1"
 
@@ -166,13 +166,8 @@ if [ -n "$wsl_version" ] && [[ ! "$wsl_version" =~ ^v[0-9]+(\.[0-9]+){0,2}$ ]]; 
 if [ -n "$wsl_distro" ] && [[ ! "$wsl_distro" =~ ^[A-Za-z0-9._-]+$ ]]; then echo "run-thub-benchmark: WSL distro is not canonical" >&2; exit 2; fi
 if [ -n "$power_mode" ] && [[ ! "$power_mode" =~ ^(ac|dc|balanced|high_performance)$ ]]; then echo "run-thub-benchmark: power mode is not canonical" >&2; exit 2; fi
 if [ -n "$reference_selection_reason" ] && [[ ! "$reference_selection_reason" =~ ^[A-Za-z0-9._/\ -]+$ ]]; then echo "run-thub-benchmark: reference reason is not canonical" >&2; exit 2; fi
-if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
-  echo "run-thub-benchmark: required Windows/WSL dependency is unavailable" >&2
-  exit 3
-fi
-
 if [ -z "$output" ]; then
-  output="$REPO_ROOT/artifacts/perf/t-hub-${terminals}t-$(date -u +%Y%m%dT%H%M%SZ).json"
+  output="$REPO_ROOT/artifacts/perf/t-hub-${terminals}t-$(/bin/date -u +%Y%m%dT%H%M%SZ).json"
 elif [[ "$output" != /* ]]; then
   output="$REPO_ROOT/$output"
 fi
@@ -180,7 +175,7 @@ if [[ "$executable" == /* ]]; then
   executable="$(to_windows_path "$executable")"
 fi
 
-commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
+commit="$(/usr/bin/git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
 script_windows="$(to_windows_path "$POWERSHELL_SCRIPT")"
 output_windows="$(to_windows_path "$output")"
 command=(
@@ -245,6 +240,10 @@ if "$dry_run"; then
   printf '%q ' "${command[@]}"
   printf '\n'
   exit 0
+fi
+if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
+  echo "run-thub-benchmark: required Windows/WSL dependency is unavailable" >&2
+  exit 3
 fi
 if ! command -v powershell.exe >/dev/null 2>&1; then
   echo "run-thub-benchmark: powershell.exe is unavailable; run this script from WSL on Windows" >&2
