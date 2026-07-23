@@ -45,13 +45,6 @@ fi
 if "$RUNNER" --pid 0 --dry-run >/dev/null 2>&1; then
   fail "zero PID was accepted"
 fi
-set +e
-PATH="$HERE" /usr/bin/bash "$RUNNER" --terminals 1 >/dev/null 2>&1
-dependency_exit=$?
-set -e
-if [ "$dependency_exit" -ne 3 ]; then
-  fail "missing PowerShell dependency returned exit $dependency_exit instead of 3"
-fi
 if "$RUNNER" --scenario-kind unsupported --dry-run >/dev/null 2>&1; then
   fail "unsupported scenario kind was accepted"
 fi
@@ -73,22 +66,113 @@ fi
 if "$RUNNER" --source-commit bad --dry-run >/dev/null 2>&1; then
   fail "invalid source commit was accepted"
 fi
-runner_diag="/tmp/thub-runner-diagnostic-${PPID}.json"
+runner_tmp="$(/bin/mktemp -d)"
+trap '/bin/rm -rf "$runner_tmp"' EXIT
+
+assert_runner_diagnostic() {
+  local artifact="$1" expected_code="$2"
+  [ -s "$artifact" ] || fail "runner case did not publish a diagnostic artifact"
+  /usr/bin/jq -e --arg code "$expected_code" '
+    .schemaVersion == 3 and
+    (.candidate | type == "object") and
+    (.candidate.sourceCommit | type == "string") and
+    (.candidate.installedBinarySha256 == null) and
+    (.candidate.installerSha256 == null) and
+    (.candidate.protocolVersion | type == "number") and
+    (.reference | type == "object") and
+    (.reference.installedBinarySha256 == null) and
+    (.reference.selectionReason == null) and
+    (.host | type == "object") and
+    (.host.windowsVersion | type == "string") and
+    (.host.wslVersion | type == "string") and
+    (.host.distro | type == "string") and
+    (.host.logicalProcessors | type == "number") and
+    (.host.memoryBytes | type == "number") and
+    (.host.powerMode | type == "string") and
+    (.host.displayScale | type == "number") and
+    (.scenario | type == "object") and
+    (.scenario.kind | type == "string") and
+    (.scenario.terminalCount | type == "number") and
+    (.scenario.observedTerminalCount == null) and
+    (.scenario.workloadVersion | type == "string") and
+    (.scenario.workloadSeed | type == "string") and
+    (.scenario.repetition | type == "number") and
+    (.scenario.startedAt == null) and
+    (.scenario.finishedAt == null) and
+    (.resources | type == "object") and
+    (.resources.windows | type == "object") and
+    (.resources.wslOwned | type == "object") and
+    (.resources.wslOwned.available | type == "boolean") and
+    (.resources.wslOwned.reason | type == "string") and
+    (.resources.webview | type == "object") and
+    (.resources.samples | type == "array") and
+    (.operations | type == "array") and
+    (.preview | type == "object") and
+    (.voice | type == "object") and
+    (.journal | type == "object") and
+    (.diagnostics | type == "object") and
+    (.diagnostics.errorCode | type == "string") and
+    (.diagnostics.heartbeatStalls | type == "array") and
+    (.diagnostics.longTasks | type == "array") and
+    (.diagnostics.resizeObserverErrors | type == "array") and
+    (.diagnostics.redactionCount | type == "number") and
+    (.validity | type == "object") and
+    (.validity.eligible | type == "boolean") and
+    (.validity.reasons | type == "array") and
+    (.validity.processBirthIntervalsExcluded | type == "number") and
+    (.budgets | type == "array") and
+    (.decision | type == "string") and
+    (.rawEvidence | type == "array") and
+    (.redactionCount | type == "number") and
+    (.diagnostics.errorCode == $code)
+  ' "$artifact" >/dev/null || fail "runner diagnostic schema/types or error code are invalid"
+}
+
+run_runner_case() {
+  local name="$1" expected_code="$2"; shift 2
+  local artifact="$runner_tmp/$name.json" actual
+  set +e
+  "$RUNNER" --output "$artifact" "$@" >/dev/null 2>&1
+  actual=$?
+  set -e
+  [ "$actual" -eq "$expected_code" ] || fail "runner $name returned exit $actual instead of $expected_code"
+  assert_runner_diagnostic "$artifact" "runner_failure"
+  printf '%s\n' "$artifact"
+}
+
+run_runner_case malformed 2 --terminals 2 >/dev/null
+run_runner_case missing 2 --terminals >/dev/null
+run_runner_case unknown 2 --unknown-flag >/dev/null
+dependency_artifact="$runner_tmp/dependency.json"
+set +e
+PATH="$HERE" /usr/bin/bash "$RUNNER" --output "$dependency_artifact" --terminals 1 >/dev/null 2>&1
+dependency_exit=$?
+set -e
+[ "$dependency_exit" -eq 3 ] || fail "missing PowerShell dependency returned exit $dependency_exit instead of 3"
+assert_runner_diagnostic "$dependency_artifact" "runner_failure"
+
+runner_diag="$runner_tmp/collision.json"
 set +e
 "$RUNNER" --output "$runner_diag" --unknown-flag >/dev/null 2>&1
 runner_exit=$?
 set -e
-if [ "$runner_exit" -ne 2 ] || [ ! -s "$runner_diag" ] || ! grep -Fq '"schemaVersion":3' "$runner_diag"; then
-  fail "invalid invocation did not publish a schema-valid exit2 diagnostic"
-fi
+[ "$runner_exit" -eq 2 ] || fail "collision baseline returned exit $runner_exit instead of 2"
+assert_runner_diagnostic "$runner_diag" "runner_failure"
 runner_before="$(/usr/bin/sha256sum "$runner_diag" | /usr/bin/awk '{print $1}')"
 set +e
 "$RUNNER" --output "$runner_diag" --unknown-flag >/dev/null 2>&1
+collision_exit=$?
 set -e
+[ "$collision_exit" -eq 2 ] || fail "collision retry returned exit $collision_exit instead of 2"
 runner_after="$(/usr/bin/sha256sum "$runner_diag" | /usr/bin/awk '{print $1}')"
-if [ "$runner_before" != "$runner_after" ] || ! /usr/bin/find "$(/usr/bin/dirname "$runner_diag")" -maxdepth 1 -name "$(/usr/bin/basename "${runner_diag%.json}").runner-*.json" -print -quit | /bin/grep -q .; then
-  fail "runner diagnostic collision did not preserve old evidence and create a unique attempt"
-fi
+[ "$runner_before" = "$runner_after" ] || fail "runner collision clobbered the original artifact"
+tmp_count="$(/usr/bin/find "$runner_tmp" -maxdepth 1 -type f -name '*.tmp' | /usr/bin/wc -l)"
+stale_count="$(/usr/bin/find "$runner_tmp" -maxdepth 1 -type f -name 'collision.json.*' | /usr/bin/wc -l)"
+collision_count="$(/usr/bin/find "$runner_tmp" -maxdepth 1 -type f -name 'collision.runner-*.json' | /usr/bin/wc -l)"
+[ "$tmp_count" -eq 0 ] || fail "runner diagnostic left temporary artifacts"
+[ "$stale_count" -eq 0 ] || fail "runner diagnostic left stale wildcard artifacts"
+[ "$collision_count" -eq 1 ] || fail "runner collision did not create exactly one unique artifact"
+assert_runner_diagnostic "$(/usr/bin/find "$runner_tmp" -maxdepth 1 -type f -name 'collision.runner-*.json' -print -quit)" "runner_failure"
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -File "$COLLECTOR_TEST"

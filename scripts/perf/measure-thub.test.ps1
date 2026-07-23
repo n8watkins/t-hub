@@ -9,6 +9,89 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Assert-FieldType {
+    param(
+        [object]$Object,
+        [string]$Path,
+        [ValidateSet("string", "number", "boolean", "object", "array")]
+        [string]$Kind,
+        [switch]$AllowNull
+    )
+    $value = $Object
+    foreach ($segment in $Path.Split(".")) {
+        $property = $value.PSObject.Properties[$segment]
+        Assert-True ($null -ne $property) "schema field $Path is missing"
+        $value = $property.Value
+    }
+    if ($null -eq $value) {
+        Assert-True $AllowNull.IsPresent "schema field $Path is null"
+        return
+    }
+    $matches = switch ($Kind) {
+        "string" { $value -is [string] }
+        "number" { $value -is [byte] -or $value -is [int16] -or $value -is [int32] -or $value -is [int64] -or $value -is [single] -or $value -is [double] -or $value -is [decimal] }
+        "boolean" { $value -is [bool] }
+        "object" { $value -is [psobject] -and $value -isnot [array] -and $value -isnot [string] }
+        "array" { $value -is [array] }
+    }
+    Assert-True $matches "schema field $Path is not a $Kind"
+}
+
+function Assert-DiagnosticSchema {
+    param([object]$Artifact)
+    Assert-FieldType $Artifact "schemaVersion" "number"
+    Assert-FieldType $Artifact "candidate" "object"
+    Assert-FieldType $Artifact "candidate.sourceCommit" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.installedBinarySha256" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.installerSha256" "string" -AllowNull
+    Assert-FieldType $Artifact "candidate.protocolVersion" "number"
+    Assert-FieldType $Artifact "reference" "object"
+    Assert-FieldType $Artifact "reference.installedBinarySha256" "string" -AllowNull
+    Assert-FieldType $Artifact "reference.selectionReason" "string" -AllowNull
+    Assert-FieldType $Artifact "host" "object"
+    Assert-FieldType $Artifact "host.windowsVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "host.wslVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "host.distro" "string" -AllowNull
+    Assert-FieldType $Artifact "host.logicalProcessors" "number" -AllowNull
+    Assert-FieldType $Artifact "host.memoryBytes" "number" -AllowNull
+    Assert-FieldType $Artifact "host.powerMode" "string" -AllowNull
+    Assert-FieldType $Artifact "host.displayScale" "number" -AllowNull
+    Assert-FieldType $Artifact "scenario" "object"
+    Assert-FieldType $Artifact "scenario.kind" "string"
+    Assert-FieldType $Artifact "scenario.terminalCount" "number"
+    Assert-FieldType $Artifact "scenario.observedTerminalCount" "number" -AllowNull
+    Assert-FieldType $Artifact "scenario.workloadVersion" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.workloadSeed" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.repetition" "number"
+    Assert-FieldType $Artifact "scenario.startedAt" "string" -AllowNull
+    Assert-FieldType $Artifact "scenario.finishedAt" "string" -AllowNull
+    Assert-FieldType $Artifact "resources" "object"
+    Assert-FieldType $Artifact "resources.windows" "object" -AllowNull
+    Assert-FieldType $Artifact "resources.wslOwned" "object"
+    Assert-FieldType $Artifact "resources.wslOwned.available" "boolean"
+    Assert-FieldType $Artifact "resources.wslOwned.reason" "string"
+    Assert-FieldType $Artifact "resources.webview" "object"
+    Assert-FieldType $Artifact "resources.samples" "array"
+    Assert-FieldType $Artifact "operations" "array"
+    Assert-FieldType $Artifact "preview" "object"
+    Assert-FieldType $Artifact "voice" "object"
+    Assert-FieldType $Artifact "journal" "object"
+    Assert-FieldType $Artifact "diagnostics" "object"
+    Assert-FieldType $Artifact "diagnostics.errorCode" "string"
+    Assert-FieldType $Artifact "diagnostics.heartbeatStalls" "array"
+    Assert-FieldType $Artifact "diagnostics.longTasks" "array"
+    Assert-FieldType $Artifact "diagnostics.resizeObserverErrors" "array"
+    Assert-FieldType $Artifact "diagnostics.redactionCount" "number"
+    Assert-FieldType $Artifact "validity" "object"
+    Assert-FieldType $Artifact "validity.eligible" "boolean"
+    Assert-FieldType $Artifact "validity.reasons" "array"
+    Assert-FieldType $Artifact "validity.processBirthIntervalsExcluded" "number"
+    Assert-FieldType $Artifact "budgets" "array"
+    Assert-FieldType $Artifact "decision" "string"
+    Assert-FieldType $Artifact "rawEvidence" "array"
+    Assert-FieldType $Artifact "redactionCount" "number"
+}
+
 function New-ProcessRow {
     param(
         [int]$Id,
@@ -83,6 +166,7 @@ try {
     Write-DiagnosticArtifact "secret C:\\Users\\natha\\token"
     $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw | ConvertFrom-Json
     Assert-True ($diagnostic.schemaVersion -eq 3 -and $diagnostic.diagnostics.errorCode -eq "collector_exception") "diagnostic artifact shape is invalid"
+    Assert-DiagnosticSchema $diagnostic
     Assert-True ((Get-Content -LiteralPath $diagnosticPath -Raw) -notmatch "secret|token|natha") "diagnostic artifact leaked exception detail"
 } finally {
     if (Test-Path -LiteralPath $diagnosticPath) { Remove-Item -LiteralPath $diagnosticPath -Force }
