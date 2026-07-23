@@ -10,9 +10,10 @@ output=""
 write_runner_diagnostic() {
   local code="$1" path="$output"
   [ -n "$path" ] || path="$REPO_ROOT/artifacts/perf/runner-diagnostic.json"
+  if [ -e "$path" ]; then path="${path%.json}.runner-${BASHPID}.json"; fi
   /bin/mkdir -p "$(/usr/bin/dirname "$path")" 2>/dev/null || return 0
-  if [ -e "$path" ]; then return 0; fi
-  (set -C; /usr/bin/printf '%s\n' '{"schemaVersion":3,"candidate":null,"reference":null,"host":null,"scenario":null,"resources":{"webview":{},"samples":[]},"operations":[],"preview":{},"voice":{},"journal":{},"diagnostics":{"errorCode":"runner_failure","heartbeatStalls":[],"longTasks":[],"resizeObserverErrors":[],"redactionCount":0},"validity":{"eligible":false,"reasons":["runner_failure"],"processBirthIntervalsExcluded":0},"budgets":[],"decision":"ineligible","rawEvidence":[],"redactionCount":0}' > "$path") 2>/dev/null || true
+  local temp="$path.$BASHPID.tmp"
+  (set -C; /usr/bin/printf '%s\n' '{"schemaVersion":3,"candidate":{"sourceCommit":"unknown","installedBinarySha256":null,"installerSha256":null,"protocolVersion":2},"reference":{"installedBinarySha256":null,"selectionReason":null},"host":{"windowsVersion":"unknown","wslVersion":"unknown","distro":"unknown","logicalProcessors":0,"memoryBytes":0,"powerMode":"unknown","displayScale":0},"scenario":{"kind":"unknown","terminalCount":0,"observedTerminalCount":null,"workloadVersion":"unknown","workloadSeed":"unknown","repetition":0,"startedAt":null,"finishedAt":null},"resources":{"windows":{},"wslOwned":{"available":false,"reason":"runner diagnostic"},"webview":{},"samples":[]},"operations":[],"preview":{},"voice":{},"journal":{},"diagnostics":{"errorCode":"runner_failure","heartbeatStalls":[],"longTasks":[],"resizeObserverErrors":[],"redactionCount":0},"validity":{"eligible":false,"reasons":["runner_failure"],"processBirthIntervalsExcluded":0},"budgets":[],"decision":"ineligible","rawEvidence":[],"redactionCount":0}' > "$temp" && /bin/mv -n "$temp" "$path") 2>/dev/null || { /bin/rm -f "$temp" 2>/dev/null || true; }
 }
 
 terminals=1

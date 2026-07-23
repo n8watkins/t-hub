@@ -81,6 +81,14 @@ set -e
 if [ "$runner_exit" -ne 2 ] || [ ! -s "$runner_diag" ] || ! grep -Fq '"schemaVersion":3' "$runner_diag"; then
   fail "invalid invocation did not publish a schema-valid exit2 diagnostic"
 fi
+runner_before="$(/usr/bin/sha256sum "$runner_diag" | /usr/bin/awk '{print $1}')"
+set +e
+"$RUNNER" --output "$runner_diag" --unknown-flag >/dev/null 2>&1
+set -e
+runner_after="$(/usr/bin/sha256sum "$runner_diag" | /usr/bin/awk '{print $1}')"
+if [ "$runner_before" != "$runner_after" ] || ! /usr/bin/find "$(/usr/bin/dirname "$runner_diag")" -maxdepth 1 -name "$(/usr/bin/basename "${runner_diag%.json}").runner-*.json" -print -quit | /bin/grep -q .; then
+  fail "runner diagnostic collision did not preserve old evidence and create a unique attempt"
+fi
 
 if command -v pwsh >/dev/null 2>&1; then
   pwsh -NoProfile -NonInteractive -File "$COLLECTOR_TEST"
