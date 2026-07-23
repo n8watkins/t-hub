@@ -79,16 +79,23 @@ impl ToolDef {
         if self.tier == Tier::Organization {
             description.push_str(" (audited: emits a visible audit event).");
         }
+        let mut annotations = json!({
+            "t-hubTier": self.tier.label(),
+            "confirmationRequired": self.tier == Tier::ProcessChanging,
+        });
+        if self.name == "cortana_bootstrap" {
+            annotations["readOnlyHint"] = json!(true);
+            annotations["destructiveHint"] = json!(false);
+            annotations["idempotentHint"] = json!(true);
+            annotations["openWorldHint"] = json!(false);
+        }
         json!({
             "name": self.name,
             "description": description,
             "inputSchema": (self.input_schema)(),
             // A non-standard annotation block clients may ignore; it carries the
             // tier so a permission-aware host can map it to its own policy.
-            "annotations": {
-                "t-hubTier": self.tier.label(),
-                "confirmationRequired": self.tier == Tier::ProcessChanging,
-            },
+            "annotations": annotations,
         })
     }
 }
@@ -1258,6 +1265,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_captain_bootstrap,
         },
         ToolDef {
+            name: "cortana_bootstrap",
+            tier: Tier::Read,
+            summary: "Recover the bounded, redacted Cortana singleton checkpoint and current ship resume points.",
+            input_schema: schema_empty,
+        },
+        ToolDef {
             name: "list_fleet_watches",
             tier: Tier::Read,
             summary: "List the armed orchestrator wakes (who gets woken, for which sessions + states).",
@@ -1726,6 +1739,20 @@ mod tests {
         assert_eq!(mcp["annotations"]["t-hubTier"], "read");
         assert_eq!(mcp["annotations"]["confirmationRequired"], false);
         assert_eq!((tool.input_schema)(), schema_empty());
+    }
+
+    #[test]
+    fn cortana_bootstrap_is_bounded_read_only_and_preapproved_by_contract() {
+        let tool = find("cortana_bootstrap").unwrap();
+        let mcp = tool.to_mcp();
+        assert_eq!(tool.tier, Tier::Read);
+        assert_eq!((tool.input_schema)(), schema_empty());
+        assert_eq!(mcp["annotations"]["t-hubTier"], "read");
+        assert_eq!(mcp["annotations"]["confirmationRequired"], false);
+        assert_eq!(mcp["annotations"]["readOnlyHint"], true);
+        assert_eq!(mcp["annotations"]["destructiveHint"], false);
+        assert_eq!(mcp["annotations"]["idempotentHint"], true);
+        assert_eq!(mcp["annotations"]["openWorldHint"], false);
     }
 
     #[test]

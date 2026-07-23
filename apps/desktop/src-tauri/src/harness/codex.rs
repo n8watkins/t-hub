@@ -66,6 +66,26 @@ impl HarnessAdapter for CodexHarness {
         }
     }
 
+    fn fresh_cortana_argv(&self, prompt: &str) -> String {
+        let policy = sh_single_quote(super::CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE);
+        if prompt.is_empty() {
+            format!("codex --sandbox read-only -c {policy}")
+        } else {
+            format!(
+                "codex --sandbox read-only -c {policy} {}",
+                sh_single_quote(prompt)
+            )
+        }
+    }
+
+    fn resume_cortana_argv(&self, session_id: &str) -> String {
+        format!(
+            "codex resume --sandbox read-only -c {} {}",
+            sh_single_quote(super::CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE),
+            sh_single_quote(session_id)
+        )
+    }
+
     fn exec_turn_argv(&self, prompt: &str, resume: Option<&str>, perm: PermMode) -> String {
         // Headless one-turn pipeline, tee'd into the journal via the tap:
         //   fresh:  codex exec        --json <perm> '<prompt>' | t-hub-agent --codex-tap
@@ -202,6 +222,27 @@ mod tests {
             ),
             "codex resume --sandbox read-only '019f5390-6497-75c2-ad90-e721d1b6d1d5'"
         );
+    }
+
+    #[test]
+    fn cortana_fresh_and_resume_approve_only_the_bootstrap_tool() {
+        let adapter = CodexHarness;
+        let fresh = adapter.fresh_cortana_argv("restore");
+        assert_eq!(
+            fresh,
+            "codex --sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' 'restore'"
+        );
+        let resume = adapter.resume_cortana_argv("thread-xyz");
+        assert_eq!(
+            resume,
+            "codex resume --sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' 'thread-xyz'"
+        );
+        for command in [fresh, resume] {
+            assert!(!command.contains("--ask-for-approval"));
+            assert!(!command.contains("--dangerously-bypass-approvals-and-sandbox"));
+            assert!(!command.contains("--yolo"));
+            assert!(!command.contains("--full-auto"));
+        }
     }
 
     #[test]

@@ -6571,10 +6571,14 @@ impl CaptainsRegistry {
         &self,
         operation_id: &str,
         terminal_id: &str,
+        identity_id: &str,
+        generation: u64,
         expected: crate::harness::ExpectedHarnessLaunchProvenance,
     ) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
         if operation_id.trim().is_empty()
             || terminal_id.trim().is_empty()
+            || identity_id.trim().is_empty()
+            || generation == 0
             || !crate::harness::valid_expected_harness_launch_provenance(&expected)
         {
             return Err("cannot record invalid expected Cortana Harness launch provenance".into());
@@ -6588,16 +6592,37 @@ impl CaptainsRegistry {
             .ok_or("expected Cortana Harness provenance has no durable managed launch")?;
         if launch.operation_id != operation_id
             || launch.terminal_id != terminal_id
+            || launch.identity_id != identity_id
+            || launch.generation != generation
             || launch.harness != expected.provider
         {
             return Err("expected Cortana Harness provenance does not match its launch".into());
         }
+        let same_bound_entry = |legacy: &crate::harness::ExpectedHarnessLaunchProvenance| {
+            legacy.provider == expected.provider
+                && legacy.kind == expected.kind
+                && legacy.executable == expected.executable
+                && legacy.entry_script == expected.entry_script
+                && legacy.trusted_child_executable == expected.trusted_child_executable
+                && legacy.argv_layout_sha256 == expected.argv_layout_sha256
+        };
         if launch.version == 4 {
-            return if launch.expected_harness_launch_provenance.as_ref() == Some(&expected) {
-                Ok(current.cortana.clone())
-            } else {
-                Err("different expected Cortana Harness provenance is already durable".into())
-            };
+            if launch.expected_harness_launch_provenance.as_ref() == Some(&expected) {
+                return Ok(current.cortana.clone());
+            }
+            if launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .is_none_or(|legacy| {
+                    legacy.version != 2
+                        || legacy.launch_policy_sha256.is_some()
+                        || !same_bound_entry(legacy)
+                })
+            {
+                return Err(
+                    "different expected Cortana Harness provenance is already durable".into(),
+                );
+            }
         }
         if launch.version == 3
             && launch
@@ -6616,8 +6641,9 @@ impl CaptainsRegistry {
                     .into(),
             );
         }
-        if !matches!(launch.version, 1..=3)
+        if !matches!(launch.version, 1..=4)
             || (launch.version != 3 && launch.expected_harness_launch_provenance.is_some())
+                && launch.version != 4
         {
             return Err("expected Cortana Harness provenance cannot enrich this launch".into());
         }
@@ -14531,6 +14557,7 @@ fn dispatch_with_caller(
             read_crew_powder_evidence(ctx, args, caller, trusted_internal)
         }
         "captain_bootstrap" => captain_bootstrap(ctx, args),
+        "cortana_bootstrap" => cortana_bootstrap(ctx, args, caller),
         "powder_status" => powder_status(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
         "read_terminal" | "capture_pane" => read_terminal(ctx, args, caller, trusted_internal),
@@ -19202,6 +19229,274 @@ fn captain_bootstrap(ctx: &ControlContext, args: &Value) -> Result<Value, String
     }))
 }
 
+const CORTANA_BOOTSTRAP_MAX_SHIPS: usize = 16;
+const CORTANA_BOOTSTRAP_MAX_TEXT_BYTES: usize = 1_024;
+const CORTANA_BOOTSTRAP_MAX_RESPONSE_BYTES: usize = 32_768;
+
+fn bounded_bootstrap_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.len() <= CORTANA_BOOTSTRAP_MAX_TEXT_BYTES {
+        return Some(value.to_string());
+    }
+    let mut end = CORTANA_BOOTSTRAP_MAX_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(value[..end].to_string())
+}
+
+fn exact_cortana_bootstrap_live_terminal(
+    ctx: &ControlContext,
+    caller: &ResolvedIdentity,
+) -> Result<String, String> {
+    let terminal_id = exact_live_identity_terminal(ctx, caller)
+        .map_err(|error| format!("cortana_bootstrap: {error}"))?;
+    let live = (ctx.live_sessions)()
+        .map_err(|error| format!("cortana_bootstrap: terminal liveness is unavailable: {error}"))?;
+    let target = tmux_target(&terminal_id);
+    if live
+        .iter()
+        .filter(|session| **session == terminal_id || **session == target)
+        .count()
+        != 1
+    {
+        return Err("cortana_bootstrap: Cortana terminal liveness is missing or ambiguous".into());
+    }
+    Ok(terminal_id)
+}
+
+fn authorize_inflight_cortana_bootstrap(
+    ctx: &ControlContext,
+    durable: &crate::cortana_reconcile::CortanaDurableIdentity,
+    identity: &crate::identity::SessionIdentity,
+) -> Result<(), String> {
+    let launch = durable
+        .managed_launch
+        .as_ref()
+        .filter(|launch| {
+            matches!(
+                launch.phase,
+                crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Observed
+                    | crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
+            )
+        })
+        .ok_or("cortana_bootstrap: Cortana is not healthy or in an admitted launch phase")?;
+    let owner = durable
+        .owner
+        .as_ref()
+        .ok_or("cortana_bootstrap: in-flight Cortana has no exact managed owner")?;
+    if launch.generation == 0
+        || launch.identity_id != identity.id
+        || identity.session_tile.as_deref() != Some(launch.terminal_id.as_str())
+        || launch.tmux_target != tmux_target(&launch.terminal_id)
+        || owner.unit_name != launch.unit_name
+        || owner.launch_nonce != launch.launch_nonce
+        || owner.tools != launch.tools
+    {
+        return Err(
+            "cortana_bootstrap: in-flight identity, generation, terminal, Harness, launch, and owner do not agree"
+                .into(),
+        );
+    }
+    let snapshot = ctx.captains.snapshot();
+    let claims = snapshot
+        .captains
+        .iter()
+        .filter(|claim| claim.role == FleetRole::Cortana && claim.state == ClaimState::Active)
+        .collect::<Vec<_>>();
+    let claim_is_exact = matches!(
+        claims.as_slice(),
+        [claim]
+            if claim.terminal_id.as_deref() == Some(launch.terminal_id.as_str())
+                && claim.harness.as_deref() == Some(launch.harness.as_str())
+    );
+    if (launch.phase == crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
+        && !claim_is_exact)
+        || (launch.phase != crate::cortana_reconcile::CortanaManagedLaunchPhase::Claimed
+            && !claims.is_empty())
+    {
+        return Err("cortana_bootstrap: in-flight Fleet claim is missing or ambiguous".into());
+    }
+    tmux::revalidate_managed_runtime_owner(&launch.tmux_target, &tmux_cortana_owner(owner))
+        .map_err(|error| {
+            format!("cortana_bootstrap: managed owner revalidation failed: {error}")
+        })?;
+    let expected = launch
+        .expected_harness_launch_provenance
+        .as_ref()
+        .filter(|expected| crate::harness::valid_expected_harness_launch_provenance(expected))
+        .ok_or("cortana_bootstrap: in-flight Harness provenance is unavailable")?;
+    let harness = match launch.harness.as_str() {
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        _ => return Err("cortana_bootstrap: in-flight Harness is unsupported".into()),
+    };
+    let observed = crate::harness::observe_scoped_harness_process(
+        &launch.tmux_target,
+        harness,
+        expected,
+        &identity.id,
+        &identity.secret,
+        &owner.cgroup_path,
+        owner.tmux.pane_start_ticks,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|error| format!("cortana_bootstrap: Harness revalidation failed: {error}"))?;
+    if launch
+        .harness_process
+        .as_ref()
+        .is_some_and(|process| process != &observed)
+    {
+        return Err("cortana_bootstrap: in-flight Harness process changed".into());
+    }
+    Ok(())
+}
+
+fn authorize_cortana_bootstrap(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<crate::cortana_reconcile::CortanaDurableIdentity, String> {
+    let caller = caller
+        .ok_or("cortana_bootstrap: an authenticated terminal-bound Cortana bearer is required")?;
+    let identity = ctx
+        .identity
+        .get(&caller.session_id)
+        .filter(|identity| identity.role == crate::identity::Role::Cortana)
+        .ok_or("cortana_bootstrap: authenticated bearer does not resolve to Cortana")?;
+    let terminal_id = exact_cortana_bootstrap_live_terminal(ctx, caller)?;
+    if identity.session_tile.as_deref() != Some(terminal_id.as_str()) {
+        return Err("cortana_bootstrap: Cortana bearer terminal binding changed".into());
+    }
+    let before = ctx.captains.cortana_identity();
+    if matches!(
+        before.recovery,
+        crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+    ) {
+        if before.identity_id.as_deref() != Some(identity.id.as_str())
+            || before.terminal_id.as_deref() != Some(terminal_id.as_str())
+            || before.generation == 0
+            || before.harness.as_deref().is_none()
+        {
+            return Err(
+                "cortana_bootstrap: authenticated bearer is not the exact durable Cortana generation"
+                    .into(),
+            );
+        }
+        if !authoritative_cortana_identity(ctx, &identity) {
+            return Err("cortana_bootstrap: healthy Cortana authority did not revalidate".into());
+        }
+    } else {
+        authorize_inflight_cortana_bootstrap(ctx, &before, &identity)?;
+        if before
+            .managed_launch
+            .as_ref()
+            .is_none_or(|launch| launch.terminal_id != terminal_id)
+        {
+            return Err(
+                "cortana_bootstrap: live terminal does not match the durable in-flight launch"
+                    .into(),
+            );
+        }
+    }
+    if ctx.captains.cortana_identity() != before {
+        return Err("cortana_bootstrap: Cortana durable state changed during revalidation".into());
+    }
+    Ok(before)
+}
+
+fn cortana_bootstrap(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
+    if args.as_object().is_none_or(|object| !object.is_empty()) {
+        return Err("cortana_bootstrap accepts no arguments".into());
+    }
+    let durable = authorize_cortana_bootstrap(ctx, caller)?;
+    let snapshot = ctx.captains.snapshot();
+    let mut ships = snapshot
+        .captains
+        .iter()
+        .filter(|ship| ship.role == FleetRole::Captain && ship.state == ClaimState::Active)
+        .map(|ship| {
+            json!({
+                "shipSlug": ship.ship_slug,
+                "terminalId": ship.terminal_id,
+                "projectId": ship.project_id,
+                "harness": ship.harness,
+                "providerSessionId": ship.provider_session_id,
+                "conversationId": ship.conversation_id,
+                "resumePoint": bounded_bootstrap_text(ship.resume_point.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    ships.sort_by(|left, right| {
+        left["shipSlug"]
+            .as_str()
+            .cmp(&right["shipSlug"].as_str())
+            .then_with(|| {
+                left["terminalId"]
+                    .as_str()
+                    .cmp(&right["terminalId"].as_str())
+            })
+    });
+    let active_count = ships.len();
+    ships.truncate(CORTANA_BOOTSTRAP_MAX_SHIPS);
+    let returned_count = ships.len();
+    let healthy = matches!(
+        durable.recovery,
+        crate::cortana_reconcile::CortanaRecoveryState::Healthy { .. }
+    );
+    let (generation, terminal_id, harness) = if healthy {
+        (
+            durable.generation,
+            durable.terminal_id.as_deref(),
+            durable.harness.as_deref(),
+        )
+    } else {
+        let launch = durable
+            .managed_launch
+            .as_ref()
+            .ok_or("cortana_bootstrap: authorized in-flight launch disappeared")?;
+        (
+            launch.generation,
+            Some(launch.terminal_id.as_str()),
+            Some(launch.harness.as_str()),
+        )
+    };
+    let response = json!({
+        "cortana": {
+            "generation": generation,
+            "terminalId": terminal_id,
+            "harness": harness,
+            "checkpoint": bounded_bootstrap_text(durable.checkpoint.as_deref()),
+            "state": if healthy {
+                "healthy"
+            } else {
+                "inFlight"
+            },
+        },
+        "ships": ships,
+        "activeCount": active_count,
+        "returnedCount": returned_count,
+        "omittedCount": active_count.saturating_sub(returned_count),
+        "truncated": active_count > CORTANA_BOOTSTRAP_MAX_SHIPS,
+        "recoverySource": "captains-registry",
+    });
+    if serde_json::to_vec(&response)
+        .map_err(|error| format!("cortana_bootstrap: response encoding failed: {error}"))?
+        .len()
+        > CORTANA_BOOTSTRAP_MAX_RESPONSE_BYTES
+    {
+        return Err("cortana_bootstrap: bounded response ceiling exceeded".into());
+    }
+    Ok(response)
+}
+
 fn existing_project_captain(
     ctx: &ControlContext,
     project_id: &str,
@@ -19557,8 +19852,10 @@ fn valid_cortana_managed_launch(
                 .as_ref()
                 .is_some_and(|expected| {
                     expected.provider == launch.harness
-                        && expected.version
-                            == crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+                        && matches!(
+                            expected.version,
+                            2 | crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+                        )
                         && crate::harness::valid_expected_harness_launch_provenance(expected)
                 })
                 && match launch.phase {
@@ -19763,6 +20060,8 @@ fn synthetic_cortana_expected_harness_launch(
         entry_script: None,
         trusted_child_executable: None,
         argv_layout_sha256: None,
+        launch_policy_sha256: (harness == "codex")
+            .then(crate::harness::cortana_codex_launch_policy_sha256),
     }
 }
 
@@ -20392,15 +20691,14 @@ fn cortana_startup_command(
         .filter(|value| !value.is_empty());
     let command = anchor.map_or_else(
         || {
-            harness.adapter().fresh_argv_with_permissions(
-                "You are Cortana, T-Hub's singleton supervisor. Restore the durable fleet checkpoint, delegate administrative execution, and preserve ship boundaries.",
-                PermMode::Default,
+            harness.adapter().fresh_cortana_argv(
+                "You are Cortana, T-Hub's singleton supervisor. First call cortana_bootstrap to restore the bounded durable fleet checkpoint and ship resume points. Delegate administrative execution and preserve ship boundaries.",
             )
         },
         |provider_session_id| {
             harness
                 .adapter()
-                .resume_argv_with_permissions(provider_session_id, PermMode::Default)
+                .resume_cortana_argv(provider_session_id)
         },
     );
     #[cfg(test)]
@@ -20410,6 +20708,31 @@ fn cortana_startup_command(
         let _ = args;
         command
     }
+}
+
+fn resolve_cortana_expected_harness_launch(
+    command: &str,
+    harness: Harness,
+    args: &Value,
+) -> Result<crate::harness::ExpectedHarnessLaunchProvenance, String> {
+    #[cfg(not(test))]
+    let _ = args;
+    let expected = crate::harness::resolve_expected_harness_launch_provenance(command, harness)
+        .map_err(|error| format!("configured Harness launch provenance is untrusted: {error}"))?;
+    if harness == Harness::Codex
+        && expected.launch_policy_sha256.as_deref()
+            != Some(crate::harness::cortana_codex_launch_policy_sha256().as_str())
+    {
+        #[cfg(test)]
+        if args.get("testStartupCommand").is_some() {
+            return Ok(expected);
+        }
+        return Err(
+            "configured Codex launch does not grant exactly the cortana_bootstrap approval policy"
+                .into(),
+        );
+    }
+    Ok(expected)
 }
 
 #[cfg(test)]
@@ -21262,11 +21585,10 @@ fn observe_cortana_reconcile_outside_locks(
                 _ => return Err("legacy incumbent has an unsupported Harness".into()),
             };
             let command = cortana_startup_command(&durable, args, harness);
-            let expected =
-                crate::harness::resolve_expected_harness_launch_provenance(&command, harness)
-                    .map_err(|error| {
-                        format!("configured legacy incumbent provenance is untrusted: {error}")
-                    })?;
+            let expected = resolve_cortana_expected_harness_launch(&command, harness, args)
+                .map_err(|error| {
+                    format!("configured legacy incumbent provenance is untrusted: {error}")
+                })?;
             let deadline = Instant::now() + Duration::from_secs(5);
             let first =
                 observe_live_cortana_with_expected_provenance(ctx, &durable, &expected, deadline)?;
@@ -21480,10 +21802,8 @@ fn reconcile_cortana_inner(
             }
         };
         let command = cortana_startup_command(&durable, args, harness);
-        let expected = crate::harness::resolve_expected_harness_launch_provenance(
-            &command, harness,
-        )
-        .map_err(|error| {
+        let expected =
+            resolve_cortana_expected_harness_launch(&command, harness, args).map_err(|error| {
             format!(
                 "reconcile_cortana: configured Harness provenance cannot enrich the retained managed launch: {error}"
             )
@@ -21492,6 +21812,8 @@ fn reconcile_cortana_inner(
             .record_cortana_expected_harness_launch_provenance(
                 operation_id,
                 &launch.terminal_id,
+                &launch.identity_id,
+                launch.generation,
                 expected,
             )?;
         return Err(CORTANA_ATTESTATION_REQUIRED.into());
@@ -22214,13 +22536,14 @@ fn reconcile_cortana_inner(
     }
     let harness = Harness::from_provider(&harness_name);
     let startup_command = cortana_startup_command(&durable, args, harness);
-    let expected_harness_launch_provenance =
-        crate::harness::resolve_expected_harness_launch_provenance(&startup_command, harness)
-            .map_err(|error| {
-                format!(
-                    "reconcile_cortana: configured Harness launch provenance is untrusted: {error}"
-                )
-            })?;
+    let expected_harness_launch_provenance = resolve_cortana_expected_harness_launch(
+        &startup_command,
+        harness,
+        args,
+    )
+    .map_err(|error| {
+        format!("reconcile_cortana: configured Harness launch provenance is untrusted: {error}")
+    })?;
     #[cfg(test)]
     let effect_startup_command =
         arg_str(args, "testEffectStartupCommand").unwrap_or_else(|| startup_command.clone());
@@ -33443,6 +33766,20 @@ mod tests {
         (bin_dir, command)
     }
 
+    fn modeled_codex_tool_approval(command: &str, tool: &str) -> &'static str {
+        let argv = shell_words::split(command).unwrap();
+        let expected = format!("mcp_servers.t-hub.tools.{tool}.approval_mode=\"approve\"");
+        let approved = argv
+            .windows(2)
+            .filter(|pair| matches!(pair[0].as_str(), "-c" | "--config"))
+            .any(|pair| pair[1] == expected);
+        if approved {
+            "approve"
+        } else {
+            "prompt"
+        }
+    }
+
     #[cfg(unix)]
     fn compile_scoped_attestation_harness() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let directory = std::env::temp_dir().join(format!(
@@ -40446,7 +40783,8 @@ int main(int argc, char **argv) {
 
         let mut v4 = v3;
         v4["version"] = json!(4);
-        v4["expectedHarnessLaunchProvenance"]["version"] = json!(2);
+        v4["expectedHarnessLaunchProvenance"]["version"] =
+            json!(crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION);
         std::fs::write(&path, document(27, v4.clone()).to_string()).unwrap();
         assert!(matches!(
             CaptainsRegistry::read_snapshot(&path),
@@ -46215,6 +46553,166 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn cortana_bootstrap_requires_exact_live_authority_and_returns_a_bounded_redacted_snapshot() {
+        if tmux::managed_runtime_preflight().is_err() {
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let mut ctx = test_ctx("cortana-bootstrap")
+            .with_live_sessions(|| tmux::list_sessions().map_err(|error| error.to_string()))
+            .with_apply_sink(sink.clone());
+        ctx.addr = "127.0.0.1:4263".into();
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: CAPTAIN_WORKSPACE_ID.into(),
+            name: CAPTAIN_WORKSPACE_NAME.into(),
+            tile_ids: Vec::new(),
+        }]);
+        let home = std::env::temp_dir().join(format!(
+            "t-hub-cortana-bootstrap-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let started = dispatch(
+            &ctx,
+            "reconcile_cortana",
+            &json!({
+                "operationId": "cortana-bootstrap-start",
+                "testOrchestratorHome": home,
+                "testStartupCommand": harness_command,
+            }),
+        )
+        .unwrap();
+        let terminal_id = started["terminalId"].as_str().unwrap().to_string();
+        let target = tmux_target(&terminal_id);
+        let bearer = tmux::session_environment(&target, crate::identity::SESSION_TOKEN_ENV)
+            .unwrap()
+            .unwrap();
+        let modeled_launch = cortana_startup_command(
+            &crate::cortana_reconcile::CortanaDurableIdentity::default(),
+            &json!({}),
+            Harness::Codex,
+        );
+        assert_eq!(
+            modeled_codex_tool_approval(&modeled_launch, "cortana_bootstrap"),
+            "approve"
+        );
+        assert_eq!(
+            modeled_codex_tool_approval(&modeled_launch, "focus_session"),
+            "prompt"
+        );
+        assert_eq!(
+            modeled_codex_tool_approval(&modeled_launch, "spawn_terminal"),
+            "prompt"
+        );
+
+        for index in (0..20).rev() {
+            let ship_slug = format!("ship-{index:02}");
+            ctx.captains
+                .claim_test(&format!("captain-{index:02}"), Some(&ship_slug), vec![])
+                .unwrap();
+            ctx.captains
+                .checkpoint(
+                    None,
+                    Some(&ship_slug),
+                    None,
+                    Some(&format!("thread-{index:02}")),
+                    Some(&"x".repeat(CORTANA_BOOTSTRAP_MAX_TEXT_BYTES + 64)),
+                )
+                .unwrap();
+        }
+
+        let bootstrap = dispatch_authenticated(
+            &ctx,
+            req_session(&ctx.read_token, &bearer, "cortana_bootstrap", json!({})),
+        );
+        assert!(bootstrap.ok, "{:?}", bootstrap.error);
+        let result = bootstrap.result.unwrap();
+        assert_eq!(result["activeCount"], 20);
+        assert_eq!(result["returnedCount"], CORTANA_BOOTSTRAP_MAX_SHIPS);
+        assert_eq!(result["omittedCount"], 4);
+        assert_eq!(result["ships"][0]["shipSlug"], "ship-00");
+        assert_eq!(result["ships"][15]["shipSlug"], "ship-15");
+        assert_eq!(
+            result["ships"][0]["resumePoint"].as_str().unwrap().len(),
+            CORTANA_BOOTSTRAP_MAX_TEXT_BYTES
+        );
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert!(encoded.len() <= CORTANA_BOOTSTRAP_MAX_RESPONSE_BYTES);
+        let redacted = String::from_utf8(encoded).unwrap().to_ascii_lowercase();
+        for forbidden in [
+            "assignment",
+            "launchnonce",
+            "owner",
+            "harnessprocess",
+            "argv",
+            "sessiontoken",
+        ] {
+            assert!(!redacted.contains(forbidden), "{forbidden}: {redacted}");
+        }
+        let effects_before_denials = sink.calls.lock().unwrap().len();
+        for (command, args) in [
+            ("focus_session", json!({"sessionId": terminal_id.clone()})),
+            (
+                "spawn_terminal",
+                json!({"requestId": "cortana-bootstrap-must-not-spawn"}),
+            ),
+        ] {
+            let denied =
+                dispatch_authenticated(&ctx, req_session(&ctx.read_token, &bearer, command, args));
+            assert!(!denied.ok, "{command}");
+            assert!(denied
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("requires the control capability") }));
+        }
+        assert_eq!(sink.calls.lock().unwrap().len(), effects_before_denials);
+
+        let crew = ctx.identity.mint(crate::identity::Role::Crew).unwrap();
+        let denied_crew = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &crew.secret,
+                "cortana_bootstrap",
+                json!({}),
+            ),
+        );
+        assert!(!denied_crew.ok);
+
+        let ambiguous = ctx.identity.mint(crate::identity::Role::Cortana).unwrap();
+        ctx.identity.bind_tile(&ambiguous.id, &terminal_id).unwrap();
+        let denied_ambiguous = dispatch_authenticated(
+            &ctx,
+            req_session(&ctx.read_token, &bearer, "cortana_bootstrap", json!({})),
+        );
+        assert!(!denied_ambiguous.ok);
+        ctx.identity.retire(&ambiguous.id).unwrap();
+
+        let dead = test_ctx("cortana-bootstrap-dead")
+            .with_captains_registry(Arc::clone(&ctx.captains))
+            .with_identity_store(Arc::clone(&ctx.identity))
+            .with_live_sessions(|| Ok(Vec::new()));
+        let denied_dead = dispatch_authenticated(
+            &dead,
+            req_session(&dead.read_token, &bearer, "cortana_bootstrap", json!({})),
+        );
+        assert!(!denied_dead.ok);
+        let denied_missing = dispatch_authenticated(
+            &ctx,
+            req_session(&ctx.read_token, "", "cortana_bootstrap", json!({})),
+        );
+        assert!(!denied_missing.ok);
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn managed_cortana_with_lost_session_authority_is_replaced_after_restart_without_signal() {
         let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let registry_path = captains_tmp("cortana-lost-session-authority");
@@ -48884,7 +49382,7 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn schema27_launch_enrichment_preserves_bound_entry_identity() {
+    fn v2_launch_policy_enrichment_preserves_live_wal_identity_across_restart() {
         let path = captains_tmp("cortana-schema27-provenance-enrichment");
         let _ = std::fs::remove_file(&path);
         let registry = powder_lifecycle_registry(Some(path.clone()));
@@ -48925,39 +49423,90 @@ int main(int argc, char **argv) {
                 expected.clone(),
             )
             .unwrap();
+        let owner_observed = registry
+            .record_cortana_runtime_owner("schema27-operation", "a1b2c3d4", owner.clone())
+            .unwrap();
         let mut snapshot = registry.snapshot();
-        snapshot.schema_version = 27;
         let legacy_launch = snapshot.cortana.managed_launch.as_mut().unwrap();
-        legacy_launch.version = 3;
-        legacy_launch
+        legacy_launch.version = 4;
+        let legacy_expected = legacy_launch
             .expected_harness_launch_provenance
             .as_mut()
-            .unwrap()
-            .version = 1;
+            .unwrap();
+        legacy_expected.version = 2;
+        legacy_expected.launch_policy_sha256 = None;
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
         let legacy = CaptainsRegistry::load(path.clone());
+        let reloaded_legacy = legacy.cortana_identity();
+        let reloaded_launch = reloaded_legacy.managed_launch.as_ref().unwrap();
+        assert_eq!(
+            reloaded_launch.phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+        );
+        assert_eq!(
+            reloaded_legacy.owner.as_ref(),
+            owner_observed.owner.as_ref()
+        );
+        assert_eq!(
+            reloaded_legacy.terminal_id.as_ref(),
+            owner_observed.terminal_id.as_ref()
+        );
+        let reloaded_expected = reloaded_launch
+            .expected_harness_launch_provenance
+            .as_ref()
+            .unwrap();
+        assert_eq!(reloaded_expected.version, 2);
+        assert!(reloaded_expected.launch_policy_sha256.is_none());
+        assert!(crate::harness::valid_expected_harness_launch_provenance(
+            reloaded_expected
+        ));
+        for (identity_id, generation) in [("replayed-identity", 1), ("schema27-identity", 2)] {
+            assert!(legacy
+                .record_cortana_expected_harness_launch_provenance(
+                    "schema27-operation",
+                    "a1b2c3d4",
+                    identity_id,
+                    generation,
+                    expected.clone(),
+                )
+                .unwrap_err()
+                .contains("does not match its launch"));
+        }
         let mut changed = expected.clone();
         changed.executable.inode += 1;
         assert!(legacy
             .record_cortana_expected_harness_launch_provenance(
                 "schema27-operation",
                 "a1b2c3d4",
+                "schema27-identity",
+                1,
                 changed,
             )
             .unwrap_err()
-            .contains("changed while enriching"));
-        assert_eq!(legacy.cortana_identity().managed_launch.unwrap().version, 3);
+            .contains("different expected"));
+        assert_eq!(legacy.cortana_identity().managed_launch.unwrap().version, 4);
 
         let enriched = legacy
             .record_cortana_expected_harness_launch_provenance(
                 "schema27-operation",
                 "a1b2c3d4",
+                "schema27-identity",
+                1,
                 expected,
             )
             .unwrap();
         let enriched_launch = enriched.managed_launch.as_ref().unwrap();
         assert_eq!(enriched_launch.version, 4);
+        assert_eq!(
+            enriched_launch.phase,
+            crate::cortana_reconcile::CortanaManagedLaunchPhase::OwnerObserved
+        );
+        assert_eq!(enriched.owner.as_ref(), owner_observed.owner.as_ref());
+        assert_eq!(
+            enriched.terminal_id.as_ref(),
+            owner_observed.terminal_id.as_ref()
+        );
         assert_eq!(
             enriched_launch
                 .expected_harness_launch_provenance
@@ -48965,6 +49514,14 @@ int main(int argc, char **argv) {
                 .unwrap()
                 .version,
             crate::harness::EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+        );
+        assert_eq!(
+            enriched_launch
+                .expected_harness_launch_provenance
+                .as_ref()
+                .unwrap()
+                .launch_policy_sha256,
+            Some(crate::harness::cortana_codex_launch_policy_sha256())
         );
         assert_eq!(
             CaptainsRegistry::load(path.clone()).cortana_identity(),
@@ -49524,6 +50081,29 @@ int main(int argc, char **argv) {
         assert_eq!(
             crate::harness::WINDOWS_SCOPED_HARNESS_HELPERS_PER_OBSERVATION,
             1
+        );
+    }
+
+    #[test]
+    fn cortana_startup_prompt_and_resume_use_the_dedicated_bootstrap_policy() {
+        let durable = crate::cortana_reconcile::CortanaDurableIdentity::default();
+        let fresh = cortana_startup_command(&durable, &json!({}), Harness::Codex);
+        assert!(fresh.contains("First call cortana_bootstrap"));
+        assert!(!fresh.contains("captain_bootstrap"));
+        assert!(fresh.contains("--sandbox read-only"));
+        assert!(fresh.contains(crate::harness::CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE));
+
+        let resumed = cortana_startup_command(
+            &crate::cortana_reconcile::CortanaDurableIdentity {
+                provider_session_id: Some("thread-cortana".into()),
+                ..Default::default()
+            },
+            &json!({}),
+            Harness::Codex,
+        );
+        assert_eq!(
+            resumed,
+            "codex resume --sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' 'thread-cortana'"
         );
     }
 
@@ -50186,6 +50766,17 @@ int main(int argc, char **argv) {
         );
         let old_owner = observed.owner.clone().unwrap();
         let identity_secret = ctx.identity.get(&launch.identity_id).unwrap().secret;
+        let bootstrap = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &ctx.read_token,
+                &identity_secret,
+                "cortana_bootstrap",
+                json!({}),
+            ),
+        );
+        assert!(bootstrap.ok, "{:?}", bootstrap.error);
+        assert_eq!(bootstrap.result.unwrap()["cortana"]["state"], "inFlight");
         let mut reused_owner = old_owner.clone();
         reused_owner.invocation_id = if old_owner.invocation_id.starts_with('f') {
             format!("e{}", &old_owner.invocation_id[1..])
@@ -50289,6 +50880,16 @@ int main(int argc, char **argv) {
         tmux::retire_managed_runtime(&launch.tmux_target, &tmux_cortana_owner(&old_owner)).unwrap();
         std::fs::remove_dir_all(harness_dir).unwrap();
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_owner_observed_launch_can_bootstrap_before_process_wal_commit() {
+        managed_owner_generation_mutation_case(
+            "cortana_before_owner_revalidation_owner_observed",
+            false,
+            "owner-observed",
+        );
     }
 
     #[cfg(unix)]
@@ -50754,6 +51355,8 @@ int main(int argc, char **argv) {
             .record_cortana_expected_harness_launch_provenance(
                 &operation_id,
                 &replacement_terminal,
+                &replacement_identity.id,
+                2,
                 expected.clone(),
             )
             .unwrap();

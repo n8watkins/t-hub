@@ -116,6 +116,8 @@ pub enum PermMode {
 /// provider Harness, but does not expand Crew scope, T-Hub capability, legacy
 /// authority, or authority over destructive and outward-facing actions.
 pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
+pub const CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE: &str =
+    "mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"";
 
 impl PermMode {
     pub fn as_str(self) -> &'static str {
@@ -169,7 +171,7 @@ pub struct HarnessExecutableIdentity {
     pub inode: u64,
 }
 
-pub const EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION: u32 = 2;
+pub const EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION: u32 = 3;
 
 /// Sanitized identity of the configured provider entry point resolved before
 /// any managed launch effect. Script launches bind both the runtime and the
@@ -187,6 +189,8 @@ pub struct ExpectedHarnessLaunchProvenance {
     pub trusted_child_executable: Option<HarnessExecutableIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv_layout_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_policy_sha256: Option<String>,
 }
 
 /// Credential-safe, durable identity for the exact provider process accepted
@@ -402,6 +406,17 @@ pub trait HarnessAdapter: Send + Sync {
     /// Interactive resume with an explicit permission posture. Recovery paths
     /// use this instead of inheriting a potentially broader user default.
     fn resume_argv_with_permissions(&self, session_id: &str, perm: PermMode) -> String;
+
+    /// Least-privilege interactive Cortana launch. Providers without a
+    /// per-tool approval policy retain their read-only default posture.
+    fn fresh_cortana_argv(&self, prompt: &str) -> String {
+        self.fresh_argv_with_permissions(prompt, PermMode::Default)
+    }
+
+    /// Least-privilege Cortana continuity launch.
+    fn resume_cortana_argv(&self, session_id: &str) -> String {
+        self.resume_argv_with_permissions(session_id, PermMode::Default)
+    }
 
     /// The HEADLESS crew-turn pipeline string: one `exec`-style turn whose
     /// lifecycle streams into the t-hub journal via the producer tap. `resume =
@@ -665,6 +680,7 @@ cat "$cmdline"
     parse_process_evidence(&output.stdout)
 }
 
+#[derive(Clone)]
 struct ScopedProcessDetails {
     pid: u32,
     parent_pid: u32,
@@ -1518,6 +1534,73 @@ fn argv_layout_sha256(arguments: &[String]) -> String {
     framed_sha256(b"t-hub:harness-argv-layout:v1\0", fields)
 }
 
+pub fn cortana_codex_launch_policy_sha256() -> String {
+    framed_sha256(
+        b"t-hub-cortana-codex-launch-policy-v1",
+        [
+            b"sandbox=read-only".as_slice(),
+            CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE.as_bytes(),
+        ],
+    )
+}
+
+fn codex_launch_policy_sha256(
+    arguments: &[String],
+) -> Result<Option<String>, LaunchAttestationError> {
+    let mut sandbox_values = Vec::new();
+    let mut bootstrap_approval_count = 0usize;
+    let mut index = 0usize;
+    while let Some(argument) = arguments.get(index) {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        match flag {
+            "--dangerously-bypass-approvals-and-sandbox" | "--yolo" | "--full-auto" => {
+                return Err(LaunchAttestationError::UntrustedLaunchCommand);
+            }
+            "--ask-for-approval" | "-a" => {
+                let value = inline.or_else(|| arguments.get(index + 1).map(String::as_str));
+                if value.is_none() {
+                    return Err(LaunchAttestationError::UntrustedLaunchCommand);
+                }
+                return Err(LaunchAttestationError::UntrustedLaunchCommand);
+            }
+            "--sandbox" | "-s" => {
+                let value = inline
+                    .or_else(|| arguments.get(index + 1).map(String::as_str))
+                    .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+                sandbox_values.push(value);
+                index += usize::from(inline.is_none());
+            }
+            "-c" | "--config" => {
+                let value = inline
+                    .or_else(|| arguments.get(index + 1).map(String::as_str))
+                    .ok_or(LaunchAttestationError::UntrustedLaunchCommand)?;
+                if value == CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE {
+                    bootstrap_approval_count += 1;
+                } else if value.contains("approval_mode")
+                    || value.contains("approval_policy")
+                    || value.contains("ask_for_approval")
+                {
+                    return Err(LaunchAttestationError::UntrustedLaunchCommand);
+                }
+                index += usize::from(inline.is_none());
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if bootstrap_approval_count == 0 {
+        return Ok(None);
+    }
+    if bootstrap_approval_count != 1 || sandbox_values.as_slice() != ["read-only"] {
+        return Err(LaunchAttestationError::UntrustedLaunchCommand);
+    }
+    Ok(Some(cortana_codex_launch_policy_sha256()))
+}
+
 fn codex_native_layout(os: &str, arch: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match (os, arch) {
         ("Linux" | "Android", "x86_64") => {
@@ -1706,6 +1789,11 @@ pub fn resolve_expected_harness_launch_provenance(
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
     let entry = resolve_launch_executable(executable_argument)?;
+    let launch_policy_sha256 = if expected_provider == Harness::Codex {
+        codex_launch_policy_sha256(&argv[1..])?
+    } else {
+        None
+    };
     let Some(shebang) = entry.shebang.as_deref() else {
         return Ok(ExpectedHarnessLaunchProvenance {
             version: EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION,
@@ -1715,6 +1803,7 @@ pub fn resolve_expected_harness_launch_provenance(
             entry_script: None,
             trusted_child_executable: None,
             argv_layout_sha256: None,
+            launch_policy_sha256,
         });
     };
     let shebang_argv =
@@ -1753,6 +1842,7 @@ pub fn resolve_expected_harness_launch_provenance(
         entry_script: Some(entry.identity),
         trusted_child_executable,
         argv_layout_sha256: Some(argv_layout_sha256(&argv[1..])),
+        launch_policy_sha256,
     })
 }
 
@@ -1775,10 +1865,15 @@ pub fn valid_expected_harness_launch_provenance(
     };
     matches!(
         expected.version,
-        1 | EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
-    ) && (expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
-        || expected.trusted_child_executable.is_none())
+        1 | 2 | EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+    ) && (expected.version >= 2 || expected.trusted_child_executable.is_none())
+        && (expected.version == EXPECTED_HARNESS_LAUNCH_PROVENANCE_VERSION
+            || expected.launch_policy_sha256.is_none())
         && matches!(expected.provider.as_str(), "codex" | "claude")
+        && expected
+            .launch_policy_sha256
+            .as_deref()
+            .is_none_or(valid_digest)
         && valid_executable(&expected.executable)
         && match expected.kind.as_str() {
             "direct" => {
@@ -1811,8 +1906,11 @@ fn scoped_process_matches_expected_launch(
     {
         return Ok(false);
     }
-    match expected.kind.as_str() {
-        "direct" => Ok(expected.entry_script.is_none() && expected.argv_layout_sha256.is_none()),
+    let (shape_matches, provider_arguments) = match expected.kind.as_str() {
+        "direct" => Ok((
+            expected.entry_script.is_none() && expected.argv_layout_sha256.is_none(),
+            process.argv.get(1..),
+        )),
         "script" => {
             let observed_entry = process
                 .argv
@@ -1820,13 +1918,26 @@ fn scoped_process_matches_expected_launch(
                 .ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)
                 .and_then(|entry| resolve_launch_executable(entry))?;
             let observed_layout = argv_layout_sha256(&process.argv[2..]);
-            Ok(
+            Ok((
                 expected.entry_script.as_ref() == Some(&observed_entry.identity)
                     && expected.argv_layout_sha256.as_deref() == Some(observed_layout.as_str()),
-            )
+                process.argv.get(2..),
+            ))
         }
         _ => Err(LaunchAttestationError::ExpectedProvenanceMismatch),
+    }?;
+    if !shape_matches {
+        return Ok(false);
     }
+    let observed_policy = match expected.provider.as_str() {
+        "codex" => codex_launch_policy_sha256(
+            provider_arguments.ok_or(LaunchAttestationError::ExpectedProvenanceMismatch)?,
+        )
+        .map_err(|_| LaunchAttestationError::ExpectedProvenanceMismatch)?,
+        "claude" => None,
+        _ => return Err(LaunchAttestationError::ExpectedProvenanceMismatch),
+    };
+    Ok(observed_policy == expected.launch_policy_sha256)
 }
 
 fn scoped_process_matches_executable(
@@ -2631,6 +2742,110 @@ mod tests {
         assert_eq!(
             resolve_expected_harness_launch_provenance("claude", Harness::Codex),
             Err(LaunchAttestationError::UntrustedLaunchCommand)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cortana_codex_provenance_binds_only_the_exact_tool_approval_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-cortana-policy-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex");
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        let exact_args = vec![
+            executable.display().to_string(),
+            "--sandbox".into(),
+            "read-only".into(),
+            "-c".into(),
+            CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE.into(),
+            "restore".into(),
+        ];
+        let exact_command = exact_args
+            .iter()
+            .map(|argument| sh_single_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected =
+            resolve_expected_harness_launch_provenance(&exact_command, Harness::Codex).unwrap();
+        assert_eq!(
+            expected.launch_policy_sha256,
+            Some(cortana_codex_launch_policy_sha256())
+        );
+
+        let process = ScopedProcessDetails {
+            pid: 42,
+            parent_pid: 1,
+            start_ticks: 900,
+            process_group_id: 42,
+            process_session_id: 42,
+            executable_path: expected.executable.path.clone(),
+            executable_device: expected.executable.device,
+            executable_inode: expected.executable.inode,
+            cgroup_path: "/user.slice/t-hub.scope".into(),
+            session_token: Some("token".into()),
+            argv: exact_args,
+        };
+        assert!(scoped_process_matches_expected_launch(&process, &expected).unwrap());
+
+        let resume_args = vec![
+            executable.display().to_string(),
+            "resume".into(),
+            "--sandbox".into(),
+            "read-only".into(),
+            "-c".into(),
+            CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE.into(),
+            "thread-cortana".into(),
+        ];
+        let resume_command = resume_args
+            .iter()
+            .map(|argument| sh_single_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let resume_expected =
+            resolve_expected_harness_launch_provenance(&resume_command, Harness::Codex).unwrap();
+        assert_eq!(
+            resume_expected.launch_policy_sha256,
+            Some(cortana_codex_launch_policy_sha256())
+        );
+        let resume_process = ScopedProcessDetails {
+            argv: resume_args,
+            ..process.clone()
+        };
+        assert!(
+            scoped_process_matches_expected_launch(&resume_process, &resume_expected).unwrap(),
+            "resume options after the subcommand must be bound before authority publication"
+        );
+
+        for invalid_suffix in [
+            "--sandbox workspace-write -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.captain_bootstrap.approval_mode=\"approve\"'",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"never\"'",
+            "--sandbox read-only -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"' -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--sandbox read-only --ask-for-approval never -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--sandbox read-only --ask-for-approval approve -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--dangerously-bypass-approvals-and-sandbox -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--yolo -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+            "--full-auto -c 'mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"'",
+        ] {
+            let command = format!("{} {invalid_suffix} restore", executable.display());
+            assert_eq!(
+                resolve_expected_harness_launch_provenance(&command, Harness::Codex),
+                Err(LaunchAttestationError::UntrustedLaunchCommand),
+                "{invalid_suffix}"
+            );
+        }
+
+        let mut substituted = process;
+        substituted.argv[4] =
+            "mcp_servers.t-hub.tools.captain_bootstrap.approval_mode=\"approve\"".into();
+        assert_eq!(
+            scoped_process_matches_expected_launch(&substituted, &expected),
+            Err(LaunchAttestationError::ExpectedProvenanceMismatch)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
