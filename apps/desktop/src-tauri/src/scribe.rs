@@ -620,6 +620,26 @@ fn apply_scribe_spawn_result(
     }
 }
 
+fn prepare_scribe_worker(state: &mut ScribeEmitterState) -> Option<u64> {
+    if state.enabled
+        && state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    {
+        return None;
+    }
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    Some(state.generation)
+}
+
 fn read_scribe_status_emitter_tick(
     candidates: &mut [Option<CandidateEval>; 2],
     last_checked: &mut [std::time::Instant; 2],
@@ -698,14 +718,7 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
             return;
         }
     }
-    if let Some(cancel) = state.cancel.take() {
-        cancel.store(true, Ordering::Release);
-    }
-    if let Some(handle) = state.handle.take() {
-        let _ = handle.join();
-    }
-    state.generation = state.generation.wrapping_add(1);
-    let generation = state.generation;
+    let generation = prepare_scribe_worker(&mut state).expect("live worker handled above");
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
     let thread_result = std::thread::Builder::new()
@@ -1000,21 +1013,48 @@ mod tests {
     fn rapid_stop_start_keeps_one_worker() {
         let _test_lock = lifecycle_test_lock();
         stop_scribe_status_emitter();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = std::thread::spawn(|| {});
         let mut state = ScribeEmitterState {
             generation: 1,
             enabled: false,
             cancel: None,
             handle: None,
         };
-        apply_scribe_spawn_result(&mut state, cancel, Ok(worker));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_active = active.clone();
+        let first_peak = peak.clone();
+        let first = std::thread::spawn(move || {
+            let count = first_active.fetch_add(1, Ordering::SeqCst) + 1;
+            first_peak.fetch_max(count, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            first_active.fetch_sub(1, Ordering::SeqCst);
+        });
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        apply_scribe_spawn_result(&mut state, cancel, Ok(first));
         assert!(state.enabled && state.handle.is_some());
-        if let Some(handle) = state.handle.take() {
-            handle.join().expect("worker joins");
-        }
         state.enabled = false;
-        assert!(!state.enabled);
+        let generation = prepare_scribe_worker(&mut state).expect("replacement generation");
+        let second_active = active.clone();
+        let second_peak = peak.clone();
+        let second = std::thread::spawn(move || {
+            let count = second_active.fetch_add(1, Ordering::SeqCst) + 1;
+            second_peak.fetch_max(count, Ordering::SeqCst);
+            second_active.fetch_sub(1, Ordering::SeqCst);
+        });
+        apply_scribe_spawn_result(
+            &mut state,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Ok(second),
+        );
+        assert!(state.enabled && state.generation == generation);
+        stop_scribe_status_emitter();
+        state
+            .handle
+            .take()
+            .expect("sole worker")
+            .join()
+            .expect("worker joins");
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     #[test]
