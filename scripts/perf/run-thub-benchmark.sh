@@ -22,6 +22,7 @@ reference_binary_sha256=""
 reference_selection_reason=""
 source_commit=""
 installer_sha256=""
+package5_manifest=""
 observed_terminals=""
 protocol_version=2
 wsl_version=""
@@ -51,6 +52,7 @@ Options:
   --reference-reason T Predeclared reference selection reason
   --source-commit H   Full source Git commit bound to the installed artifact
   --installer-sha256 H Package 5 installer SHA-256
+  --package5-manifest PATH Package 5 provenance manifest for exact app binding
   --observed-terminals N Authoritative observed terminal count (required for eligibility)
   --wsl-version V      Observed WSL version (required for eligibility)
   --wsl-distro NAME    Observed WSL distro identity (required for eligibility)
@@ -94,6 +96,7 @@ while [ "$#" -gt 0 ]; do
     --reference-reason) require_value "$@"; reference_selection_reason="$2"; shift 2 ;;
     --source-commit) require_value "$@"; source_commit="$2"; shift 2 ;;
     --installer-sha256) require_value "$@"; installer_sha256="$2"; shift 2 ;;
+    --package5-manifest) require_value "$@"; package5_manifest="$2"; shift 2 ;;
     --observed-terminals) require_value "$@"; observed_terminals="$2"; shift 2 ;;
     --wsl-version) require_value "$@"; wsl_version="$2"; shift 2 ;;
     --wsl-distro) require_value "$@"; wsl_distro="$2"; shift 2 ;;
@@ -177,6 +180,9 @@ if [ -n "$source_commit" ]; then
 fi
 if [ -n "$installer_sha256" ]; then
   command+=( -InstallerSha256 "$installer_sha256" )
+fi
+if [ -n "$package5_manifest" ]; then
+  command+=( -Package5ManifestPath "$(to_windows_path "$package5_manifest")" )
 fi
 if [ -n "$observed_terminals" ]; then
   command+=( -ObservedTerminalCount "$observed_terminals" )

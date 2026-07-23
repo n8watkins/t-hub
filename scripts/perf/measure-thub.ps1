@@ -31,6 +31,7 @@ param(
     [string]$ReferenceSelectionReason = "",
     [string]$SourceCommit = "",
     [string]$InstallerSha256 = "",
+    [string]$Package5ManifestPath = "",
     [int]$ProtocolVersion = 2,
     [string]$WslVersion = "",
     [string]$WslDistro = "",
@@ -434,7 +435,7 @@ function Convert-SafeEvidenceNode {
     if ($Node -is [string]) {
         $enum = @{
             kind = @("operation", "preview", "voice", "journal", "recovery", "diagnostic", "metric")
-            status = @("ok", "ready", "running", "stopped", "failed", "unavailable", "succeeded", "idle", "busy")
+            status = @("ok", "ready", "running", "stopped", "failed", "pass", "unavailable", "succeeded", "idle", "busy")
             source = @("tauri", "scribe", "rust", "frontend", "backend", "windows", "linux", "wsl")
             type = @("static", "vite", "nextjs", "monorepo")
             outcome = @("succeeded", "failed", "unavailable", "skipped")
@@ -518,6 +519,11 @@ $installedBinarySha256 = if ($binary) { Assert-Sha256 $binary.sha256 "installed 
 if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256 = Assert-Sha256 $ReferenceBinarySha256 "reference binary hash" }
 if ($InstallerSha256.Length -gt 0) { $InstallerSha256 = Assert-Sha256 $InstallerSha256 "installer hash" }
 if ($SourceCommit.Length -gt 0 -and $SourceCommit -notmatch '^[0-9a-fA-F]{40}$') { throw "source commit must be a full 40-hex Git commit" }
+$package5Manifest = $null
+if ($Package5ManifestPath.Length -gt 0) {
+    if (-not (Test-Path -LiteralPath $Package5ManifestPath -PathType Leaf)) { throw "Package 5 provenance manifest is missing" }
+    $package5Manifest = Get-Content -LiteralPath $Package5ManifestPath -Raw | ConvertFrom-Json
+}
 
 $os = Get-CimInstance Win32_OperatingSystem
 $startedAt = (Get-Date).ToUniversalTime()
@@ -593,7 +599,20 @@ if ($DisplayScale -le 0) { $validityReasons += "display_scale_missing" }
 if ($WslVersion.Length -eq 0) { $validityReasons += "wsl_version_missing" }
 if ($WslDistro.Length -eq 0) { $validityReasons += "wsl_distro_missing" }
 if ($WslMemoryBytes -le 0) { $validityReasons += "wsl_memory_missing" }
-if (-not $runtimeEvidence.Contains("wslOwned")) { $validityReasons += "wsl_owned_evidence_unavailable" }
+$manifestCandidate = if ($null -ne $package5Manifest) { $package5Manifest.candidate } else { $null }
+$manifestInstalled = if ($null -ne $package5Manifest) { $package5Manifest.artifacts.installedBinary } else { $null }
+$manifestInstaller = if ($null -ne $package5Manifest) { $package5Manifest.artifacts.installer } else { $null }
+if ($null -eq $package5Manifest) { $validityReasons += "package5_manifest_missing" }
+elseif ($null -eq $manifestCandidate -or $manifestCandidate.sourceCommit -ne $SourceCommit) { $validityReasons += "package5_source_binding_mismatch" }
+elseif ($null -eq $manifestInstalled -or $manifestInstalled.sha256 -ne $installedBinarySha256) { $validityReasons += "package5_installed_binary_binding_mismatch" }
+elseif ($null -eq $manifestInstaller -or $manifestInstaller.sha256 -ne $InstallerSha256) { $validityReasons += "package5_installer_binding_mismatch" }
+elseif ($manifestCandidate.protocolVersion -ne $ProtocolVersion) { $validityReasons += "package5_protocol_binding_mismatch" }
+$wslOwnedObserved = $false
+if ($runtimeEvidence.Contains("wslOwned") -and $runtimeEvidence["wslOwned"] -is [System.Collections.IDictionary]) {
+    $wslOwnedEvidence = $runtimeEvidence["wslOwned"]
+    $wslOwnedObserved = $wslOwnedEvidence.Contains("available") -and [bool]$wslOwnedEvidence["available"]
+}
+if (-not $wslOwnedObserved) { $validityReasons += "wsl_owned_evidence_unavailable" }
 
 $absoluteLimit = switch ($DeclaredScenarioTerminals) {
     1 { [ordered]@{ cpuRun = 0.15; cpuP95 = 0.30; privateBytes = 700MB; workingSet = 850MB; processes = 24 } }
@@ -604,8 +623,8 @@ $absoluteLimit = switch ($DeclaredScenarioTerminals) {
 $absoluteMetricsAvailable = $null -ne $summary.cpu.run_total_core_fraction -and $null -ne $summary.cpu.statistics -and $null -ne $summary.private_bytes -and $null -ne $summary.working_set_bytes -and $null -ne $summary.process_count
 $absoluteStatus = if (-not $absoluteMetricsAvailable) { "unavailable" } elseif ($summary.cpu.run_total_core_fraction -gt $absoluteLimit.cpuRun -or $summary.cpu.statistics.p95 -gt $absoluteLimit.cpuP95 -or $summary.private_bytes.p95 -gt $absoluteLimit.privateBytes -or $summary.working_set_bytes.p95 -gt $absoluteLimit.workingSet -or $summary.process_count.p95 -gt $absoluteLimit.processes) { "fail" } else { "pass" }
 $scenarioStatus = if ($null -eq $trustedObservedTerminalCount -or $trustedObservedTerminalCount -ne $DeclaredScenarioTerminals -or $Repetition -lt 1 -or $Repetition -gt 3) { "unavailable" } else { "pass" }
-$pairedStatus = if ($runtimeEvidence.Contains("paired")) { "unavailable" } else { "unavailable" }
-$cleanupStatus = if ($runtimeEvidence.Contains("cleanup")) { "unavailable" } else { "unavailable" }
+$pairedStatus = if ($runtimeEvidence.Contains("paired") -and $runtimeEvidence["paired"] -is [System.Collections.IDictionary] -and $runtimeEvidence["paired"].Contains("status") -and $runtimeEvidence["paired"]["status"] -in @("pass", "fail")) { $runtimeEvidence["paired"]["status"] } else { "unavailable" }
+$cleanupStatus = if ($runtimeEvidence.Contains("cleanup") -and $runtimeEvidence["cleanup"] -is [System.Collections.IDictionary] -and $runtimeEvidence["cleanup"].Contains("status") -and $runtimeEvidence["cleanup"]["status"] -in @("pass", "fail")) { $runtimeEvidence["cleanup"]["status"] } else { "unavailable" }
 $budgets = @(
     [ordered]@{ id = "absolute.resources"; kind = "absolute"; status = $absoluteStatus; observed = $summary; limits = $absoluteLimit },
     [ordered]@{ id = "paired.regression"; kind = "paired"; status = $pairedStatus; observed = $null; limits = $null },
@@ -691,6 +710,7 @@ $artifact = [ordered]@{
     diagnostics = & $evidenceSection "diagnostics"
     validity = [ordered]@{ eligible = $eligible; reasons = $validityReasons; processBirthIntervalsExcluded = @($samples | Where-Object { -not $_.totals.cpu_interval_complete }).Count }
     budgets = $budgets
+    redactionCount = 0
     decision = $decision
     rawEvidence = $rawEvidence
     configuration = [ordered]@{
