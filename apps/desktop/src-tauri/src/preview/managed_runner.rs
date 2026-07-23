@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 
 use super::endpoint::{ListenerOwnership, ManagedRunIdentity};
 use super::model::{PreviewPackageManager, PreviewTarget, PreviewTargetKind};
+use super::supervisor::prepare_confined_supervised_preview_command;
 pub(crate) use super::supervisor::{prepare_supervised_preview_command, PreparedPreviewCommand};
 
 const MAX_MANAGED_OUTPUT_BYTES: usize = 64 * 1024;
@@ -67,7 +68,6 @@ pub(crate) fn typed_package_command(
     {
         return Err("Preview target root is not confined to its canonical Project".into());
     }
-    let cwd = canonical_root.join(relative_root);
     let PreviewTargetKind::PackageScript {
         package_manager,
         script,
@@ -75,11 +75,12 @@ pub(crate) fn typed_package_command(
     else {
         return Err("static Preview targets require the supervised static helper".into());
     };
-    package_command(
-        &cwd,
+    prepare_confined_supervised_preview_command(
+        canonical_root,
+        relative_root,
         run_id,
         package_manager_executable(*package_manager),
-        script,
+        &["run", script],
     )
 }
 
@@ -112,12 +113,12 @@ pub(crate) fn typed_static_command(
     {
         return Err("static Preview entrypoint is not a confined relative path".into());
     }
-    let cwd = canonical_root.join(relative_root);
     let entrypoint = entrypoint
         .to_str()
         .ok_or("static Preview entrypoint must be UTF-8")?;
-    prepare_supervised_preview_command(
-        &cwd,
+    prepare_confined_supervised_preview_command(
+        canonical_root,
+        relative_root,
         run_id,
         "/usr/bin/python3",
         &["-I", "-c", STATIC_HELPER_PY, entrypoint],
@@ -360,13 +361,14 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(args.iter().any(|arg| arg == "caller-run-1"));
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "apps").count(), 1);
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "dev; touch /tmp/never-shell")
                 .count(),
             1
         );
-        assert_eq!(command.get_current_dir(), Some(expected_cwd.as_path()));
+        assert_ne!(command.get_current_dir(), Some(expected_cwd.as_path()));
     }
 
     #[test]
@@ -408,6 +410,35 @@ mod tests {
             entrypoint: "../outside.html".into(),
         };
         assert!(typed_static_command(root.path(), &static_target, "static-command-2").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effect_time_symlink_swap_is_refused_before_static_target_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("site")).unwrap();
+        std::fs::write(root.path().join("site/index.html"), "inside").unwrap();
+        std::fs::write(outside.path().join("index.html"), "outside").unwrap();
+        let mut static_target = target("site");
+        static_target.kind = PreviewTargetKind::StaticSite {
+            entrypoint: "index.html".into(),
+        };
+        let prepared =
+            typed_static_command(root.path(), &static_target, "static-swap-run").unwrap();
+        std::fs::remove_dir_all(root.path().join("site")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("site")).unwrap();
+
+        let error = match prepared.spawn_authenticated(std::time::Duration::from_secs(2)) {
+            Ok(_) => panic!("effect-time symlink swap launched a Preview target"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("handshake")
+                || error.contains("supervisor")
+                || error.contains("authentication"),
+            "unexpected effect-time refusal: {error}"
+        );
     }
 
     #[test]

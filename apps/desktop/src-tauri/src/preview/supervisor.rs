@@ -15,6 +15,22 @@ const ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const PROTOCOL_VERSION: &str = "1";
 const READY_PREFIX: &str = "T_HUB_PREVIEW_READY";
 const GO_PREFIX: &str = "T_HUB_PREVIEW_GO";
+const CWD_GATE_PY: &str = r#"import os, sys
+root, relative, python = sys.argv[1:4]
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory = os.open(root, flags)
+try:
+    for part in relative.split('/'):
+        if part in ('', '.'):
+            continue
+        next_directory = os.open(part, flags, dir_fd=directory)
+        os.close(directory)
+        directory = next_directory
+    os.fchdir(directory)
+    os.execv(python, sys.argv[3:])
+finally:
+    os.close(directory)
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExecutableIdentity {
@@ -284,6 +300,16 @@ pub(crate) fn prepare_supervised_preview_command(
     executable: &str,
     arguments: &[&str],
 ) -> Result<PreparedPreviewCommand, String> {
+    prepare_confined_supervised_preview_command(cwd, Path::new(""), run_id, executable, arguments)
+}
+
+pub(crate) fn prepare_confined_supervised_preview_command(
+    canonical_root: &Path,
+    relative_root: &Path,
+    run_id: &str,
+    executable: &str,
+    arguments: &[&str],
+) -> Result<PreparedPreviewCommand, String> {
     super::managed_runner::validate_run_id(run_id)?;
     if executable.is_empty() || executable.as_bytes().contains(&0) {
         return Err("managed Preview executable is invalid".into());
@@ -291,8 +317,10 @@ pub(crate) fn prepare_supervised_preview_command(
     let generation = uuid::Uuid::new_v4().simple().to_string();
     let python = trusted_python_identity()?;
     revalidate_python_identity(&python)?;
+    let relative_root = validate_confined_relative_root(relative_root)?;
     let command = supervisor_command(
-        cwd,
+        canonical_root,
+        &relative_root,
         &python.path,
         run_id,
         &generation,
@@ -308,6 +336,23 @@ pub(crate) fn prepare_supervised_preview_command(
         python,
         helper_argv,
     })
+}
+
+fn validate_confined_relative_root(relative_root: &Path) -> Result<String, String> {
+    if relative_root.is_absolute()
+        || relative_root.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("managed Preview working directory is not confined".into());
+    }
+    relative_root
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "managed Preview working directory must be UTF-8".into())
 }
 
 fn expected_helper_argv(
@@ -331,7 +376,8 @@ fn expected_helper_argv(
 }
 
 fn supervisor_command(
-    cwd: &Path,
+    canonical_root: &Path,
+    relative_root: &str,
     python: &Path,
     run_id: &str,
     generation: &str,
@@ -340,12 +386,13 @@ fn supervisor_command(
 ) -> Result<Command, String> {
     #[cfg(windows)]
     {
-        let posix_cwd = super::managed_runner::unc_to_posix(&cwd.to_string_lossy())
+        let posix_root = super::managed_runner::unc_to_posix(&canonical_root.to_string_lossy())
             .ok_or("managed Preview root is not a WSL path")?;
         Ok(windows_supervisor_command(
             &trusted_wsl_path()?,
             &crate::files::host_distro(),
-            &posix_cwd,
+            &posix_root,
+            relative_root,
             python,
             run_id,
             generation,
@@ -355,8 +402,17 @@ fn supervisor_command(
     }
     #[cfg(not(windows))]
     {
+        let canonical_root = canonical_root
+            .to_str()
+            .ok_or("managed Preview canonical root must be UTF-8")?;
         let mut command = Command::new(python);
         command
+            .arg("-I")
+            .arg("-c")
+            .arg(CWD_GATE_PY)
+            .arg(canonical_root)
+            .arg(relative_root)
+            .arg(python)
             .arg("-I")
             .arg("-c")
             .arg(SUPERVISOR_PY)
@@ -364,7 +420,7 @@ fn supervisor_command(
             .arg(generation)
             .arg(executable)
             .args(arguments)
-            .current_dir(cwd)
+            .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -376,7 +432,8 @@ fn supervisor_command(
 fn windows_supervisor_command(
     wsl: &Path,
     distro: &str,
-    posix_cwd: &str,
+    posix_root: &str,
+    relative_root: &str,
     python: &Path,
     run_id: &str,
     generation: &str,
@@ -388,8 +445,14 @@ fn windows_supervisor_command(
         .arg("-d")
         .arg(distro)
         .arg("--cd")
-        .arg(posix_cwd)
+        .arg("/")
         .arg("-e")
+        .arg(python)
+        .arg("-I")
+        .arg("-c")
+        .arg(CWD_GATE_PY)
+        .arg(posix_root)
+        .arg(relative_root)
         .arg(python)
         .arg("-I")
         .arg("-c")
@@ -1012,6 +1075,7 @@ mod tests {
             Path::new(r"C:\Windows\System32\wsl.exe"),
             "Ubuntu-24.04",
             "/home/user/project",
+            "apps/web",
             Path::new("/usr/bin/python3.12"),
             "run-1",
             &"a".repeat(32),
@@ -1032,8 +1096,14 @@ mod tests {
                 "-d",
                 "Ubuntu-24.04",
                 "--cd",
-                "/home/user/project",
+                "/",
                 "-e",
+                "/usr/bin/python3.12",
+                "-I",
+                "-c",
+                CWD_GATE_PY,
+                "/home/user/project",
+                "apps/web",
                 "/usr/bin/python3.12",
                 "-I",
                 "-c",
