@@ -7,9 +7,9 @@ param(
   [Parameter(Mandatory = $true)] [string]$RawBinaryPath,
   [Parameter(Mandatory = $true)] [string]$ExpectedBinaryPath,
   [Parameter(Mandatory = $true)] [string]$ExtractedBinaryPath,
+  [Parameter(Mandatory = $true)] [string]$ValidatorPath,
   [string]$InstalledBinaryPath = "",
   [string]$InstallerScriptPath = "",
-  [string]$ValidatorPath = "",
   [string]$Workflow = "",
   [string]$RunId = "",
   [int]$RunAttempt = 1,
@@ -65,7 +65,7 @@ function Optional-Hash([string]$Path) {
   return Hash-File $Path
 }
 
-function Read-SafeValidation([string]$Path, [hashtable]$Expected) {
+function Read-SafeValidation([string]$Path, [System.Collections.IDictionary]$Expected) {
   if ([string]::IsNullOrWhiteSpace($Path)) { throw "validator evidence is required" }
   $resolved = Resolve-File $Path "validation evidence"
   $value = Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json
@@ -78,10 +78,13 @@ function Read-SafeValidation([string]$Path, [hashtable]$Expected) {
     if ($property.Value -is [System.Management.Automation.PSCustomObject]) { throw "validation evidence field '$($property.Name)' has an unsupported nested structure" }
   }
   if ($value.passed -ne $true) { throw "validator evidence did not report passed=true" }
+  if ([string]$value.productionMainBinary -cne "t-hub") { throw "validator evidence productionMainBinary is not the verified production binary" }
+  if ([string]$value.developmentMainBinary -cne "t-hub-dev") { throw "validator evidence developmentMainBinary is not the verified development binary" }
+  if ([string]$value.bundleMarkerTransformation -cne "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS") { throw "validator evidence bundle marker transformation is not the verified transformation" }
   foreach ($key in @("rawSha256", "installerSha256", "expectedSha256", "extractedSha256")) {
     if ([string]$value.$key -cne [string]$Expected[$key]) { throw "validator evidence $key does not match computed hash" }
   }
-  if ($Expected.ContainsKey("installedSha256") -and [string]$value.installedSha256 -cne [string]$Expected.installedSha256) { throw "validator evidence installedSha256 does not match computed hash" }
+  if ($Expected.Contains("installedSha256") -and [string]$value.installedSha256 -cne [string]$Expected["installedSha256"]) { throw "validator evidence installedSha256 does not match computed hash" }
   return $value
 }
 
@@ -101,6 +104,7 @@ $tauriOverlay = Join-Path $RepositoryRoot "apps\desktop\src-tauri\tauri.dev.conf
 $sourceResolved = Git-Output @("rev-parse", $SourceCommit)
 $head = Git-Output @("rev-parse", "HEAD")
 if ($sourceResolved -cne $head) { throw "SourceCommit must equal the checked-out HEAD ($head), got $sourceResolved" }
+if ($env:GITHUB_SHA -and $env:GITHUB_SHA -cne $sourceResolved) { throw "GITHUB_SHA must equal the checked-out SourceCommit" }
 $tree = Git-Output @("rev-parse", "$SourceCommit`^{tree}")
 $dirty = Git-Output @("status", "--porcelain", "--untracked-files=all")
 if (-not [string]::IsNullOrWhiteSpace($dirty)) { throw "checked-out tree is dirty; refusing provenance manifest" }
@@ -124,7 +128,7 @@ $manifest = [ordered]@{
   candidate = [ordered]@{
     artifactId = "t-hub-dev:$sourceResolved"
     branch = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { Git-Output @("branch", "--show-current") }
-    sourceBaseline = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { $sourceResolved }
+    sourceBaseline = $sourceResolved
     sourceCommit = $sourceResolved
     gitTree = $tree
     repository = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { "local" }
@@ -157,14 +161,12 @@ $manifest = [ordered]@{
     extractedBinary = [ordered]@{ path = Relative-EvidencePath $ExtractedBinaryPath; sha256 = Hash-File $ExtractedBinaryPath }
     installedBinary = if ($InstalledBinaryPath) { [ordered]@{ path = $InstalledBinaryPath; sha256 = Hash-File $InstalledBinaryPath } } else { $null }
     installerScript = if ($InstallerScriptPath) { [ordered]@{ path = Relative-EvidencePath $InstallerScriptPath; sha256 = Hash-File $InstallerScriptPath } } else { $null }
-    validator = if ($ValidatorPath) { [ordered]@{ path = Relative-EvidencePath $ValidatorPath; sha256 = Hash-File $ValidatorPath; passed = $true } } else { $null }
+    validator = [ordered]@{ path = Relative-EvidencePath $ValidatorPath; sha256 = Hash-File $ValidatorPath; passed = $true }
   }
-  installation = [ordered]@{
-    installedAt = $now
-    productName = "T-Hub Dev"
-    bundleIdentifier = "com.t-hub.dev"
-    executableName = "t-hub-dev.exe"
-    installationTarget = if ($InstalledBinaryPath) { $InstalledBinaryPath } else { "uninstalled" }
+  installation = if ($InstalledBinaryPath) {
+    [ordered]@{ status = "installed"; installedAt = $now; productName = "T-Hub Dev"; bundleIdentifier = "com.t-hub.dev"; executableName = "t-hub-dev.exe"; installationTarget = $InstalledBinaryPath }
+  } else {
+    [ordered]@{ status = "not_installed"; installedAt = $null; productName = "T-Hub Dev"; bundleIdentifier = "com.t-hub.dev"; executableName = "t-hub-dev.exe"; installationTarget = $null }
   }
   environment = [ordered]@{
     tHubDistro = if ($env:THUB_DISTRO) { $env:THUB_DISTRO } else { "unreported" }

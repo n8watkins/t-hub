@@ -58,6 +58,10 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
 
+      - name: Test Package 5 provenance evidence contract
+        shell: pwsh
+        run: ./scripts/windows/write-package5-provenance.test.ps1
+
       # Install the whole pnpm workspace from the lockfile (the desktop app is the
       # only workspace member). Run at the repo root so the workspace resolves.
       - name: Install dependencies

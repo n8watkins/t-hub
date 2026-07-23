@@ -16,7 +16,7 @@ function Assert-Fails([scriptblock]$Action, [string]$Needle) {
   $message = ""
   try { & $Action | Out-Null } catch { $failed = $true; $message = [string]$_.Exception.Message }
   Assert-True $failed "expected failure containing '$Needle'"
-  if (-not $message.Contains($Needle)) { Write-Host "Observed bounded rejection: $message" }
+  if ($message.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "wrong failure: $message" }
 }
 
 try {
@@ -36,10 +36,12 @@ try {
   $expected = Join-Path $root "expected.exe"
   $extracted = Join-Path $root "extracted.exe"
   $installer = Join-Path $root "installer.exe"
+  $installed = Join-Path $root "installed.exe"
   $validator = Join-Path $root "validator.json"
   "same" | Set-Content $raw
   Copy-Item $raw $expected
   Copy-Item $raw $extracted
+  Copy-Item $raw $installed
   "installer" | Set-Content $installer
   $hash = (Get-FileHash $raw -Algorithm SHA256).Hash.ToLowerInvariant()
   $installerHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -51,11 +53,11 @@ try {
     installerSha256 = $installerHash
     expectedSha256 = $hash
     extractedSha256 = $hash
-    bundleMarkerTransformation = "UNK -> NSS"
+    bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS"
   } | ConvertTo-Json | Set-Content $validator
   $head = (git -C $root rev-parse HEAD).Trim()
   $manifestPath = Join-Path ([System.IO.Path]::GetTempPath()) ("package-5-evidence-" + [guid]::NewGuid().ToString("N") + ".json")
-  & $scriptPath -OutputPath $manifestPath -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator | Out-Null
+  & $scriptPath -OutputPath $manifestPath -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator | Out-Null
   $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
   Assert-True ($manifest.schemaVersion -eq 1) "manifest schema version is not 1"
   Assert-True ($manifest.candidate.sourceCommit -eq $head) "source commit is not HEAD"
@@ -63,20 +65,45 @@ try {
   Assert-True ($manifest.artifacts.expectedBinary.sha256 -eq $manifest.artifacts.extractedBinary.sha256) "expected/extracted hashes differ"
   Assert-True ($manifest.validation.passed -eq $true) "validator pass is not retained"
   Assert-True ($null -ne $manifest.installation -and $null -ne $manifest.environment -and $null -ne $manifest.matrix -and $null -ne $manifest.review) "required evidence sections are missing"
+  Assert-True ($manifest.installation.status -eq "not_installed" -and $null -eq $manifest.installation.installedAt -and $null -eq $manifest.installation.installationTarget) "uninstalled manifest fabricated installation evidence"
+  Assert-True ($null -ne $manifest.artifacts.validator -and $manifest.artifacts.validator.passed -eq $true) "validator artifact binding is missing"
+
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; installedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
+  $installedManifestPath = Join-Path ([System.IO.Path]::GetTempPath()) ("package-5-installed-" + [guid]::NewGuid().ToString("N") + ".json")
+  & $scriptPath -OutputPath $installedManifestPath -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -InstalledBinaryPath $installed -ValidatorPath $validator -ValidationPath $validator | Out-Null
+  $installedManifest = Get-Content $installedManifestPath -Raw | ConvertFrom-Json
+  Assert-True ($installedManifest.installation.status -eq "installed" -and $installedManifest.artifacts.installedBinary.sha256 -eq $hash) "installed manifest does not bind installation hash"
 
   $badSource = "0" * 40
-  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-source.json") -RepositoryRoot $root -SourceCommit $badSource -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator } "SourceCommit"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-source.json") -RepositoryRoot $root -SourceCommit $badSource -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "SourceCommit"
+  $oldGithubSha = $env:GITHUB_SHA
+  $env:GITHUB_SHA = $badSource
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-github-sha.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "GITHUB_SHA"
+  if ($null -eq $oldGithubSha) { Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue } else { $env:GITHUB_SHA = $oldGithubSha }
   "dirty" | Set-Content (Join-Path $root "dirty.txt")
-  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "dirty.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator } "dirty"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "dirty.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "dirty"
   Remove-Item (Join-Path $root "dirty.txt")
   "different" | Set-Content $expected
-  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-hash.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator } "expected binary hash"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-hash.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "expected binary hash"
+  Copy-Item $raw $expected
+  @{ passed = $false; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "failed-validator.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "passed=true"
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = "bad"; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-validator-hash.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "rawSha256"
+  @{ passed = $true; productionMainBinary = "wrong"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "wrong-validator-binary.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "productionMainBinary"
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "bad" } | ConvertTo-Json | Set-Content $validator
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "wrong-validator-marker.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "bundle marker"
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS"; installedSha256 = "wrong" } | ConvertTo-Json | Set-Content $validator
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "wrong-installed-validator.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -InstalledBinaryPath $installed -ValidatorPath $validator -ValidationPath $validator } "installedSha256"
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
   Copy-Item $raw $expected
   @{ passed = $true; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; nested = @{ token = "do-not-ingest" } } | ConvertTo-Json -Depth 4 | Set-Content $validator
-  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "nested.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator } "nested"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "nested.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "nested"
+  @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
   $outside = Join-Path $root "..\outside.exe"
   "outside" | Set-Content $outside
-  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "outside.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $outside -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidationPath $validator } "outside repository"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "outside.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -InstallerScriptPath $outside -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "outside repository"
   Write-Host "write-package5-provenance.test: PASS"
 } finally {
   $outside = Join-Path $root "..\outside.exe"
