@@ -368,13 +368,16 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    type FdTargets = Vec<Option<String>>;
+    type ScriptedFdTargets = VecDeque<Option<FdTargets>>;
+
     #[derive(Default)]
     struct FakeProc {
         files: BTreeMap<String, Vec<u8>>,
         scripted_files: RefCell<BTreeMap<String, VecDeque<Option<Vec<u8>>>>>,
         pids: Vec<u32>,
-        fds: BTreeMap<u32, Option<Vec<Option<String>>>>,
-        scripted_fds: RefCell<BTreeMap<u32, VecDeque<Option<Vec<Option<String>>>>>>,
+        fds: BTreeMap<u32, Option<FdTargets>>,
+        scripted_fds: RefCell<BTreeMap<u32, ScriptedFdTargets>>,
         uids: BTreeMap<u32, Option<u32>>,
         scripted_uids: RefCell<BTreeMap<u32, VecDeque<Option<u32>>>>,
         expected_uid: u32,
