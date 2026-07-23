@@ -108,7 +108,7 @@ Related tasks should share one named chain workspace instead of receiving duplic
 Captains must remain in Captain Workspace, and Crew terminals must be created in the owning chain workspace.
 An eligible Work Workspace should be closed and destroyed only after its chain has landed and its terminals and worktrees are safely retired.
 Terminal headers should show the project or product first, the chain or workspace second, and branch or worktree detail as secondary information without repeating equivalent names.
-Responsive layouts should truncate deliberately, rename `Run + Preview` to `Preview`, and collapse Terminal, Files, Preview, and Board controls to accessible icons at narrow widths.
+Responsive layouts should truncate deliberately, preserve the `Preview` naming, and collapse Terminal, Files, Preview, and Board controls to accessible icons at narrow widths.
 
 A clean planning worktree already exists at `/home/natkins/projects/tools/t-hub/t-hub-worktrees/workspace-chain-lifecycle` on branch `plan/workspace-chain-lifecycle` at coordinator base `20c14a3`.
 It has no changes and no protected artifact.

@@ -35,7 +35,8 @@ The installed version number alone cannot prove source provenance because source
 The merged fixes therefore exist in source and on remote `main`, but they are not present in the currently installed executable.
 
 The existing responsive header source already renders icons and supports full-label, short-label, and icon-only densities in `apps/desktop/src/components/Tile.tsx` and `apps/desktop/src/index.css`.
-The source still labels the surface `Run + Preview`, shortens it to `Run`, and describes it accessibly as `Run and Preview`.
+Package 2 source now labels the combined surface `Preview`, uses the Eye icon, and preserves the exact `Preview` tooltip and accessible name at icon-only densities.
+This source behavior remains packaged-unproven until the installed Windows Dev matrix in `docs/PACKAGE-2-WINDOWS-E2E-REQUIREMENTS.md` passes against the exact candidate artifact.
 
 Preview currently accepts only a managed runner URL or a manually entered URL.
 It intentionally ignores arbitrary URLs printed in an agent terminal.
