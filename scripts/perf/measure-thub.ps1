@@ -53,25 +53,36 @@ function Write-DiagnosticArtifact {
     try {
         $parent = Split-Path -Parent $OutputPath
         if ($parent.Length -gt 0) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-        [ordered]@{
+        $diagnostic = [ordered]@{
             schemaVersion = 3
-            candidate = [ordered]@{ sourceCommit = $SourceCommit; installedBinarySha256 = $null; installerSha256 = $null; protocolVersion = $ProtocolVersion }
+            candidate = [ordered]@{ sourceCommit = $null; installedBinarySha256 = $null; installerSha256 = $null; protocolVersion = $ProtocolVersion }
             reference = [ordered]@{ installedBinarySha256 = $null; selectionReason = $null }
             host = [ordered]@{ windowsVersion = $null; wslVersion = $null; distro = $null; logicalProcessors = $null; memoryBytes = $null; powerMode = $null; displayScale = $null }
-            scenario = [ordered]@{ kind = $ScenarioKind; terminalCount = $DeclaredScenarioTerminals; observedTerminalCount = $null; workloadVersion = $WorkloadVersion; workloadSeed = $WorkloadSeed; repetition = $Repetition; startedAt = $null; finishedAt = $null }
+            scenario = [ordered]@{ kind = $ScenarioKind; terminalCount = $DeclaredScenarioTerminals; observedTerminalCount = $null; workloadVersion = $null; workloadSeed = $null; repetition = $Repetition; startedAt = $null; finishedAt = $null }
             resources = [ordered]@{ windows = $null; wslOwned = [ordered]@{ available = $false; reason = "diagnostic artifact" }; samples = @() }
             operations = @{}
             preview = @{}
             voice = @{}
             journal = @{}
-            diagnostics = [ordered]@{ error = $Reason; redactionCount = 0 }
-            validity = [ordered]@{ eligible = $false; reasons = @("collector_exception", $Reason); processBirthIntervalsExcluded = 0 }
+            diagnostics = [ordered]@{ errorCode = "collector_exception"; redactionCount = 0 }
+            validity = [ordered]@{ eligible = $false; reasons = @("collector_exception"); processBirthIntervalsExcluded = 0 }
             budgets = @()
             decision = "ineligible"
             rawEvidence = @()
             redactionCount = 0
-        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+        }
+        Write-JsonNoClobber $OutputPath $diagnostic 8
     } catch { }
+}
+
+function Write-JsonNoClobber {
+    param([string]$Path, [object]$Value, [int]$Depth = 12)
+    $json = $Value | ConvertTo-Json -Depth $Depth
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+        try { $writer.Write($json) } finally { $writer.Dispose() }
+    } finally { $stream.Dispose() }
 }
 
 trap {
@@ -531,6 +542,10 @@ Assert-BoundedCliString $WslVersion "WSL version" 128
 Assert-BoundedCliString $WslDistro "WSL distro" 128
 Assert-BoundedCliString $SetupNote "setup note" 256
 Assert-BoundedCliString $ProcessName "process name" 128
+Assert-BoundedCliString $CollectorRepositoryCommit "collector repository commit" 128
+Assert-BoundedCliString $ExecutablePath "executable path" 1024
+Assert-BoundedCliString $RuntimeEvidencePath "runtime evidence path" 1024
+Assert-BoundedCliString $Package5ManifestPath "Package 5 manifest path" 1024
 
 $initialSnapshot = @(Get-ProcessSnapshot)
 $candidateRoots = @(Get-CandidateRoots $initialSnapshot)
@@ -789,7 +804,7 @@ $parent = Split-Path -Parent $OutputPath
 if ($parent.Length -gt 0) {
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
 }
-$artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+Write-JsonNoClobber $OutputPath $artifact 12
 Write-Host "Wrote benchmark artifact: $OutputPath"
 if ($budgetFailure) { exit 4 }
 if (-not $eligible) { exit 5 }
