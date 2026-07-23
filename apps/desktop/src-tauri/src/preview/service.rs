@@ -843,7 +843,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                         scope: scope.clone(),
                         state: PreviewState::Failed,
                         target_id: Some(target_ref.target_id.clone()),
-                        run_id: Some(run_id.into()),
+                        run_id: None,
                         preview_url: None,
                         reason: Some(error),
                         observed_at_ms: self.runtime.now_ms(),
@@ -1522,6 +1522,51 @@ mod tests {
             .is_err());
         assert_eq!(fixture.runtime.spawn_count(), 1);
         assert_eq!(fixture.runtime.stop_count(), 1);
+    }
+
+    #[test]
+    fn failed_spawn_never_exposes_a_phantom_run_identity() {
+        let fixture = fixture("failed-spawn-identity");
+        fixture
+            .runtime
+            .state
+            .fail_spawn
+            .store(true, Ordering::Relaxed);
+
+        let failed = fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                Some(&fixture.target_ref),
+                "failed-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(failed.status.state, PreviewState::Failed);
+        assert_eq!(failed.status.run_id, None);
+        assert_eq!(failed.status.reason.as_deref(), Some("spawn failed"));
+        let intent = fixture.profiles.intent("failed-start").unwrap();
+        assert_eq!(intent.phase, PreviewIntentPhase::Committed);
+        assert_eq!(intent.managed_run, None);
+        assert_eq!(
+            fixture.service.status(&fixture.scope).unwrap().state,
+            PreviewState::Stopped
+        );
+
+        let replayed = fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                Some(&fixture.target_ref),
+                "failed-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(replayed.status, failed.status);
+        assert_eq!(replayed.status.run_id, None);
+        assert_eq!(fixture.runtime.spawn_count(), 0);
     }
 
     #[test]
