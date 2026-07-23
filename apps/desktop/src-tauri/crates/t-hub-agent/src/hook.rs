@@ -61,7 +61,7 @@ fn now_ms() -> u64 {
 /// - `source`: [`JournalSource::Hook`]
 /// - `event_type`: mapped from `hook_name` (Unknown for unrecognised names)
 /// - `entity_id`: the `session_id` string from `payload`, if present
-/// - `payload`: the full JSON value (preserves agent_id, agent_type, cwd, etc.)
+/// - `payload`: credential-safe provider metadata needed for routing/reduction
 /// - `result`: None
 pub fn build_entry(hook_name: &str, payload: &serde_json::Value) -> EventJournalEntry {
     let event_type = event_type_for_hook(hook_name);
@@ -82,9 +82,54 @@ pub fn build_entry(hook_name: &str, payload: &serde_json::Value) -> EventJournal
         event_id,
         entity_id,
         event_type,
-        payload: payload.clone(),
+        payload: sanitize_hook_payload(payload),
         result: None,
     }
+}
+
+fn sanitize_hook_payload(payload: &serde_json::Value) -> serde_json::Value {
+    const SAFE_FIELDS: &[&str] = &[
+        "session_id",
+        "cwd",
+        "transcript_path",
+        "permission_mode",
+        "hook_event_name",
+        "event_name",
+        "event_id",
+        "hook_event_id",
+        "hookEventId",
+        "agent_id",
+        "agent_type",
+        "task_id",
+        "task_type",
+        "tool_use_id",
+        "tool_name",
+        "notification_type",
+        "source",
+        "worktree",
+        "worktree_path",
+    ];
+
+    let Some(object) = payload.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut safe = serde_json::Map::new();
+    for field in SAFE_FIELDS {
+        let Some(value) = object.get(*field) else {
+            continue;
+        };
+        if value.is_string() || value.is_number() || value.is_boolean() || value.is_null() {
+            safe.insert((*field).to_string(), value.clone());
+        }
+    }
+    let redacted = object.len().saturating_sub(safe.len());
+    if redacted > 0 {
+        safe.insert(
+            "redacted_field_count".to_string(),
+            serde_json::json!(redacted),
+        );
+    }
+    serde_json::Value::Object(safe)
 }
 
 /// Run the `--hook <EVENT>` ingest path.
@@ -441,6 +486,10 @@ mod tests {
         let identity = first.event_id.unwrap();
         assert!(!identity.contains("secret-canary"));
         assert!(!identity.contains("command-canary"));
+        let persisted_payload = serde_json::to_string(&first.payload).unwrap();
+        assert!(!persisted_payload.contains("secret-canary"));
+        assert!(!persisted_payload.contains("command-canary"));
+        assert_eq!(first.payload["redacted_field_count"], 2);
     }
 
     #[test]
@@ -606,6 +655,43 @@ mod tests {
             assert_eq!(e.payload["cwd"], "/home/natkins");
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sensitive_hook_content_is_redacted_before_any_durable_file() {
+        let dir = temp_dir("redaction-canary");
+        let entry = build_entry(
+            "PermissionRequest",
+            &serde_json::json!({
+                "session_id": "session-1",
+                "event_id": "provider-event-1",
+                "tool_use_id": "tool-1",
+                "tool_name": "Bash",
+                "prompt": "prompt-secret-canary",
+                "command": "command-secret-canary",
+                "tool_input": {"token": "tool-input-secret-canary"},
+                "tool_output": "tool-output-secret-canary",
+                "message": "message-secret-canary",
+                "metadata": {"credential": "nested-secret-canary"}
+            }),
+        );
+        let journal = crate::journal::Journal::open(&dir).unwrap();
+        assert!(journal.append(entry).unwrap().is_appended());
+
+        for durable in ["events.ndjson", "head.json"] {
+            let bytes = std::fs::read(dir.join(durable)).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                !text.contains("secret-canary"),
+                "{durable} retained sensitive hook content: {text}"
+            );
+        }
+        let replayed = journal.replay(0).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].payload["session_id"], "session-1");
+        assert_eq!(replayed[0].payload["tool_use_id"], "tool-1");
+        assert_eq!(replayed[0].payload["redacted_field_count"], 6);
         std::fs::remove_dir_all(&dir).ok();
     }
 
