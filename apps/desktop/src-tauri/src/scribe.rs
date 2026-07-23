@@ -827,6 +827,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    static LIFECYCLE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn lifecycle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        LIFECYCLE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn temp_path(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -877,6 +887,7 @@ mod tests {
 
     #[test]
     fn emitter_stop_is_idempotent_when_not_running() {
+        let _test_lock = lifecycle_test_lock();
         stop_scribe_status_emitter();
         let before = scribe_emitter_state()
             .lock()
@@ -895,6 +906,7 @@ mod tests {
 
     #[test]
     fn stale_latest_status_is_cleared_and_fresh_status_recovers() {
+        let _test_lock = lifecycle_test_lock();
         let status = ScribeStatus {
             listening: true,
             status: Some("Recording".into()),
@@ -918,6 +930,7 @@ mod tests {
 
     #[test]
     fn request_coordinator_records_actual_request_start() {
+        let _test_lock = lifecycle_test_lock();
         let guard = scribe_request_coordinator()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -932,6 +945,7 @@ mod tests {
 
     #[test]
     fn finished_worker_and_stale_cache_allow_direct_recovery() {
+        let _test_lock = lifecycle_test_lock();
         stop_scribe_status_emitter();
         let worker = std::thread::spawn(|| {});
         while !worker.is_finished() {
@@ -962,6 +976,7 @@ mod tests {
 
     #[test]
     fn rapid_stop_start_keeps_one_worker() {
+        let _test_lock = lifecycle_test_lock();
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let run_worker =
@@ -983,9 +998,15 @@ mod tests {
 
     #[test]
     fn stop_clears_cache_after_inflight_worker_join() {
+        let _test_lock = lifecycle_test_lock();
         stop_scribe_status_emitter();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(5)));
+        let worker = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *latest_scribe_status_store()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms()));
+        });
         *scribe_emitter_state()
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = ScribeEmitterState {
@@ -1006,6 +1027,7 @@ mod tests {
 
     #[test]
     fn spawn_failure_resets_state_and_retry_succeeds() {
+        let _test_lock = lifecycle_test_lock();
         let mut state = ScribeEmitterState {
             generation: 1,
             enabled: true,
@@ -1023,6 +1045,7 @@ mod tests {
 
     #[test]
     fn event_generation_is_monotonic_across_restart() {
+        let _test_lock = lifecycle_test_lock();
         let generation = AtomicU64::new(0);
         let first = generation.fetch_add(1, Ordering::SeqCst) + 1;
         let second = generation.fetch_add(1, Ordering::SeqCst) + 1;
