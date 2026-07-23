@@ -73,6 +73,7 @@ impl PreviewProjectRoot {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_host_path(root: &Path) -> Result<Self, String> {
         let canonical = fs::canonicalize(root)
             .map_err(|error| format!("canonicalize Preview root {}: {error}", root.display()))?;
@@ -82,10 +83,11 @@ impl PreviewProjectRoot {
 
 #[derive(Default)]
 pub struct PreviewDiscoveryCache {
-    entries: Mutex<HashMap<(PathBuf, String), PreviewDiscovery>>,
+    entries: Mutex<HashMap<(String, PathBuf, String), PreviewDiscovery>>,
 }
 
 impl PreviewDiscoveryCache {
+    #[cfg(test)]
     pub fn discover(&self, root: &Path) -> Result<PreviewDiscovery, String> {
         let authority = PreviewProjectRoot::from_host_path(root)?;
         self.discover_authorized(&authority)
@@ -97,6 +99,7 @@ impl PreviewDiscoveryCache {
     ) -> Result<PreviewDiscovery, String> {
         let discovered = discover_authorized(authority)?;
         let key = (
+            discovered.registered_posix_root.clone(),
             discovered.canonical_root.clone(),
             discovered.discovery_fingerprint.clone(),
         );
@@ -104,13 +107,14 @@ impl PreviewDiscoveryCache {
         if let Some(cached) = entries.get(&key) {
             return Ok(cached.clone());
         }
-        entries.retain(|(candidate_root, _), _| candidate_root != &key.0);
+        entries.retain(|(registered_root, _, _), _| registered_root != &key.0);
         entries.insert(key, discovered.clone());
         Ok(discovered)
     }
 }
 
-pub fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
+#[cfg(test)]
+fn discover(root: &Path) -> Result<PreviewDiscovery, String> {
     let authority = PreviewProjectRoot::from_host_path(root)?;
     discover_authorized(&authority)
 }
@@ -1022,14 +1026,7 @@ mod tests {
     #[test]
     fn registered_posix_identity_drives_root_fingerprint_not_host_mapping() {
         let root = fixture("stable-posix-root");
-        let alternate_host_mapping = root.with_file_name(format!(
-            "{}-simulated-unc",
-            root.file_name().unwrap().to_string_lossy()
-        ));
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&root, &alternate_host_mapping).unwrap();
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(&alternate_host_mapping).unwrap();
+        let alternate_host_mapping = fixture("stable-posix-root-simulated-unc");
 
         let posix_identity = "/home/natkins/projects/stable-preview";
         let direct =
@@ -1046,6 +1043,52 @@ mod tests {
             mapped.canonical_root_fingerprint
         );
         assert_eq!(direct.discovery_fingerprint, mapped.discovery_fingerprint);
+    }
+
+    #[test]
+    fn discovery_cache_isolates_registered_identity_and_invalidates_host_remaps() {
+        let first_host = fixture("cache-first-host");
+        let second_host = fixture("cache-second-host");
+        fs::write(
+            first_host.join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            second_host.join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        let cache = PreviewDiscoveryCache::default();
+        let first_identity = "/registered/project-one";
+        let second_identity = "/registered/project-two";
+        cache
+            .discover_authorized(
+                &PreviewProjectRoot::new(first_identity, first_host.clone()).unwrap(),
+            )
+            .unwrap();
+        cache
+            .discover_authorized(&PreviewProjectRoot::new(second_identity, first_host).unwrap())
+            .unwrap();
+        assert_eq!(cache.entries.lock().len(), 2);
+
+        let remapped = cache
+            .discover_authorized(
+                &PreviewProjectRoot::new(first_identity, second_host.clone()).unwrap(),
+            )
+            .unwrap();
+        let entries = cache.entries.lock();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            remapped.canonical_root,
+            fs::canonicalize(second_host).unwrap()
+        );
+        assert!(entries.keys().any(|(identity, host, _)| {
+            identity == first_identity && host == &remapped.canonical_root
+        }));
+        assert!(entries
+            .keys()
+            .any(|(identity, _, _)| identity == second_identity));
     }
 
     #[test]

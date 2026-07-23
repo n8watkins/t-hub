@@ -1,6 +1,7 @@
 //! Per-scope serialized Preview lifecycle service.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +48,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         }
     }
 
+    #[cfg(test)]
     pub fn discover(&self, root: &Path) -> Result<PreviewDiscovery, String> {
         self.discover_authorized(&PreviewProjectRoot::from_host_path(root)?)
     }
@@ -64,6 +66,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         self.status_locked(scope, &ProbeCancellation::default())
     }
 
+    #[cfg(test)]
     pub fn select(
         &self,
         root: &Path,
@@ -139,6 +142,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         ))
     }
 
+    #[cfg(test)]
     pub fn start(
         &self,
         root: &Path,
@@ -344,6 +348,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
         }
     }
 
+    #[cfg(test)]
     pub fn restart(
         &self,
         root: &Path,
@@ -1621,7 +1626,6 @@ mod tests {
         assert_eq!(fixture.runtime.spawn_count(), 0);
     }
 
-    #[cfg(unix)]
     #[test]
     fn profile_root_fingerprint_is_stable_across_host_path_mappings() {
         let root = std::env::temp_dir().join(format!(
@@ -1635,11 +1639,17 @@ mod tests {
             r#"{"name":"app","scripts":{"dev":"vite"}}"#,
         )
         .unwrap();
-        let mapped = root.with_file_name(format!(
-            "{}-simulated-unc",
-            root.file_name().unwrap().to_string_lossy()
+        let mapped = std::env::temp_dir().join(format!(
+            "t-hub-preview-service-authorized-root-mapped-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        std::os::unix::fs::symlink(&root, &mapped).unwrap();
+        fs::create_dir_all(&mapped).unwrap();
+        fs::write(
+            mapped.join("package.json"),
+            r#"{"name":"app","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
         let profiles =
             Arc::new(PreviewProfileStore::open(&root.join("state/profiles.json")).unwrap());
         let service = PreviewService::new(FakeRuntime::default(), Arc::clone(&profiles));
