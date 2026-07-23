@@ -351,16 +351,13 @@ fn start_control_listener(
 
     // Share the event fanout (server-split M1) so a subscribed control connection
     // receives the same stream the backend emits through the SocketEmitter.
-    let preview_control = preview_service;
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
         .with_read_token(read_token)
         .with_audit(audit)
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
         .with_metrics(metrics)
-        .with_preview_control(move |command, args, root| {
-            preview::adapter::dispatch(&preview_control, command, args, root)
-        })
+        .with_preview_control(preview::adapter::control_handler(preview_service))
         // TASK C (#22): share the addressable tab registry with the control listener
         // so `list_tabs` reads what the `report_workspace_tabs` command writes.
         .with_tab_registry(tab_registry)

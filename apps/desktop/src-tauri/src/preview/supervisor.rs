@@ -40,6 +40,7 @@ pub(crate) struct SupervisedPreviewChild {
     pub identity: ManagedRunIdentity,
     #[allow(dead_code)]
     pub(crate) generation: String,
+    pub(crate) _job: Option<crate::engine_supervisor::platform::KillOnCloseJob>,
 }
 
 struct AuthenticationGuard {
@@ -87,6 +88,7 @@ impl PreparedPreviewCommand {
             .command
             .spawn()
             .map_err(|error| format!("spawn managed Preview supervisor: {error}"))?;
+        let job = crate::engine_supervisor::platform::assign_kill_on_close_job(&child).ok();
         let mut guard = AuthenticationGuard {
             child: Some(child),
             stdin: None,
@@ -164,6 +166,7 @@ impl PreparedPreviewCommand {
             stderr: guard.stderr.take(),
             identity,
             generation: self.generation,
+            _job: job,
         })
     }
 }

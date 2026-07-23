@@ -37,6 +37,12 @@ pub fn build(
     )))
 }
 
+pub fn control_handler(
+    service: Arc<DesktopPreviewService>,
+) -> impl Fn(&str, &Value, &PreviewRootAuthority) -> Result<Value, String> + Send + Sync + 'static {
+    move |command, args, root| dispatch(&service, command, args, root)
+}
+
 pub fn dispatch(
     service: &DesktopPreviewService,
     command: &str,
@@ -132,4 +138,26 @@ fn optional_string<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>, S
 
 fn serialize(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|error| format!("serialize Preview response: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_handler_retains_the_exact_shared_service_arc() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles =
+            Arc::new(PreviewProfileStore::open(root.path().join("profiles.json")).unwrap());
+        let service = Arc::new(PreviewService::new(
+            ManagedPreviewRuntime::for_test(),
+            profiles,
+        ));
+        let weak = Arc::downgrade(&service);
+        let handler = control_handler(Arc::clone(&service));
+        drop(service);
+        assert_eq!(weak.strong_count(), 1);
+        drop(handler);
+        assert!(weak.upgrade().is_none());
+    }
 }

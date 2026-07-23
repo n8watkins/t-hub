@@ -125,7 +125,7 @@ pub struct PreviewTarget {
     pub recommended: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreviewTargetRef {
     pub scope: PreviewScope,
