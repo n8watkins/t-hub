@@ -175,7 +175,7 @@ fn unobserved_tui_process_records_degraded_health_from_its_tmux_tile() {
 
     let path = journal_dir.join("events.ndjson");
     for _ in 0..100 {
-        if path.exists() {
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
