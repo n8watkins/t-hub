@@ -10,7 +10,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(test)]
+use std::process::Stdio;
+use std::process::{Child, ChildStdin, Command};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, LazyLock, Weak,
@@ -620,6 +622,7 @@ fn unc_to_posix(path: &str) -> Option<String> {
 /// lifeline. The package manager and validated script remain argv data after
 /// the fixed shell program. EOF from T-Hub triggers TERM, a bounded grace
 /// period, and KILL for the owned group. Natural child exit preserves its code.
+#[cfg(test)]
 const PROCESS_TREE_SCRIPT: &str = crate::preview::managed_runner::PROCESS_TREE_SCRIPT;
 
 /// Wrap the user's dev command so the server binds to ALL interfaces
