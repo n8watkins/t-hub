@@ -932,21 +932,32 @@ mod tests {
 
     #[test]
     fn finished_worker_and_stale_cache_allow_direct_recovery() {
-        let cache = std::sync::Mutex::new(Some((true, now_ms() - 4_000)));
+        stop_scribe_status_emitter();
         let worker = std::thread::spawn(|| {});
         while !worker.is_finished() {
             std::thread::yield_now();
         }
-        assert!(worker.is_finished());
-        worker.join().expect("finished worker joins");
-        let mut cache = cache.lock().unwrap();
-        if cache.as_ref().is_some_and(|(_, at)| now_ms() - *at > 3_000) {
-            *cache = None;
-        }
-        assert!(
-            cache.is_none(),
-            "stale cache must not block direct recovery"
-        );
+        *scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ScribeEmitterState {
+            generation: 4,
+            enabled: true,
+            cancel: None,
+            handle: Some(worker),
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms() - 4_000));
+        retire_finished_scribe_emitter();
+        assert!(scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .handle
+            .is_none());
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
     }
 
     #[test]
@@ -972,15 +983,25 @@ mod tests {
 
     #[test]
     fn stop_clears_cache_after_inflight_worker_join() {
-        let cache = std::sync::Arc::new(std::sync::Mutex::new(Some(true)));
-        let worker_cache = cache.clone();
-        let worker = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            *worker_cache.lock().unwrap() = Some(true);
-        });
-        worker.join().expect("in-flight worker joins");
-        *cache.lock().unwrap() = None;
-        assert!(cache.lock().unwrap().is_none());
+        stop_scribe_status_emitter();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(5)));
+        *scribe_emitter_state()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ScribeEmitterState {
+            generation: 5,
+            enabled: true,
+            cancel: Some(cancel),
+            handle: Some(worker),
+        };
+        *latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((ScribeStatus::default(), now_ms()));
+        stop_scribe_status_emitter();
+        assert!(latest_scribe_status_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none());
     }
 
     #[test]
