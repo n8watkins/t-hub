@@ -2440,14 +2440,21 @@ mod tests {
     #[test]
     fn stop_reaps_a_term_ignoring_descendant_and_unblocks_its_reader() {
         use std::io::Read;
+        use std::os::fd::AsRawFd;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
+        let fixture = tempfile::tempdir().unwrap();
+        let lock_path = fixture.path().join("descendant-lock");
+        let script = format!(
+            "trap '' TERM; (flock -x 9; echo ready; trap '' TERM; sleep 30) 9>'{}' & wait",
+            lock_path.display()
+        );
         let supervised = crate::preview::managed_runner::prepare_supervised_preview_command(
-            Path::new("/tmp"),
+            fixture.path(),
             "tree-test",
             "sh",
-            &["-c", "trap '' TERM; sleep 30 & echo $!; wait"],
+            &["-c", &script],
         )
         .unwrap()
         .spawn_authenticated(Duration::from_secs(3))
@@ -2466,16 +2473,25 @@ mod tests {
                 let _ = stderr.read_to_string(&mut error);
                 panic!("fixture exited before reporting its descendant: {error}");
             }
-            pid_tx
-                .send(first.trim().parse::<u32>().expect("numeric descendant pid"))
-                .expect("send descendant pid");
+            assert_eq!(first.trim(), "ready");
+            pid_tx.send(()).expect("send descendant readiness");
             let mut rest = Vec::new();
             let _ = output.read_to_end(&mut rest);
         });
-        let descendant = pid_rx
+        pid_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("fixture should report its descendant");
-        assert!(std::path::Path::new(&format!("/proc/{descendant}")).exists());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_ne!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
 
         let started = Instant::now();
         DevProcess {
@@ -2488,19 +2504,29 @@ mod tests {
         .stop();
 
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(!std::path::Path::new(&format!("/proc/{descendant}")).exists());
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
     }
 
     #[cfg(not(windows))]
     #[test]
     fn natural_parent_exit_reaps_its_surviving_descendant() {
+        use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
 
+        let fixture = tempfile::tempdir().unwrap();
+        let lock_path = fixture.path().join("descendant-lock");
+        let script = format!(
+            "(flock -x 9; echo ready; sleep 30) 9>'{}' & exit 0",
+            lock_path.display()
+        );
         let supervised = crate::preview::managed_runner::prepare_supervised_preview_command(
-            Path::new("/tmp"),
+            fixture.path(),
             "early-exit-test",
             "sh",
-            &["-c", "sleep 30 & echo $!; exit 0"],
+            &["-c", &script],
         )
         .unwrap()
         .spawn_authenticated(Duration::from_secs(3))
@@ -2510,7 +2536,7 @@ mod tests {
         let mut output = BufReader::new(supervised.stdout.expect("fixture stdout"));
         let mut first = String::new();
         output.read_line(&mut first).expect("read descendant pid");
-        let descendant = first.trim().parse::<u32>().expect("numeric descendant pid");
+        assert_eq!(first.trim(), "ready");
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -2528,7 +2554,17 @@ mod tests {
                 }
             }
         }
-        assert!(!std::path::Path::new(&format!("/proc/{descendant}")).exists());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
     }
 
     /// The TCP probe should connect to a port we open and report it refused once

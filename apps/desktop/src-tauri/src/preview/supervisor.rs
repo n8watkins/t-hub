@@ -713,7 +713,7 @@ if not valid:
     raise SystemExit(3)
 print('ok')"#;
 
-pub(crate) const SUPERVISOR_PY: &str = r#"import ctypes, os, select, signal, subprocess, sys, time
+pub(crate) const SUPERVISOR_PY: &str = r#"import ctypes, os, select, signal, stat, subprocess, sys, time
 
 READY = 'T_HUB_PREVIEW_READY'
 GO = 'T_HUB_PREVIEW_GO'
@@ -725,28 +725,38 @@ if not run_id or len(run_id) > 160 or not all(c.isalnum() or c in '-_.:' for c i
 if not generation or len(generation) != 32 or not generation.isalnum():
     raise SystemExit(65)
 
+unshare_path = '/usr/bin/unshare'
+try:
+    unshare = os.stat(unshare_path, follow_symlinks=False)
+except OSError:
+    raise SystemExit(66)
+if (not stat.S_ISREG(unshare.st_mode) or unshare.st_uid != 0
+        or unshare.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not unshare.st_mode & stat.S_IXUSR):
+    raise SystemExit(66)
+
 os.setsid()
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(36, 1, 0, 0, 0) != 0:
-    raise SystemExit(66)
+    raise SystemExit(67)
 
 pid = os.getpid()
 pgid = os.getpgrp()
 with open(f'/proc/{pid}/stat', 'rb') as handle:
     process_stat = handle.read(4097)
 if len(process_stat) > 4096:
-    raise SystemExit(67)
+    raise SystemExit(68)
 fields = process_stat.rsplit(b') ', 1)[1].split()
 started = int(fields[19])
 if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
-    raise SystemExit(68)
+    raise SystemExit(69)
 print(READY, VERSION, generation, pid, pgid, started, 'WAITING', flush=True)
 
 gate = sys.stdin.readline()
 if gate != f'{GO} {generation}\n':
-    raise SystemExit(69)
-if libc.prctl(4, 0, 0, 0, 0) != 0:
     raise SystemExit(70)
+if libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(71)
 
 environment = os.environ.copy()
 environment.update({
@@ -756,8 +766,44 @@ environment.update({
     'ASTRO_HOST': '0.0.0.0',
     'TAURI_DEV_HOST': '0.0.0.0',
 })
+launcher_script = r'''import ctypes, signal, subprocess, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(74)
 target = subprocess.Popen(
-    [executable, *arguments],
+    sys.argv[1:],
+    stdin=subprocess.DEVNULL,
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+    close_fds=True,
+)
+try:
+    status = target.wait()
+except BaseException:
+    try:
+        target.kill()
+    except ProcessLookupError:
+        pass
+    target.wait()
+    raise
+raise SystemExit(status)'''
+launcher = subprocess.Popen(
+    [
+        unshare_path,
+        '--user',
+        '--map-current-user',
+        '--pid',
+        '--fork',
+        '--mount',
+        '--mount-proc',
+        '--kill-child=KILL',
+        sys.executable,
+        '-I',
+        '-c',
+        launcher_script,
+        executable,
+        *arguments,
+    ],
     stdin=subprocess.DEVNULL,
     stdout=sys.stdout,
     stderr=sys.stderr,
@@ -766,6 +812,8 @@ target = subprocess.Popen(
 )
 
 tracked = {}
+SCAN_LIMIT = 32768
+SCAN_SLICE = 0.1
 
 def process_identity(candidate):
     with open(f'/proc/{candidate}/stat', 'rb') as handle:
@@ -775,18 +823,23 @@ def process_identity(candidate):
     fields = value.rsplit(b') ', 1)[1].split()
     return int(fields[1]), int(fields[19])
 
-def discover_descendants():
+def discover_descendants(deadline):
     snapshot = {}
-    for name in os.listdir('/proc'):
-        if not name.isdigit():
-            continue
-        candidate = int(name)
-        if candidate == pid:
-            continue
-        try:
-            snapshot[candidate] = process_identity(candidate)
-        except (OSError, ValueError, IndexError):
-            pass
+    complete = True
+    with os.scandir('/proc') as entries:
+        for index, entry in enumerate(entries):
+            if index >= SCAN_LIMIT or time.monotonic() >= deadline:
+                complete = False
+                break
+            if not entry.name.isdigit():
+                continue
+            candidate = int(entry.name)
+            if candidate == pid:
+                continue
+            try:
+                snapshot[candidate] = process_identity(candidate)
+            except (OSError, ValueError, IndexError):
+                pass
     descendants = set()
     changed = True
     while changed:
@@ -795,10 +848,11 @@ def discover_descendants():
             if candidate not in descendants and (parent == pid or parent in descendants):
                 descendants.add(candidate)
                 changed = True
-    return {candidate: snapshot[candidate][1] for candidate in descendants}
+    return ({candidate: snapshot[candidate][1] for candidate in descendants}, complete)
 
-def track_descendants():
-    for candidate, start in discover_descendants().items():
+def track_descendants(deadline):
+    descendants, complete = discover_descendants(deadline)
+    for candidate, start in descendants.items():
         current = tracked.get(candidate)
         if current is not None and current[0] == start:
             continue
@@ -821,6 +875,7 @@ def track_descendants():
             pass
         os.close(descriptor)
         del tracked[candidate]
+    return complete
 
 def reap():
     while True:
@@ -842,36 +897,47 @@ def clean_descendants():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     grace = time.monotonic() + 2.0
     while time.monotonic() < grace:
-        track_descendants()
+        complete = track_descendants(min(grace, time.monotonic() + SCAN_SLICE))
         signal_tracked(signal.SIGTERM)
         reap()
-        track_descendants()
-        if not tracked:
+        complete = track_descendants(min(grace, time.monotonic() + SCAN_SLICE)) and complete
+        if complete and not tracked:
             return
         time.sleep(0.02)
     kill_deadline = time.monotonic() + 2.0
     while time.monotonic() < kill_deadline:
-        track_descendants()
+        complete = track_descendants(min(kill_deadline, time.monotonic() + SCAN_SLICE))
         signal_tracked(signal.SIGKILL)
         reap()
-        track_descendants()
-        if not tracked:
+        complete = track_descendants(min(kill_deadline, time.monotonic() + SCAN_SLICE)) and complete
+        if complete and not tracked:
             reap()
             return
         time.sleep(0.02)
-    for _, descriptor in tracked.values():
-        os.close(descriptor)
-    tracked.clear()
+    try:
+        print(f'T_HUB_PREVIEW_CLEANUP_PENDING {generation}', file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        pass
+    while True:
+        complete = track_descendants(time.monotonic() + SCAN_SLICE)
+        signal_tracked(signal.SIGKILL)
+        reap()
+        complete = track_descendants(time.monotonic() + SCAN_SLICE) and complete
+        if complete and not tracked:
+            return
+        time.sleep(0.02)
 
 status = None
 stopped = False
 while status is None:
-    track_descendants()
+    if not track_descendants(time.monotonic() + SCAN_SLICE):
+        stopped = True
+        break
     try:
-        observed, code = os.waitpid(target.pid, os.WNOHANG)
+        observed, code = os.waitpid(launcher.pid, os.WNOHANG)
     except ChildProcessError:
-        observed, code = target.pid, 0
-    if observed == target.pid:
+        observed, code = launcher.pid, 0
+    if observed == launcher.pid:
         status = code
         break
     readable, _, _ = select.select([sys.stdin.fileno()], [], [], 0.02)
@@ -881,6 +947,10 @@ while status is None:
             break
 
 clean_descendants()
+try:
+    print(f'T_HUB_PREVIEW_STOPPED {generation}', file=sys.stderr, flush=True)
+except BrokenPipeError:
+    pass
 if stopped:
     raise SystemExit(0)
 if os.WIFEXITED(status):
@@ -893,6 +963,25 @@ raise SystemExit(71)"#;
 mod tests {
     use super::*;
     use std::io::BufRead;
+
+    #[cfg(target_os = "linux")]
+    fn assert_exclusive_lock_available(path: &Path) {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "surviving process still holds {}",
+            path.display()
+        );
+    }
 
     #[test]
     fn handshake_requires_generation_and_group_leader_identity() {
@@ -984,10 +1073,12 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let started = fixture.path().join("started");
         let descendant = fixture.path().join("descendant");
+        let lock = fixture.path().join("descendant-lock");
         let script = format!(
-            "echo 'T_HUB_PREVIEW_READY 1 spoof 9 9 9 9 9 WAITING'; test ! -e '{0}'; touch '{0}'; sleep 30 & echo $! > '{1}'; wait",
+            "echo 'T_HUB_PREVIEW_READY 1 spoof 9 9 9 9 9 WAITING'; test ! -e '{0}'; touch '{0}'; flock -x '{2}' sleep 30 & echo ready > '{1}'; wait",
             started.display(),
-            descendant.display()
+            descendant.display(),
+            lock.display()
         );
         let prepared =
             prepare_supervised_preview_command(fixture.path(), "gated-run", "sh", &["-c", &script])
@@ -1008,14 +1099,9 @@ mod tests {
         while !descendant.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let pid = std::fs::read_to_string(&descendant)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
         supervised.stdin.take();
         assert!(supervised.child.wait().unwrap().success());
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_exclusive_lock_available(&lock);
     }
 
     #[cfg(target_os = "linux")]
@@ -1023,7 +1109,12 @@ mod tests {
     fn natural_parent_exit_reaps_surviving_descendant() {
         let fixture = tempfile::tempdir().unwrap();
         let descendant = fixture.path().join("descendant");
-        let script = format!("sleep 30 & echo $! > '{}'; exit 0", descendant.display());
+        let lock = fixture.path().join("descendant-lock");
+        let script = format!(
+            "flock -x '{}' sleep 30 & echo ready > '{}'; exit 0",
+            lock.display(),
+            descendant.display()
+        );
         let prepared = prepare_supervised_preview_command(
             fixture.path(),
             "natural-exit-run",
@@ -1050,12 +1141,7 @@ mod tests {
             .read_to_string(&mut stderr)
             .unwrap();
         assert!(status.success(), "status {status:?}, stderr: {stderr}");
-        let pid = std::fs::read_to_string(descendant)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert_exclusive_lock_available(&lock);
     }
 
     #[cfg(target_os = "linux")]
@@ -1103,7 +1189,7 @@ mod tests {
         let result = fixture.path().join("fd-result");
         let script = r#"import os,sys,time
 try:
-    descriptor = os.open(f'/proc/{os.getppid()}/fd/0', os.O_RDONLY)
+    descriptor = os.open(f'/proc/{os.getppid()}/fd/0', os.O_WRONLY)
 except PermissionError:
     outcome = 'denied'
 else:
@@ -1118,6 +1204,7 @@ time.sleep(30)"#;
             &["-I", "-c", script, result.to_str().unwrap()],
         )
         .unwrap();
+        let generation = prepared.generation.clone();
         let mut supervised = prepared
             .spawn_authenticated(Duration::from_secs(3))
             .unwrap();
@@ -1130,6 +1217,112 @@ time.sleep(30)"#;
         supervised.stdin.take();
         assert!(supervised.child.wait().unwrap().success());
         assert!(stopped.elapsed() < Duration::from_secs(5));
+        let mut stderr = String::new();
+        supervised
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            stderr.contains(&format!("T_HUB_PREVIEW_STOPPED {generation}")),
+            "missing correlated WSL cleanup acknowledgement: {stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_killing_its_direct_parent_is_still_reaped_by_watchdog() {
+        let fixture = tempfile::tempdir().unwrap();
+        let result = fixture.path().join("parent-result");
+        let lock_path = fixture.path().join("parent-killer-lock");
+        let script = r#"import fcntl,os,signal,sys,time
+lock = open(sys.argv[2], 'w')
+fcntl.flock(lock, fcntl.LOCK_EX)
+parent = os.getppid()
+os.kill(os.getppid(), signal.SIGKILL)
+time.sleep(0.1)
+os.kill(parent, 0)
+open(sys.argv[1], 'w').write(f'protected {parent}')
+time.sleep(30)"#;
+        let prepared = prepare_supervised_preview_command(
+            fixture.path(),
+            "parent-killer",
+            "/usr/bin/python3",
+            &[
+                "-I",
+                "-c",
+                script,
+                result.to_str().unwrap(),
+                lock_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut supervised = prepared
+            .spawn_authenticated(Duration::from_secs(3))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !result.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(result).unwrap(), "protected 1");
+        supervised.stdin.take();
+        assert!(supervised.child.wait().unwrap().success());
+        assert_exclusive_lock_available(&lock_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fork_churn_cannot_escape_bounded_watchdog_scans() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ready = fixture.path().join("fork-ready");
+        let lock = fixture.path().join("fork-lock");
+        let script = r#"import fcntl,os,signal,sys,time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = open(sys.argv[2], 'w')
+fcntl.flock(lock, fcntl.LOCK_EX)
+children = []
+for index in range(64):
+    child = os.fork()
+    if child == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(30)
+        os._exit(0)
+    children.append(child)
+open(sys.argv[1], 'w').write(' '.join(str(pid) for pid in children))
+while True:
+    time.sleep(1)"#;
+        let prepared = prepare_supervised_preview_command(
+            fixture.path(),
+            "fork-churn",
+            "/usr/bin/python3",
+            &[
+                "-I",
+                "-c",
+                script,
+                ready.to_str().unwrap(),
+                lock.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut supervised = prepared
+            .spawn_authenticated(Duration::from_secs(3))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pids = std::fs::read_to_string(&ready)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 64);
+        let stopped = Instant::now();
+        supervised.stdin.take();
+        assert!(supervised.child.wait().unwrap().success());
+        assert!(stopped.elapsed() < Duration::from_secs(6));
+        assert_exclusive_lock_available(&lock);
     }
 
     #[cfg(target_os = "linux")]
@@ -1137,7 +1330,10 @@ time.sleep(30)"#;
     fn setsid_target_and_escaped_descendant_are_reaped_within_bound() {
         let fixture = tempfile::tempdir().unwrap();
         let identities = fixture.path().join("escaped-pids");
-        let script = r#"import os,signal,sys,time
+        let lock_path = fixture.path().join("escaped-lock");
+        let script = r#"import fcntl,os,signal,sys,time
+lock = open(sys.argv[2], 'w')
+fcntl.flock(lock, fcntl.LOCK_EX)
 os.setsid()
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 child = os.fork()
@@ -1152,7 +1348,13 @@ os._exit(0)"#;
             fixture.path(),
             "escaped-tree",
             "/usr/bin/python3",
-            &["-I", "-c", script, identities.to_str().unwrap()],
+            &[
+                "-I",
+                "-c",
+                script,
+                identities.to_str().unwrap(),
+                lock_path.to_str().unwrap(),
+            ],
         )
         .unwrap();
         let mut supervised = prepared
@@ -1168,9 +1370,7 @@ os._exit(0)"#;
             .map(|value| value.parse::<u32>().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(pids.len(), 2);
-        for pid in pids {
-            assert!(!Path::new(&format!("/proc/{pid}")).exists());
-        }
+        assert_exclusive_lock_available(&lock_path);
     }
 
     #[cfg(target_os = "linux")]
