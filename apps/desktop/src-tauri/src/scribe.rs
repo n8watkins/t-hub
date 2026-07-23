@@ -92,11 +92,23 @@ static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterS
 static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
     std::sync::OnceLock::new();
 static SCRIBE_DIRECT_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_DIRECT_FLAVOR: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_DIRECT_CANDIDATES: std::sync::OnceLock<
+    std::sync::Mutex<([Option<CandidateEval>; 2], [std::time::Instant; 2])>,
+> = std::sync::OnceLock::new();
 static SCRIBE_REQUEST_COORDINATOR: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
 fn scribe_request_coordinator() -> &'static std::sync::Mutex<()> {
     SCRIBE_REQUEST_COORDINATOR.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn scribe_direct_candidates(
+) -> &'static std::sync::Mutex<([Option<CandidateEval>; 2], [std::time::Instant; 2])> {
+    SCRIBE_DIRECT_CANDIDATES.get_or_init(|| {
+        let expired = std::time::Instant::now() - Duration::from_secs(4);
+        std::sync::Mutex::new(([None, None], [expired, expired]))
+    })
 }
 
 fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
@@ -618,6 +630,20 @@ fn read_scribe_status_emitter_tick(
     status
 }
 
+fn read_scribe_status_direct_tick() -> ScribeStatus {
+    if std::env::var("T_HUB_SCRIBE_CONTROL_FILE").is_ok()
+        || std::env::var("T_HUB_SCRIBE_STATUS_FILE").is_ok()
+    {
+        return read_scribe_status();
+    }
+    let flavor = (SCRIBE_DIRECT_FLAVOR.fetch_add(1, Ordering::Relaxed) % 2) as usize;
+    let mut state = scribe_direct_candidates()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (candidates, last_checked) = &mut *state;
+    read_scribe_status_emitter_tick(candidates, last_checked, flavor)
+}
+
 /// Start the backend event producer while voice announcements are enabled.
 ///
 /// Scribe's v1 contract is currently a pull endpoint, so this producer uses
@@ -744,7 +770,7 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
         let _request_guard = scribe_request_coordinator()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        read_scribe_status()
+        read_scribe_status_direct_tick()
     })
     .await
     .map_err(|e| format!("scribe_status task failed: {e}"))?;
