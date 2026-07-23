@@ -5159,57 +5159,6 @@ fn legacy_crew_workspace_reconciliation_is_exact_or_needs_assignment() {
 }
 
 #[test]
-fn dispatch_workspace_resolution_is_owned_exact_and_bounded() {
-    let reg = Arc::new(CaptainsRegistry::new());
-    reg.claim_test(
-        "captain-a",
-        Some("alpha"),
-        vec!["work-a".into(), "work-b".into(), "foreign".into()],
-    )
-    .unwrap();
-    let tabs = Arc::new(TabRegistry::new());
-    tabs.replace(vec![
-        TabRecord {
-            id: "work-a".into(),
-            name: "Shared".into(),
-            tile_ids: Vec::new(),
-        },
-        TabRecord {
-            id: "work-b".into(),
-            name: "Shared".into(),
-            tile_ids: Vec::new(),
-        },
-    ]);
-    let ctx = test_ctx("dispatch-workspace")
-        .with_captains_registry(reg.clone())
-        .with_tab_registry(tabs);
-    let captain = reg.snapshot().captains[0].clone();
-    let error = resolve_dispatch_workspace(&ctx, &json!({}), &captain).unwrap_err();
-    assert!(error.starts_with("workspace_required:"));
-    assert!(error.contains("work-a"));
-    assert!(error.contains("work-b"));
-    assert!(!error.contains("foreign"));
-    assert!(resolve_dispatch_workspace(
-        &ctx,
-        &json!({"workspaceTabId": CAPTAIN_WORKSPACE_ID}),
-        &captain
-    )
-    .unwrap_err()
-    .contains("Crew cannot"));
-    assert_eq!(
-        resolve_dispatch_workspace(&ctx, &json!({"workspaceTabId": "work-a"}), &captain)
-            .unwrap()
-            .id,
-        "work-a"
-    );
-    assert!(
-        resolve_dispatch_workspace(&ctx, &json!({"tabName": "Shared"}), &captain)
-            .unwrap_err()
-            .starts_with("workspace_required:")
-    );
-}
-
-#[test]
 fn work_workspace_ownership_is_globally_exclusive_sequentially_and_concurrently() {
     let sequential = CaptainsRegistry::new();
     sequential

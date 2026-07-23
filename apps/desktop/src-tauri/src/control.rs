@@ -41,7 +41,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -57,11 +57,9 @@ use sha2::{Digest, Sha256};
 use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
-use crate::harness::{
-    attest_final_launch_permissions, attest_launch_permissions, attest_respawn_launch_permissions,
-    confirm_stable_launch_baseline, observe_harness_process, Harness, HarnessPermissionAttestation,
-    HarnessProcessEvidence, LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
-};
+#[cfg(test)]
+use crate::harness::{attest_launch_permissions, observe_harness_process};
+use crate::harness::{Harness, HarnessPermissionAttestation, PermMode, CREW_DEFAULT_PERMISSION};
 use crate::supervision::Supervisor;
 use crate::{
     agent_session::{AgentCheckpoint, AgentEvent, AgentSessionRecord, RuntimeState},
@@ -1585,16 +1583,6 @@ pub enum PowderMutationKind {
     Completion,
 }
 
-impl PowderMutationKind {
-    fn command_label(self) -> &'static str {
-        match self {
-            Self::WorkLogAppend => "Powder work-log append",
-            Self::CriterionReview => "Powder criterion review",
-            Self::Completion => "Powder completion",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PowderMutationTerminalState {
@@ -1602,26 +1590,6 @@ pub enum PowderMutationTerminalState {
     Expired,
     Rejected,
     Stale,
-}
-
-impl PowderMutationTerminalState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Conflict => "conflict",
-            Self::Expired => "expired",
-            Self::Rejected => "rejected",
-            Self::Stale => "stale",
-        }
-    }
-
-    fn disposition(self) -> &'static str {
-        match self {
-            Self::Conflict => "the run is stale, released, or reclaimed",
-            Self::Expired => "the claim expired",
-            Self::Rejected => "the exact run-bound operation was rejected",
-            Self::Stale => "the exact run is no longer authoritative",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1657,7 +1625,6 @@ pub struct PowderMutationIntent {
 }
 
 const POWDER_MUTATION_INTENT_SCHEMA_VERSION: u32 = 3;
-const POWDER_OPERATION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 fn valid_lower_hex_digest(value: &str) -> bool {
     value.len() == 64
@@ -1740,15 +1707,6 @@ fn validate_powder_mutation_intent(
         ));
     }
     Ok(())
-}
-
-fn powder_mutation_request_digest(intent: &PowderMutationIntent) -> Result<&str, String> {
-    intent.powder_request_digest.as_deref().ok_or_else(|| {
-        format!(
-            "Powder operation '{}' uses a legacy mutation intent without Powder's canonical request digest; refusing mutation and cleanup until the exact operation is reconciled",
-            intent.operation_id
-        )
-    })
 }
 
 /// Durable T-Hub-side state for a Crew member's exact Powder run.
@@ -2929,7 +2887,6 @@ struct DispatchAuthority {
     captain: CaptainRecord,
     project: ProjectRecord,
     generation: ScopedAuthorityGeneration,
-    caller: Option<ResolvedIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3109,8 +3066,6 @@ pub struct CaptainsRegistry {
     powder_operations_inflight: Mutex<std::collections::HashMap<String, CrewPowderOperationKind>>,
     powder_operation_ready: Condvar,
     #[cfg(test)]
-    powder_operation_wait_hook: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
-    #[cfg(test)]
     #[allow(dead_code)]
     historical_scope_capture_hook: Mutex<Option<HistoricalScopeCaptureHook>>,
     #[cfg(test)]
@@ -3157,10 +3112,7 @@ struct HistoricalScopeCaptureHook {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrewPowderOperationKind {
-    Mutation,
-    Completion,
     Cleanup,
-    Renewal,
 }
 
 impl Drop for CrewPowderOperationGuard<'_> {
@@ -3230,21 +3182,7 @@ impl CaptainsRegistry {
             .powder_operations_inflight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(test)]
-        let mut wait_hook_notified = false;
         while inflight.contains_key(crew_session_id) {
-            #[cfg(test)]
-            if !wait_hook_notified {
-                if let Some(hook) = self
-                    .powder_operation_wait_hook
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .as_ref()
-                {
-                    let _ = hook.try_send(crew_session_id.to_string());
-                }
-                wait_hook_notified = true;
-            }
             inflight = self
                 .powder_operation_ready
                 .wait(inflight)
@@ -3267,8 +3205,6 @@ impl CaptainsRegistry {
             git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
-            #[cfg(test)]
-            powder_operation_wait_hook: Mutex::new(None),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3439,8 +3375,6 @@ impl CaptainsRegistry {
             git_initialization: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
             powder_operation_ready: Condvar::new(),
-            #[cfg(test)]
-            powder_operation_wait_hook: Mutex::new(None),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -7281,292 +7215,6 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
-    fn pending_dispatch_claim(
-        &self,
-        connection_profile: &str,
-        repository: &str,
-        card_id: &str,
-    ) -> Option<PendingDispatchClaim> {
-        self.lock()
-            .pending_dispatch_claims
-            .iter()
-            .find(|intent| {
-                intent.connection_profile == connection_profile
-                    && intent.repository == repository
-                    && intent.card_id == card_id
-            })
-            .cloned()
-    }
-
-    fn begin_pending_dispatch_claim(&self, intent: PendingDispatchClaim) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if let Some(existing) = current.pending_dispatch_claims.iter().find(|existing| {
-            existing.connection_profile == intent.connection_profile
-                && existing.repository == intent.repository
-                && existing.card_id == intent.card_id
-        }) {
-            if existing == &intent {
-                return Ok(());
-            }
-            return Err(format!(
-                "dispatch_crew: Powder card '{}' already has an unresolved initial claim attempt; reconcile it before redispatching",
-                intent.card_id
-            ));
-        }
-        let previous = current.clone();
-        current.pending_dispatch_claims.push(intent);
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)
-    }
-
-    fn clear_pending_dispatch_claim(&self, intent: &PendingDispatchClaim) -> Result<bool, String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let Some(position) = current
-            .pending_dispatch_claims
-            .iter()
-            .position(|existing| existing == intent)
-        else {
-            return Ok(false);
-        };
-        let previous = current.clone();
-        current.pending_dispatch_claims.remove(position);
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)?;
-        Ok(true)
-    }
-
-    /// Persist a trusted release-recovery record and retain only the exact Crew
-    /// binding that owns it.  This deliberately does not inspect the Captain's
-    /// current Project or Powder binding: both may have been replaced after the
-    /// dispatch captured its authority.
-    fn prepare_dispatch_release(&self, recovery: PendingDispatchRelease) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        if let Some(existing) = current
-            .pending_dispatch_releases
-            .iter()
-            .find(|existing| existing.crew_session_id == recovery.crew_session_id)
-        {
-            if existing == &recovery && existing.state == PendingDispatchReleaseState::Prepared {
-                return Ok(());
-            }
-            return Err(format!(
-                "Crew session '{}' already has a different pending dispatch release recovery",
-                recovery.crew_session_id
-            ));
-        }
-        let previous = current.clone();
-        let crew = current
-            .captains
-            .iter_mut()
-            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
-            .flat_map(|captain| captain.crew.iter_mut())
-            .find(|crew| crew.terminal_id == recovery.crew_session_id)
-            .ok_or_else(|| {
-                format!(
-                    "trusted release recovery refused because Crew session '{}' is no longer durable",
-                    recovery.crew_session_id
-                )
-            })?;
-        let work = crew.powder_work.as_mut().ok_or_else(|| {
-            format!(
-                "trusted release recovery refused because Crew session '{}' has no Powder binding",
-                recovery.crew_session_id
-            )
-        })?;
-        if work.card_id != recovery.card_id
-            || work.run_id != recovery.run_id
-            || work.agent.as_deref() != Some(recovery.agent.as_str())
-        {
-            return Err(format!(
-                "trusted release recovery refused because Crew session '{}' no longer owns the exact claim",
-                recovery.crew_session_id
-            ));
-        }
-        if !matches!(crew.state, CrewState::CleanupPending { .. }) {
-            crew.state = CrewState::CleanupPending { since: now_ms() };
-        }
-        work.dispatch_release_recovery = true;
-        current.pending_dispatch_releases.push(recovery);
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)
-    }
-
-    fn transition_dispatch_release(
-        &self,
-        recovery: &PendingDispatchRelease,
-        expected: PendingDispatchReleaseState,
-        next: PendingDispatchReleaseState,
-    ) -> Result<(), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let previous = current.clone();
-        let record = current
-            .pending_dispatch_releases
-            .iter_mut()
-            .find(|existing| {
-                existing.crew_session_id == recovery.crew_session_id
-                    && existing.project_id == recovery.project_id
-                    && existing.connection_profile == recovery.connection_profile
-                    && existing.connection_endpoint_identity
-                        == recovery.connection_endpoint_identity
-                    && existing.repository == recovery.repository
-                    && existing.card_id == recovery.card_id
-                    && existing.run_id == recovery.run_id
-                    && existing.agent == recovery.agent
-                    && existing.operation_id == recovery.operation_id
-            })
-            .ok_or("trusted dispatch release recovery is no longer durable")?;
-        if record.state != expected {
-            return Err("trusted dispatch release recovery is in an unexpected state".into());
-        }
-        record.state = next;
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)
-    }
-
-    fn pending_dispatch_release(&self, crew_session_id: &str) -> Option<PendingDispatchRelease> {
-        self.lock()
-            .pending_dispatch_releases
-            .iter()
-            .find(|recovery| recovery.crew_session_id == crew_session_id)
-            .cloned()
-    }
-
-    /// Clear a confirmed release recovery and only its transaction-owned Crew
-    /// binding.  A replacement Captain or Crew is never removed by this path.
-    fn clear_confirmed_dispatch_release(
-        &self,
-        recovery: &PendingDispatchRelease,
-    ) -> Result<(bool, bool, bool), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let Some(position) = current
-            .pending_dispatch_releases
-            .iter()
-            .position(|existing| {
-                existing.crew_session_id == recovery.crew_session_id
-                    && existing.project_id == recovery.project_id
-                    && existing.connection_profile == recovery.connection_profile
-                    && existing.connection_endpoint_identity
-                        == recovery.connection_endpoint_identity
-                    && existing.repository == recovery.repository
-                    && existing.card_id == recovery.card_id
-                    && existing.run_id == recovery.run_id
-                    && existing.agent == recovery.agent
-                    && existing.operation_id == recovery.operation_id
-            })
-        else {
-            return Ok((false, false, false));
-        };
-        let owned_crew_count = current
-            .captains
-            .iter()
-            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
-            .flat_map(|captain| captain.crew.iter())
-            .filter(|crew| {
-                crew.terminal_id == recovery.crew_session_id
-                    && matches!(crew.state, CrewState::CleanupPending { .. })
-                    && crew.powder_work.as_ref().is_some_and(|work| {
-                        work.card_id == recovery.card_id
-                            && work.run_id == recovery.run_id
-                            && work.agent.as_deref() == Some(recovery.agent.as_str())
-                            && work.dispatch_release_recovery
-                    })
-            })
-            .count();
-        if owned_crew_count != 1 {
-            return Err(format!(
-                "exact release recovery for Crew '{}' no longer has one transaction-owned CleanupPending binding",
-                recovery.crew_session_id
-            ));
-        }
-        let previous = current.clone();
-        current.pending_dispatch_releases.remove(position);
-        let mut crew_removed = false;
-        for captain in &mut current.captains {
-            if captain.project_id.as_deref() != Some(recovery.project_id.as_str()) {
-                continue;
-            }
-            let before = captain.crew.len();
-            captain.crew.retain(|crew| {
-                let transaction_owned = crew.terminal_id == recovery.crew_session_id
-                    && matches!(crew.state, CrewState::CleanupPending { .. })
-                    && crew.powder_work.as_ref().is_some_and(|work| {
-                        work.card_id == recovery.card_id
-                            && work.run_id == recovery.run_id
-                            && work.agent.as_deref() == Some(recovery.agent.as_str())
-                            && work.dispatch_release_recovery
-                    });
-                !transaction_owned
-            });
-            crew_removed |= captain.crew.len() != before;
-        }
-        debug_assert!(crew_removed, "validated transaction Crew must be removed");
-        let mut workspace_changed = false;
-        for workspace in &mut current.workspaces {
-            let before = workspace.tile_ids.len();
-            workspace
-                .tile_ids
-                .retain(|tile| tile != &recovery.crew_session_id);
-            workspace_changed |= workspace.tile_ids.len() != before;
-        }
-        if !current
-            .retired_fleet_tile_ids
-            .contains(&recovery.crew_session_id)
-        {
-            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
-                current.retired_fleet_tile_ids.remove(0);
-            }
-            current
-                .retired_fleet_tile_ids
-                .push(recovery.crew_session_id.clone());
-        }
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)?;
-        Ok((true, crew_removed, workspace_changed))
-    }
-
-    fn rollback_crew_and_workspace(&self, crew_session_id: &str) -> Result<(bool, bool), String> {
-        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
-        let mut current = self.lock();
-        let previous = current.clone();
-        let mut crew_removed = false;
-        for captain in &mut current.captains {
-            let before = captain.crew.len();
-            captain
-                .crew
-                .retain(|crew| crew.terminal_id != crew_session_id);
-            crew_removed |= captain.crew.len() != before;
-        }
-        let mut workspace_changed = false;
-        for workspace in &mut current.workspaces {
-            let before = workspace.tile_ids.len();
-            workspace.tile_ids.retain(|tile| tile != crew_session_id);
-            workspace_changed |= workspace.tile_ids.len() != before;
-        }
-        if !current
-            .retired_fleet_tile_ids
-            .iter()
-            .any(|retired| retired == crew_session_id)
-        {
-            if current.retired_fleet_tile_ids.len() == MAX_RETIRED_FLEET_TILES {
-                current.retired_fleet_tile_ids.remove(0);
-            }
-            current
-                .retired_fleet_tile_ids
-                .push(crew_session_id.to_string());
-        }
-        if !crew_removed && !workspace_changed {
-            return Ok((false, false));
-        }
-        current.seq = current.seq.saturating_add(1);
-        self.commit_mutation(current, previous)?;
-        Ok((crew_removed, workspace_changed))
-    }
-
     /// Capture durable registry values and their internal authority versions under
     /// one lock. The returned copies are safe to carry across remote I/O without
     /// holding either the registry lock or the mutation serializer.
@@ -8094,7 +7742,6 @@ impl CaptainsRegistry {
         self.commit_mutation(g, previous)?;
         Ok(result)
     }
-
 
     pub fn checkpoint(
         &self,
@@ -9031,13 +8678,6 @@ impl CaptainsRegistry {
         )
     }
 
-    fn set_powder_operation_wait_hook(&self, hook: Option<std::sync::mpsc::SyncSender<String>>) {
-        *self
-            .powder_operation_wait_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
-    }
-
     #[allow(dead_code)]
     fn set_historical_scope_capture_hook(
         &self,
@@ -9636,32 +9276,6 @@ pub(crate) struct SpawnAdmissionGuard<'a> {
     _capacity: crate::governor::CapacityReport,
 }
 
-const DISPATCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DispatchReservationKey {
-    connection_profile: String,
-    repository: String,
-    card_id: String,
-}
-
-#[derive(Default)]
-struct DispatchReservationState {
-    active: HashSet<DispatchReservationKey>,
-    waiters: usize,
-}
-
-#[derive(Default)]
-struct DispatchReservations {
-    state: Mutex<DispatchReservationState>,
-    ready: Condvar,
-}
-
-struct DispatchReservationGuard {
-    reservations: Arc<DispatchReservations>,
-    key: Option<DispatchReservationKey>,
-}
-
 /// Short-lived authority minted for one exact durable orchestration identity.
 ///
 /// The secret exists only in the app and MCP process memories. It is never part
@@ -9824,90 +9438,6 @@ impl CaptainControlLeases {
     }
 }
 
-impl DispatchReservations {
-    fn acquire(
-        self: &Arc<Self>,
-        connection_profile: &str,
-        repository: &str,
-        card_id: &str,
-    ) -> Result<DispatchReservationGuard, String> {
-        self.acquire_with_timeout(
-            connection_profile,
-            repository,
-            card_id,
-            DISPATCH_RESERVATION_TIMEOUT,
-        )
-    }
-
-    fn acquire_with_timeout(
-        self: &Arc<Self>,
-        connection_profile: &str,
-        repository: &str,
-        card_id: &str,
-        timeout: Duration,
-    ) -> Result<DispatchReservationGuard, String> {
-        let key = DispatchReservationKey {
-            connection_profile: connection_profile.to_string(),
-            repository: repository.to_string(),
-            card_id: card_id.to_string(),
-        };
-        let deadline = Instant::now() + timeout;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while state.active.contains(&key) {
-            state.waiters = state.waiters.saturating_add(1);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                state.waiters = state.waiters.saturating_sub(1);
-                return Err(format!(
-                    "dispatch_crew: another dispatch for Powder card '{card_id}' is still in progress"
-                ));
-            }
-            let (next, wait) = self
-                .ready
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
-            state.waiters = state.waiters.saturating_sub(1);
-            if wait.timed_out() && state.active.contains(&key) {
-                return Err(format!(
-                    "dispatch_crew: another dispatch for Powder card '{card_id}' is still in progress"
-                ));
-            }
-        }
-        state.active.insert(key.clone());
-        Ok(DispatchReservationGuard {
-            reservations: self.clone(),
-            key: Some(key),
-        })
-    }
-
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .waiters
-    }
-}
-
-impl Drop for DispatchReservationGuard {
-    fn drop(&mut self) {
-        let Some(key) = self.key.take() else {
-            return;
-        };
-        let mut state = self
-            .reservations
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.active.remove(&key);
-        self.reservations.ready.notify_all();
-    }
-}
-
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -9955,11 +9485,6 @@ pub struct ControlContext {
     /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
     /// Own empty in-memory one in headless tests.
     captains: Arc<CaptainsRegistry>,
-    /// Serializes dispatch for each protected Powder profile and card pair so a
-    /// failed launch can never release a same-run claim owned by a sibling
-    /// dispatch. The reservation spans all Powder reads, spawn, claim,
-    /// attestation, and transactional rollback work.
-    dispatch_reservations: Arc<DispatchReservations>,
     /// Serializes modern Crew admission from its authoritative snapshot through
     /// exact-baseline verification, dependency ancestry, governor preflight, and
     /// durable insertion. This closes the check-then-insert race where two
@@ -22266,83 +21791,6 @@ fn attach_captain(
     }))
 }
 
-
-fn dispatch_workspace_candidates(ctx: &ControlContext, captain: &CaptainRecord) -> Vec<TabRecord> {
-    let mut seen = std::collections::HashSet::new();
-    captain
-        .workspace_tab_ids
-        .iter()
-        .filter(|id| seen.insert((*id).clone()))
-        .filter_map(|id| ctx.tabs.work_workspace(id))
-        .collect()
-}
-
-fn workspace_required_error(candidates: &[TabRecord]) -> String {
-    let candidates: Vec<Value> = candidates
-        .iter()
-        .take(20)
-        .map(|tab| json!({ "id": tab.id, "name": tab.name }))
-        .collect();
-    format!(
-        "workspace_required: select one owned Work Workspace from {}",
-        Value::Array(candidates)
-    )
-}
-
-fn resolve_dispatch_workspace(
-    ctx: &ControlContext,
-    args: &Value,
-    captain: &CaptainRecord,
-) -> Result<TabRecord, String> {
-    let explicit_workspace =
-        arg_str(args, "workspaceTabId").or_else(|| arg_str(args, "workspace_tab_id"));
-    let compatibility_tab = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id"));
-    if explicit_workspace.is_some()
-        && compatibility_tab.is_some()
-        && explicit_workspace != compatibility_tab
-    {
-        return Err("dispatch_crew: workspaceTabId conflicts with tabId".into());
-    }
-    let requested_id = explicit_workspace.or(compatibility_tab);
-    let requested_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
-    if requested_id.is_some() && requested_name.is_some() {
-        return Err("dispatch_crew: select a Workspace by id or name, not both".into());
-    }
-    let candidates = dispatch_workspace_candidates(ctx, captain);
-    if let Some(id) = requested_id {
-        if id == CAPTAIN_WORKSPACE_ID {
-            return Err("dispatch_crew: Crew cannot be placed in Captain Workspace".into());
-        }
-        return candidates
-            .into_iter()
-            .find(|tab| tab.id == id)
-            .ok_or_else(|| {
-                format!(
-                    "dispatch_crew: Workspace '{id}' is not an existing Work Workspace owned by Captain '{}'",
-                    captain.ship_slug
-                )
-            });
-    }
-    if let Some(name) = requested_name {
-        let matching: Vec<TabRecord> = candidates
-            .into_iter()
-            .filter(|tab| tab.name == name)
-            .collect();
-        return match matching.as_slice() {
-            [only] => Ok(only.clone()),
-            [] => Err(format!(
-                "dispatch_crew: no owned Work Workspace is named '{name}'"
-            )),
-            _ => Err(workspace_required_error(&matching)),
-        };
-    }
-    match candidates.as_slice() {
-        [only] => Ok(only.clone()),
-        _ => Err(workspace_required_error(&candidates)),
-    }
-}
-
-
 fn validate_crew_checkout(
     project: &ProjectRecord,
     requested: Option<String>,
@@ -22415,7 +21863,6 @@ fn explicit_wsl_unc_distro(path: &str) -> Option<String> {
 }
 
 const CODEX_UNOBSERVED_COMMAND: &str = "t-hub-agent --codex-unobserved";
-const CREW_DORMANT_PANE_COMMAND: &str = "exec /bin/sleep 2147483647";
 
 fn crew_interactive_launch(
     harness: Harness,
@@ -22439,14 +21886,6 @@ fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
-/// A newly created tmux pane can transiently yield unreadable foreground-process
-/// evidence while its login shell is still completing startup.  The observer
-/// intentionally collapses several lookup failures into that one safe error, so
-/// this does not assert a more specific failing subcase.  Wait for a bounded
-/// stable baseline before attempting the provider launch, then retain the exact
-/// normal attestation checks for every subsequent observation.
-
-
 fn require_exact_args(args: &Value, command: &str, allowed: &[&str]) -> Result<(), String> {
     let object = args
         .as_object()
@@ -22456,7 +21895,6 @@ fn require_exact_args(args: &Value, command: &str, allowed: &[&str]) -> Result<(
     }
     Ok(())
 }
-
 
 /// Replay durable Fleet intents before the control listener accepts requests.
 /// External effects are idempotent, and each handler verifies the exact persisted
@@ -22500,7 +21938,6 @@ pub fn recover_pending_fleet_operations(ctx: &ControlContext) {
         }
     }
 }
-
 
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
 /// layout - the control-socket twin of the Tauri command of the same name (the
@@ -28252,7 +27689,6 @@ impl ControlContext {
             live_sessions: Arc::new(|| tmux::list_sessions().map_err(|error| error.to_string())),
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
-            dispatch_reservations: Arc::new(DispatchReservations::default()),
             dispatch_admission: Arc::new(Mutex::new(())),
             fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,

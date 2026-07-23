@@ -519,6 +519,7 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
     }
 }
 
+#[cfg(test)]
 fn parse_pane_generation(line: &str) -> Option<PaneGeneration> {
     let mut fields = line.trim().split('|');
     let parse_prefixed = |value: Option<&str>, prefix: char| {
@@ -548,6 +549,7 @@ fn parse_pane_generation(line: &str) -> Option<PaneGeneration> {
     })
 }
 
+#[cfg(test)]
 fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
     let output = run(
         "list-panes",
@@ -587,6 +589,7 @@ fn pane_generation(target: &str) -> Result<PaneGeneration, TmuxError> {
 /// intentionally not returned or logged.  The pre/post evidence proves the
 /// same session, window, and pane survived while the pane process generation
 /// changed.
+#[cfg(test)]
 pub(crate) fn respawn_pane_exact(
     target: &str,
     cwd: &str,
