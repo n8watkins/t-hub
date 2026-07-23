@@ -149,6 +149,44 @@ for raced_type in fifo symlink; do
   fi
 done
 
+for raced_type in fifo symlink; do
+  LATE_HOME="$WORK/late-source-$raced_type-race"
+  LATE_BIN="$LATE_HOME/t-hub-mcp"
+  LATE_PAUSE="$LATE_HOME/pause"
+  mkdir -p "$LATE_HOME" "$LATE_PAUSE"
+  cp "$FAKE_BIN" "$LATE_BIN"
+  printf 'model = "operator-model"\n' > "$LATE_HOME/config.toml"
+  late_config_before="$(sha256sum "$LATE_HOME/config.toml" | awk '{print $1}')"
+  timeout 15s env CODEX_HOME="$LATE_HOME" T_HUB_MCP_BIN="$LATE_BIN" \
+    T_HUB_ENSURE_LATE_SOURCE_PAUSE_DIR="$LATE_PAUSE" bash "$SCRIPT" \
+    >/dev/null 2>&1 &
+  late_pid=$!
+  late_wait=0
+  while [ ! -e "$LATE_PAUSE/discovered" ] && [ "$late_wait" -lt 1000 ]; do
+    sleep 0.01
+    late_wait=$((late_wait + 1))
+  done
+  mv "$LATE_BIN" "$LATE_BIN.original"
+  if [ "$raced_type" = fifo ]; then
+    mkfifo "$LATE_BIN"
+    chmod 700 "$LATE_BIN"
+  else
+    ln -s "$LATE_BIN.original" "$LATE_BIN"
+  fi
+  : > "$LATE_PAUSE/resume"
+  wait "$late_pid"
+  late_status=$?
+  if [ "$late_status" -ne 0 ] && [ "$late_status" -ne 124 ] \
+    && [ "$(sha256sum "$LATE_HOME/config.toml" | awk '{print $1}')" = "$late_config_before" ] \
+    && ! grep -q 'mcp_servers.t-hub' "$LATE_HOME/config.toml" \
+    && ! find "$LATE_HOME" -maxdepth 1 -name '.t-hub-mcp-probe.*' -print -quit \
+      | grep -q .; then
+    pass "late binary $raced_type swap fails fast before config mutation"
+  else
+    fail "late binary $raced_type swap blocked or changed config"
+  fi
+done
+
 HARDLINK_HOME="$WORK/hardlink-race"
 HARDLINK_BIN="$HARDLINK_HOME/t-hub-mcp"
 HARDLINK_SIBLING="$HARDLINK_HOME/t-hub-mcp-sibling"

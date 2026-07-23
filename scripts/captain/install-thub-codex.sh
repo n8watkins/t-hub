@@ -103,6 +103,9 @@ chmod 700 "$SOURCE_SNAPSHOT_DIR"
 SOURCE_SELECTION="$SOURCE_SNAPSHOT_DIR/selected"
 SOURCE_SNAPSHOT="$SOURCE_SNAPSHOT_DIR/t-hub-mcp"
 cleanup_source_snapshot() {
+  if [ -n "${SOURCE_INSTALLED:-}" ] && [ -f "$SOURCE_INSTALLED" ]; then
+    rm -f -- "$SOURCE_INSTALLED"
+  fi
   if [ -n "${SOURCE_SELECTION:-}" ] && [ -f "$SOURCE_SELECTION" ]; then
     rm -f -- "$SOURCE_SELECTION"
   fi
@@ -114,6 +117,7 @@ cleanup_source_snapshot() {
   fi
   SOURCE_SELECTION=
   SOURCE_SNAPSHOT=
+  SOURCE_INSTALLED=
   SOURCE_SNAPSHOT_DIR=
 }
 trap cleanup_source_snapshot EXIT
@@ -129,6 +133,12 @@ SOURCE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.path)"
 SOURCE_CANONICAL="$SOURCE"
 SOURCE_DEVICE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.device)"
 SOURCE_INODE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.inode)"
+SOURCE_UID="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.uid)"
+SOURCE_GID="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.gid)"
+SOURCE_MODE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.mode)"
+SOURCE_SIZE="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.size)"
+SOURCE_MTIME_NS="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.mtime_ns)"
+SOURCE_CTIME_NS="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.ctime_ns)"
 SOURCE_DIGEST="$(printf '%s' "$SOURCE_SELECTION_INFO" | jq -r .source.content_sha256)"
 if [ -n "${T_HUB_INSTALL_SOURCE_PAUSE_DIR:-}" ]; then
   printf 'selected\n' > "$T_HUB_INSTALL_SOURCE_PAUSE_DIR/discovered"
@@ -155,11 +165,17 @@ ACQUIRED_SOURCE_DEVICE="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.de
 ACQUIRED_SOURCE_INODE="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.inode)"
 ACQUIRED_SOURCE_DIGEST="$(printf '%s' "$SOURCE_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
 source_matches_selection() {
-  [ ! -L "$SOURCE" ] \
-    && [ "$(readlink -f "$SOURCE")" = "$SOURCE_CANONICAL" ] \
-    && [ "$(stat -Lc %d "$SOURCE")" = "$SOURCE_DEVICE" ] \
-    && [ "$(stat -Lc %i "$SOURCE")" = "$SOURCE_INODE" ] \
-    && [ "$(sha256sum "$SOURCE" | awk '{print $1}')" = "$SOURCE_DIGEST" ]
+  python3 "$ATOMIC_SOURCE" verify-executable \
+    --source "$SOURCE_CANONICAL" \
+    --expected-device "$SOURCE_DEVICE" \
+    --expected-inode "$SOURCE_INODE" \
+    --expected-uid "$SOURCE_UID" \
+    --expected-gid "$SOURCE_GID" \
+    --expected-mode "$SOURCE_MODE" \
+    --expected-size "$SOURCE_SIZE" \
+    --expected-mtime-ns "$SOURCE_MTIME_NS" \
+    --expected-ctime-ns "$SOURCE_CTIME_NS" \
+    --expected-digest "$SOURCE_DIGEST" >/dev/null
 }
 if [ "$ACQUIRED_SOURCE_DEVICE" != "$SOURCE_DEVICE" ] \
   || [ "$ACQUIRED_SOURCE_INODE" != "$SOURCE_INODE" ] \
@@ -217,6 +233,10 @@ integration_source_digest() {
 
 publish_manifest_status() {
   local status="$1"
+  if ! verify_installed_binary; then
+    echo "install-thub-codex: installed binary changed before manifest commit" >&2
+    return 1
+  fi
   manifest="$(jq --arg status "$status" '.status=$status' "$TXN/manifest.json")"
   python3 "$ATOMIC_SOURCE" publish --path "$TXN/manifest.json" --value "$manifest"
 }
@@ -586,20 +606,76 @@ rollback_on_exit() {
 }
 trap rollback_on_exit EXIT
 
+if [ -n "${T_HUB_INSTALL_LATE_SOURCE_PAUSE_DIR:-}" ]; then
+  printf 'selected\n' > "$T_HUB_INSTALL_LATE_SOURCE_PAUSE_DIR/discovered"
+  late_source_wait_count=0
+  while [ "$late_source_wait_count" -lt 1000 ]; do
+    [ ! -e "$T_HUB_INSTALL_LATE_SOURCE_PAUSE_DIR/resume" ] || break
+    sleep 0.01
+    late_source_wait_count=$((late_source_wait_count + 1))
+  done
+  if [ ! -e "$T_HUB_INSTALL_LATE_SOURCE_PAUSE_DIR/resume" ]; then
+    echo "install-thub-codex: timed out at the late source verification boundary" >&2
+    exit 1
+  fi
+fi
 if ! source_matches_selection; then
   echo "install-thub-codex: source binary changed before atomic installation" >&2
   exit 1
 fi
 install_file_stage "$SOURCE_SNAPSHOT" "$DEST" binary
-if [ "$(sha256sum "$DEST" | awk '{print $1}')" != "$SOURCE_DIGEST" ]; then
+if [ -n "${T_HUB_INSTALL_DEST_PAUSE_DIR:-}" ]; then
+  printf 'installed\n' > "$T_HUB_INSTALL_DEST_PAUSE_DIR/discovered"
+  destination_wait_count=0
+  while [ "$destination_wait_count" -lt 1000 ]; do
+    [ ! -e "$T_HUB_INSTALL_DEST_PAUSE_DIR/resume" ] || break
+    sleep 0.01
+    destination_wait_count=$((destination_wait_count + 1))
+  done
+  if [ ! -e "$T_HUB_INSTALL_DEST_PAUSE_DIR/resume" ]; then
+    echo "install-thub-codex: timed out at the installed binary verification boundary" >&2
+    exit 1
+  fi
+fi
+SOURCE_INSTALLED="$SOURCE_SNAPSHOT_DIR/installed"
+if ! INSTALLED_SNAPSHOT_INFO="$(
+  python3 "$ATOMIC_SOURCE" snapshot-executable \
+    --source "$DEST" \
+    --destination "$SOURCE_INSTALLED"
+)"; then
+  echo "install-thub-codex: failed to acquire the installed binary for verification" >&2
+  exit 1
+fi
+DEST_DEVICE="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.device)"
+DEST_INODE="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.inode)"
+DEST_UID="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.uid)"
+DEST_GID="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.gid)"
+DEST_MODE="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.mode)"
+DEST_SIZE="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.size)"
+DEST_MTIME_NS="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.mtime_ns)"
+DEST_CTIME_NS="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.ctime_ns)"
+DEST_DIGEST="$(printf '%s' "$INSTALLED_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
+if [ "$DEST_DIGEST" != "$SOURCE_DIGEST" ]; then
   echo "install-thub-codex: installed binary digest differs from the verified source snapshot" >&2
   exit 1
 fi
-if ! verify_cortana_catalog "$DEST"; then
+verify_installed_binary() {
+  python3 "$ATOMIC_SOURCE" verify-executable \
+    --source "$DEST" \
+    --expected-device "$DEST_DEVICE" \
+    --expected-inode "$DEST_INODE" \
+    --expected-uid "$DEST_UID" \
+    --expected-gid "$DEST_GID" \
+    --expected-mode "$DEST_MODE" \
+    --expected-size "$DEST_SIZE" \
+    --expected-mtime-ns "$DEST_MTIME_NS" \
+    --expected-ctime-ns "$DEST_CTIME_NS" \
+    --expected-digest "$DEST_DIGEST" >/dev/null
+}
+if ! verify_cortana_catalog "$SOURCE_INSTALLED"; then
   echo "install-thub-codex: installed binary lacks the exact cortana_bootstrap catalog contract: $DEST" >&2
   exit 1
 fi
-cleanup_source_snapshot
 install_file_stage "$HERE/ensure-thub-codex.sh" "$CAPTAIN_DIR/ensure-thub-codex.sh" codex-helper
 install_file_stage "$HERE/ensure-thub-claude.sh" "$CAPTAIN_DIR/ensure-thub-claude.sh" claude-helper
 install_file_stage "$HERE/atomic-config.py" "$CAPTAIN_DIR/atomic-config.py" atomic-helper
@@ -639,6 +715,7 @@ T_HUB_SKILL_TRANSACTION_DIR="$TXN/skills" \
 publish_manifest_status skills-applied
 if [ "${T_HUB_INSTALL_CRASH_AFTER_STAGE:-}" = skills ]; then kill -KILL "$$"; fi
 
+cleanup_source_snapshot
 trap - EXIT
 python3 "$ATOMIC_SOURCE" purge --path "$TXN"
 

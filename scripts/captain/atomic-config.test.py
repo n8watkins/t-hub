@@ -132,6 +132,62 @@ class AtomicConfigTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(destination.read_bytes(), b"known good\n")
 
+    def test_verify_executable_is_nonblocking_and_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            snapshot = root / "snapshot"
+            source.write_bytes(b"verified executable\n")
+            source.chmod(0o700)
+            selected = json.loads(
+                subprocess.check_output(
+                    [
+                        sys.executable,
+                        str(HELPER),
+                        "snapshot-executable",
+                        "--source",
+                        str(source),
+                        "--destination",
+                        str(snapshot),
+                    ],
+                    text=True,
+                )
+            )["source"]
+            snapshot.unlink()
+
+            command = [
+                sys.executable,
+                str(HELPER),
+                "verify-executable",
+                "--source",
+                str(source),
+            ]
+            for field, option in (
+                ("device", "--expected-device"),
+                ("inode", "--expected-inode"),
+                ("uid", "--expected-uid"),
+                ("gid", "--expected-gid"),
+                ("mode", "--expected-mode"),
+                ("size", "--expected-size"),
+                ("mtime_ns", "--expected-mtime-ns"),
+                ("ctime_ns", "--expected-ctime-ns"),
+                ("content_sha256", "--expected-digest"),
+            ):
+                command.extend((option, str(selected[field])))
+            subprocess.run(command, check=True)
+
+            original = root / "original"
+            source.rename(original)
+            for raced_type in ("fifo", "symlink"):
+                with self.subTest(raced_type=raced_type):
+                    if raced_type == "fifo":
+                        os.mkfifo(source, 0o700)
+                    else:
+                        source.symlink_to(original.name)
+                    result = subprocess.run(command, check=False, timeout=2)
+                    self.assertNotEqual(result.returncode, 0)
+                    source.unlink()
+
     def test_release_unlinks_running_executable_without_truncation(self) -> None:
         helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:

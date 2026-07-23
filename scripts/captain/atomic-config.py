@@ -193,8 +193,11 @@ def snapshot_executable(source: str, destination: str) -> Dict[str, Any]:
                 "device": source_before.st_dev,
                 "inode": source_before.st_ino,
                 "uid": source_before.st_uid,
+                "gid": source_before.st_gid,
                 "mode": source_mode,
                 "size": size,
+                "mtime_ns": source_before.st_mtime_ns,
+                "ctime_ns": source_before.st_ctime_ns,
                 "content_sha256": snapshot_digest,
             },
             "snapshot": {
@@ -222,6 +225,68 @@ def snapshot_executable(source: str, destination: str) -> Dict[str, Any]:
             os.close(destination_descriptor)
         if source_descriptor >= 0:
             os.close(source_descriptor)
+
+
+def verify_executable(source: str, expected: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify a mutable executable path through one bounded, no-follow FD."""
+    source = os.path.abspath(source)
+    descriptor = os.open(
+        source,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if not stat.S_ISREG(before.st_mode):
+            raise AtomicError(f"refusing non-regular executable: {source}")
+        if before.st_uid != os.geteuid():
+            raise AtomicError(f"executable must be owned by the current user: {source}")
+        if not mode & stat.S_IXUSR or mode & 0o7022:
+            raise AtomicError(f"executable mode is unsafe: {source}")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+        observed = {
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "uid": before.st_uid,
+            "gid": before.st_gid,
+            "mode": mode,
+            "size": size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "content_sha256": digest.hexdigest(),
+        }
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise AtomicError(f"executable changed while it was verified: {source}")
+        path_metadata = os.lstat(source)
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_dev != before.st_dev
+            or path_metadata.st_ino != before.st_ino
+        ):
+            raise AtomicError(f"executable path changed while it was verified: {source}")
+        if observed != expected:
+            raise AtomicError(f"executable no longer matches selected identity: {source}")
+        return {"path": source, **observed}
+    finally:
+        os.close(descriptor)
 
 
 def description(path: str) -> Dict[str, Any]:
@@ -1120,6 +1185,17 @@ def main() -> int:
     snapshot_parser = subparsers.add_parser("snapshot-executable")
     snapshot_parser.add_argument("--source", required=True)
     snapshot_parser.add_argument("--destination", required=True)
+    verify_parser = subparsers.add_parser("verify-executable")
+    verify_parser.add_argument("--source", required=True)
+    verify_parser.add_argument("--expected-device", type=int, required=True)
+    verify_parser.add_argument("--expected-inode", type=int, required=True)
+    verify_parser.add_argument("--expected-uid", type=int, required=True)
+    verify_parser.add_argument("--expected-gid", type=int, required=True)
+    verify_parser.add_argument("--expected-mode", type=int, required=True)
+    verify_parser.add_argument("--expected-size", type=int, required=True)
+    verify_parser.add_argument("--expected-mtime-ns", type=int, required=True)
+    verify_parser.add_argument("--expected-ctime-ns", type=int, required=True)
+    verify_parser.add_argument("--expected-digest", required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "exchange":
@@ -1189,6 +1265,19 @@ def main() -> int:
                     sort_keys=True,
                 )
             )
+        elif arguments.command == "verify-executable":
+            expected = {
+                "device": arguments.expected_device,
+                "inode": arguments.expected_inode,
+                "uid": arguments.expected_uid,
+                "gid": arguments.expected_gid,
+                "mode": arguments.expected_mode,
+                "size": arguments.expected_size,
+                "mtime_ns": arguments.expected_mtime_ns,
+                "ctime_ns": arguments.expected_ctime_ns,
+                "content_sha256": arguments.expected_digest,
+            }
+            print(json.dumps(verify_executable(arguments.source, expected), sort_keys=True))
         else:
             discard(arguments.path)
     except (OSError, AtomicError, ValueError, json.JSONDecodeError) as error:

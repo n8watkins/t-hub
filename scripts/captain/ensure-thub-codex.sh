@@ -110,6 +110,12 @@ BIN="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.path)"
 BIN_CANONICAL="$BIN"
 BIN_DEVICE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.device)"
 BIN_INODE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.inode)"
+BIN_UID="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.uid)"
+BIN_GID="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.gid)"
+BIN_MODE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.mode)"
+BIN_SIZE="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.size)"
+BIN_MTIME_NS="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.mtime_ns)"
+BIN_CTIME_NS="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.ctime_ns)"
 BIN_DIGEST="$(printf '%s' "$BIN_SELECTION_INFO" | jq -r .source.content_sha256)"
 if [ -n "${T_HUB_ENSURE_SOURCE_PAUSE_DIR:-}" ]; then
   printf 'selected\n' > "$T_HUB_ENSURE_SOURCE_PAUSE_DIR/discovered"
@@ -136,11 +142,17 @@ ACQUIRED_BIN_DEVICE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.device)"
 ACQUIRED_BIN_INODE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.inode)"
 ACQUIRED_BIN_DIGEST="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
 binary_matches_selection() {
-  [ ! -L "$BIN" ] \
-    && [ "$(readlink -f "$BIN")" = "$BIN_CANONICAL" ] \
-    && [ "$(stat -Lc %d "$BIN")" = "$BIN_DEVICE" ] \
-    && [ "$(stat -Lc %i "$BIN")" = "$BIN_INODE" ] \
-    && [ "$(sha256sum "$BIN" | awk '{print $1}')" = "$BIN_DIGEST" ]
+  python3 "$ATOMIC_HELPER" verify-executable \
+    --source "$BIN_CANONICAL" \
+    --expected-device "$BIN_DEVICE" \
+    --expected-inode "$BIN_INODE" \
+    --expected-uid "$BIN_UID" \
+    --expected-gid "$BIN_GID" \
+    --expected-mode "$BIN_MODE" \
+    --expected-size "$BIN_SIZE" \
+    --expected-mtime-ns "$BIN_MTIME_NS" \
+    --expected-ctime-ns "$BIN_CTIME_NS" \
+    --expected-digest "$BIN_DIGEST" >/dev/null
 }
 if [ "$ACQUIRED_BIN_DEVICE" != "$BIN_DEVICE" ] \
   || [ "$ACQUIRED_BIN_INODE" != "$BIN_INODE" ] \
@@ -154,12 +166,10 @@ if ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
   echo "ensure-thub-codex: t-hub MCP binary lacks the exact cortana_bootstrap catalog contract: $BIN" >&2
   exit 1
 fi
-if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+if ! binary_matches_selection || ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
   echo "ensure-thub-codex: installed binary changed after its verified catalog snapshot: $BIN" >&2
   exit 1
 fi
-cleanup_binary_snapshot
-trap - EXIT
 
 ENV_VARS_JSON='["T_HUB_CONTROL_FILE","T_HUB_SESSION_TOKEN"]'
 ENV_VARS_TOML='env_vars = ["T_HUB_CONTROL_FILE", "T_HUB_SESSION_TOKEN"]'
@@ -188,7 +198,7 @@ publish_before_state() {
   python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/codex-state.json" --value "$state"
 }
 publish_committed_state() {
-  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
     echo "ensure-thub-codex: installed binary changed before config commit" >&2
     return 1
   fi
@@ -208,7 +218,22 @@ refresh_expected_hash() {
   if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
 }
 begin_config_transaction() {
-  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+  if [ -n "${T_HUB_ENSURE_LATE_SOURCE_PAUSE_DIR:-}" ] \
+    && [ -z "${LATE_SOURCE_PAUSED:-}" ]; then
+    printf 'selected\n' > "$T_HUB_ENSURE_LATE_SOURCE_PAUSE_DIR/discovered"
+    late_wait_count=0
+    while [ "$late_wait_count" -lt 1000 ]; do
+      [ ! -e "$T_HUB_ENSURE_LATE_SOURCE_PAUSE_DIR/resume" ] || break
+      sleep 0.01
+      late_wait_count=$((late_wait_count + 1))
+    done
+    if [ ! -e "$T_HUB_ENSURE_LATE_SOURCE_PAUSE_DIR/resume" ]; then
+      echo "ensure-thub-codex: timed out at the late binary verification boundary" >&2
+      return 1
+    fi
+    LATE_SOURCE_PAUSED=true
+  fi
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
     echo "ensure-thub-codex: installed binary changed before config mutation" >&2
     return 1
   fi
@@ -218,7 +243,7 @@ begin_config_transaction() {
     cp -p "$CONFIG" "$BACKUP"
     EXPECTED_HASH="$(config_hash)"
   fi
-  trap rollback EXIT
+  trap rollback_and_cleanup EXIT
 }
 rollback() {
   current_hash=absent
@@ -238,13 +263,18 @@ rollback() {
   fi
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }
+rollback_and_cleanup() {
+  rollback
+  cleanup_binary_snapshot
+}
 commit_config_transaction() {
-  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN"; then
+  if ! binary_matches_selection || ! verify_cortana_catalog "$BIN_SNAPSHOT"; then
     echo "ensure-thub-codex: installed binary changed during config mutation" >&2
     return 1
   fi
   trap - EXIT
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
+  cleanup_binary_snapshot
 }
 
 # This exact under-lock boundary is durable before any registration command can

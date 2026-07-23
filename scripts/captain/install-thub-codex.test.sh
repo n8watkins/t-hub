@@ -179,6 +179,56 @@ for raced_type in fifo symlink; do
   fi
 done
 
+for raced_type in fifo symlink; do
+  LATE_WORK="$WORK/late-source-$raced_type-race"
+  LATE_HOME="$LATE_WORK/home"
+  LATE_CODEX="$LATE_WORK/codex"
+  LATE_CLAUDE="$LATE_WORK/claude"
+  LATE_BIN="$LATE_WORK/install/bin"
+  LATE_CAPTAIN="$LATE_WORK/install/captain"
+  LATE_SOURCE="$LATE_WORK/source-t-hub-mcp"
+  LATE_PAUSE="$LATE_WORK/pause"
+  mkdir -p "$LATE_HOME" "$LATE_CODEX" "$LATE_CLAUDE" "$LATE_BIN" \
+    "$LATE_CAPTAIN" "$LATE_PAUSE"
+  cp "$SOURCE" "$LATE_SOURCE"
+  printf 'known-good late binary\n' > "$LATE_BIN/t-hub-mcp"
+  chmod 700 "$LATE_BIN/t-hub-mcp"
+  printf 'operator config\n' > "$LATE_CODEX/config.toml"
+  late_binary_before="$(sha256sum "$LATE_BIN/t-hub-mcp" | awk '{print $1}')"
+  late_config_before="$(sha256sum "$LATE_CODEX/config.toml" | awk '{print $1}')"
+  timeout 15s env HOME="$LATE_HOME" CODEX_HOME="$LATE_CODEX" \
+    CLAUDE_HOME="$LATE_CLAUDE" T_HUB_MCP_SOURCE="$LATE_SOURCE" \
+    T_HUB_BIN_DIR="$LATE_BIN" T_HUB_CAPTAIN_DIR="$LATE_CAPTAIN" \
+    T_HUB_INSTALL_LATE_SOURCE_PAUSE_DIR="$LATE_PAUSE" bash "$SCRIPT" \
+    >/dev/null 2>&1 &
+  late_pid=$!
+  late_wait=0
+  while [ ! -e "$LATE_PAUSE/discovered" ] && [ "$late_wait" -lt 1000 ]; do
+    sleep 0.01
+    late_wait=$((late_wait + 1))
+  done
+  mv "$LATE_SOURCE" "$LATE_SOURCE.original"
+  if [ "$raced_type" = fifo ]; then
+    mkfifo "$LATE_SOURCE"
+    chmod 700 "$LATE_SOURCE"
+  else
+    ln -s "$LATE_SOURCE.original" "$LATE_SOURCE"
+  fi
+  : > "$LATE_PAUSE/resume"
+  wait "$late_pid"
+  late_status=$?
+  if [ "$late_status" -ne 0 ] && [ "$late_status" -ne 124 ] \
+    && [ "$(sha256sum "$LATE_BIN/t-hub-mcp" | awk '{print $1}')" = "$late_binary_before" ] \
+    && [ "$(sha256sum "$LATE_CODEX/config.toml" | awk '{print $1}')" = "$late_config_before" ] \
+    && [ ! -e "$LATE_HOME/.t-hub/transactions/install-current/manifest.json" ] \
+    && ! find "$LATE_HOME/.t-hub/transactions" -name '.source-snapshot.*' -print -quit \
+      | grep -q .; then
+    pass "late source $raced_type swap fails fast before install without state changes"
+  else
+    fail "late source $raced_type swap blocked or changed install state"
+  fi
+done
+
 HARDLINK_WORK="$WORK/source-hardlink-race"
 HARDLINK_HOME="$HARDLINK_WORK/home"
 HARDLINK_CODEX="$HARDLINK_WORK/codex"
