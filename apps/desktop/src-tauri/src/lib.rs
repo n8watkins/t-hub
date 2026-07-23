@@ -22,7 +22,8 @@ pub mod control; // MCP control listener: dispatches `{command,args}` over loopb
 mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 pub mod delegated_admin; // durable Ship Admin and Fleet Admin grants, scope, revocation, and audit attribution
-mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
+#[cfg(test)]
+mod devserver; // retired runner retained only for regression comparison tests
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
@@ -31,6 +32,8 @@ mod governor; // fleet spawn budget + rate limits for process-changing control c
 mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
 mod history; // provider-neutral conversation identity and transcript adapter foundation
+pub mod preview; // Package 3 provider-neutral Preview domain and runtime foundation
+mod preview_compat; // reachability helpers for the existing WebPreview UI
 mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere) // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
                  // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
@@ -266,6 +269,7 @@ fn report_workspace_tabs(
 fn start_control_listener(
     state: &AppState,
     app: &tauri::AppHandle,
+    preview_service: std::sync::Arc<preview::adapter::DesktopPreviewService>,
     fanout: std::sync::Arc<control::EventFanout>,
     tab_registry: std::sync::Arc<control::TabRegistry>,
     captains_registry: std::sync::Arc<control::CaptainsRegistry>,
@@ -355,6 +359,7 @@ fn start_control_listener(
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
         .with_metrics(metrics)
+        .with_preview_control(preview::adapter::control_handler(preview_service))
         // TASK C (#22): share the addressable tab registry with the control listener
         // so `list_tabs` reads what the `report_workspace_tabs` command writes.
         .with_tab_registry(tab_registry)
@@ -772,25 +777,9 @@ pub fn run() {
             // site that both owns the store and can supply the tmux predicate; the
             // store stays tmux-free + unit-testable.
             //
-            // Off the setup thread + ONE tmux probe (load-time fix): the old form
-            // called `session_liveness` (one `wsl.exe tmux has-session` subprocess)
-            // PER identity, SYNCHRONOUSLY on the setup path, so the window's first
-            // paint blocked proportional to how many dead tiles had accreted across
-            // restarts (the "takes forever to load" that got worse over time). We
-            // now snapshot every live session in a SINGLE `list_sessions()` call and
-            // test membership, and run the whole reconcile on a background thread so
-            // paint never waits on it. prune_dead is an atomic GC (persist-or-
-            // rollback), not a correctness gate, so a brief post-launch delay before
-            // it runs is harmless; a resolve that races it just sees the pre-prune
-            // (dead, unused) identity for a moment.
-            //
-            // De-conflation (spawn-wedge) preserved via list_sessions' OWN error
-            // contract: `Ok(names)` is a DEFINITIVE snapshot (an empty vec means no
-            // tmux server, i.e. every tile-bound session really is gone, the same as
-            // the per-tile `Gone`), while `Err` is INDETERMINATE (the probe timed
-            // out / failed to spawn), so we SKIP the prune entirely rather than
-            // retire live identities on an ambiguous read. A degraded control plane
-            // must never retire a live session's secret.
+            // Snapshot the identity generation before the asynchronous liveness
+            // read. The compare-and-prune step keeps identities minted or rebound
+            // while this background task is running.
             {
                 let prune_generation = identity_store.prune_generation();
                 let identity_store = identity_store.clone();
@@ -887,9 +876,29 @@ pub fn run() {
                     std::sync::Arc::new(move |uuid: &str, status| notifier.on_status(uuid, status));
                 state.agent.set_status_observer(observer);
             }
+            let preview_service =
+                preview::adapter::build(app.handle().clone(), state.agent.clone()).map_err(
+                    |error| {
+                        std::io::Error::other(format!(
+                            "durable Preview service could not be loaded safely: {error}"
+                        ))
+                    },
+                )?;
+            for result in preview_service.recover_incomplete().map_err(|error| {
+                std::io::Error::other(format!(
+                    "durable Preview recovery could not complete safely: {error}"
+                ))
+            })? {
+                eprintln!(
+                    "t-hub: recovered Preview request {} ({:?})",
+                    result.request_id, result.outcome
+                );
+            }
+            app.manage(preview_service.clone());
             if let Some(handshake) = start_control_listener(
                 &state,
                 app.handle(),
+                preview_service,
                 control_fanout,
                 tab_registry,
                 captains_registry,
@@ -973,6 +982,10 @@ pub fn run() {
             commands_05::uninstall_claude_hooks,
             commands_05::claude_hooks_installed,
             commands_05::claude_hooks_managed,
+            commands_05::install_codex_hooks,
+            commands_05::repair_codex_hooks,
+            commands_05::uninstall_codex_hooks,
+            commands_05::codex_hooks_health,
             // item-3 Pillar C: the blocking PreToolUse gate - a DISTINCT opt-in.
             commands_05::install_claude_gate,
             commands_05::uninstall_claude_gate,
@@ -996,19 +1009,15 @@ pub fn run() {
             git::git_worktree_add,
             git::git_worktree_remove,
             // ----------------------
-            // feat/dev-runner: managed per-project dev server (Dev tab). Self-
-            // contained (its own process-global registry; no .manage() needed).
-            // Streams output on `devserver://<terminal_id>`.
-            devserver::discover_run_targets,
-            devserver::start_dev_server,
-            devserver::stop_dev_server,
-            devserver::dev_server_snapshot,
+            // The Dev tab routes Preview lifecycle through the shared control
+            // service. Only the reachability compatibility helpers remain as
+            // direct Tauri commands.
             // feat/preview: WSL2 preview-reachability helpers. `preview_host`
             // returns the Windows-reachable host to substitute for a WSL
             // `localhost`; `probe_tcp` reports whether a host:port accepts a
-            // connection (precise preview errors). See devserver.rs.
-            devserver::preview_host,
-            devserver::probe_tcp,
+            // connection (precise preview errors). See preview_compat.rs.
+            preview_compat::preview_host,
+            preview_compat::probe_tcp,
             // Theming contract (MCP-facing): read/write the active theme + emit
             // theme://changed.
             theme::get_theme,
@@ -1053,6 +1062,10 @@ pub fn run() {
             // browser-Origin requests, so the webview never fetches it).
             voice::voice_settings_read,
             voice::voice_settings_write,
+            voice::voice_announcement_claim,
+            voice::voice_announcement_seed_boundary,
+            voice::voice_announcement_outcome,
+            voice::voice_announcement_recover,
             voice::voice_list_voices,
             voice::voice_tts,
             // Bounded /health probe (2s) per engine - the Settings dual-engine

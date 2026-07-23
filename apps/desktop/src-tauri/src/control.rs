@@ -11907,7 +11907,11 @@ fn serve_pty_attach(
     // the input loop below unblocks promptly whether the stream died because the
     // client vanished (sink error) or because the tmux session exited under a
     // still-connected client - without it, teardown waited on the client.
-    let sink = writer.try_clone()?;
+    let outbound = Arc::new(Mutex::new(writer.try_clone()?));
+    let sink = SharedPtyWriter {
+        outbound: outbound.clone(),
+        buffer: Vec::new(),
+    };
     let conn_for_stream_end = writer.try_clone()?;
     let on_stream_end: Box<dyn FnOnce() + Send> = Box::new(move || {
         let _ = conn_for_stream_end.shutdown(std::net::Shutdown::Both);
@@ -11933,7 +11937,7 @@ fn serve_pty_attach(
     // negotiated framing. Capture the result instead of `?` so teardown runs on
     // the error paths too (an abrupt RST mid-stream must still reap everything).
     let input_result = match framing {
-        pty::PtyFraming::V1Json => read_pty_input_v1(reader, &mut handle, cols, rows),
+        pty::PtyFraming::V1Json => read_pty_input_v1(reader, &mut handle, cols, rows, &outbound),
         pty::PtyFraming::V2Binary => read_pty_input_v2(reader, &mut handle),
     };
     // Deterministic teardown, same order on every path: shut the socket down
@@ -11943,6 +11947,32 @@ fn serve_pty_attach(
     let _ = writer.shutdown(std::net::Shutdown::Both);
     handle.detach();
     input_result
+}
+
+/// Serialize PTY output frames and probe acknowledgements onto one TCP byte
+/// stream. The output forwarder and input handler run concurrently, so sharing
+/// the writer prevents an acknowledgement from splitting an output frame.
+struct SharedPtyWriter {
+    outbound: Arc<Mutex<TcpStream>>,
+    buffer: Vec<u8>,
+}
+
+impl Write for SharedPtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY output writer lock poisoned"))?;
+        outbound.write_all(&self.buffer)?;
+        outbound.flush()?;
+        self.buffer.clear();
+        Ok(())
+    }
 }
 
 /// Emit an attach-time error in the negotiated framing: a v1 `{"ok":false,error}`
@@ -11970,6 +12000,7 @@ fn read_pty_input_v1(
     handle: &mut pty::PtyStreamHandle,
     cols: u16,
     rows: u16,
+    outbound: &Arc<Mutex<TcpStream>>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
     loop {
@@ -11981,7 +12012,12 @@ fn read_pty_input_v1(
             Ok(v) => v,
             Err(_) => continue, // skip a malformed frame rather than tearing down
         };
-        if let Some(b64) = frame.get("write").and_then(|v| v.as_str()) {
+        if let Some(probe) = frame.get("probe").and_then(|v| v.as_u64()) {
+            let mut writer = outbound
+                .lock()
+                .map_err(|_| std::io::Error::other("PTY output writer lock poisoned"))?;
+            write_json_line(&mut writer, &json!({ "probeAck": probe }))?;
+        } else if let Some(b64) = frame.get("write").and_then(|v| v.as_str()) {
             if let Ok(bytes) = STANDARD.decode(b64) {
                 let _ = handle.write(&bytes);
             }
@@ -33877,6 +33913,42 @@ impl ControlContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_output_and_probe_ack_frames_cannot_interleave() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let outbound = Arc::new(Mutex::new(server));
+        let mut sink = SharedPtyWriter {
+            outbound: outbound.clone(),
+            buffer: Vec::new(),
+        };
+
+        // Simulate the output producer constructing one frame through partial
+        // writes while the input path emits an acknowledgement in between.
+        sink.write_all(br#"{"out":"YW"#).unwrap();
+        {
+            let mut writer = outbound.lock().unwrap();
+            write_json_line(&mut writer, &json!({ "probeAck": 7 })).unwrap();
+        }
+        sink.write_all(b"Jj\"}\n").unwrap();
+        sink.flush().unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut first = String::new();
+        let mut second = String::new();
+        reader.read_line(&mut first).unwrap();
+        reader.read_line(&mut second).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap(),
+            json!({ "probeAck": 7 })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&second).unwrap(),
+            json!({ "out": "YWJj" })
+        );
+    }
     use std::sync::{mpsc, Mutex as StdMutex};
     use std::thread;
 

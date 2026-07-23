@@ -52,6 +52,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -78,6 +79,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the command returns a clear error instead of hanging. (Symmetric to the event
 /// fanout's subscriber write timeout in `control::EventFanout::register`.)
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct ProbeProgress {
+    acknowledged: u64,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct ProbeChannel {
+    progress: StdMutex<ProbeProgress>,
+    changed: Condvar,
+}
+
+impl ProbeChannel {
+    fn acknowledge(&self, nonce: u64) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.acknowledged = progress.acknowledged.max(nonce);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.closed = true;
+        self.changed.notify_all();
+    }
+}
 
 /// A live remote-PTY connection for one terminal tile. Holds the WRITE half of the
 /// socket (a `TcpStream` clone) for `write`/`resize`, plus the reader thread handle
@@ -92,6 +120,8 @@ pub struct RemotePty {
     writer: TcpStream,
     /// The reader thread, joined on detach/Drop so it never outlives us.
     reader: Option<JoinHandle<()>>,
+    probe_channel: Arc<ProbeChannel>,
+    next_probe: u64,
     /// Last known geometry, so `resize` can no-op an unchanged size (matching
     /// [`crate::pty::PtySession::resize`]): xterm's `fit` addon fires resize
     /// liberally and a redundant resize raises a spurious SIGWINCH some TUIs
@@ -189,9 +219,11 @@ impl RemotePty {
         // each {"out"}/{"exit"} frame into the webview via a cheap AppHandle clone.
         let app_for_thread = app.clone();
         let id_for_thread = id.to_string();
+        let probe_channel = Arc::new(ProbeChannel::default());
+        let probe_for_thread = probe_channel.clone();
         let handle = std::thread::Builder::new()
             .name(format!("t-hub-remote-pty-{id}"))
-            .spawn(move || reader_loop(app_for_thread, id_for_thread, reader))
+            .spawn(move || reader_loop(app_for_thread, id_for_thread, reader, probe_for_thread))
             .map_err(|e| format!("remote_pty: spawn reader thread failed: {e}"))?;
 
         Ok((
@@ -199,6 +231,8 @@ impl RemotePty {
                 id: id.to_string(),
                 writer,
                 reader: Some(handle),
+                probe_channel,
+                next_probe: 0,
                 cols,
                 rows,
             },
@@ -226,9 +260,9 @@ impl RemotePty {
     ///
     /// A reader-thread check alone has a check-to-use window, and `resize` cannot
     /// serve as the probe because unchanged geometry deliberately performs no I/O.
-    /// The v1 attach server ignores unknown well-formed frames, so this empty probe
-    /// has no PTY side effect while still forcing the socket to report a known
-    /// broken write path. `attach_terminal` checks the reader again after this.
+    /// The server echoes the nonce only after its attach input loop receives the
+    /// frame. A local write/flush is not sufficient evidence because TCP can accept
+    /// bytes briefly after the peer has closed.
     pub fn probe(&mut self) -> Result<(), String> {
         if !self.is_alive() {
             return Err(format!(
@@ -236,14 +270,38 @@ impl RemotePty {
                 self.id
             ));
         }
+        self.next_probe = self.next_probe.wrapping_add(1).max(1);
+        let nonce = self.next_probe;
+        let mut frame = serde_json::to_vec(&json!({ "probe": nonce }))
+            .map_err(|e| format!("remote_pty: serialize probe failed: {e}"))?;
+        frame.push(b'\n');
         self.writer
-            .write_all(b"{\"probe\":true}\n")
+            .write_all(&frame)
             .and_then(|()| self.writer.flush())
             .map_err(|e| format!("remote_pty: probe terminal {} failed: {e}", self.id))?;
-        std::thread::yield_now();
-        if !self.is_alive() {
+
+        let progress = self
+            .probe_channel
+            .progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (progress, timeout) = self
+            .probe_channel
+            .changed
+            .wait_timeout_while(progress, PROBE_TIMEOUT, |progress| {
+                progress.acknowledged < nonce && !progress.closed
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        if progress.closed || progress.acknowledged < nonce {
+            let reason = if progress.closed {
+                "reader stopped during probe"
+            } else if timeout.timed_out() {
+                "acknowledgement timed out"
+            } else {
+                "acknowledgement missing"
+            };
             return Err(format!(
-                "remote_pty: probe terminal {} failed: reader stopped during probe",
+                "remote_pty: probe terminal {} failed: {reason}",
                 self.id
             ));
         }
@@ -283,7 +341,7 @@ impl RemotePty {
     /// survives, like `close_terminal`), then join the reader thread. Shutting down
     /// `Both` makes the reader's blocking `read_line` return EOF, so the thread
     /// exits and the join can't hang. Mirrors [`crate::pty::PtySession::detach`].
-    pub fn detach(mut self) {
+    pub fn detach(&mut self) {
         self.shutdown_and_join();
     }
 
@@ -336,6 +394,7 @@ enum PtyFrame {
     Output(Vec<u8>),
     /// The process exited; `Option<i32>` is the exit code when known.
     Exit(Option<i32>),
+    ProbeAck(u64),
     /// A blank line, a malformed frame, or any other shape (e.g. a late
     /// `{"scrollback"}` or the server's idle `{"keepalive"}`) — skipped without
     /// tearing the stream down.
@@ -360,6 +419,8 @@ fn parse_pty_frame(line: &[u8]) -> PtyFrame {
         }
     } else if let Some(exit) = frame.get("exit") {
         PtyFrame::Exit(exit.as_i64().and_then(|c| i32::try_from(c).ok()))
+    } else if let Some(nonce) = frame.get("probeAck").and_then(|value| value.as_u64()) {
+        PtyFrame::ProbeAck(nonce)
     } else {
         PtyFrame::Ignore
     }
@@ -448,7 +509,12 @@ fn emit_stream_end(app: &AppHandle, id: &str, code: Option<i32>) {
 ///   - EOF (connection closed without an `{"exit"}`) → flush, then the same
 ///     verified transition with `code: None`, so a server/connection drop over a
 ///     LIVE session reads as an attach loss (Detached), not a false exit.
-fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
+fn reader_loop(
+    app: AppHandle,
+    id: String,
+    reader: BufReader<TcpStream>,
+    probe_channel: Arc<ProbeChannel>,
+) {
     // The handshake's BufReader may already hold bytes past the scrollback frame
     // (the first `out` frames can ride the same TCP segment). Drain that buffered
     // tail into our accumulator BEFORE switching to raw, timeout-toggled reads, so
@@ -479,6 +545,7 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
                     saw_exit = true;
                     break 'read;
                 }
+                PtyFrame::ProbeAck(nonce) => probe_channel.acknowledge(nonce),
                 PtyFrame::Ignore => {}
             }
         }
@@ -512,6 +579,7 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
     if !saw_exit {
         emit_stream_end(&app, &id, None);
     }
+    probe_channel.close();
 }
 
 /// App-wide registry of live remote-PTY connections, keyed by T-Hub id. Mirrors
@@ -521,12 +589,96 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
 /// socket op, so the `Mutex` is never held across I/O.
 #[derive(Default)]
 pub struct RemotePtyManager {
-    pub conns: Mutex<HashMap<String, RemotePty>>,
+    pub conns: Mutex<HashMap<String, Arc<Mutex<RemotePty>>>>,
+}
+
+impl RemotePtyManager {
+    pub fn cached(&self, id: &str) -> Option<Arc<Mutex<RemotePty>>> {
+        self.conns.lock().get(id).cloned()
+    }
+
+    pub fn with_current(
+        &self,
+        id: &str,
+        candidate: &Arc<Mutex<RemotePty>>,
+        on_current: impl FnOnce(),
+    ) -> bool {
+        let conns = self.conns.lock();
+        if conns
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        {
+            on_current();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_if_current(
+        &self,
+        id: &str,
+        candidate: &Arc<Mutex<RemotePty>>,
+    ) -> Option<Arc<Mutex<RemotePty>>> {
+        let mut conns = self.conns.lock();
+        if conns
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        {
+            conns.remove(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn install_if_absent(
+        &self,
+        id: String,
+        connection: RemotePty,
+        on_installed: impl FnOnce(),
+    ) -> Result<Arc<Mutex<RemotePty>>, RemotePty> {
+        use std::collections::hash_map::Entry;
+
+        let mut conns = self.conns.lock();
+        match conns.entry(id) {
+            Entry::Vacant(entry) => {
+                let connection = Arc::new(Mutex::new(connection));
+                entry.insert(connection.clone());
+                on_installed();
+                Ok(connection)
+            }
+            Entry::Occupied(_) => Err(connection),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    fn test_remote(
+        writer: TcpStream,
+        reader: JoinHandle<()>,
+        probe_channel: Arc<ProbeChannel>,
+    ) -> RemotePty {
+        RemotePty {
+            id: "test".into(),
+            writer,
+            reader: Some(reader),
+            probe_channel,
+            next_probe: 0,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn installed(result: Result<Arc<Mutex<RemotePty>>, RemotePty>) -> Arc<Mutex<RemotePty>> {
+        match result {
+            Ok(connection) => connection,
+            Err(_) => panic!("test connection unexpectedly lost compare-and-insert"),
+        }
+    }
 
     fn out_frame(bytes: &[u8]) -> Vec<u8> {
         format!("{{\"out\":\"{}\"}}", STANDARD.encode(bytes)).into_bytes()
@@ -549,6 +701,10 @@ mod tests {
         );
         // A null/absent exit code → Exit(None) (signalled / unknown).
         assert_eq!(parse_pty_frame(br#"{"exit":null}"#), PtyFrame::Exit(None));
+        assert_eq!(
+            parse_pty_frame(br#"{"probeAck":17}"#),
+            PtyFrame::ProbeAck(17)
+        );
     }
 
     #[test]
@@ -588,8 +744,6 @@ mod tests {
 
     #[test]
     fn probe_rejects_a_server_closed_transport() {
-        use std::net::TcpListener;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
@@ -611,13 +765,312 @@ mod tests {
         }
         assert!(reader.is_finished(), "reader did not observe server close");
 
-        let mut remote = RemotePty {
-            id: "closed".into(),
-            writer,
-            reader: Some(reader),
-            cols: 80,
-            rows: 24,
-        };
+        let mut remote = test_remote(writer, reader, Arc::new(ProbeChannel::default()));
         assert!(remote.probe().is_err());
+    }
+
+    #[test]
+    fn acknowledged_probe_roundtrip_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut input = BufReader::new(server.try_clone().unwrap());
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
+                .as_u64()
+                .unwrap();
+            write!(server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            server.flush().unwrap();
+            let mut tail = Vec::new();
+            input.read_to_end(&mut tail).unwrap();
+        });
+        let probe_channel = Arc::new(ProbeChannel::default());
+        let probe_for_reader = probe_channel.clone();
+        let reader = std::thread::spawn(move || {
+            let mut input = BufReader::new(reader_stream);
+            let mut line = String::new();
+            while input.read_line(&mut line).unwrap() > 0 {
+                if let PtyFrame::ProbeAck(nonce) = parse_pty_frame(line.trim_end().as_bytes()) {
+                    probe_for_reader.acknowledge(nonce);
+                }
+                line.clear();
+            }
+            probe_for_reader.close();
+        });
+        let mut remote = test_remote(writer, reader, probe_channel);
+
+        remote.probe().unwrap();
+        assert!(remote.is_alive());
+        remote.detach();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_probe_does_not_block_another_terminal_write() {
+        use std::sync::mpsc;
+
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_writer = TcpStream::connect(stalled_listener.local_addr().unwrap()).unwrap();
+        let stalled_reader_stream = stalled_writer.try_clone().unwrap();
+        let (mut stalled_server, _) = stalled_listener.accept().unwrap();
+        let (probe_seen_tx, probe_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let stalled_server_thread = std::thread::spawn(move || {
+            let mut input = BufReader::new(stalled_server.try_clone().unwrap());
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
+                .as_u64()
+                .unwrap();
+            probe_seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            write!(stalled_server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            stalled_server.flush().unwrap();
+            let mut tail = Vec::new();
+            input.read_to_end(&mut tail).unwrap();
+        });
+        let stalled_channel = Arc::new(ProbeChannel::default());
+        let stalled_channel_reader = stalled_channel.clone();
+        let stalled_reader = std::thread::spawn(move || {
+            let mut input = BufReader::new(stalled_reader_stream);
+            let mut line = String::new();
+            while input.read_line(&mut line).unwrap() > 0 {
+                if let PtyFrame::ProbeAck(nonce) = parse_pty_frame(line.trim_end().as_bytes()) {
+                    stalled_channel_reader.acknowledge(nonce);
+                }
+                line.clear();
+            }
+            stalled_channel_reader.close();
+        });
+
+        let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_writer = TcpStream::connect(other_listener.local_addr().unwrap()).unwrap();
+        let other_reader_stream = other_writer.try_clone().unwrap();
+        let (other_server, _) = other_listener.accept().unwrap();
+        let other_reader = std::thread::spawn(move || {
+            let mut reader = other_reader_stream;
+            let mut tail = Vec::new();
+            let _ = reader.read_to_end(&mut tail);
+        });
+
+        let manager = Arc::new(RemotePtyManager::default());
+        installed(manager.install_if_absent(
+            "stalled".into(),
+            test_remote(stalled_writer, stalled_reader, stalled_channel),
+            || {},
+        ));
+        installed(manager.install_if_absent(
+            "other".into(),
+            test_remote(
+                other_writer,
+                other_reader,
+                Arc::new(ProbeChannel::default()),
+            ),
+            || {},
+        ));
+
+        let probe_manager = manager.clone();
+        let probe =
+            std::thread::spawn(move || probe_manager.cached("stalled").unwrap().lock().probe());
+        probe_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = std::time::Instant::now();
+        manager
+            .cached("other")
+            .unwrap()
+            .lock()
+            .write(b"responsive")
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "another terminal write waited behind the stalled probe"
+        );
+
+        release_tx.send(()).unwrap();
+        probe.join().unwrap().unwrap();
+        for id in ["stalled", "other"] {
+            manager.conns.lock().remove(id).unwrap().lock().detach();
+        }
+        drop(other_server);
+        stalled_server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn ack_followed_by_reader_loss_is_evicted_before_replacement_is_installed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut input = BufReader::new(server.try_clone().unwrap());
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
+                .as_u64()
+                .unwrap();
+            write!(server, "{{\"probeAck\":{nonce}}}\n").unwrap();
+            server.flush().unwrap();
+            server.shutdown(Shutdown::Both).unwrap();
+        });
+        let probe_channel = Arc::new(ProbeChannel::default());
+        let probe_for_reader = probe_channel.clone();
+        let reader = std::thread::spawn(move || {
+            let mut input = BufReader::new(reader_stream);
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            let nonce = match parse_pty_frame(line.trim_end().as_bytes()) {
+                PtyFrame::ProbeAck(nonce) => nonce,
+                frame => panic!("expected probe ack, got {frame:?}"),
+            };
+            let mut tail = Vec::new();
+            input.read_to_end(&mut tail).unwrap();
+            // Coordinate the race: loss is recorded before the waiter may accept
+            // the acknowledgement.
+            probe_for_reader.close();
+            probe_for_reader.acknowledge(nonce);
+        });
+        let manager = RemotePtyManager::default();
+        let cached = installed(manager.install_if_absent(
+            "term".into(),
+            test_remote(writer, reader, probe_channel),
+            || {},
+        ));
+
+        assert!(cached.lock().probe().is_err());
+        let stale = manager
+            .remove_if_current("term", &cached)
+            .expect("failed generation must be evicted");
+        assert!(manager.cached("term").is_none());
+        stale.lock().detach();
+        server_thread.join().unwrap();
+
+        let replacement_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let replacement_writer =
+            TcpStream::connect(replacement_listener.local_addr().unwrap()).unwrap();
+        let (replacement_server, _) = replacement_listener.accept().unwrap();
+        let replacement_reader_stream = replacement_writer.try_clone().unwrap();
+        let replacement_reader = std::thread::spawn(move || {
+            let mut reader = replacement_reader_stream;
+            let mut tail = Vec::new();
+            let _ = reader.read_to_end(&mut tail);
+        });
+        let installed_live = std::sync::atomic::AtomicBool::new(false);
+        let replacement = installed(manager.install_if_absent(
+            "term".into(),
+            test_remote(
+                replacement_writer,
+                replacement_reader,
+                Arc::new(ProbeChannel::default()),
+            ),
+            || installed_live.store(true, std::sync::atomic::Ordering::SeqCst),
+        ));
+        assert!(installed_live.load(std::sync::atomic::Ordering::SeqCst));
+        let current = std::sync::atomic::AtomicBool::new(false);
+        assert!(manager.with_current("term", &replacement, || {
+            current.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        assert!(current.load(std::sync::atomic::Ordering::SeqCst));
+        replacement.lock().detach();
+        drop(replacement_server);
+    }
+
+    #[test]
+    fn close_cannot_order_detached_before_current_live_commit() {
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut reader = reader_stream;
+            let mut tail = Vec::new();
+            let _ = reader.read_to_end(&mut tail);
+        });
+        let manager = Arc::new(RemotePtyManager::default());
+        let candidate = installed(manager.install_if_absent(
+            "term".into(),
+            test_remote(writer, reader, Arc::new(ProbeChannel::default())),
+            || {},
+        ));
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let live_manager = manager.clone();
+        let live_candidate = candidate.clone();
+        let live_events = events.clone();
+        let live = std::thread::spawn(move || {
+            assert!(live_manager.with_current("term", &live_candidate, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                live_events.lock().unwrap().push("Live");
+            }));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let close_manager = manager.clone();
+        let close_candidate = candidate.clone();
+        let close_events = events.clone();
+        let close = std::thread::spawn(move || {
+            let removed = close_manager
+                .remove_if_current("term", &close_candidate)
+                .unwrap();
+            close_events.lock().unwrap().push("Detached");
+            removed
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(events.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        live.join().unwrap();
+        let removed = close.join().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["Live", "Detached"]);
+        removed.lock().detach();
+        drop(server);
+    }
+
+    #[test]
+    fn compare_and_insert_never_overwrites_a_concurrent_winner() {
+        fn connection() -> (RemotePty, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let reader_stream = writer.try_clone().unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut reader = reader_stream;
+                let mut tail = Vec::new();
+                let _ = reader.read_to_end(&mut tail);
+            });
+            (
+                test_remote(writer, reader, Arc::new(ProbeChannel::default())),
+                server,
+            )
+        }
+
+        let manager = RemotePtyManager::default();
+        let (winner_connection, winner_server) = connection();
+        let winner = installed(manager.install_if_absent("term".into(), winner_connection, || {}));
+        let (loser_connection, loser_server) = connection();
+        let loser_live = std::sync::atomic::AtomicBool::new(false);
+        let mut loser = match manager.install_if_absent("term".into(), loser_connection, || {
+            loser_live.store(true, std::sync::atomic::Ordering::SeqCst)
+        }) {
+            Ok(_) => panic!("loser overwrote the installed winner"),
+            Err(connection) => connection,
+        };
+        assert!(!loser_live.load(std::sync::atomic::Ordering::SeqCst));
+        let current = std::sync::atomic::AtomicBool::new(false);
+        assert!(manager.with_current("term", &winner, || {
+            current.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        assert!(current.load(std::sync::atomic::Ordering::SeqCst));
+
+        loser.detach();
+        manager.conns.lock().remove("term").unwrap().lock().detach();
+        drop(loser_server);
+        drop(winner_server);
     }
 }

@@ -463,8 +463,8 @@ pub async fn attach_terminal(
     // the old `has_live` branch, which returned empty scrollback). We hold the
     // manager lock only for the in-memory resize-frame write (a non-blocking socket
     // write of a tiny frame), never across a connect.
-    {
-        let mut conns = remote.conns.lock();
+    loop {
+        let cached = remote.cached(&id);
         // Only REUSE a cached connection whose reader thread is still running. A
         // dropped/rebound control server (the port rotates on `rebind_control`
         // self-heal) makes the reader hit EOF and exit, but the dead `RemotePty`
@@ -473,13 +473,16 @@ pub async fn attach_terminal(
         // scrollback, so the tile read "Live" while attached to nothing: frozen
         // until an app restart cleared the map. Purge the stale conn and fall
         // through to a fresh connect so the tile actually re-attaches.
-        let reusable = conns.get(&id).map(|conn| conn.is_alive()).unwrap_or(false);
-        if reusable {
-            if let Some(conn) = conns.get_mut(&id) {
+        if let Some(cached) = cached {
+            let reusable = cached.lock().is_alive();
+            let healthy = {
+                let mut conn = cached.lock();
                 let probe_ok = conn.probe().is_ok();
                 let resize_ok = probe_ok && conn.resize(cols, rows).is_ok();
-                if remote_reuse_is_healthy(reusable, probe_ok, resize_ok, conn.is_alive()) {
-                    drop(conns);
+                remote_reuse_is_healthy(reusable, probe_ok, resize_ok, conn.is_alive())
+            };
+            if healthy {
+                let emitted = remote.with_current(&id, &cached, || {
                     let _ = app.emit(
                         events::STATE,
                         &StateEvent {
@@ -487,50 +490,58 @@ pub async fn attach_terminal(
                             state: TerminalState::Live,
                         },
                     );
+                });
+                if emitted {
                     return Ok(String::new());
                 }
+                // Another attach/close replaced this generation while its probe
+                // was in flight. Evaluate the winner instead of overwriting it.
+                continue;
+            }
+            // Remove only the exact generation we probed. A concurrent close or
+            // reconnect may already have replaced it while the roundtrip waited.
+            let stale = remote.remove_if_current(&id, &cached);
+            if let Some(stale) = stale {
+                stale.lock().detach();
+            } else {
+                // A concurrent attach already replaced this generation.
+                continue;
             }
         }
-        // A stale (dead-reader) connection is present: detach it (joins the already-
-        // exited thread, best-effort shuts the dead socket) so the fresh connect
-        // below is the sole streamer for this id.
-        if let Some(stale) = conns.remove(&id) {
-            drop(conns);
-            stale.detach();
+
+        // First attach (or re-attach after `close_terminal` detached it): open a
+        // new RemotePty outside the global manager lock.
+        let endpoint = control_endpoint(&app)?;
+        let (conn, _compatibility_seed) =
+            match RemotePty::connect(&app, &endpoint.addr(), endpoint.token(), &id, cols, rows) {
+                Ok(x) => x,
+                Err(e) => match endpoint.refresh_addr() {
+                    Some(fresh) => {
+                        RemotePty::connect(&app, &fresh, endpoint.token(), &id, cols, rows)?
+                    }
+                    None => return Err(e),
+                },
+            };
+        match remote.install_if_absent(id.clone(), conn, || {
+            // Emit Live while the successful compare-and-insert still holds the
+            // map lock. A concurrent close therefore emits Detached afterward,
+            // never before a stale Live.
+            let _ = app.emit(
+                events::STATE,
+                &StateEvent {
+                    id: id.clone(),
+                    state: TerminalState::Live,
+                },
+            );
+        }) {
+            Ok(_) => return Ok(String::new()),
+            Err(mut losing_connection) => {
+                // A concurrent attach won. Detach this unused connection, then
+                // probe/reuse the installed winner rather than overwriting it.
+                losing_connection.detach();
+            }
         }
     }
-
-    // First attach (or re-attach after `close_terminal` detached it): open a new
-    // RemotePty over the control socket. `connect` performs the attach_pty
-    // handshake and returns the empty compatibility seed from its opening frame.
-    let endpoint = control_endpoint(&app)?;
-    let (conn, _compatibility_seed) =
-        match RemotePty::connect(&app, &endpoint.addr(), endpoint.token(), &id, cols, rows) {
-            Ok(x) => x,
-            // A local rebind may have rotated the listener port (relay-wedge
-            // self-heal). Re-read the fresh addr from control.json and retry the
-            // attach ONCE against it, keeping the (unchanged) token.
-            Err(e) => match endpoint.refresh_addr() {
-                Some(fresh) => RemotePty::connect(&app, &fresh, endpoint.token(), &id, cols, rows)?,
-                None => return Err(e),
-            },
-        };
-    remote.conns.lock().insert(id.clone(), conn);
-
-    // A successful attach binds a remote PTY to this session, so the terminal is
-    // unambiguously Live. After a reload the frontend may have seeded this terminal
-    // as Detached (no live conn at list time) or never seeded it; without this
-    // transition the tile would stay stuck on its initial dot (bug #16). Idempotent
-    // for a tile that was already Live.
-    let _ = app.emit(
-        events::STATE,
-        &StateEvent {
-            id: id.clone(),
-            state: TerminalState::Live,
-        },
-    );
-
-    Ok(String::new())
 }
 
 fn remote_reuse_is_healthy(
@@ -569,12 +580,17 @@ pub async fn write_terminal(
 ) -> Result<(), String> {
     // Write a `{"write"}` frame to the remote PTY. The lock is held only for the
     // small frame write (a non-blocking loopback send), never across a connect.
-    let mut conns = remote.conns.lock();
-    let conn = conns
-        .get_mut(&id)
+    let conn = remote
+        .conns
+        .lock()
+        .get(&id)
+        .cloned()
         .ok_or_else(|| format!("no live terminal {id}"))?;
-    conn.write(data.as_bytes())
-        .map_err(|e| format!("failed to write to terminal {id}: {e}"))
+    let result = conn
+        .lock()
+        .write(data.as_bytes())
+        .map_err(|e| format!("failed to write to terminal {id}: {e}"));
+    result
 }
 
 /// comms-plane Phase 1: the primary AUTOMATION-input path over the in-app write
@@ -597,12 +613,17 @@ pub async fn deliver_agent_input(
 ) -> Result<(), String> {
     let source = crate::plane::WriteSource::parse(&source)?;
     crate::plane::note_primary(source, &id, data.len());
-    let mut conns = remote.conns.lock();
-    let conn = conns
-        .get_mut(&id)
+    let conn = remote
+        .conns
+        .lock()
+        .get(&id)
+        .cloned()
         .ok_or_else(|| format!("no live terminal {id}"))?;
-    conn.write(data.as_bytes())
-        .map_err(|e| format!("failed to deliver agent input to terminal {id}: {e}"))
+    let result = conn
+        .lock()
+        .write(data.as_bytes())
+        .map_err(|e| format!("failed to deliver agent input to terminal {id}: {e}"));
+    result
 }
 
 #[tauri::command]
@@ -612,11 +633,14 @@ pub async fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut conns = remote.conns.lock();
-    let conn = conns
-        .get_mut(&id)
+    let conn = remote
+        .conns
+        .lock()
+        .get(&id)
+        .cloned()
         .ok_or_else(|| format!("no live terminal {id}"))?;
-    conn.resize(cols, rows)
+    let result = conn.lock().resize(cols, rows);
+    result
 }
 
 #[tauri::command]
@@ -635,7 +659,7 @@ pub async fn close_terminal(
     if let Some(conn) = conn {
         // Shuts down the socket (the server detaches; tmux survives) and joins the
         // reader thread.
-        conn.detach();
+        conn.lock().detach();
     }
     Ok(())
 }
@@ -709,7 +733,7 @@ pub async fn kill_terminal(
     // session also closes the server-side attach client, so the connection would
     // EOF on its own; detaching here makes the teardown prompt + deterministic.)
     if let Some(conn) = conn {
-        conn.detach();
+        conn.lock().detach();
     }
 
     kill_result
