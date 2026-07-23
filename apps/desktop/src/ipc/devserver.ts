@@ -1,26 +1,16 @@
-// Typed wrappers over the Dev-server IPC surface (feat/dev-runner).
+// Thin compatibility wrappers over the shared Preview control service.
 //
-// Preview runs one managed typed target per project, scoped to that
-// project's directory. These wrappers invoke the discovery and lifecycle commands and
-// `listen` on the per-terminal output channel. Kept separate from ./client (0.1
-// nucleus) and ./files so the dev-runner contract lives in one place. Mirrors
-// `src-tauri/src/devserver.rs` (its `DevServerEvent` uses `rename_all =
-// "camelCase"`); keep this in lockstep with that file.
+// Preview runs one managed typed target per durable Project or Fleet Workspace.
+// Lifecycle calls use the same control adapter as CLI and MCP. The direct Tauri
+// commands below are reachability-only helpers for the existing webview.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { controlRequest } from "./controlClient";
 import type { TerminalId } from "./types";
 
-/** Tauri command names for the managed dev runner (used with `invoke`). */
+/** Direct Tauri command names retained only for webview reachability. */
 export const CommandsDevServer = {
-  /** Discover typed package-script and static-site targets for a project. */
-  discoverRunTargets: "discover_run_targets",
-  /** Start (or restart) the selected typed target. */
-  startDevServer: "start_dev_server",
-  /** Stop one exact run, or the active run when omitted. */
-  stopDevServer: "stop_dev_server",
-  /** Read backend-authoritative lifecycle state. */
-  devServerSnapshot: "dev_server_snapshot",
   /** Host to substitute for a `localhost` preview URL (WSL2 fix). → string|null */
   previewHost: "preview_host",
   /** TCP-reachability probe for a host:port (precise preview errors). → bool */
@@ -37,28 +27,31 @@ export interface PackageScriptRunTarget {
   packageManager: PackageManager;
   commandDisplay: string;
   recommended: boolean;
+  discoveryFingerprint: string;
 }
 
 export interface StaticSiteRunTarget {
   kind: "staticSite";
-  id: "static-site:root";
-  entrypoint: "index.html";
-  relativeRoot: ".";
+  id: string;
+  entrypoint: string;
+  relativeRoot: string;
   label: string;
   commandDisplay: string;
   recommended: boolean;
+  discoveryFingerprint: string;
 }
 
 export type RunTarget = PackageScriptRunTarget | StaticSiteRunTarget;
 
 export interface PackageScriptTargetRef {
   kind: "packageScript";
-  script: string;
+  id: string;
+  script?: string;
 }
 
 export interface StaticSiteTargetRef {
   kind: "staticSite";
-  id: "static-site:root";
+  id: string;
 }
 
 export type RunTargetRef = PackageScriptTargetRef | StaticSiteTargetRef;
@@ -110,14 +103,197 @@ export interface DevServerEvent {
   line: string;
 }
 
-export function discoverRunTargets(cwd: string): Promise<RunTargetDiscovery> {
-  return invoke(CommandsDevServer.discoverRunTargets, { cwd });
+interface PreviewScope {
+  projectId: string;
+  workspaceId?: string;
 }
 
-export function devServerSnapshot(
+interface PreviewContext {
+  rootPath: string;
+  scope: PreviewScope;
+}
+
+interface PreviewTarget {
+  id: string;
+  label: string;
+  kind:
+    | { type: "packageScript"; packageManager: PackageManager; script: string }
+    | { type: "staticSite"; entrypoint: string };
+  relativeRoot: string;
+  recommended: boolean;
+}
+
+interface PreviewDiscovery {
+  discoveryFingerprint: string;
+  targets: PreviewTarget[];
+}
+
+interface PreviewStatus {
+  state: "starting" | "running" | "unreachable" | "stale" | "failed" | "stopped";
+  targetId?: string;
+  runId?: string;
+  previewUrl?: string;
+  reason?: string;
+  observedAtMs: number;
+}
+
+interface CaptainsSnapshot {
+  projects?: Array<{ projectId: string; rootPath?: string; repoRoot: string }>;
+  workspaces?: Array<{
+    id: string;
+    kind: "captain" | "work";
+    owner?: { projectId: string };
+    tileIds: string[];
+  }>;
+  captains?: Array<{
+    terminalId?: string;
+    projectId?: string;
+    crew?: Array<{ terminalId: string }>;
+  }>;
+}
+
+const targets = new Map<TerminalId, RunTarget[]>();
+
+async function previewContext(terminalId: TerminalId): Promise<PreviewContext> {
+  const snapshot = (await controlRequest("list_captains")) as CaptainsSnapshot;
+  const workspace = snapshot.workspaces?.find((candidate) =>
+    candidate.tileIds.includes(terminalId),
+  );
+  const captain = snapshot.captains?.find(
+    (candidate) =>
+      candidate.terminalId === terminalId ||
+      candidate.crew?.some((crew) => crew.terminalId === terminalId),
+  );
+  const projectId = workspace?.owner?.projectId ?? captain?.projectId;
+  if (!projectId) {
+    throw new Error("Preview requires a terminal owned by a registered Project");
+  }
+  const project = snapshot.projects?.find(
+    (candidate) => candidate.projectId === projectId,
+  );
+  if (!project) {
+    throw new Error(`Preview Project '${projectId}' is no longer registered`);
+  }
+  return {
+    rootPath: project.rootPath ?? project.repoRoot,
+    scope: {
+      projectId,
+      ...(workspace?.kind === "work" && workspace.owner?.projectId === projectId
+        ? { workspaceId: workspace.id }
+        : {}),
+    },
+  };
+}
+
+function legacyTarget(target: PreviewTarget, fingerprint: string): RunTarget {
+  if (target.kind.type === "packageScript") {
+    return {
+      kind: "packageScript",
+      id: target.id,
+      script: target.kind.script,
+      label: target.label,
+      packageManager: target.kind.packageManager,
+      commandDisplay: `${target.kind.packageManager} run ${target.kind.script}`,
+      recommended: target.recommended,
+      discoveryFingerprint: fingerprint,
+    };
+  }
+  return {
+    kind: "staticSite",
+    id: target.id,
+    entrypoint: target.kind.entrypoint,
+    relativeRoot: target.relativeRoot || ".",
+    label: target.label,
+    commandDisplay: "Static site",
+    recommended: target.recommended,
+    discoveryFingerprint: fingerprint,
+  };
+}
+
+export async function discoverRunTargets(
+  terminalId: TerminalId,
+  _cwd: string,
+): Promise<RunTargetDiscovery> {
+  const context = await previewContext(terminalId);
+  const discovery = (await controlRequest("preview_discover", {
+    rootPath: context.rootPath,
+  })) as PreviewDiscovery;
+  const discovered = discovery.targets.map((target) =>
+    legacyTarget(target, discovery.discoveryFingerprint),
+  );
+  targets.set(terminalId, discovered);
+  return {
+    state: discovered.length > 0 ? "ready" : "notFound",
+    targets: discovered,
+    message: discovered.length > 0 ? null : "No managed Preview targets found",
+  };
+}
+
+export async function devServerSnapshot(
   terminalId: TerminalId,
 ): Promise<DevServerSnapshot> {
-  return invoke(CommandsDevServer.devServerSnapshot, { terminalId });
+  const context = await previewContext(terminalId);
+  const status = (await controlRequest("preview_status", {
+    scope: context.scope,
+  })) as PreviewStatus;
+  return legacySnapshot(terminalId, status);
+}
+
+export async function selectPreviewTarget(
+  terminalId: TerminalId,
+  targetId: string,
+): Promise<DevServerSnapshot> {
+  const context = await previewContext(terminalId);
+  const target = targets
+    .get(terminalId)
+    ?.find((candidate) => candidate.id === targetId);
+  if (!target) throw new Error("Selected Preview target is stale");
+  const result = (await controlRequest("preview_select", {
+    rootPath: context.rootPath,
+    target: {
+      scope: context.scope,
+      targetId: target.id,
+      discoveryFingerprint: target.discoveryFingerprint,
+    },
+    requestId: requestId(),
+  })) as { status: PreviewStatus };
+  return legacySnapshot(terminalId, result.status);
+}
+
+export async function refreshPreview(
+  terminalId: TerminalId,
+): Promise<DevServerSnapshot> {
+  return scopedMutation(terminalId, "preview_refresh");
+}
+
+export async function openPreview(
+  terminalId: TerminalId,
+): Promise<DevServerSnapshot> {
+  return scopedMutation(terminalId, "preview_open");
+}
+
+export async function restartPreview(
+  terminalId: TerminalId,
+): Promise<DevServerSnapshot> {
+  const context = await previewContext(terminalId);
+  const result = (await controlRequest("preview_restart", {
+    rootPath: context.rootPath,
+    scope: context.scope,
+    requestId: requestId(),
+  })) as { status: PreviewStatus };
+  return legacySnapshot(terminalId, result.status);
+}
+
+async function scopedMutation(
+  terminalId: TerminalId,
+  command: "preview_refresh" | "preview_open",
+): Promise<DevServerSnapshot> {
+  const context = await previewContext(terminalId);
+  const result = (await controlRequest(command, {
+    scope: context.scope,
+    requestId: requestId(),
+  })) as { status: PreviewStatus };
+  return legacySnapshot(terminalId, result.status);
 }
 
 /**
@@ -139,15 +315,48 @@ export function startDevServer(
   cwd: string,
   target: RunTargetRef,
 ): Promise<DevServerSnapshot> {
-  return invoke(CommandsDevServer.startDevServer, { terminalId, cwd, target });
+  return startCanonical(terminalId, cwd, target);
+}
+
+async function startCanonical(
+  terminalId: TerminalId,
+  _cwd: string,
+  target: RunTargetRef,
+): Promise<DevServerSnapshot> {
+  const context = await previewContext(terminalId);
+  const selected = targets
+    .get(terminalId)
+    ?.find((candidate) =>
+      target.kind === "packageScript"
+        ? candidate.kind === target.kind && candidate.id === target.id
+        : candidate.kind === target.kind && candidate.id === target.id,
+    );
+  if (!selected) throw new Error("Selected Preview target is stale");
+  const result = (await controlRequest("preview_start", {
+    rootPath: context.rootPath,
+    scope: context.scope,
+    target: {
+      scope: context.scope,
+      targetId: selected.id,
+      discoveryFingerprint: selected.discoveryFingerprint,
+    },
+    requestId: requestId(),
+  })) as { status: PreviewStatus };
+  return legacySnapshot(terminalId, result.status);
 }
 
 /** Stop the managed dev server for `terminalId` without touching a replacement. */
-export function stopDevServer(
+export async function stopDevServer(
   terminalId: TerminalId,
   runId?: string | null,
 ): Promise<DevServerSnapshot> {
-  return invoke(CommandsDevServer.stopDevServer, { terminalId, runId });
+  const context = await previewContext(terminalId);
+  const result = (await controlRequest("preview_stop", {
+    scope: context.scope,
+    ...(runId ? { expectedRunId: runId } : {}),
+    requestId: requestId(),
+  })) as { status: PreviewStatus };
+  return legacySnapshot(terminalId, result.status);
 }
 
 /**
@@ -159,12 +368,43 @@ export function stopDevServer(
  * plain per-terminal `listen` is the right shape.
  */
 export function onDevServerEvent(
-  terminalId: TerminalId,
-  cb: (e: DevServerEvent) => void,
+  _terminalId: TerminalId,
+  _cb: (e: DevServerEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<DevServerEvent>(devServerChannel(terminalId), (ev) =>
-    cb(ev.payload),
+  return Promise.resolve(() => {});
+}
+
+function requestId(): string {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `preview-${Date.now()}-${Math.random().toString(16).slice(2)}`
   );
+}
+
+function legacySnapshot(
+  terminalId: TerminalId,
+  status: PreviewStatus,
+): DevServerSnapshot {
+  const target =
+    targets.get(terminalId)?.find((candidate) => candidate.id === status.targetId) ??
+    null;
+  const state: RunnerState =
+    status.state === "stopped"
+      ? "idle"
+      : status.state === "unreachable" || status.state === "stale"
+        ? "failed"
+        : status.state;
+  return {
+    terminalId,
+    runId: status.runId ?? null,
+    revision: status.observedAtMs,
+    state,
+    target,
+    exitCode: null,
+    reason: status.reason ?? null,
+    previewUrl: status.previewUrl ?? null,
+    observedAt: status.observedAtMs,
+  };
 }
 
 // ---------------------------------------------------------------------------

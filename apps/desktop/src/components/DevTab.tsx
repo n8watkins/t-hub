@@ -10,6 +10,7 @@ import {
   devServerSnapshot,
   discoverRunTargets,
   onDevServerEvent,
+  selectPreviewTarget,
   startDevServer,
   stopDevServer,
   type DevServerEvent,
@@ -252,7 +253,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       discoveryMessage: null,
     });
     void Promise.all([
-      discoverRunTargets(cwd),
+      discoverRunTargets(terminalId, cwd),
       devServerSnapshot(terminalId),
     ])
       .then(([discovery, authoritative]) => {
@@ -304,6 +305,18 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
     if (nearBottom) element.scrollTop = element.scrollHeight;
   }, [lines]);
 
+  useEffect(() => {
+    if (!["starting", "running", "stopping"].includes(snapshot.state)) return;
+    const timer = window.setInterval(() => {
+      void devServerSnapshot(terminalId)
+        .then((authoritative) => applySnapshot(terminalId, authoritative))
+        .catch(() => {
+          // The next poll or an explicit action will retry through control.
+        });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [snapshot.state, terminalId]);
+
   const selectedTarget = state.targets.find(
     (target) => target.id === state.selectedTargetId,
   );
@@ -330,7 +343,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
     usePanels.getState().setDevUrl(terminalId, null);
     const targetRef =
       target.kind === "packageScript"
-        ? { kind: target.kind, script: target.script }
+        ? { kind: target.kind, id: target.id, script: target.script }
         : { kind: target.kind, id: target.id };
     void startDevServer(terminalId, cwd, targetRef)
       .then((authoritative) => applySnapshot(terminalId, authoritative))
@@ -379,9 +392,18 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
         <select
           aria-label="Run target"
           value={state.selectedTargetId ?? ""}
-          onChange={(event) =>
-            update(terminalId, { selectedTargetId: event.target.value || null })
-          }
+          onChange={(event) => {
+            const targetId = event.target.value || null;
+            update(terminalId, { selectedTargetId: targetId });
+            if (targetId) {
+              void selectPreviewTarget(terminalId, targetId).catch((error) => {
+                appendLine(
+                  terminalId,
+                  `[t-hub] failed to save target selection: ${String(error)}`,
+                );
+              });
+            }
+          }}
           disabled={state.discoveryState !== "ready" || busy || state.targets.length === 0}
           className="min-w-0 flex-1 px-2.5 py-1.5 font-mono text-sm disabled:opacity-60"
           style={{

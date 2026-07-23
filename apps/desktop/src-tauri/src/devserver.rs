@@ -4,6 +4,7 @@
 //! a selected target again at start time, constructs executable arguments or a
 //! confined loopback server itself, and owns authoritative generation-safe
 //! lifecycle snapshots. Frontend-provided shell text is never executed.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::fs;
@@ -2020,7 +2021,6 @@ fn wsl_host_ip() -> Option<String> {
 ///
 /// On Windows this is the WSL interface IP. Cached for the process lifetime —
 /// the address is stable for a WSL session and the lookup spawns `wsl.exe`.
-#[tauri::command]
 pub async fn preview_host() -> Result<Option<String>, String> {
     #[cfg(windows)]
     {
@@ -2069,7 +2069,6 @@ fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> Result<bool, String>
 ///
 /// Returns `Ok(true)` if the TCP handshake succeeds, `Ok(false)` if it is
 /// refused or times out. A malformed `host`/`port` is an `Err`.
-#[tauri::command]
 pub async fn probe_tcp(host: String, port: u16, timeout_ms: u64) -> Result<bool, String> {
     tcp_reachable(&host, port, timeout_ms)
 }

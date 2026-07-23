@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   devServerSnapshot: vi.fn(),
   startDevServer: vi.fn(),
   stopDevServer: vi.fn(),
+  selectPreviewTarget: vi.fn(),
   onDevServerEvent: vi.fn(),
   eventHandlers: new Map<string, (event: DevServerEvent) => void>(),
 }));
@@ -22,6 +23,7 @@ vi.mock("../ipc/devserver", () => ({
   devServerSnapshot: mocks.devServerSnapshot,
   startDevServer: mocks.startDevServer,
   stopDevServer: mocks.stopDevServer,
+  selectPreviewTarget: mocks.selectPreviewTarget,
   onDevServerEvent: mocks.onDevServerEvent,
 }));
 
@@ -37,6 +39,7 @@ const discovery: RunTargetDiscovery = {
       packageManager: "pnpm",
       commandDisplay: "pnpm run dev",
       recommended: true,
+      discoveryFingerprint: "sha256:test",
     },
     {
       kind: "packageScript",
@@ -46,6 +49,7 @@ const discovery: RunTargetDiscovery = {
       packageManager: "pnpm",
       commandDisplay: "pnpm run preview",
       recommended: false,
+      discoveryFingerprint: "sha256:test",
     },
   ],
 };
@@ -118,6 +122,7 @@ describe("DevTab", () => {
     await waitFor(() =>
       expect(mocks.startDevServer).toHaveBeenCalledWith("typed", "/repo", {
         kind: "packageScript",
+        id: "package-script:dev",
         script: "dev",
       }),
     );
@@ -133,6 +138,7 @@ describe("DevTab", () => {
       label: "Static site",
       commandDisplay: "Serve ./index.html",
       recommended: true,
+      discoveryFingerprint: "sha256:test",
     };
     mocks.discoverRunTargets.mockResolvedValueOnce({
       state: "ready",
@@ -171,6 +177,7 @@ describe("DevTab", () => {
       label: "Static site",
       commandDisplay: "Serve ./index.html",
       recommended: true,
+      discoveryFingerprint: "sha256:test",
     };
     mocks.discoverRunTargets.mockResolvedValueOnce({
       state: "ready",

@@ -143,6 +143,7 @@ fn serialize(value: impl serde::Serialize) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn control_handler_retains_the_exact_shared_service_arc() {
@@ -159,5 +160,114 @@ mod tests {
         assert_eq!(weak.strong_count(), 1);
         drop(handler);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn source_adapter_runs_the_complete_lifecycle_through_one_service() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            serde_json::to_vec(&json!({
+                "scripts": {
+                    "dev": "node -e \"const h=require('http').createServer((q,s)=>s.end('ok'));h.listen(0,'0.0.0.0',()=>console.log('http://127.0.0.1:'+h.address().port+'/'))\""
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let profiles =
+            Arc::new(PreviewProfileStore::open(root.path().join("preview-profiles.json")).unwrap());
+        let service = PreviewService::new(ManagedPreviewRuntime::for_test(), profiles);
+        let authority = PreviewRootAuthority {
+            posix_identity: root.path().to_string_lossy().into_owned(),
+            host_open_path: root.path().to_path_buf(),
+        };
+        let scope = json!({ "projectId": "project-adapter" });
+        let discovery = dispatch(
+            &service,
+            "preview_discover",
+            &json!({ "rootPath": authority.posix_identity }),
+            &authority,
+        )
+        .unwrap();
+        let target_id = discovery["targets"][0]["id"].clone();
+        let target = json!({
+            "scope": scope,
+            "targetId": target_id,
+            "discoveryFingerprint": discovery["discoveryFingerprint"],
+        });
+        dispatch(
+            &service,
+            "preview_select",
+            &json!({
+                "rootPath": authority.posix_identity,
+                "target": target,
+                "requestId": "adapter-select-1",
+            }),
+            &authority,
+        )
+        .unwrap();
+        let started = dispatch(
+            &service,
+            "preview_start",
+            &json!({
+                "rootPath": authority.posix_identity,
+                "scope": scope,
+                "target": target,
+                "requestId": "adapter-start-1",
+            }),
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(started["status"]["state"], "running");
+        assert!(started["status"]["previewUrl"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+        assert_eq!(
+            dispatch(
+                &service,
+                "preview_status",
+                &json!({ "scope": scope }),
+                &authority,
+            )
+            .unwrap()["state"],
+            "running"
+        );
+        for (command, request_id) in [
+            ("preview_refresh", "adapter-refresh-1"),
+            ("preview_open", "adapter-open-1"),
+        ] {
+            dispatch(
+                &service,
+                command,
+                &json!({ "scope": scope, "requestId": request_id }),
+                &authority,
+            )
+            .unwrap();
+        }
+        let restarted = dispatch(
+            &service,
+            "preview_restart",
+            &json!({
+                "rootPath": authority.posix_identity,
+                "scope": scope,
+                "requestId": "adapter-restart-1",
+            }),
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(restarted["status"]["state"], "running");
+        let stopped = dispatch(
+            &service,
+            "preview_stop",
+            &json!({
+                "scope": scope,
+                "expectedRunId": restarted["status"]["runId"],
+                "requestId": "adapter-stop-1",
+            }),
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(stopped["status"]["state"], "stopped");
     }
 }

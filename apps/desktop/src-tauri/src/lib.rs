@@ -22,7 +22,8 @@ pub mod control; // MCP control listener: dispatches `{command,args}` over loopb
 mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 pub mod delegated_admin; // durable Ship Admin and Fleet Admin grants, scope, revocation, and audit attribution
-mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
+#[cfg(test)]
+mod devserver; // retired runner retained only for regression comparison tests
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
@@ -32,6 +33,7 @@ mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost 
 mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
 mod history; // provider-neutral conversation identity and transcript adapter foundation
 pub mod preview; // Package 3 provider-neutral Preview domain and runtime foundation
+mod preview_compat; // reachability helpers for the existing WebPreview UI
 mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere) // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
                  // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
@@ -561,10 +563,6 @@ pub fn brand_name() -> &'static str {
     }
 }
 
-pub fn run_preview_static_helper(args: &[String]) -> Option<i32> {
-    devserver::run_preview_static_helper(args)
-}
-
 pub fn run() {
     // Must run before any `T_HUB_*`-backed LazyLock (socket/control/diag) is
     // first touched — i.e. before the Tauri builder spawns anything.
@@ -992,19 +990,15 @@ pub fn run() {
             git::git_worktree_add,
             git::git_worktree_remove,
             // ----------------------
-            // feat/dev-runner: managed per-project dev server (Dev tab). Self-
-            // contained (its own process-global registry; no .manage() needed).
-            // Streams output on `devserver://<terminal_id>`.
-            devserver::discover_run_targets,
-            devserver::start_dev_server,
-            devserver::stop_dev_server,
-            devserver::dev_server_snapshot,
+            // The Dev tab routes Preview lifecycle through the shared control
+            // service. Only the reachability compatibility helpers remain as
+            // direct Tauri commands.
             // feat/preview: WSL2 preview-reachability helpers. `preview_host`
             // returns the Windows-reachable host to substitute for a WSL
             // `localhost`; `probe_tcp` reports whether a host:port accepts a
-            // connection (precise preview errors). See devserver.rs.
-            devserver::preview_host,
-            devserver::probe_tcp,
+            // connection (precise preview errors). See preview_compat.rs.
+            preview_compat::preview_host,
+            preview_compat::probe_tcp,
             // Theming contract (MCP-facing): read/write the active theme + emit
             // theme://changed.
             theme::get_theme,
