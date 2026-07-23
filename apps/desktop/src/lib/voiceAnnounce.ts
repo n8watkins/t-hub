@@ -13,15 +13,10 @@
 // Raw reducer statuses on purpose (not displayStatus): rateLimited is an
 // overlay on a WORKING session, not a needs-input state, so it must not talk.
 //
-// SCRIBE VOICE-GATE: the general dictates with Scribe. A ~250ms poll of the
-// scribe_status command maintains a cached `listening` boolean (the hot path
-// never blocks on IPC). While the general is talking, an announcement that
-// would fire is HELD in a single pending slot (coalesced to the latest, no
-// backlog) instead of spoken. When they stop, after a short tail delay we
-// re-scan for anything still blocked and deliver the held cue (or drop it if
-// the situation resolved while they talked). Fail-open: the backend returns
-// listening=false whenever it can't tell, so a missing/dead Scribe never
-// silences T-Hub.
+// SCRIBE VOICE-GATE: Scribe events update the cached `listening` boolean when
+// the event bridge is available. Until the first event arrives, a bounded
+// one-second status fallback keeps older Scribe builds safe. The existing
+// hold, tail, coalescing, and fail-open semantics remain unchanged.
 import { useSupervision } from "../store/supervision";
 import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useWorkspace, tabIdForTerminal } from "../store/workspace";
@@ -33,7 +28,7 @@ import {
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
 import { onJournal } from "../ipc/client05";
-import { scribeStatus } from "../ipc/scribe";
+import { onScribeStatus, scribeStatus } from "../ipc/scribe";
 import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import { notify } from "./notify";
 import { useEngineRuntime } from "../store/engineRuntime";
@@ -54,8 +49,8 @@ export const ANNOUNCE_MIN_GAP_MS = 5000;
  *  window is enough to break the silence without becoming its own nuisance. */
 export const FALLBACK_ALERT_MIN_GAP_MS = 60000;
 
-/** How often to poll the Scribe voice-gate status (cheap loopback file read). */
-export const SCRIBE_POLL_MS = 250;
+/** Compatibility fallback interval until Scribe emits its first event. */
+export const SCRIBE_POLL_MS = 1000;
 
 /** After the general STOPS dictating, wait this long before delivering a held
  *  announcement - a brief pause between phrases should not trigger delivery
@@ -119,6 +114,7 @@ let pending: PendingAnnouncement | null = null;
 let journalProcessing: Promise<void> = Promise.resolve();
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
+let scribeEventUnlisten: (() => void) | null = null;
 /** Incremented whenever the poller starts or stops.
  * Results from an older generation are ignored after a settings transition. */
 let pollGeneration = 0;
@@ -624,6 +620,8 @@ function stopScribePoll(): void {
     clearInterval(pollTimer);
     pollTimer = null;
   }
+  scribeEventUnlisten?.();
+  scribeEventUnlisten = null;
   scribeListening = false;
   scribeStatusKnown = false;
   if (pending?.attemptId) {
@@ -641,16 +639,35 @@ function stopScribePoll(): void {
   }
 }
 
-/** Arm the ~250ms Scribe voice-gate poll.
- * Each tick reads the cached listening state off the loopback command and feeds the edge machine.
- * An IPC failure fails open (listening=false), and a slow read never stacks overlapping ticks. */
+/** Arm the event-first Scribe voice gate.
+ * The one-shot status read establishes a safe initial state, then the
+ * `scribe://status` event stream owns updates when available. Older Scribe
+ * builds that do not emit an event retain a bounded one-second fallback.
+ * An IPC failure fails open and a slow read never stacks overlapping ticks. */
 function armScribePoll(): void {
   if (pollTimer) return;
   const generation = ++pollGeneration;
   scribeStatusKnown = false;
   scribeListening = false;
   let polling = false;
+  let eventSeen = false;
+  void onScribeStatus((s) => {
+    if (generation !== pollGeneration) return;
+    eventSeen = true;
+    applyScribeListening(!!s.listening, Date.now());
+  })
+    .then((unlisten) => {
+      if (generation !== pollGeneration) {
+        unlisten();
+        return;
+      }
+      scribeEventUnlisten = unlisten;
+    })
+    .catch(() => {
+      // The one-second fallback remains active for older/non-Tauri Scribe.
+    });
   const tick = () => {
+    if (eventSeen) return;
     if (polling) return;
     polling = true;
     void scribeStatus()

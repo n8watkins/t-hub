@@ -13,9 +13,9 @@
 // is NEVER cached: every call re-reads control.json and re-connects, so a
 // restarted Scribe (new port + token) is picked up immediately and a stale
 // cached address can never wedge the gate (the same lesson as t-hub's own
-// control.json). scribe_status is a per-request pull polled at ~250ms, so a
-// plain GET per call is the right shape; the SSE stream (/v1/events) would
-// only add connection state without making the gate faster. The v1 snapshot is
+// control.json). scribe_status remains the bounded compatibility pull for
+// older clients. The frontend prefers Scribe's event bridge and uses this
+// snapshot only for initial state and fallback. The v1 snapshot is
 // held to the same 15s `updatedAt` TTL as the fallback (below): a
 // wedged-but-serving Scribe frozen on `busy:true` must not hold voice forever
 // - stronger than contract s7.1's intrinsic-liveness, per the fail-open
@@ -73,8 +73,8 @@ const SCRIBE_CONTROL_DEV: &str = "control.dev.json";
 const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 
 /// HTTP budget for the loopback GET /v1/status. Tight on purpose: the endpoint
-/// is 127.0.0.1-only and voiceAnnounce polls this whole gate at ~250ms, so a
-/// hung server must resolve to fail-open quickly, not park the poll.
+/// is 127.0.0.1-only and the compatibility fallback is bounded at one second,
+/// so a hung server must resolve to fail-open quickly, not park the fallback.
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
 
@@ -464,7 +464,7 @@ pub fn read_scribe_status() -> ScribeStatus {
 
     // Resolve prod + dev CONCURRENTLY. Each flavor's v1 GET can park up to the
     // HTTP timeout, so a sequential resolve would sum them (~1.5s worst case)
-    // against the ~250ms poll; two scoped threads bound the wait to a single
+    // against the bounded fallback; two scoped threads bound the wait to a single
     // flavor's timeout. The intermediate collect() starts BOTH threads before
     // either is joined (a lazy map+filter_map would spawn-then-join serially).
     // Order is preserved (prod first) so combine_candidates keeps its

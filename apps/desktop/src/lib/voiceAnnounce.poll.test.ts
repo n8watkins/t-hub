@@ -13,9 +13,10 @@ vi.mock("./voiceAudio", () => ({ playWavBase64: vi.fn() }));
 
 vi.mock("../ipc/scribe", () => ({
   scribeStatus: vi.fn(() => Promise.resolve({ listening: false })),
+  onScribeStatus: vi.fn(() => Promise.resolve(() => {})),
 }));
 
-import { scribeStatus } from "../ipc/scribe";
+import { onScribeStatus, scribeStatus } from "../ipc/scribe";
 import { synthesizeVoice } from "../ipc/voice";
 import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useSupervision } from "../store/supervision";
@@ -33,6 +34,8 @@ beforeEach(() => {
   _resetVoiceAnnounceForTest();
   vi.mocked(scribeStatus).mockReset();
   vi.mocked(scribeStatus).mockResolvedValue({ listening: false });
+  vi.mocked(onScribeStatus).mockReset();
+  vi.mocked(onScribeStatus).mockImplementation(() => Promise.resolve(() => {}));
   vi.mocked(synthesizeVoice).mockClear();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
@@ -42,6 +45,27 @@ beforeEach(() => {
 });
 
 describe("Scribe poll lifecycle", () => {
+  it("switches to event-driven updates after the first Scribe event", async () => {
+    let emit: ((status: { listening: boolean }) => void) | undefined;
+    vi.mocked(onScribeStatus).mockImplementation(
+      (callback) => {
+        emit = callback;
+        return Promise.resolve(() => {});
+      },
+    );
+    startScribePoll();
+    useVoice.setState({
+      enabled: true,
+      announceOnAttention: true,
+      announcementPolicy: { permission: true, question: true, completion: false, failure: false },
+    });
+    await Promise.resolve();
+    expect(scribeStatus).toHaveBeenCalledTimes(1);
+    emit?.({ listening: true });
+    await vi.advanceTimersByTimeAsync(SCRIBE_POLL_MS * 3);
+    expect(scribeStatus).toHaveBeenCalledTimes(1);
+  });
+
   it("does not call Scribe while voice announcements are disabled", async () => {
     startScribePoll();
 

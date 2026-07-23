@@ -4,6 +4,7 @@
 // with Scribe's status.json file as the fallback transport. Its own module
 // (not ipc/voice) so the voiceAnnounce gate has one mockable seam.
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** The Scribe voice-gate status. `listening` is the COMPUTED effective value,
  *  sourced from Scribe's level-triggered `busy` flag (fail-open: false
@@ -23,4 +24,14 @@ export interface ScribeStatus {
  *  itself always resolves (fail-open) rather than erroring on a bad source. */
 export function scribeStatus(): Promise<ScribeStatus> {
   return invoke("scribe_status");
+}
+
+/** Subscribe to Scribe's event-driven dictation state when the Scribe build
+ * exposes its Tauri event bridge. The voice gate keeps a bounded one-second
+ * fallback poll until the first event arrives, so older Scribe builds retain
+ * the previous fail-open semantics without a sustained 250 ms loop. */
+export function onScribeStatus(
+  callback: (status: ScribeStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<ScribeStatus>("scribe://status", (event) => callback(event.payload));
 }
