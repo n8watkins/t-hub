@@ -104,11 +104,6 @@ impl PreviewRuntime for ManagedPreviewRuntime {
         target_ref: &PreviewTargetRef,
         run_id: &str,
     ) -> Result<ManagedPreviewProcess, String> {
-        if !matches!(target.kind, PreviewTargetKind::PackageScript { .. }) {
-            return Err(
-                "static Preview targets are not available through the managed runtime".into(),
-            );
-        }
         {
             let mut admission = self.admission.lock();
             let runs = self.runs.lock();
@@ -124,7 +119,14 @@ impl PreviewRuntime for ManagedPreviewRuntime {
             admission.targets.insert(target_ref.clone());
         }
         let spawned = (|| {
-            let prepared = managed_runner::typed_package_command(canonical_root, target, run_id)?;
+            let prepared = match target.kind {
+                PreviewTargetKind::PackageScript { .. } => {
+                    managed_runner::typed_package_command(canonical_root, target, run_id)?
+                }
+                PreviewTargetKind::StaticSite { .. } => {
+                    managed_runner::typed_static_command(canonical_root, target, run_id)?
+                }
+            };
             prepared.spawn_authenticated(AUTHENTICATION_TIMEOUT)
         })();
         let child = match spawned {
@@ -663,5 +665,58 @@ mod tests {
         );
         assert!(parse_http_socket("https://127.0.0.1:43191/").is_none());
         assert!(parse_http_socket("http://localhost:43191/").is_none());
+    }
+
+    #[test]
+    fn static_target_runs_under_the_same_supervisor_and_resolves_its_owned_endpoint() {
+        let runtime = ManagedPreviewRuntime::for_test();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.html"), "STATIC RUNTIME SENTINEL").unwrap();
+        let scope = PreviewScope::new("project-static", None).unwrap();
+        let target = PreviewTarget {
+            id: PreviewTargetId::parse("static:root").unwrap(),
+            label: "Static".into(),
+            source: PreviewTargetSource::Config,
+            relative_root: String::new(),
+            kind: PreviewTargetKind::StaticSite {
+                entrypoint: "index.html".into(),
+            },
+            recommended: true,
+        };
+        let target_ref = PreviewTargetRef {
+            scope: scope.clone(),
+            target_id: target.id.clone(),
+            discovery_fingerprint: "sha256:static-runtime".into(),
+        };
+        let process = runtime
+            .spawn(
+                &scope,
+                root.path(),
+                &target,
+                &target_ref,
+                "runtime-static-1",
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let endpoint = loop {
+            let RuntimeObservation::Running { output } = runtime.observe(&process).unwrap() else {
+                panic!("static Preview helper exited before endpoint resolution");
+            };
+            match runtime.resolve_endpoint(&process, &output, &ProbeCancellation::default()) {
+                Ok(endpoint) => break endpoint,
+                Err(super::super::endpoint::EndpointError::NoManagedHint)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("static Preview endpoint did not resolve: {error:?}"),
+            }
+        };
+        let response = ureq::get(&endpoint.reachable_url).call().unwrap();
+        assert!(response
+            .into_string()
+            .unwrap()
+            .contains("STATIC RUNTIME SENTINEL"));
+        runtime.stop(&process).unwrap();
     }
 }

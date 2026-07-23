@@ -83,6 +83,47 @@ pub(crate) fn typed_package_command(
     )
 }
 
+pub(crate) fn typed_static_command(
+    canonical_root: &Path,
+    target: &PreviewTarget,
+    run_id: &str,
+) -> Result<PreparedPreviewCommand, String> {
+    validate_run_id(run_id)?;
+    let relative_root = Path::new(&target.relative_root);
+    if relative_root.is_absolute()
+        || relative_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("Preview target root is not confined to its canonical Project".into());
+    }
+    let PreviewTargetKind::StaticSite { entrypoint } = &target.kind else {
+        return Err("package Preview targets require the typed package runner".into());
+    };
+    let entrypoint = Path::new(entrypoint);
+    if entrypoint.is_absolute()
+        || entrypoint.as_os_str().is_empty()
+        || entrypoint.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("static Preview entrypoint is not a confined relative path".into());
+    }
+    let cwd = canonical_root.join(relative_root);
+    let entrypoint = entrypoint
+        .to_str()
+        .ok_or("static Preview entrypoint must be UTF-8")?;
+    prepare_supervised_preview_command(
+        &cwd,
+        run_id,
+        "/usr/bin/python3",
+        &["-I", "-c", STATIC_HELPER_PY, entrypoint],
+    )
+}
+
 pub(crate) fn validate_run_id(run_id: &str) -> Result<(), String> {
     if run_id.is_empty()
         || run_id.len() > 160
@@ -179,6 +220,97 @@ fn package_manager_executable(manager: PreviewPackageManager) -> &'static str {
     }
 }
 
+const STATIC_HELPER_PY: &str = r#"import mimetypes, os, socket, stat, sys, urllib.parse
+
+MAX_REQUEST = 16384
+MAX_FILE = 16 * 1024 * 1024
+entrypoint = sys.argv[1]
+root = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+
+def confined_file(request_path):
+    decoded = urllib.parse.unquote(urllib.parse.urlsplit(request_path).path)
+    if decoded == '/':
+        decoded = '/' + entrypoint
+    if '\x00' in decoded or '\\' in decoded:
+        raise ValueError()
+    parts = [part for part in decoded.split('/') if part not in ('', '.')]
+    if not parts or any(part == '..' for part in parts):
+        raise ValueError()
+    directory = os.dup(root)
+    try:
+        for part in parts[:-1]:
+            next_directory = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = next_directory
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    finally:
+        os.close(directory)
+    details = os.fstat(descriptor)
+    if not stat.S_ISREG(details.st_mode) or details.st_size > MAX_FILE:
+        os.close(descriptor)
+        raise ValueError()
+    return descriptor, details.st_size, parts[-1]
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(('0.0.0.0', 0))
+listener.listen(16)
+port = listener.getsockname()[1]
+quoted = '/'.join(urllib.parse.quote(part, safe='') for part in entrypoint.split('/'))
+print(f'http://127.0.0.1:{port}/{quoted}', flush=True)
+
+while True:
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(1.0)
+        request = b''
+        descriptor = None
+        try:
+            while b'\r\n\r\n' not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    raise ValueError()
+                request += chunk
+                if len(request) > MAX_REQUEST:
+                    raise ValueError()
+            line = request.split(b'\r\n', 1)[0].decode('ascii')
+            method, path, version = line.split(' ')
+            if method not in ('GET', 'HEAD') or version not in ('HTTP/1.0', 'HTTP/1.1'):
+                raise ValueError()
+            descriptor, length, name = confined_file(path)
+            content_type = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+            header = (
+                f'HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n'
+                f'Content-Type: {content_type}\r\nConnection: close\r\n\r\n'
+            ).encode('ascii')
+            connection.sendall(header)
+            if method == 'GET':
+                with os.fdopen(descriptor, 'rb') as source:
+                    descriptor = None
+                    while True:
+                        chunk = source.read(65536)
+                        if not chunk:
+                            break
+                        connection.sendall(chunk)
+            else:
+                os.close(descriptor)
+                descriptor = None
+        except Exception:
+            try:
+                connection.sendall(
+                    b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+                )
+            except Exception:
+                pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+"#;
+
 #[cfg(windows)]
 pub(crate) fn unc_to_posix(path: &str) -> Option<String> {
     let path = if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
@@ -247,6 +379,35 @@ mod tests {
         };
         assert!(typed_package_command(root.path(), &static_target, "run-1").is_err());
         assert!(typed_package_command(root.path(), &target(""), "../marker-escape").is_err());
+    }
+
+    #[test]
+    fn typed_static_command_is_backend_owned_and_confines_its_entrypoint() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.html"), "STATIC SENTINEL").unwrap();
+        let mut static_target = target("");
+        static_target.kind = PreviewTargetKind::StaticSite {
+            entrypoint: "index.html".into(),
+        };
+        let prepared =
+            typed_static_command(root.path(), &static_target, "static-command-1").unwrap();
+        let command = prepared.command();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == STATIC_HELPER_PY));
+        assert!(arguments.iter().any(|argument| argument == "index.html"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("STATIC SENTINEL")));
+
+        static_target.kind = PreviewTargetKind::StaticSite {
+            entrypoint: "../outside.html".into(),
+        };
+        assert!(typed_static_command(root.path(), &static_target, "static-command-2").is_err());
     }
 
     #[test]
