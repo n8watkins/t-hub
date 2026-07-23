@@ -3,6 +3,13 @@ param(
     [ValidateSet(1, 4, 8, 16)]
     [int]$DeclaredScenarioTerminals = 1,
 
+    [ValidateSet("idle", "terminal_output", "folder_browsing", "preview_starting", "preview_noisy", "preview_refreshing", "voice_synthesis", "endpoint_recovery", "history_open")]
+    [string]$ScenarioKind = "idle",
+    [string]$WorkloadVersion = "v1",
+    [string]$WorkloadSeed = "default",
+    [ValidateRange(1, 3)]
+    [int]$Repetition = 1,
+
     [ValidateRange(0, 3600)]
     [int]$WarmupSeconds = 30,
 
@@ -20,6 +27,8 @@ param(
     [int]$RootProcessId = 0,
     [string]$SetupNote = "",
     [string]$CollectorRepositoryCommit = "unknown",
+    [string]$ReferenceBinarySha256 = "",
+    [string]$RuntimeEvidencePath = "",
     [switch]$FunctionsOnly
 )
 
@@ -190,6 +199,19 @@ function Get-TreeTotals {
             cpu_interval_complete = $true
         }
     }
+    $wslNames = @("wsl.exe", "wslhost.exe", "conhost.exe", "OpenConsole.exe")
+    $wslTotals = [ordered]@{
+        process_count = 0
+        thread_count = 0
+        working_set_bytes = [int64]0
+        private_bytes = [int64]0
+        cpu_delta_seconds_observed = [double]0
+        cpu_core_fraction = $null
+        cpu_core_fraction_observed_lower_bound = [double]0
+        process_births = 0
+        process_deaths = 0
+        cpu_interval_complete = $true
+    }
 
     $currentByKey = @{}
     foreach ($process in $Processes) {
@@ -206,15 +228,24 @@ function Get-TreeTotals {
         $totals.thread_count += $process.thread_count
         $totals.working_set_bytes += $process.working_set_bytes
         $totals.private_bytes += $process.private_bytes
+        $isWsl = $wslNames -icontains $process.name
+        if ($isWsl) {
+            $wslTotals.process_count += 1
+            $wslTotals.thread_count += $process.thread_count
+            $wslTotals.working_set_bytes += $process.working_set_bytes
+            $wslTotals.private_bytes += $process.private_bytes
+        }
 
         $key = "{0}|{1}" -f $process.process_id, $process.creation_time_utc
         if ($previousByKey.ContainsKey($key)) {
             $delta = [Math]::Max(0.0, $process.cpu_seconds - $previousByKey[$key].cpu_seconds)
             $cpuDelta += $delta
             $totals.cpu_delta_seconds_observed += $delta
+            if ($isWsl) { $wslTotals.cpu_delta_seconds_observed += $delta }
         } else {
             $births += 1
             $totals.process_births += 1
+            if ($isWsl) { $wslTotals.process_births += 1 }
         }
     }
 
@@ -225,6 +256,7 @@ function Get-TreeTotals {
             $deaths += 1
             $category = Get-ProcessCategory $process $rootIds
             $categoryTotals[$category].process_deaths += 1
+            if ($wslNames -icontains $process.name) { $wslTotals.process_deaths += 1 }
         }
     }
 
@@ -238,6 +270,9 @@ function Get-TreeTotals {
             $totals.cpu_core_fraction = $totals.cpu_core_fraction_observed_lower_bound
         }
     }
+    $wslTotals.cpu_core_fraction_observed_lower_bound = $wslTotals.cpu_delta_seconds_observed / $ElapsedSeconds
+    $wslTotals.cpu_interval_complete = $wslTotals.process_births -eq 0 -and $wslTotals.process_deaths -eq 0
+    if ($wslTotals.cpu_interval_complete) { $wslTotals.cpu_core_fraction = $wslTotals.cpu_core_fraction_observed_lower_bound }
 
     $workingSet = [int64]0
     $privateBytes = [int64]0
@@ -260,6 +295,7 @@ function Get-TreeTotals {
         process_deaths = $deaths
         cpu_interval_complete = $births -eq 0 -and $deaths -eq 0
         categories = $categoryTotals
+        wsl_descendants = $wslTotals
     }
 }
 
@@ -346,7 +382,66 @@ function Get-ArtifactSummary {
             process_deaths = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.categories[$category].process_deaths })
         }
     }
+    $summary.wsl_descendants = [ordered]@{
+        process_count = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.process_count })
+        thread_count = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.thread_count })
+        working_set_bytes = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.working_set_bytes })
+        private_bytes = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.private_bytes })
+        process_births = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.process_births })
+        process_deaths = Get-Statistics @($Samples | ForEach-Object { [double]$_.totals.wsl_descendants.process_deaths })
+        cpu = [ordered]@{
+            complete_interval_count = @($Samples | Where-Object { $_.totals.wsl_descendants.cpu_interval_complete }).Count
+            incomplete_interval_count = @($Samples | Where-Object { -not $_.totals.wsl_descendants.cpu_interval_complete }).Count
+            run_total_core_fraction = $null
+        }
+    }
+    $wslWall = [double]0
+    $wslCpu = [double]0
+    foreach ($sample in $Samples) {
+        if ($sample.totals.wsl_descendants.cpu_interval_complete) {
+            $wslWall += [double]$sample.interval_seconds
+            $wslCpu += [double]$sample.totals.wsl_descendants.cpu_delta_seconds_observed
+        }
+    }
+    if ($wslWall -gt 0) { $summary.wsl_descendants.cpu.run_total_core_fraction = $wslCpu / $wslWall }
     return $summary
+}
+
+function Convert-SafeEvidenceNode {
+    param([object]$Node, [string]$Key = "root", [int]$Depth = 0)
+    if ($Depth -gt 8) { throw "runtime evidence nesting exceeds the bound" }
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [bool] -or $Node -is [byte] -or $Node -is [sbyte] -or $Node -is [int16] -or $Node -is [uint16] -or $Node -is [int32] -or $Node -is [uint32] -or $Node -is [int64] -or $Node -is [uint64] -or $Node -is [single] -or $Node -is [double] -or $Node -is [decimal]) { return $Node }
+    if ($Node -is [string]) {
+        if ($Key -notmatch '(?i)(id|kind|status|source|reason|version|unit|name|type|outcome|engine|device)$') { throw "runtime evidence string field '$Key' is not allowlisted" }
+        if ($Node.Length -gt 128 -or $Node -match '[\x00-\x1f]') { throw "runtime evidence string field '$Key' is invalid" }
+        return $Node
+    }
+    if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
+        $items = @()
+        foreach ($item in $Node) { $items += Convert-SafeEvidenceNode $item $Key ($Depth + 1) }
+        if ($items.Count -gt 256) { throw "runtime evidence array '$Key' exceeds the bound" }
+        return @($items)
+    }
+    $output = [ordered]@{}
+    foreach ($property in $Node.PSObject.Properties) {
+        if ($property.Name -match '(?i)(token|secret|credential|password|transcript|prompt|argument|payload|raw|content|command|path)') { throw "runtime evidence contains prohibited field '$($property.Name)'" }
+        $output[$property.Name] = Convert-SafeEvidenceNode $property.Value $property.Name ($Depth + 1)
+    }
+    return $output
+}
+
+function Read-SafeRuntimeEvidence {
+    if ([string]::IsNullOrWhiteSpace($RuntimeEvidencePath)) { return [ordered]@{} }
+    if (-not (Test-Path -LiteralPath $RuntimeEvidencePath -PathType Leaf)) { throw "runtime evidence file is missing" }
+    $root = Get-Content -LiteralPath $RuntimeEvidencePath -Raw | ConvertFrom-Json
+    $allowed = @("operations", "preview", "voice", "journal", "recovery", "diagnostics", "metrics")
+    $result = [ordered]@{}
+    foreach ($property in $root.PSObject.Properties) {
+        if ($property.Name -notin $allowed) { throw "runtime evidence root field '$($property.Name)' is not allowlisted" }
+        $result[$property.Name] = Convert-SafeEvidenceNode $property.Value $property.Name
+    }
+    return $result
 }
 
 if ($FunctionsOnly) {
@@ -411,16 +506,28 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $SampleSeconds) {
     Assert-UnambiguousRootSet $currentSnapshot $firstRoot $explicitPid
     $currentTree = Get-AppTree $currentSnapshot $firstRoot.process_id $firstRoot.creation_time_utc
     $sampleIndex += 1
+    $sampleTotals = Get-TreeTotals $currentTree.processes $previousTree.processes $intervalSeconds $currentTree.roots
     $samples += [pscustomobject]@{
         index = $sampleIndex
         elapsed_seconds = $elapsed
         interval_seconds = $intervalSeconds
-        totals = Get-TreeTotals $currentTree.processes $previousTree.processes $intervalSeconds $currentTree.roots
+        metrics = [ordered]@{
+            elapsed_ms = [double]($elapsed * 1000.0)
+            interval_ms = [double]($intervalSeconds * 1000.0)
+            cpu_core_fraction = $sampleTotals.cpu_core_fraction
+            working_set_bytes = [double]$sampleTotals.working_set_bytes
+            private_bytes = [double]$sampleTotals.private_bytes
+            process_count = [int]$sampleTotals.process_count
+            thread_count = [int]$sampleTotals.thread_count
+            wsl_descendant_process_count = [int]$sampleTotals.wsl_descendants.process_count
+        }
+        totals = $sampleTotals
     }
     $previousTree = $currentTree
 }
 
 $finishedAt = (Get-Date).ToUniversalTime()
+$runtimeEvidence = Read-SafeRuntimeEvidence
 $rootMetadata = @($initialTree.roots | ForEach-Object {
     [ordered]@{
         process_id = $_.process_id
@@ -430,7 +537,7 @@ $rootMetadata = @($initialTree.roots | ForEach-Object {
     }
 })
 $artifact = [ordered]@{
-    schema_version = 2
+    schema_version = 3
     benchmark = "t-hub-packaged-runtime"
     metadata = [ordered]@{
         started_at_utc = $startedAt.ToString("o")
@@ -441,11 +548,16 @@ $artifact = [ordered]@{
         logical_processor_count = [int]$env:NUMBER_OF_PROCESSORS
         powershell_version = $PSVersionTable.PSVersion.ToString()
         collector_repository_commit = $CollectorRepositoryCommit
-        binary_provenance_note = "The collector repository commit does not prove which source commit produced the installed binary; use installed_binary.sha256 for identity."
+        binary_provenance_note = "The collector repository commit does not prove which source commit produced the installed binary; use installed_binary.sha256 and the Package 5 provenance manifest for identity."
         installed_binary = $binary
+        reference_binary_sha256 = if ($ReferenceBinarySha256.Length -gt 0) { $ReferenceBinarySha256.ToLowerInvariant() } else { $null }
     }
     configuration = [ordered]@{
         declared_scenario_terminals = $DeclaredScenarioTerminals
+        scenario_kind = $ScenarioKind
+        workload_version = $WorkloadVersion
+        workload_seed = $WorkloadSeed
+        repetition = $Repetition
         observed_terminal_count = $null
         observed_terminal_metadata = $null
         warmup_seconds = $WarmupSeconds
@@ -465,11 +577,13 @@ $artifact = [ordered]@{
         "The installed T-Hub app was already running before collection began.",
         "The terminal scenario count is declared by the operator and was not verified through T-Hub control.",
         "Terminal creation, closure, and workload changes were avoided during warmup and sampling.",
-        "Unrelated WSL, agent-browser, Next.js, and Codex processes are excluded unless they are descendants of the selected T-Hub root."
+        "Unrelated WSL, agent-browser, Next.js, and Codex processes are excluded unless they are descendants of the selected T-Hub root.",
+        "WSL descendant metrics include only Windows WSL bridge descendants visible from the pinned T-Hub root; Linux-side process metrics require a separate redacted runtime evidence source."
     )
     roots = $rootMetadata
     samples = $samples
     summary = Get-ArtifactSummary $samples
+    evidence = $runtimeEvidence
 }
 
 $parent = Split-Path -Parent $OutputPath

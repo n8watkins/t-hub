@@ -61,6 +61,8 @@ $next = @(
 $stable = Get-TreeTotals $next $tree.processes 2.0 @($root)
 Assert-True $stable.cpu_interval_complete "stable interval was marked incomplete"
 Assert-True ([Math]::Abs($stable.cpu_core_fraction - 0.75) -lt 0.000001) "stable CPU delta was incorrect"
+Assert-True ($stable.wsl_descendants.process_count -eq 1) "WSL descendant process metrics were incorrect"
+Assert-True $stable.wsl_descendants.cpu_interval_complete "WSL descendant CPU completeness was incorrect"
 
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
 $incomplete = Get-TreeTotals $withBirth $next 1.0 @($root)
@@ -79,5 +81,20 @@ $cpu = Get-CpuSummary @($sampleA, $sampleB, $sampleC)
 Assert-True ($cpu.complete_interval_count -eq 2 -and $cpu.incomplete_interval_count -eq 1) "CPU completeness summary was incorrect"
 Assert-True (-not $cpu.release_acceptance_eligible) "incomplete run was release-eligible"
 Assert-True ([Math]::Abs($cpu.run_total_core_fraction - 1.5) -lt 0.000001) "duration-weighted CPU was incorrect"
+
+$evidencePath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-runtime-evidence-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    @{ preview = @{ ready_ms = 125.5; probe_count = 2 }; voice = @{ outcome = "succeeded"; synthesis_ms = 42.0 }; journal = @{ duplicate_count = 1 }; recovery = @{ latency_ms = 250.0 } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $RuntimeEvidencePath = $evidencePath
+    $safe = Read-SafeRuntimeEvidence
+    Assert-True ([double]$safe.preview.ready_ms -eq 125.5) "safe runtime evidence did not retain numeric Preview metrics"
+    Assert-True ([double]$safe.voice.synthesis_ms -eq 42.0) "safe runtime evidence did not retain numeric voice metrics"
+    @{ voice = @{ prompt = "must-not-ingest" } } | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+    $threw = $false
+    try { Read-SafeRuntimeEvidence | Out-Null } catch { $threw = $true }
+    Assert-True $threw "runtime evidence accepted prohibited prompt content"
+} finally {
+    if (Test-Path -LiteralPath $evidencePath) { Remove-Item -LiteralPath $evidencePath -Force }
+}
 
 Write-Host "measure-thub.test: PASS"

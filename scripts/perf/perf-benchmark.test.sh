@@ -15,10 +15,16 @@ test -r "$COLLECTOR" || fail "PowerShell collector is missing"
 for scenario in 1 4 8 16; do
   output="$("$RUNNER" --terminals "$scenario" --warmup-seconds 0 --sample-seconds 1 --interval-ms 100 --dry-run)"
   grep -Fq -- "-DeclaredScenarioTerminals $scenario" <<<"$output" || fail "scenario $scenario was not forwarded"
+  grep -Fq -- "-ScenarioKind idle" <<<"$output" || fail "scenario kind was not forwarded"
+  grep -Fq -- "-WorkloadSeed default" <<<"$output" || fail "workload seed was not forwarded"
   grep -Fq -- "-CollectorRepositoryCommit" <<<"$output" || fail "collector commit metadata was not forwarded"
 done
 pid_output="$("$RUNNER" --pid 1234 --dry-run)"
 grep -Fq -- "-RootProcessId 1234" <<<"$pid_output" || fail "explicit PID was not forwarded"
+evidence_output="$("$RUNNER" --scenario-kind voice_synthesis --evidence artifacts/perf/evidence.json --reference-sha256 abc --dry-run)"
+grep -Fq -- "-ScenarioKind voice_synthesis" <<<"$evidence_output" || fail "scenario kind override was not forwarded"
+grep -Fq -- "-RuntimeEvidencePath" <<<"$evidence_output" || fail "runtime evidence was not forwarded"
+grep -Fq -- "-ReferenceBinarySha256 abc" <<<"$evidence_output" || fail "reference hash was not forwarded"
 
 if "$RUNNER" --terminals 2 --dry-run >/dev/null 2>&1; then
   fail "invalid terminal scenario was accepted"
@@ -34,6 +40,9 @@ if "$RUNNER" --interval-ms 60001 --dry-run >/dev/null 2>&1; then
 fi
 if "$RUNNER" --pid 0 --dry-run >/dev/null 2>&1; then
   fail "zero PID was accepted"
+fi
+if "$RUNNER" --scenario-kind unsupported --dry-run >/dev/null 2>&1; then
+  fail "unsupported scenario kind was accepted"
 fi
 
 if command -v pwsh >/dev/null 2>&1; then
@@ -51,7 +60,13 @@ grep -Fq 'cpu_core_fraction' "$COLLECTOR" || fail "collector does not expose nor
 grep -Fq 'working_set_bytes' "$COLLECTOR" || fail "collector does not expose working set"
 grep -Fq 'private_bytes' "$COLLECTOR" || fail "collector does not expose private bytes"
 grep -Fq 'thread_count' "$COLLECTOR" || fail "collector does not expose thread counts"
-grep -Fq 'schema_version = 2' "$COLLECTOR" || fail "collector schema is not versioned"
+grep -Fq 'schema_version = 3' "$COLLECTOR" || fail "collector schema is not versioned"
+grep -Fq 'wsl_descendants' "$COLLECTOR" || fail "collector does not expose WSL descendant metrics"
+grep -Fq 'Read-SafeRuntimeEvidence' "$COLLECTOR" || fail "collector does not sanitize runtime evidence"
+grep -Fq 'preview' "$COLLECTOR" || fail "collector does not retain preview evidence section"
+grep -Fq 'voice' "$COLLECTOR" || fail "collector does not retain voice evidence section"
+grep -Fq 'journal' "$COLLECTOR" || fail "collector does not retain journal evidence section"
+grep -Fq 'recovery' "$COLLECTOR" || fail "collector does not retain recovery evidence section"
 grep -Fq 'p95 = $sorted[$p95Index]' "$COLLECTOR" || fail "collector summary does not expose p95"
 grep -Fq 'Unrelated WSL, agent-browser, Next.js, and Codex processes are excluded' "$COLLECTOR" \
   || fail "artifact does not state process isolation assumptions"

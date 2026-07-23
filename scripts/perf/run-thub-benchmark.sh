@@ -7,12 +7,18 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 POWERSHELL_SCRIPT="$HERE/measure-thub.ps1"
 
 terminals=1
+scenario_kind=idle
+workload_version=v1
+workload_seed=default
+repetition=1
 warmup_seconds=30
 sample_seconds=60
 interval_ms=1000
 output=""
 executable=""
 pid=""
+runtime_evidence=""
+reference_binary_sha256=""
 setup_note="idle terminals at shell prompts"
 dry_run=false
 
@@ -22,12 +28,18 @@ Usage: scripts/perf/run-thub-benchmark.sh [options]
 
 Options:
   --terminals N       Declared terminal scenario: 1, 4, 8, or 16 (default: 1)
+  --scenario-kind K   Matrix scenario kind (default: idle)
+  --workload-version V Stable workload definition (default: v1)
+  --workload-seed S   Stable workload seed (default: default)
+  --repetition N      Eligible repetition number (default: 1)
   --warmup-seconds N  Warmup duration before sampling (default: 30)
   --sample-seconds N  Measurement duration (default: 60)
   --interval-ms N     Sample interval, at least 100 ms (default: 1000)
   --output PATH       JSON artifact path (default: artifacts/perf/<timestamp>.json)
   --exe PATH          Exact installed Windows executable path; WSL paths are converted
   --pid PID           Exact T-Hub root PID; required when multiple roots match
+  --evidence PATH     Optional redacted numeric runtime evidence JSON
+  --reference-sha256 H Reference installed binary SHA-256 for paired comparison
   --setup-note TEXT   Workload and tab-layout note stored in benchmark metadata
   --dry-run           Validate arguments and print the PowerShell invocation only
   --help              Show this help
@@ -52,12 +64,18 @@ to_windows_path() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --terminals) require_value "$@"; terminals="$2"; shift 2 ;;
+    --scenario-kind) require_value "$@"; scenario_kind="$2"; shift 2 ;;
+    --workload-version) require_value "$@"; workload_version="$2"; shift 2 ;;
+    --workload-seed) require_value "$@"; workload_seed="$2"; shift 2 ;;
+    --repetition) require_value "$@"; repetition="$2"; shift 2 ;;
     --warmup-seconds) require_value "$@"; warmup_seconds="$2"; shift 2 ;;
     --sample-seconds) require_value "$@"; sample_seconds="$2"; shift 2 ;;
     --interval-ms) require_value "$@"; interval_ms="$2"; shift 2 ;;
     --output) require_value "$@"; output="$2"; shift 2 ;;
     --exe) require_value "$@"; executable="$2"; shift 2 ;;
     --pid) require_value "$@"; pid="$2"; shift 2 ;;
+    --evidence) require_value "$@"; runtime_evidence="$2"; shift 2 ;;
+    --reference-sha256) require_value "$@"; reference_binary_sha256="$2"; shift 2 ;;
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -66,6 +84,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$terminals" in 1|4|8|16) ;; *) echo "run-thub-benchmark: --terminals must be 1, 4, 8, or 16" >&2; exit 2 ;; esac
+case "$scenario_kind" in idle|terminal_output|folder_browsing|preview_starting|preview_noisy|preview_refreshing|voice_synthesis|endpoint_recovery|history_open) ;; *) echo "run-thub-benchmark: unsupported --scenario-kind '$scenario_kind'" >&2; exit 2 ;; esac
+case "$repetition" in ''|*[!0-9]*) echo "run-thub-benchmark: --repetition must be an integer" >&2; exit 2 ;; esac
+if [ "$repetition" -lt 1 ] || [ "$repetition" -gt 3 ]; then echo "run-thub-benchmark: --repetition must be between 1 and 3" >&2; exit 2; fi
 case "$warmup_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --warmup-seconds must be an integer" >&2; exit 2 ;; esac
 case "$sample_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --sample-seconds must be an integer" >&2; exit 2 ;; esac
 case "$interval_ms" in ''|*[!0-9]*) echo "run-thub-benchmark: --interval-ms must be an integer" >&2; exit 2 ;; esac
@@ -95,6 +116,10 @@ command=(
   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
   -File "$script_windows"
   -DeclaredScenarioTerminals "$terminals"
+  -ScenarioKind "$scenario_kind"
+  -WorkloadVersion "$workload_version"
+  -WorkloadSeed "$workload_seed"
+  -Repetition "$repetition"
   -WarmupSeconds "$warmup_seconds"
   -SampleSeconds "$sample_seconds"
   -IntervalMilliseconds "$interval_ms"
@@ -107,6 +132,12 @@ if [ -n "$executable" ]; then
 fi
 if [ -n "$pid" ]; then
   command+=( -RootProcessId "$pid" )
+fi
+if [ -n "$runtime_evidence" ]; then
+  command+=( -RuntimeEvidencePath "$(to_windows_path "$runtime_evidence")" )
+fi
+if [ -n "$reference_binary_sha256" ]; then
+  command+=( -ReferenceBinarySha256 "$reference_binary_sha256" )
 fi
 
 if "$dry_run"; then

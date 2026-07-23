@@ -5,7 +5,8 @@ It establishes a reproducible baseline before performance changes are made.
 
 ## Metrics
 
-Each sample records total and per-category values for the selected T-Hub roots and their descendants:
+Each sample records total and per-category values for the selected T-Hub roots and their descendants.
+The artifact schema is version 3.
 
 - Working set bytes.
 - Private bytes.
@@ -14,7 +15,11 @@ Each sample records total and per-category values for the selected T-Hub roots a
 - Thread count.
 
 The categories are `application`, `webview2`, `host_bridge`, and `other_descendant`.
-The JSON also records Windows version, logical processor count, installed binary version and SHA-256 when available, the collector repository commit, benchmark timing, the pinned process root, and setup notes.
+The JSON also records Windows version, logical processor count, installed binary version and SHA-256 when available, the collector repository commit, benchmark timing, the pinned process root, scenario kind, workload seed, repetition, and setup notes.
+Scenario kinds are `idle`, `terminal_output`, `folder_browsing`, `preview_starting`, `preview_noisy`, `preview_refreshing`, `voice_synthesis`, `endpoint_recovery`, and `history_open`.
+WSL descendant metrics are reported for the owned Windows bridge descendants visible below the pinned root.
+Optional redacted runtime evidence can add numeric Preview, voice, journal, and endpoint-recovery metrics.
+The collector rejects unknown evidence roots and fields that could contain secrets, prompts, commands, paths, or provider payloads.
 The collector commit identifies the scripts that produced the artifact; it does not prove which source commit produced the installed binary.
 Use the installed binary SHA-256 as the packaged-build identity.
 
@@ -43,6 +48,14 @@ scripts/perf/run-thub-benchmark.sh --terminals 1
 scripts/perf/run-thub-benchmark.sh --terminals 4
 scripts/perf/run-thub-benchmark.sh --terminals 8
 scripts/perf/run-thub-benchmark.sh --terminals 16
+
+# Explicit scenario metadata and redacted runtime metrics
+scripts/perf/run-thub-benchmark.sh \
+  --terminals 4 \
+  --scenario-kind voice_synthesis \
+  --workload-seed voice-v1 \
+  --repetition 1 \
+  --evidence artifacts/perf/voice-metrics.json
 ```
 
 Use an exact executable path if more than one T-Hub variant is running:
