@@ -45,6 +45,7 @@ struct TapState {
     exact_turn_id: Option<String>,
     active_turn: bool,
     terminal_turn: bool,
+    saw_supported_input: bool,
     recognized_events: usize,
     turn_failed: bool,
 }
@@ -101,6 +102,7 @@ fn ingest_reader(
             }
         };
         if let Some(entry) = map_tap_message(&value, &mut state, binding) {
+            state.saw_supported_input = true;
             append_deduplicated(journal, &mut state, entry)?;
         }
     }
@@ -113,7 +115,7 @@ fn ingest_reader(
             "disconnected",
             "structured_stream_ended_mid_turn",
         )?;
-    } else if state.recognized_events == 0 {
+    } else if !state.saw_supported_input {
         append_health(
             journal,
             &mut state,
@@ -843,6 +845,45 @@ mod tests {
         assert_eq!(
             entries.last().unwrap().payload["telemetry"]["runtime_health"],
             "disconnected"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn duplicate_only_restart_does_not_emit_unsupported_health() {
+        let dir = temp_dir("duplicate-restart-health");
+        let input = r#"{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}"#;
+        {
+            let journal = crate::journal::Journal::open(&dir).unwrap();
+            let first = ingest_reader(
+                std::io::Cursor::new(input),
+                &journal,
+                &TmuxBinding::default(),
+            )
+            .unwrap();
+            assert_eq!(first.recognized_events, 1);
+            assert_eq!(journal.replay(0).unwrap().len(), 1);
+        }
+
+        let restarted = crate::journal::Journal::open(&dir).unwrap();
+        let duplicate = ingest_reader(
+            std::io::Cursor::new(input),
+            &restarted,
+            &TmuxBinding::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate.recognized_events, 0,
+            "duplicates are not newly appended recognized events"
+        );
+        let entries = restarted.replay(0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, JournalEventType::SessionStart);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.payload["lifecycle"] != "telemetry_health"),
+            "a mapped duplicate must not emit unsupported-stream health"
         );
         std::fs::remove_dir_all(dir).ok();
     }
