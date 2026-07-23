@@ -47,6 +47,38 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
+function Write-DiagnosticArtifact {
+    param([string]$Reason)
+    if ([string]::IsNullOrWhiteSpace($OutputPath) -or (Test-Path -LiteralPath $OutputPath)) { return }
+    try {
+        $parent = Split-Path -Parent $OutputPath
+        if ($parent.Length -gt 0) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+        [ordered]@{
+            schemaVersion = 3
+            candidate = [ordered]@{ sourceCommit = $SourceCommit; installedBinarySha256 = $null; installerSha256 = $null; protocolVersion = $ProtocolVersion }
+            reference = [ordered]@{ installedBinarySha256 = $null; selectionReason = $null }
+            host = [ordered]@{ windowsVersion = $null; wslVersion = $null; distro = $null; logicalProcessors = $null; memoryBytes = $null; powerMode = $null; displayScale = $null }
+            scenario = [ordered]@{ kind = $ScenarioKind; terminalCount = $DeclaredScenarioTerminals; observedTerminalCount = $null; workloadVersion = $WorkloadVersion; workloadSeed = $WorkloadSeed; repetition = $Repetition; startedAt = $null; finishedAt = $null }
+            resources = [ordered]@{ windows = $null; wslOwned = [ordered]@{ available = $false; reason = "diagnostic artifact" }; samples = @() }
+            operations = @{}
+            preview = @{}
+            voice = @{}
+            journal = @{}
+            diagnostics = [ordered]@{ error = $Reason; redactionCount = 0 }
+            validity = [ordered]@{ eligible = $false; reasons = @("collector_exception", $Reason); processBirthIntervalsExcluded = 0 }
+            budgets = @()
+            decision = "ineligible"
+            rawEvidence = @()
+            redactionCount = 0
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+    } catch { }
+}
+
+trap {
+    Write-DiagnosticArtifact $_.Exception.Message
+    exit 5
+}
+
 function Get-ProcessSnapshot {
     $rows = @(Get-CimInstance Win32_Process)
     $snapshot = @()
@@ -478,12 +510,27 @@ function Read-SafeRuntimeEvidence {
     return $result
 }
 
+function Assert-BoundedCliString {
+    param([string]$Value, [string]$Name, [int]$Maximum = 256)
+    if ($Value.Length -gt $Maximum -or $Value -match '[\x00-\x1f]') {
+        throw "$Name exceeds the bounded CLI string contract"
+    }
+}
+
 if ($FunctionsOnly) {
     return
 }
 if ($OutputPath.Length -eq 0) {
     throw "OutputPath is required."
 }
+Assert-BoundedCliString $WorkloadVersion "workload version" 64
+Assert-BoundedCliString $WorkloadSeed "workload seed" 128
+Assert-BoundedCliString $ReferenceSelectionReason "reference selection reason" 256
+Assert-BoundedCliString $PowerMode "power mode" 128
+Assert-BoundedCliString $WslVersion "WSL version" 128
+Assert-BoundedCliString $WslDistro "WSL distro" 128
+Assert-BoundedCliString $SetupNote "setup note" 256
+Assert-BoundedCliString $ProcessName "process name" 128
 
 $initialSnapshot = @(Get-ProcessSnapshot)
 $candidateRoots = @(Get-CandidateRoots $initialSnapshot)
