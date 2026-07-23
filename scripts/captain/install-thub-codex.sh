@@ -79,19 +79,7 @@ else
 fi
 
 verify_cortana_catalog() {
-  local binary="$1" catalog
-  catalog="$("$binary" --list-tools 2>/dev/null)" || return 1
-  printf '%s' "$catalog" | jq -e '
-  [(.tools // .)[] | select(.name == "cortana_bootstrap")]
-  | length == 1
-    and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
-    and .[0].annotations["t-hubTier"] == "read"
-    and .[0].annotations.confirmationRequired == false
-    and .[0].annotations.readOnlyHint == true
-    and .[0].annotations.destructiveHint == false
-    and .[0].annotations.idempotentHint == true
-    and .[0].annotations.openWorldHint == false
-' >/dev/null
+  python3 "$ATOMIC_SOURCE" verify-cortana-catalog --executable "$1"
 }
 
 if [ ! -x "$SOURCE" ] || [ ! -f "$SOURCE" ] || [ -L "$SOURCE" ]; then

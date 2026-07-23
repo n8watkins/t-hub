@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -187,6 +188,43 @@ class AtomicConfigTest(unittest.TestCase):
                     result = subprocess.run(command, check=False, timeout=2)
                     self.assertNotEqual(result.returncode, 0)
                     source.unlink()
+
+    def test_catalog_verification_is_exact_bounded_and_pinned(self) -> None:
+        helper = load_helper()
+        helper.CATALOG_TIMEOUT_SECONDS = 0.2
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            valid = root / "valid"
+            valid.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' "
+                "'{\"tools\":[{\"name\":\"cortana_bootstrap\","
+                "\"inputSchema\":{\"type\":\"object\",\"properties\":{},"
+                "\"additionalProperties\":false},\"annotations\":{"
+                "\"t-hubTier\":\"read\",\"confirmationRequired\":false,"
+                "\"readOnlyHint\":true,\"destructiveHint\":false,"
+                "\"idempotentHint\":true,\"openWorldHint\":false}}]}'\n"
+            )
+            valid.chmod(0o700)
+            helper.verify_cortana_catalog(str(valid))
+
+            for name, body in (
+                ("hang", "#!/bin/sh\nsleep 30\n"),
+                ("flood", "#!/bin/sh\nyes x\n"),
+                ("stderr-flood", "#!/bin/sh\nyes x >&2\n"),
+                (
+                    "dirty-exit",
+                    f"#!/bin/sh\n{valid.read_text().splitlines()[1]}\nexit 7\n",
+                ),
+            ):
+                with self.subTest(name=name):
+                    executable = root / name
+                    executable.write_text(body)
+                    executable.chmod(0o700)
+                    started = time.monotonic()
+                    with self.assertRaises(helper.AtomicError):
+                        helper.verify_cortana_catalog(str(executable))
+                    self.assertLess(time.monotonic() - started, 2)
 
     def test_release_unlinks_running_executable_without_truncation(self) -> None:
         helper = load_helper()

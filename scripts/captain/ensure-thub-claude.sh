@@ -39,6 +39,10 @@ publish_before_state() {
   python3 "$ATOMIC_HELPER" publish --path "$T_HUB_INSTALL_STATE_DIR/claude-state.json" --value "$state"
 }
 publish_committed_state() {
+  if ! binary_matches_selection; then
+    echo "ensure-thub-claude: installed binary changed before config commit" >&2
+    return 1
+  fi
   if [ -z "${T_HUB_INSTALL_STATE_DIR:-}" ]; then return; fi
   post="$(python3 "$ATOMIC_HELPER" describe --path "$CONFIG")"
   post="$(printf '%s' "$post" | jq -c '{presence:"present",digest:.digest,description:.description}')"
@@ -64,13 +68,79 @@ if ! command -v flock >/dev/null 2>&1; then
   echo "ensure-thub-claude: flock is required for safe config updates" >&2
   exit 1
 fi
-if [ ! -x "$BIN" ] || ! "$BIN" --list-tools >/dev/null 2>&1; then
+if [ ! -x "$BIN" ] || [ ! -f "$BIN" ] || [ -L "$BIN" ]; then
   echo "ensure-thub-claude: t-hub MCP binary is unavailable or invalid: $BIN" >&2
+  exit 1
+fi
+BIN_SNAPSHOT_DIR="$(mktemp -d "$(dirname "$CONFIG")/.t-hub-mcp-probe.XXXXXX")"
+chmod 700 "$BIN_SNAPSHOT_DIR"
+BIN_SNAPSHOT="$BIN_SNAPSHOT_DIR/t-hub-mcp"
+cleanup_binary_snapshot() {
+  if [ -n "${BIN_SNAPSHOT:-}" ] && [ -f "$BIN_SNAPSHOT" ]; then
+    rm -f -- "$BIN_SNAPSHOT"
+  fi
+  if [ -n "${BIN_SNAPSHOT_DIR:-}" ] && [ -d "$BIN_SNAPSHOT_DIR" ]; then
+    rmdir -- "$BIN_SNAPSHOT_DIR"
+  fi
+  BIN_SNAPSHOT=
+  BIN_SNAPSHOT_DIR=
+}
+trap cleanup_binary_snapshot EXIT
+if ! BIN_SNAPSHOT_INFO="$(
+  python3 "$ATOMIC_HELPER" snapshot-executable \
+    --source "$BIN" \
+    --destination "$BIN_SNAPSHOT"
+)"; then
+  echo "ensure-thub-claude: failed to acquire a verified MCP binary: $BIN" >&2
+  exit 1
+fi
+BIN="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.path)"
+BIN_DEVICE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.device)"
+BIN_INODE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.inode)"
+BIN_UID="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.uid)"
+BIN_GID="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.gid)"
+BIN_MODE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.mode)"
+BIN_SIZE="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.size)"
+BIN_MTIME_NS="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.mtime_ns)"
+BIN_CTIME_NS="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.ctime_ns)"
+BIN_DIGEST="$(printf '%s' "$BIN_SNAPSHOT_INFO" | jq -r .source.content_sha256)"
+binary_matches_selection() {
+  python3 "$ATOMIC_HELPER" verify-executable \
+    --source "$BIN" \
+    --expected-device "$BIN_DEVICE" \
+    --expected-inode "$BIN_INODE" \
+    --expected-uid "$BIN_UID" \
+    --expected-gid "$BIN_GID" \
+    --expected-mode "$BIN_MODE" \
+    --expected-size "$BIN_SIZE" \
+    --expected-mtime-ns "$BIN_MTIME_NS" \
+    --expected-ctime-ns "$BIN_CTIME_NS" \
+    --expected-digest "$BIN_DIGEST" >/dev/null
+}
+if ! python3 "$ATOMIC_HELPER" verify-cortana-catalog --executable "$BIN_SNAPSHOT"; then
+  echo "ensure-thub-claude: t-hub MCP binary lacks the exact cortana_bootstrap catalog contract: $BIN" >&2
   exit 1
 fi
 
 exec 9>"${CONFIG}.t-hub.lock"
 flock -x 9
+if [ -n "${T_HUB_CLAUDE_LATE_SOURCE_PAUSE_DIR:-}" ]; then
+  printf 'selected\n' > "$T_HUB_CLAUDE_LATE_SOURCE_PAUSE_DIR/discovered"
+  source_wait_count=0
+  while [ "$source_wait_count" -lt 1000 ]; do
+    [ ! -e "$T_HUB_CLAUDE_LATE_SOURCE_PAUSE_DIR/resume" ] || break
+    sleep 0.01
+    source_wait_count=$((source_wait_count + 1))
+  done
+  if [ ! -e "$T_HUB_CLAUDE_LATE_SOURCE_PAUSE_DIR/resume" ]; then
+    echo "ensure-thub-claude: timed out at the binary verification boundary" >&2
+    exit 1
+  fi
+fi
+if ! binary_matches_selection; then
+  echo "ensure-thub-claude: installed binary changed before config inspection" >&2
+  exit 1
+fi
 
 if [ -f "$CONFIG" ] && ! jq -e '
   (has("mcpServers") | not) or (.mcpServers | type) == "object"
@@ -207,7 +277,11 @@ rollback() {
   fi
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
 }
-trap rollback EXIT
+rollback_and_cleanup() {
+  rollback
+  cleanup_binary_snapshot
+}
+trap rollback_and_cleanup EXIT
 
 if jq -e '.mcpServers["t-hub"] != null' "$CONFIG" >/dev/null 2>&1; then
   if claude mcp remove -s user t-hub >/dev/null 2>&1; then
@@ -219,6 +293,10 @@ if jq -e '.mcpServers["t-hub"] != null' "$CONFIG" >/dev/null 2>&1; then
     echo "ensure-thub-claude: failed to remove stale t-hub registration" >&2
     exit 1
   fi
+fi
+if ! binary_matches_selection; then
+  echo "ensure-thub-claude: installed binary changed before config mutation" >&2
+  exit 1
 fi
 if ! claude mcp add -s user t-hub -- "$BIN" >/dev/null; then
   refresh_expected_hash
@@ -240,4 +318,5 @@ fi
 publish_committed_state
 trap - EXIT
 [ -z "$BACKUP" ] || rm -f "$BACKUP"
+cleanup_binary_snapshot
 echo "ensure-thub-claude: registered t-hub user server ($BIN)"

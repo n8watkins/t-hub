@@ -23,10 +23,45 @@ STATE_DIR="$WORK/helper-state"
 mkdir -m 700 "$STATE_DIR"
 cat > "$BIN" <<'EOF'
 #!/usr/bin/env bash
-[ "${1:-}" = --list-tools ] && printf '[]\n' && exit 0
+[ "${1:-}" = --list-tools ] && printf '{"tools":[{"name":"cortana_bootstrap","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"t-hubTier":"read","confirmationRequired":false,"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}]}\n' && exit 0
 exit 1
 EOF
 chmod 700 "$BIN"
+
+for raced_type in fifo symlink; do
+  LATE_HOME="$WORK/late-$raced_type-home"
+  LATE_BIN="$LATE_HOME/t-hub-mcp"
+  LATE_PAUSE="$LATE_HOME/pause"
+  mkdir -p "$LATE_HOME" "$LATE_PAUSE"
+  cp "$BIN" "$LATE_BIN"
+  timeout 15s env HOME="$LATE_HOME" T_HUB_MCP_BIN="$LATE_BIN" \
+    T_HUB_CLAUDE_LATE_SOURCE_PAUSE_DIR="$LATE_PAUSE" "$SCRIPT" \
+    >/dev/null 2>&1 &
+  late_pid=$!
+  late_wait=0
+  while [ ! -e "$LATE_PAUSE/discovered" ] && [ "$late_wait" -lt 1000 ]; do
+    sleep 0.01
+    late_wait=$((late_wait + 1))
+  done
+  mv "$LATE_BIN" "$LATE_BIN.original"
+  if [ "$raced_type" = fifo ]; then
+    mkfifo "$LATE_BIN"
+    chmod 700 "$LATE_BIN"
+  else
+    ln -s "$LATE_BIN.original" "$LATE_BIN"
+  fi
+  : > "$LATE_PAUSE/resume"
+  wait "$late_pid"
+  late_status=$?
+  if [ "$late_status" -ne 0 ] && [ "$late_status" -ne 124 ] \
+    && [ ! -e "$LATE_HOME/.claude.json" ] \
+    && ! find "$LATE_HOME" -maxdepth 1 -name '.t-hub-mcp-probe.*' -print -quit \
+      | grep -q .; then
+    pass "late Claude binary $raced_type swap fails fast without config or snapshot state"
+  else
+    fail "late Claude binary $raced_type swap blocked or changed state"
+  fi
+done
 
 if T_HUB_MCP_BIN="$BIN" T_HUB_INSTALL_STATE_DIR="$STATE_DIR" "$SCRIPT" >/dev/null 2>&1; then
   pass "first run exits 0"

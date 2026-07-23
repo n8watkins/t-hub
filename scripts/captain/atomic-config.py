@@ -13,9 +13,13 @@ import errno
 import hashlib
 import json
 import os
+import selectors
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, Optional
 
 
@@ -23,6 +27,8 @@ AT_FDCWD = -100
 RENAME_EXCHANGE = 2
 LIBC = ctypes.CDLL(None, use_errno=True)
 VERSION = 1
+CATALOG_OUTPUT_LIMIT = 128 * 1024
+CATALOG_TIMEOUT_SECONDS = 5.0
 
 
 class AtomicError(RuntimeError):
@@ -286,6 +292,113 @@ def verify_executable(source: str, expected: Dict[str, Any]) -> Dict[str, Any]:
             raise AtomicError(f"executable no longer matches selected identity: {source}")
         return {"path": source, **observed}
     finally:
+        os.close(descriptor)
+
+
+def verify_cortana_catalog(executable: str) -> None:
+    """Run a pinned executable FD with bounded time and output."""
+    executable = os.path.abspath(executable)
+    descriptor = os.open(
+        executable,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    process: Optional[subprocess.Popen[bytes]] = None
+    selector = selectors.DefaultSelector()
+    try:
+        metadata = os.fstat(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or not mode & stat.S_IXUSR
+            or mode & 0o7022
+        ):
+            raise AtomicError("catalog executable is not a trusted private snapshot")
+        process = subprocess.Popen(
+            [f"/proc/self/fd/{descriptor}", "--list-tools"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(descriptor,),
+            start_new_session=True,
+        )
+        if process.stdout is None or process.stderr is None:
+            raise AtomicError("catalog executable output pipes are unavailable")
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + CATALOG_TIMEOUT_SECONDS
+        output = bytearray()
+        total_output = 0
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AtomicError("catalog executable exceeded its time limit")
+            events = selector.select(remaining)
+            if not events:
+                raise AtomicError("catalog executable exceeded its time limit")
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total_output += len(chunk)
+                if total_output > CATALOG_OUTPUT_LIMIT:
+                    raise AtomicError("catalog executable exceeded its output limit")
+                if key.data == "stdout":
+                    output.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AtomicError("catalog executable exceeded its time limit")
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            raise AtomicError("catalog executable exceeded its time limit") from error
+        if return_code != 0:
+            raise AtomicError("catalog executable failed")
+        try:
+            catalog = json.loads(output)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AtomicError("catalog executable returned invalid JSON") from error
+        tools = catalog.get("tools") if isinstance(catalog, dict) else catalog
+        if not isinstance(tools, list):
+            raise AtomicError("catalog executable returned an invalid tool list")
+        matches = [
+            tool
+            for tool in tools
+            if isinstance(tool, dict) and tool.get("name") == "cortana_bootstrap"
+        ]
+        expected_schema = {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+        expected_annotations = {
+            "t-hubTier": "read",
+            "confirmationRequired": False,
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        }
+        if (
+            len(matches) != 1
+            or matches[0].get("inputSchema") != expected_schema
+            or matches[0].get("annotations") != expected_annotations
+        ):
+            raise AtomicError("catalog executable lacks the exact cortana_bootstrap contract")
+    finally:
+        selector.close()
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
         os.close(descriptor)
 
 
@@ -1196,6 +1309,8 @@ def main() -> int:
     verify_parser.add_argument("--expected-mtime-ns", type=int, required=True)
     verify_parser.add_argument("--expected-ctime-ns", type=int, required=True)
     verify_parser.add_argument("--expected-digest", required=True)
+    catalog_parser = subparsers.add_parser("verify-cortana-catalog")
+    catalog_parser.add_argument("--executable", required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "exchange":
@@ -1278,6 +1393,8 @@ def main() -> int:
                 "content_sha256": arguments.expected_digest,
             }
             print(json.dumps(verify_executable(arguments.source, expected), sort_keys=True))
+        elif arguments.command == "verify-cortana-catalog":
+            verify_cortana_catalog(arguments.executable)
         else:
             discard(arguments.path)
     except (OSError, AtomicError, ValueError, json.JSONDecodeError) as error:
