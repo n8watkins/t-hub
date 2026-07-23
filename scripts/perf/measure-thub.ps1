@@ -593,7 +593,7 @@ $binary = $null
 if ($firstRoot.executable_path.Length -gt 0 -and (Test-Path -LiteralPath $firstRoot.executable_path)) {
     $item = Get-Item -LiteralPath $firstRoot.executable_path
     $binary = [ordered]@{
-        path = $firstRoot.executable_path
+        path = $null
         file_version = $item.VersionInfo.FileVersion
         product_version = $item.VersionInfo.ProductVersion
         sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $firstRoot.executable_path).Hash.ToLowerInvariant()
@@ -722,7 +722,7 @@ $rootMetadata = @($initialTree.roots | ForEach-Object {
     [ordered]@{
         process_id = $_.process_id
         name = $_.name
-        executable_path = $_.executable_path
+        executable_path = $null
         creation_time_utc = $_.creation_time_utc
     }
 })
@@ -802,7 +802,7 @@ $artifact = [ordered]@{
         sample_count = $samples.Count
         interval_milliseconds = $IntervalMilliseconds
         process_name = $ProcessName
-        executable_path_filter = $ExecutablePath
+        executable_path_filter = $null
         selected_root_process_id = $firstRoot.process_id
         selected_root_creation_time_utc = $firstRoot.creation_time_utc
         setup_note = $null
