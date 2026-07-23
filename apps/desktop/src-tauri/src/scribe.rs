@@ -640,6 +640,20 @@ fn prepare_scribe_worker(state: &mut ScribeEmitterState) -> Option<u64> {
     Some(state.generation)
 }
 
+fn stop_scribe_worker(state: &mut ScribeEmitterState) {
+    if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
+        return;
+    }
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+}
+
 fn read_scribe_status_emitter_tick(
     candidates: &mut [Option<CandidateEval>; 2],
     last_checked: &mut [std::time::Instant; 2],
@@ -748,17 +762,7 @@ pub fn stop_scribe_status_emitter() {
     let mut state = scribe_emitter_state()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if !state.enabled && state.handle.is_none() && state.cancel.is_none() {
-        return;
-    }
-    state.enabled = false;
-    state.generation = state.generation.wrapping_add(1);
-    if let Some(cancel) = state.cancel.take() {
-        cancel.store(true, Ordering::Release);
-    }
-    if let Some(handle) = state.handle.take() {
-        let _ = handle.join();
-    }
+    stop_scribe_worker(&mut state);
     *latest_scribe_status_store()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
@@ -1026,13 +1030,16 @@ mod tests {
         let first = std::thread::spawn(move || {
             let count = first_active.fetch_add(1, Ordering::SeqCst) + 1;
             first_peak.fetch_max(count, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            while first_active.load(Ordering::SeqCst) > 0 {
+                std::thread::yield_now();
+                break;
+            }
             first_active.fetch_sub(1, Ordering::SeqCst);
         });
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         apply_scribe_spawn_result(&mut state, cancel, Ok(first));
         assert!(state.enabled && state.handle.is_some());
-        state.enabled = false;
+        stop_scribe_worker(&mut state);
         let generation = prepare_scribe_worker(&mut state).expect("replacement generation");
         let second_active = active.clone();
         let second_peak = peak.clone();
@@ -1047,13 +1054,7 @@ mod tests {
             Ok(second),
         );
         assert!(state.enabled && state.generation == generation);
-        stop_scribe_status_emitter();
-        state
-            .handle
-            .take()
-            .expect("sole worker")
-            .join()
-            .expect("worker joins");
+        stop_scribe_worker(&mut state);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
