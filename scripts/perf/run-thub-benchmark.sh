@@ -5,6 +5,15 @@ set -euo pipefail
 HERE="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 POWERSHELL_SCRIPT="$HERE/measure-thub.ps1"
+output=""
+
+write_runner_diagnostic() {
+  local code="$1" path="$output"
+  [ -n "$path" ] || path="$REPO_ROOT/artifacts/perf/runner-diagnostic.json"
+  /bin/mkdir -p "$(/usr/bin/dirname "$path")" 2>/dev/null || return 0
+  if [ -e "$path" ]; then return 0; fi
+  (set -C; /usr/bin/printf '%s\n' '{"schemaVersion":3,"candidate":null,"reference":null,"host":null,"scenario":null,"resources":{"webview":{},"samples":[]},"operations":[],"preview":{},"voice":{},"journal":{},"diagnostics":{"errorCode":"runner_failure","heartbeatStalls":[],"longTasks":[],"resizeObserverErrors":[],"redactionCount":0},"validity":{"eligible":false,"reasons":["runner_failure"],"processBirthIntervalsExcluded":0},"budgets":[],"decision":"ineligible","rawEvidence":[],"redactionCount":0}' > "$path") 2>/dev/null || true
+}
 
 terminals=1
 scenario_kind=idle
@@ -14,7 +23,6 @@ repetition=1
 warmup_seconds=30
 sample_seconds=60
 interval_ms=1000
-output=""
 executable=""
 pid=""
 runtime_evidence=""
@@ -70,6 +78,7 @@ EOF
 require_value() {
   if [ "$#" -lt 2 ] || [ -z "$2" ]; then
     echo "run-thub-benchmark: $1 requires a value" >&2
+    write_runner_diagnostic 2
     exit 2
   fi
 }
@@ -123,7 +132,7 @@ while [ "$#" -gt 0 ]; do
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
-    *) echo "run-thub-benchmark: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "run-thub-benchmark: unknown argument: $1" >&2; usage >&2; write_runner_diagnostic 2; exit 2 ;;
   esac
 done
 
@@ -243,6 +252,7 @@ if "$dry_run"; then
 fi
 if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
   echo "run-thub-benchmark: required Windows/WSL dependency is unavailable" >&2
+  write_runner_diagnostic 3
   exit 3
 fi
 if ! command -v powershell.exe >/dev/null 2>&1; then
