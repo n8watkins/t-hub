@@ -1025,34 +1025,43 @@ mod tests {
         };
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
         let first_active = active.clone();
         let first_peak = peak.clone();
+        let first_cancel = cancel.clone();
+        let first_started = started.clone();
         let first = std::thread::spawn(move || {
             let count = first_active.fetch_add(1, Ordering::SeqCst) + 1;
             first_peak.fetch_max(count, Ordering::SeqCst);
-            while first_active.load(Ordering::SeqCst) > 0 {
+            first_started.wait();
+            while !first_cancel.load(Ordering::Acquire) {
                 std::thread::yield_now();
-                break;
             }
             first_active.fetch_sub(1, Ordering::SeqCst);
         });
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         apply_scribe_spawn_result(&mut state, cancel, Ok(first));
+        started.wait();
         assert!(state.enabled && state.handle.is_some());
         stop_scribe_worker(&mut state);
         let generation = prepare_scribe_worker(&mut state).expect("replacement generation");
         let second_active = active.clone();
         let second_peak = peak.clone();
+        let second_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_cancel_worker = second_cancel.clone();
+        let second_started_worker = second_started.clone();
         let second = std::thread::spawn(move || {
             let count = second_active.fetch_add(1, Ordering::SeqCst) + 1;
             second_peak.fetch_max(count, Ordering::SeqCst);
+            second_started_worker.wait();
+            while !second_cancel_worker.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             second_active.fetch_sub(1, Ordering::SeqCst);
         });
-        apply_scribe_spawn_result(
-            &mut state,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Ok(second),
-        );
+        apply_scribe_spawn_result(&mut state, second_cancel, Ok(second));
+        second_started.wait();
         assert!(state.enabled && state.generation == generation);
         stop_scribe_worker(&mut state);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
