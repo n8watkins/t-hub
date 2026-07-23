@@ -91,8 +91,8 @@ static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterS
     std::sync::OnceLock::new();
 static SCRIBE_LATEST_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<(ScribeStatus, i64)>>> =
     std::sync::OnceLock::new();
-static SCRIBE_DIRECT_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
 static SCRIBE_DIRECT_FLAVOR: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_COORDINATOR_LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
 static SCRIBE_DIRECT_CANDIDATES: std::sync::OnceLock<
     std::sync::Mutex<([Option<CandidateEval>; 2], [std::time::Instant; 2])>,
 > = std::sync::OnceLock::new();
@@ -101,6 +101,15 @@ static SCRIBE_REQUEST_COORDINATOR: std::sync::OnceLock<std::sync::Mutex<()>> =
 
 fn scribe_request_coordinator() -> &'static std::sync::Mutex<()> {
     SCRIBE_REQUEST_COORDINATOR.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn reserve_scribe_request_slot() {
+    let now = now_ms().max(0) as u64;
+    let previous = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+    if now.saturating_sub(previous) < 1_000 {
+        std::thread::sleep(Duration::from_millis(1_000 - now.saturating_sub(previous)));
+    }
+    SCRIBE_COORDINATOR_LAST_REQUEST_MS.store(now_ms().max(0) as u64, Ordering::Release);
 }
 
 fn scribe_direct_candidates(
@@ -688,6 +697,7 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
                     let _request_guard = scribe_request_coordinator()
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
+                    reserve_scribe_request_slot();
                     read_scribe_status_emitter_tick(&mut candidates, &mut last_checked, flavor)
                 };
                 emit_status_event(&app, &status);
@@ -766,19 +776,11 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
     if emitter_running {
         return Ok(ScribeStatus::not_listening());
     }
-    let now = now_ms().max(0) as u64;
-    let previous = SCRIBE_DIRECT_LAST_REQUEST_MS.load(Ordering::Acquire);
-    if now.saturating_sub(previous) < 1_000
-        || SCRIBE_DIRECT_LAST_REQUEST_MS
-            .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return Ok(ScribeStatus::not_listening());
-    }
     let status = tauri::async_runtime::spawn_blocking(|| {
         let _request_guard = scribe_request_coordinator()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        reserve_scribe_request_slot();
         read_scribe_status_direct_tick()
     })
     .await
