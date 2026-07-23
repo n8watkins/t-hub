@@ -10725,6 +10725,9 @@ pub struct ControlContext {
     /// Stable identifier and monotonic generation for discovery publication.
     listener_instance_id: String,
     listener_generation: Arc<AtomicU64>,
+    /// Immutable identity allocated for this exact serve loop before it starts.
+    /// Unlike `listener_generation`, this never observes a later overlapping rebind.
+    bound_listener_generation: u64,
     /// Fleet spawn budget + rate limits (socket-gate Phase 1). Shared `Arc` so one
     /// fleet-wide budget is enforced across every connection handler thread.
     /// Consulted from [`dispatch_authenticated`] for the ProcessChanging tier only.
@@ -11244,10 +11247,11 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     }
     // Record that discovery is live before spawned sessions receive its stable path.
     ctx.addr = addr.to_string();
+    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    ctx.bound_listener_generation = listener_generation;
     // The stable discovery record is always ambient read-only. The trusted
     // in-process frontend receives its credential through skipped fields below,
     // while durable Captains prove identity to acquire a scoped lease.
-    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let handshake = ControlHandshake {
         addr: addr.to_string(),
         // Discovery is always ambient read-only. Durable Captains reacquire an
@@ -11286,7 +11290,12 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
                     "t-hub: control listener ALSO bound on {remote_addr} for REMOTE \
                      access (token-gated; loopback + Tailscale peers only)"
                 );
-                let ctx_remote = ctx.clone();
+                let mut ctx_remote = ctx.clone();
+                ctx_remote.addr = remote_addr;
+                ctx_remote.bound_listener_generation = ctx_remote
+                    .listener_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
                 // The remote listener is not part of the loopback relay-wedge path
                 // and is never rebound, so it gets a stop flag that is never set.
                 let remote_stop = Arc::new(AtomicBool::new(false));
@@ -13913,7 +13922,8 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             "nonce": nonce,
             "protocolVersion": PROTOCOL_VERSION,
             "instanceId": ctx.listener_instance_id,
-            "listenerGeneration": ctx.listener_generation.load(Ordering::Acquire),
+            "listenerGeneration": ctx.bound_listener_generation,
+            "listenerAddr": ctx.addr,
         }));
     }
     let delegated_control_access = if tier == CommandTier::Read
@@ -14456,11 +14466,16 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
         .map_err(|e| format!("rebind_control: bound but could not read fresh addr: {e}"))?
         .to_string();
     let old_addr = ctx.addr.clone();
+    // Reserve this listener's immutable generation before its serve loop starts.
+    // Failed publication intentionally leaves a gap; no overlapping listener can
+    // ever claim another listener's generation.
+    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
 
     // New serve loop context: the SAME shared state (fanout, registries, governor,
     // ...), only `addr` changes so spawns injected AFTER the rebind carry it.
     let mut new_ctx = ctx.clone();
     new_ctx.addr = new_addr.clone();
+    new_ctx.bound_listener_generation = listener_generation;
     let new_stop = Arc::new(AtomicBool::new(false));
     let serve_stop = new_stop.clone();
 
@@ -14472,7 +14487,6 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
         .map_err(|e| format!("rebind_control: failed to spawn serve loop: {e}"))?;
 
     // Publish the fresh addr atomically (temp+rename), KEEPING tokens.
-    let listener_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let handshake = ControlHandshake {
         addr: new_addr.clone(),
         token: ctx.read_token.clone(),
@@ -33388,6 +33402,7 @@ impl ControlContext {
             addr: String::new(),
             listener_instance_id: uuid::Uuid::new_v4().simple().to_string(),
             listener_generation: Arc::new(AtomicU64::new(0)),
+            bound_listener_generation: 0,
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
             requests: Arc::new(RequestCache::new()),
@@ -37333,6 +37348,30 @@ int main(int argc, char **argv) {
         matches!(BufReader::new(stream).read_line(&mut line), Ok(n) if n > 0)
     }
 
+    fn listener_discovery_proof(addr: &str, nonce: &str) -> Option<Value> {
+        use std::io::{BufRead, BufReader, Write};
+        let socket: std::net::SocketAddr = addr.parse().ok()?;
+        let stream = TcpStream::connect_timeout(&socket, Duration::from_millis(300)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        let mut writer = stream.try_clone().ok()?;
+        let request = json!({
+            "token": "read-secret",
+            "session": "",
+            "command": "control_discovery_proof",
+            "args": {"nonce": nonce},
+            "v": PROTOCOL_VERSION,
+        });
+        writeln!(writer, "{request}").ok()?;
+        let mut line = String::new();
+        if BufReader::new(stream).read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        serde_json::from_str::<Value>(&line)
+            .ok()?
+            .get("result")
+            .cloned()
+    }
+
     /// Poll `cond` until it holds or `budget` elapses (short sleeps).
     fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + budget;
@@ -37367,6 +37406,8 @@ int main(int argc, char **argv) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind initial");
         let old_addr = listener.local_addr().unwrap().to_string();
         ctx.addr = old_addr.clone();
+        let old_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        ctx.bound_listener_generation = old_generation;
         let stop = Arc::new(AtomicBool::new(false));
         ctx.rebind.set_initial_stop(stop.clone());
         {
@@ -37378,6 +37419,9 @@ int main(int argc, char **argv) {
             wait_until(Duration::from_secs(2), || listener_serves(&old_addr)),
             "the initial listener should serve before a rebind"
         );
+        let old_proof = listener_discovery_proof(&old_addr, "old-listener-proof").unwrap();
+        assert_eq!(old_proof["listenerAddr"], old_addr);
+        assert_eq!(old_proof["listenerGeneration"], old_generation);
 
         // WRITE-token gated: rebind_control is Organization tier (control token only).
         assert_eq!(required_tier("rebind_control"), CommandTier::Organization);
@@ -37413,6 +37457,16 @@ int main(int argc, char **argv) {
             wait_until(Duration::from_secs(2), || listener_serves(&new_addr)),
             "the fresh listener should serve after a rebind"
         );
+        let new_proof = listener_discovery_proof(&new_addr, "new-listener-proof").unwrap();
+        assert_eq!(new_proof["listenerAddr"], new_addr);
+        assert_eq!(
+            new_proof["listenerGeneration"],
+            written["listener_generation"]
+        );
+        assert_ne!(
+            new_proof["listenerGeneration"],
+            old_proof["listenerGeneration"]
+        );
         assert!(
             wait_until(Duration::from_secs(3), || !listener_serves(&old_addr)),
             "the old listener should stop accepting after a rebind"
@@ -37432,6 +37486,66 @@ int main(int argc, char **argv) {
         wake_accept(&new_addr);
         std::env::remove_var("T_HUB_CONTROL_FILE");
         let _ = std::fs::remove_file(&cj);
+    }
+
+    #[test]
+    fn failed_rebind_publication_preserves_old_bound_proof_and_retires_unpublished_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-rebind-publish-fail-{}-{}",
+            std::process::id(),
+            REBIND_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let blocked_handshake = root.join("control.json");
+        std::fs::create_dir_all(&blocked_handshake).unwrap();
+        std::env::set_var("T_HUB_CONTROL_FILE", &blocked_handshake);
+
+        let mut ctx = test_ctx("secret");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let old_addr = listener.local_addr().unwrap().to_string();
+        ctx.addr = old_addr.clone();
+        let old_generation = ctx.listener_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        ctx.bound_listener_generation = old_generation;
+        let stop = Arc::new(AtomicBool::new(false));
+        ctx.rebind.set_initial_stop(stop.clone());
+        {
+            let serve_ctx = ctx.clone();
+            let serve_stop = stop.clone();
+            std::thread::spawn(move || serve(listener, serve_ctx, serve_stop));
+        }
+        assert!(wait_until(Duration::from_secs(2), || {
+            listener_discovery_proof(&old_addr, "before-failed-publish").is_some()
+        }));
+
+        let error = rebind_control(&ctx).unwrap_err();
+        assert!(error.contains("failed to publish control.json"));
+        let unpublished_addr = error
+            .split("fresh port ")
+            .nth(1)
+            .and_then(|tail| tail.split(" but failed").next())
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            ctx.listener_generation.load(Ordering::Acquire),
+            old_generation + 1,
+            "the failed publication consumes its reserved generation"
+        );
+        let old_proof =
+            listener_discovery_proof(&old_addr, "after-failed-publish").expect("old remains live");
+        assert_eq!(old_proof["listenerAddr"], old_addr);
+        assert_eq!(old_proof["listenerGeneration"], old_generation);
+        assert!(
+            wait_until(Duration::from_secs(2), || listener_discovery_proof(
+                &unpublished_addr,
+                "unpublished"
+            )
+            .is_none()),
+            "the unpublished generation must not remain available for validation"
+        );
+
+        stop.store(true, Ordering::Release);
+        wake_accept(&old_addr);
+        std::env::remove_var("T_HUB_CONTROL_FILE");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     static REBIND_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -57847,7 +57961,8 @@ int main(int argc, char **argv) {
     fn discovery_proof_echoes_nonce_and_live_listener_identity_at_read_tier() {
         let mut ctx = test_ctx("t");
         ctx.listener_instance_id = "proof-instance".into();
-        ctx.listener_generation.store(7, Ordering::Release);
+        ctx.addr = "127.0.0.1:4242".into();
+        ctx.bound_listener_generation = 7;
         let proof = dispatch_authenticated(
             &ctx,
             req(
@@ -57861,6 +57976,38 @@ int main(int argc, char **argv) {
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["instanceId"], "proof-instance");
         assert_eq!(result["listenerGeneration"], 7);
+        assert_eq!(result["listenerAddr"], "127.0.0.1:4242");
+
+        // An overlapping serve loop shares the allocator but retains its own
+        // immutable address/generation proof.
+        let mut replacement = ctx.clone();
+        replacement.addr = "127.0.0.1:4243".into();
+        replacement.bound_listener_generation = 8;
+        ctx.listener_generation.store(99, Ordering::Release);
+        let old_overlap = dispatch_authenticated(
+            &ctx,
+            req(
+                "read-t",
+                "control_discovery_proof",
+                json!({"nonce": "old-overlap"}),
+            ),
+        )
+        .result
+        .unwrap();
+        let new_overlap = dispatch_authenticated(
+            &replacement,
+            req(
+                "read-t",
+                "control_discovery_proof",
+                json!({"nonce": "new-overlap"}),
+            ),
+        )
+        .result
+        .unwrap();
+        assert_eq!(old_overlap["listenerGeneration"], 7);
+        assert_eq!(old_overlap["listenerAddr"], "127.0.0.1:4242");
+        assert_eq!(new_overlap["listenerGeneration"], 8);
+        assert_eq!(new_overlap["listenerAddr"], "127.0.0.1:4243");
 
         let missing =
             dispatch_authenticated(&ctx, req("read-t", "control_discovery_proof", json!({})));
