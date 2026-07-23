@@ -53,8 +53,10 @@
 // talking over the general once; the cost of a false "listening" is losing an
 // announcement forever - so we err toward speaking.
 use serde::Serialize;
+use tauri::Emitter;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Scribe's production + dev Tauri bundle ids: the app_cache_dir subfolder
 /// where each flavor's fallback status.json lives.
@@ -77,6 +79,7 @@ const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 /// so a hung server must resolve to fail-open quickly, not park the fallback.
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
+static SCRIBE_EVENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
 /// sourced from the snapshot's `busy` flag (after the fail-open rules);
@@ -489,10 +492,21 @@ pub fn read_scribe_status() -> ScribeStatus {
 }
 
 #[tauri::command]
-pub async fn scribe_status() -> Result<ScribeStatus, String> {
-    tauri::async_runtime::spawn_blocking(read_scribe_status)
+pub async fn scribe_status(app: tauri::AppHandle) -> Result<ScribeStatus, String> {
+    let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
         .await
-        .map_err(|e| format!("scribe_status task failed: {e}"))
+        .map_err(|e| format!("scribe_status task failed: {e}"))?;
+    let generation = SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = app.emit("scribe://status", serde_json::json!({
+        "listening": status.listening,
+        "status": status.status,
+        "since": status.since,
+        "source": status.source,
+        "sourceIdentity": status.source.unwrap_or("unknown"),
+        "generation": generation,
+        "observedAtMs": now_ms(),
+    }));
+    Ok(status)
 }
 
 #[cfg(test)]

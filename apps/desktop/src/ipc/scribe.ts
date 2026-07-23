@@ -18,6 +18,9 @@ export interface ScribeStatus {
   status?: string | null;
   since?: string | number | null;
   source?: string | null;
+  generation?: number;
+  observedAtMs?: number;
+  sourceIdentity?: string;
 }
 
 /** Read the current Scribe status. Rejects only on an IPC failure; the backend

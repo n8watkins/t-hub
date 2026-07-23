@@ -51,6 +51,8 @@ export const FALLBACK_ALERT_MIN_GAP_MS = 60000;
 
 /** Compatibility fallback interval until Scribe emits its first event. */
 export const SCRIBE_POLL_MS = 1000;
+/** Events are trusted only while a fresh producer heartbeat is observed. */
+export const SCRIBE_EVENT_TTL_MS = 5000;
 
 /** After the general STOPS dictating, wait this long before delivering a held
  *  announcement - a brief pause between phrases should not trigger delivery
@@ -115,6 +117,8 @@ let journalProcessing: Promise<void> = Promise.resolve();
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
 let scribeEventUnlisten: (() => void) | null = null;
+let lastValidScribeEventAt = 0;
+let lastScribeEventGeneration = 0;
 /** Incremented whenever the poller starts or stops.
  * Results from an older generation are ignored after a settings transition. */
 let pollGeneration = 0;
@@ -622,6 +626,8 @@ function stopScribePoll(): void {
   }
   scribeEventUnlisten?.();
   scribeEventUnlisten = null;
+  lastValidScribeEventAt = 0;
+  lastScribeEventGeneration = 0;
   scribeListening = false;
   scribeStatusKnown = false;
   if (pending?.attemptId) {
@@ -650,10 +656,23 @@ function armScribePoll(): void {
   scribeStatusKnown = false;
   scribeListening = false;
   let polling = false;
-  let eventSeen = false;
+  lastValidScribeEventAt = 0;
+  lastScribeEventGeneration = 0;
   void onScribeStatus((s) => {
     if (generation !== pollGeneration) return;
-    eventSeen = true;
+    if (
+      typeof s?.listening !== "boolean" ||
+      !Number.isFinite(s.generation) ||
+      !Number.isFinite(s.observedAtMs) ||
+      typeof s.sourceIdentity !== "string" ||
+      s.sourceIdentity.length === 0 ||
+      (s.generation ?? 0) <= lastScribeEventGeneration ||
+      Math.abs(Date.now() - (s.observedAtMs ?? 0)) > SCRIBE_EVENT_TTL_MS
+    ) {
+      return;
+    }
+    lastScribeEventGeneration = s.generation ?? 0;
+    lastValidScribeEventAt = Date.now();
     applyScribeListening(!!s.listening, Date.now());
   })
     .then((unlisten) => {
@@ -667,7 +686,10 @@ function armScribePoll(): void {
       // The one-second fallback remains active for older/non-Tauri Scribe.
     });
   const tick = () => {
-    if (eventSeen) return;
+    if (
+      lastValidScribeEventAt > 0 &&
+      Date.now() - lastValidScribeEventAt < SCRIBE_EVENT_TTL_MS
+    ) return;
     if (polling) return;
     polling = true;
     void scribeStatus()
