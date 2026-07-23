@@ -64,6 +64,19 @@ Assert-True ([Math]::Abs($stable.cpu_core_fraction - 0.75) -lt 0.000001) "stable
 Assert-True ($stable.wsl_descendants.process_count -eq 1) "WSL descendant process metrics were incorrect"
 Assert-True $stable.wsl_descendants.cpu_interval_complete "WSL descendant CPU completeness was incorrect"
 
+$artifactPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-write-" + [guid]::NewGuid().ToString("N") + ".json")
+try {
+    Write-JsonNoClobber $artifactPath ([ordered]@{ schemaVersion = 3; decision = "ineligible" }) 4
+    Assert-True (Test-Path -LiteralPath $artifactPath -PathType Leaf) "atomic artifact publication did not create the destination"
+    $collision = $false
+    try { Write-JsonNoClobber $artifactPath ([ordered]@{ schemaVersion = 3 }) 4 } catch { $collision = $true }
+    Assert-True $collision "atomic artifact publication overwrote an existing destination"
+    $temporary = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetDirectoryName($artifactPath)) -Filter (([System.IO.Path]::GetFileName($artifactPath)) + ".*.tmp") -ErrorAction SilentlyContinue)
+    Assert-True ($temporary.Count -eq 0) "atomic artifact publication left temporary files"
+} finally {
+    if (Test-Path -LiteralPath $artifactPath) { Remove-Item -LiteralPath $artifactPath -Force }
+}
+
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
 $incomplete = Get-TreeTotals $withBirth $next 1.0 @($root)
 Assert-True (-not $incomplete.cpu_interval_complete) "birth interval was marked complete"

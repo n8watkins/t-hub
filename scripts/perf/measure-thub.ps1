@@ -81,11 +81,14 @@ function Write-JsonNoClobber {
     $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     $stream = [System.IO.File]::Open($temp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     try {
-        $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
-        try { $writer.Write($json) } finally { $writer.Dispose() }
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        $writer = New-Object System.IO.StreamWriter($stream, $encoding, 1024, $true)
+        try { $writer.Write($json); $writer.Flush() } finally { $writer.Dispose() }
         $stream.Flush($true)
     } finally { $stream.Dispose() }
-    try { [System.IO.File]::Move($temp, $Path) } catch { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }; throw }
+    $published = $false
+    try { [System.IO.File]::Move($temp, $Path); $published = $true }
+    finally { if (-not $published -and (Test-Path -LiteralPath $temp)) { Remove-Item -LiteralPath $temp -Force } }
 }
 
 trap {
