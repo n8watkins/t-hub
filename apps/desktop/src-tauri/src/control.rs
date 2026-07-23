@@ -10327,7 +10327,16 @@ const PROVIDER_SESSION_ENV: &str = "T_HUB_PROVIDER_SESSION";
 /// The indirection is a failure-injection seam. A failed enumeration is an
 /// unavailable capacity observation, never an observation of zero sessions.
 type LiveSessionsFn = Arc<dyn Fn() -> Result<Vec<String>, String> + Send + Sync>;
-type PreviewControlFn = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRootAuthority {
+    /// Stable registered POSIX identity used by profiles and fingerprints.
+    pub posix_identity: String,
+    /// Host-native path used only to open the registered Project capability.
+    pub host_open_path: PathBuf,
+}
+
+type PreviewControlFn =
+    Arc<dyn Fn(&str, &Value, &PreviewRootAuthority) -> Result<Value, String> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnPurpose {
@@ -14784,14 +14793,31 @@ fn preview_control(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    let top_scope = args
+        .get("scope")
+        .map(|scope| serde_json::from_value::<crate::preview::model::PreviewScope>(scope.clone()))
+        .transpose()
+        .map_err(|error| format!("{command} has an invalid scope: {error}"))?;
+    let target_scope = args
+        .pointer("/target/scope")
+        .map(|scope| serde_json::from_value::<crate::preview::model::PreviewScope>(scope.clone()))
+        .transpose()
+        .map_err(|error| format!("{command} has an invalid target scope: {error}"))?;
+    if top_scope
+        .as_ref()
+        .zip(target_scope.as_ref())
+        .is_some_and(|(top, target)| top != target)
+    {
+        return Err(format!(
+            "{command} top-level and target scopes must match exactly"
+        ));
+    }
+    let requested_scope = top_scope.as_ref().or(target_scope.as_ref());
     let requested_root = ["rootPath", "repoRoot", "repo_root"]
         .into_iter()
         .filter_map(|field| arg_str(args, field).map(|value| (field, value)))
         .collect::<Vec<_>>();
-    let requested_project_id = args
-        .pointer("/scope/projectId")
-        .or_else(|| args.pointer("/target/scope/projectId"))
-        .and_then(Value::as_str);
+    let requested_project_id = requested_scope.map(|scope| scope.project_id.as_str());
     let projects = ctx.captains.projects();
     let project = if let Some(project_id) = requested_project_id {
         let matches = projects
@@ -14821,10 +14847,8 @@ fn preview_control(
     } else {
         return Err(format!("{command} requires a typed scope with a projectId"));
     };
-    let authoritative_root = project
-        .root_path
-        .as_deref()
-        .unwrap_or(project.repo_root.as_str());
+    let root_authority = preview_root_authority(project)?;
+    let authoritative_root = root_authority.posix_identity.as_str();
     for (field, supplied) in &requested_root {
         let supplied = canonical_project_identity(supplied)?;
         if supplied != authoritative_root {
@@ -14835,6 +14859,16 @@ fn preview_control(
         }
     }
     enforce_preview_project_authority(ctx, caller, trusted_internal, &project.project_id, command)?;
+    if let Some(workspace_id) = requested_scope.and_then(|scope| scope.workspace_id.as_deref()) {
+        enforce_preview_workspace_authority(
+            ctx,
+            caller,
+            trusted_internal,
+            &project.project_id,
+            workspace_id,
+            command,
+        )?;
+    }
 
     let mut authorized = args
         .as_object()
@@ -14848,7 +14882,26 @@ fn preview_control(
             Value::String(authoritative_root.to_string()),
         );
     }
-    (ctx.preview_control)(command, &Value::Object(authorized))
+    (ctx.preview_control)(command, &Value::Object(authorized), &root_authority)
+}
+
+fn preview_root_authority(project: &ProjectRecord) -> Result<PreviewRootAuthority, String> {
+    preview_root_authority_with(project, files::to_host_path)
+}
+
+fn preview_root_authority_with(
+    project: &ProjectRecord,
+    to_host_path: impl FnOnce(&str) -> PathBuf,
+) -> Result<PreviewRootAuthority, String> {
+    let registered = project
+        .root_path
+        .as_deref()
+        .unwrap_or(project.repo_root.as_str());
+    let posix_identity = canonical_project_identity(registered)?;
+    Ok(PreviewRootAuthority {
+        host_open_path: to_host_path(&posix_identity),
+        posix_identity,
+    })
 }
 
 fn enforce_preview_project_authority(
@@ -14884,6 +14937,57 @@ fn enforce_preview_project_authority(
     } else {
         Err(format!(
             "acl: '{command}' requires General/Cortana or the owning Project Captain"
+        ))
+    }
+}
+
+fn enforce_preview_workspace_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    project_id: &str,
+    workspace_id: &str,
+    command: &str,
+) -> Result<(), String> {
+    let matches = ctx
+        .captains
+        .snapshot()
+        .workspaces
+        .into_iter()
+        .filter(|workspace| workspace.id == workspace_id)
+        .collect::<Vec<_>>();
+    let workspace = match matches.as_slice() {
+        [workspace] => workspace,
+        [] => {
+            return Err(format!(
+                "{command} names unknown durable workspaceId '{workspace_id}'"
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "{command} durable workspaceId '{workspace_id}' is ambiguous"
+            ))
+        }
+    };
+    let owner = workspace.owner.as_ref().ok_or_else(|| {
+        format!("{command} workspaceId '{workspace_id}' has no durable Project owner")
+    })?;
+    if owner.project_id != project_id {
+        return Err(format!(
+            "{command} workspaceId '{workspace_id}' belongs to another Project"
+        ));
+    }
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a Fleet identity"))?;
+    if caller.fleet_role == Some(FleetRole::Captain)
+        && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' workspace belongs to another Captain"
         ))
     }
 }
@@ -33502,7 +33606,7 @@ impl ControlContext {
         Self {
             status,
             history: crate::history::HistoryService::from_env(),
-            preview_control: Arc::new(|command, _| {
+            preview_control: Arc::new(|command, _, _| {
                 Err(format!(
                     "Preview operation '{command}' is unavailable until a backend runtime is attached"
                 ))
@@ -33652,7 +33756,10 @@ impl ControlContext {
     /// control, CLI, and MCP callers.
     pub fn with_preview_control(
         mut self,
-        preview_control: impl Fn(&str, &Value) -> Result<Value, String> + Send + Sync + 'static,
+        preview_control: impl Fn(&str, &Value, &PreviewRootAuthority) -> Result<Value, String>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.preview_control = Arc::new(preview_control);
         self
@@ -56682,7 +56789,7 @@ int main(int argc, char **argv) {
         let root_path = root.path().to_string_lossy().into_owned();
         let calls = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
         let recorded = calls.clone();
-        let ctx = test_ctx("preview-control").with_preview_control(move |command, args| {
+        let ctx = test_ctx("preview-control").with_preview_control(move |command, args, _root| {
             recorded
                 .lock()
                 .unwrap()
@@ -56737,7 +56844,7 @@ int main(int argc, char **argv) {
         let root_path = root.path().to_string_lossy().into_owned();
         let calls = Arc::new(AtomicUsize::new(0));
         let recorded = calls.clone();
-        let ctx = test_ctx("preview-authority").with_preview_control(move |_, _| {
+        let ctx = test_ctx("preview-authority").with_preview_control(move |_, _, _| {
             recorded.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"unexpected": true}))
         });
@@ -56784,7 +56891,7 @@ int main(int argc, char **argv) {
         let root_path = root.path().to_string_lossy().into_owned();
         let calls = Arc::new(AtomicUsize::new(0));
         let recorded = calls.clone();
-        let ctx = test_ctx("preview-captain-authority").with_preview_control(move |_, _| {
+        let ctx = test_ctx("preview-captain-authority").with_preview_control(move |_, _, _| {
             recorded.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"authorized": true}))
         });
@@ -56836,6 +56943,184 @@ int main(int argc, char **argv) {
             .unwrap_err()
             .contains("requires a Fleet identity"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preview_root_keeps_posix_identity_separate_from_host_open_path() {
+        let project = ProjectRecord {
+            project_id: "project-1".into(),
+            name: "Preview Project".into(),
+            repo_root: "/home/natkins/project".into(),
+            root_path: Some("/home/natkins/project".into()),
+            vcs_capability: Some("none".into()),
+            git_main_root: None,
+            remote_url: None,
+            default_branch: None,
+            powder: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let authority = preview_root_authority_with(&project, |identity| {
+            assert_eq!(identity, "/home/natkins/project");
+            PathBuf::from(r"\\wsl.localhost\Ubuntu-24.04\home\natkins\project")
+        })
+        .unwrap();
+        assert_eq!(authority.posix_identity, "/home/natkins/project");
+        assert_eq!(
+            authority.host_open_path,
+            PathBuf::from(r"\\wsl.localhost\Ubuntu-24.04\home\natkins\project")
+        );
+    }
+
+    #[test]
+    fn preview_scoped_commands_refuse_unknown_and_foreign_durable_workspaces() {
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let ctx = test_ctx("preview-workspace-authority").with_preview_control(move |_, _, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        });
+        for (index, root) in roots.iter().enumerate() {
+            let project_id = format!("project-{}", index + 1);
+            let ship_slug = format!("ship-{}", index + 1);
+            let terminal_id = format!("captain-{}", index + 1);
+            let root_path = root.path().to_string_lossy().into_owned();
+            ctx.captains
+                .upsert_project(ProjectRecord {
+                    project_id: project_id.clone(),
+                    name: project_id.clone(),
+                    repo_root: root_path.clone(),
+                    root_path: Some(root_path),
+                    vcs_capability: Some("none".into()),
+                    git_main_root: None,
+                    remote_url: None,
+                    default_branch: None,
+                    powder: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+            ctx.captains
+                .claim_test(&terminal_id, Some(&ship_slug), vec![])
+                .unwrap();
+            ctx.captains
+                .bind_ship_context(&ship_slug, &project_id, "Package 3", "codex")
+                .unwrap();
+            let captain = ctx
+                .captains
+                .snapshot()
+                .captains
+                .into_iter()
+                .find(|captain| captain.ship_slug == ship_slug)
+                .unwrap();
+            ctx.captains
+                .create_workspace(
+                    &format!("workspace-{}", index + 1),
+                    "Work",
+                    Some(&FleetWorkspaceOwner {
+                        project_id,
+                        assignment_id: captain.assignment_id,
+                        ship_slug,
+                    }),
+                )
+                .unwrap();
+        }
+        let root_path = roots[0].path().to_string_lossy().into_owned();
+        let scoped = |workspace_id: &str| {
+            json!({
+                "scope": {
+                    "projectId": "project-1",
+                    "workspaceId": workspace_id
+                },
+                "requestId": "request-1"
+            })
+        };
+        let rooted = |workspace_id: &str| {
+            json!({
+                "rootPath": root_path,
+                "scope": {
+                    "projectId": "project-1",
+                    "workspaceId": workspace_id
+                },
+                "requestId": "request-1"
+            })
+        };
+        for workspace_id in ["missing-workspace", "workspace-2"] {
+            for (command, args) in [
+                ("preview_status", scoped(workspace_id)),
+                (
+                    "preview_select",
+                    json!({
+                        "rootPath": root_path,
+                        "target": {
+                            "scope": {
+                                "projectId": "project-1",
+                                "workspaceId": workspace_id
+                            }
+                        }
+                    }),
+                ),
+                ("preview_refresh", scoped(workspace_id)),
+                ("preview_open", scoped(workspace_id)),
+                ("preview_start", rooted(workspace_id)),
+                ("preview_stop", scoped(workspace_id)),
+                ("preview_restart", rooted(workspace_id)),
+            ] {
+                let error = dispatch(&ctx, command, &args).unwrap_err();
+                assert!(
+                    error.contains("unknown durable workspaceId")
+                        || error.contains("belongs to another Project"),
+                    "{command}: {error}"
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preview_control_refuses_mismatched_top_level_and_target_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_string_lossy().into_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let ctx = test_ctx("preview-scope-match").with_preview_control(move |_, _, _| {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        });
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-1".into(),
+                name: "Preview Project".into(),
+                repo_root: root_path.clone(),
+                root_path: Some(root_path.clone()),
+                vcs_capability: Some("none".into()),
+                git_main_root: None,
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        for target_scope in [
+            json!({"projectId": "another-project"}),
+            json!({"projectId": "project-1", "workspaceId": "another-workspace"}),
+        ] {
+            let error = dispatch(
+                &ctx,
+                "preview_select",
+                &json!({
+                    "rootPath": root_path,
+                    "scope": {"projectId": "project-1"},
+                    "target": {"scope": target_scope}
+                }),
+            )
+            .unwrap_err();
+            assert!(error.contains("scopes must match exactly"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
