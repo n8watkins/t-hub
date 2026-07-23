@@ -80,8 +80,26 @@ const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
 static SCRIBE_EVENT_GENERATION: AtomicU64 = AtomicU64::new(0);
-static SCRIBE_STATUS_EMITTER_RUNNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+struct ScribeEmitterState {
+    generation: u64,
+    enabled: bool,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+static SCRIBE_EMITTER_STATE: std::sync::OnceLock<std::sync::Mutex<ScribeEmitterState>> =
+    std::sync::OnceLock::new();
+
+fn scribe_emitter_state() -> &'static std::sync::Mutex<ScribeEmitterState> {
+    SCRIBE_EMITTER_STATE.get_or_init(|| {
+        std::sync::Mutex::new(ScribeEmitterState {
+            generation: 0,
+            enabled: false,
+            cancel: None,
+            handle: None,
+        })
+    })
+}
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
 /// sourced from the snapshot's `busy` flag (after the fail-open rules);
@@ -98,6 +116,8 @@ pub struct ScribeStatus {
     pub since: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    #[serde(skip)]
+    source_identity: Option<String>,
 }
 
 impl ScribeStatus {
@@ -306,6 +326,11 @@ fn eval_v1_snapshot(v: &serde_json::Value, now: i64) -> Option<CandidateEval> {
             status: v.get("status").and_then(|x| x.as_str()).map(str::to_string),
             since: v.get("since").cloned(),
             source: Some("v1"),
+            source_identity: v
+                .get("pid")
+                .and_then(|pid| pid.as_u64())
+                .map(|pid| format!("v1-pid-{pid}"))
+                .or_else(|| v.get("instanceId").and_then(|id| id.as_str()).map(|id| format!("v1-{id}"))),
         },
         updated_at: updated_at.map(str::to_string),
     })
@@ -338,6 +363,7 @@ fn evaluate_fallback(
         status: status.clone(),
         since: since.clone(),
         source: Some("file"),
+        source_identity: None,
     };
 
     // Step 2: the pid kill-switch. A checkable-and-dead pid overrides
@@ -370,6 +396,10 @@ fn evaluate_fallback(
         status,
         since,
         source: Some("file"),
+        source_identity: v
+            .get("pid")
+            .and_then(|pid| pid.as_u64())
+            .map(|pid| format!("file-pid-{pid}")),
     }
 }
 
@@ -439,6 +469,7 @@ fn combine_candidates(cands: &[CandidateEval]) -> ScribeStatus {
         status: chosen.status.status.clone(),
         since: chosen.status.since.clone(),
         source: chosen.status.source,
+        source_identity: chosen.status.source_identity.clone(),
     }
 }
 
@@ -507,7 +538,7 @@ fn status_event_payload(status: &ScribeStatus, generation: u64, observed_at_ms: 
         "status": safe_status,
         "since": safe_since,
         "source": status.source,
-        "sourceIdentity": status.source.unwrap_or("unknown"),
+        "sourceIdentity": status.source_identity.as_deref().unwrap_or(status.source.unwrap_or("unknown")),
         "generation": generation,
         "observedAtMs": observed_at_ms,
     })
@@ -531,20 +562,52 @@ fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
 /// restart with a new endpoint, token, or PID is observed without a T-Hub
 /// restart. No endpoint token or raw Scribe payload is ever emitted.
 pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
-    if SCRIBE_STATUS_EMITTER_RUNNING.swap(true, Ordering::AcqRel) {
+    let mut state = scribe_emitter_state().lock().unwrap_or_else(|p| p.into_inner());
+    if state.enabled && state.handle.is_some() {
         return;
     }
-    std::thread::Builder::new()
-        .name("scribe-status-emitter".to_string())
-        .spawn(move || while SCRIBE_STATUS_EMITTER_RUNNING.load(Ordering::Acquire) {
-            emit_status_event(&app, &read_scribe_status());
-            std::thread::sleep(Duration::from_secs(1));
-        })
-        .ok();
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
+    state.generation = state.generation.wrapping_add(1);
+    let generation = state.generation;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_for_thread = cancel.clone();
+    let thread_result = std::thread::Builder::new()
+        .name(format!("scribe-status-emitter-{generation}"))
+        .spawn(move || {
+            while !cancel_for_thread.load(Ordering::Acquire) {
+                emit_status_event(&app, &read_scribe_status());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    match thread_result {
+        Ok(handle) => {
+            state.enabled = true;
+            state.cancel = Some(cancel);
+            state.handle = Some(handle);
+        }
+        Err(_) => {
+            state.enabled = false;
+            state.cancel = None;
+            state.handle = None;
+        }
+    }
 }
 
 pub fn stop_scribe_status_emitter() {
-    SCRIBE_STATUS_EMITTER_RUNNING.store(false, Ordering::Release);
+    let mut state = scribe_emitter_state().lock().unwrap_or_else(|p| p.into_inner());
+    state.enabled = false;
+    state.generation = state.generation.wrapping_add(1);
+    if let Some(cancel) = state.cancel.take() {
+        cancel.store(true, Ordering::Release);
+    }
+    if let Some(handle) = state.handle.take() {
+        let _ = handle.join();
+    }
 }
 
 #[tauri::command]
@@ -608,6 +671,7 @@ mod tests {
                 status: Some("Recording".to_string()),
                 since: Some(json!("2026-07-08T12:00:00.000Z")),
                 source: Some("v1"),
+                source_identity: Some("v1-pid-42".to_string()),
             },
             42,
             1234,
@@ -615,7 +679,7 @@ mod tests {
         assert_eq!(payload["listening"], json!(true));
         assert_eq!(payload["generation"], json!(42));
         assert_eq!(payload["observedAtMs"], json!(1234));
-        assert_eq!(payload["sourceIdentity"], json!("v1"));
+        assert_eq!(payload["sourceIdentity"], json!("v1-pid-42"));
         let encoded = serde_json::to_string(&payload).expect("payload serializes");
         assert!(!encoded.contains("readToken"));
         assert!(!encoded.contains("Authorization"));
@@ -1129,6 +1193,7 @@ mod tests {
                 status: Some("Ready".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T01:00:00Z".into()),
         };
@@ -1138,6 +1203,7 @@ mod tests {
                 status: Some("Recording".into()),
                 since: None,
                 source: Some("file"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
@@ -1163,6 +1229,7 @@ mod tests {
                 status: Some("prod".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
@@ -1172,6 +1239,7 @@ mod tests {
                 status: Some("dev".into()),
                 since: None,
                 source: Some("v1"),
+                source_identity: None,
             },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
