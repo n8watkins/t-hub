@@ -62,12 +62,18 @@ describe("TerminalLifecycleController", () => {
   });
 
   it("caps parked warm terminals while preserving hot headroom", () => {
-    const lifecycle = new TerminalLifecycleController(() => {}, 300_000, 2);
+    const changed = vi.fn();
+    const lifecycle = new TerminalLifecycleController(changed, 300_000, 2);
     lifecycle.reconcile(["hot", "a", "b", "c"], new Set(["hot"]));
     expect(lifecycle.temperature("hot", true)).toBe("hot");
     expect(lifecycle.temperature("a", false)).toBe("cold");
     expect(lifecycle.temperature("b", false)).toBe("warm");
     expect(lifecycle.temperature("c", false)).toBe("warm");
+    expect(changed).toHaveBeenCalledTimes(1);
+
+    // The cap is stable after React performs the requested follow-up render.
+    lifecycle.reconcile(["hot", "a", "b", "c"], new Set(["hot"]));
+    expect(changed).toHaveBeenCalledTimes(1);
   });
 });
 

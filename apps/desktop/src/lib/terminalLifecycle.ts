@@ -59,18 +59,23 @@ export class TerminalLifecycleController {
     const warm = [...current].filter(
       (id) => !hotIds.has(id) && !this.cold.has(id),
     );
-    warm
+    const demoted = warm
       .sort(
         (a, b) =>
           (this.parkedOrder.get(a) ?? 0) - (this.parkedOrder.get(b) ?? 0),
       )
-      .slice(0, Math.max(0, warm.length - this.maxWarm))
-      .forEach((id) => {
-        this.clearTimer(id);
-        this.cold.add(id);
-      });
+      .slice(0, Math.max(0, warm.length - this.maxWarm));
+    for (const id of demoted) {
+      this.clearTimer(id);
+      this.cold.add(id);
+    }
     this.known.clear();
     for (const id of current) this.known.add(id);
+    // reconcile runs from TerminalPool's effect, after React has already rendered
+    // the previous temperatures. Force one follow-up render when the count cap
+    // immediately demotes warm terminals so their TerminalViews unmount and their
+    // RemotePty detach hooks run now, rather than waiting for an unrelated render.
+    if (demoted.length > 0) this.onChange();
   }
 
   temperature(id: string, hot: boolean): TerminalTemperature {
