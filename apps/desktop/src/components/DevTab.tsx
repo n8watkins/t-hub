@@ -70,6 +70,7 @@ function idleSnapshot(terminalId: TerminalId): DevServerSnapshot {
     exitCode: null,
     reason: null,
     previewUrl: null,
+    output: [],
     observedAt: 0,
   };
 }
@@ -167,6 +168,7 @@ function applySnapshot(id: TerminalId, snapshot: DevServerSnapshot): void {
   const url = snapshot.state === "running" ? snapshot.previewUrl : null;
   update(id, {
     snapshot,
+    lines: snapshot.output.slice(-MAX_LINES),
     ...(url ? { url } : snapshot.state !== "running" ? { url: null } : {}),
   });
   if (url) {
@@ -263,6 +265,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
           authoritative.state === "running" ? authoritative.previewUrl : null;
         update(terminalId, {
           snapshot: authoritative,
+          lines: authoritative.output.slice(-MAX_LINES),
           ...(authoritativeUrl
             ? { url: authoritativeUrl }
             : authoritative.state !== "running"

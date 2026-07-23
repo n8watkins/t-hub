@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 const MAX_ID_BYTES: usize = 160;
+pub const MAX_PREVIEW_STATUS_OUTPUT_BYTES: usize = 8 * 1024;
+pub const MAX_PREVIEW_STATUS_OUTPUT_LINES: usize = 256;
 
 fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > MAX_ID_BYTES {
@@ -178,6 +180,8 @@ pub struct PreviewStatus {
     pub preview_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<String>,
     pub observed_at_ms: u64,
 }
 
@@ -190,6 +194,7 @@ impl PreviewStatus {
             run_id: None,
             preview_url: None,
             reason: None,
+            output: Vec::new(),
             observed_at_ms,
         }
     }

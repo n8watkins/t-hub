@@ -79,6 +79,7 @@ export interface DevServerSnapshot {
   exitCode: number | null;
   reason: string | null;
   previewUrl: string | null;
+  output: string[];
   observedAt: number;
 }
 
@@ -134,6 +135,7 @@ interface PreviewStatus {
   runId?: string;
   previewUrl?: string;
   reason?: string;
+  output?: string[];
   observedAtMs: number;
 }
 
@@ -403,6 +405,7 @@ function legacySnapshot(
     exitCode: null,
     reason: status.reason ?? null,
     previewUrl: status.previewUrl ?? null,
+    output: (status.output ?? []).slice(-2000),
     observedAt: status.observedAtMs,
   };
 }

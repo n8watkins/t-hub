@@ -69,6 +69,7 @@ function snapshot(
     exitCode: null,
     reason: null,
     previewUrl: null,
+    output: [],
     observedAt: 1,
   };
 }
@@ -149,6 +150,7 @@ describe("DevTab", () => {
       ...snapshot("static", "running", "run-static", 2),
       target,
       previewUrl: "http://127.0.0.1:43123/",
+      output: ["Static Preview ready", "http://127.0.0.1:43123/"],
     });
     render(<DevTab terminalId="static" cwd="/static" />);
 
@@ -163,6 +165,7 @@ describe("DevTab", () => {
     await waitFor(() =>
       expect(usePanels.getState().devUrl.static).toBe("http://127.0.0.1:43123/"),
     );
+    expect(screen.getByText("Static Preview ready")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(usePanels.getState().devUrl.static).toBeNull());
     expect(screen.queryByText("http://127.0.0.1:43123/")).toBeNull();

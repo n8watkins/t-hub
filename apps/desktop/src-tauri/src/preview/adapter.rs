@@ -223,6 +223,9 @@ mod tests {
         assert!(started["status"]["previewUrl"]
             .as_str()
             .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+        assert!(started["status"]["output"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty()));
         assert_eq!(
             dispatch(
                 &service,

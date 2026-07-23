@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::endpoint::ManagedRunIdentity;
 use super::model::{
     PreviewOperation, PreviewScope, PreviewStatus, PreviewTarget, PreviewTargetId,
-    PreviewTargetKind, PreviewTargetRef, PreviewTargetSource,
+    PreviewTargetKind, PreviewTargetRef, PreviewTargetSource, MAX_PREVIEW_STATUS_OUTPUT_BYTES,
+    MAX_PREVIEW_STATUS_OUTPUT_LINES,
 };
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
@@ -536,6 +537,12 @@ fn validate_status(status: &PreviewStatus) -> Result<(), String> {
     }
     if let Some(reason) = status.reason.as_deref() {
         validate_bounded_text(reason, "Preview status reason", MAX_TEXT_BYTES, true)?;
+    }
+    if status.output.len() > MAX_PREVIEW_STATUS_OUTPUT_LINES
+        || status.output.iter().map(|line| line.len()).sum::<usize>()
+            > MAX_PREVIEW_STATUS_OUTPUT_BYTES
+    {
+        return Err("Preview status output exceeds its bound".into());
     }
     Ok(())
 }

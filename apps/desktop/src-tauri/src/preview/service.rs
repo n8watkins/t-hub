@@ -11,7 +11,8 @@ use super::discovery::{PreviewDiscovery, PreviewDiscoveryCache, PreviewProjectRo
 use super::endpoint::{EndpointError, ProbeCancellation};
 use super::model::{
     PreviewOperation, PreviewOperationOutcome, PreviewOperationResult, PreviewScope, PreviewState,
-    PreviewStatus, PreviewTarget, PreviewTargetRef,
+    PreviewStatus, PreviewTarget, PreviewTargetRef, MAX_PREVIEW_STATUS_OUTPUT_BYTES,
+    MAX_PREVIEW_STATUS_OUTPUT_LINES,
 };
 use super::profile::{
     PreviewIntent, PreviewIntentPhase, PreviewProfileStore, ProjectPreviewProfile,
@@ -27,6 +28,7 @@ struct ActiveRun {
     state: PreviewState,
     preview_url: Option<String>,
     reason: Option<String>,
+    output: Vec<String>,
 }
 
 pub struct PreviewService<R> {
@@ -699,6 +701,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                                     state: PreviewState::Starting,
                                     preview_url: None,
                                     reason: None,
+                                    output: Vec::new(),
                                 },
                             );
                         let status =
@@ -742,6 +745,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                                             state: PreviewState::Starting,
                                             preview_url: None,
                                             reason: None,
+                                            output: Vec::new(),
                                         },
                                     );
                                 let status = self
@@ -918,6 +922,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                         run_id: None,
                         preview_url: None,
                         reason: Some(error),
+                        output: Vec::new(),
                         observed_at_ms: self.runtime.now_ms(),
                     };
                     self.commit_intent(request_id, status.clone())?;
@@ -945,12 +950,13 @@ impl<R: PreviewRuntime> PreviewService<R> {
             run_id: Some(process.identity.run_id.clone()),
             preview_url: None,
             reason: None,
+            output: bounded_output_lines(&process.output),
             observed_at_ms: self.runtime.now_ms(),
         };
         if let Err(error) = self.profiles.observe_managed_run(
             request_id,
             process.identity.clone(),
-            starting,
+            starting.clone(),
             self.runtime.now_ms(),
         ) {
             let _ = self.runtime.stop(&process);
@@ -966,6 +972,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                     state: PreviewState::Starting,
                     preview_url: None,
                     reason: None,
+                    output: starting.output.clone(),
                 },
             );
         let status = self.status_locked(scope, cancellation)?;
@@ -1004,6 +1011,7 @@ impl<R: PreviewRuntime> PreviewService<R> {
                 active.reason = Some("managed process identity was lost".into());
             }
             RuntimeObservation::Running { output } => {
+                active.output = bounded_output_lines(&output);
                 match self
                     .runtime
                     .resolve_endpoint(&active.process, &output, cancellation)
@@ -1026,6 +1034,11 @@ impl<R: PreviewRuntime> PreviewService<R> {
                         active.preview_url = None;
                         active.reason = Some(format!("Preview endpoint is unreachable: {error:?}"));
                     }
+                }
+                if let RuntimeObservation::Running { output } =
+                    self.runtime.observe(&active.process)?
+                {
+                    active.output = bounded_output_lines(&output);
                 }
             }
         }
@@ -1298,8 +1311,25 @@ fn status_from_active(
         run_id: Some(active.process.identity.run_id.clone()),
         preview_url: active.preview_url.clone(),
         reason,
+        output: active.output.clone(),
         observed_at_ms,
     }
+}
+
+fn bounded_output_lines(output: &[u8]) -> Vec<String> {
+    let tail = if output.len() > MAX_PREVIEW_STATUS_OUTPUT_BYTES {
+        &output[output.len() - MAX_PREVIEW_STATUS_OUTPUT_BYTES..]
+    } else {
+        output
+    };
+    let mut lines = String::from_utf8_lossy(tail)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.len() > MAX_PREVIEW_STATUS_OUTPUT_LINES {
+        lines.drain(..lines.len() - MAX_PREVIEW_STATUS_OUTPUT_LINES);
+    }
+    lines
 }
 
 fn result(
@@ -2269,5 +2299,48 @@ mod tests {
             *fixture.runtime.state.opened.lock().unwrap(),
             vec!["http://127.0.0.1:4173/"]
         );
+    }
+
+    #[test]
+    fn status_exposes_only_the_bounded_supervised_output_tail() {
+        let fixture = fixture("bounded-output");
+        let started = fixture
+            .service
+            .start(
+                &fixture.root,
+                &fixture.scope,
+                None,
+                "bounded-output-start",
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+        let run_id = started.status.run_id.unwrap();
+        let mut output = (0..400)
+            .map(|index| format!("line-{index:03}-{}", "x".repeat(48)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        output.extend_from_slice(b"\nFINAL-SUPERVISED-LINE\n");
+        fixture.runtime.set_observation(
+            &run_id,
+            RuntimeObservation::Running {
+                output: output.clone(),
+            },
+        );
+
+        let status = fixture.service.status(&fixture.scope).unwrap();
+        assert!(status.output.len() <= MAX_PREVIEW_STATUS_OUTPUT_LINES);
+        assert!(
+            status.output.iter().map(|line| line.len()).sum::<usize>()
+                <= MAX_PREVIEW_STATUS_OUTPUT_BYTES
+        );
+        assert_eq!(
+            status.output.last().map(String::as_str),
+            Some("FINAL-SUPERVISED-LINE")
+        );
+        assert!(!status
+            .output
+            .iter()
+            .any(|line| line.starts_with("line-000")));
     }
 }
