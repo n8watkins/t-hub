@@ -6,8 +6,11 @@ HERE="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 POWERSHELL_SCRIPT="$HERE/measure-thub.ps1"
 output=""
+runner_diagnostic_written=false
 
 write_runner_diagnostic() {
+  if [ "$runner_diagnostic_written" = true ]; then return 0; fi
+  runner_diagnostic_written=true
   local code="$1" path="$output"
   [ -n "$path" ] || path="$REPO_ROOT/artifacts/perf/runner-diagnostic.json"
   if [ -e "$path" ]; then path="${path%.json}.runner-${BASHPID}.json"; fi
@@ -15,6 +18,8 @@ write_runner_diagnostic() {
   local temp="$path.$BASHPID.tmp"
   (set -C; /usr/bin/printf '%s\n' '{"schemaVersion":3,"candidate":{"sourceCommit":"unknown","installedBinarySha256":null,"installerSha256":null,"protocolVersion":2},"reference":{"installedBinarySha256":null,"selectionReason":null},"host":{"windowsVersion":"unknown","wslVersion":"unknown","distro":"unknown","logicalProcessors":0,"memoryBytes":0,"powerMode":"unknown","displayScale":0},"scenario":{"kind":"unknown","terminalCount":0,"observedTerminalCount":null,"workloadVersion":"unknown","workloadSeed":"unknown","repetition":0,"startedAt":null,"finishedAt":null},"resources":{"windows":{},"wslOwned":{"available":false,"reason":"runner diagnostic"},"webview":{},"samples":[]},"operations":[],"preview":{},"voice":{},"journal":{},"diagnostics":{"errorCode":"runner_failure","heartbeatStalls":[],"longTasks":[],"resizeObserverErrors":[],"redactionCount":0},"validity":{"eligible":false,"reasons":["runner_failure"],"processBirthIntervalsExcluded":0},"budgets":[],"decision":"ineligible","rawEvidence":[],"redactionCount":0}' > "$temp" && /bin/mv -n "$temp" "$path") 2>/dev/null || { /bin/rm -f "$temp" 2>/dev/null || true; }
 }
+
+trap 'runner_rc=$?; if [ "$runner_rc" -eq 2 ] || [ "$runner_rc" -eq 3 ]; then write_runner_diagnostic "$runner_rc"; fi; trap - EXIT; exit "$runner_rc"' EXIT
 
 terminals=1
 scenario_kind=idle
