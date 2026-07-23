@@ -657,8 +657,14 @@ pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
     let mut state = scribe_emitter_state()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if state.enabled && state.handle.is_some() {
-        return;
+    if state.enabled {
+        if state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
     }
     if let Some(cancel) = state.cancel.take() {
         cancel.store(true, Ordering::Release);
@@ -752,7 +758,10 @@ pub async fn scribe_status() -> Result<ScribeStatus, String> {
         let state = scribe_emitter_state()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        state.enabled && state.handle.is_some()
+        state
+            .handle
+            .as_ref()
+            .is_some_and(|handle| state.enabled && !handle.is_finished())
     };
     if emitter_running {
         return Ok(ScribeStatus::not_listening());
