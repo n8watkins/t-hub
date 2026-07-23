@@ -1,0 +1,9 @@
+[package]
+name = "t-hub-preview-runtime"
+version = "0.1.0"
+description = "Canonical Linux process and listener ownership evidence for T-Hub Preview."
+edition = "2021"
+rust-version = "1.89"
+
+[dependencies]
+libc = "0.2"

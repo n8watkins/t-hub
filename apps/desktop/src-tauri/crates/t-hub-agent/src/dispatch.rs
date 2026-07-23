@@ -8,7 +8,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use t_hub_protocol::{
     AgentRequest, AgentResponse, EventJournalEntry, JournalEventType, JournalSource,
-    ResponseErrorKind,
+    PreviewListenerOwnership, ResponseErrorKind,
 };
 
 use crate::host;
@@ -69,6 +69,40 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
             Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
         },
 
+        AgentRequest::InspectPreviewListener {
+            run_id,
+            generation,
+            port,
+            expected_process_group_id,
+            expected_process_group_started_at,
+        } => {
+            if !valid_preview_run_id(&run_id)
+                || generation.len() != 32
+                || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || port == 0
+                || expected_process_group_id == 0
+                || expected_process_group_started_at == 0
+            {
+                return err(
+                    ResponseErrorKind::BadRequest,
+                    "managed Preview listener expectation is invalid".into(),
+                );
+            }
+            match t_hub_preview_runtime::listener_ownership(port) {
+                Ok(ownership) => AgentResponse::PreviewListener {
+                    run_id,
+                    generation,
+                    expected_process_group_id,
+                    expected_process_group_started_at,
+                    ownership: ownership.map(|ownership| PreviewListenerOwnership {
+                        process_group_id: ownership.process_group_id,
+                        process_group_started_at: ownership.process_group_started_at,
+                    }),
+                },
+                Err(error) => err(ResponseErrorKind::CommandFailed, error),
+            }
+        }
+
         AgentRequest::CapturePane { name } => match registry::capture_pane(&name) {
             Ok(bytes) => AgentResponse::Pane {
                 base64: STANDARD.encode(bytes),
@@ -81,6 +115,14 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
             "unsupported request op".to_string(),
         ),
     }
+}
+
+fn valid_preview_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 160
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn err(kind: ResponseErrorKind, message: String) -> AgentResponse {
@@ -167,6 +209,74 @@ mod tests {
             other => panic!("expected GitInfo, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_listener_request_echoes_exact_generation_and_expectation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected =
+            t_hub_preview_runtime::process_group_identity_for_pid(std::process::id()).unwrap();
+        let (journal, directory) = temp_journal("preview-listener");
+        let response = handle(
+            &journal,
+            AgentRequest::InspectPreviewListener {
+                run_id: "run-1".into(),
+                generation: "a".repeat(32),
+                port,
+                expected_process_group_id: expected.process_group_id,
+                expected_process_group_started_at: expected.process_group_started_at,
+            },
+        );
+        match response {
+            AgentResponse::PreviewListener {
+                run_id,
+                generation,
+                expected_process_group_id,
+                expected_process_group_started_at,
+                ownership,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(generation, "a".repeat(32));
+                assert_eq!(expected_process_group_id, expected.process_group_id);
+                assert_eq!(
+                    expected_process_group_started_at,
+                    expected.process_group_started_at
+                );
+                assert_eq!(
+                    ownership,
+                    Some(PreviewListenerOwnership {
+                        process_group_id: expected.process_group_id,
+                        process_group_started_at: expected.process_group_started_at,
+                    })
+                );
+            }
+            other => panic!("expected PreviewListener, got {other:?}"),
+        }
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn preview_listener_request_rejects_uncorrelated_shapes() {
+        let (journal, directory) = temp_journal("preview-listener-invalid");
+        let response = handle(
+            &journal,
+            AgentRequest::InspectPreviewListener {
+                run_id: "../escape".into(),
+                generation: "not-a-generation".into(),
+                port: 0,
+                expected_process_group_id: 0,
+                expected_process_group_started_at: 0,
+            },
+        );
+        assert!(matches!(
+            response,
+            AgentResponse::Error {
+                kind: ResponseErrorKind::BadRequest,
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(directory).ok();
     }
 
     #[test]

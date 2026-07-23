@@ -8,6 +8,7 @@
 members = [
     "crates/t-hub-protocol",
     "crates/t-hub-agent",
+    "crates/t-hub-preview-runtime",
     # The local MCP server binary: speaks MCP JSON-RPC on stdio and forwards
     # tools/call to the running app over the loopback control channel (PRD §9.6).
     "crates/t-hub-mcp",
@@ -134,6 +135,9 @@ socket2 = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The shared agent⇄core NDJSON contract (workspace member).
 t-hub-protocol = { path = "crates/t-hub-protocol" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+t-hub-preview-runtime = { path = "crates/t-hub-preview-runtime" }
 
 # Windows-only: direct Win32 access to subclass the frameless main window and
 # answer WM_NCHITTEST, restoring Windows 11 Snap Layouts (the hover-the-maximize

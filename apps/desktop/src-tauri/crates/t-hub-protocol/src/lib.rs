@@ -219,6 +219,19 @@ pub enum AgentRequest {
     /// Full git facts for the Files panel, collected inside the persistent agent.
     GitInfo { cwd: String },
 
+    /// Resolve one managed Preview listener inside WSL using the canonical
+    /// Linux ownership algorithm.
+    ///
+    /// The generation and expected process identity bind the response to the
+    /// authenticated supervisor instance that the Windows core launched.
+    InspectPreviewListener {
+        run_id: String,
+        generation: String,
+        port: u16,
+        expected_process_group_id: u32,
+        expected_process_group_started_at: u64,
+    },
+
     // --- bulk (Channel::Bulk) ---
     /// Capture pane scrollback (potentially large → routed on the bulk channel).
     CapturePane { name: String },
@@ -300,6 +313,15 @@ pub enum AgentResponse {
     GitWorktrees { worktrees: Vec<WorktreeInfo> },
     /// `git_info` → the complete Files-panel git snapshot.
     GitInfo(GitInfo),
+    /// `inspect_preview_listener` → exact WSL listener evidence.
+    PreviewListener {
+        run_id: String,
+        generation: String,
+        expected_process_group_id: u32,
+        expected_process_group_started_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ownership: Option<PreviewListenerOwnership>,
+    },
     /// `capture_pane` → base64-encoded scrollback bytes (ANSI preserved).
     Pane { base64: String },
     /// Any request that failed. `kind` is a stable machine-readable code; see
@@ -308,6 +330,13 @@ pub enum AgentResponse {
         kind: ResponseErrorKind,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewListenerOwnership {
+    pub process_group_id: u32,
+    pub process_group_started_at: u64,
 }
 
 /// Stable, machine-readable error codes for an [`AgentResponse::Error`].
@@ -657,6 +686,73 @@ mod tests {
             } => assert_eq!(actual, info),
             other => panic!("expected GitInfo response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preview_listener_expectation_and_echo_roundtrip() {
+        let request = CoreFrame {
+            channel: Channel::Control,
+            msg: CoreToAgent::Request {
+                id: 45,
+                priority: Priority::High,
+                body: AgentRequest::InspectPreviewListener {
+                    run_id: "run-1".into(),
+                    generation: "a".repeat(32),
+                    port: 4177,
+                    expected_process_group_id: 42,
+                    expected_process_group_started_at: 99,
+                },
+            },
+        };
+        let line = encode_core(&request).unwrap();
+        let decoded = decode_core(&line).unwrap();
+        assert!(matches!(
+            decoded.msg,
+            CoreToAgent::Request {
+                body: AgentRequest::InspectPreviewListener {
+                    ref run_id,
+                    ref generation,
+                    port: 4177,
+                    expected_process_group_id: 42,
+                    expected_process_group_started_at: 99,
+                },
+                ..
+            } if run_id == "run-1" && generation == &"a".repeat(32)
+        ));
+
+        let response = AgentFrame {
+            channel: Channel::Control,
+            msg: AgentToCore::Response {
+                id: 45,
+                body: AgentResponse::PreviewListener {
+                    run_id: "run-1".into(),
+                    generation: "a".repeat(32),
+                    expected_process_group_id: 42,
+                    expected_process_group_started_at: 99,
+                    ownership: Some(PreviewListenerOwnership {
+                        process_group_id: 42,
+                        process_group_started_at: 99,
+                    }),
+                },
+            },
+        };
+        let line = encode_agent(&response).unwrap();
+        let decoded = decode_agent(&line).unwrap();
+        assert!(matches!(
+            decoded.msg,
+            AgentToCore::Response {
+                id: 45,
+                body: AgentResponse::PreviewListener {
+                    ref run_id,
+                    ref generation,
+                    ownership: Some(PreviewListenerOwnership {
+                        process_group_id: 42,
+                        process_group_started_at: 99,
+                    }),
+                    ..
+                },
+            } if run_id == "run-1" && generation == &"a".repeat(32)
+        ));
     }
 
     #[test]

@@ -4203,6 +4203,7 @@ dependencies = [
  "shell-words",
  "socket2",
  "t-hub-mcp",
+ "t-hub-preview-runtime",
  "t-hub-protocol",
  "tauri",
  "tauri-build",
@@ -4228,6 +4229,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "t-hub-preview-runtime",
  "t-hub-protocol",
 ]
 
@@ -4238,6 +4240,13 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "t-hub-preview-runtime"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

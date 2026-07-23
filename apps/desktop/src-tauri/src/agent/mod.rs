@@ -33,8 +33,8 @@ use std::sync::{mpsc, Arc, LazyLock, Weak};
 use parking_lot::Mutex;
 use t_hub_protocol::{
     AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, GitInfo,
-    Hello, HostMetrics, Priority, ResponseErrorKind, TerminalSnapshot, WorktreeInfo,
-    PROTOCOL_VERSION,
+    Hello, HostMetrics, PreviewListenerOwnership, Priority, ResponseErrorKind, TerminalSnapshot,
+    WorktreeInfo, PROTOCOL_VERSION,
 };
 
 use crate::supervision::Supervisor;
@@ -677,6 +677,75 @@ impl AgentBridge {
         map_git_info_response(response)
     }
 
+    /// Inspect a managed Preview listener inside WSL through the persistent,
+    /// correlated agent channel.
+    ///
+    /// Every echoed field must match the authenticated supervisor expectation.
+    /// A stale or crossed response is refused even when the transport request id
+    /// itself was valid.
+    #[allow(dead_code)]
+    pub(crate) fn inspect_preview_listener(
+        &self,
+        run_id: &str,
+        generation: &str,
+        port: u16,
+        expected_process_group_id: u32,
+        expected_process_group_started_at: u64,
+    ) -> Result<Option<PreviewListenerOwnership>, String> {
+        let response = self
+            .request(AgentRequest::InspectPreviewListener {
+                run_id: run_id.to_string(),
+                generation: generation.to_string(),
+                port,
+                expected_process_group_id,
+                expected_process_group_started_at,
+            })
+            .map_err(|error| error.to_string())?;
+        map_preview_listener_response(
+            response,
+            run_id,
+            generation,
+            expected_process_group_id,
+            expected_process_group_started_at,
+        )
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_preview_listener_response(
+    response: AgentResponse,
+    run_id: &str,
+    generation: &str,
+    expected_process_group_id: u32,
+    expected_process_group_started_at: u64,
+) -> Result<Option<PreviewListenerOwnership>, String> {
+    match response {
+        AgentResponse::PreviewListener {
+            run_id: echoed_run_id,
+            generation: echoed_generation,
+            expected_process_group_id: echoed_group,
+            expected_process_group_started_at: echoed_started,
+            ownership,
+        } if echoed_run_id == run_id
+            && echoed_generation == generation
+            && echoed_group == expected_process_group_id
+            && echoed_started == expected_process_group_started_at =>
+        {
+            Ok(ownership)
+        }
+        AgentResponse::PreviewListener { .. } => {
+            Err("WSL Preview listener response correlation changed".into())
+        }
+        AgentResponse::Error { kind, message } => Err(format!(
+            "WSL Preview listener inspection {kind:?}: {message}"
+        )),
+        other => Err(format!(
+            "unexpected response to WSL Preview listener inspection: {other:?}"
+        )),
+    }
+}
+
+impl AgentBridge {
     /// Fetch terminal reconciliation metadata through the persistent agent.
     pub fn terminal_snapshot(&self) -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
         let response =
@@ -1051,6 +1120,31 @@ fn cap_title(s: &str) -> String {
 mod tests {
     use super::*;
     use t_hub_protocol::{JournalEventType, JournalSource};
+
+    #[test]
+    fn preview_listener_response_requires_every_echoed_correlation_field() {
+        let response = |generation: &str| AgentResponse::PreviewListener {
+            run_id: "run-1".into(),
+            generation: generation.into(),
+            expected_process_group_id: 42,
+            expected_process_group_started_at: 99,
+            ownership: Some(PreviewListenerOwnership {
+                process_group_id: 42,
+                process_group_started_at: 99,
+            }),
+        };
+        assert_eq!(
+            map_preview_listener_response(response("a"), "run-1", "a", 42, 99).unwrap(),
+            Some(PreviewListenerOwnership {
+                process_group_id: 42,
+                process_group_started_at: 99,
+            })
+        );
+        assert!(map_preview_listener_response(response("b"), "run-1", "a", 42, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-2", "a", 42, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-1", "a", 41, 99).is_err());
+        assert!(map_preview_listener_response(response("a"), "run-1", "a", 42, 98).is_err());
+    }
 
     fn entry(
         seq: u64,
