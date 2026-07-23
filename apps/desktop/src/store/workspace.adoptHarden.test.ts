@@ -94,6 +94,49 @@ describe("adopt-harden: debris never reaches the canvas once the server is autho
     ]);
   });
 
+  it("keeps authoritative placements when runtime enumeration is temporarily empty", () => {
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a", "b"] },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: CAPTAINS_TAB_NAME,
+        kind: "captain",
+        tileIds: ["cortana"],
+      },
+    ]);
+
+    useWorkspace.getState().setTerminals([]);
+
+    expect(useWorkspace.getState().tabs.find((t) => t.id === "t1")?.order).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(
+      useWorkspace.getState().tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
+    ).toEqual(["cortana"]);
+
+    // Runtime enumeration is metadata only after adoption. A later server
+    // snapshot remains authoritative for actual placement removal.
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: [] },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: CAPTAINS_TAB_NAME,
+        kind: "captain",
+        tileIds: [],
+      },
+    ]);
+    expect(placedIds()).toEqual(new Set());
+  });
+
+  it("still prunes dead persisted placements before server adoption", () => {
+    expect(useWorkspace.getState().registryAdopted).toBe(false);
+
+    useWorkspace.getState().setTerminals([]);
+
+    expect(placedIds()).toEqual(new Set());
+  });
+
   it("still adopts pre-existing sessions on a registry-less boot (legacy fallback preserved)", () => {
     // No server registry has arrived yet: the blind-append must still surface a
     // pre-existing session so a registry-less first boot is not blank.

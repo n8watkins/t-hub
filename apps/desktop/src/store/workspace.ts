@@ -1186,18 +1186,24 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       for (const t of list) terminals[t.id] = t;
       const liveIds = new Set(list.map((t) => t.id));
 
-      const { tabs, activeTabId, poppedOutTabs } = get();
-      // Keep each tab's ordering for ids that still exist; prune dead ids.
+      const { tabs, activeTabId, poppedOutTabs, registryAdopted } = get();
+      // Once the server registry is authoritative, terminal enumeration updates
+      // runtime metadata only. A temporarily empty or partial scan must not turn
+      // into a layout mutation that the tab reporter sends back to the server.
+      // Before adoption, retain the legacy liveness pruning used to repair a
+      // persisted local-only layout.
       const placed = new Set<TerminalId>();
       const registeredCaptains = new Set(captainRegistryIds());
       const recoveredFromCaptain: TerminalId[] = [];
       const nextTabs = tabs.map((t) => {
-        let order = t.order.filter((id) => liveIds.has(id));
+        let order = registryAdopted
+          ? t.order
+          : t.order.filter((id) => liveIds.has(id));
         // A registry-less boot can briefly append every live shell to the
         // active Captain Workspace before bootstrap creates the first Work
         // Workspace. Keep durable Captain tiles pinned, but recover ordinary
         // shells into a work tab so the next report is valid.
-        if (workspaceKind(t) === "captain") {
+        if (!registryAdopted && workspaceKind(t) === "captain") {
           const captainOrder: TerminalId[] = [];
           for (const id of order) {
             if (registeredCaptains.has(id)) captainOrder.push(id);
@@ -1236,7 +1242,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // blanked the UI. Keep the legacy append ONLY until the first registry
       // arrives (a registry-less boot), so pre-existing sessions still surface.
       const appended =
-        SATELLITE_TAB || get().registryAdopted
+        SATELLITE_TAB || registryAdopted
           ? []
           : [...recoveredFromCaptain, ...list.map((t) => t.id)].filter(
               (id, index, all) => !placed.has(id) && all.indexOf(id) === index,

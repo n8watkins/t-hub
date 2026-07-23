@@ -92,6 +92,60 @@ describe("workspace registry bootstrap", () => {
     );
   });
 
+  it("keeps a durable Cortana and work layout through an empty cold-boot terminal scan", async () => {
+    const workTileIds = [
+      "253a60dc",
+      "4464d15d",
+      "7f433705",
+      "99246c2f",
+      "9f5092dd",
+      "c84bfc45",
+      "d8170451",
+    ];
+    seed([
+      { id: "work-1", name: "Workspace 1", order: workTileIds },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 1,
+      activeTabId: "work-1",
+      tabs: [
+        { id: "work-1", name: "Workspace 1", kind: "work", tileIds: workTileIds },
+        {
+          id: CAPTAINS_TAB_ID,
+          name: "Captain Workspace",
+          kind: "captain",
+          tileIds: ["5bfa4f12"],
+        },
+      ],
+    });
+
+    await bootstrapWorkspaceTabs();
+    useWorkspace.getState().setTerminals([]);
+
+    const state = useWorkspace.getState();
+    expect(state.tabs.find((tab) => tab.id === "work-1")?.order).toEqual(workTileIds);
+    expect(state.tabs.find((tab) => tab.id === CAPTAINS_TAB_ID)?.order).toEqual([
+      "5bfa4f12",
+    ]);
+    const nextReport = state.tabs.map((tab) => ({ id: tab.id, tileIds: tab.order }));
+    expect(nextReport).toEqual([
+      { id: "work-1", tileIds: workTileIds },
+      { id: CAPTAINS_TAB_ID, tileIds: ["5bfa4f12"] },
+    ]);
+
+    useWorkspace.getState().adoptRegistry([
+      { id: "work-1", name: "Workspace 1", kind: "work", tileIds: [] },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain",
+        tileIds: [],
+      },
+    ]);
+    expect(useWorkspace.getState().tabs.map((tab) => tab.order)).toEqual([[], []]);
+  });
+
   it("seeds a work workspace when both sides are Captain-only", async () => {
     seed([{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] }]);
     controlRequest.mockResolvedValue({
