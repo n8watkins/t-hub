@@ -28,10 +28,11 @@ import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import {
   claimVoiceAnnouncement,
   recordVoiceAnnouncementOutcome,
+  seedVoiceAnnouncementBoundary,
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
-import { onJournal } from "../ipc/client05";
+import { agentState, onJournal } from "../ipc/client05";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import { notify } from "./notify";
@@ -502,7 +503,14 @@ export function flushPending(now: number = Date.now()): void {
   const statuses = useSupervision.getState().statuses;
   const stillBlocked = Object.values(statuses).some((st) => NEEDS_INPUT.has(st));
   if (held.requireBlocked && !stillBlocked) {
-    pending = null; // resolved during dictation - drop silently
+    if (held.attemptId) {
+      void recordVoiceAnnouncementOutcome(
+        held.attemptId,
+        "interrupted",
+        "The requested input was resolved before the held announcement could be delivered.",
+      ).catch(() => {});
+    }
+    pending = null;
     return;
   }
   if (speak(held.text, now, held.attemptId)) {
@@ -524,8 +532,32 @@ export function flushPending(now: number = Date.now()): void {
 export function mountVoiceAnnounce(): void {
   if (mounted) return;
   mounted = true;
-  void onJournal((event) => {
+  const buffered: JournalEvent[] = [];
+  let boundaryReady = false;
+  const enqueue = (event: JournalEvent) => {
     journalProcessing = journalProcessing.then(() => handleJournalEvent(event));
+  };
+  void onJournal((event) => {
+    if (boundaryReady) enqueue(event);
+    else buffered.push(event);
+  }).then(async () => {
+    const state = await agentState();
+    const firstObservedSeq = buffered.reduce(
+      (minimum, event) => Math.min(minimum, event.entry.seq),
+      Number.POSITIVE_INFINITY,
+    );
+    const boundary = Number.isFinite(firstObservedSeq)
+      ? Math.min(state.journalCursor, Math.max(0, firstObservedSeq - 1))
+      : state.journalCursor;
+    await seedVoiceAnnouncementBoundary(boundary);
+    boundaryReady = true;
+    for (const event of buffered.splice(0)) enqueue(event);
+  }).catch((error) => {
+    notify(
+      "error",
+      "Voice announcement replay boundary unavailable",
+      error instanceof Error ? error.message : String(error),
+    );
   });
 }
 

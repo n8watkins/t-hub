@@ -381,6 +381,28 @@ fn claim_announcement(
     claim_announcement_at(&voice_settings_path(), seq, event_id.as_deref(), kind)
 }
 
+fn seed_announcement_boundary(seq: u64) -> Result<(), String> {
+    let _guard = VOICE_FILE_LOCK
+        .lock()
+        .map_err(|_| "voice settings lock poisoned".to_string())?;
+    seed_announcement_boundary_at(&voice_settings_path(), seq)
+}
+
+fn seed_announcement_boundary_at(path: &Path, seq: u64) -> Result<(), String> {
+    let mut root = read_json_root(path)?;
+    let current = root
+        .get("announcementStartupBoundarySeq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    root.as_object_mut()
+        .expect("filtered to object above")
+        .insert(
+            "announcementStartupBoundarySeq".into(),
+            serde_json::json!(current.max(seq)),
+        );
+    write_json_root_unlocked(path, &root)
+}
+
 fn claim_announcement_at(
     path: &Path,
     seq: u64,
@@ -405,6 +427,10 @@ fn claim_announcement_in_root(
         .get("lastHandledJournalSeq")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
+    let startup_boundary = root
+        .get("announcementStartupBoundarySeq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let identity = event_id
         .map(str::to_string)
         .unwrap_or_else(|| format!("journal-seq:{seq}"));
@@ -419,7 +445,7 @@ fn claim_announcement_in_root(
         })
         .unwrap_or_default();
     let too_old = seq.saturating_add(ANNOUNCEMENT_REORDER_WINDOW) <= high_water;
-    if too_old || handled.iter().any(|known| known == &identity) {
+    if seq <= startup_boundary || too_old || handled.iter().any(|known| known == &identity) {
         return (
             VoiceAnnouncementClaim {
                 should_announce: false,
@@ -689,6 +715,13 @@ pub async fn voice_announcement_claim(
     tauri::async_runtime::spawn_blocking(move || claim_announcement(seq, event_id, kind))
         .await
         .map_err(|e| format!("voice_announcement_claim task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn voice_announcement_seed_boundary(seq: u64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || seed_announcement_boundary(seq))
+        .await
+        .map_err(|e| format!("voice_announcement_seed_boundary task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1121,6 +1154,48 @@ mod tests {
         assert!(question.should_announce);
         assert!(!completion.should_announce);
         assert!(failure.should_announce);
+    }
+
+    #[test]
+    fn startup_boundary_suppresses_history_without_suppressing_new_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("voice.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "enabled": true,
+                "announcementPolicy": {
+                    "permission": true,
+                    "question": true,
+                    "completion": true,
+                    "failure": true,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        seed_announcement_boundary_at(&path, 40).unwrap();
+
+        let historical = claim_announcement_at(
+            &path,
+            40,
+            Some("historical-event"),
+            Some(VoiceAnnouncementKind::Permission),
+        )
+        .unwrap();
+        let current = claim_announcement_at(
+            &path,
+            41,
+            Some("current-event"),
+            Some(VoiceAnnouncementKind::Permission),
+        )
+        .unwrap();
+
+        assert!(!historical.should_announce);
+        assert!(current.should_announce);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["announcementStartupBoundarySeq"], 40);
     }
 
     #[test]

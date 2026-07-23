@@ -54,6 +54,10 @@ export function claimVoiceAnnouncement(
   return invoke("voice_announcement_claim", { seq, kind, eventId });
 }
 
+export function seedVoiceAnnouncementBoundary(seq: number): Promise<void> {
+  return invoke("voice_announcement_seed_boundary", { seq });
+}
+
 export type VoiceAnnouncementOutcomeStatus =
   | "succeeded"
   | "failed"

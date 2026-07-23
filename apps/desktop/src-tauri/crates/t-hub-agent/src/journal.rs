@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use t_hub_protocol::{EventJournalEntry, JournalSource};
+use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 /// Default journal location relative to `$HOME`: `~/.t-hub/journal`.
 const JOURNAL_SUBDIR: &str = ".t-hub/journal";
@@ -46,6 +46,7 @@ const MAX_HEAD_BYTES: usize = 128 * 1024;
 const MAX_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RECENT_EVENT_IDS: usize = 1024;
 const HEAD_VERSION: u8 = 2;
+const COMPACTION_WATERMARK_KEY: &str = "_t_hub_compaction_watermark";
 
 /// At agent startup, compact the journal once it exceeds this size. The
 /// incremental tail (see [`Journal::tail_from`]) keeps live delivery cheap at
@@ -417,6 +418,39 @@ impl Journal {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
+    fn is_compaction_watermark(entry: &EventJournalEntry) -> bool {
+        entry.event_type == JournalEventType::Unknown
+            && entry
+                .payload
+                .get(COMPACTION_WATERMARK_KEY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }
+
+    fn compaction_watermark(seq: u64, padding: Option<&str>) -> EventJournalEntry {
+        let mut payload = serde_json::json!({});
+        payload
+            .as_object_mut()
+            .expect("watermark payload is an object")
+            .insert(COMPACTION_WATERMARK_KEY.into(), serde_json::json!(true));
+        if let Some(padding) = padding {
+            payload
+                .as_object_mut()
+                .expect("watermark payload is an object")
+                .insert("padding".into(), serde_json::json!(padding));
+        }
+        EventJournalEntry {
+            seq,
+            timestamp_ms: 0,
+            source: JournalSource::Agent,
+            event_id: None,
+            entity_id: None,
+            event_type: JournalEventType::Unknown,
+            payload,
+            result: None,
+        }
+    }
+
     fn valid_recent_event_ids(state: &HeadState) -> bool {
         state.recent_event_ids.len() <= MAX_RECENT_EVENT_IDS
             && state.recent_event_ids.iter().all(|recent| {
@@ -688,7 +722,7 @@ impl Journal {
             match serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 Ok(mut entry) => {
                     seq = entry.seq.max(seq.saturating_add(1));
-                    if seq > after_seq {
+                    if seq > after_seq && !Self::is_compaction_watermark(&entry) {
                         entry.seq = seq;
                         out.push(entry);
                     }
@@ -789,8 +823,10 @@ impl Journal {
             // as recovery/replay); only count parseable entries toward `seq`.
             if let Ok(mut e) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 seq = e.seq.max(seq.saturating_add(1));
-                e.seq = seq;
-                out.push(e);
+                if !Self::is_compaction_watermark(&e) {
+                    e.seq = seq;
+                    out.push(e);
+                }
             }
         }
         Ok((out, pos, seq))
@@ -838,6 +874,8 @@ impl Journal {
 
         let mut kept: u64 = 0;
         let mut head_seq: u64 = 0;
+        let mut retained_head_seq: u64 = 0;
+        let mut compacted_len: u64 = 0;
         let mut recent_event_ids = Vec::new();
         {
             let file = Self::open_private_truncate(&tmp)
@@ -859,20 +897,41 @@ impl Journal {
                 if let Some(entry) = parsed.as_ref() {
                     head_seq = entry.seq.max(head_seq.saturating_add(1));
                 }
-                let is_status = parsed
-                    .as_ref()
-                    .is_some_and(|entry| entry.source == JournalSource::Status);
-                if !is_status {
+                let is_discarded = parsed.as_ref().is_some_and(|entry| {
+                    entry.source == JournalSource::Status || Self::is_compaction_watermark(entry)
+                });
+                if !is_discarded {
                     out.write_all(&line.bytes)
                         .context("writing compaction entry")?;
                     out.write_all(b"\n")?;
+                    compacted_len = compacted_len
+                        .checked_add(line.bytes.len() as u64 + 1)
+                        .context("compacted journal length overflow")?;
                     if let Some(entry) = parsed {
                         kept += 1;
+                        retained_head_seq = head_seq;
                         if let Some(event_id) = entry.event_id.as_deref() {
                             Self::remember_event_id(&mut recent_event_ids, event_id, head_seq);
                         }
                     }
                 }
+            }
+            if retained_head_seq < head_seq {
+                let mut watermark = serde_json::to_vec(&Self::compaction_watermark(head_seq, None))
+                    .context("serializing compaction watermark")?;
+                if compacted_len
+                    .checked_add(watermark.len() as u64 + 1)
+                    .context("compaction watermark length overflow")?
+                    == before
+                {
+                    watermark =
+                        serde_json::to_vec(&Self::compaction_watermark(head_seq, Some("x")))
+                            .context("serializing padded compaction watermark")?;
+                }
+                out.write_all(&watermark)
+                    .context("writing compaction watermark")?;
+                out.write_all(b"\n")
+                    .context("terminating compaction watermark")?;
             }
             out.flush().context("flushing compaction temp")?;
             let f = out.into_inner().context("finishing compaction temp")?;
@@ -1689,8 +1748,16 @@ mod tests {
             "compaction preserves the high-water sequence of dropped records"
         );
 
-        // A fresh process recovers the dropped record's high-water sequence
-        // from the sidecar before appending, and no Status survives.
+        let compacted_bytes = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+        assert!(
+            compacted_bytes.contains(COMPACTION_WATERMARK_KEY),
+            "the compacted journal itself carries the dropped trailing sequence"
+        );
+
+        // Simulate a crash after the compacted journal rename became durable
+        // but before the new head sidecar was published. A fresh process must
+        // recover the dropped record's high-water sequence from the journal.
+        std::fs::remove_file(dir.join(JOURNAL_HEAD_FILE)).unwrap();
         drop(j);
         let reopened = Journal::open(&dir).unwrap();
         assert_eq!(reopened.head_seq(), 4);

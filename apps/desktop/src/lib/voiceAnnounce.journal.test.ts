@@ -7,8 +7,12 @@ vi.mock("../ipc/voice", () => ({
   synthesizeVoice: vi.fn(() => Promise.resolve("d2F2")),
   recordVoiceAnnouncementOutcome: vi.fn(() => Promise.resolve()),
   recoverVoiceAnnouncements: vi.fn(() => Promise.resolve(null)),
+  seedVoiceAnnouncementBoundary: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("../ipc/client05", () => ({
+  agentState: vi.fn(() =>
+    Promise.resolve({ connection: "live", journalCursor: 0 }),
+  ),
   onJournal: vi.fn(),
 }));
 vi.mock("./voiceAudio", () => {
@@ -32,9 +36,11 @@ vi.mock("./notify", () => ({
 import {
   claimVoiceAnnouncement,
   recordVoiceAnnouncementOutcome,
+  seedVoiceAnnouncementBoundary,
   synthesizeVoice,
   type VoiceAnnouncementKind,
 } from "../ipc/voice";
+import { agentState, onJournal } from "../ipc/client05";
 import type { JournalEvent, JournalEventType } from "../ipc/protocol";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
 import { useEngineRuntime } from "../store/engineRuntime";
@@ -45,7 +51,9 @@ import {
   _pendingTextForTest,
   _resetVoiceAnnounceForTest,
   _setScribeListeningForTest,
+  flushPending,
   handleJournalEvent,
+  mountVoiceAnnounce,
 } from "./voiceAnnounce";
 
 function journal(
@@ -292,5 +300,66 @@ describe("provider-neutral journal announcements", () => {
       "interrupted",
       expect.stringContaining("active Captain, Crew, or Assignment"),
     );
+  });
+
+  it("records a held input cue as interrupted when the request resolves", async () => {
+    vi.mocked(claimVoiceAnnouncement).mockResolvedValue({
+      shouldAnnounce: true,
+      attemptId: "voice-attempt:v1:21",
+    });
+    _setScribeListeningForTest(true);
+    useSupervision.setState({
+      statuses: { "session-1": "needsPermission" },
+    });
+    await handleJournalEvent(journal(21, "permissionRequest"), 30_000);
+    expect(_pendingTextForTest()).toContain("needs permission");
+
+    useSupervision.setState({ statuses: { "session-1": "working" } });
+    flushPending(31_000);
+    await settle();
+
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    expect(recordVoiceAnnouncementOutcome).toHaveBeenCalledWith(
+      "voice-attempt:v1:21",
+      "interrupted",
+      expect.stringContaining("resolved before"),
+    );
+    expect(_pendingTextForTest()).toBeNull();
+  });
+
+  it("seeds the startup cursor before admitting later journal events", async () => {
+    let listener: ((event: JournalEvent) => void) | undefined;
+    vi.mocked(onJournal).mockImplementation((callback) => {
+      listener = callback;
+      return Promise.resolve(() => {});
+    });
+    vi.mocked(agentState).mockResolvedValue({
+      connection: "live",
+      journalCursor: 50,
+    });
+    vi.mocked(claimVoiceAnnouncement).mockImplementation((seq) =>
+      Promise.resolve({ shouldAnnounce: seq > 50 }),
+    );
+
+    mountVoiceAnnounce();
+    await settle();
+    expect(seedVoiceAnnouncementBoundary).toHaveBeenCalledWith(50);
+
+    listener?.(journal(50, "permissionRequest"));
+    listener?.(journal(51, "permissionRequest"));
+    await settle();
+    await settle();
+
+    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+      50,
+      "permission",
+      "provider-event:v1:50",
+    );
+    expect(claimVoiceAnnouncement).toHaveBeenCalledWith(
+      51,
+      "permission",
+      "provider-event:v1:51",
+    );
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
   });
 });

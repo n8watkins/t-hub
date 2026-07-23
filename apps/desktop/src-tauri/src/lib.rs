@@ -1048,6 +1048,7 @@ pub fn run() {
             voice::voice_settings_read,
             voice::voice_settings_write,
             voice::voice_announcement_claim,
+            voice::voice_announcement_seed_boundary,
             voice::voice_announcement_outcome,
             voice::voice_announcement_recover,
             voice::voice_list_voices,
