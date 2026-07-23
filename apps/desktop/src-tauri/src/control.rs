@@ -33659,6 +33659,28 @@ int main(int argc, char **argv) {
         }
     }
 
+    struct ManagedCortanaTestCleanup {
+        ctx: Arc<ControlContext>,
+    }
+
+    impl ManagedCortanaTestCleanup {
+        fn new(ctx: Arc<ControlContext>) -> Self {
+            Self { ctx }
+        }
+    }
+
+    impl Drop for ManagedCortanaTestCleanup {
+        fn drop(&mut self) {
+            let durable = self.ctx.captains.cortana_identity();
+            if let (Some(launch), Some(owner)) =
+                (durable.managed_launch.as_ref(), durable.owner.as_ref())
+            {
+                let _ =
+                    tmux::retire_managed_runtime(&launch.tmux_target, &tmux_cortana_owner(owner));
+            }
+        }
+    }
+
     fn process_permission_attestation(
         expected: Harness,
         executable_name: &str,
@@ -49968,6 +49990,7 @@ int main(int argc, char **argv) {
         let mut context = test_ctx("cortana-post-claim-revalidation").with_apply_sink(sink);
         context.addr = "127.0.0.1:4258".into();
         let ctx = Arc::new(context);
+        let _runtime_cleanup = ManagedCortanaTestCleanup::new(Arc::clone(&ctx));
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
             name: CAPTAIN_WORKSPACE_NAME.into(),
@@ -50079,6 +50102,7 @@ int main(int argc, char **argv) {
             test_ctx(&format!("cortana-owner-generation-{case}")).with_apply_sink(sink);
         context.addr = "127.0.0.1:4261".into();
         let ctx = Arc::new(context);
+        let _runtime_cleanup = ManagedCortanaTestCleanup::new(Arc::clone(&ctx));
         ctx.tab_registry().replace(vec![TabRecord {
             id: CAPTAIN_WORKSPACE_ID.into(),
             name: CAPTAIN_WORKSPACE_NAME.into(),
@@ -50351,8 +50375,14 @@ int main(int argc, char **argv) {
     fn captured_packaged_observed_launch_requires_its_wal_before_generic_planning() {
         let fixture: Value =
             serde_json::from_str(PACKAGED_SCHEMA_25_OBSERVED_LAUNCH_FIXTURE).unwrap();
-        let snapshot: CaptainsSnapshot =
-            serde_json::from_value(fixture["captainsSnapshot"].clone()).unwrap();
+        let registry_path = captains_tmp("captured-observed-planning");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&fixture["captainsSnapshot"]).unwrap(),
+        )
+        .unwrap();
+        let snapshot = CaptainsRegistry::read_snapshot(&registry_path).unwrap();
+        std::fs::remove_file(registry_path).unwrap();
         CaptainsRegistry::validate_snapshot(&snapshot).unwrap();
         let durable = snapshot.cortana;
         let launch = durable.managed_launch.as_ref().unwrap();
