@@ -553,6 +553,12 @@ Assert-BoundedCliString $CollectorRepositoryCommit "collector repository commit"
 Assert-BoundedCliString $ExecutablePath "executable path" 1024
 Assert-BoundedCliString $RuntimeEvidencePath "runtime evidence path" 1024
 Assert-BoundedCliString $Package5ManifestPath "Package 5 manifest path" 1024
+if ($WorkloadVersion -notmatch '^v[0-9]+$') { throw "workload version must use the canonical vN form" }
+if ($WorkloadSeed -notmatch '^[A-Za-z0-9._-]+$') { throw "workload seed must use the canonical token form" }
+if ($WslVersion.Length -gt 0 -and $WslVersion -notmatch '^v[0-9]+(?:\.[0-9]+){0,2}$') { throw "WSL version must use the canonical vN form" }
+if ($WslDistro.Length -gt 0 -and $WslDistro -notmatch '^[A-Za-z0-9._-]+$') { throw "WSL distro must use the canonical token form" }
+if ($PowerMode.Length -gt 0 -and $PowerMode -notmatch '^(ac|dc|balanced|high_performance)$') { throw "power mode must use a canonical enum" }
+if ($ReferenceSelectionReason.Length -gt 0 -and $ReferenceSelectionReason -notmatch '^[A-Za-z0-9 ._/-]+$') { throw "reference selection reason contains unsupported text" }
 
 $initialSnapshot = @(Get-ProcessSnapshot)
 $candidateRoots = @(Get-CandidateRoots $initialSnapshot)
@@ -790,7 +796,7 @@ $artifact = [ordered]@{
         executable_path_filter = $ExecutablePath
         selected_root_process_id = $firstRoot.process_id
         selected_root_creation_time_utc = $firstRoot.creation_time_utc
-        setup_note = $SetupNote
+        setup_note = $null
         cpu_definition = "CPU seconds consumed divided by wall seconds; 1.0 equals one fully utilized logical core. Intervals with process births or deaths are incomplete and excluded from CPU release statistics. Their observed lower bound is diagnostic only."
         quantile_definition = "p50 and p95 use the nearest-rank empirical quantile: sorted[ceil(p*n)-1]."
     }
