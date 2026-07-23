@@ -123,6 +123,7 @@ $expectedValidation = [ordered]@{ rawSha256 = $rawHash; installerSha256 = $insta
 if ($installedHash) { $expectedValidation.installedSha256 = $installedHash }
 if ($InstalledBinaryPath) {
   if ([string]::IsNullOrWhiteSpace($InstalledAt)) { throw "InstalledAt is required when InstalledBinaryPath is provided" }
+  if ($InstalledAt -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$') { throw "InstalledAt must be an RFC3339 timestamp" }
   try { [DateTimeOffset]::Parse($InstalledAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) | Out-Null } catch { throw "InstalledAt must be an RFC3339 timestamp" }
 }
 if ($ValidationPath) {
