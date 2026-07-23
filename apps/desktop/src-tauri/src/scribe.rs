@@ -80,6 +80,7 @@ const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 const V1_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const V1_OVERALL_TIMEOUT: Duration = Duration::from_millis(750);
 static SCRIBE_EVENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SCRIBE_STATUS_EMITTER_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// The result T-Hub acts on. `listening` is the COMPUTED effective gate value,
 /// sourced from the snapshot's `busy` flag (after the fail-open rules);
@@ -491,21 +492,54 @@ pub fn read_scribe_status() -> ScribeStatus {
     combine_candidates(&cands)
 }
 
-#[tauri::command]
-pub async fn scribe_status(app: tauri::AppHandle) -> Result<ScribeStatus, String> {
-    let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
-        .await
-        .map_err(|e| format!("scribe_status task failed: {e}"))?;
-    let generation = SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = app.emit("scribe://status", serde_json::json!({
+fn status_event_payload(status: &ScribeStatus, generation: u64, observed_at_ms: i64) -> serde_json::Value {
+    serde_json::json!({
         "listening": status.listening,
         "status": status.status,
         "since": status.since,
         "source": status.source,
         "sourceIdentity": status.source.unwrap_or("unknown"),
         "generation": generation,
-        "observedAtMs": now_ms(),
-    }));
+        "observedAtMs": observed_at_ms,
+    })
+}
+
+fn emit_status_event(app: &tauri::AppHandle, status: &ScribeStatus) {
+    let generation = SCRIBE_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = app.emit(
+        "scribe://status",
+        status_event_payload(status, generation, now_ms()),
+    );
+}
+
+/// Start the backend event producer once Tauri has an AppHandle.
+///
+/// Scribe's v1 contract is currently a pull endpoint, so this producer uses
+/// the same bounded discovery + file fallback resolver as `scribe_status` and
+/// publishes a sanitized snapshot at 1 Hz.  Frontend consumers therefore use
+/// events as the normal path while retaining a bounded poll watchdog when the
+/// producer is unavailable.  Discovery is re-read on every tick, so a Scribe
+/// restart with a new endpoint, token, or PID is observed without a T-Hub
+/// restart.  No endpoint token or raw Scribe payload is ever emitted.
+pub fn start_scribe_status_emitter(app: tauri::AppHandle) {
+    if SCRIBE_STATUS_EMITTER_STARTED.set(()).is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("scribe-status-emitter".to_string())
+        .spawn(move || loop {
+            emit_status_event(&app, &read_scribe_status());
+            std::thread::sleep(Duration::from_secs(1));
+        })
+        .expect("spawn scribe status emitter");
+}
+
+#[tauri::command]
+pub async fn scribe_status(app: tauri::AppHandle) -> Result<ScribeStatus, String> {
+    let status = tauri::async_runtime::spawn_blocking(read_scribe_status)
+        .await
+        .map_err(|e| format!("scribe_status task failed: {e}"))?;
+    emit_status_event(&app, &status);
     Ok(status)
 }
 
@@ -540,6 +574,27 @@ mod tests {
     /// fallback files that must read as fresh through the real clock.
     fn iso_now() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    #[test]
+    fn status_event_payload_is_bounded_and_generation_tagged() {
+        let payload = status_event_payload(
+            &ScribeStatus {
+                listening: true,
+                status: Some("Recording".to_string()),
+                since: Some(json!("2026-07-08T12:00:00.000Z")),
+                source: Some("v1"),
+            },
+            42,
+            1234,
+        );
+        assert_eq!(payload["listening"], json!(true));
+        assert_eq!(payload["generation"], json!(42));
+        assert_eq!(payload["observedAtMs"], json!(1234));
+        assert_eq!(payload["sourceIdentity"], json!("v1"));
+        let encoded = serde_json::to_string(&payload).expect("payload serializes");
+        assert!(!encoded.contains("readToken"));
+        assert!(!encoded.contains("Authorization"));
     }
 
     /// Fallback-file read as the production path composes it (file only).

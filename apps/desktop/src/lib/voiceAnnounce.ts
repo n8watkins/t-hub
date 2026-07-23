@@ -52,7 +52,7 @@ export const FALLBACK_ALERT_MIN_GAP_MS = 60000;
 /** Compatibility fallback interval until Scribe emits its first event. */
 export const SCRIBE_POLL_MS = 1000;
 /** Events are trusted only while a fresh producer heartbeat is observed. */
-export const SCRIBE_EVENT_TTL_MS = 5000;
+export const SCRIBE_EVENT_TTL_MS = 3000;
 
 /** After the general STOPS dictating, wait this long before delivering a held
  *  announcement - a brief pause between phrases should not trigger delivery

@@ -627,6 +627,10 @@ pub fn run() {
             // actually emits on them.
             use tauri::Manager;
             let state = app.state::<AppState>().inner().clone();
+            // Publish the Scribe gate independently of frontend pull calls.
+            // The producer re-resolves Scribe at 1 Hz and the frontend keeps a
+            // bounded fallback watchdog for older or unavailable emitters.
+            scribe::start_scribe_status_emitter(app.handle().clone());
             // Arm the host main-thread hang watchdog (catches the sporadic
             // Not-Responding/Alt-Tab-ghost freeze that the renderer-side JS detector
             // can't see). Logs {"t":"hang","src":"rust-main",...} to the diag file.
