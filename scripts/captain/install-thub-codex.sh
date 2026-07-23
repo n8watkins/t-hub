@@ -59,9 +59,27 @@ if ! command -v flock >/dev/null 2>&1; then
   echo "install-thub-codex: flock is required for safe installation" >&2
   exit 1
 fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "install-thub-codex: jq is required to verify the MCP catalog" >&2
+  exit 1
+fi
 
-if ! "$SOURCE" --list-tools >/dev/null 2>&1; then
+SOURCE_CATALOG="$("$SOURCE" --list-tools 2>/dev/null)" || {
   echo "install-thub-codex: source binary failed its offline catalog probe: $SOURCE" >&2
+  exit 1
+}
+if ! printf '%s' "$SOURCE_CATALOG" | jq -e '
+  [(.tools // .)[] | select(.name == "cortana_bootstrap")]
+  | length == 1
+    and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
+    and .[0].annotations["t-hubTier"] == "read"
+    and .[0].annotations.confirmationRequired == false
+    and .[0].annotations.readOnlyHint == true
+    and .[0].annotations.destructiveHint == false
+    and .[0].annotations.idempotentHint == true
+    and .[0].annotations.openWorldHint == false
+' >/dev/null; then
+  echo "install-thub-codex: source binary lacks the exact cortana_bootstrap catalog contract: $SOURCE" >&2
   exit 1
 fi
 

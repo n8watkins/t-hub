@@ -27,7 +27,7 @@ SOURCE="$WORK/source-t-hub-mcp"
 cat > "$SOURCE" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--list-tools" ]; then
-  printf '[{"name":"list_terminals"},{"name":"claim_captain"}]\n'
+  printf '{"tools":[{"name":"list_terminals"},{"name":"claim_captain"},{"name":"cortana_bootstrap","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"t-hubTier":"read","confirmationRequired":false,"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}]}\n'
   exit 0
 fi
 exit 1
@@ -50,6 +50,29 @@ for bad_args in \
     fail "installer accepted or misclassified flags: $bad_args"
   fi
 done
+
+mkdir -p "$BIN_DIR"
+printf 'known-good binary\n' > "$BIN_DIR/t-hub-mcp"
+chmod 700 "$BIN_DIR/t-hub-mcp"
+STALE_SOURCE="$WORK/stale-source-t-hub-mcp"
+cat > "$STALE_SOURCE" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list-tools" ]; then
+  printf '{"tools":[{"name":"list_terminals"}]}\n'
+  exit 0
+fi
+exit 1
+EOF
+chmod 700 "$STALE_SOURCE"
+if T_HUB_MCP_SOURCE="$STALE_SOURCE" T_HUB_BIN_DIR="$BIN_DIR" \
+  T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "installer accepted a stale MCP catalog"
+elif [ "$(cat "$BIN_DIR/t-hub-mcp")" = "known-good binary" ]; then
+  pass "stale MCP catalog is refused before replacing the installed binary"
+else
+  fail "stale MCP catalog changed the installed binary"
+fi
+rm -f "$BIN_DIR/t-hub-mcp"
 
 if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "isolated install exits 0"

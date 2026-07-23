@@ -42,12 +42,30 @@ FAKE_BIN="$WORK/t-hub-mcp"
 cat > "$FAKE_BIN" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--list-tools" ]; then
-  printf '[{"name":"list_terminals"}]\n'
+  printf '{"tools":[{"name":"list_terminals"},{"name":"cortana_bootstrap","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"t-hubTier":"read","confirmationRequired":false,"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}]}\n'
   exit 0
 fi
 exit 1
 EOF
 chmod 700 "$FAKE_BIN"
+
+STALE_BIN="$WORK/stale-t-hub-mcp"
+cat > "$STALE_BIN" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list-tools" ]; then
+  printf '{"tools":[{"name":"list_terminals"}]}\n'
+  exit 0
+fi
+exit 1
+EOF
+chmod 700 "$STALE_BIN"
+if T_HUB_MCP_BIN="$STALE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "provisioner accepted a stale MCP catalog"
+elif [ ! -e "$WORK/config.toml" ]; then
+  pass "stale MCP catalog is refused before changing Codex config"
+else
+  fail "stale MCP catalog changed Codex config"
+fi
 
 # Pre-seed a user config with [hooks] + [hooks.state] trust blocks (the clobber
 # risk the provisioner must not touch).

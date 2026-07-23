@@ -59,8 +59,22 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-if ! "$BIN" --list-tools >/dev/null 2>&1; then
+BIN_CATALOG="$("$BIN" --list-tools 2>/dev/null)" || {
   echo "ensure-thub-codex: t-hub MCP binary failed its offline catalog probe: $BIN" >&2
+  exit 1
+}
+if ! printf '%s' "$BIN_CATALOG" | jq -e '
+  [(.tools // .)[] | select(.name == "cortana_bootstrap")]
+  | length == 1
+    and .[0].inputSchema == {"type":"object","properties":{},"additionalProperties":false}
+    and .[0].annotations["t-hubTier"] == "read"
+    and .[0].annotations.confirmationRequired == false
+    and .[0].annotations.readOnlyHint == true
+    and .[0].annotations.destructiveHint == false
+    and .[0].annotations.idempotentHint == true
+    and .[0].annotations.openWorldHint == false
+' >/dev/null; then
+  echo "ensure-thub-codex: t-hub MCP binary lacks the exact cortana_bootstrap catalog contract: $BIN" >&2
   exit 1
 fi
 
