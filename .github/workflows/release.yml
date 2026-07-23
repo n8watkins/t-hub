@@ -185,7 +185,7 @@ jobs:
             -PnpmVersion (pnpm --version) `
             -RustVersion (rustc --version) `
             -AppVersion ((Get-Content apps/desktop/package.json | ConvertFrom-Json).version) `
-            -ValidationPath "$releaseDir/dev-installer-evidence/dev-installer-validation.json" | Out-Host
+            | Out-Host
 
       # The in-app updater fetches latest.json from the latest release; it points
       # at the signed NSIS installer of this release.

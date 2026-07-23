@@ -8,7 +8,9 @@ param(
   [Parameter(Mandatory = $true)] [string]$ExpectedBinaryPath,
   [Parameter(Mandatory = $true)] [string]$ExtractedBinaryPath,
   [Parameter(Mandatory = $true)] [string]$ValidatorPath,
+  [string]$ValidationPath = "",
   [string]$InstalledBinaryPath = "",
+  [string]$InstalledAt = "",
   [string]$InstallerScriptPath = "",
   [string]$Workflow = "",
   [string]$RunId = "",
@@ -22,8 +24,7 @@ param(
   [string]$TargetTriple = "x86_64-pc-windows-msvc",
   [string[]]$FeatureSet = @("devbuild"),
   [string]$AppVersion = "",
-  [int]$ProtocolVersion = 2,
-  [string]$ValidationPath = ""
+  [int]$ProtocolVersion = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -120,7 +121,13 @@ if ($expectedHash -cne $extractedHash) { throw "expected binary hash must equal 
 if ($installedHash -and $installedHash -cne $expectedHash) { throw "installed binary hash must equal expected/extracted binary hash" }
 $expectedValidation = [ordered]@{ rawSha256 = $rawHash; installerSha256 = $installerHash; expectedSha256 = $expectedHash; extractedSha256 = $extractedHash }
 if ($installedHash) { $expectedValidation.installedSha256 = $installedHash }
-$validation = Read-SafeValidation $ValidationPath $expectedValidation
+if ($InstalledBinaryPath -and [string]::IsNullOrWhiteSpace($InstalledAt)) { throw "InstalledAt is required when InstalledBinaryPath is provided" }
+if ($ValidationPath) {
+  $validationResolved = Resolve-File $ValidationPath "validation evidence"
+  if ($validationResolved -cne $ValidatorPath) { throw "ValidationPath must equal ValidatorPath" }
+}
+$validation = Read-SafeValidation $ValidatorPath $expectedValidation
+if (-not $ExpectedValidation.Contains("installedSha256") -and $null -ne $validation.PSObject.Properties["installedSha256"]) { throw "validator evidence installedSha256 is not allowed for an uninstalled manifest" }
 $now = (Get-Date).ToUniversalTime().ToString("o")
 
 $manifest = [ordered]@{
@@ -164,7 +171,7 @@ $manifest = [ordered]@{
     validator = [ordered]@{ path = Relative-EvidencePath $ValidatorPath; sha256 = Hash-File $ValidatorPath; passed = $true }
   }
   installation = if ($InstalledBinaryPath) {
-    [ordered]@{ status = "installed"; installedAt = $now; productName = "T-Hub Dev"; bundleIdentifier = "com.t-hub.dev"; executableName = "t-hub-dev.exe"; installationTarget = $InstalledBinaryPath }
+    [ordered]@{ status = "installed"; installedAt = $InstalledAt; productName = "T-Hub Dev"; bundleIdentifier = "com.t-hub.dev"; executableName = "t-hub-dev.exe"; installationTarget = (Split-Path -Parent $InstalledBinaryPath) }
   } else {
     [ordered]@{ status = "not_installed"; installedAt = $null; productName = "T-Hub Dev"; bundleIdentifier = "com.t-hub.dev"; executableName = "t-hub-dev.exe"; installationTarget = $null }
   }
