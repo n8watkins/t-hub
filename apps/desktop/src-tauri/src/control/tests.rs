@@ -18814,7 +18814,7 @@ fn non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects() {
                 .to_string(),
         );
         let before_dispatch = ctx.captains.snapshot();
-        let dispatch_refusal = dispatch_authenticated(
+        let retired_dispatch = dispatch_authenticated(
             &ctx,
             req(
                 "non-git-captain",
@@ -18826,7 +18826,15 @@ fn non_git_captain_checkpoint_reload_and_bootstrap_preserve_real_projects() {
                 }),
             ),
         );
-        assert_native_git_required(dispatch_refusal, "dispatch_crew");
+        assert!(!retired_dispatch.ok);
+        assert_eq!(retired_dispatch.error_kind, None);
+        assert_eq!(
+            retired_dispatch.error.as_deref(),
+            Some(
+                "control: command 'dispatch_crew' is not exposed over the control channel \
+                 (process-changing/destructive commands are gated; see PRD §11.2)"
+            )
+        );
         assert_eq!(ctx.captains.snapshot().seq, before_dispatch.seq);
         let checkpoint = dispatch(
             &ctx,
@@ -21840,10 +21848,6 @@ fn command_tiers_are_classified() {
         assert_eq!(required_tier(command), CommandTier::Read);
     }
     assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
-    assert_eq!(
-        required_tier("complete_crew_powder"),
-        CommandTier::ProcessChanging
-    );
     assert_eq!(required_tier("new_tab"), CommandTier::Organization);
     assert_eq!(required_tier("history_focus"), CommandTier::Organization);
     assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
@@ -24742,7 +24746,7 @@ fn crew_cannot_self_assign_the_reserved_cortana_role_or_slug() {
 }
 
 #[test]
-fn captain_cannot_close_or_heartbeat_foreign_crew() {
+fn captain_cannot_close_foreign_crew() {
     let store = Arc::new(crate::identity::IdentityStore::ephemeral());
     let reg = Arc::new(CaptainsRegistry::new());
     reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
@@ -24771,15 +24775,18 @@ fn captain_cannot_close_or_heartbeat_foreign_crew() {
         .with_identity_store(store)
         .with_captains_registry(reg);
 
-    for (command, args) in [
-        ("close_terminal", json!({"sessionId": "crew-b"})),
-        ("heartbeat_crew_powder", json!({"crewSessionId": "crew-b"})),
-    ] {
-        let response = dispatch_authenticated(&ctx, req_session("ctrl", &captain, command, args));
-        assert!(!response.ok);
-        let error = response.error.unwrap_or_default();
-        assert!(error.starts_with("acl:"), "got: {error}");
-    }
+    let response = dispatch_authenticated(
+        &ctx,
+        req_session(
+            "ctrl",
+            &captain,
+            "close_terminal",
+            json!({"sessionId": "crew-b"}),
+        ),
+    );
+    assert!(!response.ok);
+    let error = response.error.unwrap_or_default();
+    assert!(error.starts_with("acl:"), "got: {error}");
 }
 
 #[test]
