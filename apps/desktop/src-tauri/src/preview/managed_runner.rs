@@ -18,10 +18,6 @@ use super::model::{PreviewPackageManager, PreviewTarget, PreviewTargetKind};
 const MAX_MANAGED_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_MARKER_BYTES: u64 = 512;
 const MAX_PROC_STAT_BYTES: u64 = 4096;
-#[cfg(target_os = "linux")]
-const MAX_PROC_ENTRIES: usize = 32_768;
-#[cfg(target_os = "linux")]
-const MAX_FDS_PER_PROCESS: usize = 4096;
 
 #[derive(Default)]
 pub(crate) struct BoundedOutput {
@@ -454,141 +450,7 @@ fn signal_exact_process_group_with(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn listener_ownership(port: u16) -> Result<Option<ListenerOwnership>, String> {
-    if port == 0 {
-        return Err("managed Preview listener port must be nonzero".into());
-    }
-    let mut socket_inodes = std::collections::BTreeSet::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let contents = std::fs::read_to_string(table)
-            .map_err(|error| format!("read managed Preview listener table {table}: {error}"))?;
-        if contents.len() > 8 * 1024 * 1024 {
-            return Err("managed Preview listener table exceeds its bound".into());
-        }
-        for line in contents.lines().skip(1) {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            let Some((_, encoded_port)) = fields.get(1).and_then(|local| local.rsplit_once(':'))
-            else {
-                continue;
-            };
-            let Some(observed_port) = u16::from_str_radix(encoded_port, 16).ok() else {
-                continue;
-            };
-            if observed_port == port && fields.get(3) == Some(&"0A") {
-                let inode = fields
-                    .get(9)
-                    .ok_or("managed Preview listener table omitted its socket inode")?;
-                if !inode.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err("managed Preview listener table has an invalid socket inode".into());
-                }
-                socket_inodes.insert((*inode).to_string());
-            }
-        }
-    }
-    if socket_inodes.is_empty() {
-        return Ok(None);
-    }
-
-    let mut processes = std::fs::read_dir("/proc")
-        .map_err(|error| format!("enumerate managed Preview listener owners: {error}"))?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            if !name.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-            Some((name.parse::<u32>().ok()?, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    if processes.len() > MAX_PROC_ENTRIES {
-        return Err("managed Preview process enumeration exceeds its bound".into());
-    }
-    processes.sort_by_key(|(pid, _)| *pid);
-
-    let mut ownership = std::collections::BTreeSet::new();
-    for (pid, process_path) in processes {
-        let Ok(entries) = std::fs::read_dir(process_path.join("fd")) else {
-            continue;
-        };
-        let mut inspected = 0usize;
-        let mut owns_listener = false;
-        for entry in entries {
-            inspected += 1;
-            if inspected > MAX_FDS_PER_PROCESS {
-                return Err("managed Preview file descriptor enumeration exceeds its bound".into());
-            }
-            let Ok(entry) = entry else { continue };
-            let Ok(target) = std::fs::read_link(entry.path()) else {
-                continue;
-            };
-            let target = target.to_string_lossy();
-            let Some(inode) = target
-                .strip_prefix("socket:[")
-                .and_then(|value| value.strip_suffix(']'))
-            else {
-                continue;
-            };
-            if socket_inodes.contains(inode) {
-                owns_listener = true;
-                break;
-            }
-        }
-        if owns_listener {
-            let owner = process_group_identity_for_pid(pid)?;
-            ownership.insert((owner.process_group_id, owner.process_group_started_at));
-        }
-    }
-    match ownership.into_iter().collect::<Vec<_>>().as_slice() {
-        [] => Ok(None),
-        [(process_group_id, process_group_started_at)] => Ok(Some(ListenerOwnership {
-            process_group_id: *process_group_id,
-            process_group_started_at: *process_group_started_at,
-        })),
-        _ => Err("managed Preview listener ownership is ambiguous".into()),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_group_identity_for_pid(pid: u32) -> Result<ListenerOwnership, String> {
-    let fields = read_proc_stat_fields(pid)?;
-    let process_group_id = fields
-        .get(2)
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .ok_or("managed Preview listener owner has an invalid process group")?;
-    let leader = read_proc_stat_fields(process_group_id)?;
-    let leader_group = leader
-        .get(2)
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or("managed Preview process-group leader has an invalid group")?;
-    let process_group_started_at = leader
-        .get(19)
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or("managed Preview process-group leader has invalid start ticks")?;
-    if leader_group != process_group_id {
-        return Err("managed Preview process-group leader identity changed".into());
-    }
-    Ok(ListenerOwnership {
-        process_group_id,
-        process_group_started_at,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn read_proc_stat_fields(pid: u32) -> Result<Vec<String>, String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("read managed Preview listener process identity: {error}"))?;
-    if stat.len() as u64 > MAX_PROC_STAT_BYTES {
-        return Err("managed Preview listener process stat exceeds its bound".into());
-    }
-    Ok(stat
-        .rsplit_once(") ")
-        .ok_or("managed Preview listener process stat has an invalid shape")?
-        .1
-        .split_whitespace()
-        .map(str::to_string)
-        .collect())
+    super::proc_listener::listener_ownership(port)
 }
 
 fn package_manager_executable(manager: PreviewPackageManager) -> &'static str {
@@ -687,7 +549,9 @@ mod tests {
     fn listener_inspection_resolves_exact_process_group_identity() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let expected = process_group_identity_for_pid(std::process::id()).unwrap();
+        let expected =
+            crate::preview::proc_listener::process_group_identity_for_pid(std::process::id())
+                .unwrap();
         let observed = listener_ownership(port)
             .unwrap()
             .expect("bound listener should have one owner");
