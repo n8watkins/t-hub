@@ -1110,8 +1110,23 @@ fn respond_static(
 }
 
 fn start_static_server(cwd: &str, run_id: &str) -> Result<(StaticServer, String), String> {
+    let (server, entrypoint_url) = start_static_server_at(cwd, run_id, "index.html")?;
+    let authority = entrypoint_url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(authority, _)| authority)
+        .ok_or("static Preview helper returned an invalid URL")?;
+    Ok((server, format!("http://{authority}/")))
+}
+
+fn start_static_server_at(
+    cwd: &str,
+    run_id: &str,
+    entrypoint: &str,
+) -> Result<(StaticServer, String), String> {
     let root = open_static_root(cwd)?;
-    open_static_file(&root, "/")
+    let request_path = format!("/{}", entrypoint.trim_start_matches('/'));
+    open_static_file(&root, &request_path)
         .map_err(|()| "the static site entrypoint is no longer a regular file".to_string())?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("failed to bind static preview: {error}"))?;
@@ -1169,8 +1184,53 @@ fn start_static_server(cwd: &str, run_id: &str) -> Result<(StaticServer, String)
             thread: Some(thread),
             active_responses,
         },
-        format!("http://127.0.0.1:{}/", address.port()),
+        format!(
+            "http://127.0.0.1:{}{}",
+            address.port(),
+            encode_static_url_path(&request_path)
+        ),
     ))
+}
+
+fn encode_static_url_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn run_preview_static_helper(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("--t-hub-preview-static-helper") {
+        return None;
+    }
+    let [_, root, entrypoint, run_id] = args else {
+        eprintln!("invalid supervised static Preview helper arguments");
+        return Some(64);
+    };
+    if run_id.is_empty()
+        || run_id.len() > 160
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        eprintln!("invalid supervised static Preview run identity");
+        return Some(65);
+    }
+    let (_server, url) = match start_static_server_at(root, run_id, entrypoint) {
+        Ok(started) => started,
+        Err(error) => {
+            eprintln!("{error}");
+            return Some(66);
+        }
+    };
+    println!("{url}");
+    let _ = std::io::stdout().flush();
+    loop {
+        std::thread::park();
+    }
 }
 
 #[tauri::command]
@@ -2036,6 +2096,50 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn supervised_static_helper_validates_and_advertises_selected_entrypoint() {
+        use std::io::{Read, Write};
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("custom page.html"), "CUSTOM ENTRYPOINT").unwrap();
+        let (server, url) = start_static_server_at(
+            root.path().to_str().unwrap(),
+            "static-entrypoint",
+            "custom page.html",
+        )
+        .unwrap();
+        assert!(url.ends_with("/custom%20page%2Ehtml"));
+        let rest = url.strip_prefix("http://127.0.0.1:").unwrap();
+        let (port, path) = rest.split_once('/').unwrap();
+        let port = port.parse::<u16>().unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("CUSTOM ENTRYPOINT"));
+        server.stop();
+
+        assert_eq!(run_preview_static_helper(&[]), None);
+        assert_eq!(
+            run_preview_static_helper(&["--t-hub-preview-static-helper".into()]),
+            Some(64)
+        );
+        assert!(start_static_server_at(
+            root.path().to_str().unwrap(),
+            "static-missing",
+            "../outside.html"
+        )
+        .is_err());
     }
 
     #[test]

@@ -559,6 +559,10 @@ pub fn brand_name() -> &'static str {
     }
 }
 
+pub fn run_preview_static_helper(args: &[String]) -> Option<i32> {
+    devserver::run_preview_static_helper(args)
+}
+
 pub fn run() {
     // Must run before any `T_HUB_*`-backed LazyLock (socket/control/diag) is
     // first touched — i.e. before the Tauri builder spawns anything.
