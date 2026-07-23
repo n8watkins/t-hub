@@ -31,7 +31,8 @@ Exercise the following matrix in the installed Windows Dev build:
 At every matrix point, Terminal, Files, and Preview must remain visible as nonzero controls inside the tile header.
 No header control, identity marker, branch chip, status indicator, or context meter may overlap another visible control.
 Long text may truncate or disappear according to the responsive priority rules, but it must not displace the three panel controls.
-Preview must use the Eye icon and expose exactly `Preview` in visible text, its tooltip, and its accessible name.
+Preview must use the Eye icon and expose exactly `Preview` as visible text whenever responsive labels are shown.
+Its tooltip and accessible name must remain exactly `Preview` at every density, including the icon-only tiers where the visible label is intentionally hidden.
 
 ## Keyboard and accessibility gate
 
