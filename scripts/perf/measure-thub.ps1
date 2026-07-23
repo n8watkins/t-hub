@@ -526,7 +526,7 @@ function Assert-BoundedCliString {
     if ($Value.Length -gt $Maximum -or $Value -match '[\x00-\x1f]') {
         throw "$Name exceeds the bounded CLI string contract"
     }
-    if ($RejectSensitive -and $Value -match '(?i)(token|secret|password|credential|transcript|prompt|payload|content|command)') {
+    if ($RejectSensitive -and $Value -match '(?i)\b(token|secret|password|credential|transcript|prompt|payload|content|command)\b') {
         throw "$Name contains a prohibited sensitive-content marker"
     }
 }

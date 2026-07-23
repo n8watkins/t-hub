@@ -28,6 +28,8 @@ protocol_version=2
 wsl_version=""
 wsl_distro=""
 wsl_memory_bytes=""
+power_mode=""
+display_scale=""
 setup_note="idle terminals at shell prompts"
 dry_run=false
 
@@ -57,6 +59,8 @@ Options:
   --wsl-version V      Observed WSL version (required for eligibility)
   --wsl-distro NAME    Observed WSL distro identity (required for eligibility)
   --wsl-memory-bytes N Observed WSL memory bytes (required for eligibility)
+  --power-mode NAME   Observed host power mode (required for eligibility)
+  --display-scale N   Observed display scale percent (required for eligibility)
   --setup-note TEXT   Workload and tab-layout note stored in benchmark metadata
   --dry-run           Validate arguments and print the PowerShell invocation only
   --help              Show this help
@@ -66,6 +70,18 @@ EOF
 require_value() {
   if [ "$#" -lt 2 ] || [ -z "$2" ]; then
     echo "run-thub-benchmark: $1 requires a value" >&2
+    exit 2
+  fi
+}
+
+validate_text() {
+  local name="$1" value="$2" maximum="$3"
+  if [ "${#value}" -gt "$maximum" ] || [[ "$value" =~ [[:cntrl:]] ]]; then
+    echo "run-thub-benchmark: $name exceeds its bounded text contract" >&2
+    exit 2
+  fi
+  if [[ "$value" =~ (^|[^[:alnum:]])(token|secret|password|credential|transcript|prompt|payload|content|command)([^[:alnum:]]|$) ]]; then
+    echo "run-thub-benchmark: $name contains a prohibited sensitive-content marker" >&2
     exit 2
   fi
 }
@@ -101,6 +117,8 @@ while [ "$#" -gt 0 ]; do
     --wsl-version) require_value "$@"; wsl_version="$2"; shift 2 ;;
     --wsl-distro) require_value "$@"; wsl_distro="$2"; shift 2 ;;
     --wsl-memory-bytes) require_value "$@"; wsl_memory_bytes="$2"; shift 2 ;;
+    --power-mode) require_value "$@"; power_mode="$2"; shift 2 ;;
+    --display-scale) require_value "$@"; display_scale="$2"; shift 2 ;;
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -116,6 +134,7 @@ case "$warmup_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --warmup-second
 case "$sample_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --sample-seconds must be an integer" >&2; exit 2 ;; esac
 case "$observed_terminals" in ''|*[!0-9]*) [ -z "$observed_terminals" ] || { echo "run-thub-benchmark: --observed-terminals must be an integer" >&2; exit 2; } ;; esac
 case "$wsl_memory_bytes" in ''|*[!0-9]*) [ -z "$wsl_memory_bytes" ] || { echo "run-thub-benchmark: --wsl-memory-bytes must be an integer" >&2; exit 2; } ;; esac
+case "$display_scale" in ''|*[!0-9]*) [ -z "$display_scale" ] || { echo "run-thub-benchmark: --display-scale must be an integer" >&2; exit 2; } ;; esac
 case "$interval_ms" in ''|*[!0-9]*) echo "run-thub-benchmark: --interval-ms must be an integer" >&2; exit 2 ;; esac
 case "$pid" in ''|*[!0-9]*) [ -z "$pid" ] || { echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; } ;; esac
 if [ -n "$pid" ] && [ "$pid" -lt 1 ]; then echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; fi
@@ -124,6 +143,7 @@ if [ "$warmup_seconds" -gt 3600 ]; then echo "run-thub-benchmark: --warmup-secon
 if [ "$sample_seconds" -gt 86400 ]; then echo "run-thub-benchmark: --sample-seconds must not exceed 86400" >&2; exit 2; fi
 if [ -n "$observed_terminals" ] && { [ "$observed_terminals" -lt 1 ] || [ "$observed_terminals" -gt 16 ]; }; then echo "run-thub-benchmark: --observed-terminals must be between 1 and 16" >&2; exit 2; fi
 if [ -n "$wsl_memory_bytes" ] && [ "$wsl_memory_bytes" -lt 1 ]; then echo "run-thub-benchmark: --wsl-memory-bytes must be positive" >&2; exit 2; fi
+if [ -n "$display_scale" ] && { [ "$display_scale" -lt 1 ] || [ "$display_scale" -gt 500 ]; }; then echo "run-thub-benchmark: --display-scale must be between 1 and 500" >&2; exit 2; fi
 if [ -n "$reference_binary_sha256" ] && [[ ! "$reference_binary_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --reference-sha256 must be 64 hex characters" >&2; exit 2; fi
 if [ -n "$reference_binary_sha256" ] && [ -z "$reference_selection_reason" ]; then echo "run-thub-benchmark: --reference-reason is required with --reference-sha256" >&2; exit 2; fi
 if [ -n "$installer_sha256" ] && [[ ! "$installer_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "run-thub-benchmark: --installer-sha256 must be 64 hex characters" >&2; exit 2; fi
@@ -132,6 +152,13 @@ if [ "$interval_ms" -lt 100 ] || [ "$interval_ms" -gt 60000 ]; then
   echo "run-thub-benchmark: --interval-ms must be between 100 and 60000" >&2
   exit 2
 fi
+validate_text "workload version" "$workload_version" 64
+validate_text "workload seed" "$workload_seed" 128
+validate_text "reference reason" "$reference_selection_reason" 256
+validate_text "power mode" "$power_mode" 128
+validate_text "WSL version" "$wsl_version" 128
+validate_text "WSL distro" "$wsl_distro" 128
+validate_text "setup note" "$setup_note" 256
 
 if [ -z "$output" ]; then
   output="$REPO_ROOT/artifacts/perf/t-hub-${terminals}t-$(date -u +%Y%m%dT%H%M%SZ).json"
@@ -195,6 +222,12 @@ if [ -n "$wsl_distro" ]; then
 fi
 if [ -n "$wsl_memory_bytes" ]; then
   command+=( -WslMemoryBytes "$wsl_memory_bytes" )
+fi
+if [ -n "$power_mode" ]; then
+  command+=( -PowerMode "$power_mode" )
+fi
+if [ -n "$display_scale" ]; then
+  command+=( -DisplayScale "$display_scale" )
 fi
 
 if "$dry_run"; then
