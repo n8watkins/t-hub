@@ -174,11 +174,12 @@ pub async fn install_codex_hooks(
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+        .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::install(
-        &home,
-        &crate::codex::hooks_install::requirements_path(),
-        std::path::Path::new(&agent_bin),
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
         consent,
     )
     .map_err(|error| error.to_string())
@@ -189,11 +190,12 @@ pub async fn repair_codex_hooks(
     agent_bin: String,
     consent: bool,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+        .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::repair(
-        &home,
-        &crate::codex::hooks_install::requirements_path(),
-        std::path::Path::new(&agent_bin),
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
         consent,
     )
     .map_err(|error| error.to_string())
@@ -203,11 +205,12 @@ pub async fn repair_codex_hooks(
 pub async fn uninstall_codex_hooks(
     agent_bin: String,
 ) -> Result<crate::codex::hooks_install::InstallReport, String> {
-    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+        .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::uninstall(
-        &home,
-        &crate::codex::hooks_install::requirements_path(),
-        std::path::Path::new(&agent_bin),
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
     )
     .map_err(|error| error.to_string())
 }
@@ -217,12 +220,18 @@ pub async fn codex_hooks_health(
     agent_bin: String,
     project_root: Option<String>,
 ) -> Result<crate::codex::hooks_install::ProducerHealth, String> {
-    let home = crate::codex::hooks_install::codex_home().map_err(|error| error.to_string())?;
+    let paths = crate::codex::hooks_install::runtime_paths(&agent_bin)
+        .map_err(|error| error.to_string())?;
+    let project_root = project_root
+        .as_deref()
+        .map(crate::codex::hooks_install::host_project_path)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     crate::codex::hooks_install::health_at_with_project(
-        &home,
-        &crate::codex::hooks_install::requirements_path(),
-        std::path::Path::new(&agent_bin),
-        project_root.as_deref().map(std::path::Path::new),
+        &paths.codex_home,
+        &paths.requirements_path,
+        &paths.agent_bin,
+        project_root.as_deref(),
     )
     .map_err(|error| error.to_string())
 }

@@ -94,6 +94,49 @@ pub struct InstallReport {
     pub health: ProducerHealth,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePaths {
+    pub codex_home: PathBuf,
+    pub requirements_path: PathBuf,
+    pub agent_bin: PathBuf,
+}
+
+pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
+    #[cfg(unix)]
+    {
+        Ok(RuntimePaths {
+            codex_home: codex_home()?,
+            requirements_path: requirements_path(),
+            agent_bin: PathBuf::from(agent_bin),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let distro = wsl_distro();
+        let home = wsl_home(&distro)?;
+        Ok(RuntimePaths {
+            codex_home: wsl_posix_to_unc(&distro, &format!("{home}/.codex"))?,
+            requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
+            agent_bin: PathBuf::from(resolve_wsl_agent_bin(&distro)?),
+        })
+    }
+}
+
+#[cfg(windows)]
+pub fn host_project_path(path: &str) -> Result<PathBuf> {
+    if path.starts_with('/') {
+        wsl_posix_to_unc(&wsl_distro(), path)
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn host_project_path(path: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(unix)]
 pub fn codex_home() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CODEX_HOME") {
         let path = PathBuf::from(path);
@@ -107,6 +150,13 @@ pub fn codex_home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("could not resolve Codex home"))
 }
 
+#[cfg(windows)]
+pub fn codex_home() -> Result<PathBuf> {
+    let distro = wsl_distro();
+    let home = wsl_home(&distro)?;
+    wsl_posix_to_unc(&distro, &format!("{home}/.codex"))
+}
+
 #[cfg(unix)]
 pub fn requirements_path() -> PathBuf {
     PathBuf::from("/etc/codex/requirements.toml")
@@ -114,12 +164,104 @@ pub fn requirements_path() -> PathBuf {
 
 #[cfg(windows)]
 pub fn requirements_path() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("OpenAI")
-        .join("Codex")
-        .join("requirements.toml")
+    wsl_posix_to_unc(&wsl_distro(), "/etc/codex/requirements.toml")
+        .expect("the fixed Codex requirements path is a valid POSIX path")
+}
+
+#[cfg(windows)]
+fn wsl_distro() -> String {
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
+#[cfg(any(windows, test))]
+fn normalize_wsl_home(output: &[u8]) -> Result<String> {
+    let home = String::from_utf8_lossy(output).trim().to_string();
+    if home.starts_with('/') && home.len() > 1 && !home.split('/').any(|part| part == "..") {
+        Ok(home.trim_end_matches('/').to_string())
+    } else {
+        bail!("WSL home is not an absolute POSIX path");
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_wsl_executable(output: &[u8]) -> Result<String> {
+    let path = String::from_utf8_lossy(output).trim().to_string();
+    if path.starts_with('/')
+        && path.len() > 1
+        && !path.contains('\0')
+        && !path.split('/').any(|part| part == "..")
+    {
+        Ok(path)
+    } else {
+        bail!("WSL t-hub-agent path is not an absolute POSIX path");
+    }
+}
+
+#[cfg(any(windows, test))]
+fn wsl_posix_to_unc(distro: &str, path: &str) -> Result<PathBuf> {
+    if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        bail!("WSL path must be an absolute POSIX path without traversal");
+    }
+    if distro.is_empty() || distro.contains(['\\', '/']) {
+        bail!("WSL distribution name is invalid");
+    }
+    let relative = path.trim_start_matches('/').replace('/', "\\");
+    let suffix = if relative.is_empty() {
+        String::new()
+    } else {
+        format!(r"\{relative}")
+    };
+    Ok(PathBuf::from(format!(r"\\wsl.localhost\{distro}{suffix}")))
+}
+
+#[cfg(windows)]
+fn wsl_home(distro: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("wsl.exe");
+    command
+        .arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg("printf %s \"$HOME\"")
+        .creation_flags(0x0800_0000);
+    let output =
+        crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+            .with_context(|| format!("resolving WSL home for {distro}"))?;
+    if !output.status.success() {
+        bail!(
+            "could not resolve WSL home for {distro}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    normalize_wsl_home(&output.stdout)
+}
+
+#[cfg(windows)]
+fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("wsl.exe");
+    command
+        .arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg("command -v t-hub-agent")
+        .creation_flags(0x0800_0000);
+    let output =
+        crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+            .with_context(|| format!("resolving t-hub-agent inside WSL distribution {distro}"))?;
+    if !output.status.success() {
+        bail!(
+            "could not find t-hub-agent inside WSL distribution {distro}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    normalize_wsl_executable(&output.stdout)
 }
 
 struct ConfigLock {
@@ -391,7 +533,11 @@ fn toml_has_hook_events(value: &toml::Value) -> bool {
 }
 
 fn validate_agent_bin(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
+    #[cfg(unix)]
+    let is_absolute = path.is_absolute();
+    #[cfg(windows)]
+    let is_absolute = path.to_string_lossy().starts_with('/');
+    if !is_absolute {
         bail!("Codex hook executable must be an absolute path");
     }
     if !executable_ok(path) {
@@ -401,9 +547,16 @@ fn validate_agent_bin(path: &Path) -> Result<()> {
 }
 
 fn executable_ok(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let expected = path.to_string_lossy();
+        return resolve_wsl_agent_bin(&wsl_distro()).is_ok_and(|actual| actual == expected);
+    }
+    #[cfg(not(windows))]
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
+    #[cfg(not(windows))]
     if !metadata.is_file() {
         return false;
     }
@@ -411,10 +564,6 @@ fn executable_ok(path: &Path) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
     }
 }
 
@@ -664,17 +813,59 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("writing {}", temp.display()))?;
         file.sync_all()
             .with_context(|| format!("syncing {}", temp.display()))?;
-        std::fs::rename(&temp, path)
+        replace_file(&temp, path)
             .with_context(|| format!("renaming {} to {}", temp.display(), path.display()))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("syncing {}", parent.display()))?;
+        sync_parent_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| std::io::Error::last_os_error())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    // Windows has no stable directory-fsync contract through std, especially
+    // for a WSL UNC share. The temp file is fully synced before the atomic
+    // rename, and a successful rename is therefore the durability boundary.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -935,5 +1126,40 @@ mod tests {
         std::fs::write(home.join("config.toml"), "[hooks\nbroken").unwrap();
         assert!(install(&home, &requirements, &agent, true).is_err());
         assert!(!home.join("hooks.json").exists());
+    }
+
+    #[test]
+    fn windows_wsl_paths_keep_host_io_separate_from_runtime_commands() {
+        let distro = "Ubuntu-24.04";
+        let home = normalize_wsl_home(b" /home/natkins/\r\n").unwrap();
+        let codex_home = wsl_posix_to_unc(distro, &format!("{home}/.codex")).unwrap();
+        let requirements = wsl_posix_to_unc(distro, "/etc/codex/requirements.toml").unwrap();
+        let agent = normalize_wsl_executable(b"/home/natkins/.local/bin/t-hub-agent\r\n").unwrap();
+
+        assert_eq!(home, "/home/natkins");
+        assert_eq!(
+            codex_home.to_string_lossy(),
+            r"\\wsl.localhost\Ubuntu-24.04\home\natkins\.codex"
+        );
+        assert_eq!(
+            requirements.to_string_lossy(),
+            r"\\wsl.localhost\Ubuntu-24.04\etc\codex\requirements.toml"
+        );
+        assert_eq!(agent, "/home/natkins/.local/bin/t-hub-agent");
+        let command = managed_command(Path::new(&agent), "Stop");
+        assert!(command.starts_with("'/home/natkins/.local/bin/t-hub-agent' "));
+        assert!(!command.contains(r"\\wsl"));
+        assert!(!command.contains("C:\\"));
+    }
+
+    #[test]
+    fn windows_wsl_path_contract_rejects_host_paths_and_traversal() {
+        assert!(normalize_wsl_home(b"C:\\Users\\natha").is_err());
+        assert!(normalize_wsl_home(b"/home/../root").is_err());
+        assert!(normalize_wsl_executable(b"t-hub-agent").is_err());
+        assert!(normalize_wsl_executable(b"/home/natkins/../bin/t-hub-agent").is_err());
+        assert!(wsl_posix_to_unc("Ubuntu-24.04", r"C:\Users\natha").is_err());
+        assert!(wsl_posix_to_unc("Ubuntu-24.04", "/home/../root").is_err());
+        assert!(wsl_posix_to_unc(r"Ubuntu\other", "/home/natkins").is_err());
     }
 }
