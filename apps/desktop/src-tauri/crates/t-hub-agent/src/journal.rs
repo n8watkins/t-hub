@@ -7,10 +7,10 @@
 //! (a torn final line is detected and ignored on open).
 //!
 //! ## Durability
-//! Each [`Journal::append`] writes the line and `fsync`s the file before
-//! returning, so an appended entry is durable the moment the call returns. The
-//! sequence number is the entry's 1-based position; we recover the head
-//! sequence on open by counting valid lines.
+//! Each [`Journal::append`] acquires the journal's interprocess transaction
+//! lock, allocates the next sequence from durable head state, writes one complete
+//! line, and `fsync`s both the journal and head state before returning.
+//! A stale or torn head state is rebuilt from complete journal lines.
 //!
 //! ## Why a file, not SQLite (here)
 //! The agent's journal is a *write-mostly, append-only, replay-from-cursor* log;
@@ -19,11 +19,13 @@
 //! (The Windows core keeps its own SQLite catalog; that is a separate concern.)
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use t_hub_protocol::{EventJournalEntry, JournalSource};
 
 /// Default journal location relative to `$HOME`: `~/.t-hub/journal`.
@@ -32,6 +34,13 @@ const JOURNAL_SUBDIR: &str = ".t-hub/journal";
 const JOURNAL_DIR_ENV: &str = "T_HUB_AGENT_JOURNAL_DIR";
 /// The append-only log file name within the journal directory.
 const JOURNAL_FILE: &str = "events.ndjson";
+/// Interprocess lock shared by the long-lived agent and short-lived hooks.
+const JOURNAL_LOCK_FILE: &str = "events.lock";
+/// Atomically replaced allocation state for the journal head.
+const JOURNAL_HEAD_FILE: &str = "head.json";
+/// Hook processes must never wait indefinitely behind a stalled writer.
+const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const JOURNAL_LOCK_RETRY: Duration = Duration::from_millis(2);
 
 /// At agent startup, compact the journal once it exceeds this size. The
 /// incremental tail (see [`Journal::tail_from`]) keeps live delivery cheap at
@@ -70,18 +79,44 @@ pub fn resolve_journal_dir(override_dir: Option<&str>) -> PathBuf {
     resolve_journal_dir_from(override_dir, env_dir.as_deref(), home.as_deref())
 }
 
-/// An open append-only journal. Cheap to clone-share behind an `Arc`; all
-/// mutation goes through the internal `Mutex<File>` so concurrent appends from
-/// multiple request handlers are serialized and never interleave a line.
+/// An open append-only journal.
+///
+/// The internal mutex serializes threads sharing this handle.
+/// A separate file lock serializes independent short-lived hook processes and
+/// the long-lived agent across append and compaction transactions.
 pub struct Journal {
     path: PathBuf,
+    dir: PathBuf,
+    lock_file: File,
     inner: Mutex<Inner>,
 }
 
 struct Inner {
-    file: File,
     /// Highest sequence appended so far (0 = empty journal).
     head_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct HeadState {
+    version: u8,
+    head_seq: u64,
+    journal_len: u64,
+}
+
+struct InterprocessLock<'a> {
+    #[cfg(unix)]
+    file: &'a File,
+    #[cfg(not(unix))]
+    _file: std::marker::PhantomData<&'a File>,
+}
+
+impl Drop for InterprocessLock<'_> {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(std::os::fd::AsRawFd::as_raw_fd(self.file), libc::LOCK_UN);
+        }
+    }
 }
 
 impl Journal {
@@ -92,52 +127,191 @@ impl Journal {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating journal dir {dir:?}"))?;
         let path = dir.join(JOURNAL_FILE);
-
-        // Count existing complete lines to recover head_seq. A "complete" line is
-        // one terminated by `\n` AND parseable as an EventJournalEntry; anything
-        // after the last good newline is treated as a torn tail.
-        let head_seq = Self::recover_head_seq(&path)?;
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .with_context(|| format!("opening journal file {path:?}"))?;
-
-        Ok(Self {
+        let lock_path = dir.join(JOURNAL_LOCK_FILE);
+        let lock_file = Self::open_private_file(&lock_path, true)
+            .with_context(|| format!("opening journal lock {lock_path:?}"))?;
+        let journal = Self {
             path,
-            inner: Mutex::new(Inner { file, head_seq }),
-        })
+            dir: dir.to_path_buf(),
+            lock_file,
+            inner: Mutex::new(Inner { head_seq: 0 }),
+        };
+
+        {
+            let _lock = journal.lock_exclusive()?;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&journal.path)
+                .with_context(|| format!("opening journal file {:?}", journal.path))?;
+            let head = journal.authoritative_head_locked()?;
+            journal
+                .inner
+                .lock()
+                .expect("journal mutex poisoned")
+                .head_seq = head.head_seq;
+        }
+        Ok(journal)
     }
 
-    /// Scan the file (if any) and return the number of complete, parseable
-    /// lines — that is the recovered head sequence.
-    fn recover_head_seq(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    fn open_private_file(path: &Path, create: bool) -> Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .create(create)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening private journal file {path:?}"))
+    }
+
+    #[cfg(not(unix))]
+    fn open_private_file(path: &Path, create: bool) -> Result<File> {
+        OpenOptions::new()
+            .create(create)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening private journal file {path:?}"))
+    }
+
+    fn lock_exclusive(&self) -> Result<InterprocessLock<'_>> {
+        #[cfg(unix)]
+        {
+            self.lock_unix(libc::LOCK_EX)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(InterprocessLock {
+                _file: std::marker::PhantomData,
+            })
+        }
+    }
+
+    fn lock_shared(&self) -> Result<InterprocessLock<'_>> {
+        #[cfg(unix)]
+        {
+            self.lock_unix(libc::LOCK_SH)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(InterprocessLock {
+                _file: std::marker::PhantomData,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_unix(&self, operation: libc::c_int) -> Result<InterprocessLock<'_>> {
+        use std::os::fd::AsRawFd;
+
+        let deadline = Instant::now() + JOURNAL_LOCK_TIMEOUT;
+        loop {
+            let rc = unsafe { libc::flock(self.lock_file.as_raw_fd(), operation | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(InterprocessLock {
+                    file: &self.lock_file,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error).context("acquiring journal transaction lock");
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "journal transaction lock remained busy for {}ms",
+                    JOURNAL_LOCK_TIMEOUT.as_millis()
+                );
+            }
+            std::thread::sleep(JOURNAL_LOCK_RETRY);
+        }
+    }
+
+    /// Scan the file and return its complete, parseable line count plus the byte
+    /// boundary before any torn trailing line.
+    fn recover_head(path: &Path) -> Result<(u64, u64, u64)> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, 0)),
             Err(e) => return Err(e).with_context(|| format!("reading journal {path:?}")),
         };
-        let reader = BufReader::new(file);
+        let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let mut reader = BufReader::new(file);
         let mut count: u64 = 0;
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                // An io error mid-scan (rare) — stop counting; treat the rest as
-                // torn. We have a consistent prefix up to here.
-                Err(_) => break,
-            };
+        let mut valid_len = 0_u64;
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let read = reader.read_until(b'\n', &mut bytes)?;
+            if read == 0 {
+                break;
+            }
+            if bytes.last() != Some(&b'\n') {
+                break;
+            }
+            valid_len = valid_len.saturating_add(read as u64);
+            let line = std::str::from_utf8(&bytes[..read - 1]).unwrap_or("");
             if line.trim().is_empty() {
                 continue;
             }
-            // Only count lines that parse; a partial/garbage trailing line is
-            // ignored (crash tolerance).
-            if serde_json::from_str::<EventJournalEntry>(&line).is_ok() {
+            if serde_json::from_str::<EventJournalEntry>(line).is_ok() {
                 count += 1;
             }
         }
-        Ok(count)
+        Ok((count, valid_len, file_len))
+    }
+
+    fn read_head_state(&self) -> Option<HeadState> {
+        let file = Self::open_private_file(&self.dir.join(JOURNAL_HEAD_FILE), false).ok()?;
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 4096 {
+            return None;
+        }
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn authoritative_head_locked(&self) -> Result<HeadState> {
+        let journal_len = std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if let Some(state) = self
+            .read_head_state()
+            .filter(|state| state.version == 1 && state.journal_len == journal_len)
+        {
+            return Ok(state);
+        }
+
+        let (head_seq, valid_len, file_len) = Self::recover_head(&self.path)?;
+        if valid_len < file_len {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .context("opening journal to remove torn tail")?;
+            file.set_len(valid_len)
+                .context("truncating torn journal tail")?;
+            file.sync_data().context("syncing repaired journal")?;
+        }
+        let state = HeadState {
+            version: 1,
+            head_seq,
+            journal_len: valid_len,
+        };
+        self.publish_head_state_locked(state)?;
+        Ok(state)
+    }
+
+    fn publish_head_state_locked(&self, state: HeadState) -> Result<()> {
+        let path = self.dir.join(JOURNAL_HEAD_FILE);
+        let mut file = Self::open_private_file(&path, true)?;
+        file.set_len(0).context("truncating journal head")?;
+        let bytes = serde_json::to_vec(&state).context("serializing journal head")?;
+        file.write_all(&bytes).context("writing journal head")?;
+        file.sync_data().context("syncing journal head")?;
+        Ok(())
     }
 
     /// The current head sequence (highest appended seq; 0 when empty).
@@ -161,10 +335,12 @@ impl Journal {
     /// a hook fired by Claude is a separate process that appends to the file; the
     /// long-lived `--stdio` agent's tail thread polls this to notice the growth.
     pub fn head_seq_on_disk(&self) -> u64 {
-        let on_disk = Self::recover_head_seq(&self.path).unwrap_or(0);
         let mut guard = self.inner.lock().expect("journal mutex poisoned");
-        if on_disk > guard.head_seq {
-            guard.head_seq = on_disk;
+        let Ok(_lock) = self.lock_exclusive() else {
+            return guard.head_seq;
+        };
+        if let Ok(state) = self.authoritative_head_locked() {
+            guard.head_seq = guard.head_seq.max(state.head_seq);
         }
         guard.head_seq
     }
@@ -179,22 +355,35 @@ impl Journal {
     /// entry (with `seq` populated). The write is durable when this returns.
     pub fn append(&self, mut entry: EventJournalEntry) -> Result<EventJournalEntry> {
         let mut guard = self.inner.lock().expect("journal mutex poisoned");
-        let seq = guard.head_seq + 1;
+        let _lock = self.lock_exclusive()?;
+        let state = self.authoritative_head_locked()?;
+        let seq = state
+            .head_seq
+            .checked_add(1)
+            .context("journal sequence exhausted")?;
         entry.seq = seq;
 
-        let line = serde_json::to_string(&entry).context("serializing journal entry")?;
-        // One line, newline-terminated. write_all + flush + sync_data gives us
-        // durability before we acknowledge.
-        guard
-            .file
-            .write_all(line.as_bytes())
-            .context("writing journal line")?;
-        guard
-            .file
-            .write_all(b"\n")
-            .context("writing journal newline")?;
-        guard.file.flush().context("flushing journal")?;
-        guard.file.sync_data().context("fsync journal")?;
+        let mut line = serde_json::to_vec(&entry).context("serializing journal entry")?;
+        line.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)
+            .with_context(|| format!("opening journal append target {:?}", self.path))?;
+        file.write_all(&line).context("writing journal line")?;
+        file.flush().context("flushing journal")?;
+        file.sync_data().context("fsync journal")?;
+
+        let journal_len = file
+            .metadata()
+            .context("reading appended journal metadata")?
+            .len();
+        self.publish_head_state_locked(HeadState {
+            version: 1,
+            head_seq: seq,
+            journal_len,
+        })?;
 
         guard.head_seq = seq;
         Ok(entry)
@@ -207,6 +396,7 @@ impl Journal {
         // Take the lock to get a consistent view, then read from the start of the
         // file via a fresh handle so we don't disturb the append cursor.
         let _guard = self.inner.lock().expect("journal mutex poisoned");
+        let _lock = self.lock_shared()?;
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -248,6 +438,10 @@ impl Journal {
     /// current EOF so it streams only entries appended afterwards. See
     /// [`Journal::tail_from`].
     pub fn byte_len(&self) -> u64 {
+        let _guard = self.inner.lock().expect("journal mutex poisoned");
+        let Ok(_lock) = self.lock_shared() else {
+            return std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        };
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
@@ -273,6 +467,7 @@ impl Journal {
         last_seq: u64,
     ) -> Result<(Vec<EventJournalEntry>, u64, u64)> {
         let _guard = self.inner.lock().expect("journal mutex poisoned");
+        let _lock = self.lock_shared()?;
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -334,13 +529,15 @@ impl Journal {
     /// and silently stall delivery. At startup there is no cursor yet, so the
     /// core simply handshakes against the freshly-compacted head.
     ///
-    /// A handful of entries appended by another process during the rewrite window
-    /// may be dropped — acceptable here (status is re-emitted within seconds;
-    /// durable hook events are sparse) and callers only invoke it over the cap,
-    /// so it is rare. Unparseable lines are KEPT (never silently drop unknown
-    /// durable data).
+    /// Append and compaction use the same interprocess transaction lock.
+    /// A hook that opened the journal before compaction therefore reopens the
+    /// published path only after compaction completes and cannot write to the
+    /// retired inode.
+    /// Unparseable lines are kept and never silently drop unknown durable data.
     pub fn compact_dropping_status(&self) -> Result<(u64, u64, u64)> {
         let mut guard = self.inner.lock().expect("journal mutex poisoned");
+        let _lock = self.lock_exclusive()?;
+        let _ = self.authoritative_head_locked()?;
         let before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
 
         let src = match File::open(&self.path) {
@@ -388,19 +585,17 @@ impl Journal {
 
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("publishing compacted journal {:?}", self.path))?;
-
-        // The old append handle now points at the unlinked pre-compaction inode;
-        // reopen onto the freshly-published file so future appends land in it,
-        // and resync the in-memory head to the kept count.
-        guard.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.path)
-            .with_context(|| format!("reopening journal after compaction {:?}", self.path))?;
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .context("syncing journal directory after compaction")?;
         guard.head_seq = kept;
 
         let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.publish_head_state_locked(HeadState {
+            version: 1,
+            head_seq: kept,
+            journal_len: after,
+        })?;
         Ok((before, after, kept))
     }
 }
@@ -408,6 +603,8 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Barrier};
     use t_hub_protocol::{JournalEventType, JournalSource};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -469,6 +666,87 @@ mod tests {
         assert_eq!(a.seq, 1);
         assert_eq!(b.seq, 2);
         assert_eq!(j.head_seq(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_short_lived_writers_allocate_one_monotonic_sequence() {
+        const WRITERS: usize = 8;
+        const ENTRIES_PER_WRITER: usize = 32;
+
+        let dir = temp_dir("concurrent-writers");
+        let writers = (0..WRITERS)
+            .map(|_| Journal::open(&dir).unwrap())
+            .collect::<Vec<_>>();
+        let start = Arc::new(Barrier::new(WRITERS));
+        let threads = writers
+            .into_iter()
+            .enumerate()
+            .map(|(writer_index, journal)| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for entry_index in 0..ENTRIES_PER_WRITER {
+                        journal
+                            .append(entry(
+                                JournalEventType::Notification,
+                                &format!("writer-{writer_index}-entry-{entry_index}"),
+                            ))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let lines = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
+        let entries = lines
+            .lines()
+            .map(|line| serde_json::from_str::<EventJournalEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        let expected = WRITERS * ENTRIES_PER_WRITER;
+        assert_eq!(
+            entries.len(),
+            expected,
+            "no append may be lost or interleaved"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<BTreeSet<_>>(),
+            (1..=expected as u64).collect(),
+            "every persisted sequence must be unique and gap-free"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn noisy_hook_writer_fails_within_the_lock_budget() {
+        let dir = temp_dir("bounded-lock");
+        let blocker = Journal::open(&dir).unwrap();
+        let writer = Journal::open(&dir).unwrap();
+        let _held = blocker.lock_exclusive().unwrap();
+        let started = Instant::now();
+        let error = writer
+            .append(entry(JournalEventType::Notification, "bounded-hook"))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("remained busy"),
+            "unexpected lock error: {error:#}"
+        );
+        assert!(
+            elapsed >= JOURNAL_LOCK_TIMEOUT && elapsed < Duration::from_secs(3),
+            "lock wait must be bounded near {:?}, got {elapsed:?}",
+            JOURNAL_LOCK_TIMEOUT
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -635,6 +913,33 @@ mod tests {
     }
 
     #[test]
+    fn writer_opened_before_compaction_appends_to_published_journal() {
+        let dir = temp_dir("compact-concurrent-writer");
+        let compactor = Journal::open(&dir).unwrap();
+        compactor
+            .append(entry(JournalEventType::SessionStart, "seed"))
+            .unwrap();
+
+        // A short-lived hook can open the journal immediately before the
+        // long-lived agent publishes a compacted replacement.
+        let hook_writer = Journal::open(&dir).unwrap();
+        compactor.compact_dropping_status().unwrap();
+        hook_writer
+            .append(entry(JournalEventType::Stop, "concurrent-hook"))
+            .unwrap();
+
+        let published = Journal::open(&dir).unwrap().replay(0).unwrap();
+        assert!(
+            published
+                .iter()
+                .any(|entry| entry.entity_id.as_deref() == Some("concurrent-hook")),
+            "a hook append must never land on the retired pre-compaction inode"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn torn_trailing_line_is_tolerated_on_open() {
         let dir = temp_dir("torn");
         {
@@ -652,6 +957,15 @@ mod tests {
         // Reopen: the torn tail must not be counted, and the next append is seq 2.
         let j2 = Journal::open(&dir).unwrap();
         assert_eq!(j2.head_seq(), 1, "torn tail must not inflate head_seq");
+        let appended = j2
+            .append(entry(JournalEventType::SessionEnd, "s1"))
+            .unwrap();
+        assert_eq!(appended.seq, 2);
+        assert_eq!(
+            j2.replay(0).unwrap().len(),
+            2,
+            "the repaired tail must not hide the next durable append"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
