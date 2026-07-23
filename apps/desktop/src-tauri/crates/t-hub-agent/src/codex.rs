@@ -493,9 +493,12 @@ fn append_deduplicated(
         }
     }
     let event_id = entry.event_id.clone();
-    journal.append(entry).context("appending Codex lifecycle")?;
+    let outcome = journal.append(entry).context("appending Codex lifecycle")?;
     if let Some(event_id) = event_id {
         state.seen.insert(event_id);
+    }
+    if !outcome.is_appended() {
+        return Ok(());
     }
     state.recognized_events += 1;
     Ok(())

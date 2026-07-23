@@ -42,8 +42,10 @@ const JOURNAL_HEAD_FILE: &str = "head.json";
 const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_LOCK_RETRY: Duration = Duration::from_millis(2);
 const MAX_ENTRY_BYTES: usize = 1024 * 1024;
-const MAX_HEAD_BYTES: usize = 4096;
+const MAX_HEAD_BYTES: usize = 128 * 1024;
 const MAX_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_RECENT_EVENT_IDS: usize = 1024;
+const HEAD_VERSION: u8 = 2;
 
 /// At agent startup, compact the journal once it exceeds this size. The
 /// incremental tail (see [`Journal::tail_from`]) keeps live delivery cheap at
@@ -99,11 +101,48 @@ struct Inner {
     head_seq: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeadState {
     version: u8,
     head_seq: u64,
     journal_len: u64,
+    #[serde(default)]
+    recent_event_ids: Vec<RecentEventId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecentEventId {
+    event_id: String,
+    seq: u64,
+}
+
+/// Result of one journal append transaction.
+///
+/// A duplicate carries the already-assigned sequence but was not written again.
+#[derive(Debug, Clone)]
+pub enum AppendOutcome {
+    Appended(EventJournalEntry),
+    Duplicate(EventJournalEntry),
+}
+
+impl AppendOutcome {
+    pub fn is_appended(&self) -> bool {
+        matches!(self, Self::Appended(_))
+    }
+
+    fn entry(&self) -> &EventJournalEntry {
+        match self {
+            Self::Appended(entry) | Self::Duplicate(entry) => entry,
+        }
+    }
+}
+
+impl std::ops::Deref for AppendOutcome {
+    type Target = EventJournalEntry;
+
+    fn deref(&self) -> &Self::Target {
+        self.entry()
+    }
 }
 
 struct BoundedLine {
@@ -316,14 +355,19 @@ impl Journal {
 
     /// Scan the file and return its complete, parseable line count plus the byte
     /// boundary before any torn trailing line.
-    fn recover_head(path: &Path) -> Result<(u64, u64, u64)> {
+    fn recover_head(path: &Path) -> Result<HeadState> {
         let file = match Self::open_private_file(path, false) {
             Ok(f) => f,
             Err(e)
                 if e.downcast_ref::<std::io::Error>()
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                return Ok((0, 0, 0));
+                return Ok(HeadState {
+                    version: HEAD_VERSION,
+                    head_seq: 0,
+                    journal_len: 0,
+                    recent_event_ids: Vec::new(),
+                });
             }
             Err(e) => return Err(e).with_context(|| format!("reading journal {path:?}")),
         };
@@ -336,6 +380,7 @@ impl Journal {
         let mut count: u64 = 0;
         let mut valid_len = 0_u64;
         let mut scanned = 0_u64;
+        let mut recent_event_ids = Vec::new();
         loop {
             let Some(line) = Self::read_bounded_line(&mut reader, &mut scanned)? else {
                 break;
@@ -347,11 +392,59 @@ impl Journal {
             if line.bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if serde_json::from_slice::<EventJournalEntry>(&line.bytes).is_ok() {
+            if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
                 count += 1;
+                if let Some(event_id) = entry.event_id.as_deref() {
+                    Self::remember_event_id(&mut recent_event_ids, event_id, count);
+                }
             }
         }
-        Ok((count, valid_len, file_len))
+        Ok(HeadState {
+            version: HEAD_VERSION,
+            head_seq: count,
+            journal_len: valid_len.min(file_len),
+            recent_event_ids,
+        })
+    }
+
+    fn valid_event_id(event_id: &str) -> bool {
+        let Some(digest) = event_id.strip_prefix("provider-event:v1:") else {
+            return false;
+        };
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn valid_recent_event_ids(state: &HeadState) -> bool {
+        state.recent_event_ids.len() <= MAX_RECENT_EVENT_IDS
+            && state.recent_event_ids.iter().all(|recent| {
+                recent.seq > 0
+                    && recent.seq <= state.head_seq
+                    && Self::valid_event_id(&recent.event_id)
+            })
+            && state
+                .recent_event_ids
+                .windows(2)
+                .all(|window| window[0].seq < window[1].seq)
+    }
+
+    fn remember_event_id(recent: &mut Vec<RecentEventId>, event_id: &str, seq: u64) {
+        if !Self::valid_event_id(event_id) {
+            return;
+        }
+        if let Some(index) = recent.iter().position(|known| known.event_id == event_id) {
+            recent.remove(index);
+        }
+        recent.push(RecentEventId {
+            event_id: event_id.to_string(),
+            seq,
+        });
+        let excess = recent.len().saturating_sub(MAX_RECENT_EVENT_IDS);
+        if excess > 0 {
+            recent.drain(..excess);
+        }
     }
 
     fn ensure_scan_bound(len: u64) -> Result<()> {
@@ -412,31 +505,28 @@ impl Journal {
         let journal_len = std::fs::metadata(&self.path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        if let Some(state) = self
-            .read_head_state()
-            .filter(|state| state.version == 1 && state.journal_len == journal_len)
-        {
+        if let Some(state) = self.read_head_state().filter(|state| {
+            state.version == HEAD_VERSION
+                && state.journal_len == journal_len
+                && Self::valid_recent_event_ids(state)
+        }) {
             return Ok(state);
         }
 
-        let (head_seq, valid_len, file_len) = Self::recover_head(&self.path)?;
-        if valid_len < file_len {
+        let mut state = Self::recover_head(&self.path)?;
+        if state.journal_len < journal_len {
             let file = Self::open_private_file(&self.path, false)
                 .context("opening journal to remove torn tail")?;
-            file.set_len(valid_len)
+            file.set_len(state.journal_len)
                 .context("truncating torn journal tail")?;
             file.sync_data().context("syncing repaired journal")?;
         }
-        let state = HeadState {
-            version: 1,
-            head_seq,
-            journal_len: valid_len,
-        };
-        self.publish_head_state_locked(state)?;
+        state.version = HEAD_VERSION;
+        self.publish_head_state_locked(&state)?;
         Ok(state)
     }
 
-    fn publish_head_state_locked(&self, state: HeadState) -> Result<()> {
+    fn publish_head_state_locked(&self, state: &HeadState) -> Result<()> {
         let path = self.dir.join(JOURNAL_HEAD_FILE);
         let tmp = self
             .dir
@@ -495,10 +585,24 @@ impl Journal {
 
     /// Append `entry`, assign it the next sequence, fsync, and return the stored
     /// entry (with `seq` populated). The write is durable when this returns.
-    pub fn append(&self, mut entry: EventJournalEntry) -> Result<EventJournalEntry> {
+    pub fn append(&self, mut entry: EventJournalEntry) -> Result<AppendOutcome> {
         let mut guard = self.inner.lock().expect("journal mutex poisoned");
         let _lock = self.lock_exclusive()?;
-        let state = self.authoritative_head_locked()?;
+        let mut state = self.authoritative_head_locked()?;
+        if let Some(event_id) = entry.event_id.as_deref() {
+            anyhow::ensure!(
+                Self::valid_event_id(event_id),
+                "journal event_id is not a canonical provider identity"
+            );
+            if let Some(known) = state
+                .recent_event_ids
+                .iter()
+                .find(|known| known.event_id == event_id)
+            {
+                entry.seq = known.seq;
+                return Ok(AppendOutcome::Duplicate(entry));
+            }
+        }
         let seq = state
             .head_seq
             .checked_add(1)
@@ -528,14 +632,16 @@ impl Journal {
             .metadata()
             .context("reading appended journal metadata")?
             .len();
-        self.publish_head_state_locked(HeadState {
-            version: 1,
-            head_seq: seq,
-            journal_len,
-        })?;
+        state.version = HEAD_VERSION;
+        state.head_seq = seq;
+        state.journal_len = journal_len;
+        if let Some(event_id) = entry.event_id.as_deref() {
+            Self::remember_event_id(&mut state.recent_event_ids, event_id, seq);
+        }
+        self.publish_head_state_locked(&state)?;
 
         guard.head_seq = seq;
-        Ok(entry)
+        Ok(AppendOutcome::Appended(entry))
     }
 
     /// Read back all entries with `seq > after_seq`, in order, for replay to the
@@ -733,6 +839,7 @@ impl Journal {
             .with_file_name(format!("{JOURNAL_FILE}.compact.{}", std::process::id()));
 
         let mut kept: u64 = 0;
+        let mut recent_event_ids = Vec::new();
         {
             let file = Self::open_private_truncate(&tmp)
                 .with_context(|| format!("creating compaction temp {tmp:?}"))?;
@@ -757,6 +864,11 @@ impl Journal {
                         .context("writing compaction entry")?;
                     out.write_all(b"\n")?;
                     kept += 1;
+                    if let Ok(entry) = serde_json::from_slice::<EventJournalEntry>(&line.bytes) {
+                        if let Some(event_id) = entry.event_id.as_deref() {
+                            Self::remember_event_id(&mut recent_event_ids, event_id, kept);
+                        }
+                    }
                 }
             }
             out.flush().context("flushing compaction temp")?;
@@ -770,10 +882,11 @@ impl Journal {
         guard.head_seq = kept;
 
         let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        self.publish_head_state_locked(HeadState {
-            version: 1,
+        self.publish_head_state_locked(&HeadState {
+            version: HEAD_VERSION,
             head_seq: kept,
             journal_len: after,
+            recent_event_ids,
         })?;
         Ok((before, after, kept))
     }
@@ -820,6 +933,13 @@ mod tests {
         }
     }
 
+    fn identified_entry(event_id: &str, timestamp_ms: u64) -> EventJournalEntry {
+        let mut entry = entry(JournalEventType::PermissionRequest, "identified");
+        entry.event_id = Some(event_id.to_string());
+        entry.timestamp_ms = timestamp_ms;
+        entry
+    }
+
     fn wait_for_path(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !path.exists() {
@@ -838,6 +958,7 @@ mod tests {
         opened: Option<&Path>,
         go: Option<&Path>,
         pause_after_sync: Option<&Path>,
+        event_id: Option<&str>,
     ) -> Child {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -859,6 +980,9 @@ mod tests {
         if let Some(path) = pause_after_sync {
             command.env("T_HUB_TEST_PAUSE_AFTER_JOURNAL_SYNC", path);
         }
+        if let Some(event_id) = event_id {
+            command.env("T_HUB_TEST_JOURNAL_EVENT_ID", event_id);
+        }
         command.spawn().expect("spawning journal test helper")
     }
 
@@ -879,9 +1003,9 @@ mod tests {
         }
         match operation.as_str() {
             "append" => {
-                journal
-                    .append(entry(JournalEventType::Notification, &entity))
-                    .unwrap();
+                let mut entry = entry(JournalEventType::Notification, &entity);
+                entry.event_id = std::env::var("T_HUB_TEST_JOURNAL_EVENT_ID").ok();
+                journal.append(entry).unwrap();
             }
             other => panic!("unknown journal subprocess operation: {other}"),
         }
@@ -926,6 +1050,168 @@ mod tests {
         assert_eq!(b.seq, 2);
         assert_eq!(j.head_seq(), 2);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_and_out_of_order_provider_events_are_appended_once() {
+        let dir = temp_dir("dedup-order");
+        let journal = Journal::open(&dir).unwrap();
+        let event_id =
+            crate::event_identity::derive("codex", "permission_requested", &[("id", Some("1"))])
+                .unwrap();
+
+        let first = journal.append(identified_entry(&event_id, 200)).unwrap();
+        let duplicate = journal.append(identified_entry(&event_id, 100)).unwrap();
+        assert!(first.is_appended());
+        assert!(!duplicate.is_appended());
+        assert_eq!(duplicate.seq, first.seq);
+        assert_eq!(journal.head_seq(), 1);
+
+        let entries = journal.replay(0).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a provider retry must not be re-journaled"
+        );
+        assert_eq!(entries[0].timestamp_ms, 200);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provider_event_deduplication_survives_journal_restart() {
+        let dir = temp_dir("dedup-restart");
+        let event_id =
+            crate::event_identity::derive("claude", "Stop", &[("event_id", Some("stop-1"))])
+                .unwrap();
+        Journal::open(&dir)
+            .unwrap()
+            .append(identified_entry(&event_id, 100))
+            .unwrap();
+        Journal::open(&dir)
+            .unwrap()
+            .append(identified_entry(&event_id, 200))
+            .unwrap();
+
+        assert_eq!(Journal::open(&dir).unwrap().replay(0).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_equivalent_provider_events_are_appended_once() {
+        const WRITERS: usize = 8;
+        let dir = temp_dir("dedup-concurrent");
+        let event_id = crate::event_identity::derive(
+            "codex",
+            "turn_completed",
+            &[("turn_id", Some("turn-1"))],
+        )
+        .unwrap();
+        let writers = (0..WRITERS)
+            .map(|_| Journal::open(&dir).unwrap())
+            .collect::<Vec<_>>();
+        let start = Arc::new(Barrier::new(WRITERS));
+        let threads = writers
+            .into_iter()
+            .map(|journal| {
+                let start = Arc::clone(&start);
+                let event_id = event_id.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    journal.append(identified_entry(&event_id, 100)).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(Journal::open(&dir).unwrap().replay(0).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn events_without_provider_identity_remain_non_deduplicable() {
+        let dir = temp_dir("no-identity");
+        let journal = Journal::open(&dir).unwrap();
+        journal
+            .append(entry(JournalEventType::Stop, "opaque"))
+            .unwrap();
+        journal
+            .append(entry(JournalEventType::Stop, "opaque"))
+            .unwrap();
+        assert_eq!(journal.replay(0).unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_head_ledger_is_reconciled_from_the_journal() {
+        let dir = temp_dir("dedup-reconcile");
+        let event_id =
+            crate::event_identity::derive("claude", "Stop", &[("event_id", Some("stop-1"))])
+                .unwrap();
+        Journal::open(&dir)
+            .unwrap()
+            .append(identified_entry(&event_id, 100))
+            .unwrap();
+
+        std::fs::write(
+            dir.join(JOURNAL_HEAD_FILE),
+            br#"{"version":1,"head_seq":1,"journal_len":0}"#,
+        )
+        .unwrap();
+        let reopened = Journal::open(&dir).unwrap();
+        let duplicate = reopened.append(identified_entry(&event_id, 200)).unwrap();
+        assert!(!duplicate.is_appended());
+        assert_eq!(reopened.replay(0).unwrap().len(), 1);
+
+        let recovered: HeadState =
+            serde_json::from_slice(&std::fs::read(dir.join(JOURNAL_HEAD_FILE)).unwrap()).unwrap();
+        assert_eq!(recovered.version, HEAD_VERSION);
+        assert_eq!(recovered.recent_event_ids.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recent_event_ledger_is_bounded_and_keeps_newest_identities() {
+        let mut recent = Vec::new();
+        for seq in 1..=(MAX_RECENT_EVENT_IDS as u64 + 2) {
+            let provider_id = format!("provider-{seq}");
+            let event_id = crate::event_identity::derive(
+                "codex",
+                "turn_completed",
+                &[("turn_id", Some(&provider_id))],
+            )
+            .unwrap();
+            Journal::remember_event_id(&mut recent, &event_id, seq);
+        }
+        assert_eq!(recent.len(), MAX_RECENT_EVENT_IDS);
+        assert_eq!(recent.first().unwrap().seq, 3);
+        assert_eq!(recent.last().unwrap().seq, MAX_RECENT_EVENT_IDS as u64 + 2);
+
+        let serialized = serde_json::to_vec(&HeadState {
+            version: HEAD_VERSION,
+            head_seq: MAX_RECENT_EVENT_IDS as u64 + 2,
+            journal_len: 0,
+            recent_event_ids: recent,
+        })
+        .unwrap();
+        assert!(serialized.len() <= MAX_HEAD_BYTES);
+    }
+
+    #[test]
+    fn invalid_provider_identity_is_rejected_without_journal_mutation() {
+        let dir = temp_dir("invalid-event-id");
+        let journal = Journal::open(&dir).unwrap();
+        let mut invalid = entry(JournalEventType::Notification, "invalid");
+        invalid.event_id = Some("raw-provider-secret-canary".to_string());
+        let error = journal.append(invalid).unwrap_err();
+        assert!(
+            error.to_string().contains("canonical provider identity"),
+            "unexpected invalid identity error: {error:#}"
+        );
+        assert_eq!(journal.byte_len(), 0);
+        assert_eq!(journal.head_seq(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1001,6 +1287,7 @@ mod tests {
                     None,
                     Some(&go),
                     None,
+                    None,
                 )
             })
             .collect::<Vec<_>>();
@@ -1025,6 +1312,50 @@ mod tests {
             (1..=WRITERS as u64).collect()
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_short_lived_processes_deduplicate_one_provider_event() {
+        const WRITERS: usize = 12;
+
+        let dir = temp_dir("concurrent-process-dedup");
+        let go = dir.join("go");
+        let event_id = crate::event_identity::derive(
+            "codex",
+            "permission_requested",
+            &[("request_id", Some("shared-request"))],
+        )
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut children = (0..WRITERS)
+            .map(|index| {
+                spawn_helper(
+                    &dir,
+                    "append",
+                    &format!("process-{index}"),
+                    None,
+                    Some(&go),
+                    None,
+                    Some(&event_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&go, b"go").unwrap();
+
+        for child in children.drain(..) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "journal helper failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let entries = Journal::open(&dir).unwrap().replay(0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].event_id.as_deref(), Some(event_id.as_str()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1351,6 +1682,7 @@ mod tests {
             Some(&opened),
             Some(&go),
             None,
+            None,
         );
         wait_for_path(&opened);
         compactor.compact_dropping_status().unwrap();
@@ -1379,6 +1711,12 @@ mod tests {
         let dir = temp_dir("sigkill-recovery");
         std::fs::create_dir_all(&dir).unwrap();
         let synced = dir.join("synced");
+        let event_id = crate::event_identity::derive(
+            "codex",
+            "permission_requested",
+            &[("request_id", Some("killed-request"))],
+        )
+        .unwrap();
         let mut child = spawn_helper(
             &dir,
             "append",
@@ -1386,6 +1724,7 @@ mod tests {
             None,
             None,
             Some(&synced),
+            Some(&event_id),
         );
         wait_for_path(&synced);
         let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
@@ -1398,6 +1737,11 @@ mod tests {
             recovered.head_seq(),
             1,
             "the fsynced entry must survive a stale head"
+        );
+        let duplicate = recovered.append(identified_entry(&event_id, 2)).unwrap();
+        assert!(
+            !duplicate.is_appended(),
+            "recovery must rebuild dedup state from the durable journal"
         );
         let next = recovered
             .append(entry(JournalEventType::SessionEnd, "after-kill"))
