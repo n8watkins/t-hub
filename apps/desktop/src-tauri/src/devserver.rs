@@ -2338,7 +2338,7 @@ mod tests {
         command
             .arg("-c")
             .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-runner")
+            .arg("t-hub-devserver")
             .arg("tree-test")
             .arg("sh")
             .arg("-c")
@@ -2394,7 +2394,7 @@ mod tests {
         command
             .arg("-c")
             .arg(PROCESS_TREE_SCRIPT)
-            .arg("t-hub-runner")
+            .arg("t-hub-devserver")
             .arg("early-exit-test")
             .arg("sh")
             .arg("-c")

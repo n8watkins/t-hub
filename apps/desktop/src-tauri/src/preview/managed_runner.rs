@@ -17,13 +17,19 @@ use super::model::{PreviewPackageManager, PreviewTarget, PreviewTargetKind};
 /// EOF from T-Hub triggers TERM, a bounded grace period, and KILL for the exact
 /// owned process group.
 pub(crate) const PROCESS_TREE_SCRIPT: &str = r#"set -u
+case "$0" in
+  t-hub-preview|t-hub-devserver) ;;
+  *) exit 64 ;;
+esac
+case "$1" in
+  ""|*[!A-Za-z0-9_.:-]*) exit 65 ;;
+esac
 MARKER="/tmp/$0-$1.pid"
 shift
 export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0
 exec 3<&0
 setsid "$@" 3<&- </dev/null &
 SRV=$!
-echo "$SRV" > "$MARKER" 2>/dev/null || true
 cleanup() {
   kill -TERM -- -"$SRV" 2>/dev/null || true
   i=0
@@ -35,6 +41,20 @@ cleanup() {
   wait "$SRV" 2>/dev/null || true
   rm -f "$MARKER" 2>/dev/null || true
 }
+STAT=$(cat "/proc/$SRV/stat" 2>/dev/null) || { cleanup; exit 66; }
+REST=${STAT##*) }
+set -- $REST
+START_TICKS=${20:-}
+case "$START_TICKS" in
+  ""|*[!0-9]*) cleanup; exit 67 ;;
+esac
+umask 077
+TMP=$(mktemp "${MARKER}.XXXXXX") || { cleanup; exit 68; }
+if ! printf '%s %s\n' "$SRV" "$START_TICKS" > "$TMP" || ! mv -f "$TMP" "$MARKER"; then
+  rm -f "$TMP" 2>/dev/null || true
+  cleanup
+  exit 69
+fi
 trap 'cleanup; exit 0' TERM INT HUP
 (cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || true) &
 LIFE=$!
@@ -108,6 +128,7 @@ pub(crate) fn typed_package_command(
     target: &PreviewTarget,
     run_id: &str,
 ) -> Result<Command, String> {
+    validate_run_id(run_id)?;
     let relative_root = Path::new(&target.relative_root);
     if relative_root.is_absolute()
         || relative_root
@@ -130,6 +151,18 @@ pub(crate) fn typed_package_command(
         package_manager_executable(*package_manager),
         script,
     ))
+}
+
+fn validate_run_id(run_id: &str) -> Result<(), String> {
+    if run_id.is_empty()
+        || run_id.len() > 160
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err("managed Preview run id has an invalid marker identity".into());
+    }
+    Ok(())
 }
 
 fn package_manager_executable(manager: PreviewPackageManager) -> &'static str {
@@ -207,5 +240,58 @@ mod tests {
             entrypoint: "index.html".into(),
         };
         assert!(typed_package_command(root.path(), &static_target, "run-1").is_err());
+        assert!(typed_package_command(root.path(), &target(""), "../marker-escape").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_wrapper_publishes_exact_group_start_ticks_and_cleans_marker() {
+        use std::io::BufRead;
+        use std::time::{Duration, Instant};
+
+        let run_id = format!("identity-{}", uuid::Uuid::new_v4().simple());
+        let marker = Path::new("/tmp").join(format!("t-hub-preview-{run_id}.pid"));
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(PROCESS_TREE_SCRIPT)
+            .arg("t-hub-preview")
+            .arg(&run_id)
+            .arg("sh")
+            .arg("-c")
+            .arg("echo ready; sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let identity = loop {
+            if let Ok(identity) = std::fs::read_to_string(&marker) {
+                break identity;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "identity marker was not published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let fields = identity.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(fields.len(), 2);
+        let process_group_id = fields[0].parse::<u32>().unwrap();
+        let start_ticks = fields[1].parse::<u64>().unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{process_group_id}/stat")).unwrap();
+        let observed = stat.rsplit_once(") ").unwrap().1.split_whitespace().nth(19);
+        assert_eq!(observed, Some(fields[1]));
+        assert!(start_ticks > 0);
+
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        assert!(!marker.exists());
     }
 }
