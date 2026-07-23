@@ -102,7 +102,7 @@ This queue is planning context only until the General authorizes a production As
 
 1. Automatically match and bind existing Powder repositories from exact Git identity while hiding unrelated boards from the normal Captain flow.
 2. Integrate safe board creation only after Powder exposes a non-overwriting create-if-absent contract.
-3. Reproduce and repair the installed registered-Project Board and remaining Run and Preview issues.
+3. Reproduce and repair the installed registered-Project Board and remaining Preview issues.
 4. Repair coordinator-to-Captain monitoring, lifecycle status, fleet watches, and durable messaging.
 5. Complete Codex and Claude Captain, Crew, Workspace, claim, rollback, event, recovery, and retirement acceptance.
 6. Connect provider-neutral History, Codex resume, auto-continue, and usage persistence without extending the legacy Claude-only Recent contract.

@@ -935,7 +935,7 @@ Prove the complete multi-Captain, multi-Workspace, Codex, Claude, messaging, rec
 
 ### Goal
 
-Make Board, Run and Preview, Files, History, Provider limits, Messages, Resources, and settings work without hidden setup knowledge.
+Make Board, Preview, Files, History, Provider limits, Messages, Resources, and settings work without hidden setup knowledge.
 
 ### Work
 
@@ -943,7 +943,7 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 2. Display clear unbound, unauthorized, unreachable, and framing-blocked states.
 3. Avoid credentials in URLs and frontend-persisted state.
 4. Preserve external-browser fallback when framing is blocked.
-5. Replace Dev then Preview with one **Run and Preview** flow.
+5. Replace Dev then Preview with one **Preview** flow.
 6. Detect package scripts, allow command selection, bind a reachable interface, detect the port, and probe Windows reachability.
 7. Show startup output, health, URL, stop, restart, ownership, and failure reasons together.
 8. Suspend hidden Board and Preview activity without a visible consumer.
@@ -988,7 +988,7 @@ Source commits `5011803` and `3177d81`, packaged as installed `0.3.84` from `0cd
 The installed static server bound only Windows `127.0.0.1`, published its authoritative URL without log parsing, auto-loaded and restored the iframe across tab remount, denied traversal, hidden, and symlink requests, removed the iframe and URL on Stop, restarted cleanly, and closed on forced application exit.
 Source commit `1484750`, completed by `d05073d` and packaged as installed `0.3.86` from `5ea945c`, hardens concurrent Start and Stop ownership, authoritative rejected-start recovery, static path-race confinement, exact Host validation, bounded request handling, and bounded shutdown.
 Packaged acceptance passed the static HTTP and confinement matrix, stale-run ownership, 206-millisecond nonreading-client Stop, independent cross-terminal Start, listener cleanup, and preservation of the six-session pre-install tmux baseline.
-The Run and Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
+The Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
 Framework-aware generic Vite arguments and stale WSL-address recovery remain open follow-up hardening.
 History items 11 through 13 are governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
 The existing Recent implementation is Claude-only, keyed and filtered by cwd, archives an entire Claude project transcript directory, and hardcodes Claude resume behavior.
@@ -1031,13 +1031,13 @@ The next History slice must add bounded fair discovery, source statuses, collisi
 ### Exit Gate
 
 - Board opens the correct Project board without manual URL configuration.
-- Run and Preview starts and stops representative Vite, Next.js, and static projects.
+- Preview starts and stops representative Vite, Next.js, and static projects.
 - Files and Captain creation use the same canonical WSL path semantics.
 - History resumes Codex and Claude sessions accurately.
 - Codex and Claude auto-continue state is visible, controllable, and bound to the correct session.
 - Full Board opens the intended Project context or clearly labels the external global Powder board.
 - Provider limits and History retain last-known valid data through bounded transient failures without duplicate equivalent scans.
-- Run and Preview executes only a validated typed Project target or an explicitly reviewed temporary target.
+- Preview executes only a validated typed Project target or an explicitly reviewed temporary target.
 - Hidden surfaces produce no sustained CPU activity.
 
 ## Phase 10 - Cortana Operations, Context, Voice, and Notifications
@@ -1303,7 +1303,7 @@ These lanes may proceed in parallel after the identity and adapter contracts sta
 - **C1 Codebase picker and preflight UI.**
 - **C2 New-codebase and rollback transaction.**
 - **C3 Board binding and authentication states.**
-- **C4 Run and Preview lifecycle.**
+- **C4 Preview lifecycle.**
 - **C5 History and Provider limits UI.**
 - **C6 Messages and Resources UI.**
 - **C7 Cortana health and recovery commands.**

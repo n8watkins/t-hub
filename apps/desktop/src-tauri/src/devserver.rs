@@ -1,4 +1,4 @@
-//! Managed typed-target runner for the per-project Run and Preview surface.
+//! Managed typed-target runner for the per-project Preview surface.
 //!
 //! The backend discovers package scripts and package-less static sites, validates
 //! a selected target again at start time, constructs executable arguments or a
