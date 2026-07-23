@@ -2429,10 +2429,11 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(command.get_program().to_string_lossy().starts_with('/'));
-        assert_eq!(arguments[0], "-c");
-        assert_eq!(arguments[1], crate::preview::supervisor::SUPERVISOR_PY);
-        assert_eq!(arguments[2], "run-test");
-        assert_eq!(arguments[4..], ["pnpm", "run", "odd; $(unsafe) ' name"]);
+        assert_eq!(arguments[0], "-I");
+        assert_eq!(arguments[1], "-c");
+        assert_eq!(arguments[2], crate::preview::supervisor::SUPERVISOR_PY);
+        assert_eq!(arguments[3], "run-test");
+        assert_eq!(arguments[5..], ["pnpm", "run", "odd; $(unsafe) ' name"]);
     }
 
     #[cfg(not(windows))]

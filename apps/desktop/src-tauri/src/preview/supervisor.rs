@@ -28,6 +28,7 @@ pub(crate) struct PreparedPreviewCommand {
     run_id: String,
     generation: String,
     python: ExecutableIdentity,
+    helper_argv: Vec<String>,
 }
 
 pub(crate) struct SupervisedPreviewChild {
@@ -130,6 +131,7 @@ impl PreparedPreviewCommand {
             &self.run_id,
             &self.generation,
             &handshake,
+            &self.helper_argv,
             timeout,
         )?;
         writeln!(
@@ -204,14 +206,12 @@ struct Handshake {
     process_id: u32,
     process_group_id: u32,
     process_group_started_at: u64,
-    python_device: u64,
-    python_inode: u64,
 }
 
 fn parse_handshake(line: &[u8], generation: &str) -> Result<Handshake, String> {
     let text = std::str::from_utf8(line).map_err(|_| "managed Preview handshake is not UTF-8")?;
     let fields = text.split_whitespace().collect::<Vec<_>>();
-    if fields.len() != 9
+    if fields.len() != 7
         || fields[0] != READY_PREFIX
         || fields[1] != PROTOCOL_VERSION
         || fields[2] != generation
@@ -221,17 +221,13 @@ fn parse_handshake(line: &[u8], generation: &str) -> Result<Handshake, String> {
     let process_id = parse_nonzero(fields[3], "helper pid")?;
     let process_group_id = parse_nonzero(fields[4], "helper process group")?;
     let process_group_started_at = parse_nonzero_u64(fields[5], "helper start ticks")?;
-    let python_device = parse_nonzero_u64(fields[6], "Python device")?;
-    let python_inode = parse_nonzero_u64(fields[7], "Python inode")?;
-    if fields[8] != "WAITING" || process_id != process_group_id {
+    if fields[6] != "WAITING" || process_id != process_group_id {
         return Err("managed Preview helper is not its process-group leader".into());
     }
     Ok(Handshake {
         process_id,
         process_group_id,
         process_group_started_at,
-        python_device,
-        python_inode,
     })
 }
 
@@ -300,12 +296,35 @@ pub(crate) fn prepare_supervised_preview_command(
         executable,
         arguments,
     )?;
+    let helper_argv =
+        expected_helper_argv(&python.path, run_id, &generation, executable, arguments);
     Ok(PreparedPreviewCommand {
         command,
         run_id: run_id.to_string(),
         generation,
         python,
+        helper_argv,
     })
+}
+
+fn expected_helper_argv(
+    python: &Path,
+    run_id: &str,
+    generation: &str,
+    executable: &str,
+    arguments: &[&str],
+) -> Vec<String> {
+    let mut result = vec![
+        python.to_string_lossy().into_owned(),
+        "-I".into(),
+        "-c".into(),
+        SUPERVISOR_PY.into(),
+        run_id.into(),
+        generation.into(),
+        executable.into(),
+    ];
+    result.extend(arguments.iter().map(|argument| (*argument).to_string()));
+    result
 }
 
 fn supervisor_command(
@@ -335,6 +354,7 @@ fn supervisor_command(
     {
         let mut command = Command::new(python);
         command
+            .arg("-I")
             .arg("-c")
             .arg(SUPERVISOR_PY)
             .arg(run_id)
@@ -368,6 +388,7 @@ fn windows_supervisor_command(
         .arg(posix_cwd)
         .arg("-e")
         .arg(python)
+        .arg("-I")
         .arg("-c")
         .arg(SUPERVISOR_PY)
         .arg(run_id)
@@ -422,23 +443,78 @@ fn revalidate_python_identity(expected: &ExecutableIdentity) -> Result<(), Strin
 }
 
 #[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct HelperObservation {
+    uid: u32,
+    process_group_id: u32,
+    process_group_started_at: u64,
+    executable_device: u64,
+    executable_inode: u64,
+    command: Vec<Vec<u8>>,
+}
+
+#[cfg(unix)]
 fn verify_helper(
     python: &ExecutableIdentity,
-    run_id: &str,
-    generation: &str,
+    _run_id: &str,
+    _generation: &str,
     handshake: &Handshake,
+    expected_argv: &[String],
     _timeout: Duration,
 ) -> Result<(), String> {
+    let before = observe_helper(handshake.process_id)?;
+    if before.uid != unsafe { libc::geteuid() }
+        || before.process_group_id != handshake.process_group_id
+        || before.process_group_started_at != handshake.process_group_started_at
+        || before.executable_device != python.device
+        || before.executable_inode != python.inode
+        || !command_matches(&before.command, expected_argv)
+    {
+        return Err("managed Preview helper process identity changed".into());
+    }
+    let after = observe_helper(handshake.process_id)?;
+    if after != before {
+        return Err("managed Preview helper changed during authentication".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn observe_helper(pid: u32) -> Result<HelperObservation, String> {
     use std::os::unix::fs::MetadataExt;
 
-    if handshake.python_device != python.device || handshake.python_inode != python.inode {
-        return Err("managed Preview helper reported an unexpected Python identity".into());
+    let stat_path = format!("/proc/{pid}/stat");
+    let before = helper_stat_identity(&read_bounded_bytes(&stat_path, HELPER_OBSERVATION_LIMIT)?)?;
+    let process = std::fs::metadata(format!("/proc/{pid}"))
+        .map_err(|error| format!("inspect managed Preview helper uid: {error}"))?;
+    let executable = std::fs::metadata(format!("/proc/{pid}/exe"))
+        .map_err(|error| format!("inspect managed Preview helper executable: {error}"))?;
+    if !executable.is_file() {
+        return Err("managed Preview helper executable is not a regular file".into());
     }
-    let stat = read_bounded(
-        &format!("/proc/{}/stat", handshake.process_id),
-        HELPER_OBSERVATION_LIMIT,
-    )?;
-    let fields = stat
+    let command = read_bounded_bytes(&format!("/proc/{pid}/cmdline"), 128 * 1024)?
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| argument.to_vec())
+        .collect::<Vec<_>>();
+    let after = helper_stat_identity(&read_bounded_bytes(&stat_path, HELPER_OBSERVATION_LIMIT)?)?;
+    if after != before {
+        return Err("managed Preview helper changed during observation".into());
+    }
+    Ok(HelperObservation {
+        uid: process.uid(),
+        process_group_id: before.0,
+        process_group_started_at: before.1,
+        executable_device: executable.dev(),
+        executable_inode: executable.ino(),
+        command,
+    })
+}
+
+#[cfg(unix)]
+fn helper_stat_identity(stat: &[u8]) -> Result<(u32, u64), String> {
+    let text = std::str::from_utf8(stat).map_err(|_| "managed Preview helper stat is not UTF-8")?;
+    let fields = text
         .rsplit_once(") ")
         .ok_or("managed Preview helper process stat is malformed")?
         .1
@@ -447,68 +523,22 @@ fn verify_helper(
     let group = fields
         .get(2)
         .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
         .ok_or("managed Preview helper process group is invalid")?;
     let started = fields
         .get(19)
         .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
         .ok_or("managed Preview helper start ticks are invalid")?;
-    let metadata = std::fs::metadata(format!("/proc/{}", handshake.process_id))
-        .map_err(|error| format!("inspect managed Preview helper uid: {error}"))?;
-    if metadata.uid() != unsafe { libc::geteuid() }
-        || group != handshake.process_group_id
-        || started != handshake.process_group_started_at
-    {
-        return Err("managed Preview helper process identity changed".into());
-    }
-    let cmdline = read_bounded_bytes(
-        &format!("/proc/{}/cmdline", handshake.process_id),
-        128 * 1024,
-    )?;
-    let arguments = cmdline
-        .split(|byte| *byte == 0)
-        .filter(|argument| !argument.is_empty())
-        .collect::<Vec<_>>();
-    let expected = [
-        python.path.as_os_str().as_encoded_bytes(),
-        b"-c",
-        SUPERVISOR_PY.as_bytes(),
-        run_id.as_bytes(),
-        generation.as_bytes(),
-    ];
-    if arguments.len() < expected.len()
-        || arguments
-            .iter()
-            .zip(expected)
-            .any(|(actual, expected)| *actual != expected)
-    {
-        return Err("managed Preview helper command identity is unexpected".into());
-    }
-    let final_stat = read_bounded(
-        &format!("/proc/{}/stat", handshake.process_id),
-        HELPER_OBSERVATION_LIMIT,
-    )?;
-    let final_fields = final_stat
-        .rsplit_once(") ")
-        .ok_or("managed Preview helper process stat is malformed")?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    let final_group = final_fields
-        .get(2)
-        .and_then(|value| value.parse::<u32>().ok());
-    let final_started = final_fields
-        .get(19)
-        .and_then(|value| value.parse::<u64>().ok());
-    if final_group != Some(group) || final_started != Some(started) {
-        return Err("managed Preview helper changed during authentication".into());
-    }
-    Ok(())
+    Ok((group, started))
 }
 
-#[cfg(unix)]
-fn read_bounded(path: &str, max: usize) -> Result<String, String> {
-    let bytes = read_bounded_bytes(path, max)?;
-    String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8"))
+fn command_matches(actual: &[Vec<u8>], expected: &[String]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected.as_bytes())
 }
 
 #[cfg(unix)]
@@ -563,6 +593,7 @@ fn trusted_python_identity() -> Result<ExecutableIdentity, String> {
         .arg(crate::files::host_distro())
         .arg("-e")
         .arg("/usr/bin/python3")
+        .arg("-I")
         .arg("-c")
         .arg(PYTHON_IDENTITY_PY);
     use std::os::windows::process::CommandExt;
@@ -592,22 +623,18 @@ fn revalidate_python_identity(expected: &ExecutableIdentity) -> Result<(), Strin
 #[cfg(windows)]
 fn verify_helper(
     python: &ExecutableIdentity,
-    run_id: &str,
-    generation: &str,
+    _run_id: &str,
+    _generation: &str,
     handshake: &Handshake,
+    expected_argv: &[String],
     timeout: Duration,
 ) -> Result<(), String> {
-    if handshake.python_device != python.device || handshake.python_inode != python.inode {
-        return Err("managed Preview helper reported an unexpected Python identity".into());
-    }
     let expected = serde_json::json!({
         "pid": handshake.process_id,
         "group": handshake.process_group_id,
         "started": handshake.process_group_started_at,
         "python": python,
-        "run": run_id,
-        "generation": generation,
-        "script": SUPERVISOR_PY,
+        "argv": expected_argv,
     });
     let mut command = Command::new(trusted_wsl_path()?);
     command
@@ -615,6 +642,7 @@ fn verify_helper(
         .arg(crate::files::host_distro())
         .arg("-e")
         .arg(&python.path)
+        .arg("-I")
         .arg("-c")
         .arg(VERIFY_HELPER_PY)
         .arg(expected.to_string());
@@ -649,7 +677,7 @@ for candidate in ('/usr/bin/python3', '/bin/python3'):
 raise SystemExit(1)"#;
 
 #[cfg(windows)]
-const VERIFY_HELPER_PY: &str = r#"import json, os, sys
+const VERIFY_HELPER_PY: &str = r#"import json, os, stat, sys
 expected = json.loads(sys.argv[1])
 pid = expected['pid']
 def stat_fields():
@@ -657,24 +685,35 @@ def stat_fields():
         data = handle.read(4097)
     if len(data) > 4096:
         raise SystemExit(2)
-    return data.rsplit(b') ', 1)[1].split(), data
-fields, _ = stat_fields()
-details = os.stat(f'/proc/{pid}')
-command = open(f'/proc/{pid}/cmdline', 'rb').read(131073)
-wanted = [expected['python']['path'].encode(), b'-c', expected['script'].encode(),
-          expected['run'].encode(), expected['generation'].encode()]
-actual = [part for part in command.split(b'\0') if part]
-fields2, _ = stat_fields()
-valid = (details.st_uid == os.geteuid() and int(fields[2]) == expected['group']
-         and int(fields[19]) == expected['started']
-         and int(fields2[2]) == expected['group']
-         and int(fields2[19]) == expected['started']
-         and len(command) <= 131072 and actual[:len(wanted)] == wanted)
+    fields = data.rsplit(b') ', 1)[1].split()
+    return int(fields[2]), int(fields[19])
+def snapshot():
+    before = stat_fields()
+    process = os.stat(f'/proc/{pid}')
+    executable = os.stat(f'/proc/{pid}/exe')
+    with open(f'/proc/{pid}/cmdline', 'rb') as handle:
+        command = handle.read(131073)
+    if len(command) > 131072:
+        raise SystemExit(2)
+    after = stat_fields()
+    if after != before:
+        raise SystemExit(2)
+    return (process.st_uid, before[0], before[1], executable.st_dev,
+            executable.st_ino, stat.S_ISREG(executable.st_mode),
+            tuple(part for part in command.split(b'\0') if part))
+before = snapshot()
+after = snapshot()
+wanted = tuple(value.encode() for value in expected['argv'])
+valid = (before == after and before[0] == os.geteuid()
+         and before[1] == expected['group'] and before[2] == expected['started']
+         and before[3] == expected['python']['device']
+         and before[4] == expected['python']['inode'] and before[5]
+         and before[6] == wanted)
 if not valid:
     raise SystemExit(3)
 print('ok')"#;
 
-pub(crate) const SUPERVISOR_PY: &str = r#"import ctypes, os, select, signal, stat, subprocess, sys, time
+pub(crate) const SUPERVISOR_PY: &str = r#"import ctypes, os, select, signal, subprocess, sys, time
 
 READY = 'T_HUB_PREVIEW_READY'
 GO = 'T_HUB_PREVIEW_GO'
@@ -699,12 +738,15 @@ if len(process_stat) > 4096:
     raise SystemExit(67)
 fields = process_stat.rsplit(b') ', 1)[1].split()
 started = int(fields[19])
-python = os.stat(os.path.realpath(sys.executable), follow_symlinks=False)
-print(READY, VERSION, generation, pid, pgid, started, python.st_dev, python.st_ino, 'WAITING', flush=True)
+if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+    raise SystemExit(68)
+print(READY, VERSION, generation, pid, pgid, started, 'WAITING', flush=True)
 
 gate = sys.stdin.readline()
 if gate != f'{GO} {generation}\n':
-    raise SystemExit(68)
+    raise SystemExit(69)
+if libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise SystemExit(70)
 
 environment = os.environ.copy()
 environment.update({
@@ -723,6 +765,63 @@ target = subprocess.Popen(
     close_fds=True,
 )
 
+tracked = {}
+
+def process_identity(candidate):
+    with open(f'/proc/{candidate}/stat', 'rb') as handle:
+        value = handle.read(4097)
+    if len(value) > 4096:
+        raise OSError('oversized process stat')
+    fields = value.rsplit(b') ', 1)[1].split()
+    return int(fields[1]), int(fields[19])
+
+def discover_descendants():
+    snapshot = {}
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        candidate = int(name)
+        if candidate == pid:
+            continue
+        try:
+            snapshot[candidate] = process_identity(candidate)
+        except (OSError, ValueError, IndexError):
+            pass
+    descendants = set()
+    changed = True
+    while changed:
+        changed = False
+        for candidate, (parent, _) in snapshot.items():
+            if candidate not in descendants and (parent == pid or parent in descendants):
+                descendants.add(candidate)
+                changed = True
+    return {candidate: snapshot[candidate][1] for candidate in descendants}
+
+def track_descendants():
+    for candidate, start in discover_descendants().items():
+        current = tracked.get(candidate)
+        if current is not None and current[0] == start:
+            continue
+        if current is not None:
+            os.close(current[1])
+            del tracked[candidate]
+        try:
+            descriptor = os.pidfd_open(candidate, 0)
+            if process_identity(candidate)[1] != start:
+                os.close(descriptor)
+                continue
+            tracked[candidate] = (start, descriptor)
+        except (OSError, ValueError, IndexError):
+            pass
+    for candidate, (start, descriptor) in list(tracked.items()):
+        try:
+            if process_identity(candidate)[1] == start:
+                continue
+        except (OSError, ValueError, IndexError):
+            pass
+        os.close(descriptor)
+        del tracked[candidate]
+
 def reap():
     while True:
         try:
@@ -732,51 +831,42 @@ def reap():
         if child == 0:
             return
 
-def group_members():
-    result = []
-    for name in os.listdir('/proc'):
-        if not name.isdigit():
-            continue
-        candidate = int(name)
-        if candidate == pid:
-            continue
+def signal_tracked(kind):
+    for _, descriptor in list(tracked.values()):
         try:
-            with open(f'/proc/{candidate}/stat', 'rb') as handle:
-                value = handle.read(4097)
-            if len(value) <= 4096 and int(value.rsplit(b') ', 1)[1].split()[2]) == pgid:
-                result.append(candidate)
-        except (OSError, ValueError, IndexError):
+            signal.pidfd_send_signal(descriptor, kind)
+        except ProcessLookupError:
             pass
-    return result
 
-def clean_group():
+def clean_descendants():
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
     grace = time.monotonic() + 2.0
     while time.monotonic() < grace:
+        track_descendants()
+        signal_tracked(signal.SIGTERM)
         reap()
-        if not group_members():
+        track_descendants()
+        if not tracked:
             return
         time.sleep(0.02)
-    while True:
-        members = group_members()
-        if not members:
+    kill_deadline = time.monotonic() + 2.0
+    while time.monotonic() < kill_deadline:
+        track_descendants()
+        signal_tracked(signal.SIGKILL)
+        reap()
+        track_descendants()
+        if not tracked:
             reap()
             return
-        for member in members:
-            try:
-                os.kill(member, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        reap()
         time.sleep(0.02)
+    for _, descriptor in tracked.values():
+        os.close(descriptor)
+    tracked.clear()
 
 status = None
 stopped = False
 while status is None:
+    track_descendants()
     try:
         observed, code = os.waitpid(target.pid, os.WNOHANG)
     except ChildProcessError:
@@ -790,14 +880,14 @@ while status is None:
             stopped = True
             break
 
-clean_group()
+clean_descendants()
 if stopped:
     raise SystemExit(0)
 if os.WIFEXITED(status):
     raise SystemExit(os.WEXITSTATUS(status))
 if os.WIFSIGNALED(status):
     raise SystemExit(128 + os.WTERMSIG(status))
-raise SystemExit(70)"#;
+raise SystemExit(71)"#;
 
 #[cfg(test)]
 mod tests {
@@ -807,20 +897,18 @@ mod tests {
     #[test]
     fn handshake_requires_generation_and_group_leader_identity() {
         let generation = "a".repeat(32);
-        let line = format!("{READY_PREFIX} {PROTOCOL_VERSION} {generation} 42 42 99 8 123 WAITING");
+        let line = format!("{READY_PREFIX} {PROTOCOL_VERSION} {generation} 42 42 99 WAITING");
         assert_eq!(
             parse_handshake(line.as_bytes(), &generation).unwrap(),
             Handshake {
                 process_id: 42,
                 process_group_id: 42,
                 process_group_started_at: 99,
-                python_device: 8,
-                python_inode: 123,
             }
         );
         assert!(parse_handshake(line.as_bytes(), &"b".repeat(32)).is_err());
         assert!(parse_handshake(
-            format!("{READY_PREFIX} 1 {generation} 42 41 99 8 123 WAITING").as_bytes(),
+            format!("{READY_PREFIX} 1 {generation} 42 41 99 WAITING").as_bytes(),
             &generation
         )
         .is_err());
@@ -855,6 +943,7 @@ mod tests {
                 "/home/user/project",
                 "-e",
                 "/usr/bin/python3.12",
+                "-I",
                 "-c",
                 SUPERVISOR_PY,
                 "run-1",
@@ -864,6 +953,29 @@ mod tests {
                 "odd; $(unsafe)",
             ]
         );
+    }
+
+    #[test]
+    fn helper_command_authentication_requires_the_complete_exact_argv() {
+        let expected = vec![
+            "/usr/bin/python3".to_string(),
+            "-I".to_string(),
+            "-c".to_string(),
+            "trusted-script".to_string(),
+            "run-1".to_string(),
+        ];
+        let actual = expected
+            .iter()
+            .map(|argument| argument.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        assert!(command_matches(&actual, &expected));
+        assert!(!command_matches(&actual[..4], &expected));
+        let mut appended = actual.clone();
+        appended.push(b"untrusted-extra".to_vec());
+        assert!(!command_matches(&appended, &expected));
+        let mut replaced = actual;
+        replaced[0] = b"/tmp/python3".to_vec();
+        assert!(!command_matches(&replaced, &expected));
     }
 
     #[cfg(target_os = "linux")]
@@ -948,6 +1060,121 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn isolated_helper_ignores_project_and_pythonpath_shadow_modules_before_ready() {
+        let fixture = tempfile::tempdir().unwrap();
+        let pythonpath = tempfile::tempdir().unwrap();
+        let project_marker = fixture.path().join("project-shadow-loaded");
+        let pythonpath_marker = fixture.path().join("pythonpath-shadow-loaded");
+        std::fs::write(
+            fixture.path().join("subprocess.py"),
+            format!(
+                "open({:?}, 'w').close()\n",
+                project_marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pythonpath.path().join("select.py"),
+            format!(
+                "open({:?}, 'w').close()\n",
+                pythonpath_marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut prepared =
+            prepare_supervised_preview_command(fixture.path(), "isolated-run", "sleep", &["30"])
+                .unwrap();
+        prepared.command.env("PYTHONPATH", pythonpath.path());
+        assert!(!project_marker.exists());
+        assert!(!pythonpath_marker.exists());
+        let mut supervised = prepared
+            .spawn_authenticated(Duration::from_secs(3))
+            .unwrap();
+        assert!(!project_marker.exists());
+        assert!(!pythonpath_marker.exists());
+        supervised.stdin.take();
+        assert!(supervised.child.wait().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_cannot_reopen_supervisor_lifeline_through_proc() {
+        let fixture = tempfile::tempdir().unwrap();
+        let result = fixture.path().join("fd-result");
+        let script = r#"import os,sys,time
+try:
+    descriptor = os.open(f'/proc/{os.getppid()}/fd/0', os.O_RDONLY)
+except PermissionError:
+    outcome = 'denied'
+else:
+    outcome = 'opened'
+    os.set_inheritable(descriptor, True)
+open(sys.argv[1], 'w').write(outcome)
+time.sleep(30)"#;
+        let prepared = prepare_supervised_preview_command(
+            fixture.path(),
+            "protected-lifeline",
+            "/usr/bin/python3",
+            &["-I", "-c", script, result.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut supervised = prepared
+            .spawn_authenticated(Duration::from_secs(3))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !result.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&result).unwrap(), "denied");
+        let stopped = Instant::now();
+        supervised.stdin.take();
+        assert!(supervised.child.wait().unwrap().success());
+        assert!(stopped.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setsid_target_and_escaped_descendant_are_reaped_within_bound() {
+        let fixture = tempfile::tempdir().unwrap();
+        let identities = fixture.path().join("escaped-pids");
+        let script = r#"import os,signal,sys,time
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = os.fork()
+if child == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(30)
+    os._exit(0)
+open(sys.argv[1], 'w').write(f'{os.getpid()} {child}')
+os._exit(0)"#;
+        let prepared = prepare_supervised_preview_command(
+            fixture.path(),
+            "escaped-tree",
+            "/usr/bin/python3",
+            &["-I", "-c", script, identities.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut supervised = prepared
+            .spawn_authenticated(Duration::from_secs(3))
+            .unwrap();
+        let started = Instant::now();
+        let status = supervised.child.wait().unwrap();
+        assert!(status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pids = std::fs::read_to_string(&identities)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2);
+        for pid in pids {
+            assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn correlation_failure_closes_gate_without_starting_target() {
         let fixture = tempfile::tempdir().unwrap();
         let started = fixture.path().join("started");
@@ -975,6 +1202,7 @@ mod tests {
             prepare_supervised_preview_command(fixture.path(), "timeout-run", "true", &[]).unwrap();
         let mut command = Command::new(&prepared.python.path);
         command
+            .arg("-I")
             .arg("-c")
             .arg(
                 "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)",
@@ -1010,12 +1238,12 @@ os.setsid()
 pid=os.getpid()
 open(sys.argv[1],'w').write(str(pid))
 fields=open(f'/proc/{pid}/stat','rb').read().rsplit(b') ',1)[1].split()
-details=os.stat(os.path.realpath(sys.executable),follow_symlinks=False)
 fake=pid+1
-print('T_HUB_PREVIEW_READY', '1', sys.argv[2], fake, fake, int(fields[19]), details.st_dev, details.st_ino, 'WAITING', flush=True)
+print('T_HUB_PREVIEW_READY', '1', sys.argv[2], fake, fake, int(fields[19]), 'WAITING', flush=True)
 sys.stdin.buffer.read()"#;
         let mut command = Command::new(&prepared.python.path);
         command
+            .arg("-I")
             .arg("-c")
             .arg(script)
             .arg(&pid_file)
