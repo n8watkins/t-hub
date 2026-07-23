@@ -230,10 +230,24 @@ impl RemotePty {
     /// has no PTY side effect while still forcing the socket to report a known
     /// broken write path. `attach_terminal` checks the reader again after this.
     pub fn probe(&mut self) -> Result<(), String> {
+        if !self.is_alive() {
+            return Err(format!(
+                "remote_pty: probe terminal {} failed: reader already stopped",
+                self.id
+            ));
+        }
         self.writer
             .write_all(b"{\"probe\":true}\n")
             .and_then(|()| self.writer.flush())
-            .map_err(|e| format!("remote_pty: probe terminal {} failed: {e}", self.id))
+            .map_err(|e| format!("remote_pty: probe terminal {} failed: {e}", self.id))?;
+        std::thread::yield_now();
+        if !self.is_alive() {
+            return Err(format!(
+                "remote_pty: probe terminal {} failed: reader stopped during probe",
+                self.id
+            ));
+        }
+        Ok(())
     }
 
     /// Send keystrokes to the remote PTY: `{"write":"<b64>"}`.
@@ -570,5 +584,40 @@ mod tests {
         }
         assert_eq!(batch, b"foobar");
         assert_eq!(STANDARD.encode(&batch), STANDARD.encode(b"foobar"));
+    }
+
+    #[test]
+    fn probe_rejects_a_server_closed_transport() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.shutdown(Shutdown::Both).unwrap();
+
+        // Observe the peer's FIN before probing so this exercises the broken
+        // transport deterministically rather than racing TCP close propagation.
+        let mut observer = writer.try_clone().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            assert_eq!(observer.read(&mut byte).unwrap(), 0);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !reader.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(reader.is_finished(), "reader did not observe server close");
+
+        let mut remote = RemotePty {
+            id: "closed".into(),
+            writer,
+            reader: Some(reader),
+            cols: 80,
+            rows: 24,
+        };
+        assert!(remote.probe().is_err());
     }
 }
