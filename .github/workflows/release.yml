@@ -141,6 +141,42 @@ jobs:
           Copy-Item $extractedBinary.FullName "$evidenceDir/t-hub-dev.extracted.exe"
           Get-Content "$evidenceDir/dev-installer-validation.json"
 
+      - name: Write Package 5 artifact provenance manifest
+        if: ${{ github.event.inputs.variant == 'dev' }}
+        shell: pwsh
+        env:
+          PACKAGE5_SOURCE_COMMIT: ${{ github.sha }}
+          PACKAGE5_WORKFLOW: ${{ github.workflow }}
+          PACKAGE5_RUN_ID: ${{ github.run_id }}
+          PACKAGE5_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PACKAGE5_REPOSITORY: ${{ github.repository }}
+        run: |
+          $releaseDir = "apps/desktop/src-tauri/target/release"
+          $nsisDir = "$releaseDir/bundle/nsis"
+          $installer = Get-ChildItem -Path $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
+          $installerScript = Get-ChildItem -Path "$releaseDir/nsis" -Filter "installer.nsi" -Recurse | Select-Object -First 1
+          $extracted = Get-ChildItem -Path "$releaseDir/dev-installer-extracted" -Filter "t-hub-dev.exe" -Recurse | Select-Object -First 1
+          & ./scripts/windows/write-package5-provenance.ps1 `
+            -OutputPath "$releaseDir/dev-installer-evidence/package-5-evidence.json" `
+            -RepositoryRoot (Get-Location).Path `
+            -SourceCommit $env:PACKAGE5_SOURCE_COMMIT `
+            -InstallerPath $installer.FullName `
+            -RawBinaryPath "$releaseDir/t-hub-dev.raw.exe" `
+            -ExpectedBinaryPath "$releaseDir/dev-installer-evidence/t-hub-dev.expected.exe" `
+            -ExtractedBinaryPath $extracted.FullName `
+            -InstallerScriptPath $installerScript.FullName `
+            -ValidatorPath "$releaseDir/dev-installer-evidence/dev-installer-validation.json" `
+            -Workflow $env:PACKAGE5_WORKFLOW `
+            -RunId $env:PACKAGE5_RUN_ID `
+            -RunAttempt ([int]$env:PACKAGE5_RUN_ATTEMPT) `
+            -RunnerImage "windows-latest" `
+            -WindowsVersion ((Get-CimInstance Win32_OperatingSystem).Version) `
+            -NodeVersion (node --version) `
+            -PnpmVersion (pnpm --version) `
+            -RustVersion (rustc --version) `
+            -AppVersion ((Get-Content apps/desktop/package.json | ConvertFrom-Json).version) `
+            -ValidationPath "$releaseDir/dev-installer-evidence/dev-installer-validation.json" | Out-Host
+
       # The in-app updater fetches latest.json from the latest release; it points
       # at the signed NSIS installer of this release.
       - name: Generate updater manifest (latest.json)
@@ -174,6 +210,7 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
             apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
             apps/desktop/src-tauri/target/release/bundle/nsis/latest.json
+            apps/desktop/src-tauri/target/release/dev-installer-evidence/package-5-evidence.json
           generate_release_notes: true
 
       - name: Upload installers as workflow artifacts

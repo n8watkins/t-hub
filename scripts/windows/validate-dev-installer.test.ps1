@@ -309,6 +309,10 @@ SectionEnd
     '$extractedBinaries.Count -ne 1',
     '$LASTEXITCODE -ne 0',
     '-ExpectedBinaryPath',
+    'write-package5-provenance.ps1',
+    'package-5-evidence.json',
+    '-SourceCommit',
+    '-InstallerPath',
     'dev-installer-evidence/*'
   )) {
     Assert-True ($workflow.Contains($requiredWorkflowContract)) "release workflow is missing '$requiredWorkflowContract'."
