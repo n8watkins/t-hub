@@ -18,7 +18,7 @@ vi.mock("../ipc/scribe", () => ({
   stopScribeStatusEmitter: vi.fn(() => Promise.resolve()),
 }));
 
-import { onScribeStatus, scribeStatus } from "../ipc/scribe";
+import { onScribeStatus, scribeStatus, type ScribeStatus } from "../ipc/scribe";
 import { synthesizeVoice } from "../ipc/voice";
 import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useSupervision } from "../store/supervision";
@@ -49,7 +49,7 @@ beforeEach(() => {
 
 describe("Scribe poll lifecycle", () => {
   it("switches to event-driven updates after the first Scribe event", async () => {
-    let emit: ((status: { listening: boolean }) => void) | undefined;
+    let emit: ((status: ScribeStatus) => void) | undefined;
     vi.mocked(onScribeStatus).mockImplementation(
       (callback) => {
         emit = callback;
@@ -75,7 +75,7 @@ describe("Scribe poll lifecycle", () => {
   });
 
   it("ignores malformed, stale, and out-of-order Scribe events", async () => {
-    let emit: ((status: { listening: boolean; generation?: number; observedAtMs?: number; sourceIdentity?: string }) => void) | undefined;
+    let emit: ((status: ScribeStatus) => void) | undefined;
     vi.mocked(onScribeStatus).mockImplementation((callback) => {
       emit = callback;
       return Promise.resolve(() => {});
