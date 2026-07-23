@@ -1047,6 +1047,7 @@ pub fn run() {
             // browser-Origin requests, so the webview never fetches it).
             voice::voice_settings_read,
             voice::voice_settings_write,
+            voice::voice_announcement_claim,
             voice::voice_list_voices,
             voice::voice_tts,
             // Bounded /health probe (2s) per engine - the Settings dual-engine

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 /// Cap on the /tts `text` from the webview: announcements are one short
@@ -33,6 +34,11 @@ const MAX_TTS_TEXT_BYTES: usize = 4096;
 /// server, and truncating silently would hand the webview a corrupt WAV - so
 /// error instead.
 const MAX_TTS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Serialize settings writes and announcement claims inside this process.
+/// Both paths update the same JSON document, so allowing their read-modify-write
+/// cycles to overlap could lose a policy edit or replay cursor.
+static VOICE_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// The selectable TTS backend. Serialized lowercase ("piper" / "kokoro") in
 /// voice.json and over IPC so external tooling reads the same token. Piper is
@@ -134,6 +140,55 @@ fn voice_settings_path() -> PathBuf {
 /// scripts read the same field names).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct VoiceAnnouncementPolicy {
+    pub permission: bool,
+    pub question: bool,
+    pub completion: bool,
+    pub failure: bool,
+}
+
+impl Default for VoiceAnnouncementPolicy {
+    fn default() -> Self {
+        Self {
+            permission: false,
+            question: false,
+            completion: false,
+            failure: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceAnnouncementKind {
+    Permission,
+    Question,
+    Completion,
+    Failure,
+}
+
+impl VoiceAnnouncementPolicy {
+    fn enabled(&self, kind: VoiceAnnouncementKind) -> bool {
+        match kind {
+            VoiceAnnouncementKind::Permission => self.permission,
+            VoiceAnnouncementKind::Question => self.question,
+            VoiceAnnouncementKind::Completion => self.completion,
+            VoiceAnnouncementKind::Failure => self.failure,
+        }
+    }
+}
+
+/// The durable result of reserving one normalized journal event for voice.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAnnouncementClaim {
+    /// True only for the first observation of a sequence whose master switch
+    /// and per-event policy are both enabled.
+    pub should_announce: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VoiceSettings {
     pub enabled: bool,
     /// The selected TTS backend (default Piper). The voices list + /tts target
@@ -145,6 +200,8 @@ pub struct VoiceSettings {
     /// UI does not edit it but must round-trip it faithfully.
     pub sapi_rate: i64,
     pub announce_on_attention: bool,
+    #[serde(default)]
+    pub announcement_policy: VoiceAnnouncementPolicy,
 }
 
 impl Default for VoiceSettings {
@@ -156,6 +213,7 @@ impl Default for VoiceSettings {
             volume: 0.8,
             sapi_rate: 0,
             announce_on_attention: false,
+            announcement_policy: VoiceAnnouncementPolicy::default(),
         }
     }
 }
@@ -167,6 +225,17 @@ impl Default for VoiceSettings {
 /// testable without touching the filesystem.
 fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
     let d = VoiceSettings::default();
+    let legacy_attention = v
+        .get("announceOnAttention")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(d.announce_on_attention);
+    let policy = v.get("announcementPolicy").and_then(|x| x.as_object());
+    let policy_value = |field: &str, legacy_default: bool| {
+        policy
+            .and_then(|p| p.get(field))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(legacy_default)
+    };
     VoiceSettings {
         enabled: v
             .get("enabled")
@@ -191,10 +260,13 @@ fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
             .get("sapiRate")
             .and_then(|x| x.as_i64())
             .unwrap_or(d.sapi_rate),
-        announce_on_attention: v
-            .get("announceOnAttention")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(d.announce_on_attention),
+        announce_on_attention: legacy_attention,
+        announcement_policy: VoiceAnnouncementPolicy {
+            permission: policy_value("permission", legacy_attention),
+            question: policy_value("question", legacy_attention),
+            completion: policy_value("completion", false),
+            failure: policy_value("failure", false),
+        },
     }
 }
 
@@ -221,6 +293,13 @@ fn read_settings() -> VoiceSettings {
 /// Write the five owned fields into voice.json, PRESERVING any unknown keys an
 /// external script may have added (read-modify-write on the JSON object).
 fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
+    let _guard = VOICE_FILE_LOCK
+        .lock()
+        .map_err(|_| "voice settings lock poisoned".to_string())?;
+    write_settings_unlocked(settings)
+}
+
+fn write_settings_unlocked(settings: &VoiceSettings) -> Result<(), String> {
     let path = voice_settings_path();
     let mut root = std::fs::read_to_string(&path)
         .ok()
@@ -239,6 +318,11 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
     obj.insert(
         "announceOnAttention".into(),
         serde_json::json!(settings.announce_on_attention),
+    );
+    obj.insert(
+        "announcementPolicy".into(),
+        serde_json::to_value(&settings.announcement_policy)
+            .map_err(|e| format!("serialize announcement policy: {e}"))?,
     );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
@@ -261,6 +345,74 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
+fn claim_announcement(
+    seq: u64,
+    kind: VoiceAnnouncementKind,
+) -> Result<VoiceAnnouncementClaim, String> {
+    let _guard = VOICE_FILE_LOCK
+        .lock()
+        .map_err(|_| "voice settings lock poisoned".to_string())?;
+    let path = voice_settings_path();
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let claim = claim_announcement_in_root(&mut root, seq, kind);
+    if claim.1 {
+        write_json_root_unlocked(&path, &root)?;
+    }
+    Ok(claim.0)
+}
+
+fn claim_announcement_in_root(
+    root: &mut serde_json::Value,
+    seq: u64,
+    kind: VoiceAnnouncementKind,
+) -> (VoiceAnnouncementClaim, bool) {
+    let last_handled = root
+        .get("lastHandledJournalSeq")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    if seq <= last_handled {
+        return (
+            VoiceAnnouncementClaim {
+                should_announce: false,
+            },
+            false,
+        );
+    }
+
+    let settings = parse_settings(&root);
+    root.as_object_mut()
+        .expect("filtered to object above")
+        .insert("lastHandledJournalSeq".into(), serde_json::json!(seq));
+    (
+        VoiceAnnouncementClaim {
+            should_announce: settings.enabled && settings.announcement_policy.enabled(kind),
+        },
+        true,
+    )
+}
+
+fn write_json_root_unlocked(
+    path: &std::path::Path,
+    root: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let body = serde_json::to_vec_pretty(root).map_err(|e| format!("serialize voice.json: {e}"))?;
+    static CLAIM_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.claim.{}.{}.tmp",
+        std::process::id(),
+        CLAIM_TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+}
+
 #[tauri::command]
 pub async fn voice_settings_read() -> Result<VoiceSettings, String> {
     tauri::async_runtime::spawn_blocking(read_settings)
@@ -273,6 +425,16 @@ pub async fn voice_settings_write(settings: VoiceSettings) -> Result<(), String>
     tauri::async_runtime::spawn_blocking(move || write_settings(&settings))
         .await
         .map_err(|e| format!("voice_settings_write task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn voice_announcement_claim(
+    seq: u64,
+    kind: VoiceAnnouncementKind,
+) -> Result<VoiceAnnouncementClaim, String> {
+    tauri::async_runtime::spawn_blocking(move || claim_announcement(seq, kind))
+        .await
+        .map_err(|e| format!("voice_announcement_claim task failed: {e}"))?
 }
 
 /// Pull one voice name out of a /voices entry: a bare string, or the first
@@ -349,7 +511,15 @@ fn synthesize(text: &str, voice: &str, engine: VoiceEngine) -> Result<String, St
             "tts response exceeds {MAX_TTS_RESPONSE_BYTES} bytes",
         ));
     }
+    validate_wav(&wav)?;
     Ok(STANDARD.encode(wav))
+}
+
+fn validate_wav(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("tts response is not a RIFF/WAVE audio payload".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -528,6 +698,86 @@ mod tests {
         assert!(parsed.enabled);
         assert_eq!(parsed.voice, "en_US-ryan-high.onnx");
         assert_eq!(parsed.volume, 0.6);
+    }
+
+    #[test]
+    fn legacy_attention_setting_migrates_to_explicit_input_policies() {
+        let parsed = parse_settings(&serde_json::json!({
+            "announceOnAttention": true,
+        }));
+        assert!(parsed.announcement_policy.permission);
+        assert!(parsed.announcement_policy.question);
+        assert!(!parsed.announcement_policy.completion);
+        assert!(!parsed.announcement_policy.failure);
+    }
+
+    #[test]
+    fn explicit_announcement_policy_overrides_legacy_attention() {
+        let parsed = parse_settings(&serde_json::json!({
+            "announceOnAttention": true,
+            "announcementPolicy": {
+                "permission": false,
+                "question": true,
+                "completion": true,
+                "failure": false,
+            }
+        }));
+        assert!(!parsed.announcement_policy.permission);
+        assert!(parsed.announcement_policy.question);
+        assert!(parsed.announcement_policy.completion);
+        assert!(!parsed.announcement_policy.failure);
+    }
+
+    #[test]
+    fn announcement_claim_advances_while_disabled_and_never_replays() {
+        let mut root = serde_json::json!({
+            "enabled": false,
+            "announcementPolicy": {
+                "permission": true,
+                "question": true,
+                "completion": true,
+                "failure": true,
+            }
+        });
+        let (disabled, changed) =
+            claim_announcement_in_root(&mut root, 41, VoiceAnnouncementKind::Permission);
+        assert!(!disabled.should_announce);
+        assert!(changed);
+        assert_eq!(root["lastHandledJournalSeq"], 41);
+
+        root["enabled"] = serde_json::json!(true);
+        let (replayed, changed) =
+            claim_announcement_in_root(&mut root, 41, VoiceAnnouncementKind::Permission);
+        assert!(!replayed.should_announce);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn announcement_claim_respects_each_event_policy() {
+        let mut root = serde_json::json!({
+            "enabled": true,
+            "announcementPolicy": {
+                "permission": false,
+                "question": true,
+                "completion": false,
+                "failure": true,
+            }
+        });
+        let (question, _) =
+            claim_announcement_in_root(&mut root, 1, VoiceAnnouncementKind::Question);
+        let (completion, _) =
+            claim_announcement_in_root(&mut root, 2, VoiceAnnouncementKind::Completion);
+        let (failure, _) = claim_announcement_in_root(&mut root, 3, VoiceAnnouncementKind::Failure);
+        assert!(question.should_announce);
+        assert!(!completion.should_announce);
+        assert!(failure.should_announce);
+    }
+
+    #[test]
+    fn wav_validation_rejects_empty_and_non_audio_responses() {
+        assert!(validate_wav(&[]).is_err());
+        assert!(validate_wav(b"<html>upstream error</html>").is_err());
+        assert!(validate_wav(b"RIFF\x00\x00\x00\x00WAVE").is_ok());
     }
 
     /// STRICT identity parse (engine supervisor D2): only the two known tokens

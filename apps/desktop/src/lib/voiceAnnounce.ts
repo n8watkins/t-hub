@@ -23,17 +23,23 @@
 // listening=false whenever it can't tell, so a missing/dead Scribe never
 // silences T-Hub.
 import { useSupervision } from "../store/supervision";
-import { useVoice } from "../store/voice";
+import { DEFAULT_VOICE_SETTINGS, useVoice } from "../store/voice";
 import { useWorkspace, tabIdForTerminal } from "../store/workspace";
-import { synthesizeVoice } from "../ipc/voice";
+import {
+  claimVoiceAnnouncement,
+  synthesizeVoice,
+  type VoiceAnnouncementKind,
+} from "../ipc/voice";
+import { onJournal } from "../ipc/client05";
 import { scribeStatus } from "../ipc/scribe";
-import { playWavBase64 } from "./voiceAudio";
+import { playWavBase64, VoiceAudioError } from "./voiceAudio";
 import { notify } from "./notify";
 import { useEngineRuntime } from "../store/engineRuntime";
 import { effectiveTarget } from "../ipc/engine";
 import { createWarmup } from "./warmup";
 import { captainSubjectForSession } from "./captainAttribution";
 import type { SessionStatus } from "../ipc/model";
+import type { EventJournalEntry, JournalEvent } from "../ipc/protocol";
 
 /** Minimum gap between spoken announcements (the burst debounce). */
 export const ANNOUNCE_MIN_GAP_MS = 5000;
@@ -88,7 +94,7 @@ let scribeListening = false;
 let scribeStatusKnown = false;
 /** The single held announcement while the general is dictating (coalesced to
  *  the latest transition - no backlog). Null when nothing is held. */
-let pending: { text: string } | null = null;
+let pending: { text: string; requireBlocked: boolean } | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
 /** Incremented whenever the poller starts or stops.
@@ -116,39 +122,146 @@ function speak(text: string, now: number): boolean {
     voice.voice,
   );
   const engine = target.engine;
+  const onSynthesisFailure = (error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    useVoice
+      .getState()
+      .recordDeliveryFailure("synthesis", detail || "Synthesis failed", now);
+    const managed = !!useEngineRuntime.getState().status?.managed;
+    if (!managed && now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
+      lastFallbackAlertAt = now;
+      notify(
+        "error",
+        "Voice engine unreachable",
+        `The ${engine} TTS server did not produce an announcement. Check Settings › Voice.`,
+      );
+    }
+  };
+  const onPlaybackFailure = (error: unknown) => {
+    const kind =
+      error instanceof VoiceAudioError ? error.kind : ("playback" as const);
+    const detail = error instanceof Error ? error.message : String(error);
+    useVoice
+      .getState()
+      .recordDeliveryFailure(kind, detail || "Audio delivery failed", now);
+    notify(
+      "error",
+      kind === "device" ? "Voice audio device failed" : "Voice playback failed",
+      kind === "device"
+        ? "The announcement was synthesized, but no usable audio device was available."
+        : "The announcement was synthesized, but the audio clip could not be played.",
+    );
+  };
   void synthesizeVoice(text, target.voice, target.engine)
-    .then((b64) => {
-      lastSpokenAt = now;
-      playWavBase64(b64, useVoice.getState().volume);
-    })
-    .catch(() => {
-      // TTS server down / no backend: the visual attention cues still stand,
-      // and the debounce window stays open for the next transition. NEVER let
-      // this be silent - the incident this feature exists for was a kokoro death
-      // that fell through with zero surfacing. Raise the notify "error" chime +
-      // toast (WebAudio, independent of the dead TTS server) so a dropped
-      // announcement is heard/seen, debounced so a persistently-down engine
-      // alerts at most once per window rather than on every attempt.
-      //
-      // F6: when the managed lifecycle is running, the SUPERVISOR owns the
-      // fallback narrative (its own "Voice fell back" toast + amber state, and
-      // effectiveTarget already rerouted to the live engine), so suppress this
-      // #52 chime to avoid a double-chime in the down-debounce window.
-      const managed = !!useEngineRuntime.getState().status?.managed;
-      if (!managed && now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
-        lastFallbackAlertAt = now;
-        notify(
-          "error",
-          "Voice engine unreachable",
-          `The ${engine} TTS server didn't answer - an attention announcement ` +
-            `could not be spoken. Check Settings › Voice.`,
-        );
-      }
-    })
+    .then(
+      (b64) =>
+        Promise.resolve(playWavBase64(b64, useVoice.getState().volume)).then(
+          () => {
+            lastSpokenAt = now;
+            useVoice.getState().clearDeliveryFailure();
+          },
+          onPlaybackFailure,
+        ),
+      onSynthesisFailure,
+    )
     .finally(() => {
       speaking = false;
+      if (
+        pending &&
+        scribeStatusKnown &&
+        !scribeListening &&
+        !tailTimer
+      ) {
+        const delay = Math.max(
+          0,
+          ANNOUNCE_MIN_GAP_MS - (Date.now() - lastSpokenAt),
+        );
+        tailTimer = setTimeout(() => {
+          tailTimer = null;
+          flushPending(Date.now());
+        }, delay);
+      }
     });
   return true;
+}
+
+const JOURNAL_KIND: Partial<
+  Record<EventJournalEntry["event_type"], VoiceAnnouncementKind>
+> = {
+  permissionRequest: "permission",
+  elicitation: "question",
+  stop: "completion",
+  stopFailure: "failure",
+};
+
+function announcementText(
+  kind: VoiceAnnouncementKind,
+  sessionId: string | undefined,
+): string {
+  const subject = sessionId
+    ? captainSubjectForSession(sessionId) ??
+      labelForSession(sessionId) ??
+      "A session"
+    : "A session";
+  switch (kind) {
+    case "permission":
+      return `${subject} needs permission`;
+    case "question":
+      return `${subject} has a question`;
+    case "completion":
+      return `${subject} completed`;
+    case "failure":
+      return `${subject} failed`;
+  }
+}
+
+/** Consume one normalized provider-neutral journal event.
+ * The backend claim is the durable replay boundary and policy authority. */
+export async function handleJournalEvent(
+  event: JournalEvent,
+  now: number = Date.now(),
+): Promise<void> {
+  const kind = JOURNAL_KIND[event.entry.event_type];
+  if (!kind) return;
+
+  let shouldAnnounce = false;
+  try {
+    shouldAnnounce = (
+      await claimVoiceAnnouncement(event.entry.seq, kind)
+    ).shouldAnnounce;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    notify(
+      "error",
+      "Voice announcement policy unavailable",
+      detail || "The durable announcement cursor could not be updated.",
+    );
+    return;
+  }
+  if (!shouldAnnounce) return;
+
+  const text = announcementText(kind, event.entry.entity_id);
+  const requireBlocked = kind === "permission" || kind === "question";
+  if (!scribeStatusKnown || scribeListening) {
+    pending = { text, requireBlocked };
+    return;
+  }
+  if (speaking || now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) {
+    // Bounded delivery queue: retain the latest cue rather than silently
+    // losing an event while another clip is playing or the burst gap is open.
+    // The durable claim is intentionally at-most-once, so this one-slot queue
+    // is the only retry and coalescing boundary.
+    pending = { text, requireBlocked };
+    if (!tailTimer) {
+      const delay = Math.max(0, ANNOUNCE_MIN_GAP_MS - (now - lastSpokenAt));
+      tailTimer = setTimeout(() => {
+        tailTimer = null;
+        flushPending(Date.now());
+      }, delay);
+    }
+    return;
+  }
+  speak(text, now);
 }
 
 /** A STABLE spoken name for a session, via the statusline's tmux index (the
@@ -239,7 +352,7 @@ export function handleStatusesChange(
   // is delivered on the listening falling edge (flushPending). Reads the
   // cached boolean only; never blocks on IPC.
   if (!scribeStatusKnown || scribeListening) {
-    pending = { text };
+    pending = { text, requireBlocked: true };
     return;
   }
 
@@ -312,7 +425,7 @@ export function flushPending(now: number = Date.now()): void {
   if (!held) return;
   const statuses = useSupervision.getState().statuses;
   const stillBlocked = Object.values(statuses).some((st) => NEEDS_INPUT.has(st));
-  if (!stillBlocked) {
+  if (held.requireBlocked && !stillBlocked) {
     pending = null; // resolved during dictation - drop silently
     return;
   }
@@ -330,20 +443,22 @@ export function flushPending(now: number = Date.now()): void {
   }, SCRIBE_TAIL_MS);
 }
 
-/** Arm the watcher once (idempotent). Subscribes the supervision store - the
- *  statuses map identity only changes on a real status write, so the handler
- *  early-outs for snapshot/tree-only updates. */
+/** Arm the watcher once. Journal delivery occurs only after normalized event
+ * deduplication and redaction in the backend. */
 export function mountVoiceAnnounce(): void {
   if (mounted) return;
   mounted = true;
-  warmup.start();
-  prevStatuses = useSupervision.getState().statuses;
-  useSupervision.subscribe((s) => handleStatusesChange(s.statuses));
+  void onJournal((event) => void handleJournalEvent(event));
 }
 
 function voiceAnnouncementsEnabled(): boolean {
   const voice = useVoice.getState();
-  return voice.enabled && voice.announceOnAttention;
+  const policy =
+    voice.announcementPolicy ?? DEFAULT_VOICE_SETTINGS.announcementPolicy!;
+  return (
+    voice.enabled &&
+    Object.values(policy).some((enabled) => enabled)
+  );
 }
 
 /** Stop the Scribe poll and discard all voice-gate state.

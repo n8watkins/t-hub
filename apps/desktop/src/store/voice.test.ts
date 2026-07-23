@@ -58,6 +58,8 @@ beforeEach(() => {
     voices: null,
     voicesUnavailable: false,
     health: { piper: "unknown", kokoro: "unknown" },
+    deliveryFailure: null,
+    settingsError: null,
   });
 });
 
@@ -104,6 +106,12 @@ describe("voice settings round-trip", () => {
       volume: 0.3,
       sapiRate: 2, // untouched by the UI, faithfully round-tripped
       announceOnAttention: true,
+      announcementPolicy: {
+        permission: true,
+        question: true,
+        completion: false,
+        failure: false,
+      },
     });
   });
 
@@ -124,6 +132,16 @@ describe("voice settings round-trip", () => {
     expect(useVoice.getState().volume).toBe(1);
     useVoice.getState().setVolume(-1);
     expect(useVoice.getState().volume).toBe(0);
+  });
+
+  it("surfaces a voice.json write failure", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue(FILE_SETTINGS);
+    vi.mocked(writeVoiceSettings).mockRejectedValueOnce(
+      new Error("disk is read-only"),
+    );
+    useVoice.getState().setVolume(0.4);
+    await flushPersist();
+    expect(useVoice.getState().settingsError).toBe("disk is read-only");
   });
 });
 

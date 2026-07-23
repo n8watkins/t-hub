@@ -22,7 +22,11 @@
 // start prompt. The "we just tried and couldn't" event surfaces separately as a
 // chime+toast from the announce path (lib/voiceAnnounce.ts).
 import { useEffect, useState } from "react";
-import { useVoice, type EngineHealthStatus } from "../store/voice";
+import {
+  DEFAULT_VOICE_SETTINGS,
+  useVoice,
+  type EngineHealthStatus,
+} from "../store/voice";
 import { useEngineRuntime } from "../store/engineRuntime";
 import { effectiveTarget } from "../ipc/engine";
 import { synthesizeVoice, type VoiceEngine } from "../ipc/voice";
@@ -76,7 +80,11 @@ export function VoiceSection() {
   const engine = useVoice((s) => s.engine);
   const voice = useVoice((s) => s.voice);
   const volume = useVoice((s) => s.volume);
-  const announceOnAttention = useVoice((s) => s.announceOnAttention);
+  const announcementPolicy =
+    useVoice((s) => s.announcementPolicy) ??
+    DEFAULT_VOICE_SETTINGS.announcementPolicy!;
+  const deliveryFailure = useVoice((s) => s.deliveryFailure);
+  const settingsError = useVoice((s) => s.settingsError);
   const voices = useVoice((s) => s.voices);
   const voicesUnavailable = useVoice((s) => s.voicesUnavailable);
   const health = useVoice((s) => s.health);
@@ -163,7 +171,8 @@ export function VoiceSection() {
       title="Voice announcements"
       description={
         `Spoken cues synthesized by a local TTS server (${engine}, 127.0.0.1:${activePort}). ` +
-        "Settings persist to ~/.t-hub/voice.json and are shared with the captain's announce tooling."
+        "Settings persist to ~/.t-hub/voice.json and are shared with the captain's announce tooling. " +
+        "Journal events are claimed at most once; a failed delivery is shown below and is not replayed."
       }
     >
       <SettingToggleRow
@@ -312,14 +321,60 @@ export function VoiceSection() {
         )}
       </div>
 
+      {deliveryFailure && (
+        <p
+          role="alert"
+          className="text-xs leading-snug"
+          style={{ color: "var(--th-dot-error, #f87171)" }}
+        >
+          Last delivery failure ({deliveryFailure.kind}):{" "}
+          {deliveryFailure.detail}
+        </p>
+      )}
+      {settingsError && (
+        <p
+          role="alert"
+          className="text-xs leading-snug"
+          style={{ color: "var(--th-dot-error, #f87171)" }}
+        >
+          Voice settings were not saved: {settingsError}
+        </p>
+      )}
+
       <SettingToggleRow
-        label="Announce when a session needs attention"
-        hint={
-          "Opt-in: speaks one short cue when a session enters needs-permission " +
-          "or needs-question (bursts are debounced). Off by default."
+        label="Announce permission requests"
+        hint="Speaks a short cue when an agent requests permission."
+        value={announcementPolicy.permission}
+        onChange={(v) =>
+          useVoice.getState().setAnnouncementPolicy("permission", v)
         }
-        value={announceOnAttention}
-        onChange={(v) => useVoice.getState().setAnnounceOnAttention(v)}
+        disabled={controlsDisabled}
+      />
+      <SettingToggleRow
+        label="Announce questions"
+        hint="Speaks a short cue when an agent asks for input."
+        value={announcementPolicy.question}
+        onChange={(v) =>
+          useVoice.getState().setAnnouncementPolicy("question", v)
+        }
+        disabled={controlsDisabled}
+      />
+      <SettingToggleRow
+        label="Announce completions"
+        hint="Speaks a short cue when an agent turn completes."
+        value={announcementPolicy.completion}
+        onChange={(v) =>
+          useVoice.getState().setAnnouncementPolicy("completion", v)
+        }
+        disabled={controlsDisabled}
+      />
+      <SettingToggleRow
+        label="Announce failures"
+        hint="Speaks a short cue when an agent turn fails."
+        value={announcementPolicy.failure}
+        onChange={(v) =>
+          useVoice.getState().setAnnouncementPolicy("failure", v)
+        }
         disabled={controlsDisabled}
       />
     </Group>

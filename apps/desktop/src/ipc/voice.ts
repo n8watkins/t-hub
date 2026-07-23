@@ -9,6 +9,14 @@ import { invoke } from "@tauri-apps/api/core";
  *  port 7477 (pre-existing); Kokoro is port 7478. */
 export type VoiceEngine = "piper" | "kokoro";
 
+export type VoiceAnnouncementKind =
+  | "permission"
+  | "question"
+  | "completion"
+  | "failure";
+
+export type VoiceAnnouncementPolicy = Record<VoiceAnnouncementKind, boolean>;
+
 /** The shared ~/.t-hub/voice.json schema. camelCase on disk and over IPC -
  *  external captain tooling (announce.sh) reads the same field names, so the
  *  FILE is the source of truth (no localStorage mirror). */
@@ -23,6 +31,8 @@ export interface VoiceSettings {
    *  does not edit it but must round-trip it faithfully. */
   sapiRate: number;
   announceOnAttention: boolean;
+  /** Missing only when reading a legacy voice.json through an older backend. */
+  announcementPolicy?: VoiceAnnouncementPolicy;
 }
 
 export function readVoiceSettings(): Promise<VoiceSettings> {
@@ -31,6 +41,16 @@ export function readVoiceSettings(): Promise<VoiceSettings> {
 
 export function writeVoiceSettings(settings: VoiceSettings): Promise<void> {
   return invoke("voice_settings_write", { settings });
+}
+
+/** Atomically reserve a normalized journal event for voice delivery.
+ * The backend advances a durable sequence cursor even when voice or this event
+ * policy is off, so disabled events never replay after restart or opt-in. */
+export function claimVoiceAnnouncement(
+  seq: number,
+  kind: VoiceAnnouncementKind,
+): Promise<{ shouldAnnounce: boolean }> {
+  return invoke("voice_announcement_claim", { seq, kind });
 }
 
 /** Installed voice names from the given engine's /voices (via the backend

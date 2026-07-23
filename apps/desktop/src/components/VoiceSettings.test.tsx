@@ -129,7 +129,7 @@ describe("VoiceSection degradation (selected engine down)", () => {
       screen.getByRole("button", { name: /Test voice/ }),
     ).toHaveProperty("disabled", true);
     expect(
-      screen.getByLabelText("Announce when a session needs attention"),
+      screen.getByLabelText("Announce permission requests"),
     ).toHaveProperty("disabled", true);
     // The master switch + engine selector stay interactive so the user can
     // flip intent or switch to the other engine while one is down.

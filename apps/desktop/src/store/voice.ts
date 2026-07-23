@@ -16,6 +16,8 @@ import {
   voiceHealth,
   writeVoiceSettings,
   type VoiceEngine,
+  type VoiceAnnouncementKind,
+  type VoiceAnnouncementPolicy,
   type VoiceSettings,
 } from "../ipc/voice";
 
@@ -29,20 +31,37 @@ export const HEALTH_ENGINES: readonly VoiceEngine[] = ["piper", "kokoro"];
 /** Defaults when voice.json is missing/unreadable - mirrors the Rust side
  *  (voice.rs VoiceSettings::default): announcements opt-in, Piper engine, Ryan
  *  voice. */
-export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
+export const DEFAULT_VOICE_SETTINGS: VoiceSettings & {
+  announcementPolicy: VoiceAnnouncementPolicy;
+} = {
   enabled: false,
   engine: "piper",
   voice: "en_US-ryan-high.onnx",
   volume: 0.8,
   sapiRate: 0,
   announceOnAttention: false,
+  announcementPolicy: {
+    permission: false,
+    question: false,
+    completion: false,
+    failure: false,
+  },
 };
 
 /** Debounce for file writes: long enough to coalesce a slider drag, short
  *  enough that an external reader sees the change near-immediately. */
 export const VOICE_PERSIST_DEBOUNCE_MS = 300;
 
-interface VoiceState extends VoiceSettings {
+export type VoiceDeliveryFailureKind = "synthesis" | "playback" | "device";
+
+export interface VoiceDeliveryFailure {
+  kind: VoiceDeliveryFailureKind;
+  detail: string;
+  occurredAt: number;
+}
+
+interface VoiceState extends Omit<VoiceSettings, "announcementPolicy"> {
+  announcementPolicy: VoiceAnnouncementPolicy;
   /** True once load() has resolved (from the file or to defaults). */
   loaded: boolean;
   /** Installed voices from the TTS server, or null before/without a fetch. */
@@ -52,6 +71,11 @@ interface VoiceState extends VoiceSettings {
   /** Reachability of BOTH engines (not just the selected one) for the Settings
    *  health display. Transient, never persisted; "unknown" until first probed. */
   health: Record<VoiceEngine, EngineHealthStatus>;
+  /** Latest announcement delivery failure, visible until a later delivery
+   * succeeds or the user changes voice configuration. Never persisted. */
+  deliveryFailure: VoiceDeliveryFailure | null;
+  /** Latest failure to persist voice.json. Never persisted. */
+  settingsError: string | null;
 
   /** Hydrate from voice.json (defaults when missing). Safe to re-run. */
   load: () => Promise<void>;
@@ -70,10 +94,28 @@ interface VoiceState extends VoiceSettings {
   setVoice: (v: string) => void;
   setVolume: (v: number) => void;
   setAnnounceOnAttention: (v: boolean) => void;
+  setAnnouncementPolicy: (kind: VoiceAnnouncementKind, v: boolean) => void;
+  recordDeliveryFailure: (
+    kind: VoiceDeliveryFailureKind,
+    detail: string,
+    occurredAt?: number,
+  ) => void;
+  clearDeliveryFailure: () => void;
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let loadGeneration = 0;
+
+function policyFrom(settings: VoiceSettings): VoiceAnnouncementPolicy {
+  return (
+    settings.announcementPolicy ?? {
+      permission: settings.announceOnAttention,
+      question: settings.announceOnAttention,
+      completion: false,
+      failure: false,
+    }
+  );
+}
 
 /** Fields THIS store instance changed since the last successful load/persist.
  *  Persist is read-MERGE-write over this set: dirty fields carry the store's
@@ -88,6 +130,7 @@ const fieldGenerations: Record<keyof VoiceSettings, number> = {
   volume: 0,
   sapiRate: 0,
   announceOnAttention: 0,
+  announcementPolicy: 0,
 };
 
 export const useVoice = create<VoiceState>((set, get) => {
@@ -111,6 +154,7 @@ export const useVoice = create<VoiceState>((set, get) => {
       volume: s.volume,
       sapiRate: s.sapiRate,
       announceOnAttention: s.announceOnAttention,
+      announcementPolicy: s.announcementPolicy,
     };
     const merged: VoiceSettings = fileSettings
       ? {
@@ -124,18 +168,26 @@ export const useVoice = create<VoiceState>((set, get) => {
           announceOnAttention: dirtyNow.has("announceOnAttention")
             ? owned.announceOnAttention
             : fileSettings.announceOnAttention,
+          announcementPolicy: dirtyNow.has("announcementPolicy")
+            ? owned.announcementPolicy
+            : policyFrom(fileSettings),
         }
       : owned;
     // Surface externally-changed (non-dirty) values in the UI immediately.
     if (fileSettings) set(merged);
     try {
       await writeVoiceSettings(merged);
+      set({ settingsError: null });
       // Only the fields THIS flush covered come clean - a setter that fired
       // mid-flight re-dirtied its field and scheduled another persist.
       for (const f of dirtyNow) dirtyFields.delete(f);
-    } catch {
+    } catch (error) {
       // Best-effort: outside Tauri (plain `pnpm dev`) there is no backend;
       // the fields stay dirty so a later flush retries them.
+      set({
+        settingsError:
+          error instanceof Error ? error.message : String(error),
+      });
     }
   };
 
@@ -164,6 +216,8 @@ export const useVoice = create<VoiceState>((set, get) => {
     voices: null,
     voicesUnavailable: false,
     health: { piper: "unknown", kokoro: "unknown" },
+    deliveryFailure: null,
+    settingsError: null,
 
     load: async () => {
       const generation = ++loadGeneration;
@@ -184,6 +238,9 @@ export const useVoice = create<VoiceState>((set, get) => {
           announceOnAttention: changedDuringLoad("announceOnAttention")
             ? current.announceOnAttention
             : file.announceOnAttention,
+          announcementPolicy: changedDuringLoad("announcementPolicy")
+            ? current.announcementPolicy
+            : policyFrom(file),
           loaded: true,
         });
       } catch {
@@ -208,6 +265,9 @@ export const useVoice = create<VoiceState>((set, get) => {
           announceOnAttention: changedDuringLoad("announceOnAttention")
             ? current.announceOnAttention
             : DEFAULT_VOICE_SETTINGS.announceOnAttention,
+          announcementPolicy: changedDuringLoad("announcementPolicy")
+            ? current.announcementPolicy
+            : DEFAULT_VOICE_SETTINGS.announcementPolicy,
           loaded: true,
         });
       }
@@ -279,11 +339,32 @@ export const useVoice = create<VoiceState>((set, get) => {
       schedulePersist();
     },
     setAnnounceOnAttention: (v) => {
-      set({ announceOnAttention: v });
+      set((s) => ({
+        announceOnAttention: v,
+        announcementPolicy: {
+          ...s.announcementPolicy,
+          permission: v,
+          question: v,
+        },
+      }));
       fieldGenerations.announceOnAttention += 1;
+      fieldGenerations.announcementPolicy += 1;
       dirtyFields.add("announceOnAttention");
+      dirtyFields.add("announcementPolicy");
       schedulePersist();
     },
+    setAnnouncementPolicy: (kind, v) => {
+      set((s) => ({
+        announcementPolicy: { ...s.announcementPolicy, [kind]: v },
+        deliveryFailure: null,
+      }));
+      fieldGenerations.announcementPolicy += 1;
+      dirtyFields.add("announcementPolicy");
+      schedulePersist();
+    },
+    recordDeliveryFailure: (kind, detail, occurredAt = Date.now()) =>
+      set({ deliveryFailure: { kind, detail, occurredAt } }),
+    clearDeliveryFailure: () => set({ deliveryFailure: null }),
   };
 });
 

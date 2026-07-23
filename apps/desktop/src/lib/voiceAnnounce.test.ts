@@ -50,6 +50,8 @@ async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function statuses(map: Record<string, SessionStatus>): Record<string, SessionStatus> {
