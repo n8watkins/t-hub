@@ -916,6 +916,19 @@ mod tests {
         assert!(take_fresh_latest_status().is_some());
     }
 
+    #[test]
+    fn request_coordinator_records_actual_request_start() {
+        let guard = scribe_request_coordinator()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+        reserve_scribe_request_slot();
+        let after = SCRIBE_COORDINATOR_LAST_REQUEST_MS.load(Ordering::Acquire);
+        drop(guard);
+        assert!(after >= before);
+        assert!(after > 0);
+    }
+
     /// Fallback-file read as the production path composes it (file only).
     fn read_fallback_at(path: &Path) -> ScribeStatus {
         match eval_candidate(path) {
