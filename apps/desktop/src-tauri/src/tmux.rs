@@ -159,7 +159,43 @@ pub(crate) struct TestLifecycleGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     #[cfg(unix)]
     _process_lock: std::fs::File,
+    #[cfg(windows)]
+    _process_lock: WindowsTestLifecycleLock,
     anchor: String,
+}
+
+#[cfg(all(test, windows))]
+struct WindowsTestLifecycleLock(windows::Win32::Foundation::HANDLE);
+
+#[cfg(all(test, windows))]
+impl WindowsTestLifecycleLock {
+    fn acquire() -> Self {
+        use windows::core::w;
+        use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+
+        let handle = unsafe { CreateMutexW(None, false, w!("Local\\T-Hub-Test-Tmux-Lifecycle")) }
+            .expect("create cross-process test tmux mutex");
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        assert!(
+            wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED,
+            "wait for cross-process test tmux mutex failed: {wait:?}"
+        );
+        Self(handle)
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for WindowsTestLifecycleLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +219,8 @@ impl TestLifecycleGuard {
             assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
             file
         };
+        #[cfg(windows)]
+        let process_lock = WindowsTestLifecycleLock::acquire();
         // Once per test process, under the serialization lock, clear leaked ghost
         // sessions from PRIOR runs so they can't starve the governor or collide with
         // a fixture name. Age-bounded (see the helper) so a live sibling is safe.
@@ -199,6 +237,8 @@ impl TestLifecycleGuard {
                     _lock: lock,
                     #[cfg(unix)]
                     _process_lock: process_lock,
+                    #[cfg(windows)]
+                    _process_lock: process_lock,
                     anchor,
                 },
                 Err(error) if error.message == "server exited unexpectedly" => {
@@ -207,6 +247,8 @@ impl TestLifecycleGuard {
                             return Self {
                                 _lock: lock,
                                 #[cfg(unix)]
+                                _process_lock: process_lock,
+                                #[cfg(windows)]
                                 _process_lock: process_lock,
                                 anchor,
                             }
@@ -386,6 +428,9 @@ fn tmux(args: &[&str]) -> Result<Command, TmuxError> {
     };
     #[cfg(unix)]
     let mut cmd = Command::new("tmux");
+    // Keep this outside the platform branches. Native Windows launches tmux
+    // through wsl.exe, but it must still select the same isolated named socket
+    // as Unix, especially under cfg(test) where the default is `t-hub-test`.
     cmd.arg("-L").arg(socket);
     cmd.args(args);
     Ok(cmd)
@@ -3088,6 +3133,24 @@ mod tests {
         assert_eq!(
             validate_socket_name("t-hub.dev_01").unwrap(),
             "t-hub.dev_01"
+        );
+    }
+
+    #[test]
+    fn every_platform_tmux_command_selects_the_isolated_test_socket() {
+        let command = tmux(&["list-sessions"]).unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let socket_args = args
+            .windows(2)
+            .position(|pair| pair == ["-L", default_socket_name()])
+            .expect("tmux command must carry the configured socket after platform setup");
+        assert_eq!(default_socket_name(), "t-hub-test");
+        assert_eq!(
+            args.get(socket_args + 2).map(String::as_str),
+            Some("list-sessions")
         );
     }
 
