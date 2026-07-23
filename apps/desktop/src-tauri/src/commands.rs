@@ -655,7 +655,7 @@ pub async fn close_terminal(
     //
     // We `remove` the conn (releasing the lock) BEFORE `detach`, so the manager
     // Mutex is never held across the blocking socket shutdown + reader-thread join.
-    let conn = remote.conns.lock().remove(&id);
+    let conn = remote.remove(&id);
     if let Some(conn) = conn {
         // Shuts down the socket (the server detaches; tmux survives) and joins the
         // reader thread.
@@ -698,7 +698,7 @@ pub async fn kill_terminal(
     // Stop for real: detach the remote PTY AND kill the tmux session (terminating
     // its process tree). Remove the conn (releasing the lock) before any blocking
     // socket op so the Mutex is never held across I/O.
-    let conn = remote.conns.lock().remove(&id);
+    let conn = remote.remove(&id);
     // Captain-chat phase 2: a killed tile leaves the captains registry too - its
     // captaincy is released, and it drops out of every crew list. The UI kills
     // via this command (the × and the closeWorkspace reap), so this is the UI's
@@ -878,6 +878,7 @@ pub async fn list_terminals(
                         .is_some_and(|exp| tmux_target(id) == exp);
                 if still_backs {
                     if let Some(c) = conns.remove(id) {
+                        c.lock().retire_generation();
                         dead.push(c);
                     }
                 }

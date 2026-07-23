@@ -93,6 +93,128 @@ struct ProbeChannel {
     changed: Condvar,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationState {
+    Pending,
+    Current,
+    Retired,
+}
+
+struct GenerationProgress {
+    state: GenerationState,
+    closed: bool,
+    pending: Vec<ReaderEvent>,
+    pending_bytes: usize,
+}
+
+struct GenerationAuthority {
+    progress: StdMutex<GenerationProgress>,
+    changed: Condvar,
+    sink: Arc<dyn Fn(ReaderEvent) + Send + Sync>,
+}
+
+const MAX_PENDING_AUTHORITY_BYTES: usize = MAX_BATCH_BYTES * 4;
+
+impl GenerationAuthority {
+    fn new(sink: Arc<dyn Fn(ReaderEvent) + Send + Sync>) -> Self {
+        Self {
+            progress: StdMutex::new(GenerationProgress {
+                state: GenerationState::Pending,
+                closed: false,
+                pending: Vec::new(),
+                pending_bytes: 0,
+            }),
+            changed: Condvar::new(),
+            sink,
+        }
+    }
+
+    fn activate_if_open(&self, on_activated: impl FnOnce()) -> bool {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if progress.closed || progress.state != GenerationState::Pending {
+            progress.state = GenerationState::Retired;
+            progress.pending.clear();
+            progress.pending_bytes = 0;
+            self.changed.notify_all();
+            return false;
+        }
+        progress.state = GenerationState::Current;
+        on_activated();
+        for event in progress.pending.drain(..) {
+            (self.sink)(event);
+        }
+        progress.pending_bytes = 0;
+        self.changed.notify_all();
+        true
+    }
+
+    fn retire(&self) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.state = GenerationState::Retired;
+        progress.pending.clear();
+        progress.pending_bytes = 0;
+        self.changed.notify_all();
+    }
+
+    fn mark_closed(&self) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.closed = true;
+        self.changed.notify_all();
+    }
+
+    fn emit_if_current(&self, emit: impl FnOnce()) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        if progress.state == GenerationState::Current && !progress.closed {
+            emit();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn dispatch(&self, event: ReaderEvent) {
+        let event_bytes = event.byte_len();
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        while progress.state == GenerationState::Pending
+            && progress.pending_bytes.saturating_add(event_bytes) > MAX_PENDING_AUTHORITY_BYTES
+        {
+            progress = self
+                .changed
+                .wait(progress)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        match progress.state {
+            GenerationState::Pending => {
+                progress.pending_bytes = progress.pending_bytes.saturating_add(event_bytes);
+                progress.pending.push(event);
+                self.changed.notify_all();
+            }
+            GenerationState::Current => (self.sink)(event),
+            GenerationState::Retired => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_closed(&self, timeout: Duration) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        let (progress, _) = self
+            .changed
+            .wait_timeout_while(progress, timeout, |progress| !progress.closed)
+            .unwrap_or_else(|e| e.into_inner());
+        progress.closed
+    }
+
+    #[cfg(test)]
+    fn wait_pending_events(&self, count: usize, timeout: Duration) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        let (progress, _) = self
+            .changed
+            .wait_timeout_while(progress, timeout, |progress| progress.pending.len() < count)
+            .unwrap_or_else(|e| e.into_inner());
+        progress.pending.len() >= count
+    }
+}
+
 impl ProbeChannel {
     fn acknowledge(&self, nonce: u64) {
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -121,6 +243,9 @@ pub struct RemotePty {
     /// The reader thread, joined on detach/Drop so it never outlives us.
     reader: Option<JoinHandle<()>>,
     probe_channel: Arc<ProbeChannel>,
+    generation: Arc<GenerationAuthority>,
+    #[cfg(test)]
+    after_probe_write: Option<Arc<dyn Fn() + Send + Sync>>,
     next_probe: u64,
     /// Last known geometry, so `resize` can no-op an unchanged size (matching
     /// [`crate::pty::PtySession::resize`]): xterm's `fit` addon fires resize
@@ -217,13 +342,25 @@ impl RemotePty {
 
         // Spawn the reader thread: it owns `reader` (the read half) and re-emits
         // each {"out"}/{"exit"} frame into the webview via a cheap AppHandle clone.
-        let app_for_thread = app.clone();
         let id_for_thread = id.to_string();
         let probe_channel = Arc::new(ProbeChannel::default());
         let probe_for_thread = probe_channel.clone();
+        let event_app = app.clone();
+        let event_id = id.to_string();
+        let event_sink: Arc<dyn Fn(ReaderEvent) + Send + Sync> =
+            Arc::new(move |event| emit_reader_event(&event_app, &event_id, event));
+        let generation = Arc::new(GenerationAuthority::new(event_sink));
+        let generation_for_thread = generation.clone();
         let handle = std::thread::Builder::new()
             .name(format!("t-hub-remote-pty-{id}"))
-            .spawn(move || reader_loop(app_for_thread, id_for_thread, reader, probe_for_thread))
+            .spawn(move || {
+                reader_loop(
+                    id_for_thread,
+                    reader,
+                    probe_for_thread,
+                    generation_for_thread,
+                )
+            })
             .map_err(|e| format!("remote_pty: spawn reader thread failed: {e}"))?;
 
         Ok((
@@ -232,6 +369,9 @@ impl RemotePty {
                 writer,
                 reader: Some(handle),
                 probe_channel,
+                generation,
+                #[cfg(test)]
+                after_probe_write: None,
                 next_probe: 0,
                 cols,
                 rows,
@@ -254,6 +394,10 @@ impl RemotePty {
             .as_ref()
             .map(|handle| !handle.is_finished())
             .unwrap_or(false)
+    }
+
+    pub(crate) fn retire_generation(&self) {
+        self.generation.retire();
     }
 
     /// Perform an actual transport write before a cached connection is reused.
@@ -279,6 +423,11 @@ impl RemotePty {
             .write_all(&frame)
             .and_then(|()| self.writer.flush())
             .map_err(|e| format!("remote_pty: probe terminal {} failed: {e}", self.id))?;
+
+        #[cfg(test)]
+        if let Some(after_probe_write) = &self.after_probe_write {
+            after_probe_write();
+        }
 
         let progress = self
             .probe_channel
@@ -349,6 +498,9 @@ impl RemotePty {
     /// (unblocking the reader) and join the thread. Idempotent — a second call sees
     /// `reader == None` and is a no-op.
     fn shutdown_and_join(&mut self) {
+        // Wake a Pending reader that is backpressured on the bounded pre-install
+        // event buffer, and suppress any later event from this generation.
+        self.generation.retire();
         // Best-effort: the peer may already be gone (the attach client exited and
         // the server closed the connection), in which case shutdown errors harmlessly.
         let _ = self.writer.shutdown(Shutdown::Both);
@@ -401,6 +553,27 @@ enum PtyFrame {
     Ignore,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PreparedStreamEnd {
+    Detached,
+    Exited(Option<i32>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReaderEvent {
+    Output(Vec<u8>),
+    StreamEnd(PreparedStreamEnd),
+}
+
+impl ReaderEvent {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Output(bytes) => bytes.len(),
+            Self::StreamEnd(_) => 0,
+        }
+    }
+}
+
 /// Parse one NDJSON line (without the trailing newline) into a [`PtyFrame`]. A
 /// blank line, non-JSON, or un-decodable base64 yields [`PtyFrame::Ignore`] so a
 /// single bad frame can never tear down the terminal.
@@ -429,18 +602,11 @@ fn parse_pty_frame(line: &[u8]) -> PtyFrame {
 /// Emit the accumulated output `batch` as a single base64 `terminal://output`
 /// event, then clear it. A no-op when empty. (We re-encode the COMBINED bytes
 /// once rather than per source frame, so N coalesced chunks cost one emit.)
-fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
+fn emit_batch(authority: &GenerationAuthority, batch: &mut Vec<u8>) {
     if batch.is_empty() {
         return;
     }
-    let payload = OutputEvent {
-        id: id.to_string(),
-        base64: STANDARD.encode(&batch),
-    };
-    // If emit fails the window is gone; we still clear so the buffer doesn't grow.
-    crate::hangwatch::note_emit(); // count toward the main-thread emit-rate watchdog
-    let _ = app.emit(events::OUTPUT, &payload);
-    batch.clear();
+    authority.dispatch(ReaderEvent::Output(std::mem::take(batch)));
 }
 
 /// The attach stream ended — an explicit `{"exit"}` frame, or EOF/error on the
@@ -470,34 +636,52 @@ fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
 /// thread, so the cost is off every hot path. NOTE: the check runs on the CLIENT
 /// host — correct while the control endpoint is loopback (M2a); when M2 points this
 /// at a remote host, liveness must be asked of the remote server instead.
-fn emit_stream_end(app: &AppHandle, id: &str, code: Option<i32>) {
+fn prepare_stream_end(id: &str, code: Option<i32>) -> PreparedStreamEnd {
     let gone = crate::tmux::is_definitively_gone(crate::tmux::session_liveness(
         &crate::tmux::target_for_id(id),
     ));
     if !gone {
-        let _ = app.emit(
-            events::STATE,
-            &StateEvent {
-                id: id.to_string(),
-                state: TerminalState::Detached,
-            },
-        );
-        return;
+        return PreparedStreamEnd::Detached;
     }
-    let _ = app.emit(
-        events::EXIT,
-        &ExitEvent {
-            id: id.to_string(),
-            code,
-        },
-    );
-    let _ = app.emit(
-        events::STATE,
-        &StateEvent {
-            id: id.to_string(),
-            state: TerminalState::Exited,
-        },
-    );
+    PreparedStreamEnd::Exited(code)
+}
+
+fn emit_reader_event(app: &AppHandle, id: &str, event: ReaderEvent) {
+    match event {
+        ReaderEvent::Output(bytes) => {
+            let payload = OutputEvent {
+                id: id.to_string(),
+                base64: STANDARD.encode(bytes),
+            };
+            crate::hangwatch::note_emit();
+            let _ = app.emit(events::OUTPUT, &payload);
+        }
+        ReaderEvent::StreamEnd(PreparedStreamEnd::Detached) => {
+            let _ = app.emit(
+                events::STATE,
+                &StateEvent {
+                    id: id.to_string(),
+                    state: TerminalState::Detached,
+                },
+            );
+        }
+        ReaderEvent::StreamEnd(PreparedStreamEnd::Exited(code)) => {
+            let _ = app.emit(
+                events::EXIT,
+                &ExitEvent {
+                    id: id.to_string(),
+                    code,
+                },
+            );
+            let _ = app.emit(
+                events::STATE,
+                &StateEvent {
+                    id: id.to_string(),
+                    state: TerminalState::Exited,
+                },
+            );
+        }
+    }
 }
 
 /// Drain the socket's frames, re-emitting into the webview like
@@ -510,10 +694,10 @@ fn emit_stream_end(app: &AppHandle, id: &str, code: Option<i32>) {
 ///     verified transition with `code: None`, so a server/connection drop over a
 ///     LIVE session reads as an attach loss (Detached), not a false exit.
 fn reader_loop(
-    app: AppHandle,
     id: String,
     reader: BufReader<TcpStream>,
     probe_channel: Arc<ProbeChannel>,
+    generation: Arc<GenerationAuthority>,
 ) {
     // The handshake's BufReader may already hold bytes past the scrollback frame
     // (the first `out` frames can ride the same TCP segment). Drain that buffered
@@ -524,7 +708,7 @@ fn reader_loop(
 
     let mut batch: Vec<u8> = Vec::new();
     let mut buf = [0u8; RECV_BUF];
-    let mut saw_exit = false;
+    let mut exit_code = None;
 
     'read: loop {
         // Parse every COMPLETE line currently in `acc` before blocking again. A
@@ -535,14 +719,13 @@ fn reader_loop(
                 PtyFrame::Output(bytes) => {
                     batch.extend_from_slice(&bytes);
                     if batch.len() >= MAX_BATCH_BYTES {
-                        emit_batch(&app, &id, &mut batch);
+                        emit_batch(&generation, &mut batch);
                     }
                 }
                 PtyFrame::Exit(code) => {
                     // Flush any output that preceded the exit so order is preserved.
-                    emit_batch(&app, &id, &mut batch);
-                    emit_stream_end(&app, &id, code);
-                    saw_exit = true;
+                    emit_batch(&generation, &mut batch);
+                    exit_code = Some(code);
                     break 'read;
                 }
                 PtyFrame::ProbeAck(nonce) => probe_channel.acknowledge(nonce),
@@ -561,25 +744,22 @@ fn reader_loop(
             Ok(n) => acc.extend_from_slice(&buf[..n]),
             // The coalesce window elapsed with a batch pending → flush it.
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                emit_batch(&app, &id, &mut batch);
+                emit_batch(&generation, &mut batch);
             }
             Err(_) => break, // a torn-down connection (shutdown) surfaces here.
         }
     }
 
     // Flush whatever output was still pending when the stream ended.
-    emit_batch(&app, &id, &mut batch);
+    emit_batch(&generation, &mut batch);
 
-    // If the stream ended WITHOUT an explicit {"exit"} (a server/connection drop
-    // mid-stream), still emit a verified terminal transition so the tile doesn't
-    // hang "live": Exited when the tmux session is really gone, Detached when the
-    // session survived the drop (attach churn — the frontend auto-reattaches). On
-    // a clean `detach()` the user already removed the tile, so the (Detached)
-    // state event lands in a webview that no longer renders it.
-    if !saw_exit {
-        emit_stream_end(&app, &id, None);
-    }
+    // Close health authority before any potentially slow tmux classification or
+    // stream-end event. A probe waiter can therefore never accept an ack and emit
+    // Live after this reader has already published Detached/Exited.
     probe_channel.close();
+    generation.mark_closed();
+    let stream_end = prepare_stream_end(&id, exit_code.unwrap_or(None));
+    generation.dispatch(ReaderEvent::StreamEnd(stream_end));
 }
 
 /// App-wide registry of live remote-PTY connections, keyed by T-Hub id. Mirrors
@@ -608,8 +788,7 @@ impl RemotePtyManager {
             .get(id)
             .is_some_and(|current| Arc::ptr_eq(current, candidate))
         {
-            on_current();
-            true
+            candidate.lock().generation.emit_if_current(on_current)
         } else {
             false
         }
@@ -625,6 +804,7 @@ impl RemotePtyManager {
             .get(id)
             .is_some_and(|current| Arc::ptr_eq(current, candidate))
         {
+            candidate.lock().generation.retire();
             conns.remove(id)
         } else {
             None
@@ -642,13 +822,28 @@ impl RemotePtyManager {
         let mut conns = self.conns.lock();
         match conns.entry(id) {
             Entry::Vacant(entry) => {
+                let key = entry.key().clone();
                 let connection = Arc::new(Mutex::new(connection));
                 entry.insert(connection.clone());
-                on_installed();
-                Ok(connection)
+                if connection.lock().generation.activate_if_open(on_installed) {
+                    Ok(connection)
+                } else {
+                    let removed = conns.remove(&key).expect("just-inserted generation");
+                    drop(connection);
+                    let mutex = Arc::try_unwrap(removed)
+                        .unwrap_or_else(|_| panic!("unpublished generation unexpectedly shared"));
+                    Err(mutex.into_inner())
+                }
             }
             Entry::Occupied(_) => Err(connection),
         }
+    }
+
+    pub fn remove(&self, id: &str) -> Option<Arc<Mutex<RemotePty>>> {
+        let mut conns = self.conns.lock();
+        let connection = conns.get(id)?.clone();
+        connection.lock().generation.retire();
+        conns.remove(id)
     }
 }
 
@@ -662,15 +857,61 @@ mod tests {
         reader: JoinHandle<()>,
         probe_channel: Arc<ProbeChannel>,
     ) -> RemotePty {
+        test_remote_with_sink(writer, reader, probe_channel, Arc::new(|_| {}))
+    }
+
+    fn test_remote_with_sink(
+        writer: TcpStream,
+        reader: JoinHandle<()>,
+        probe_channel: Arc<ProbeChannel>,
+        sink: Arc<dyn Fn(ReaderEvent) + Send + Sync>,
+    ) -> RemotePty {
         RemotePty {
             id: "test".into(),
             writer,
             reader: Some(reader),
             probe_channel,
+            generation: Arc::new(GenerationAuthority::new(sink)),
+            after_probe_write: None,
             next_probe: 0,
             cols: 80,
             rows: 24,
         }
+    }
+
+    fn socket_backed_remote(
+        id: &str,
+        writer: TcpStream,
+        reader_stream: TcpStream,
+        sink: Arc<dyn Fn(ReaderEvent) + Send + Sync>,
+    ) -> (RemotePty, Arc<GenerationAuthority>) {
+        let probe_channel = Arc::new(ProbeChannel::default());
+        let generation = Arc::new(GenerationAuthority::new(sink));
+        let reader_probe_channel = probe_channel.clone();
+        let reader_generation = generation.clone();
+        let reader_id = id.to_string();
+        let reader = std::thread::spawn(move || {
+            reader_loop(
+                reader_id,
+                BufReader::new(reader_stream),
+                reader_probe_channel,
+                reader_generation,
+            )
+        });
+        (
+            RemotePty {
+                id: id.into(),
+                writer,
+                reader: Some(reader),
+                probe_channel,
+                generation: generation.clone(),
+                after_probe_write: None,
+                next_probe: 0,
+                cols: 80,
+                rows: 24,
+            },
+            generation,
+        )
     }
 
     fn installed(result: Result<Arc<Mutex<RemotePty>>, RemotePty>) -> Arc<Mutex<RemotePty>> {
@@ -1072,5 +1313,300 @@ mod tests {
         manager.conns.lock().remove("term").unwrap().lock().detach();
         drop(loser_server);
         drop(winner_server);
+    }
+
+    #[test]
+    fn pending_winner_flushes_output_once_and_loser_never_emits() {
+        let winner_events = Arc::new(StdMutex::new(Vec::new()));
+        let winner_sink = winner_events.clone();
+        let winner = GenerationAuthority::new(Arc::new(move |event| {
+            winner_sink.lock().unwrap().push(event)
+        }));
+        winner.dispatch(ReaderEvent::Output(b"pre-install".to_vec()));
+        assert!(winner_events.lock().unwrap().is_empty());
+        assert!(winner.activate_if_open(|| {}));
+        assert_eq!(
+            *winner_events.lock().unwrap(),
+            [ReaderEvent::Output(b"pre-install".to_vec())]
+        );
+        assert!(!winner.activate_if_open(|| {}));
+
+        let loser_events = Arc::new(StdMutex::new(Vec::new()));
+        let loser_sink = loser_events.clone();
+        let loser = GenerationAuthority::new(Arc::new(move |event| {
+            loser_sink.lock().unwrap().push(event)
+        }));
+        loser.dispatch(ReaderEvent::Output(b"loser".to_vec()));
+        loser.retire();
+        assert!(loser_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn socket_reader_ack_then_eof_rejects_probe_before_live() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut input = BufReader::new(server.try_clone().unwrap());
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            let nonce = serde_json::from_str::<Value>(&line).unwrap()["probe"]
+                .as_u64()
+                .unwrap();
+            writeln!(server, "{{\"probeAck\":{nonce}}}").unwrap();
+            server.flush().unwrap();
+            server.shutdown(Shutdown::Both).unwrap();
+        });
+
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let (mut remote, generation) = socket_backed_remote(
+            "ack-eof",
+            writer,
+            reader_stream,
+            Arc::new(move |event| {
+                sink_events.lock().unwrap().push(format!("{event:?}"));
+            }),
+        );
+        assert!(
+            generation.activate_if_open(|| { events.lock().unwrap().push("initial:Live".into()) })
+        );
+
+        let probe_written = Arc::new(std::sync::Barrier::new(2));
+        let release_probe = Arc::new(std::sync::Barrier::new(2));
+        let hook_written = probe_written.clone();
+        let hook_release = release_probe.clone();
+        remote.after_probe_write = Some(Arc::new(move || {
+            hook_written.wait();
+            hook_release.wait();
+        }));
+        let remote = Arc::new(Mutex::new(remote));
+        let probing_remote = remote.clone();
+        let probing_generation = generation.clone();
+        let probe_events = events.clone();
+        let probe = std::thread::spawn(move || {
+            let result = probing_remote.lock().probe();
+            if result.is_ok() {
+                probing_generation
+                    .emit_if_current(|| probe_events.lock().unwrap().push("probe:Live".into()));
+            }
+            result
+        });
+
+        probe_written.wait();
+        assert!(
+            generation.wait_closed(Duration::from_secs(1)),
+            "actual reader_loop did not record EOF"
+        );
+        release_probe.wait();
+        assert!(probe.join().unwrap().is_err());
+        remote
+            .lock()
+            .reader
+            .take()
+            .expect("reader handle")
+            .join()
+            .unwrap();
+        server_thread.join().unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.first().map(String::as_str), Some("initial:Live"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("StreamEnd("))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event == "probe:Live"));
+    }
+
+    #[test]
+    fn retired_socket_reader_eof_is_suppressed_after_replacement_live() {
+        let old_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let old_writer = TcpStream::connect(old_listener.local_addr().unwrap()).unwrap();
+        let old_reader_stream = old_writer.try_clone().unwrap();
+        let (old_server, _) = old_listener.accept().unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let old_events = events.clone();
+        let (old_remote, _) = socket_backed_remote(
+            "old-generation",
+            old_writer,
+            old_reader_stream,
+            Arc::new(move |event| {
+                old_events.lock().unwrap().push(format!("old:{event:?}"));
+            }),
+        );
+        let manager = RemotePtyManager::default();
+        let installed_events = events.clone();
+        let old = installed(
+            manager.install_if_absent("term".into(), old_remote, move || {
+                installed_events.lock().unwrap().push("old:Live".into())
+            }),
+        );
+        let retired = manager.remove_if_current("term", &old).unwrap();
+
+        let replacement_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let replacement_writer =
+            TcpStream::connect(replacement_listener.local_addr().unwrap()).unwrap();
+        let replacement_reader_stream = replacement_writer.try_clone().unwrap();
+        let (replacement_server, _) = replacement_listener.accept().unwrap();
+        let replacement_reader = std::thread::spawn(move || {
+            let mut reader = replacement_reader_stream;
+            let mut tail = Vec::new();
+            let _ = reader.read_to_end(&mut tail);
+        });
+        let replacement_events = events.clone();
+        let replacement = installed(manager.install_if_absent(
+            "term".into(),
+            test_remote(
+                replacement_writer,
+                replacement_reader,
+                Arc::new(ProbeChannel::default()),
+            ),
+            move || {
+                replacement_events
+                    .lock()
+                    .unwrap()
+                    .push("replacement:Live".into())
+            },
+        ));
+
+        old_server.shutdown(Shutdown::Both).unwrap();
+        retired
+            .lock()
+            .reader
+            .take()
+            .expect("old reader handle")
+            .join()
+            .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["old:Live".to_string(), "replacement:Live".to_string()]
+        );
+
+        manager.remove_if_current("term", &replacement).unwrap();
+        replacement.lock().detach();
+        drop(replacement_server);
+    }
+
+    #[test]
+    fn socket_reader_flushes_preinstall_output_once_after_live() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let reader_stream = writer.try_clone().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let (remote, generation) = socket_backed_remote(
+            "preinstall",
+            writer,
+            reader_stream,
+            Arc::new(move |event| {
+                sink_events.lock().unwrap().push(format!("{event:?}"));
+            }),
+        );
+
+        writeln!(
+            server,
+            "{{\"out\":\"{}\"}}",
+            STANDARD.encode(b"pre-install")
+        )
+        .unwrap();
+        server.flush().unwrap();
+        assert!(
+            generation.wait_pending_events(1, Duration::from_secs(1)),
+            "actual reader_loop did not buffer pre-install output"
+        );
+        assert!(events.lock().unwrap().is_empty());
+
+        let manager = RemotePtyManager::default();
+        let live_events = events.clone();
+        let installed_remote =
+            installed(manager.install_if_absent("term".into(), remote, move || {
+                live_events.lock().unwrap().push("Live".into())
+            }));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "Live".to_string(),
+                "Output([112, 114, 101, 45, 105, 110, 115, 116, 97, 108, 108])".to_string()
+            ]
+        );
+
+        manager
+            .remove_if_current("term", &installed_remote)
+            .unwrap();
+        installed_remote.lock().detach();
+        drop(server);
+    }
+
+    #[test]
+    fn ack_then_eof_cannot_emit_stale_live_after_detached() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let authority = GenerationAuthority::new(Arc::new(move |event| {
+            sink_events.lock().unwrap().push(format!("{event:?}"))
+        }));
+        assert!(authority.activate_if_open(|| {}));
+
+        authority.mark_closed();
+        authority.dispatch(ReaderEvent::StreamEnd(PreparedStreamEnd::Detached));
+        assert!(!authority.emit_if_current(|| { events.lock().unwrap().push("Live".into()) }));
+        assert_eq!(*events.lock().unwrap(), ["StreamEnd(Detached)".to_string()]);
+    }
+
+    #[test]
+    fn retired_old_reader_cannot_emit_after_replacement_live() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let old_events = events.clone();
+        let old = GenerationAuthority::new(Arc::new(move |event| {
+            old_events.lock().unwrap().push(format!("old:{event:?}"))
+        }));
+        assert!(old.activate_if_open(|| {}));
+        old.retire();
+
+        let new_events = events.clone();
+        let new = GenerationAuthority::new(Arc::new(move |event| {
+            new_events.lock().unwrap().push(format!("new:{event:?}"))
+        }));
+        assert!(new.activate_if_open(|| { events.lock().unwrap().push("new:Live".into()) }));
+        old.dispatch(ReaderEvent::StreamEnd(PreparedStreamEnd::Detached));
+        assert_eq!(*events.lock().unwrap(), ["new:Live".to_string()]);
+    }
+
+    #[test]
+    fn detach_wakes_reader_blocked_at_pending_authority_cap() {
+        let authority = Arc::new(GenerationAuthority::new(Arc::new(|_| {})));
+        for _ in 0..4 {
+            authority.dispatch(ReaderEvent::Output(vec![0; MAX_BATCH_BYTES]));
+        }
+        let blocked_authority = authority.clone();
+        let blocked_reader = std::thread::spawn(move || {
+            blocked_authority.dispatch(ReaderEvent::Output(vec![0; MAX_BATCH_BYTES]));
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut remote = RemotePty {
+            id: "pending".into(),
+            writer,
+            reader: Some(blocked_reader),
+            probe_channel: Arc::new(ProbeChannel::default()),
+            generation: authority,
+            after_probe_write: None,
+            next_probe: 0,
+            cols: 80,
+            rows: 24,
+        };
+        let started = std::time::Instant::now();
+        remote.detach();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "detach did not wake the pending reader"
+        );
+        drop(server);
     }
 }
