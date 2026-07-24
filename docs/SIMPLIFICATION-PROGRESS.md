@@ -19,21 +19,21 @@ Every change is behavior-preserving, verified (tests / typecheck), committed sep
 | `30d9102` | **WS1**: `control.rs` history handlers -> `control/handlers_history.rs` | -> 26,717 |
 | `3cbe2aa` | **WS1**: `control.rs` fleet-watch handlers -> `control/handlers_fleet.rs` | -> 26,507 |
 | `df37fd6` | **WS1**: `control.rs` worktree handlers -> `control/handlers_worktrees.rs` | -> 25,840 |
+| `969f822` | **WS1**: `control.rs` inherent `impl CaptainsRegistry` (99 methods) -> `control/captains_registry.rs` | -> 20,338 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~25,840 lines total across this effort.
+`control.rs` has gone from 73,435 to ~20,338 lines total across this effort.
 
 ## Remaining workstreams
 
 ### WS1 - split `control.rs` production half into submodules (IN PROGRESS)
 
-Goal: take `control.rs` from ~25,840 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
-Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`.
+Goal: take `control.rs` from ~20,338 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
+Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`.
 
 **Remaining groups** (do biggest/hardest first, one verified commit each):
-- `captains_registry.rs` (~7,600 lines) - the `impl CaptainsRegistry` state machine + `FleetRole`/`ClaimState` enums.
-  Hardest: it is an `impl` block, so its methods (not just free fns) need `pub(super)` where called from the parent, and the struct fields stay accessible because the child module sees the parent's private items.
-- `idempotency.rs` (~5,000) - `RequestCache` + provider-capacity evidence + control leases.
+- `idempotency.rs` - `RequestCache` + provider-capacity evidence + control leases.
+  Reassessed: NOT one contiguous ~5k cluster - the `RequestCache`/`CaptainControlLeases` structs+impls (~600 lines, 8884-9485) are interleaved with provider-capacity types, `SpawnPurpose`/`SpawnAdmissionGuard`, and `PreviewRootAuthority` that `ControlContext` and spawn admission depend on. Extract the RequestCache+lease sub-cluster only, or defer.
 - `handlers_status.rs` - `get_status`, `wait_for_status`, `supervision_tree`, `list_agents`, `agent_events`, `dispatch_preflight`.
 - `handlers_agents.rs` - `agent_checkpoint`, `agent_followup`, `record_agent_delivery`.
 - `handlers_tabs.rs` - `new_tab`/`close_tab`/`rename_tab`/`focus_tab`/`move_tile`/`list_tabs`/`open_file`.
@@ -42,7 +42,9 @@ Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `h
 - `handlers_spawn.rs` - `spawn_terminal`/`start_agent`/`commission_captain`/`attach_captain` + spawn-capacity eval.
 - `handlers_comms.rs` - `plane_send`/`inbox_ack`/`inbox_status`/`check_authorization`.
 
-Done: `handlers_fleet.rs` (`watch_fleet`/`unwatch_fleet`/`list_fleet_watches` + scope/owner helpers), `handlers_worktrees.rs` (`create_worktree`/`remove_worktree`/`list_worktrees` + authz/git-capability/rollback helpers).
+Also still available in the `captains_registry.rs` neighbourhood: the `#[cfg(test)] impl CaptainsRegistry` helper impl and `impl Default for CaptainsRegistry` could fold into that submodule for cohesion; the `CaptainsRegistry` struct + supporting types (`CaptainsInner`, `ClaimDisposition`, `ShipMembership`, ...) are pervasively referenced by `ControlContext`/handlers, so moving them needs care with `pub(super)` + the `private_interfaces` lint.
+
+Done: `handlers_fleet.rs` (`watch_fleet`/`unwatch_fleet`/`list_fleet_watches` + scope/owner helpers), `handlers_worktrees.rs` (`create_worktree`/`remove_worktree`/`list_worktrees` + authz/git-capability/rollback helpers), `captains_registry.rs` (the inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide).
 
 **Stays in `control.rs`**: `ControlContext`/`ControlRequest`/`ControlResponse`/`ControlHandshake`/`EventFanout`/`TabRegistry` types; the serve/listen loop (`start`, `serve`, `handle_conn`, `serve_pty_attach`); discovery/handshake + identity/token resolution; the dispatch entry points (`dispatch_authenticated`, `dispatch`, `dispatch_with_caller`, `required_tier`); and shared helpers (`arg_str`, `deny`, error taggers, `now_ms`).
 
@@ -57,6 +59,11 @@ Done: `handlers_fleet.rs` (`watch_fleet`/`unwatch_fleet`/`list_fleet_watches` + 
    The glob re-export means both the dispatch arms and the sibling test module resolve the names unchanged - no call-site edits.
 5. Verify: `cargo check --tests` must be warning-free (watch the `private_interfaces` lint), then `cargo test --lib control::tests` (baseline 426 pass / 0 fail, ~6 min), then `cargo clippy --lib`.
 6. Commit path-scoped (`control.rs` + the new submodule + version-bump files) after running `apps/desktop/scripts/bump-version.sh`.
+
+**Impl-block variant** (used for `captains_registry.rs`): to extract a single inherent `impl Type { ... }` block, move the whole `impl` verbatim, keep the struct + other impls (test/`Default`) in the parent, and prepend only `use super::*;`.
+Prefix each private method (`^    fn `) with `pub(super)`; leave `pub fn` methods as-is.
+In the parent, replace the block with a bare `mod <name>;` and NO glob import - inherent methods resolve crate-wide by type, so nothing needs re-exporting, and a `use <name>::*;` on an impl-only module would just be an unused import.
+This compiled warning-free first try (no `private_interfaces` fallout: a `pub(super)` method exposing a parent-module-private type is the same visibility level, so no leak).
 
 ### WS3 - consolidate `wsl_bash` helper (BLOCKED / deferred)
 
