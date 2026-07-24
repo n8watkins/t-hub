@@ -27,9 +27,13 @@ Every change is behavior-preserving, verified (tests / typecheck), committed sep
 | `17c4833` | **WS1**: `control.rs` captain handlers (claim lifecycle + provisioning) -> `handlers_captains.rs` (16 fns + 1 const) | -> 14,792 |
 | `0de9005` | **WS1**: `control.rs` terminal I/O + tab handlers -> `handlers_terminal.rs` (14 fns + 3 types) + `handlers_tabs.rs` (11 fns) | -> 13,804 |
 | `d7a3d48` | **WS1**: `control.rs` read_terminal -> `handlers_terminal.rs`, open_file -> `handlers_files.rs` | -> 13,682 |
+| `0083456` | **WS1**: fold `#[cfg(test)]` + `Default` `CaptainsRegistry` impls into `captains_registry.rs` | -> 13,554 |
+| `fab795a` | **WS1**: `RequestCache` + captain-control leases -> `control/idempotency.rs` | -> 13,002 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~13,682 lines total across this effort.
+`control.rs` has gone from 73,435 to ~13,002 lines total across this effort.
+
+Type-extraction gotcha (idempotency): moving a struct whose fields the sibling `control/tests.rs` inspects needs those FIELDS made `pub(super)`, not just the struct - once the struct leaves `control` for `control::idempotency`, `tests.rs` (a sibling, not a descendant) can no longer see ancestor-private fields. The compiler surfaces these one struct at a time, so re-check until clean.
 
 Two more gotchas from these later moves (both fixed in-commit):
 - Splitting a cluster mid-way through a fn's doc comment strands the doc (`error: expected item after doc comment`) in the source module and leaves the fn undoc'd in the target - cascading into "undeclared" errors because the stranded-doc module fails to compile and its glob re-export vanishes. Cut on blank lines between items, never inside a doc block.
@@ -57,12 +61,13 @@ Note (sibling-to-sibling resolution PROVEN): a helper moved into submodule A is 
 This is the same mechanism `control/tests.rs` already uses to reach the moved handlers, and it now also holds for production siblings (`handlers_fleet` reaches `target_statuses` in `handlers_status`).
 So shared helpers can move into whichever submodule owns them; they need not stay in `control.rs`.
 
-**Remaining TYPE clusters** (delicate - `pub(super)` the types, watch `private_interfaces`; do one verified commit each):
-- Fold the `#[cfg(test)] impl CaptainsRegistry` + `impl Default for CaptainsRegistry` into `captains_registry.rs` (low-risk cohesion win - impl-only move, same as the inherent-impl move).
-- `captains_model.rs` (or extend `captains_registry.rs`): the `CaptainsRegistry` struct + `CaptainsInner`/`ClaimDisposition`/`ShipMembership`/`FleetWorkspaceRecord`/`CaptainRecord`/`ProjectRecord`/authority-projection types + their impls. Large (~2k) but pervasively referenced - `pub(super)` types, and fields the parent constructs need `pub(super)` too.
-- `idempotency.rs` - `RequestCache` (+`RequestCacheInner`) + `CaptainControlLeases` (+`CaptainControlLease`/`LeaseAuthority`/state) + their impls. `ControlContext` holds these as fields, so the struct types need `pub(super)`; the interleaved provider-capacity types moved to `handlers_spawn` already, so this sub-cluster is cleaner now.
+**Remaining TYPE clusters** (delicate - `pub(super)` the types AND any sibling-inspected fields, watch `private_interfaces`; do one verified commit each):
+- `captains_model.rs` (or extend `captains_registry.rs`): the `CaptainsRegistry` struct + `CaptainsInner`/`ClaimDisposition`/`ShipMembership`/`FleetWorkspaceRecord`/`CaptainRecord`/`ProjectRecord`/authority-projection types + their impls. Large (~2k) but pervasively referenced - `pub(super)` types, and fields the parent/tests construct need `pub(super)` too. Highest remaining line-count win.
 - `pty_attach.rs` (serve internals) - `RebindController`/`AttachForwarderGuard`/`ConnGuard`/`SharedPtyWriter` + `serve_pty_attach`. Tightly coupled to the serve loop; treat as serve-internal, move only if it stays behavior-preserving.
 - `authz_tier.rs` - `CommandTier` + `Capability` enums/impls (the tier/capability model).
+- Remaining read handlers still by dispatch (`list_terminals`, `list_captains`, `list_projects`, `cortana_bootstrap`, `claude_usage`/`codex_usage`, `host_metrics`, `archive_recent_project`) could form a small `handlers_read.rs`.
+
+Done (type clusters): folded `#[cfg(test)]` + `Default` `CaptainsRegistry` impls into `captains_registry.rs`; `idempotency.rs` (`RequestCache` + `CaptainControlLeases`).
 
 Done: `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs` (inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide), `handlers_agents.rs` (agent lifecycle), `handlers_status.rs` (status/supervision/host-monitoring), `handlers_comms.rs` (inbox/plane-send/authorization), `handlers_admin.rs` (delegated-admin lifecycle + execution), `handlers_spawn.rs` (spawn-capacity eval + spawn/tmux handlers), `handlers_captains.rs` (claim lifecycle + captain provisioning + crew launch), `handlers_terminal.rs` (break-glass writers + close_terminal lifecycle + read_terminal), `handlers_tabs.rs` (org-apply + tab mutations + list_tabs).
 
