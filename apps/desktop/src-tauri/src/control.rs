@@ -2323,7 +2323,6 @@ pub(crate) struct SpawnAdmissionGuard<'a> {
     _capacity: crate::governor::CapacityReport,
 }
 
-
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -7113,7 +7112,6 @@ fn local_host_metrics() -> t_hub_protocol::HostMetrics {
 // dispatch match that routes to them).
 mod handlers_files;
 
-
 /// `list_captains`: the claimed captains from the CORE captains registry
 /// (captain-chat phase 2), each `{shipSlug, captainSessionId, workspaceTabIds,
 /// crew}` plus the registry revision - the same versioned-snapshot contract as
@@ -11605,7 +11603,6 @@ fn trusted_provider_session_id(
     }
     Ok(runtime.or(presented))
 }
-
 
 mod handlers_comms;
 use handlers_comms::*;
