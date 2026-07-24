@@ -117,4 +117,3 @@ pub(super) fn open_file(
         files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
     serde_json::to_value(contents).map_err(|e| e.to_string())
 }
-

@@ -41,7 +41,8 @@ pub(super) const REQUEST_CACHE_TTL: std::time::Duration = std::time::Duration::f
 /// reaped-but-alive op resolves against what actually happened instead of being
 /// blindly duplicated regardless of the window. The window still bounds how long a
 /// truly-dead reservation blocks retries; the re-probe removes the duplicate risk.
-pub(super) const REQUEST_INFLIGHT_REAP_DEFAULT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(super) const REQUEST_INFLIGHT_REAP_DEFAULT: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 /// The effective InFlight reap window: `$T_HUB_REQUEST_INFLIGHT_REAP_SECS` (seconds)
 /// if set to a positive integer, else [`REQUEST_INFLIGHT_REAP_DEFAULT`].

@@ -235,7 +235,9 @@ pub(super) fn get_agent(
     Ok(agent_status_value(agent, true))
 }
 
-pub(super) fn parse_agent_followup(args: &Value) -> Result<crate::agent_session::AgentFollowup, String> {
+pub(super) fn parse_agent_followup(
+    args: &Value,
+) -> Result<crate::agent_session::AgentFollowup, String> {
     require_exact_args(
         args,
         "agent_followup",
@@ -533,7 +535,11 @@ pub(super) fn required_delivery_evidence<'a>(
     Ok(evidence)
 }
 
-pub(super) fn evidence_string(evidence: &Value, field: &str, state: &str) -> Result<String, String> {
+pub(super) fn evidence_string(
+    evidence: &Value,
+    field: &str,
+    state: &str,
+) -> Result<String, String> {
     arg_str(evidence, field)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {

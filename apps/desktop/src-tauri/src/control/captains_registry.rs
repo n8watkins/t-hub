@@ -1707,7 +1707,10 @@ impl CaptainsRegistry {
         Ok(workspace)
     }
 
-    pub(super) fn adopt_unowned_workspace_projection(&self, tabs: &[TabRecord]) -> Result<bool, String> {
+    pub(super) fn adopt_unowned_workspace_projection(
+        &self,
+        tabs: &[TabRecord],
+    ) -> Result<bool, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         let previous = current.clone();
@@ -1758,7 +1761,11 @@ impl CaptainsRegistry {
         self.commit_mutation(current, previous)
     }
 
-    pub(super) fn move_workspace_tile(&self, tile_id: &str, workspace_id: &str) -> Result<(), String> {
+    pub(super) fn move_workspace_tile(
+        &self,
+        tile_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         if current
@@ -1923,7 +1930,10 @@ impl CaptainsRegistry {
         Ok(operation)
     }
 
-    pub(super) fn pending_close_terminal_operation(&self, terminal_id: &str) -> Option<PendingFleetOperation> {
+    pub(super) fn pending_close_terminal_operation(
+        &self,
+        terminal_id: &str,
+    ) -> Option<PendingFleetOperation> {
         self.lock()
             .pending_fleet_operations
             .iter()
@@ -1940,7 +1950,10 @@ impl CaptainsRegistry {
     }
 
     #[allow(dead_code)]
-    pub(super) fn close_operation_owns_dispatch_release(&self, recovery: &PendingDispatchRelease) -> bool {
+    pub(super) fn close_operation_owns_dispatch_release(
+        &self,
+        recovery: &PendingDispatchRelease,
+    ) -> bool {
         self.lock()
             .pending_fleet_operations
             .iter()
@@ -2977,7 +2990,11 @@ impl CaptainsRegistry {
         Ok(())
     }
 
-    pub(super) fn mark_cortana_degraded(&self, operation_id: &str, reason: &str) -> Result<(), String> {
+    pub(super) fn mark_cortana_degraded(
+        &self,
+        operation_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
         if operation_id.trim().is_empty() || reason.trim().is_empty() {
             return Err("degraded Cortana state requires an operationId and reason".into());
         }
@@ -4077,7 +4094,9 @@ impl CaptainsRegistry {
     /// Capture durable registry values and their internal authority versions under
     /// one lock. The returned copies are safe to carry across remote I/O without
     /// holding either the registry lock or the mutation serializer.
-    pub(super) fn snapshot_with_authority_generations(&self) -> (CaptainsSnapshot, AuthorityGenerations, u64) {
+    pub(super) fn snapshot_with_authority_generations(
+        &self,
+    ) -> (CaptainsSnapshot, AuthorityGenerations, u64) {
         let g = self.lock();
         (
             CaptainsSnapshot {
@@ -4136,7 +4155,10 @@ impl CaptainsRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(super) fn begin_git_initialization(&self, intent: GitInitIntent) -> Result<GitInitIntent, String> {
+    pub(super) fn begin_git_initialization(
+        &self,
+        intent: GitInitIntent,
+    ) -> Result<GitInitIntent, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
         if let Some(existing) = current

@@ -469,7 +469,10 @@ pub(super) fn authorize_worktree_maintenance(
     .map(Some)
 }
 
-pub(super) fn create_worktree_rollback_error(primary: String, rollback: Result<(), String>) -> String {
+pub(super) fn create_worktree_rollback_error(
+    primary: String,
+    rollback: Result<(), String>,
+) -> String {
     match rollback {
         Ok(()) => format!("{primary}; the new worktree was rolled back"),
         Err(error) => format!("{primary}; worktree rollback also failed: {error}"),

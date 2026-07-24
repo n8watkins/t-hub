@@ -30,7 +30,11 @@ use super::*;
 /// existing confirmation-gate tier — same audit, same remote-peer cwd allowlist,
 /// no new ungated path (a caller with this tier could already run commands via
 /// the equally-gated `send_text`).
-pub(super) fn string_set_arg(args: &Value, key: &str, command: &str) -> Result<BTreeSet<String>, String> {
+pub(super) fn string_set_arg(
+    args: &Value,
+    key: &str,
+    command: &str,
+) -> Result<BTreeSet<String>, String> {
     args.get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{command} requires a '{key}' array"))?
@@ -81,7 +85,10 @@ pub(super) fn agent_retains_lane_ownership(agent: &AgentSessionRecord) -> bool {
             .is_some_and(|states| states.integrated)
 }
 
-pub(super) fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usize) -> (bool, usize) {
+pub(super) fn dispatch_machine_evidence(
+    ctx: &ControlContext,
+    live_sessions: usize,
+) -> (bool, usize) {
     let metrics = ctx.metrics.as_ref().and_then(|fetch| fetch().ok());
     let Some(metrics) = metrics else {
         #[cfg(test)]
@@ -109,7 +116,10 @@ pub(super) fn dispatch_machine_evidence(ctx: &ControlContext, live_sessions: usi
     )
 }
 
-pub(super) fn recorded_admin_harness(snapshot: &CaptainsSnapshot, terminal_id: &str) -> Option<String> {
+pub(super) fn recorded_admin_harness(
+    snapshot: &CaptainsSnapshot,
+    terminal_id: &str,
+) -> Option<String> {
     snapshot
         .agent_sessions
         .iter()
@@ -267,7 +277,9 @@ pub(super) fn recorded_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeM
     harnesses
 }
 
-pub(super) fn durable_agent_provider_harnesses(snapshot: &CaptainsSnapshot) -> BTreeMap<String, String> {
+pub(super) fn durable_agent_provider_harnesses(
+    snapshot: &CaptainsSnapshot,
+) -> BTreeMap<String, String> {
     snapshot
         .agent_sessions
         .iter()
@@ -372,7 +384,9 @@ pub(super) fn inspect_provider_live_sessions(
     Ok(live)
 }
 
-pub(super) fn provider_capacity_evidence(ctx: &ControlContext) -> Result<ProviderCapacityEvidence, String> {
+pub(super) fn provider_capacity_evidence(
+    ctx: &ControlContext,
+) -> Result<ProviderCapacityEvidence, String> {
     (ctx.provider_capacity)()
         .and_then(|mut evidence| {
             if evidence.session_capacity == 0 {

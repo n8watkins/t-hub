@@ -184,7 +184,9 @@ pub(super) fn current_admin_actor(
     current_admin_actor_for_identity(ctx, &grant.actor_identity_id)
 }
 
-pub(super) fn parse_admin_role(value: &str) -> Result<crate::delegated_admin::DelegatedAdminRole, String> {
+pub(super) fn parse_admin_role(
+    value: &str,
+) -> Result<crate::delegated_admin::DelegatedAdminRole, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "shipadmin" | "ship-admin" | "ship_admin" => {
             Ok(crate::delegated_admin::DelegatedAdminRole::ShipAdmin)

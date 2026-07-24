@@ -1085,7 +1085,11 @@ pub(super) fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
-pub(super) fn require_exact_args(args: &Value, command: &str, allowed: &[&str]) -> Result<(), String> {
+pub(super) fn require_exact_args(
+    args: &Value,
+    command: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
     let object = args
         .as_object()
         .ok_or_else(|| format!("{command} requires an argument object"))?;

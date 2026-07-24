@@ -50,7 +50,11 @@ pub(super) fn forward_apply(ctx: &ControlContext, command: &str, args: &Value) -
     sink_applied.unwrap_or(subscribers > 0)
 }
 
-pub(super) fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
+pub(super) fn organization_apply(
+    ctx: &ControlContext,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
     let applied = forward_apply(ctx, command, args);
     Ok(json!({
         "accepted": command,

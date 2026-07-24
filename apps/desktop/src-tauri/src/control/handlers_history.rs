@@ -805,7 +805,9 @@ pub(super) fn finish_history_resume(
 
 pub(super) const HISTORY_PENDING_RUNTIME_PROOF_GRACE_MS: u64 = 120_000;
 
-pub(super) fn history_pending_runtime_proof_expired(pending: &crate::history::HistoryPendingResume) -> bool {
+pub(super) fn history_pending_runtime_proof_expired(
+    pending: &crate::history::HistoryPendingResume,
+) -> bool {
     now_ms().saturating_sub(pending.reserved_at_ms) >= HISTORY_PENDING_RUNTIME_PROOF_GRACE_MS
 }
 
