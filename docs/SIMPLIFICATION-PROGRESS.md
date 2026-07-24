@@ -8,6 +8,16 @@ Started 2026-07-23; this file is the single reference for what is done and what 
 Reduce the two headline liabilities - the `control.rs` monolith and the `workspace.ts` god-store - plus retire dead code, without changing behavior.
 Every change is behavior-preserving, verified (tests / typecheck), committed separately, and path-scoped so it does not sweep concurrent-session edits.
 
+## Landing / merge process
+
+This effort commits directly to local `main` (the same convention the prior sessions used; the coordination note below is about concurrent `main` commits). There is no feature branch or PR for it.
+
+- **State**: local `main` is a clean fast-forward ahead of `origin/main` (verify: `git merge-base --is-ancestor origin/main HEAD`). A `git push origin main` is a fast-forward - no rebase/merge needed.
+- **Scope caveat**: pushing `main` publishes ALL local commits ahead of origin, not just this effort's. That is expected (shared branch), but if only this work should land in isolation, cherry-pick this effort's commits onto a branch first: `git switch -c refactor/control-split <base>` then `git cherry-pick <range>`, and open a PR.
+- **Pre-push gates** (all currently green): `cd apps/desktop/src-tauri && cargo test --lib control::tests` (426/0), `cargo clippy --lib` (clean), and a full `cargo test --lib` (1181/1182 - the single failure is one of two KNOWN pre-existing parallel-load flakes: `harness::tests::launch_resolution_handles_ci_bash_and_available_login_shells` or `control::tests::delayed_node_wrapper_waits_for_exact_trusted_native_child`; both pass in isolation and are unrelated to this refactor - re-run in isolation to confirm before blaming an edit).
+- **Frontend**: untouched by the `control.rs` split (WS2's `workspace.ts` work landed earlier). A full merge gate would still run `cd apps/desktop && pnpm typecheck && pnpm vitest run`, but this effort's Rust-only commits do not change frontend behavior.
+- **Push happens only on the General's say-so** (per the repo commit policy); this doc does not authorize an automatic push.
+
 ## Progress (done, on `main`)
 
 | Commit | Change | Result |
