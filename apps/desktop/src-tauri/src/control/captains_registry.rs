@@ -5510,3 +5510,132 @@ impl CaptainsRegistry {
         Ok(changed)
     }
 }
+
+// --- #[cfg(test)] helper impl + Default (folded from control.rs) ---
+#[cfg(test)]
+impl CaptainsRegistry {
+    /// Test convenience preserving the legacy 3-arg `claim` ergonomics: a `Captain`
+    /// claim, no UUID hint, and a "nothing is dead" liveness predicate (so a live
+    /// incumbent is never auto-released). Tests that exercise the dead-claim /
+    /// rebind / Cortana paths call the full 6-arg [`claim`](Self::claim) directly.
+    pub(crate) fn claim_test(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+    ) -> Result<ClaimOutcome, String> {
+        self.claim(
+            terminal_id,
+            ship_slug,
+            FleetRole::Captain,
+            None,
+            workspace_tab_ids,
+            &|_| false,
+            // Legacy resurrect-all: existing readopt tests predate the liveness
+            // gate and assert orphaned crew come back Active. Tests that exercise
+            // the Gone/Unknown legs pass an explicit `crew_liveness` to `claim`.
+            &|_| tmux::SessionLiveness::Alive,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn set_historical_scope_capture_hook(
+        &self,
+        authenticated: std::sync::mpsc::SyncSender<String>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .historical_scope_capture_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HistoricalScopeCaptureHook {
+            authenticated,
+            resume,
+        });
+    }
+
+    pub(super) fn test_scoped_authority_generation(
+        &self,
+        ship_slug: &str,
+        crew_session_id: &str,
+        project_id: &str,
+    ) -> ScopedAuthorityGeneration {
+        self.lock().authority_generations.scoped(
+            self.authority_epoch,
+            ship_slug,
+            crew_session_id,
+            project_id,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn test_remove_captain_and_project(
+        &self,
+        ship_slug: &str,
+        project_id: &str,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain_index = g
+            .captains
+            .iter()
+            .position(|captain| captain.ship_slug == ship_slug)
+            .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
+        let project_index = g
+            .projects
+            .iter()
+            .position(|project| project.project_id == project_id)
+            .ok_or_else(|| format!("unknown projectId '{project_id}'"))?;
+        g.captains.remove(captain_index);
+        g.projects.remove(project_index);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn test_restore_captain_and_project(
+        &self,
+        captain: CaptainRecord,
+        project: ProjectRecord,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        if g.captains
+            .iter()
+            .any(|candidate| candidate.ship_slug == captain.ship_slug)
+            || g.projects
+                .iter()
+                .any(|candidate| candidate.project_id == project.project_id)
+        {
+            return Err("test authority scope already exists".into());
+        }
+        g.projects.push(project);
+        g.captains.push(captain);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn pause_before_historical_scope_capture(&self, crew_session_id: &str) {
+        let mut hook = self
+            .historical_scope_capture_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(hook) = hook.take() else {
+            return;
+        };
+        hook.authenticated
+            .send(crew_session_id.to_string())
+            .expect("historical scope observer must still be available");
+        hook.resume
+            .recv_timeout(Duration::from_secs(4))
+            .expect("historical scope capture must be resumed before its deadline");
+    }
+}
+
+impl Default for CaptainsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
