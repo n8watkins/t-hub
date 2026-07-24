@@ -47,25 +47,26 @@ Two portability gotchas surfaced during these moves (both fixed in-commit):
 
 ### WS1 - split `control.rs` production half into submodules (IN PROGRESS)
 
-Goal: take `control.rs` from ~13,682 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
-Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`, `handlers_agents.rs`, `handlers_status.rs`, `handlers_comms.rs`, `handlers_admin.rs`, `handlers_spawn.rs`, `handlers_captains.rs`, `handlers_terminal.rs`, `handlers_tabs.rs`.
+Original goal: take `control.rs` from ~26,717 toward ~5,000-6,000 lines by moving handler groups into `control/handlers_*.rs`. Reassessed (see "Reality check" below): ~11k is the realistic floor with the remaining in-plan move, since the plan's "Stays in `control.rs`" list keeps the bulk of the core types + dispatch + serve loop.
+Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`, `handlers_agents.rs`, `handlers_status.rs`, `handlers_comms.rs`, `handlers_admin.rs`, `handlers_spawn.rs`, `handlers_captains.rs`, `handlers_terminal.rs`, `handlers_tabs.rs`, `idempotency.rs`.
 
-**The free-function handler extraction is essentially COMPLETE.** What remains in `control.rs` (~13.7k) is now dominated by three things, not loose handlers:
+**The free-function handler extraction is COMPLETE.** What remains in `control.rs` (~13.0k) is now dominated by three things, not loose handlers:
 1. Type definitions + their impls (lines ~1-8,300): the wire types, `EventFanout`, `TabRegistry`, the `CaptainsRegistry` data model (`CaptainsInner`/`ClaimDisposition`/`ShipMembership`/`FleetWorkspaceRecord`/`CaptainRecord`/`ProjectRecord`/authority projections + the `#[cfg(test)]`/`Default` `CaptainsRegistry` impls), `RequestCache` + `CaptainControlLeases`, `ControlContext`, the PTY-attach machinery (`RebindController`/`AttachForwarderGuard`/`ConnGuard`/`SharedPtyWriter`), `CommandTier`, `Capability`.
 2. The dispatch match + serve/listen loop + handshake/identity/token resolution (core - STAYS).
 3. A handful of read handlers still adjacent to dispatch (`list_terminals`, `list_captains`, `list_projects`, `cortana_bootstrap`, `claude_usage`/`codex_usage`, `host_metrics`, `archive_recent_project`).
 
-Getting to 5-6k requires moving the delicate TYPE clusters from (1) into submodules (below), which is higher-risk than the handler moves - they are referenced pervasively by `ControlContext` and need `pub(super)` on the types (and sometimes fields), watching the `private_interfaces` lint.
+Only ONE of these is in the original plan to move: the `CaptainsRegistry` data model from (1), which finishes the planned `captains_registry.rs` module (below). The rest of (1) - `ControlContext`, the wire types, PTY-attach, `CommandTier`/`Capability` - and all of (2)/(3) are on the plan's "Stays in `control.rs`" list.
 
 Note (sibling-to-sibling resolution PROVEN): a helper moved into submodule A is reachable from sibling submodule B through `control`'s `use A::*;` re-export + B's `use super::*;`.
 This is the same mechanism `control/tests.rs` already uses to reach the moved handlers, and it now also holds for production siblings (`handlers_fleet` reaches `target_statuses` in `handlers_status`).
 So shared helpers can move into whichever submodule owns them; they need not stay in `control.rs`.
 
-**Remaining TYPE clusters** (delicate - `pub(super)` the types AND any sibling-inspected fields, watch `private_interfaces`; do one verified commit each):
-- `captains_model.rs` (or extend `captains_registry.rs`): the `CaptainsRegistry` struct + `CaptainsInner`/`ClaimDisposition`/`ShipMembership`/`FleetWorkspaceRecord`/`CaptainRecord`/`ProjectRecord`/authority-projection types + their impls. Large (~2k) but pervasively referenced - `pub(super)` types, and fields the parent/tests construct need `pub(super)` too. Highest remaining line-count win.
-- `pty_attach.rs` (serve internals) - `RebindController`/`AttachForwarderGuard`/`ConnGuard`/`SharedPtyWriter` + `serve_pty_attach`. Tightly coupled to the serve loop; treat as serve-internal, move only if it stays behavior-preserving.
-- `authz_tier.rs` - `CommandTier` + `Capability` enums/impls (the tier/capability model).
-- Remaining read handlers still by dispatch (`list_terminals`, `list_captains`, `list_projects`, `cortana_bootstrap`, `claude_usage`/`codex_usage`, `host_metrics`, `archive_recent_project`) could form a small `handlers_read.rs`.
+**Remaining WS1 work that is IN the original plan** (one verified commit each):
+- Finish `captains_registry.rs` - the original plan scoped this module at ~7,600 lines as "the `impl CaptainsRegistry` state machine + `FleetRole`/`ClaimState` enums"; only the ~5,500-line inherent impl (+ folded test/Default impls) has moved so far. Completing it means moving the `CaptainsRegistry` **data model** into `captains_registry.rs`: the struct + `CaptainsInner`/`ClaimDisposition`/`ShipMembership`/`FleetWorkspaceRecord`/`CaptainRecord`/`ProjectRecord`/authority-projection types + `FleetRole`/`ClaimState`/`CrewRef`/`CrewState` enums + their impls (~2k lines). Delicate: pervasively referenced, so `pub(super)` the types AND any field the parent/tests inspect (see the idempotency gotcha above); some of these types interleave with the wire types that stay, so it is a non-contiguous move done in sub-clusters, not one block.
+
+**Explicitly NOT in scope** (the plan's "Stays in `control.rs`" list names these as staying, so do NOT move them without re-agreeing the plan): the wire types (`ControlRequest`/`Response`/`Handshake`), `EventFanout`, `TabRegistry`, `ControlContext`, the serve/listen loop **including `serve_pty_attach`** (and its `RebindController`/`AttachForwarderGuard`/`ConnGuard`/`SharedPtyWriter` internals), discovery/handshake, identity/token resolution **including `required_tier`/`CommandTier`/`Capability`** (`Capability` is also referenced cross-module from `delegated_admin.rs`), the dispatch entry points, and shared helpers (`arg_str`/`deny`/`now_ms`/`tmux_target`/`captains_path`). A `pty_attach.rs` or `authz_tier.rs` split would contradict this list; the read handlers by dispatch (`list_terminals`/`list_captains`/`list_projects`/`cortana_bootstrap`/usage/`host_metrics`) sit inside the dispatch core and are best left there. These are possible FUTURE scope, but only if the plan is revisited - they are not agreed work.
+
+Reality check on the 5-6k target: with only the in-plan `captains_registry.rs` data-model move left, `control.rs` lands around ~11k, not 5-6k. The original 5-6k figure assumed moving core types the "Stays" list keeps, so ~11k is the realistic floor without re-scoping.
 
 Done (type clusters): folded `#[cfg(test)]` + `Default` `CaptainsRegistry` impls into `captains_registry.rs`; `idempotency.rs` (`RequestCache` + `CaptainControlLeases`).
 
