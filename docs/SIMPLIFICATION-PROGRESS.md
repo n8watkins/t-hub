@@ -45,8 +45,10 @@ This effort commits directly to local `main` (the same convention the prior sess
 | `ceb79b0` | **WS1**: captains data model pt.4 (`FleetIdentity`/disposition/`ProjectRecord`) -> `captains_registry.rs` | -> 12,069 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~12,069 lines total across this effort.
+`control.rs` has gone from 73,435 to ~12,068 lines total across this effort.
 **The `captains_registry.rs` module - the whole planned scope (impl + data model) - is now DONE.**
+
+Post-extraction polish (merge-prep): removed 3 stray double-blank-line artifacts left by the moves (`cbc2078`), and made `handlers_files` dispatch consistent with the other 13 submodules by adding its `use handlers_files::*;` glob and switching its 6 dispatch arms to bare calls (`56cbdee`). Deliberately NOT done: consolidating the scattered `mod handlers_*;` declarations into one block - they sit contextually where each block was removed, each with an explanatory inline comment, which is a defensible convention with reader value; grouping them is a taste preference, not a clear win.
 
 Type-extraction gotcha (idempotency): moving a struct whose fields the sibling `control/tests.rs` inspects needs those FIELDS made `pub(super)`, not just the struct - once the struct leaves `control` for `control::idempotency`, `tests.rs` (a sibling, not a descendant) can no longer see ancestor-private fields. The compiler surfaces these one struct at a time, so re-check until clean.
 
