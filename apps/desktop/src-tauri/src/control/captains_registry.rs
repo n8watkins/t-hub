@@ -6224,3 +6224,173 @@ pub(super) fn slugify_ship(name: &str) -> String {
     }
     out
 }
+
+// --- Captains data model: workspace + pending-operation + snapshot records ---
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceOwner {
+    pub project_id: String,
+    pub assignment_id: String,
+    pub ship_slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FleetWorkspaceRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: WorkspaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FleetWorkspaceOwner>,
+    #[serde(default)]
+    pub tile_ids: Vec<String>,
+}
+
+impl FleetWorkspaceRecord {
+    pub(super) fn captain_workspace() -> Self {
+        Self {
+            id: CAPTAIN_WORKSPACE_ID.to_string(),
+            name: CAPTAIN_WORKSPACE_NAME.to_string(),
+            kind: WorkspaceKind::Captain,
+            owner: None,
+            tile_ids: Vec::new(),
+        }
+    }
+
+    pub(super) fn as_tab_record(&self) -> TabRecord {
+        TabRecord {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            tile_ids: self.tile_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingFleetOperationPhase {
+    Prepared,
+    EffectApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum PendingFleetOperationPayload {
+    CloseTerminal {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        powder_release: Option<PendingDispatchRelease>,
+    },
+    CommissionCaptain {
+        terminal_id: String,
+        project_id: String,
+        assignment: String,
+        ship_slug: String,
+        harness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingFleetOperation {
+    pub operation_id: String,
+    pub expected_seq: u64,
+    pub phase: PendingFleetOperationPhase,
+    pub created_at: u64,
+    pub payload: PendingFleetOperationPayload,
+}
+
+/// Durable transaction intent for explicit Git initialization.
+/// The intent remains on disk until the Project and ownership marker are both
+/// finalized, so a restart can finish or fail closed without guessing whether
+/// T-Hub created the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitInitIntent {
+    pub version: u32,
+    pub operation_id: String,
+    pub root_path: String,
+    pub name: String,
+    pub project_id: String,
+    pub owner_identity: String,
+    pub phase: String,
+    pub marker_nonce: String,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct CloseWorkspaceResult {
+    pub(super) removed_tile_ids: Vec<String>,
+    pub(super) captains_changed: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct CloseTerminalCommitResult {
+    pub(super) captain_state_changed: bool,
+    pub(super) workspace_changed: bool,
+}
+
+/// A full, versioned copy of the captains registry: what `list_captains` returns,
+/// what every `sync_captains` forward carries down to the UI (the UI renders FROM
+/// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
+/// shape (so a restart resumes at the same revision).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptainsSnapshot {
+    /// On-disk schema version (item-2 §3.2/D2). Absent/0 = legacy; every write
+    /// stamps [`CAPTAINS_SCHEMA_VERSION`].
+    ///
+    /// Upgrades are seamless because the reader accepts every prior shape.
+    /// Downgrading from v2 is not safe for project metadata: a v1 binary ignores
+    /// the new fields and drops them on its next write even though captain claims
+    /// remain readable.
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub captains: Vec<CaptainRecord>,
+    /// Durable identity, generation, continuity, and recovery state for the
+    /// singleton Cortana supervisor.
+    #[serde(default)]
+    pub cortana: crate::cortana_reconcile::CortanaDurableIdentity,
+    /// Powder-independent durable agent sessions.
+    /// Legacy Crew records remain in `captains` until compatibility migration
+    /// is complete.
+    #[serde(default)]
+    pub agent_sessions: Vec<AgentSessionRecord>,
+    #[serde(default)]
+    pub agent_checkpoints: Vec<AgentCheckpoint>,
+    #[serde(default)]
+    pub agent_events: Vec<AgentEvent>,
+    /// Durable registered repositories. Added in schema v2; older snapshots
+    /// deserialize to an empty registry.
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
+    /// Durable Fleet Workspace authority. TabRegistry is only a projection cache
+    /// of these records and is seeded from them before any listener or UI report.
+    #[serde(default)]
+    pub workspaces: Vec<FleetWorkspaceRecord>,
+    /// Bounded prepare/effect/commit recovery records for operations that cross
+    /// tmux, IdentityStore, or Powder boundaries.
+    #[serde(default)]
+    pub pending_fleet_operations: Vec<PendingFleetOperation>,
+    /// Bounded durable tombstones for terminal identities retired by cleanup.
+    /// These prevent a stale projection or racing move from resurrecting a tile.
+    #[serde(default)]
+    pub retired_fleet_tile_ids: Vec<String>,
+    /// Initial claim attempts whose remote outcome remains unresolved.
+    #[serde(default)]
+    pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
+    /// Trusted post-bind release attempts whose remote outcome is ambiguous.
+    #[serde(default)]
+    pub pending_dispatch_releases: Vec<PendingDispatchRelease>,
+    /// Explicit Git initialization transactions awaiting safe finalization or
+    /// fail-closed recovery.
+    #[serde(default)]
+    pub pending_git_initializations: Vec<GitInitIntent>,
+}
