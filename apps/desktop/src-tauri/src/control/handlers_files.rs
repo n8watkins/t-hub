@@ -98,3 +98,23 @@ pub(super) fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value
         files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
     serde_json::to_value(contents).map_err(|e| e.to_string())
 }
+
+/// `open_file`: resolve + read a capped text file for the requested path. This is
+/// the one Organization-tier action that has a real, side-effect-free backing
+/// implementation today (the Files reader), so the MCP "open a file" tool returns
+/// the file's contents/metadata. Args: `path` (required).
+pub(super) fn open_file(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let path = arg_str(args, "path").ok_or("open_file requires a 'path' argument")?;
+    enforce_project_path_authority(ctx, caller, trusted_internal, &path, "open_file")?;
+    // Same file-read scope as the #23 reader: a REMOTE peer may only open files
+    // under the operator allowlist; loopback (the local MCP) is unrestricted.
+    let contents =
+        files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
+    serde_json::to_value(contents).map_err(|e| e.to_string())
+}
+

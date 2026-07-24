@@ -690,3 +690,102 @@ pub(super) fn close_terminal_with_policy(
         "audited": true,
     }))
 }
+
+// --- Terminal read (read_terminal) ---
+pub(super) fn read_terminal(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("read_terminal requires a 'sessionId' argument")?;
+    // Phase 3 (§2.6 H3): the cross-ship READ hole - `read_terminal` captures another
+    // session's scrollback directly via tmux, bypassing the plane entirely. An
+    // identified session may read a pane ONLY on its own ship; the proven host is unrestricted.
+    let caller_has_active_admin_grant = caller.is_some_and(|caller| {
+        ctx.delegated_admin
+            .grants_for_actor(&caller.session_id)
+            .iter()
+            .any(|grant| grant.state.is_active())
+    });
+    let delegated_audit = if caller_has_active_admin_grant {
+        let caller = caller.expect("an active delegated grant requires an identified caller");
+        let target = delegated_admin_target_for_terminal(ctx, &session_id)?;
+        Some(authorize_delegated_admin(
+            ctx,
+            caller,
+            crate::delegated_admin::AdminOperation::InspectStatus,
+            target,
+            crate::delegated_admin::AdminSafeguards::default(),
+        )?)
+    } else {
+        enforce_session_access(ctx, caller, trusted_internal, &session_id)?;
+        None
+    };
+    let result = (|| {
+        let target = tmux_target(&session_id);
+        let history = args
+            .get("historyLines")
+            .or_else(|| args.get("history_lines"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(10_000) as u32;
+        let text = tmux::capture_pane_text(&target, history)
+            .map_err(|e| format!("failed to capture pane for '{session_id}': {e}"))?;
+        Ok(json!({
+            "sessionId": session_id,
+            "target": target,
+            "historyLines": history,
+            "text": text,
+        }))
+    })();
+    record_delegated_admin_outcome(ctx, delegated_audit.as_ref(), &result);
+    result
+}
+
+pub(super) fn delegated_admin_target_for_terminal(
+    ctx: &ControlContext,
+    terminal_id: &str,
+) -> Result<crate::delegated_admin::AdminTarget, String> {
+    let terminal_id = terminal_id.strip_prefix("th_").unwrap_or(terminal_id);
+    let snapshot = ctx.captains.snapshot();
+    if let Some(captain) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.terminal_id.as_deref() == Some(terminal_id))
+    {
+        let captain_identity_id = ctx
+            .identity
+            .for_tile(terminal_id)
+            .map(|identity| identity.id)
+            .unwrap_or_else(|| captain.assignment_id.clone());
+        return Ok(crate::delegated_admin::AdminTarget::Captain {
+            ship_slug: captain.ship_slug.clone(),
+            captain_identity_id,
+        });
+    }
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == terminal_id)
+        })
+        .collect::<Vec<_>>();
+    match owners.as_slice() {
+        [owner] => Ok(crate::delegated_admin::AdminTarget::CrewSession {
+            ship_slug: owner.ship_slug.clone(),
+            session_id: terminal_id.to_string(),
+        }),
+        [] => Err(format!(
+            "delegated admin: terminal '{terminal_id}' has no authoritative Fleet owner"
+        )),
+        _ => Err(format!(
+            "delegated admin: terminal '{terminal_id}' has ambiguous Fleet ownership"
+        )),
+    }
+}
