@@ -17,16 +17,18 @@ Every change is behavior-preserving, verified (tests / typecheck), committed sep
 | `2924c69` | `control.rs` file/git read handlers -> `control/handlers_files.rs` | -> 33,823 |
 | `2e82bc0` | **WS2**: `workspace.ts` god-store -> 9 zustand slices + `internal.ts` under `store/workspace/` | 2,642 -> 667 |
 | `30d9102` | **WS1**: `control.rs` history handlers -> `control/handlers_history.rs` | -> 26,717 |
+| `3cbe2aa` | **WS1**: `control.rs` fleet-watch handlers -> `control/handlers_fleet.rs` | -> 26,507 |
+| `df37fd6` | **WS1**: `control.rs` worktree handlers -> `control/handlers_worktrees.rs` | -> 25,840 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~26,717 lines total across this effort.
+`control.rs` has gone from 73,435 to ~25,840 lines total across this effort.
 
 ## Remaining workstreams
 
 ### WS1 - split `control.rs` production half into submodules (IN PROGRESS)
 
-Goal: take `control.rs` from ~26,717 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
-Done so far: `handlers_files.rs`, `handlers_history.rs`.
+Goal: take `control.rs` from ~25,840 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
+Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`.
 
 **Remaining groups** (do biggest/hardest first, one verified commit each):
 - `captains_registry.rs` (~7,600 lines) - the `impl CaptainsRegistry` state machine + `FleetRole`/`ClaimState` enums.
@@ -35,11 +37,12 @@ Done so far: `handlers_files.rs`, `handlers_history.rs`.
 - `handlers_status.rs` - `get_status`, `wait_for_status`, `supervision_tree`, `list_agents`, `agent_events`, `dispatch_preflight`.
 - `handlers_agents.rs` - `agent_checkpoint`, `agent_followup`, `record_agent_delivery`.
 - `handlers_tabs.rs` - `new_tab`/`close_tab`/`rename_tab`/`focus_tab`/`move_tile`/`list_tabs`/`open_file`.
-- `handlers_worktrees.rs` - `create_worktree`/`remove_worktree`/`list_worktrees` + git-capability checks.
+  Note: these are scattered (interleaved with unrelated fns), not one contiguous block - split by sub-cluster or defer until neighbours are extracted.
 - `handlers_captains.rs` - `claim_captain`/`release_captain`/`rename_captain`/`report_workspace_tabs`.
-- `handlers_fleet.rs` - `watch_fleet`/`unwatch_fleet`/`list_fleet_watches`.
 - `handlers_spawn.rs` - `spawn_terminal`/`start_agent`/`commission_captain`/`attach_captain` + spawn-capacity eval.
 - `handlers_comms.rs` - `plane_send`/`inbox_ack`/`inbox_status`/`check_authorization`.
+
+Done: `handlers_fleet.rs` (`watch_fleet`/`unwatch_fleet`/`list_fleet_watches` + scope/owner helpers), `handlers_worktrees.rs` (`create_worktree`/`remove_worktree`/`list_worktrees` + authz/git-capability/rollback helpers).
 
 **Stays in `control.rs`**: `ControlContext`/`ControlRequest`/`ControlResponse`/`ControlHandshake`/`EventFanout`/`TabRegistry` types; the serve/listen loop (`start`, `serve`, `handle_conn`, `serve_pty_attach`); discovery/handshake + identity/token resolution; the dispatch entry points (`dispatch_authenticated`, `dispatch`, `dispatch_with_caller`, `required_tier`); and shared helpers (`arg_str`, `deny`, error taggers, `now_ms`).
 
