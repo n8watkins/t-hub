@@ -14,7 +14,8 @@ This effort commits directly to local `main` (the same convention the prior sess
 
 - **State**: local `main` is a clean fast-forward ahead of `origin/main` (verify: `git merge-base --is-ancestor origin/main HEAD`). A `git push origin main` is a fast-forward - no rebase/merge needed.
 - **Scope caveat**: pushing `main` publishes ALL local commits ahead of origin, not just this effort's. That is expected (shared branch), but if only this work should land in isolation, cherry-pick this effort's commits onto a branch first: `git switch -c refactor/control-split <base>` then `git cherry-pick <range>`, and open a PR.
-- **Pre-push gates** (all currently green): `cd apps/desktop/src-tauri && cargo test --lib control::tests` (426/0), `cargo clippy --lib` (clean), and a full `cargo test --lib` (1181/1182 - the single failure is one of two KNOWN pre-existing parallel-load flakes: `harness::tests::launch_resolution_handles_ci_bash_and_available_login_shells` or `control::tests::delayed_node_wrapper_waits_for_exact_trusted_native_child`; both pass in isolation and are unrelated to this refactor - re-run in isolation to confirm before blaming an edit).
+- **Pre-push gates**: `cd apps/desktop/src-tauri && cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --lib control::tests` (426/0), and a full `cargo test --lib` (1181/1182 - the single failure is one of two KNOWN pre-existing parallel-load flakes: `harness::tests::launch_resolution_handles_ci_bash_and_available_login_shells` or `control::tests::delayed_node_wrapper_waits_for_exact_trusted_native_child`; both pass in isolation and are unrelated to this refactor).
+- **CI (PR #75, `ci/preland-main`) findings** (2026-07-24): the pre-landing CI gate did its job. (1) It caught a `cargo fmt --check` failure from this refactor (the `pub(super)` wrapping) - FIXED. (2) It surfaced a PRE-EXISTING, unrelated red: the "Packaged runtime benchmark contract" check (`scripts/perf/perf-benchmark.test.sh` -> `scripts/perf/measure-thub.test.ps1`) invokes `powershell.exe` on the Linux runner (`ubuntu-latest`), which doesn't exist there - so that step / the "Frontend" job cannot go green regardless of this refactor. It comes from the prior Package-6 perf work (in the ~179 unpushed commits underneath this effort), which never went through PR CI. It is NOT this refactor's to fix; landing decision (fix the perf gate to skip on Linux, vs. land accepting a known-unrelated red) is the General's.
 - **Frontend**: untouched by the `control.rs` split (WS2's `workspace.ts` work landed earlier). A full merge gate would still run `cd apps/desktop && pnpm typecheck && pnpm vitest run`, but this effort's Rust-only commits do not change frontend behavior.
 - **Push happens only on the General's say-so** (per the repo commit policy); this doc does not authorize an automatic push.
 
@@ -101,7 +102,7 @@ Done (handlers): `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registr
    Blanket `pub(super)` on `fn`/`const`/`static`/`struct`/`enum`/`type` is correct here, because the sibling `control/tests.rs` references nearly every helper; a "minimal" set does not help and leaving types private triggers the `private_interfaces` lint (fix by making the types `pub(super)` too).
 4. In `control.rs`, replace the moved block with `mod handlers_<name>;` + `use handlers_<name>::*;`.
    The glob re-export means both the dispatch arms and the sibling test module resolve the names unchanged - no call-site edits.
-5. Verify: `cargo check --tests` must be warning-free (watch the `private_interfaces` lint), then `cargo test --lib control::tests` (baseline 426 pass / 0 fail, ~6 min), then `cargo clippy --lib`.
+5. Verify: `cargo check --tests` warning-free (watch the `private_interfaces` lint), `cargo fmt --all -- --check` (a `pub(super)`-widened signature often needs multi-line wrapping - run `cargo fmt` to apply), `cargo test --lib control::tests` (baseline 426/0, ~6 min), and `cargo clippy --workspace --all-targets -- -D warnings` (CI's exact clippy - stricter than `--lib`).
 6. Commit path-scoped (`control.rs` + the new submodule + version-bump files) after running `apps/desktop/scripts/bump-version.sh`.
 
 **Impl-block variant** (used for `captains_registry.rs`): to extract a single inherent `impl Type { ... }` block, move the whole `impl` verbatim, keep the struct + other impls (test/`Default`) in the parent, and prepend only `use super::*;`.
@@ -130,7 +131,8 @@ Each is small/low-risk and independent.
 
 ## Verification reference
 
-- Backend: `cd apps/desktop/src-tauri && cargo check --tests` then `cargo test --lib control::tests` (baseline 426/0) then `cargo clippy --lib`.
+- Backend (per-commit): `cd apps/desktop/src-tauri && cargo check --tests` then `cargo test --lib control::tests` (baseline 426/0) then `cargo clippy --lib`.
+- Backend (MUST also run - CI enforces these and `--lib` clippy alone misses them): `cargo fmt --all -- --check` AND `cargo clippy --workspace --all-targets -- -D warnings`. LESSON (2026-07-24): the mechanical `pub(super) fn ` prefixing pushed ~22 method signatures past rustfmt's line limit, so `cargo fmt --check` failed in CI even though check/test/`--lib` clippy were all green locally. Run `cargo fmt` before committing a move; run the workspace/all-targets clippy at least before pushing.
 - Frontend: `cd apps/desktop && pnpm typecheck` (exit 0) + `pnpm vitest run` (593 tests baseline).
 - Every code commit: run `apps/desktop/scripts/bump-version.sh` (docs-only commits are exempt).
 
