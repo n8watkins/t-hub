@@ -1657,35 +1657,6 @@ fn requested_project_root(args: &Value, command: &str) -> Result<String, String>
     Err(format!("{command} requires a 'rootPath' argument"))
 }
 
-/// A repository registered with T-Hub. Projects outlive terminals, Captain
-/// conversations, and individual ships.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectRecord {
-    pub project_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub repo_root: String,
-    /// Canonical POSIX Project identity. `repoRoot` remains a read-compatible
-    /// wire alias while this field becomes the persisted source of truth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_path: Option<String>,
-    /// Git capability is explicit: `git` or `none`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vcs_capability: Option<String>,
-    /// Canonical Git main-worktree root, present only for Git Projects.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_main_root: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub powder: Option<PowderProjectBinding>,
-    pub created_at: u64,
-    pub updated_at: u64,
-}
-
 /// Deserialize `crew` from BOTH schema versions (item-2 §3.2/D2): the legacy
 /// `Vec<String>` of bare tile ids AND the modern `Vec<CrewRef>`. A bare string
 /// upgrades through [`CrewRef::new`] so an on-disk v0 file loads without a manual
@@ -1783,167 +1754,6 @@ fn reconcile_legacy_runtime_identity(
         }
         if claude_uuid.is_none() {
             *claude_uuid = provider_session_id.clone();
-        }
-    }
-}
-
-/// A fleet identity as the control channel sees it (item-2 §2.1: the ship/role
-/// re-key). The record is keyed on the DURABLE `ship_slug` (was a mere label); the
-/// terminal id is demoted to a rebindable `Option` pointer, `role` is first-class,
-/// and the Claude UUID is a continuity anchor (a fast-path hint, resolved async, NOT
-/// the load-bearing key). Crew carry their own anchor + state.
-///
-/// Serialized camelCase in BOTH directions: the persistence file, `list_captains`,
-/// and every `sync_captains` forward all carry this exact shape. On READ it also
-/// accepts the legacy v0 shape (`captainSessionId`, `crew: [string]`, no
-/// role/state) via the field aliases + [`deserialize_crew`] (D2 migration).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FleetIdentity {
-    /// The DURABLE primary key (item-2 §2.1): every registry lookup for a captain
-    /// keys on this. For a Cortana claim it is the reserved [`CORTANA_SLUG`].
-    pub ship_slug: String,
-    /// Durable Assignment key. This is independent of the current terminal,
-    /// Harness conversation, cwd, and Workspace placement.
-    #[serde(default)]
-    pub assignment_id: String,
-    /// Durable user-facing Captain name. Legacy records are deterministically
-    /// seeded from `ship_slug` during load and persisted on the next mutation.
-    #[serde(default)]
-    pub display_name: String,
-    /// The first-class role (D1). Cortana is the registry-wide singleton.
-    #[serde(default)]
-    pub role: FleetRole,
-    /// The Claude continuity anchor (`provider_session_id`). A fast-path idempotency
-    /// hint that fires WHEN resolved and is otherwise absent (backfilled async,
-    /// HIGH-1); correctness never rests on it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_uuid: Option<String>,
-    /// Harness that owns `provider_session_id`. Missing means a legacy Claude claim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Provider-native continuity anchor. This replaces Claude-only identity for
-    /// new claims while `claude_uuid` remains a read-compatible migration field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_session_id: Option<String>,
-    /// The MUTABLE terminal pointer (was `captain_session_id`, the old primary key).
-    /// `None` while orphaned/vacant - un-pointed but not lost (the exact window that
-    /// deadlocked R-H2). Accepts the legacy `captainSessionId` field on load.
-    #[serde(default, alias = "captainSessionId")]
-    pub terminal_id: Option<String>,
-    /// The registered project this ship supervises. A missing value identifies a
-    /// legacy or deliberately unscoped Captain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    /// The Captain's durable assignment, restored independently of model memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assignment: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness: Option<String>,
-    /// Harness-neutral conversation identifier for reset and provider migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-    /// Deterministic one-screen recovery state, refreshed by the Captain protocol.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_point: Option<String>,
-    #[serde(default)]
-    pub workspace_tab_ids: Vec<String>,
-    /// The ship's crew (item-2 §2.3). Deserializes from BOTH the legacy `Vec<String>`
-    /// of tile ids and the modern `Vec<CrewRef>` (D2 migration).
-    #[serde(default, deserialize_with = "deserialize_crew")]
-    pub crew: Vec<CrewRef>,
-    #[serde(default)]
-    pub state: ClaimState,
-}
-
-/// Back-compat alias: item-2 renamed `CaptainRecord` → [`FleetIdentity`] (a captain
-/// is a ship/role, not a terminal). The old name stays as an alias so existing
-/// references and call sites read unchanged.
-pub type CaptainRecord = FleetIdentity;
-
-#[derive(Debug)]
-enum SnapshotReadError {
-    Invalid(String),
-    UnsupportedSchema { path: PathBuf, version: u32 },
-    IncompatibleRecovery { path: PathBuf },
-}
-
-impl std::fmt::Display for SnapshotReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Invalid(message) => f.write_str(message),
-            Self::UnsupportedSchema { path, version } => write!(
-                f,
-                "'{}' uses unsupported schemaVersion {version}",
-                path.display()
-            ),
-            Self::IncompatibleRecovery { path } => write!(
-                f,
-                "'{}' contains dispatch release recovery state incompatible with this T-Hub version",
-                path.display()
-            ),
-        }
-    }
-}
-
-/// What a [`CaptainsRegistry::claim`] resolved to - for the audit/telemetry trail
-/// (D6: orphan/rebind lifecycle is surfaced, never silent). Distinguishes a fresh
-/// claim from an idempotent refresh, an orphan/vacant re-adoption, and a
-/// dead-incumbent auto-release (the R-H2 deadlock clearer).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimDisposition {
-    /// A brand-new claim (durable key was free).
-    Created,
-    /// A re-claim by the SAME terminal (idempotent designation refresh).
-    Refreshed,
-    /// An `Orphaned`/`Vacant` record re-claimed by its own durable key (D4: the
-    /// ship-slug re-claim IS the always-available auto-rebind trigger). Crew re-adopted.
-    ReadoptedOrphan,
-    /// The durable key was held by a DIFFERENT terminal that is UNAMBIGUOUSLY dead
-    /// (`tmux::has_session` false - the SOLE transfer-grade signal, R1): the corpse's
-    /// claim is auto-released and the new claim takes the slug. This is the R-H2
-    /// deadlock clearer (§2.2 fix 1).
-    AutoReleasedDead,
-}
-
-impl ClaimDisposition {
-    pub fn label(self) -> &'static str {
-        match self {
-            ClaimDisposition::Created => "created",
-            ClaimDisposition::Refreshed => "refreshed",
-            ClaimDisposition::ReadoptedOrphan => "readopted_orphan",
-            ClaimDisposition::AutoReleasedDead => "auto_released_dead",
-        }
-    }
-}
-
-/// The result of a [`CaptainsRegistry::claim`]: the resulting record + how it was
-/// resolved (for the audit/telemetry stamp). Whether the registry `seq` advanced
-/// (⇒ a `sync_captains` forward) is still derived by the caller from the seq delta,
-/// exactly as before.
-#[derive(Debug, Clone)]
-pub struct ClaimOutcome {
-    pub record: FleetIdentity,
-    pub disposition: ClaimDisposition,
-}
-
-/// Which ship (and role) a terminal belongs to (item-2 §2.5/§2.6: the `ship_of`
-/// resolution the cross-ship ownership ACL and per-session attribution key on). The
-/// item-2 KEY; the ACL WIRING that consumes it stays item-1 Phase 3.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShipMembership {
-    /// The tile is a supervisor's OWN terminal (a captain of its ship, or Cortana).
-    Supervisor { ship_slug: String, role: FleetRole },
-    /// The tile is a crew member of a ship.
-    Crew { ship_slug: String },
-}
-
-impl ShipMembership {
-    /// The durable ship slug, whichever membership kind (the H3 ACL comparison key).
-    pub fn ship_slug(&self) -> &str {
-        match self {
-            ShipMembership::Supervisor { ship_slug, .. } => ship_slug,
-            ShipMembership::Crew { ship_slug } => ship_slug,
         }
     }
 }
@@ -2404,7 +2214,9 @@ mod captains_registry;
 // `control::FleetRole` (used by `acl.rs`) and `control::CaptainsRegistry` (used by
 // `commands.rs` / `lib.rs`), plus the bare names in this module + sibling submodules.
 use captains_registry::*;
-pub use captains_registry::{CaptainsRegistry, ClaimState, CrewRef, CrewState, FleetRole};
+pub use captains_registry::{
+    CaptainsRegistry, ClaimState, CrewRef, CrewState, FleetRole, ProjectRecord,
+};
 
 mod idempotency;
 use idempotency::*;
