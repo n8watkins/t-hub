@@ -6316,11 +6316,11 @@ fn dispatch_with_caller(
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
-        "git_info" => handlers_files::git_info(ctx, args),
-        "index_project" => handlers_files::index_project(ctx, args),
-        "search_files" => handlers_files::search_files(ctx, args),
-        "list_dir" => handlers_files::list_dir(ctx, args),
-        "read_text_file" => handlers_files::read_text_file(ctx, args),
+        "git_info" => git_info(ctx, args),
+        "index_project" => index_project(ctx, args),
+        "search_files" => search_files(ctx, args),
+        "list_dir" => list_dir(ctx, args),
+        "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
@@ -6379,7 +6379,7 @@ fn dispatch_with_caller(
         "new_tab" => new_tab(ctx, args, caller, trusted_internal),
         "close_tab" | "remove_tab" => close_tab(ctx, args, caller, trusted_internal),
         "focus_tab" => focus_tab(ctx, args, caller, trusted_internal),
-        "open_file" => handlers_files::open_file(ctx, args, caller, trusted_internal),
+        "open_file" => open_file(ctx, args, caller, trusted_internal),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
         // the UI; remove forwards to the UI so it detaches live tiles BEFORE git
         // tears the dir down (no orphaned processes). list (T-B) is the read-only
@@ -7111,6 +7111,7 @@ fn local_host_metrics() -> t_hub_protocol::HostMetrics {
 // File/git read handlers live in the `handlers_files` submodule (below the
 // dispatch match that routes to them).
 mod handlers_files;
+use handlers_files::*;
 
 /// `list_captains`: the claimed captains from the CORE captains registry
 /// (captain-chat phase 2), each `{shipSlug, captainSessionId, workspaceTabIds,
