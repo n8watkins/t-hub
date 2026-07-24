@@ -172,17 +172,28 @@ try {
     if (Test-Path -LiteralPath $diagnosticPath) { Remove-Item -LiteralPath $diagnosticPath -Force }
 }
 
-$trapPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-trap-" + [guid]::NewGuid().ToString("N") + ".json")
-try {
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
-    $firstExit = $LASTEXITCODE
-    Assert-True ($firstExit -eq 5 -and (Test-Path -LiteralPath $trapPath -PathType Leaf)) "collector failure did not publish exit5 diagnostic"
-    $firstRaw = Get-Content -LiteralPath $trapPath -Raw
-    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
-    Assert-True ($LASTEXITCODE -eq 6) "unpublishable diagnostic did not return exit6"
-    Assert-True ((Get-Content -LiteralPath $trapPath -Raw) -ceq $firstRaw) "unpublishable diagnostic clobbered prior evidence"
-} finally {
-    if (Test-Path -LiteralPath $trapPath) { Remove-Item -LiteralPath $trapPath -Force }
+# The collector trap-path checks below shell out to the Win32 `powershell.exe`
+# and run the full Win32_Process collector, so they only work on Windows. The
+# CI contract runs this file under pwsh on Linux (ubuntu-latest), where
+# powershell.exe is absent; skip them there and keep the pure-function coverage
+# above. Short-circuit keeps this StrictMode-safe on Windows PowerShell 5.1,
+# where $IsWindows is undefined but PSVersion.Major is 5.
+$onWindowsHost = ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
+if ($onWindowsHost) {
+    $trapPath = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-trap-" + [guid]::NewGuid().ToString("N") + ".json")
+    try {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+        $firstExit = $LASTEXITCODE
+        Assert-True ($firstExit -eq 5 -and (Test-Path -LiteralPath $trapPath -PathType Leaf)) "collector failure did not publish exit5 diagnostic"
+        $firstRaw = Get-Content -LiteralPath $trapPath -Raw
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $collector -OutputPath $trapPath -ProcessName "definitely-not-running" -WarmupSeconds 0 -SampleSeconds 1 | Out-Null
+        Assert-True ($LASTEXITCODE -eq 6) "unpublishable diagnostic did not return exit6"
+        Assert-True ((Get-Content -LiteralPath $trapPath -Raw) -ceq $firstRaw) "unpublishable diagnostic clobbered prior evidence"
+    } finally {
+        if (Test-Path -LiteralPath $trapPath) { Remove-Item -LiteralPath $trapPath -Force }
+    }
+} else {
+    Write-Host "measure-thub.test: SKIP collector trap-path checks (powershell.exe collector is Windows-only)"
 }
 
 $withBirth = @($next + (New-ProcessRow 13 10 "wsl.exe" "bridge-new" 0.4))
