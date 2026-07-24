@@ -23,33 +23,37 @@ Every change is behavior-preserving, verified (tests / typecheck), committed sep
 | `fd737dd` | **WS1**: `control.rs` agent handlers -> `handlers_agents.rs` (15 fns) + status/monitoring handlers -> `handlers_status.rs` (13 fns) | -> 18,979 |
 | `bb65c0f` | **WS1**: `control.rs` comms-plane handlers -> `handlers_comms.rs` (8 fns) | -> 18,690 |
 | `1e5a88e` | **WS1**: `control.rs` delegated-admin handlers -> `handlers_admin.rs` (28 fns + 3 types) | -> 17,466 |
+| `0cdd74a` | **WS1**: `control.rs` spawn machinery -> `handlers_spawn.rs` (27 fns) | -> 15,978 |
+| `17c4833` | **WS1**: `control.rs` captain handlers (claim lifecycle + provisioning) -> `handlers_captains.rs` (16 fns + 1 const) | -> 14,792 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~17,466 lines total across this effort.
+`control.rs` has gone from 73,435 to ~14,792 lines total across this effort.
+
+Two portability gotchas surfaced during these moves (both fixed in-commit):
+- `handlers_spawn.rs`: an `include_str!("../provider-capacity.json")` is resolved relative to the source file's dir, so moving `src/control.rs` -> `src/control/handlers_spawn.rs` required `../../provider-capacity.json`.
+- `handlers_captains.rs`: a moved *public* free fn (`recover_pending_fleet_operations`, called from `lib.rs` as `control::...`) needs an explicit `pub use handlers_captains::recover_pending_fleet_operations;` in `control.rs`, because the private `use handlers_captains::*;` glob does not re-export it on the `control::` path. (Inherent `pub` methods are unaffected - they resolve by type, not module path, which is why `captains_registry.rs`'s 33 `pub` methods needed no re-export.)
 
 ## Remaining workstreams
 
 ### WS1 - split `control.rs` production half into submodules (IN PROGRESS)
 
-Goal: take `control.rs` from ~17,466 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
-Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`, `handlers_agents.rs`, `handlers_status.rs`, `handlers_comms.rs`, `handlers_admin.rs`.
+Goal: take `control.rs` from ~14,792 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
+Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`, `handlers_agents.rs`, `handlers_status.rs`, `handlers_comms.rs`, `handlers_admin.rs`, `handlers_spawn.rs`, `handlers_captains.rs`.
 
 Note (sibling-to-sibling resolution PROVEN): a helper moved into submodule A is reachable from sibling submodule B through `control`'s `use A::*;` re-export + B's `use super::*;`.
 This is the same mechanism `control/tests.rs` already uses to reach the moved handlers, and it now also holds for production siblings (`handlers_fleet` reaches `target_statuses` in `handlers_status`).
 So shared helpers can move into whichever submodule owns them; they need not stay in `control.rs`.
 
 **Remaining groups** (do biggest/hardest first, one verified commit each):
-- `handlers_spawn.rs` - `spawn_terminal`/`start_agent`/`commission_captain`/`attach_captain` + the spawn-capacity/provider-capacity evaluation cluster + crew-launch helpers.
-  These are the largest remaining contiguous blocks: a spawn-capacity eval cluster (`admit_spawn`/`evaluate_spawn_capacity`/`provider_capacity_evidence`/...) sits just above `start_agent`+`spawn_terminal`+`spawn_tmux_*`; `commission_captain`/`attach_captain`+crew-launch helpers are a separate block ~1,700 lines higher. Extract as sub-clusters.
-- `handlers_captains.rs` - `captain_checkpoint`/`rename_captain`/`claim_captain`/`claim_captain_locked`/`release_captain`/`report_workspace_tabs`.
-- `handlers_tabs.rs` - `new_tab`/`close_tab`/`rename_tab`/`focus_tab`/`move_tile`/`list_tabs`/`open_file` + the org-apply helpers (`broadcast_apply`/`forward_apply`/`organization_apply`/`with_sync`/`organization_sync_apply`).
-  Note: these are scattered (interleaved with unrelated fns), not one contiguous block - split by sub-cluster or defer until neighbours are extracted.
+- `handlers_tabs.rs` - the tab/organization handlers: `new_tab`/`close_tab`/`rename_tab`/`focus_tab`/`move_tile`/`list_tabs`/`open_file` + the org-apply helpers (`broadcast_apply`/`forward_apply`/`organization_apply`/`with_sync`/`organization_sync_apply`/`captains_sync_apply` is already in `handlers_captains`).
+  Note: these are scattered (`new_tab`/`close_tab`/`rename_tab` + org-apply as one block; `focus_tab`/`move_tile` as another; `list_tabs`/`open_file` separate) - split by sub-cluster.
+- `handlers_terminal.rs` - direct terminal I/O: `read_terminal`, `send_text`, `send_keys`, `close_terminal` (+`ClosePlan`), `mark_break_glass`, `writer_liveness_gate`, `spawn`-adjacent `abort`.
 - `idempotency.rs` - `RequestCache` + provider-capacity evidence + control leases.
   Reassessed: NOT one contiguous ~5k cluster - the `RequestCache`/`CaptainControlLeases` structs+impls (~600 lines) are interleaved with provider-capacity types, `SpawnPurpose`/`SpawnAdmissionGuard`, and `PreviewRootAuthority` that `ControlContext` and spawn admission depend on. Extract the RequestCache+lease sub-cluster only, or defer.
 
 Also still available in the `captains_registry.rs` neighbourhood: the `#[cfg(test)] impl CaptainsRegistry` helper impl and `impl Default for CaptainsRegistry` could fold into that submodule for cohesion; the `CaptainsRegistry` struct + supporting types (`CaptainsInner`, `ClaimDisposition`, `ShipMembership`, ...) are pervasively referenced by `ControlContext`/handlers, so moving them needs care with `pub(super)` + the `private_interfaces` lint.
 
-Done: `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs` (inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide), `handlers_agents.rs` (agent lifecycle), `handlers_status.rs` (status/supervision/host-monitoring), `handlers_comms.rs` (inbox/plane-send/authorization), `handlers_admin.rs` (delegated-admin lifecycle + execution).
+Done: `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs` (inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide), `handlers_agents.rs` (agent lifecycle), `handlers_status.rs` (status/supervision/host-monitoring), `handlers_comms.rs` (inbox/plane-send/authorization), `handlers_admin.rs` (delegated-admin lifecycle + execution), `handlers_spawn.rs` (spawn-capacity eval + spawn/tmux handlers), `handlers_captains.rs` (claim lifecycle + captain provisioning + crew launch).
 
 **Stays in `control.rs`**: `ControlContext`/`ControlRequest`/`ControlResponse`/`ControlHandshake`/`EventFanout`/`TabRegistry` types; the serve/listen loop (`start`, `serve`, `handle_conn`, `serve_pty_attach`); discovery/handshake + identity/token resolution; the dispatch entry points (`dispatch_authenticated`, `dispatch`, `dispatch_with_caller`, `required_tier`); and shared helpers (`arg_str`, `deny`, error taggers, `now_ms`).
 
