@@ -20,31 +20,34 @@ Every change is behavior-preserving, verified (tests / typecheck), committed sep
 | `3cbe2aa` | **WS1**: `control.rs` fleet-watch handlers -> `control/handlers_fleet.rs` | -> 26,507 |
 | `df37fd6` | **WS1**: `control.rs` worktree handlers -> `control/handlers_worktrees.rs` | -> 25,840 |
 | `969f822` | **WS1**: `control.rs` inherent `impl CaptainsRegistry` (99 methods) -> `control/captains_registry.rs` | -> 20,338 |
+| `fd737dd` | **WS1**: `control.rs` agent handlers -> `handlers_agents.rs` (15 fns) + status/monitoring handlers -> `handlers_status.rs` (13 fns) | -> 18,979 |
 
 Also verified (authored by a concurrent session): the retired **Powder runtime** was fully removed (`powder.rs` deleted, handlers + tests gone); `main` compiles and the lib test suite is green.
-`control.rs` has gone from 73,435 to ~20,338 lines total across this effort.
+`control.rs` has gone from 73,435 to ~18,979 lines total across this effort.
 
 ## Remaining workstreams
 
 ### WS1 - split `control.rs` production half into submodules (IN PROGRESS)
 
-Goal: take `control.rs` from ~20,338 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
-Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`.
+Goal: take `control.rs` from ~18,979 to roughly 5,000-6,000 lines (core dispatch + serve loop + shared types/helpers) by moving handler groups into `control/handlers_*.rs`.
+Done so far: `handlers_files.rs`, `handlers_history.rs`, `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs`, `handlers_agents.rs`, `handlers_status.rs`.
+
+Note (sibling-to-sibling resolution PROVEN): a helper moved into submodule A is reachable from sibling submodule B through `control`'s `use A::*;` re-export + B's `use super::*;`.
+This is the same mechanism `control/tests.rs` already uses to reach the moved handlers, and it now also holds for production siblings (`handlers_fleet` reaches `target_statuses` in `handlers_status`).
+So shared helpers can move into whichever submodule owns them; they need not stay in `control.rs`.
 
 **Remaining groups** (do biggest/hardest first, one verified commit each):
-- `idempotency.rs` - `RequestCache` + provider-capacity evidence + control leases.
-  Reassessed: NOT one contiguous ~5k cluster - the `RequestCache`/`CaptainControlLeases` structs+impls (~600 lines, 8884-9485) are interleaved with provider-capacity types, `SpawnPurpose`/`SpawnAdmissionGuard`, and `PreviewRootAuthority` that `ControlContext` and spawn admission depend on. Extract the RequestCache+lease sub-cluster only, or defer.
-- `handlers_status.rs` - `get_status`, `wait_for_status`, `supervision_tree`, `list_agents`, `agent_events`, `dispatch_preflight`.
-- `handlers_agents.rs` - `agent_checkpoint`, `agent_followup`, `record_agent_delivery`.
+- `handlers_spawn.rs` - `spawn_terminal`/`start_agent`/`commission_captain`/`attach_captain` + spawn-capacity eval.
+- `handlers_captains.rs` - `claim_captain`/`release_captain`/`rename_captain`/`report_workspace_tabs`.
+- `handlers_comms.rs` - `plane_send`/`inbox_ack`/`inbox_status`/`check_authorization`.
 - `handlers_tabs.rs` - `new_tab`/`close_tab`/`rename_tab`/`focus_tab`/`move_tile`/`list_tabs`/`open_file`.
   Note: these are scattered (interleaved with unrelated fns), not one contiguous block - split by sub-cluster or defer until neighbours are extracted.
-- `handlers_captains.rs` - `claim_captain`/`release_captain`/`rename_captain`/`report_workspace_tabs`.
-- `handlers_spawn.rs` - `spawn_terminal`/`start_agent`/`commission_captain`/`attach_captain` + spawn-capacity eval.
-- `handlers_comms.rs` - `plane_send`/`inbox_ack`/`inbox_status`/`check_authorization`.
+- `idempotency.rs` - `RequestCache` + provider-capacity evidence + control leases.
+  Reassessed: NOT one contiguous ~5k cluster - the `RequestCache`/`CaptainControlLeases` structs+impls (~600 lines) are interleaved with provider-capacity types, `SpawnPurpose`/`SpawnAdmissionGuard`, and `PreviewRootAuthority` that `ControlContext` and spawn admission depend on. Extract the RequestCache+lease sub-cluster only, or defer.
 
 Also still available in the `captains_registry.rs` neighbourhood: the `#[cfg(test)] impl CaptainsRegistry` helper impl and `impl Default for CaptainsRegistry` could fold into that submodule for cohesion; the `CaptainsRegistry` struct + supporting types (`CaptainsInner`, `ClaimDisposition`, `ShipMembership`, ...) are pervasively referenced by `ControlContext`/handlers, so moving them needs care with `pub(super)` + the `private_interfaces` lint.
 
-Done: `handlers_fleet.rs` (`watch_fleet`/`unwatch_fleet`/`list_fleet_watches` + scope/owner helpers), `handlers_worktrees.rs` (`create_worktree`/`remove_worktree`/`list_worktrees` + authz/git-capability/rollback helpers), `captains_registry.rs` (the inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide).
+Done: `handlers_fleet.rs`, `handlers_worktrees.rs`, `captains_registry.rs` (inherent `impl CaptainsRegistry` - 99 methods; struct + test/Default impls stay in parent, `mod`-only include since inherent methods resolve crate-wide), `handlers_agents.rs` (agent lifecycle), `handlers_status.rs` (status/supervision/host-monitoring).
 
 **Stays in `control.rs`**: `ControlContext`/`ControlRequest`/`ControlResponse`/`ControlHandshake`/`EventFanout`/`TabRegistry` types; the serve/listen loop (`start`, `serve`, `handle_conn`, `serve_pty_attach`); discovery/handshake + identity/token resolution; the dispatch entry points (`dispatch_authenticated`, `dispatch`, `dispatch_with_caller`, `required_tier`); and shared helpers (`arg_str`, `deny`, error taggers, `now_ms`).
 
