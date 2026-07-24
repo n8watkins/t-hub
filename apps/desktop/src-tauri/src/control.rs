@@ -1294,160 +1294,6 @@ fn normalize_captain_display_name(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
-/// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
-/// maps to exactly one ship. This is the first-class role that RETIRES the
-/// `ship: cortana` slug-collision hack: uniqueness is enforced on the role, not on a
-/// reserved slug. It is a strict subset of the coarse [`crate::identity::Role`]
-/// (which also carries mint-time General/Crew/Unknown) because only a supervisor
-/// ever holds a registry claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FleetRole {
-    Cortana,
-    Captain,
-}
-
-impl Default for FleetRole {
-    /// Legacy records (no `role` field) default to `Captain`; the load-time
-    /// reconciliation then re-seeds the single `ship_slug == "cortana"` incumbent to
-    /// `Cortana` (D2/MED-6), so the singleton is seeded from the live incumbent, not
-    /// defaulted empty.
-    fn default() -> Self {
-        FleetRole::Captain
-    }
-}
-
-impl FleetRole {
-    pub fn label(self) -> &'static str {
-        match self {
-            FleetRole::Cortana => "cortana",
-            FleetRole::Captain => "captain",
-        }
-    }
-}
-
-/// The lifecycle state of a claim (item-2 §2.4). Death MARKS, it does not scrub - a
-/// dead supervisor's record and crew are RETAINED for re-adoption instead of the
-/// silent `retain`-away leak (the old `remove_session` C4 single-point-of-failure).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum ClaimState {
-    /// Live and pointed at a terminal.
-    #[default]
-    Active,
-    /// The supervisor's terminal is UNAMBIGUOUSLY gone (`tmux::has_session` false)
-    /// but the durable identity + its crew are retained for re-adoption by a resumed
-    /// same-key supervisor. `since` is epoch-ms. Retained INDEFINITELY (D6); reap
-    /// timing + the landed-gate stay reap-ship's, not item-2's.
-    Orphaned { since: u64 },
-    /// Explicitly released while crew remained: re-claimable by a new captain of the
-    /// same ship, crew preserved. (A release with NO crew hard-removes instead.)
-    Vacant,
-}
-
-/// A crew member's lifecycle under its ship (item-2 §2.4). Like [`ClaimState`],
-/// crew are marked rather than scrubbed so an orphaned worker is re-adoptable and
-/// a dead one is visible to telemetry/reap-ship instead of vanishing.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum CrewState {
-    /// Live under a live captain.
-    #[default]
-    Active,
-    /// The CAPTAIN died: the crew is orphaned-but-retained, re-adopted (→ `Active`)
-    /// when a same-ship captain resumes. `since` epoch-ms.
-    Orphaned { since: u64 },
-    /// The Crew terminal is stopped, but its Powder claim could not be released.
-    /// Keep the binding addressable until a later cleanup confirms the release.
-    CleanupPending { since: u64 },
-    /// A live legacy Crew terminal whose owning Work Workspace cannot be resolved
-    /// without guessing. It remains visible but cannot be treated as assigned.
-    NeedsAssignment { since: u64 },
-    /// The crew's OWN tile died: a terminal marker (NOT re-adoptable - the worker is
-    /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
-    /// epoch-ms.
-    Removed { since: u64 },
-}
-
-/// One crew member of a ship (item-2 §2.3). Crew membership is a property of the
-/// SHIP (this ref lives inside the ship's [`FleetIdentity`]), so it follows the ship
-/// across a captain migration by construction - no pointer-chasing migration routine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CrewRef {
-    /// The crew's tile id (a MUTABLE pointer). Membership is keyed on the ship, not
-    /// on this pointer.
-    pub terminal_id: String,
-    /// The crew's Claude continuity anchor. `None` at record time (the crew's own
-    /// `SessionStart` has not fired yet - `control.rs` async-backfill window, MED-7)
-    /// and BACKFILLED on the first StatusBridge resolution. Never load-bearing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_uuid: Option<String>,
-    /// Harness that owns `provider_session_id`. Missing on legacy records.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Provider-native conversation id, such as a Codex thread id or Claude UUID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_session_id: Option<String>,
-    /// Harness-neutral conversation identifier used to resume or reconcile a
-    /// replaced Crew conversation. Provider continuity is useful, but never the
-    /// durable crew identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-    /// Latest durable handoff boundary for this Crew conversation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_point: Option<String>,
-    /// Human-readable task boundary delegated to this Crew member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness: Option<String>,
-    /// Effective provider-native permission mode, persisted only after
-    /// authoritative post-launch process evidence verifies it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness_permission: Option<PermMode>,
-    /// T-Hub control-plane capability is a separate authority axis from local
-    /// Harness execution permission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub t_hub_capability: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Exact durable Work Workspace selected by the owning Captain before launch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_tab_id: Option<String>,
-    /// Powder work claimed by this Crew member. T-Hub owns the terminal binding;
-    /// Powder remains authoritative for the claim and run lifecycle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub powder_work: Option<PowderWorkBinding>,
-    #[serde(default)]
-    pub state: CrewState,
-}
-
-impl CrewRef {
-    fn new(terminal_id: &str) -> Self {
-        CrewRef {
-            terminal_id: terminal_id.to_string(),
-            claude_uuid: None,
-            provider: None,
-            provider_session_id: None,
-            conversation_id: None,
-            resume_point: None,
-            task: None,
-            harness: None,
-            harness_permission: None,
-            t_hub_capability: None,
-            worktree_path: None,
-            branch: None,
-            workspace_tab_id: None,
-            powder_work: None,
-            state: CrewState::Active,
-        }
-    }
-}
-
 /// A Crew member's durable pointer into Powder's work ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3149,6 +2995,10 @@ fn slugify_ship(name: &str) -> String {
 }
 
 mod captains_registry;
+// The CaptainsRegistry data-model types live in the submodule alongside its impl;
+// re-export the public ones so `control::FleetRole` (used by `acl.rs`) and the bare
+// names in this module + sibling submodules keep resolving unchanged.
+pub use captains_registry::{ClaimState, CrewRef, CrewState, FleetRole};
 
 mod idempotency;
 use idempotency::*;
