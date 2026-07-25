@@ -156,6 +156,15 @@ jobs:
           } else {
             Write-Host "Source tree is clean before Package 5 provenance."
           }
+          $cargoManifest = "apps/desktop/src-tauri/Cargo.toml"
+          git diff --ignore-space-at-eol --quiet -- $cargoManifest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows build changed Cargo.toml content beyond line-ending/whitespace normalization"
+          }
+          if ($status -match "Cargo\.toml") {
+            git restore --source=HEAD --worktree -- $cargoManifest
+            Write-Host "Restored Windows Cargo.toml line-ending normalization before provenance."
+          }
 
       - name: Write Package 5 artifact provenance manifest
         if: ${{ github.event.inputs.variant == 'dev' }}
