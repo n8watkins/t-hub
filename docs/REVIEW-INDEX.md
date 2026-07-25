@@ -7,7 +7,8 @@ When documents disagree, use the precedence below and verify claims against the 
 Historical documents should remain intact as design rationale and evidence unless a separate cleanup explicitly archives them.
 
 Canonical precedence is scope-based, while the numbered list below is the required reading order.
-The phased plan governs product decisions and dependencies, the handoff governs verified current runtime facts only, the operating model governs organizational lifecycle, and narrower canonical contracts govern their named subsystem behavior.
+The phased plan governs product decisions and dependencies, an explicitly current handoff may govern verified runtime facts, the operating model governs organizational lifecycle, and narrower canonical contracts govern their named subsystem behavior.
+Historical handoffs do not provide current runtime facts and cannot override the active package acceptance documents.
 No handoff or subsystem contract may override an explicit phased-plan decision or General authorization.
 When canonical scopes genuinely conflict, stop the affected action and record the resolved decision in the phased plan.
 
@@ -36,7 +37,8 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 - [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md) remains the interaction and path-convention design, while the unified worktree contract governs status and safety.
 - [SESSION_AWARENESS.md](./SESSION_AWARENESS.md) records the existing Claude-oriented event spine, while the two-axis status model governs provider-neutral semantics.
 - [SMOKE-TEST.md](./SMOKE-TEST.md) is a useful regression checklist, but version-specific assertions must be checked against the current phased plan before use.
-- [AGENT-SESSION-SMOKE-0.3.106.md](./AGENT-SESSION-SMOKE-0.3.106.md) is the current version-specific release smoke procedure.
+- [AGENT-SESSION-SMOKE-0.3.106.md](./AGENT-SESSION-SMOKE-0.3.106.md) is a historical version-specific release smoke procedure.
+  Use [PACKAGE-5-LIVE-ACCEPTANCE.md](./PACKAGE-5-LIVE-ACCEPTANCE.md) and [PACKAGE-6-PERFORMANCE-CLOSURE.md](./PACKAGE-6-PERFORMANCE-CLOSURE.md) for the current candidate's release and performance evidence.
 
 ## Historical Reviews and Shipped Plans
 

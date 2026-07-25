@@ -2,13 +2,15 @@
 
 > Historical compatibility assignment: this record targets the pre-retirement
 > Powder acceptance run and is preserved for audit history only.
-> It is not current authorization to mutate Powder or dispatch a Crew.
+> It is not current authorization to mutate Powder, dispatch a Crew, or operate
+> the current Package 0 through Package 6 itinerary.
 
-## Purpose
+## Preserved Purpose
 
-This document is the active instruction for Captain terminal `c2940be4` on ship `t-hub-app`.
-The Captain must use the `$captain` skill and recover its durable manifest before acting.
-The installed acceptance target is T-Hub `0.3.103` from source commit `8654986`.
+This document records the former instruction for Captain terminal `c2940be4` on ship `t-hub-app`.
+The terminal, ship state, worktree, sentinel, card, run, version, and source commit below are historical evidence.
+They must not be reused as current runtime facts or resume points.
+The active product requirements are in [UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md](./UX-RELIABILITY-AND-PERFORMANCE-ITINERARY.md) and the current Captain contracts listed by [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 
 ## Current Authorization
 

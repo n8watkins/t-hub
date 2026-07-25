@@ -25,6 +25,10 @@ The program must deliver the following user-visible outcomes.
 
 ## Confirmed Baseline
 
+The executable and timestamp details in this section are a historical July 21, 2026 installation snapshot.
+They are retained to explain the original packaged-version gap and must not be treated as the identity of the current release candidate.
+For a current candidate, use the exact source commit, installer hash, installed binary hash, and evidence manifest required by Package 5.
+
 The installed production executable is `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` version `0.3.106`, modified July 19, 2026 at 11:51 PM Pacific.
 The installed development executable is version `0.3.105`, modified July 19, 2026 at 9:25 PM Pacific.
 The provider-neutral History UI began landing after midnight on July 20.
@@ -38,11 +42,12 @@ The existing responsive header source already renders icons and supports full-la
 Package 2 source now labels the combined surface `Preview`, uses the Eye icon, and preserves the exact `Preview` tooltip and accessible name at icon-only densities.
 This source behavior remains packaged-unproven until the installed Windows Dev matrix in `docs/PACKAGE-2-WINDOWS-E2E-REQUIREMENTS.md` passes against the exact candidate artifact.
 
-Preview currently accepts only a managed runner URL or a manually entered URL.
+Preview accepts an authoritative managed-runner URL or an explicitly selected discovered target, with manual URL entry retained only for the supported URL contract.
 It intentionally ignores arbitrary URLs printed in an agent terminal.
-Chat context does not currently start or navigate Preview.
-Preview lifecycle operations exist only behind the desktop UI's Tauri commands.
-There is no provider-neutral Preview control surface in the T-Hub control dispatcher, MCP catalog, or CLI.
+Chat context does not itself start or navigate Preview; an agent must call the typed operation explicitly.
+The current source exposes the shared Preview lifecycle through the desktop control dispatcher, the MCP catalog, and the `th preview` CLI adapter.
+The UI, MCP server, and CLI remain thin adapters over the shared Preview service.
+This source-level implementation is still packaged-unproven until Package 5 verifies the exact installed Windows candidate.
 
 Kokoro settings are enabled and both local text-to-speech health endpoints responded successfully during the audit.
 A real Kokoro request produced a valid WAV file, so synthesis is available.
