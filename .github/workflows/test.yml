@@ -98,6 +98,25 @@ jobs:
             file
         working-directory: .
 
+      # The preview/devserver process-supervisor tests spawn
+      # `unshare --user --map-current-user --pid --fork --mount --mount-proc` to
+      # sandbox a target process tree. Ubuntu 24.04 (ubuntu-latest) ships an
+      # AppArmor policy that restricts unprivileged user namespaces
+      # (kernel.apparmor_restrict_unprivileged_userns=1), so that unshare fails
+      # writing /proc/self/uid_map with EPERM ("Operation not permitted") and the
+      # supervisor tests fail. The runner is a real VM with passwordless sudo, so
+      # relax the restriction to restore the classic unprivileged user namespaces
+      # these tests rely on. Guarded so it is a no-op on kernels without the knob.
+      - name: Enable unprivileged user namespaces (preview supervisor tests)
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+        working-directory: .
+
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: stable
