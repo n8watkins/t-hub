@@ -110,7 +110,9 @@ if ($sourceResolved -cne $head) { throw "SourceCommit must equal the checked-out
 if ($env:GITHUB_SHA -and $env:GITHUB_SHA -cne $sourceResolved) { throw "GITHUB_SHA must equal the checked-out SourceCommit" }
 $tree = Git-Output @("rev-parse", "$SourceCommit`^{tree}")
 $dirty = Git-Output @("status", "--porcelain", "--untracked-files=all")
-if (-not [string]::IsNullOrWhiteSpace($dirty)) { throw "checked-out tree is dirty; refusing provenance manifest" }
+if (-not [string]::IsNullOrWhiteSpace($dirty)) {
+  throw "checked-out tree is dirty; refusing provenance manifest. Paths:`n$dirty"
+}
 foreach ($tracked in @("pnpm-lock.yaml", "apps/desktop/src-tauri/Cargo.lock", "apps/desktop/src-tauri/tauri.conf.json", "apps/desktop/src-tauri/tauri.dev.conf.json")) {
   $null = Git-Output @("ls-files", "--error-unmatch", $tracked)
 }

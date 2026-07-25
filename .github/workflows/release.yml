@@ -145,6 +145,18 @@ jobs:
           Copy-Item $extractedBinary.FullName "$evidenceDir/t-hub-dev.extracted.exe"
           Get-Content "$evidenceDir/dev-installer-validation.json"
 
+      - name: Inspect source tree before provenance
+        if: ${{ github.event.inputs.variant == 'dev' }}
+        shell: pwsh
+        run: |
+          $status = git status --porcelain --untracked-files=all
+          if (-not [string]::IsNullOrWhiteSpace($status)) {
+            Write-Host "Source tree status before Package 5 provenance:"
+            Write-Host $status
+          } else {
+            Write-Host "Source tree is clean before Package 5 provenance."
+          }
+
       - name: Write Package 5 artifact provenance manifest
         if: ${{ github.event.inputs.variant == 'dev' }}
         shell: pwsh
