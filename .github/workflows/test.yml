@@ -5,11 +5,11 @@ name: Test
 # quality gate. It mirrors the exact suites the crews / no-mistakes run locally,
 # so a red suite blocks merge and release instead of relying on a local test run.
 #
-# Runs on ubuntu-latest, NOT windows: every suite here is platform-agnostic
-# (the Rust tests shell out to `tmux -L t-hub` on an isolated socket and the
-# frontend suites are jsdom), they run green on Linux, and ubuntu runners are
-# ~faster/cheaper. The Windows-only bits (the Tauri installer) stay in
-# release.yml where they belong.
+# Rust, CLI, frontend, and browser suites run on Ubuntu. The Rust tests shell
+# out to `tmux -L t-hub` on an isolated socket, while Playwright exercises the
+# browser fixture in real Chromium. Package 5 evidence and installer contracts
+# run on Windows so their PowerShell and line-ending behavior is authoritative.
+# Building and inspecting the real Tauri installer remains in release.yml.
 
 on:
   workflow_call:
@@ -133,6 +133,11 @@ jobs:
       - name: cargo workspace gate
         run: ../scripts/workspace_gate.sh
 
+      # The canonical `th` CLI is a separate Cargo workspace, so the desktop
+      # workspace gate above does not discover its human/JSON contract suites.
+      - name: CLI workspace tests
+        run: cargo test --manifest-path ../../cli/Cargo.toml --locked
+
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -164,6 +169,14 @@ jobs:
       - name: vitest run
         run: pnpm --filter t-hub-desktop test
 
+      - name: Install Playwright Chromium
+        run: pnpm --filter t-hub-desktop exec playwright install --with-deps chromium
+
+      # Runs the real Chromium suite, including the responsive Package 2 header
+      # matrix. The package script owns Vite startup and teardown.
+      - name: Playwright browser suite
+        run: pnpm --filter t-hub-desktop test:browser
+
       # Compile the actual production bundle as well as checking TypeScript.
       # This catches Vite import, asset, and bundling failures that jsdom does not.
       - name: Production frontend build
@@ -177,3 +190,19 @@ jobs:
 
       - name: GitHub Actions pinning contract
         run: bash scripts/ci/workflow-actions.test.sh
+
+  package5-windows-contracts:
+    name: Package 5 Windows contracts
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Package 5 evidence manifest contract
+        shell: pwsh
+        run: ./scripts/windows/write-package5-provenance.test.ps1
+
+      # Exercises LF, CRLF, legacy-development migration safety, production
+      # isolation, marker rewriting, payload identity, and workflow ordering.
+      - name: Development installer validator fixtures
+        shell: pwsh
+        run: ./scripts/windows/validate-dev-installer.test.ps1
