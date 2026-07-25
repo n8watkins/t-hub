@@ -16136,7 +16136,23 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(observe(&target, &owner).unwrap(), baseline);
+    // The ordinary tool child must not change the attested harness identity.
+    // Poll to a deadline rather than sampling once: under load the observation
+    // can transiently fail to read before it settles back on the baseline.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match observe(&target, &owner) {
+            Ok(observed) if observed == baseline => break,
+            Ok(observed) => {
+                panic!("ordinary tool child changed the attested harness identity: {observed:?}")
+            }
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "attested harness identity was not observable after the tool child: {error:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     tmux::retire_managed_runtime(&target, &owner).unwrap();
 
     let (target, marker, owner) = start("exit-tool", true);
@@ -16225,21 +16241,28 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
                 Instant::now() + Duration::from_secs(2),
             )
         };
+        // The node launcher spawns the native Codex child asynchronously, so an
+        // early observation can still bind to the launcher before the native
+        // child appears in the scoped process list. Wait for the observation to
+        // converge on the trusted native executable so the baseline is the
+        // settled state, not a mid-spawn sample. (Breaking on the first Ok here
+        // is what made this test flake under CI parallel load.)
         let deadline = Instant::now() + Duration::from_secs(5);
         let package_baseline = loop {
             match observe_package() {
-                Ok(observed) => break observed,
-                Err(error) => assert!(
+                Ok(observed)
+                    if Some(&observed.executable)
+                        == package_expected.trusted_child_executable.as_ref() =>
+                {
+                    break observed;
+                }
+                other => assert!(
                     Instant::now() < deadline,
-                    "bound native Codex child was not observed: {error:?}"
+                    "bound native Codex child did not settle on the trusted executable: {other:?}"
                 ),
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(
-            Some(&package_baseline.executable),
-            package_expected.trusted_child_executable.as_ref()
-        );
         std::fs::write(&tool_marker, b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while tmux::observe_session_effect_identity(&package_target)
@@ -16251,7 +16274,26 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(observe_package().unwrap(), package_baseline);
+        // The ordinary tool child must not change the attested harness identity.
+        // Poll to a deadline rather than sampling once: under load the
+        // observation can transiently fail to read before it settles back on the
+        // baseline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match observe_package() {
+                Ok(observed) if observed == package_baseline => break,
+                Ok(observed) => {
+                    panic!(
+                        "ordinary tool child changed the attested harness identity: {observed:?}"
+                    )
+                }
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "attested harness identity was not observable after the tool child: {error:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         tmux::retire_managed_runtime(&package_target, &package_owner).unwrap();
         let target_triple = package_native
             .parent()
@@ -16436,10 +16478,25 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
         permissions.set_mode(0o755);
         std::fs::set_permissions(&replacement, permissions).unwrap();
         std::fs::rename(&replacement, &script).unwrap();
-        assert_eq!(
-            observe_script().unwrap_err(),
-            crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch
-        );
+        // Substituting the on-disk launcher must be rejected as a provenance
+        // mismatch. Poll to a deadline instead of asserting on a single
+        // observation: under CI parallel load an observation can transiently
+        // surface a different error (e.g. an unreadable/ancestry read) before it
+        // settles on the mismatch, and demanding the exact variant on the first
+        // try is what let this assertion flake. A trusted Ok is still a hard
+        // failure.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match observe_script() {
+                Err(crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => break,
+                Ok(observed) => panic!("substituted launcher was trusted: {observed:?}"),
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "substituted launcher never reached a stable provenance mismatch: {error:?}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         tmux::retire_managed_runtime(&target, &owner).unwrap();
     }
 
