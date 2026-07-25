@@ -5,7 +5,10 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $scriptPath = Join-Path $PSScriptRoot "write-package5-provenance.ps1"
+$workflowPath = Join-Path $PSScriptRoot "..\..\.github\workflows\release.yml"
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-package5-provenance-" + [guid]::NewGuid().ToString("N"))
+$webView2Version = "150.0.4078.99"
+$PSDefaultParameterValues["write-package5-provenance.ps1:WebView2Version"] = $webView2Version
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw "Assertion failed: $Message" }
@@ -20,6 +23,10 @@ function Assert-Fails([scriptblock]$Action, [string]$Needle) {
 }
 
 try {
+  $workflow = Get-Content -LiteralPath $workflowPath -Raw
+  Assert-True ($workflow -match '\$webView2Version = \$webView2Runtime\.VersionInfo\.FileVersion') "release workflow does not derive WebView2 version from executable metadata"
+  Assert-True ($workflow -match '-WebView2Version \$webView2Version') "release workflow does not pass WebView2 version to provenance"
+
   New-Item -ItemType Directory -Force -Path (Join-Path $root "apps/desktop/src-tauri") | Out-Null
   "lock" | Set-Content (Join-Path $root "pnpm-lock.yaml")
   "lock" | Set-Content (Join-Path $root "apps/desktop/src-tauri/Cargo.lock")
@@ -62,11 +69,14 @@ try {
   Assert-True ($manifest.schemaVersion -eq 1) "manifest schema version is not 1"
   Assert-True ($manifest.candidate.sourceCommit -eq $head) "source commit is not HEAD"
   Assert-True ($manifest.candidate.gitTree.Length -eq 40) "git tree binding is missing"
+  Assert-True ($manifest.build.webView2Version -eq $webView2Version) "WebView2 version is not retained"
   Assert-True ($manifest.artifacts.expectedBinary.sha256 -eq $manifest.artifacts.extractedBinary.sha256) "expected/extracted hashes differ"
   Assert-True ($manifest.validation.passed -eq $true) "validator pass is not retained"
   Assert-True ($null -ne $manifest.installation -and $null -ne $manifest.environment -and $null -ne $manifest.matrix -and $null -ne $manifest.review) "required evidence sections are missing"
   Assert-True ($manifest.installation.status -eq "not_installed" -and $null -eq $manifest.installation.installedAt -and $null -eq $manifest.installation.installationTarget) "uninstalled manifest fabricated installation evidence"
   Assert-True ($null -ne $manifest.artifacts.validator -and $manifest.artifacts.validator.passed -eq $true) "validator artifact binding is missing"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "missing-webview2.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator -WebView2Version "" } "WebView2Version"
+  Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "invalid-webview2.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator -WebView2Version "unknown" } "WebView2Version"
 
   @{ passed = $true; productionMainBinary = "t-hub"; developmentMainBinary = "t-hub-dev"; rawSha256 = $hash; installerSha256 = $installerHash; expectedSha256 = $hash; extractedSha256 = $hash; installedSha256 = $null; bundleMarkerTransformation = "__TAURI_BUNDLE_TYPE_VAR_UNK -> __TAURI_BUNDLE_TYPE_VAR_NSS" } | ConvertTo-Json | Set-Content $validator
   $nullManifestPath = Join-Path ([System.IO.Path]::GetTempPath()) ("package-5-null-installed-" + [guid]::NewGuid().ToString("N") + ".json")
@@ -118,6 +128,7 @@ try {
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "outside.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -InstallerScriptPath $outside -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "outside repository"
   Write-Host "write-package5-provenance.test: PASS"
 } finally {
+  $PSDefaultParameterValues.Remove("write-package5-provenance.ps1:WebView2Version")
   $outside = Join-Path $root "..\outside.exe"
   if (Test-Path -LiteralPath $outside) { Remove-Item -LiteralPath $outside -Force }
   if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

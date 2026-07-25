@@ -17,7 +17,9 @@ param(
   [int]$RunAttempt = 1,
   [string]$RunnerImage = "",
   [string]$WindowsVersion = "",
-  [string]$WebView2Version = "",
+  [Parameter(Mandatory = $true)]
+  [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+  [string]$WebView2Version,
   [string]$NodeVersion = "",
   [string]$PnpmVersion = "",
   [string]$RustVersion = "",

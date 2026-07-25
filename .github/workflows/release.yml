@@ -166,6 +166,16 @@ jobs:
           $extractedBinaries = @(Get-ChildItem -Path "$releaseDir/dev-installer-extracted" -Filter "t-hub-dev.exe" -Recurse)
           if ($extractedBinaries.Count -ne 1) { throw "Expected exactly one extracted t-hub-dev.exe, found $($extractedBinaries.Count)" }
           $extracted = $extractedBinaries[0]
+          $webView2Candidates = @(
+            Get-ChildItem -Path "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" -File -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "$env:ProgramFiles\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe" -File -ErrorAction SilentlyContinue
+          )
+          $webView2Runtime = $webView2Candidates |
+            Where-Object { $_.VersionInfo.FileVersion -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending |
+            Select-Object -First 1
+          if ($null -eq $webView2Runtime) { throw "The installed WebView2 runtime version could not be resolved from its executable metadata" }
+          $webView2Version = $webView2Runtime.VersionInfo.FileVersion
           & ./scripts/windows/write-package5-provenance.ps1 `
             -OutputPath "$releaseDir/dev-installer-evidence/package-5-evidence.json" `
             -RepositoryRoot (Get-Location).Path `
@@ -181,6 +191,7 @@ jobs:
             -RunAttempt ([int]$env:PACKAGE5_RUN_ATTEMPT) `
             -RunnerImage "windows-latest" `
             -WindowsVersion ((Get-CimInstance Win32_OperatingSystem).Version) `
+            -WebView2Version $webView2Version `
             -NodeVersion (node --version) `
             -PnpmVersion (pnpm --version) `
             -RustVersion (rustc --version) `
