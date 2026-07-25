@@ -9,6 +9,8 @@ $workflowPath = Join-Path $PSScriptRoot "..\..\.github\workflows\release.yml"
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("thub-package5-provenance-" + [guid]::NewGuid().ToString("N"))
 $webView2Version = "150.0.4078.99"
 $PSDefaultParameterValues["write-package5-provenance.ps1:WebView2Version"] = $webView2Version
+$inheritedGithubSha = $env:GITHUB_SHA
+Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw "Assertion failed: $Message" }
@@ -94,10 +96,9 @@ try {
 
   $badSource = "0" * 40
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-source.json") -RepositoryRoot $root -SourceCommit $badSource -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "SourceCommit"
-  $oldGithubSha = $env:GITHUB_SHA
   $env:GITHUB_SHA = $badSource
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "bad-github-sha.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "GITHUB_SHA"
-  if ($null -eq $oldGithubSha) { Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue } else { $env:GITHUB_SHA = $oldGithubSha }
+  Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue
   "dirty" | Set-Content (Join-Path $root "dirty.txt")
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "dirty.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "dirty"
   Remove-Item (Join-Path $root "dirty.txt")
@@ -128,6 +129,11 @@ try {
   Assert-Fails { & $scriptPath -OutputPath (Join-Path ([System.IO.Path]::GetTempPath()) "outside.json") -RepositoryRoot $root -SourceCommit $head -InstallerPath $installer -InstallerScriptPath $outside -RawBinaryPath $raw -ExpectedBinaryPath $expected -ExtractedBinaryPath $extracted -ValidatorPath $validator -ValidationPath $validator } "outside repository"
   Write-Host "write-package5-provenance.test: PASS"
 } finally {
+  if ($null -eq $inheritedGithubSha) {
+    Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue
+  } else {
+    $env:GITHUB_SHA = $inheritedGithubSha
+  }
   $PSDefaultParameterValues.Remove("write-package5-provenance.ps1:WebView2Version")
   $outside = Join-Path $root "..\outside.exe"
   if (Test-Path -LiteralPath $outside) { Remove-Item -LiteralPath $outside -Force }
