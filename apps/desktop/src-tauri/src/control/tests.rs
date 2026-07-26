@@ -82,7 +82,10 @@ fn test_ctx(token: &str) -> ControlContext {
         });
     // Point the audit sink at a per-token temp dir so dispatch_authenticated
     // tests never write to the real ~/.t-hub/audit.
-    let audit_dir = std::env::temp_dir().join(format!("t-hub-ctl-test-{token}"));
+    let audit_dir = std::env::temp_dir().join(format!(
+        "t-hub-ctl-test-{token}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     // A known read token so capability tests can present it; distinct from the
     // control token so ReadOnly vs Full resolution is exercised.
     let mut ctx = ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
@@ -21608,6 +21611,11 @@ fn read_audit(dir: &std::path::Path) -> Vec<Value> {
     out
 }
 
+fn clean_audit(dir: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_file(crate::audit::head_path_for_test(dir));
+}
+
 fn req(token: &str, command: &str, args: Value) -> ControlRequest {
     ControlRequest {
         token: token.to_string(),
@@ -21701,7 +21709,7 @@ fn normal_captain_fanout_burst_not_refused_at_gate() {
     // burst of 8 the governor admits all six; they fail downstream only because
     // this headless ctx has no UI sink, never because of the budget.
     let dir = std::env::temp_dir().join("t-hub-gate-burst");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("burst")
         .with_governor(Arc::new(SpawnGovernor::default()))
         .with_audit(Arc::new(AuditLog::new(dir.clone())));
@@ -21724,7 +21732,122 @@ fn normal_captain_fanout_burst_not_refused_at_gate() {
             "spawn {i} hit the concurrent cap: {err}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
+}
+
+#[test]
+fn socket_process_change_is_refused_before_side_effect_when_audit_sink_fails() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let id = format!("af{:06x}", (nanos as u64) & 0x00ff_ffff);
+    let target = tmux::target_for_id(&id);
+    let sentinel = std::env::temp_dir().join(format!("t-hub-audit-fail-e2e-{id}"));
+    let sink_parent = std::env::temp_dir().join(format!("t-hub-audit-sink-file-{id}"));
+    let _ = std::fs::remove_file(&sentinel);
+    let _ = std::fs::remove_dir_all(&sink_parent);
+    let _ = std::fs::remove_file(&sink_parent);
+    std::fs::write(&sink_parent, b"not a directory").unwrap();
+
+    let _ = tmux::kill_session(&target);
+    tmux::new_session_with_env(&target, "/tmp", None, &[]).expect("spawn session");
+    tmux::resize_window_for_tests(&target, 80, 24).expect("resize session");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().unwrap();
+    let ctx = test_ctx("audit-e2e").with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        handle_conn(stream, &ctx).expect("serve request");
+    });
+
+    let command = format!("printf AUDIT_SIDE_EFFECT > {}", sentinel.display());
+    let frame = json!({
+        "token": "audit-e2e",
+        "host": "audit-e2e",
+        "command": "send_text",
+        "args": {
+            "sessionId": id,
+            "text": command,
+            "enter": true
+        },
+        "v": PROTOCOL_VERSION
+    });
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    let mut bytes = serde_json::to_vec(&frame).unwrap();
+    bytes.push(b'\n');
+    stream.write_all(&bytes).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let response: Value = serde_json::from_str(line.trim()).unwrap();
+    drop(reader);
+    server.join().unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !sentinel.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let side_effect_happened = sentinel.exists();
+
+    let _ = tmux::kill_session(&target);
+    let _ = std::fs::remove_file(&sentinel);
+    let _ = std::fs::remove_file(&sink_parent);
+
+    assert_eq!(
+        response["ok"], false,
+        "a process-changing socket request must fail when its durable audit record cannot be written: {response}"
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("audit sink unavailable")),
+        "the refusal must identify the failed audit guarantee: {response}"
+    );
+    assert!(
+        !side_effect_happened,
+        "send_text reached the user's shell even though its audit record could not be written"
+    );
+}
+
+#[test]
+fn audit_refusal_releases_idempotency_reservation_for_retry() {
+    let sink_parent = std::env::temp_dir().join(format!(
+        "t-hub-audit-idempotency-failure-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _ = std::fs::remove_dir_all(&sink_parent);
+    let _ = std::fs::remove_file(&sink_parent);
+    std::fs::write(&sink_parent, b"not a directory").unwrap();
+    let ctx =
+        test_ctx("audit-retry").with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
+    let request = || {
+        req(
+            "audit-retry",
+            "spawn_terminal",
+            json!({"cwd": "/tmp", "requestId": "audit-retry-id"}),
+        )
+    };
+
+    let first = dispatch_authenticated(&ctx, request());
+    let second = dispatch_authenticated(&ctx, request());
+
+    for response in [first, second] {
+        let error = response.error.unwrap_or_default();
+        assert!(
+            error.contains("audit sink unavailable"),
+            "a retry should reach the audit gate again: {error}"
+        );
+        assert!(
+            !error.contains("already in flight"),
+            "the failed audit gate leaked its reservation: {error}"
+        );
+    }
+    let _ = std::fs::remove_file(&sink_parent);
 }
 
 #[test]
@@ -21732,7 +21855,7 @@ fn spawn_rate_limit_refuses_with_exact_message_and_audits() {
     // Burst 1: the first spawn spends the only token; the second is refused with
     // the exact §5 message and recorded as `refused-rate`.
     let dir = std::env::temp_dir().join("t-hub-gate-rate");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("rate")
         .with_governor(Arc::new(SpawnGovernor::new(64, 20.0, 1.0)))
         .with_audit(Arc::new(AuditLog::new(dir.clone())));
@@ -21760,7 +21883,7 @@ fn spawn_rate_limit_refuses_with_exact_message_and_audits() {
     assert_eq!(recs[1]["decision"], "refused-rate");
     // The hash chain links the refusal to the prior line.
     assert_eq!(recs[1]["prev"], recs[0]["hash"]);
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
@@ -21768,14 +21891,14 @@ fn read_tier_is_not_gated_or_audited() {
     // list_terminals is Read tier: it must never touch the governor or the audit
     // log, whether or not tmux is reachable in the test env.
     let dir = std::env::temp_dir().join("t-hub-gate-read");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("read").with_audit(Arc::new(AuditLog::new(dir.clone())));
     let _ = dispatch_authenticated(&ctx, req("read", "list_terminals", json!({})));
     assert!(
         read_audit(&dir).is_empty(),
         "a read-tier command was audited"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
@@ -21783,7 +21906,7 @@ fn send_text_is_audited_with_redaction_through_gate() {
     // send_text is process-changing (audited) but NOT rate-limited. The literal
     // text must never reach the audit log - only a length + hash.
     let dir = std::env::temp_dir().join("t-hub-gate-sendtext");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("st").with_audit(Arc::new(AuditLog::new(dir.clone())));
     let resp = dispatch_authenticated(
         &ctx,
@@ -21798,13 +21921,15 @@ fn send_text_is_audited_with_redaction_through_gate() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0]["command"], "send_text");
     assert_eq!(recs[0]["decision"], "allowed");
+    assert_eq!(recs[0]["phase"], "authorization");
+    assert!(recs[0].get("outcome").is_none());
     let blob = serde_json::to_string(&recs[0]).unwrap();
     assert!(
         !blob.contains("SUPERSECRET"),
         "literal text leaked into audit: {blob}"
     );
     assert_eq!(recs[0]["args"]["textLen"], 11);
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
@@ -21812,12 +21937,12 @@ fn bad_token_is_rejected_and_not_audited() {
     // A bad token is rejected before the gate and never audited (no leak of the
     // process-changing surface to an unauthenticated probe).
     let dir = std::env::temp_dir().join("t-hub-gate-badtok");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("good").with_audit(Arc::new(AuditLog::new(dir.clone())));
     let resp = dispatch_authenticated(&ctx, req("WRONG", "spawn_terminal", json!({})));
     assert!(resp.error.unwrap().contains("bad control token"));
     assert!(read_audit(&dir).is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
@@ -22629,7 +22754,7 @@ fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
     // be ADMITTED and audited allowed. This is the "legit orchestration still
     // works over the exact socket" guarantee, exercised through the gate.
     let dir = std::env::temp_dir().join("t-hub-gate-e2e");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let sink = Arc::new(RecordingSink {
         calls: StdMutex::new(Vec::new()),
     });
@@ -22713,7 +22838,7 @@ fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
         !blob.contains("GATE_E2E_OK"),
         "send_text literal leaked into audit"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 // -----------------------------------------------------------------------
@@ -22773,7 +22898,7 @@ fn control_token_still_grants_full_power_backward_compat() {
 #[test]
 fn read_token_reads_but_cannot_spawn_or_kill() {
     let dir = std::env::temp_dir().join("t-hub-p2-readonly");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
 
     // Read tier: allowed (not authz-refused). May fail on tmux, but never authz.
@@ -22816,13 +22941,13 @@ fn read_token_reads_but_cannot_spawn_or_kill() {
     assert!(!recs.is_empty());
     assert!(recs.iter().all(|r| r["decision"] == "refused-authz"));
     assert!(recs.iter().all(|r| r["tokenTier"] == "read"));
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
 fn control_token_command_audits_token_tier_control() {
     let dir = std::env::temp_dir().join("t-hub-p2-ctltier");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
     // An Organization command with the control token: allowed, audited control.
     let _ = dispatch_authenticated(&ctx, req("t", "new_tab", json!({"name": "T"})));
@@ -22830,13 +22955,13 @@ fn control_token_command_audits_token_tier_control() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0]["tokenTier"], "control");
     assert_eq!(recs[0]["decision"], "allowed");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
 fn generic_control_spawn_is_refused_without_recording_a_false_elevation() {
     let dir = std::env::temp_dir().join("t-hub-item3-ctlspawn");
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
     let mut ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
     // A bound address enables stable discovery and identity minting.
     ctx.addr = "127.0.0.1:4242".to_string();
@@ -22860,7 +22985,7 @@ fn generic_control_spawn_is_refused_without_recording_a_false_elevation() {
     assert!(refused.contains("unsupported for generic Crew spawns"));
     let recs = read_audit(&dir);
     assert!(recs.iter().all(|r| r["decision"] != "control-spawn"));
-    let _ = std::fs::remove_dir_all(&dir);
+    clean_audit(&dir);
 }
 
 #[test]
@@ -23694,6 +23819,35 @@ fn my_capability_reports_the_callers_resolved_capability() {
     assert_eq!(control.result.unwrap()["capability"], "control");
     let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
     assert_eq!(read.result.unwrap()["capability"], "read");
+}
+
+#[test]
+fn audit_verify_reports_live_integrity_to_a_read_token() {
+    let dir = std::env::temp_dir().join(format!(
+        "t-hub-audit-verify-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    clean_audit(&dir);
+    let ctx = test_ctx("audit-verify").with_audit(Arc::new(AuditLog::new(dir.clone())));
+
+    let mutation = dispatch_authenticated(
+        &ctx,
+        req(
+            "audit-verify",
+            "send_text",
+            json!({"sessionId": "missing", "text": "hello", "enter": true}),
+        ),
+    );
+    assert!(!mutation.ok, "the target session is intentionally absent");
+
+    let response =
+        dispatch_authenticated(&ctx, req("read-audit-verify", "audit_verify", json!({})));
+    assert!(response.ok);
+    let report = response.result.unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["records"], 1);
+    assert_eq!(report["breaks"], json!([]));
+    clean_audit(&dir);
 }
 
 #[test]

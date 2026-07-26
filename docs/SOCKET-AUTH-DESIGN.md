@@ -186,15 +186,22 @@ Keep the bad-token message byte-for-byte identical to today (`unauthorized: bad 
 
 ## 6. Audit trail with teeth
 
-The `"audited": true` flag is currently a lie; give it a sink.
+The `"audited": true` flag requires a real enforcement-backed sink.
 
 - **What**: an append-only JSONL log at `~/.t-hub/audit/control-YYYYMMDD.jsonl` (0600), one line per Organization/Organization-destructive/ProcessChanging command AND per refusal.
-- **Fields**: `ts`, `command`, `tier`, `decision` (`allowed` | `refused-authz` | `refused-cap` | `refused-rate` | `refused-ceiling`), `sessionId`/`target`, `spawnedBy`, `peer` (`loopback` | tailnet-ip), `tokenTier` (`read` | `control`), and a **redacted** args summary. For `send_text`, log `text` length + a hash, NOT the literal content (it can carry secrets/prompts). For `send_keys`, log the key names (they are not sensitive and are exactly what we want to see for kill patterns).
+- **Fields**: `ts`, `command`, `tier`, `decision` (`allowed` | `refused-authz` | `refused-cap` | `refused-rate` | `refused-ceiling`), `phase` for pre-dispatch authorization, `sessionId`/`target`, `spawnedBy`, `peer` (`loopback` | tailnet-ip), `tokenTier` (`read` | `control`), and a **redacted** args summary.
+  For `send_text`, log `text` length + a hash, not the literal content because it can carry secrets or prompts.
+  For `send_keys`, log the key names because they are the kill-pattern signal.
 - **Teeth, concretely**:
   1. It is the **enforcement input**, not just a record - the governor's counters and the rate buckets are the same data the log captures, so "what the log says happened" and "what the gate allowed" cannot diverge.
-  2. **Tamper-evident**: chain each line with a running hash of the previous line, so a truncation or edit is detectable.
+  2. **Keyed tamper evidence**: authenticate each version 2 record and its previous-record link with HMAC-SHA256 under a persistent key stored outside the log directory.
+     Anchor each day's record count and final hash in a separately authenticated head file so tail truncation is detectable.
+     Verify the chain at startup and through the read-tier `audit_verify` command.
   3. **Live signal**: mirror refusals (and optionally spawns) onto the existing event fanout (`control.rs:999`) so the captain overlay can surface fleet pressure and denials as they happen.
-- **Where**: write from `dispatch_authenticated` after the decision, so allowed and refused paths both land. Batch/fsync to avoid per-command sync cost; a small buffered writer behind a mutex is enough at fleet command rates.
+  4. **Fail closed**: flush and sync the record and head before a ProcessChanging side effect.
+     Refuse the command and release its idempotency reservation if that durable write fails.
+- **Where**: write ProcessChanging authorization from `dispatch_authenticated` before dispatch.
+  Keep Organization records best-effort after dispatch so their downstream outcome is available.
 
 ---
 

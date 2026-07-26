@@ -2977,6 +2977,19 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     };
     write_handshake(&handshake)?;
 
+    let integrity = ctx.audit.startup_integrity_check();
+    if !integrity.ok() {
+        ctx.fanout.emit_event(
+            "control://audit",
+            &json!({
+                "event": "integrity-check-failed",
+                "breaks": integrity.breaks.len(),
+                "records": integrity.records,
+                "files": integrity.files,
+            }),
+        );
+    }
+
     // Opt-in ADDITIONAL bind for REMOTE access (server-split M2b). GATED — default
     // OFF, so the §8 loopback-only boundary holds unless explicitly enabled. When
     // set, a second listener serves the same dispatch; `handle_conn` restricts peers
@@ -5480,6 +5493,22 @@ fn audit_command(
     decision: &str,
     error: Option<&str>,
 ) {
+    if let Err(audit_error) = try_audit_command(ctx, req, tier, cap, decision, error) {
+        eprintln!(
+            "t-hub-audit: failed to write audit record for '{}': {audit_error}",
+            req.command
+        );
+    }
+}
+
+fn try_audit_command(
+    ctx: &ControlContext,
+    req: &ControlRequest,
+    tier: CommandTier,
+    cap: Capability,
+    decision: &str,
+    error: Option<&str>,
+) -> std::io::Result<()> {
     let session = req
         .args
         .get("sessionId")
@@ -5490,7 +5519,7 @@ fn audit_command(
         .get("spawnedBy")
         .or_else(|| req.args.get("spawned_by"))
         .and_then(|v| v.as_str());
-    ctx.audit.record(
+    ctx.audit.try_record(
         &req.command,
         tier.label(),
         decision,
@@ -5507,7 +5536,7 @@ fn audit_command(
             spawned_by,
             error,
         },
-    );
+    )
 }
 
 /// Resolve capability, gate + audit, then dispatch. A bad token is rejected before
@@ -5699,6 +5728,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
     }
 
+    if req.command == "audit_verify" {
+        return ControlResponse::ok(ctx.audit.verify_self().to_json());
+    }
+
     if matches!(req.command.as_str(), "spawn_terminal" | "create_worktree") {
         if let Err(error) = enforce_public_spawn_contract(
             &req.command,
@@ -5881,6 +5914,38 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             None
         };
 
+    // A process-changing command must have a durable authorization record before
+    // its side effect begins.
+    // If the keyed log, its external head, or its integrity state is unavailable,
+    // release any idempotency reservation and refuse the command.
+    if tier == CommandTier::ProcessChanging {
+        if let Err(audit_error) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
+            if let Some(id) = &request_id {
+                ctx.requests.cancel_reserved(
+                    id,
+                    request_reservation.expect("reserved id reaches audit gate"),
+                );
+            }
+            eprintln!(
+                "t-hub-audit: refusing process-changing command '{}' because the audit sink is unavailable: {audit_error}",
+                req.command
+            );
+            let message = format!(
+                "refused: audit sink unavailable; '{}' was not executed",
+                req.command
+            );
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": "refused-audit",
+                    "error": message.as_str(),
+                }),
+            );
+            return ControlResponse::err(message);
+        }
+    }
+
     // Dispatch, then record the outcome under the requestId (if any) so a later
     // retry replays exactly this result. `finish` returns the outcome back. The caller
     // identity resolved above is threaded in so the per-command ACL wiring can enforce
@@ -5922,9 +5987,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         Err(e) => ControlResponse::err(e),
     };
 
-    // Audit every Organization + ProcessChanging command on the allowed path,
-    // capturing the dispatch outcome. Read-tier commands are not audited.
-    if tier != CommandTier::Read {
+    // Organization commands remain best-effort and are recorded after dispatch so
+    // their downstream outcome is available.
+    // Process-changing authorization was durably recorded before dispatch above.
+    if tier == CommandTier::Organization {
         let err = if response.ok {
             None
         } else {
