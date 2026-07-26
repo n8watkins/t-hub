@@ -599,6 +599,7 @@ fn helper_stat_identity(stat: &[u8]) -> Result<(u32, u64), String> {
     Ok((group, started))
 }
 
+#[cfg(any(unix, test))]
 fn command_matches(actual: &[Vec<u8>], expected: &[String]) -> bool {
     actual.len() == expected.len()
         && actual
