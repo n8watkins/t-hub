@@ -10,15 +10,14 @@
 //!
 //! Each version 2 line is authenticated with HMAC-SHA256 under a persistent key
 //! stored outside the log directory.
-//! A separately authenticated head file anchors each day's count and final hash,
-//! which makes tail truncation detectable.
+//! A separately authenticated head manifest anchors every day's count and final
+//! hash, which makes tail and whole-day truncation detectable.
 //! Process-changing commands use [`AuditLog::try_record`] before dispatch and are
 //! refused when the authorization record cannot be made durable.
 //! On Windows the key is DPAPI-sealed for the current user.
 //! On Unix it is plaintext protected by mode `0600`, so a same-user attacker who
 //! can also read the key can still forge records.
-//! The per-day heads detect truncation and missing anchored files, but deleting
-//! both a whole day file and its head entry remains outside this local threat model.
+//! Removing a day from the manifest without the key invalidates the manifest MAC.
 //!
 //! `send_text` content is never written - only its length and a SHA-256 prefix -
 //! so the log cannot become a secret-harvesting oracle.
@@ -28,18 +27,20 @@
 //! The live mirror of refusals onto the event fanout lives in `control.rs` (it
 //! owns the fanout); this module owns only the durable record.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const AUDIT_FORMAT_VERSION: u64 = 2;
+const HEAD_FORMAT_VERSION: u64 = 1;
 const AUDIT_KEY_BYTES: usize = 32;
 
 fn home_dir() -> PathBuf {
@@ -295,8 +296,8 @@ impl AuditLog {
     }
 
     fn write_head(&self, key: &[u8], date: &str, count: u64, last: &str) -> std::io::Result<()> {
-        let mut map = read_head_map(&self.head_path)?;
-        map.insert(
+        let mut entries = read_head_entries(&self.head_path, key)?;
+        entries.insert(
             date.to_string(),
             json!({
                 "count": count,
@@ -304,7 +305,7 @@ impl AuditLog {
                 "mac": head_entry_mac(key, date, count, last),
             }),
         );
-        let body = serde_json::to_vec(&Value::Object(map))?;
+        let body = serde_json::to_vec(&head_anchor_value(key, &entries))?;
         write_private_atomic(&self.head_path, &body)
     }
 
@@ -496,7 +497,7 @@ pub fn verify(dir: &Path, key: &[u8]) -> VerifyReport {
 
 pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyReport {
     let mut report = VerifyReport::default();
-    let head = match read_head_map(head_path) {
+    let head = match read_head_entries(head_path, key) {
         Ok(head) => Some(head),
         Err(error) => {
             report.breaks.push(ChainBreak {
@@ -550,7 +551,7 @@ pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyRepor
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut seen_dates = std::collections::BTreeSet::new();
+    let mut seen_dates = BTreeSet::new();
     for (date, path) in files {
         seen_dates.insert(date.clone());
         report.files += 1;
@@ -574,7 +575,7 @@ pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyRepor
 fn verify_file(
     date: &str,
     path: &Path,
-    head: Option<&Map<String, Value>>,
+    head: Option<&BTreeMap<String, Value>>,
     key: &[u8],
     report: &mut VerifyReport,
 ) {
@@ -975,19 +976,62 @@ fn last_hash_and_count(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((last.unwrap_or_default(), count))
 }
 
-fn read_head_map(path: &Path) -> std::io::Result<Map<String, Value>> {
+fn read_head_entries(path: &Path, key: &[u8]) -> std::io::Result<BTreeMap<String, Value>> {
     let body = match std::fs::read_to_string(path) {
         Ok(body) => body,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(error) => return Err(error),
     };
-    match serde_json::from_str::<Value>(&body)? {
-        Value::Object(map) => Ok(map),
-        _ => Err(std::io::Error::new(
+    let anchor = serde_json::from_str::<Value>(&body)?;
+    let object = anchor.as_object().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "head anchor is not a JSON object")
+    })?;
+    if object.len() != 3 || object.get("v").and_then(Value::as_u64) != Some(HEAD_FORMAT_VERSION) {
+        return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "head anchor is not a JSON object",
-        )),
+            "head anchor has an unsupported format",
+        ));
     }
+    let entries = object
+        .get("entries")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "head anchor entries are not a JSON object",
+            )
+        })?
+        .iter()
+        .map(|(date, entry)| (date.clone(), entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let stored_mac = object.get("mac").and_then(Value::as_str).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "head anchor has no manifest MAC")
+    })?;
+    let expected_mac = head_manifest_mac(key, &entries);
+    if !ct_eq(stored_mac.as_bytes(), expected_mac.as_bytes()) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "head anchor manifest MAC does not verify",
+        ));
+    }
+    Ok(entries)
+}
+
+fn head_anchor_value(key: &[u8], entries: &BTreeMap<String, Value>) -> Value {
+    json!({
+        "v": HEAD_FORMAT_VERSION,
+        "entries": entries,
+        "mac": head_manifest_mac(key, entries),
+    })
+}
+
+fn head_manifest_mac(key: &[u8], entries: &BTreeMap<String, Value>) -> String {
+    let body = serde_json::to_vec(&json!({
+        "v": HEAD_FORMAT_VERSION,
+        "entries": entries,
+    }))
+    .expect("head manifest is serializable");
+    hex(&mac(key, &body))
 }
 
 fn head_entry_mac(key: &[u8], date: &str, count: u64, last: &str) -> String {
@@ -1253,6 +1297,88 @@ mod tests {
             "{:?}",
             report.breaks
         );
+        clean(&dir);
+    }
+
+    #[test]
+    fn whole_day_removal_is_detected_by_head_manifest() {
+        let dir = temp_dir("whole-day-truncation");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let mut guard = log.inner.lock().unwrap();
+        for date in ["20260724", "20260725"] {
+            log.record_locked(
+                &mut guard,
+                TEST_KEY,
+                date,
+                &format!("{date}T00:00:00Z"),
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": date}),
+                meta(),
+            )
+            .unwrap();
+        }
+        drop(guard);
+
+        std::fs::remove_file(dir.join("control-20260725.jsonl")).unwrap();
+        let head_path = head_path_for(&dir);
+        let mut head: Value =
+            serde_json::from_str(&std::fs::read_to_string(&head_path).unwrap()).unwrap();
+        head["entries"].as_object_mut().unwrap().remove("20260725");
+        std::fs::write(&head_path, serde_json::to_vec(&head).unwrap()).unwrap();
+
+        let report = verify(&dir, TEST_KEY);
+        assert!(report
+            .breaks
+            .iter()
+            .any(|audit_break| audit_break.kind == BreakKind::HeadTampered));
+        clean(&dir);
+    }
+
+    #[test]
+    fn live_write_rejects_a_modified_head_manifest() {
+        let dir = temp_dir("live-manifest-tamper");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let mut guard = log.inner.lock().unwrap();
+        for date in ["20260724", "20260725"] {
+            log.record_locked(
+                &mut guard,
+                TEST_KEY,
+                date,
+                &format!("{date}T00:00:00Z"),
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": date}),
+                meta(),
+            )
+            .unwrap();
+        }
+
+        let head_path = head_path_for(&dir);
+        let mut head: Value =
+            serde_json::from_str(&std::fs::read_to_string(&head_path).unwrap()).unwrap();
+        head["entries"].as_object_mut().unwrap().remove("20260724");
+        std::fs::write(&head_path, serde_json::to_vec(&head).unwrap()).unwrap();
+
+        let error = log
+            .record_locked(
+                &mut guard,
+                TEST_KEY,
+                "20260725",
+                "20260725T00:00:01Z",
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "second"}),
+                meta(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("manifest MAC"));
+        drop(guard);
         clean(&dir);
     }
 

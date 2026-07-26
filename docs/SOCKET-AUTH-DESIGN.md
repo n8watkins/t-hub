@@ -195,7 +195,7 @@ The `"audited": true` flag requires a real enforcement-backed sink.
 - **Teeth, concretely**:
   1. It is the **enforcement input**, not just a record - the governor's counters and the rate buckets are the same data the log captures, so "what the log says happened" and "what the gate allowed" cannot diverge.
   2. **Keyed tamper evidence**: authenticate each version 2 record and its previous-record link with HMAC-SHA256 under a persistent key stored outside the log directory.
-     Anchor each day's record count and final hash in a separately authenticated head file so tail truncation is detectable.
+     Anchor every day's record count and final hash in one separately authenticated head manifest so tail and whole-day truncation are detectable.
      Verify the chain at startup and through the read-tier `audit_verify` command.
   3. **Live signal**: mirror refusals (and optionally spawns) onto the existing event fanout (`control.rs:999`) so the captain overlay can surface fleet pressure and denials as they happen.
   4. **Fail closed**: flush and sync the record and head before a ProcessChanging side effect.
