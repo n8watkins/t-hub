@@ -1362,7 +1362,12 @@ for index in range(64):
         time.sleep(30)
         os._exit(0)
     children.append(child)
-open(sys.argv[1], 'w').write(' '.join(str(pid) for pid in children))
+temporary = sys.argv[1] + '.tmp'
+with open(temporary, 'w') as ready:
+    ready.write(' '.join(str(pid) for pid in children))
+    ready.flush()
+    os.fsync(ready.fileno())
+os.replace(temporary, sys.argv[1])
 while True:
     time.sleep(1)"#;
         let prepared = prepare_supervised_preview_command(
