@@ -395,7 +395,7 @@ impl AuditLog {
         self.write_pending_commit(key, &pending)?;
 
         if let Some(path) = opening_path {
-            std::fs::create_dir_all(&self.dir)?;
+            create_dir_all_durable(&self.dir)?;
             let file = open_private_append(&path)?;
             guard.writer = Some((date.to_string(), BufWriter::new(file)));
         }
@@ -1566,7 +1566,7 @@ fn recover_record_append(path: &Path, line: &str) -> std::io::Result<()> {
     }
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
     }
     let mut file = open_private_append(path)?;
     file.set_len(complete_len as u64)?;
@@ -1764,7 +1764,7 @@ fn open_private_append(path: &Path) -> std::io::Result<File> {
 
 fn write_private_create_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    create_dir_all_durable(parent)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1781,7 +1781,7 @@ fn write_private_create_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
 
 fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    create_dir_all_durable(parent)?;
     let temp = path.with_extension(format!(
         "tmp.{}.{}",
         std::process::id(),
@@ -1802,6 +1802,40 @@ fn remove_durable(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => sync_parent(path.parent().unwrap_or_else(|| Path::new("."))),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent != path {
+        create_dir_all_durable(parent)?;
+    }
+
+    match std::fs::create_dir(path) {
+        Ok(()) => sync_parent(parent),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if std::fs::metadata(path)?.is_dir() {
+                sync_parent(parent)
+            } else {
+                Err(error)
+            }
+        }
         Err(error) => Err(error),
     }
 }
@@ -2998,6 +3032,19 @@ mod tests {
             );
         }
         clean(&dir);
+    }
+
+    #[test]
+    fn persistent_key_creation_durably_creates_nested_directories() {
+        let root = temp_dir("durable-nested-directory");
+        clean(&root);
+        let path = root.join("profile").join("state").join("audit-hmac-key");
+
+        let state = load_or_create_audit_key(&path, Some(TEST_KEY)).unwrap();
+
+        assert_eq!(state.key, TEST_KEY);
+        assert!(path.is_file());
+        clean(&root);
     }
 
     #[test]
