@@ -34,11 +34,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -157,10 +158,10 @@ struct AuditFileStamp {
     modified: Option<std::time::SystemTime>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct VerifiedAuditFile {
     stamp: AuditFileStamp,
-    content_hash: [u8; 32],
+    content_hasher: Sha256,
 }
 
 impl AuditFileStamp {
@@ -459,19 +460,26 @@ impl AuditLog {
             guard.writer = Some((date.to_string(), BufWriter::new(file)));
         }
         let (_, writer) = guard.writer.as_mut().expect("writer opened above");
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-        let writer_stamp = audit_file_stamp_for_file(writer.get_ref())?;
-        let path_stamp = audit_file_stamp(&path)?;
-        let verified_file = validate_append_transition(
-            previous_stamp.as_ref(),
-            &writer_stamp,
-            &path_stamp,
-            &path,
-            format!("{line}\n").as_bytes(),
-        )?;
+        writer.get_ref().try_lock_exclusive()?;
+        let append_result = (|| {
+            validate_pre_append_state(previous_stamp.as_ref(), writer.get_ref(), &path)?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            writer.get_ref().sync_data()?;
+            let writer_stamp = audit_file_stamp_for_file(writer.get_ref())?;
+            let path_stamp = audit_file_stamp(&path)?;
+            validate_append_transition(
+                previous_stamp.as_ref(),
+                &writer_stamp,
+                &path_stamp,
+                &path,
+                format!("{line}\n").as_bytes(),
+            )
+        })();
+        let unlock_result = FileExt::unlock(writer.get_ref());
+        let verified_file = append_result?;
+        unlock_result?;
 
         write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
         self.store_checkpoint(guard, pending.checkpoint)?;
@@ -908,7 +916,7 @@ fn verified_audit_file(path: &Path) -> std::io::Result<VerifiedAuditFile> {
             "audit file changed while capturing authenticated content",
         ));
     }
-    let content_hash = hash_reader(&mut file)?;
+    let content_hasher = hash_reader(&mut file)?;
     let file_stamp_after = audit_file_stamp_for_file(&file)?;
     let path_stamp_after = audit_file_stamp(path)?;
     if file_stamp_after != file_stamp_before || path_stamp_after != file_stamp_before {
@@ -919,17 +927,17 @@ fn verified_audit_file(path: &Path) -> std::io::Result<VerifiedAuditFile> {
     }
     Ok(VerifiedAuditFile {
         stamp: file_stamp_after,
-        content_hash,
+        content_hasher,
     })
 }
 
-fn hash_reader(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
+fn hash_reader(reader: &mut impl Read) -> std::io::Result<Sha256> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
-            return Ok(hasher.finalize().into());
+            return Ok(hasher);
         }
         hasher.update(&buffer[..read]);
     }
@@ -1065,30 +1073,7 @@ fn validate_append_transition(
         ));
     }
     let previous_len = previous.map_or(0, |previous| previous.stamp.len);
-    let mut prefix_hasher = Sha256::new();
-    let mut remaining = previous_len;
-    let mut buffer = [0_u8; 64 * 1024];
-    while remaining > 0 {
-        let limit = usize::try_from(remaining.min(buffer.len() as u64))
-            .expect("bounded audit read size fits usize");
-        let read = file.read(&mut buffer[..limit])?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "live audit file ended inside its authenticated prefix",
-            ));
-        }
-        prefix_hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    let mut full_hasher = prefix_hasher.clone();
-    let prefix_hash: [u8; 32] = prefix_hasher.finalize().into();
-    if previous.is_some_and(|previous| previous.content_hash != prefix_hash) {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "live audit file authenticated prefix changed before append",
-        ));
-    }
+    file.seek(SeekFrom::Start(previous_len))?;
     let mut actual_append = vec![0_u8; appended.len()];
     file.read_exact(&mut actual_append)?;
     if actual_append != appended {
@@ -1104,7 +1089,10 @@ fn validate_append_transition(
             "live audit file contains data after the expected append",
         ));
     }
-    full_hasher.update(appended);
+    let mut content_hasher = previous
+        .map(|previous| previous.content_hasher.clone())
+        .unwrap_or_default();
+    content_hasher.update(appended);
     let file_stamp_after = audit_file_stamp_for_file(&file)?;
     let path_stamp_after = audit_file_stamp(audit_path)?;
     if file_stamp_after != *writer || path_stamp_after != *writer {
@@ -1115,8 +1103,28 @@ fn validate_append_transition(
     }
     Ok(VerifiedAuditFile {
         stamp: file_stamp_after,
-        content_hash: full_hasher.finalize().into(),
+        content_hasher,
     })
+}
+
+fn validate_pre_append_state(
+    previous: Option<&VerifiedAuditFile>,
+    writer: &File,
+    audit_path: &Path,
+) -> std::io::Result<()> {
+    let writer_stamp = audit_file_stamp_for_file(writer)?;
+    let path_stamp = audit_file_stamp(audit_path)?;
+    let valid = previous.map_or_else(
+        || writer_stamp.len == 0 && path_stamp == writer_stamp,
+        |previous| writer_stamp == previous.stamp && path_stamp == previous.stamp,
+    );
+    if !valid {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file changed before append",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +1798,8 @@ fn recover_record_append(path: &Path, line: &str) -> std::io::Result<()> {
     let mut complete_line = line.as_bytes().to_vec();
     complete_line.push(b'\n');
     if content.ends_with(&complete_line) {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.sync_data()?;
         return Ok(());
     }
 
@@ -2197,7 +2207,10 @@ fn set_owner_only(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::metadata(path)?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -2983,7 +2996,11 @@ mod tests {
             &path,
             b"second\n",
         )
-        .is_ok());
+        .is_ok_and(|verified| {
+            let actual: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+            let cached: [u8; 32] = verified.content_hasher.finalize().into();
+            cached == actual
+        }));
         drop(writer);
 
         std::fs::rename(&path, dir.join("displaced.jsonl")).unwrap();
@@ -3011,20 +3028,9 @@ mod tests {
         let previous = verified_audit_file(&path).unwrap();
 
         std::fs::write(&path, b"other\n").unwrap();
-        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
-        writer.write_all(b"second\n").unwrap();
-        writer.sync_data().unwrap();
-        let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
-
-        let error = validate_append_transition(
-            Some(&previous),
-            &writer_stamp,
-            &audit_file_stamp(&path).unwrap(),
-            &path,
-            b"second\n",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("authenticated prefix changed"));
+        let writer = OpenOptions::new().append(true).open(&path).unwrap();
+        let error = validate_pre_append_state(Some(&previous), &writer, &path).unwrap_err();
+        assert!(error.to_string().contains("changed before append"));
         clean(&dir);
     }
 
