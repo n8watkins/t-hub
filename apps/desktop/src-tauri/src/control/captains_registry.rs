@@ -1666,6 +1666,47 @@ impl CaptainsRegistry {
             .collect()
     }
 
+    /// Remove persisted ordinary terminal placements that are definitively gone
+    /// before the workspace projection becomes authoritative for a new app run.
+    /// Fleet-managed tiles remain governed by their claim and recovery state
+    /// machines, even when their current tmux runtime is absent.
+    pub fn prune_gone_unmanaged_workspace_tiles(
+        &self,
+        is_live: impl Fn(&str) -> bool,
+    ) -> Result<Vec<String>, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let previous = current.clone();
+        let managed_tiles = current
+            .captains
+            .iter()
+            .flat_map(|captain| {
+                captain
+                    .terminal_id
+                    .iter()
+                    .chain(captain.crew.iter().map(|crew| &crew.terminal_id))
+            })
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut pruned = Vec::new();
+        let mut seen_pruned = std::collections::HashSet::new();
+        for workspace in &mut current.workspaces {
+            workspace.tile_ids.retain(|tile| {
+                let keep = managed_tiles.contains(tile) || is_live(tile);
+                if !keep && seen_pruned.insert(tile.clone()) {
+                    pruned.push(tile.clone());
+                }
+                keep
+            });
+        }
+        if pruned.is_empty() {
+            return Ok(pruned);
+        }
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(pruned)
+    }
+
     pub(super) fn create_workspace(
         &self,
         id: &str,

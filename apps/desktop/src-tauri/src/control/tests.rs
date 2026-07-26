@@ -5971,6 +5971,70 @@ fn force_close_with_ambiguous_rehome_persists_needs_assignment_and_rolls_back_on
 }
 
 #[test]
+fn startup_prune_removes_gone_unmanaged_tiles_before_workspace_projection() {
+    let path = captains_tmp("startup-workspace-tile-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .adopt_unowned_workspace_projection(&[
+            TabRecord {
+                id: "work-a".into(),
+                name: "Work A".into(),
+                tile_ids: vec!["live-a".into(), "gone-a".into()],
+            },
+            TabRecord {
+                id: "work-b".into(),
+                name: "Work B".into(),
+                tile_ids: vec!["gone-b".into()],
+            },
+        ])
+        .unwrap();
+
+    let before = serde_json::to_value(registry.snapshot()).unwrap();
+    registry.fail_next_persist("startup workspace prune persistence failure");
+    let error = registry
+        .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
+        .unwrap_err();
+    assert!(error.contains("startup workspace prune persistence failure"));
+    assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
+
+    assert_eq!(
+        registry
+            .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
+            .unwrap(),
+        vec!["gone-a".to_string(), "gone-b".to_string()]
+    );
+    let committed_seq = registry.snapshot().seq;
+    assert!(registry
+        .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
+        .unwrap()
+        .is_empty());
+    assert_eq!(registry.snapshot().seq, committed_seq);
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let tabs = TabRegistry::new();
+    tabs.replace(restarted.workspace_projection());
+    let projection = tabs.snapshot();
+    assert_eq!(
+        projection
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .tile_ids,
+        vec!["live-a"]
+    );
+    assert!(projection
+        .iter()
+        .find(|workspace| workspace.id == "work-b")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn prune_tab_drops_the_tab_but_keeps_the_claim() {
     let reg = CaptainsRegistry::new();
     reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()])

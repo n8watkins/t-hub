@@ -741,6 +741,37 @@ pub fn run() {
             // app restarts.
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Reconcile ordinary workspace placements against one definitive
+            // tmux snapshot before the durable projection becomes authoritative.
+            // An unavailable tmux server is indeterminate, so preserve every
+            // placement and let the next restart retry instead of guessing.
+            let startup_live_sessions = tmux::list_sessions();
+            match startup_live_sessions.as_ref() {
+                Ok(sessions) => {
+                    let live = sessions
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>();
+                    match captains_registry.prune_gone_unmanaged_workspace_tiles(|tile| {
+                        live.contains(&tmux::target_for_id(tile))
+                    }) {
+                        Ok(pruned) if !pruned.is_empty() => eprintln!(
+                            "t-hub-workspaces: load-time prune removed {} gone terminal placement{}",
+                            pruned.len(),
+                            if pruned.len() == 1 { "" } else { "s" }
+                        ),
+                        Err(error) => eprintln!(
+                            "t-hub-workspaces: load-time prune was rolled back after \
+                             persistence failed: {error}"
+                        ),
+                        _ => {}
+                    }
+                }
+                Err(error) => eprintln!(
+                    "t-hub-workspaces: load-time prune SKIPPED because the tmux session list \
+                     is unavailable: {error}"
+                ),
+            }
             // Fleet Workspace identity is durable in the same registry as its
             // Captain/Assignment owner. TabRegistry is only the live projection
             // cache and is seeded before the listener or UI can call list_tabs.
@@ -776,15 +807,16 @@ pub fn run() {
             // site that both owns the store and can supply the tmux predicate; the
             // store stays tmux-free + unit-testable.
             //
-            // Snapshot the identity generation before the asynchronous liveness
-            // read. The compare-and-prune step keeps identities minted or rebound
-            // while this background task is running.
+            // Snapshot the identity generation before the background prune.
+            // The compare-and-prune step keeps identities minted or rebound while
+            // this background task is running.
             {
                 let prune_generation = identity_store.prune_generation();
                 let identity_store = identity_store.clone();
+                let live_sessions = startup_live_sessions;
                 std::thread::Builder::new()
                     .name("t-hub-identity-prune".into())
-                    .spawn(move || match tmux::list_sessions() {
+                    .spawn(move || match live_sessions {
                         Ok(live) => {
                             let live: std::collections::HashSet<String> =
                                 live.into_iter().collect();
