@@ -29,10 +29,12 @@ use serde_json::Value;
 /// finish within this wall-clock budget.
 const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
+const CORTANA_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
+        "reconcile_cortana" => CORTANA_RECONCILIATION_TIMEOUT,
+        "commission_captain" | "dispatch_crew" | "history_list" | "history_resume"
         | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
@@ -3205,7 +3207,7 @@ mod tests {
         );
         assert_eq!(
             response_timeout_for_command("history_list"),
-            CONTROL_DEADLINE
+            LONG_ORCHESTRATION_TIMEOUT
         );
         assert!(timeout_message("history_resume", 1, "read").contains("120s"));
         let pending = pending_request_message(

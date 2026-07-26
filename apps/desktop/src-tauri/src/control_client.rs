@@ -45,15 +45,20 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This bounds memory, parsing work, and any structured error derived from a peer.
 const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Commissioning, dispatch, and Cortana recovery cross bounded git, tmux, and
-/// harness-start operations. Their response window must outlive the server's
+/// Commissioning, dispatch, and History scans cross bounded git, tmux, Harness,
+/// and WSL transcript operations. Their response window must outlive the server's
 /// normal request phase so the client receives the authoritative result instead
-/// of abandoning a mutation that is still running.
+/// of abandoning work that is still running.
 const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Cortana reconciliation may perform multiple exact ownership transitions.
+/// Keep its single request alive past the server's bounded WSL probes so the
+/// frontend does not reissue the same id while the first operation is in flight.
+const CORTANA_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
-        "commission_captain" | "dispatch_crew" | "history_resume" | "reconcile_cortana"
+        "reconcile_cortana" => CORTANA_RECONCILIATION_TIMEOUT,
+        "commission_captain" | "dispatch_crew" | "history_list" | "history_resume"
         | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
@@ -941,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn commissioning_gets_a_longer_response_window_without_widening_normal_reads() {
+    fn slow_bounded_commands_get_specific_response_windows_without_widening_normal_reads() {
         assert_eq!(response_timeout_for_command("list_tabs"), CONTROL_DEADLINE);
         assert_eq!(
             response_timeout_for_command("codex_usage"),
@@ -958,6 +963,10 @@ mod tests {
         );
         assert_eq!(
             response_timeout_for_command("reconcile_cortana"),
+            CORTANA_RECONCILIATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("history_list"),
             LONG_ORCHESTRATION_TIMEOUT
         );
         assert_eq!(
