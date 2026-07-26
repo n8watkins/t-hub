@@ -42,7 +42,7 @@ import {
   useCodexUsage,
 } from "./UsageStrip";
 import { useMemo, useState } from "react";
-import { LayoutGrid } from "lucide-react";
+import { LayoutGrid, Trash2 } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
@@ -163,6 +163,11 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
   const workspaceCount = useWorkspace(
     (s) => s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length,
   );
+  const closableEmptyWorkspaceCount = useWorkspace((s) => {
+    const workspaces = s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID);
+    const emptyCount = workspaces.filter((t) => t.order.length === 0).length;
+    return Math.min(emptyCount, Math.max(0, workspaces.length - 1));
+  });
   const [historyCount, setHistoryCount] = useState(0);
   // Pinned captains drive the Captains section; zero pins = no section at all
   // (the titlebar anchor's tooltip explains how to pin).
@@ -249,15 +254,34 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
             ) : undefined
           }
           action={
-            <button
-              type="button"
-              onClick={() => useWorkspace.getState().addTab()}
-              aria-label="New workspace"
-              title="New workspace"
-              className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
-            >
-              <PlusIcon />
-            </button>
+            <div className="flex items-center gap-0.5">
+              {closableEmptyWorkspaceCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    useWorkspace.getState().closeEmptyWorkspaces()
+                  }
+                  aria-label={`Close ${closableEmptyWorkspaceCount} empty workspace${
+                    closableEmptyWorkspaceCount === 1 ? "" : "s"
+                  }`}
+                  title={`Close ${closableEmptyWorkspaceCount} empty workspace${
+                    closableEmptyWorkspaceCount === 1 ? "" : "s"
+                  }`}
+                  className="flex h-6 w-6 items-center justify-center rounded text-neutral-400 transition-colors hover:bg-red-600/30 hover:text-white"
+                >
+                  <Trash2 size={13} aria-hidden />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => useWorkspace.getState().addTab()}
+                aria-label="New workspace"
+                title="New workspace"
+                className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+              >
+                <PlusIcon />
+              </button>
+            </div>
           }
         >
           <WorkspacesList />

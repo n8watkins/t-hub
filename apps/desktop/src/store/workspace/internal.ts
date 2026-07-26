@@ -374,6 +374,10 @@ export interface WorkspaceState {
    *  immediately. PRESERVES sessions on switch (setActiveTab) and pop-out
    *  (popOutTab) — those never call this. No-op on the last tab (mirrors closeTab). */
   closeWorkspace: (id: string) => void;
+  /** Close every empty work workspace that can be removed while preserving at
+   *  least one work workspace. Never kills or detaches a terminal because only
+   *  tabs with an empty order qualify. Returns the closed tab IDs. */
+  closeEmptyWorkspaces: () => string[];
   /** Activate a tab (moves focus onto one of its tiles). */
   setActiveTab: (id: string) => void;
   /** Activate the tab at strip index `i` (0-based); no-op if out of range. */
