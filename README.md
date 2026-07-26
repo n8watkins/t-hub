@@ -10,6 +10,9 @@ Powder is retired from active product flows.
 Legacy Powder registry fields remain readable as inert compatibility data.
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell with an xterm.js tile grid (Fit + WebGL + Search + Unicode 11), deterministic insertion/focus, and durable layout/workspace persistence.
+  On startup, workspace placements are reconciled against live T-Hub tmux sessions so stale tiles do not return after an app, WSL, or computer restart.
+  The Workspaces header offers a trash action only when empty workspaces can be closed safely; it never kills or detaches a session and always preserves at least one work workspace.
+  History remains visible below the independently scrolling workspace list so active and resumable conversations stay available.
 - **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
 - **Agent supervision:** a `t-hub-agent` sidecar + Claude Code hooks feed a journal/statusline spine — context + cost readout, autocontinue, supervision tree. Hooks install consent-gated from **Settings → Hooks** and self-heal on startup.
 - **Git worktree workflow:** `Ctrl+B w` creates a worktree tab from a branch name (with a repo picker when the focused tile isn't in a repo), landing it as a sibling `<repo>-worktrees/<branch>`; `Ctrl+B c` opens a plain tab and `Ctrl+B l` lists/re-opens existing worktrees.

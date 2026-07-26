@@ -202,7 +202,8 @@ surfaces tool-level failures to the model.
 ### The authoritative tab registry (#22, headless-org)
 
 For any headless tab operation to work - discover a tab id, `move_tile` a terminal into it, `focus_tab` a known id, or place a `create_worktree`/`spawn_terminal` tile in a tab named by the caller - tabs must be **addressable** over the control API, and the operation must survive the target tab being hidden or the window being minimized.
-The core therefore owns the tab organization in an in-memory **tab registry** (`control::TabRegistry`: a monotonic revision `seq`, the mirrored `activeTabId`, and one `{id, name, tileIds}` record per tab).
+The core owns durable Fleet Workspace organization in `control::CaptainsRegistry`.
+The in-memory `control::TabRegistry` is its live projection cache, with a monotonic revision `seq`, the mirrored `activeTabId`, and one `{id, name, tileIds}` record per tab.
 The SERVER is the source of truth for organization:
 
 - Every organization mutation applies to the registry FIRST (an invalid target is a hard error, never a silent accept-then-lose), then the command forwards the full registry snapshot to the UI under `args.sync` on `control://apply`.
@@ -218,8 +219,10 @@ The SERVER is the source of truth for organization:
 An auto-created tab (from `tabName` placement) that becomes empty is NOT reaped implicitly - an agent staging a workspace may empty and refill it - so closing is always an explicit `close_tab`.
 `close_tab` refuses the last tab, and refuses a non-empty tab unless `force: true`; a force-closed tab's still-live sessions are re-adopted into the active tab by the UI reconciler, never orphaned.
 
-The registry is still in-memory, per app run; the frontend persists layout for restarts and seeds the registry with its first report.
-Full workspace-tab persistence remains the PRD §8 snapshot track and out of scope here.
+Fleet Workspaces are persisted with the Captains registry.
+Before the live tab projection is seeded on startup, persisted terminal placements are checked against one definitive tmux session listing and definitively gone placements are pruned.
+If tmux liveness is unavailable, startup preserves every placement rather than guessing.
+The frontend still reports user-originated layout changes, but it does not replace the reconciled startup projection with stale local terminal placements.
 
 ### The authoritative captains registry (captain-chat phase 2)
 
@@ -236,7 +239,9 @@ The contract mirrors the tab registry, with one difference (it is **persistent**
   A supervisor request that tries to link Crew, launch a provider command, or consume reserved Crew capacity is refused before the governor or any filesystem/process side effect.
   `start_agent` is the only public Crew assignment transaction and records the Captain relationship together with the exact baseline, lane claims, dependency evidence, collision preflight, and durable Starting state.
 - **Lifecycle cleanup is server-side.** `close_terminal` drops the dead session from the registry - a captain's death releases its claim, a crewmate's death leaves every crew list. `close_tab` prunes the closed tab from every captain's `workspaceTabIds` (the claim survives; a captain can control zero tabs). Each cleanup forwards a `sync_captains` snapshot.
-- **Survives restarts.** Unlike tabs (which the frontend re-seeds on boot), the captains registry is written through to `~/.t-hub/captains.json` (override `T_HUB_CAPTAINS_FILE`; the dev build isolates it under `~/.t-hub-dev`) on every mutation, including the revision, and reloaded on launch. localStorage keeps only view state (overlay geometry, MRU order). A missing or corrupt file starts empty and heals on the first write.
+- **Survives restarts.** Captain claims and Fleet Workspaces are written through to `~/.t-hub/captains.json` (override `T_HUB_CAPTAINS_FILE`; the dev build isolates it under `~/.t-hub-dev`) on every mutation, including the revision, and reloaded on launch.
+  localStorage keeps only view state (overlay geometry and MRU order).
+  A missing or corrupt file starts empty and heals on the first write.
 
 At boot the UI fetches `list_captains` and adds live commissioned Captains to the overlay without turning unrelated local overlay pins into claims.
 
