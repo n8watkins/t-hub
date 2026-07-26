@@ -37,6 +37,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
@@ -48,7 +49,9 @@ const AUDIT_FORMAT_VERSION: u64 = 2;
 const HEAD_FORMAT_VERSION: u64 = 2;
 const LEGACY_HEAD_FORMAT_VERSION: u64 = 1;
 const KEY_STATE_FORMAT_VERSION: u64 = 1;
+const COMMIT_JOURNAL_FORMAT_VERSION: u64 = 1;
 const AUDIT_KEY_BYTES: usize = 32;
+const VERIFY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -72,6 +75,9 @@ pub fn audit_key_path() -> PathBuf {
     if let Ok(path) = std::env::var("T_HUB_AUDIT_KEY_FILE") {
         return PathBuf::from(path);
     }
+    if std::env::var_os("T_HUB_AUDIT_DIR").is_some() {
+        return key_path_for(&audit_dir());
+    }
     home_dir().join(".t-hub").join("audit-hmac-key")
 }
 
@@ -83,9 +89,23 @@ fn key_path_for(dir: &Path) -> PathBuf {
     dir.with_extension("key.json")
 }
 
+fn journal_path_for(key_path: &Path) -> PathBuf {
+    key_path.with_extension("txn.json")
+}
+
 #[cfg(test)]
 pub(crate) fn head_path_for_test(dir: &Path) -> PathBuf {
     head_path_for(dir)
+}
+
+#[cfg(test)]
+pub(crate) fn key_path_for_test(dir: &Path) -> PathBuf {
+    key_path_for(dir)
+}
+
+#[cfg(test)]
+pub(crate) fn journal_path_for_test(dir: &Path) -> PathBuf {
+    journal_path_for(&key_path_for(dir))
 }
 
 /// The append-only audit sink.
@@ -95,6 +115,7 @@ pub struct AuditLog {
     dir: PathBuf,
     head_path: PathBuf,
     key_path: PathBuf,
+    journal_path: PathBuf,
     provided_key: Option<Vec<u8>>,
     inner: Mutex<Inner>,
 }
@@ -105,6 +126,7 @@ struct Inner {
     count: u64,
     key_state: Option<Result<KeyState, String>>,
     poisoned: Option<String>,
+    verification_cache: Option<(Instant, VerifyReport)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +148,13 @@ struct HeadAnchor {
     manifest_mac: String,
 }
 
+struct PendingCommit {
+    previous_checkpoint: Option<HeadCheckpoint>,
+    checkpoint: HeadCheckpoint,
+    record: Option<(String, String)>,
+    head: Value,
+}
+
 impl AuditLog {
     /// Build a log rooted at `dir` with an ephemeral key.
     /// Tests and isolated callers that need restart verification should use
@@ -137,8 +166,10 @@ impl AuditLog {
     /// Build a log rooted at `dir` with an explicit key.
     pub fn with_key(dir: PathBuf, key: Vec<u8>) -> Self {
         let head_path = head_path_for(&dir);
+        let key_path = key_path_for(&dir);
         Self {
-            key_path: key_path_for(&dir),
+            journal_path: journal_path_for(&key_path),
+            key_path,
             dir,
             head_path,
             provided_key: Some(key),
@@ -148,6 +179,7 @@ impl AuditLog {
                 count: 0,
                 key_state: None,
                 poisoned: None,
+                verification_cache: None,
             }),
         }
     }
@@ -156,10 +188,12 @@ impl AuditLog {
     /// Key loading is delayed until verification or the first write.
     pub fn from_env() -> Self {
         let dir = audit_dir();
+        let key_path = audit_key_path();
         Self {
             head_path: head_path_for(&dir),
             dir,
-            key_path: audit_key_path(),
+            journal_path: journal_path_for(&key_path),
+            key_path,
             provided_key: None,
             inner: Mutex::new(Inner {
                 writer: None,
@@ -167,6 +201,7 @@ impl AuditLog {
                 count: 0,
                 key_state: None,
                 poisoned: None,
+                verification_cache: None,
             }),
         }
     }
@@ -217,6 +252,10 @@ impl AuditLog {
                 return Err(error);
             }
         };
+        if let Err(error) = self.recover_pending_commit(&mut guard, &key) {
+            guard.poisoned = Some(error.to_string());
+            return Err(error);
+        }
 
         let result = self.record_locked(
             &mut guard, &key, &date, &ts, command, tier, decision, args, meta,
@@ -315,17 +354,23 @@ impl AuditLog {
         record["hash"] = json!(hash);
         let line = serde_json::to_string(&record)?;
 
+        let count = guard.count + 1;
+        let pending =
+            self.prepare_commit(key, self.checkpoint_for(guard), date, count, &hash, &line)?;
+        self.write_pending_commit(key, &pending)?;
+
         let (_, writer) = guard.writer.as_mut().expect("writer opened above");
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
 
-        let count = guard.count + 1;
-        let checkpoint = self.write_head(key, self.checkpoint_for(guard), date, count, &hash)?;
-        self.store_checkpoint(guard, checkpoint)?;
+        write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
+        self.store_checkpoint(guard, pending.checkpoint)?;
+        remove_durable(&self.journal_path)?;
         guard.count = count;
         guard.prev_hash = hash;
+        guard.verification_cache = None;
         Ok(())
     }
 
@@ -375,14 +420,15 @@ impl AuditLog {
         Ok(())
     }
 
-    fn write_head(
+    fn prepare_commit(
         &self,
         key: &[u8],
         checkpoint: Option<&HeadCheckpoint>,
         date: &str,
         count: u64,
         last: &str,
-    ) -> std::io::Result<HeadCheckpoint> {
+        line: &str,
+    ) -> std::io::Result<PendingCommit> {
         let anchor = read_head_anchor(&self.head_path, key)?;
         validate_checkpoint(anchor.as_ref(), checkpoint)?;
         let mut entries = anchor
@@ -400,7 +446,55 @@ impl AuditLog {
         let generation = checkpoint
             .map(|checkpoint| checkpoint.generation + 1)
             .unwrap_or(1);
-        self.write_manifest(key, generation, &entries)
+        let head = head_anchor_value(key, generation, &entries);
+        let manifest_mac = head["mac"]
+            .as_str()
+            .expect("head manifest MAC is a string")
+            .to_string();
+        Ok(PendingCommit {
+            previous_checkpoint: checkpoint.cloned(),
+            checkpoint: HeadCheckpoint {
+                generation,
+                manifest_mac,
+            },
+            record: Some((date.to_string(), line.to_string())),
+            head,
+        })
+    }
+
+    fn write_pending_commit(&self, key: &[u8], pending: &PendingCommit) -> std::io::Result<()> {
+        let value = pending_commit_value(key, pending);
+        write_private_atomic(&self.journal_path, &serde_json::to_vec(&value)?)
+    }
+
+    fn recover_pending_commit(&self, guard: &mut Inner, key: &[u8]) -> std::io::Result<()> {
+        let pending = match read_pending_commit(&self.journal_path, key)? {
+            Some(pending) => pending,
+            None => return Ok(()),
+        };
+        let current = self.checkpoint_for(guard).cloned();
+        if current.as_ref() != pending.previous_checkpoint.as_ref()
+            && current.as_ref() != Some(&pending.checkpoint)
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "pending audit commit does not extend the protected checkpoint",
+            ));
+        }
+
+        if let Some((date, line)) = &pending.record {
+            let path = self.dir.join(format!("control-{date}.jsonl"));
+            recover_record_append(&path, line)?;
+        }
+
+        write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
+        if current.as_ref() != Some(&pending.checkpoint) {
+            self.store_checkpoint(guard, pending.checkpoint.clone())?;
+        }
+        remove_durable(&self.journal_path)?;
+        guard.writer = None;
+        guard.verification_cache = None;
+        Ok(())
     }
 
     fn initialize_checkpoint(
@@ -429,40 +523,57 @@ impl AuditLog {
             Some(anchor) => anchor.entries,
             None => legacy_manifest_entries(&self.dir, key)?,
         };
-        let checkpoint = self.write_manifest(key, 1, &entries)?;
-        self.store_checkpoint(guard, checkpoint)?;
-        Ok(None)
-    }
-
-    fn write_manifest(
-        &self,
-        key: &[u8],
-        generation: u64,
-        entries: &BTreeMap<String, Value>,
-    ) -> std::io::Result<HeadCheckpoint> {
-        let value = head_anchor_value(key, generation, entries);
-        let manifest_mac = value["mac"]
+        let head = head_anchor_value(key, 1, &entries);
+        let manifest_mac = head["mac"]
             .as_str()
             .expect("head manifest MAC is a string")
             .to_string();
-        write_private_atomic(&self.head_path, &serde_json::to_vec(&value)?)?;
-        Ok(HeadCheckpoint {
-            generation,
-            manifest_mac,
-        })
+        let pending = PendingCommit {
+            previous_checkpoint: None,
+            checkpoint: HeadCheckpoint {
+                generation: 1,
+                manifest_mac,
+            },
+            record: None,
+            head,
+        };
+        self.write_pending_commit(key, &pending)?;
+        write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
+        self.store_checkpoint(guard, pending.checkpoint)?;
+        remove_durable(&self.journal_path)?;
+        Ok(None)
     }
 
     /// Verify this audit directory and its external head with the configured key.
     pub fn verify_self(&self) -> VerifyReport {
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let report = match self.key_for(&mut guard) {
-            Ok(key) => match self.initialize_checkpoint(&mut guard, &key) {
+        self.verify_locked(&mut guard, false)
+    }
+
+    pub fn verify_self_cached(&self) -> VerifyReport {
+        let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        self.verify_locked(&mut guard, true)
+    }
+
+    fn verify_locked(&self, guard: &mut Inner, allow_cached: bool) -> VerifyReport {
+        if allow_cached {
+            if let Some((checked_at, report)) = &guard.verification_cache {
+                if checked_at.elapsed() < VERIFY_CACHE_TTL {
+                    return report.clone();
+                }
+            }
+        }
+        let report = match self.key_for(guard) {
+            Ok(key) => match self
+                .recover_pending_commit(guard, &key)
+                .and_then(|()| self.initialize_checkpoint(guard, &key))
+            {
                 Ok(Some(report)) => report,
                 Ok(None) => verify_with_checkpoint(
                     &self.dir,
                     &self.head_path,
                     &key,
-                    self.checkpoint_for(&guard),
+                    self.checkpoint_for(guard),
                 ),
                 Err(error) => VerifyReport {
                     breaks: vec![ChainBreak {
@@ -484,7 +595,9 @@ impl AuditLog {
                 ..VerifyReport::default()
             },
         };
-        if !report.ok() {
+        if report.ok() {
+            guard.verification_cache = Some((Instant::now(), report.clone()));
+        } else {
             guard.writer = None;
             guard.poisoned = Some(format!(
                 "integrity verification found {} break(s)",
@@ -579,7 +692,7 @@ fn redact_args(command: &str, args: &Value) -> Value {
 // Verification
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct VerifyReport {
     pub files: usize,
     pub records: usize,
@@ -608,7 +721,7 @@ impl VerifyReport {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ChainBreak {
     pub file: String,
     pub line: usize,
@@ -1014,6 +1127,287 @@ fn verify_head_entry(
 // Persistence and crypto helpers
 // ---------------------------------------------------------------------------
 
+fn pending_commit_body(pending: &PendingCommit) -> Value {
+    json!({
+        "v": COMMIT_JOURNAL_FORMAT_VERSION,
+        "previousCheckpoint": pending.previous_checkpoint.as_ref().map(checkpoint_value),
+        "checkpoint": checkpoint_value(&pending.checkpoint),
+        "record": pending.record.as_ref().map(|(date, line)| json!({
+            "date": date,
+            "line": line,
+        })),
+        "head": pending.head,
+    })
+}
+
+fn pending_commit_value(key: &[u8], pending: &PendingCommit) -> Value {
+    let mut body = pending_commit_body(pending);
+    let tag = hex(&mac(
+        key,
+        &serde_json::to_vec(&body).expect("pending commit is serializable"),
+    ));
+    body["mac"] = json!(tag);
+    body
+}
+
+fn read_pending_commit(path: &Path, key: &[u8]) -> std::io::Result<Option<PendingCommit>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    set_owner_only(path)?;
+    let mut value = serde_json::from_str::<Value>(&raw)?;
+    let object = value.as_object().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit commit journal is not an object",
+        )
+    })?;
+    if object.len() != 6
+        || object.get("v").and_then(Value::as_u64) != Some(COMMIT_JOURNAL_FORMAT_VERSION)
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit commit journal has an unsupported format",
+        ));
+    }
+    let stored_mac = object
+        .get("mac")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "audit commit journal has no MAC")
+        })?
+        .to_string();
+    value
+        .as_object_mut()
+        .expect("object checked above")
+        .remove("mac");
+    let expected_mac = hex(&mac(key, &serde_json::to_vec(&value)?));
+    if !ct_eq(stored_mac.as_bytes(), expected_mac.as_bytes()) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit commit journal MAC does not verify",
+        ));
+    }
+
+    let previous_checkpoint = value
+        .get("previousCheckpoint")
+        .filter(|checkpoint| !checkpoint.is_null())
+        .map(decode_plain_checkpoint)
+        .transpose()?;
+    let checkpoint = decode_plain_checkpoint(value.get("checkpoint").ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit commit journal has no checkpoint",
+        )
+    })?)?;
+    let head = value.get("head").cloned().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "audit commit journal has no head")
+    })?;
+    let anchor = decode_head_anchor_value(&head, key)?;
+    if anchor.generation != checkpoint.generation
+        || !ct_eq(
+            anchor.manifest_mac.as_bytes(),
+            checkpoint.manifest_mac.as_bytes(),
+        )
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit commit journal head does not match its checkpoint",
+        ));
+    }
+    let record = value
+        .get("record")
+        .filter(|record| !record.is_null())
+        .map(|record| {
+            let date = record
+                .get("date")
+                .and_then(Value::as_str)
+                .filter(|date| date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "audit commit journal has an invalid record date",
+                    )
+                })?
+                .to_string();
+            let line = record
+                .get("line")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "audit commit journal has no record line",
+                    )
+                })?
+                .to_string();
+            validate_pending_record(&date, &line, &anchor, key)?;
+            Ok::<_, std::io::Error>((date, line))
+        })
+        .transpose()?;
+    Ok(Some(PendingCommit {
+        previous_checkpoint,
+        checkpoint,
+        record,
+        head,
+    }))
+}
+
+fn checkpoint_value(checkpoint: &HeadCheckpoint) -> Value {
+    json!({
+        "generation": checkpoint.generation,
+        "manifestMac": checkpoint.manifest_mac,
+    })
+}
+
+fn decode_plain_checkpoint(value: &Value) -> std::io::Result<HeadCheckpoint> {
+    let object = value.as_object().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "journal checkpoint is not an object",
+        )
+    })?;
+    if object.len() != 2 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "journal checkpoint has unexpected fields",
+        ));
+    }
+    Ok(HeadCheckpoint {
+        generation: object
+            .get("generation")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "journal checkpoint has no generation",
+                )
+            })?,
+        manifest_mac: object
+            .get("manifestMac")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "journal checkpoint has no manifest MAC",
+                )
+            })?
+            .to_string(),
+    })
+}
+
+fn validate_pending_record(
+    date: &str,
+    line: &str,
+    anchor: &HeadAnchor,
+    key: &[u8],
+) -> std::io::Result<()> {
+    let mut record = serde_json::from_str::<Value>(line)?;
+    let object = record.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "pending audit record is not an object",
+        )
+    })?;
+    let stored_hash = object
+        .remove("hash")
+        .and_then(|hash| hash.as_str().map(str::to_string))
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "pending audit record has no hash")
+        })?;
+    if record.get("v").and_then(Value::as_u64) != Some(AUDIT_FORMAT_VERSION)
+        || !unhex(&stored_hash).is_some_and(|tag| {
+            verify_mac(key, &serde_json::to_vec(&record).unwrap_or_default(), &tag)
+        })
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "pending audit record MAC does not verify",
+        ));
+    }
+    let entry = anchor.entries.get(date).ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "pending audit record is absent from its head",
+        )
+    })?;
+    if entry.get("last").and_then(Value::as_str) != Some(stored_hash.as_str()) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "pending audit record does not match its head",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_record_append(path: &Path, line: &str) -> std::io::Result<()> {
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let mut complete_line = line.as_bytes().to_vec();
+    complete_line.push(b'\n');
+    if content.ends_with(&complete_line) {
+        return Ok(());
+    }
+
+    let complete_len = content
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let partial = &content[complete_len..];
+    if !line.as_bytes().starts_with(partial) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit log tail does not match the pending commit",
+        ));
+    }
+    let previous_hash = serde_json::from_str::<Value>(line)?
+        .get("prev")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let complete = &content[..complete_len];
+    let last = complete
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|candidate| !candidate.is_empty())
+        .map(|candidate| serde_json::from_slice::<Value>(candidate))
+        .transpose()?
+        .and_then(|record| {
+            record
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if last != previous_hash {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "pending audit record does not extend the durable log tail",
+        ));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.set_len(complete_len as u64)?;
+    file.write_all(&complete_line)?;
+    file.sync_data()?;
+    set_owner_only(path)?;
+    Ok(())
+}
+
 fn random_key() -> Vec<u8> {
     let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);
     key.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -1237,6 +1631,14 @@ fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     result
 }
 
+fn remove_durable(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent(path.parent().unwrap_or_else(|| Path::new("."))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent(parent: &Path) -> std::io::Result<()> {
     File::open(parent)?.sync_all()
@@ -1359,6 +1761,10 @@ fn read_head_anchor(path: &Path, key: &[u8]) -> std::io::Result<Option<HeadAncho
         Err(error) => return Err(error),
     };
     let anchor = serde_json::from_str::<Value>(&body)?;
+    decode_head_anchor_value(&anchor, key).map(Some)
+}
+
+fn decode_head_anchor_value(anchor: &Value, key: &[u8]) -> std::io::Result<HeadAnchor> {
     let object = anchor.as_object().ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "head anchor is not a JSON object")
     })?;
@@ -1406,11 +1812,11 @@ fn read_head_anchor(path: &Path, key: &[u8]) -> std::io::Result<Option<HeadAncho
             "head anchor manifest MAC does not verify",
         ));
     }
-    Ok(Some(HeadAnchor {
+    Ok(HeadAnchor {
         generation,
         entries,
         manifest_mac: stored_mac.to_string(),
-    }))
+    })
 }
 
 fn validate_checkpoint(
@@ -1552,6 +1958,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_file(head_path_for(dir));
         let _ = std::fs::remove_file(key_path_for(dir));
+        let _ = std::fs::remove_file(journal_path_for(&key_path_for(dir)));
     }
 
     fn meta() -> AuditMeta<'static> {
@@ -1965,6 +2372,139 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1]["prev"], lines[0]["hash"]);
         assert!(verify(&dir, TEST_KEY).ok());
+        clean(&dir);
+    }
+
+    #[test]
+    fn pending_commit_rolls_forward_after_each_durable_stage() {
+        let source = temp_dir("pending-source");
+        clean(&source);
+        let log = AuditLog::with_key(source.clone(), TEST_KEY.to_vec());
+        log.record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        );
+        let day_path = std::fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+            .unwrap();
+        let old_log = std::fs::read(&day_path).unwrap();
+        let old_head = std::fs::read(head_path_for(&source)).unwrap();
+        let old_key = std::fs::read(key_path_for(&source)).unwrap();
+        let old_state = decode_audit_key(
+            &key_path_for(&source),
+            std::str::from_utf8(&old_key).unwrap(),
+            Some(TEST_KEY),
+        )
+        .unwrap();
+
+        log.record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "second"}),
+            meta(),
+        );
+        let new_log = std::fs::read(&day_path).unwrap();
+        let new_head = std::fs::read(head_path_for(&source)).unwrap();
+        let new_key = std::fs::read(key_path_for(&source)).unwrap();
+        let new_state = decode_audit_key(
+            &key_path_for(&source),
+            std::str::from_utf8(&new_key).unwrap(),
+            Some(TEST_KEY),
+        )
+        .unwrap();
+        let date = day_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("control-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .unwrap()
+            .to_string();
+        let second_line = std::str::from_utf8(&new_log[old_log.len()..])
+            .unwrap()
+            .trim_end()
+            .to_string();
+        let pending = PendingCommit {
+            previous_checkpoint: old_state.checkpoint,
+            checkpoint: new_state.checkpoint.unwrap(),
+            record: Some((date, second_line.clone())),
+            head: serde_json::from_slice(&new_head).unwrap(),
+        };
+        log.write_pending_commit(TEST_KEY, &pending).unwrap();
+        let journal = std::fs::read(journal_path_for(&key_path_for(&source))).unwrap();
+        drop(log);
+
+        for (tag, staged_log, staged_head) in [
+            ("record", new_log.clone(), old_head.clone()),
+            (
+                "partial-record",
+                {
+                    let mut partial = old_log.clone();
+                    partial.extend_from_slice(&second_line.as_bytes()[..second_line.len() / 2]);
+                    partial
+                },
+                old_head.clone(),
+            ),
+            ("head", new_log.clone(), new_head.clone()),
+        ] {
+            let dir = temp_dir(tag);
+            clean(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let staged_day = dir.join(day_path.file_name().unwrap());
+            std::fs::write(&staged_day, staged_log).unwrap();
+            std::fs::write(head_path_for(&dir), staged_head).unwrap();
+            std::fs::write(key_path_for(&dir), &old_key).unwrap();
+            std::fs::write(journal_path_for(&key_path_for(&dir)), &journal).unwrap();
+
+            let restarted = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+            let report = restarted.verify_self();
+            assert!(report.ok(), "{tag}: {:?}", report.breaks);
+            assert_eq!(std::fs::read(&staged_day).unwrap(), new_log, "{tag}");
+            assert_eq!(
+                std::fs::read(head_path_for(&dir)).unwrap(),
+                new_head,
+                "{tag}"
+            );
+            assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), new_key, "{tag}");
+            assert!(!journal_path_for(&key_path_for(&dir)).exists(), "{tag}");
+            clean(&dir);
+        }
+        clean(&source);
+    }
+
+    #[test]
+    fn cached_verification_avoids_repeated_full_scans() {
+        let dir = temp_dir("verify-cache");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "a"}),
+            meta(),
+        );
+        assert!(log.verify_self_cached().ok());
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            content.replace("\"sessionId\":\"a\"", "\"sessionId\":\"b\""),
+        )
+        .unwrap();
+
+        assert!(log.verify_self_cached().ok());
+        assert!(!log.verify_self().ok());
         clean(&dir);
     }
 

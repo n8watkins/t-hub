@@ -21614,6 +21614,8 @@ fn read_audit(dir: &std::path::Path) -> Vec<Value> {
 fn clean_audit(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_file(crate::audit::head_path_for_test(dir));
+    let _ = std::fs::remove_file(crate::audit::key_path_for_test(dir));
+    let _ = std::fs::remove_file(crate::audit::journal_path_for_test(dir));
 }
 
 fn req(token: &str, command: &str, args: Value) -> ControlRequest {

@@ -5776,7 +5776,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     }
 
     if req.command == "audit_verify" {
-        return ControlResponse::ok(ctx.audit.verify_self().to_json());
+        return ControlResponse::ok(ctx.audit.verify_self_cached().to_json());
     }
 
     if matches!(req.command.as_str(), "spawn_terminal" | "create_worktree") {

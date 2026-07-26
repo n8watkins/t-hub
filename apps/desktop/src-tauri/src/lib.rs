@@ -449,6 +449,10 @@ fn devbuild_env_defaults(dev_home: &std::path::Path) -> Vec<(&'static str, std::
         ("T_HUB_INBOX_DIR", dev_home.join("inbox").into_os_string()),
         ("T_HUB_AUDIT_DIR", dev_home.join("audit").into_os_string()),
         (
+            "T_HUB_AUDIT_KEY_FILE",
+            dev_home.join("audit-key.json").into_os_string(),
+        ),
+        (
             "T_HUB_SERVER_KEY_FILE",
             dev_home.join("server-key").into_os_string(),
         ),
@@ -525,6 +529,7 @@ mod devbuild_isolation_tests {
             "T_HUB_DELEGATED_ADMIN_FILE",
             "T_HUB_INBOX_DIR",
             "T_HUB_AUDIT_DIR",
+            "T_HUB_AUDIT_KEY_FILE",
             "T_HUB_SERVER_KEY_FILE",
             "T_HUB_SERVER_READ_KEY_FILE",
             "T_HUB_VOICE_FILE",
