@@ -15,7 +15,7 @@ mod tmux;
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
 pub mod agent_session; // Powder-independent durable agent-session contract
-mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
+mod audit; // keyed, externally anchored control-socket audit log (socket-gate Phase 1)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
@@ -342,7 +342,7 @@ fn start_control_listener(
 
     // item-3 §2.1.1 piece 3+4: ONE shared audit sink for BOTH the control server and
     // the Tauri UI spawn path (`commands::spawn_terminal`), so a UI control-spawn
-    // appends to the SAME hash-chained log rather than a second writer that would
+    // appends to the SAME keyed audit chain rather than a second writer that would
     // fork the chain. Managed on the app so `commands` can record against it.
     let audit = std::sync::Arc::new(crate::audit::AuditLog::from_env());
     {

@@ -2326,7 +2326,7 @@ pub(crate) struct SpawnAdmissionGuard<'a> {
 enum GovernorAdmission<'a> {
     None,
     Spawn {
-        _guard: SpawnAdmissionGuard<'a>,
+        _guard: Box<SpawnAdmissionGuard<'a>>,
         governor: &'a crate::governor::SpawnGovernor,
     },
     Destructive {
@@ -5132,7 +5132,7 @@ pub(crate) fn crew_credential_withholding_env() -> Vec<(String, String)> {
     env
 }
 
-/// Emit a hash-chained audit record for a control-capability spawn (item-3 §2.1.1
+/// Emit a keyed audit record for a control-capability spawn (item-3 §2.1.1
 /// piece 4: "a control-spawn is never silent"). A distinct `control-spawn` decision
 /// with `tokenTier: control` so a log review enumerates exactly who was elevated and
 /// by whom (the `spawnedBy` meta). Read-tier spawns (the least-privilege default) are
@@ -5353,7 +5353,7 @@ fn governor_gate<'a>(
             );
             admit_spawn(ctx, purpose, requested_provider_lanes, None).map(|guard| {
                 GovernorAdmission::Spawn {
-                    _guard: guard,
+                    _guard: Box::new(guard),
                     governor: &ctx.governor,
                 }
             })
@@ -5591,8 +5591,10 @@ fn try_audit_command(
 /// command's [`required_tier`] must be covered by that capability, else refuse
 /// `refused-authz` and audit it; (3) for ProcessChanging the fleet governor runs
 /// (Phase 1, refuse-past-ceiling); (4) dispatch. Every Organization/ProcessChanging
-/// command - allowed or refused - lands in the audit log with its `tokenTier`, and
-/// a refusal is mirrored live onto the event fanout.
+/// command is offered to the audit log with its `tokenTier`, and a refusal is
+/// mirrored live onto the event fanout.
+/// ProcessChanging authorization is durably recorded before dispatch; other
+/// records remain best-effort.
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
     // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
     // token carried on the request (`req.session`), if any. IDENTIFICATION only
@@ -5961,7 +5963,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 
     // A process-changing command must have a durable authorization record before
     // its side effect begins.
-    // If the keyed log, its external head, or its integrity state is unavailable,
+    // If the keyed log, external manifest/checkpoint, or integrity state is unavailable,
     // release any idempotency reservation and refuse the command.
     if tier == CommandTier::ProcessChanging {
         if let Err(audit_error) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {

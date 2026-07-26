@@ -2,11 +2,14 @@
 //! This implements the durable audit requirements in
 //! `docs/SOCKET-AUTH-DESIGN.md` section 6.
 //!
-//! Gives the aspirational `"audited": true` flag a real sink. Every
-//! Organization- and ProcessChanging-tier command, and every governor refusal,
-//! appends one JSON line to `~/.t-hub/audit/control-YYYYMMDD.jsonl` (mode `0600`
-//! on Unix). Read-tier commands are not logged (they are not process-affecting
-//! and would drown the signal).
+//! Gives the aspirational `"audited": true` flag a real sink.
+//! Organization-tier commands and authenticated governor refusals are recorded
+//! best-effort, while ProcessChanging authorization must be recorded durably
+//! before dispatch.
+//! Records are JSON lines in `~/.t-hub/audit/control-YYYYMMDD.jsonl` (mode `0600`
+//! on Unix).
+//! Read-tier commands are not logged because they are not process-affecting and
+//! would drown the signal.
 //!
 //! Each version 2 line is authenticated with HMAC-SHA256 under a persistent key
 //! stored outside the log directory.
@@ -63,8 +66,8 @@ pub fn audit_dir() -> PathBuf {
     home_dir().join(".t-hub").join("audit")
 }
 
-/// Resolve the persistent audit key path.
-/// It is deliberately outside the log directory.
+/// Resolve the persistent audit key-state path.
+/// It holds the sealed key and latest head checkpoint outside the log directory.
 pub fn audit_key_path() -> PathBuf {
     if let Ok(path) = std::env::var("T_HUB_AUDIT_KEY_FILE") {
         return PathBuf::from(path);
@@ -149,7 +152,7 @@ impl AuditLog {
         }
     }
 
-    /// Build a log at the default location with a persistent, sealed key.
+    /// Build a log at the default location with persistent key and checkpoint state.
     /// Key loading is delayed until verification or the first write.
     pub fn from_env() -> Self {
         let dir = audit_dir();
@@ -530,8 +533,7 @@ fn redact_error(_command: &str, error: &str) -> Value {
 pub struct AuditMeta<'a> {
     /// `"loopback"` or `"remote"` - the connection origin (`ControlContext::peer_is_loopback`).
     pub peer: &'a str,
-    /// The capability tier of the presented token. Phase 1 has a single full-power
-    /// token, so always `"control"`; the field exists for Phase 2 forward-compat.
+    /// The capability tier resolved from the presented token.
     pub token_tier: &'a str,
     /// The target session id, when the command names one (send/close).
     pub session: Option<&'a str>,
@@ -1647,10 +1649,7 @@ mod tests {
         assert_eq!(lines[1]["prev"], lines[0]["hash"]);
         assert_eq!(lines[2]["prev"], lines[1]["hash"]);
         let report = verify(&dir, TEST_KEY);
-        println!(
-            "AUDIT_RECORDS {}",
-            serde_json::to_string(&lines).unwrap()
-        );
+        println!("AUDIT_RECORDS {}", serde_json::to_string(&lines).unwrap());
         println!(
             "EXTERNAL_HEAD {}",
             std::fs::read_to_string(head_path_for(&dir)).unwrap()

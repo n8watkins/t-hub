@@ -195,11 +195,13 @@ The `"audited": true` flag requires a real enforcement-backed sink.
 - **Teeth, concretely**:
   1. It is the **enforcement input**, not just a record - the governor's counters and the rate buckets are the same data the log captures, so "what the log says happened" and "what the gate allowed" cannot diverge.
   2. **Keyed tamper evidence**: authenticate each version 2 record and its previous-record link with HMAC-SHA256 under a persistent key stored outside the log directory.
-     Anchor every day's record count and final hash in one separately authenticated head manifest so tail and whole-day truncation are detectable.
+     The key state lives at `~/.t-hub/audit-hmac-key`; Windows seals the key with current-user DPAPI, while Unix relies on owner-only `0600` permissions and therefore does not protect against a same-user attacker who can read the key.
+     Anchor every day's record count and final hash in the authenticated `~/.t-hub/audit.head.json` manifest, and commit the latest manifest generation in the protected key state, so tail truncation, whole-day removal, and signed manifest rollback are detectable.
      Verify the chain at startup and through the read-tier `audit_verify` command.
   3. **Live signal**: mirror refusals (and optionally spawns) onto the existing event fanout (`control.rs:999`) so the captain overlay can surface fleet pressure and denials as they happen.
-  4. **Fail closed**: flush and sync the record and head before a ProcessChanging side effect.
+  4. **Fail closed**: durably sync the record, head manifest, and protected checkpoint before a ProcessChanging side effect.
      Refuse the command and release its idempotency reservation if that durable write fails.
+     Skip startup fleet-operation recovery when the startup integrity check fails.
 - **Where**: write ProcessChanging authorization from `dispatch_authenticated` before dispatch.
   Keep Organization records best-effort after dispatch so their downstream outcome is available.
 
@@ -249,7 +251,7 @@ Hold 3 behind a flag until adoption is proven.
 - **Tier flip breaks probes/external scripts** that assumed `control.json.token` = omnipotent. Mitigation: Phase 3 is config-gated and default OFF; `token` stays full-power through Phase 2; documented migration note; `T_HUB_CONTROL_TOKEN` override always available.
 - **Elevated-confirm breaking autonomy** if scoped too broadly. Mitigation: it is Phase 3 and narrow - only destructive-beyond-budget, never the common in-budget spawn path.
 - **Same-user ceiling.** None of this defeats an attacker with code-exec as the user (they can read env/process memory of an elevated session). Documented as accepted (§1); the win is bounding injection-driven blast radius and enforcing least privilege on the read surface.
-- **Audit log growth / write cost.** Mitigation: daily rotation, buffered/fsync-batched writes, 0600; hash-chain adds one hash per line, negligible at command rates.
+- **Audit log growth / write cost.** Mitigation: daily rotation and owner-only files bound growth and exposure; each ProcessChanging authorization intentionally pays for a record sync plus atomic manifest and checkpoint replacement before dispatch.
 - **Two-token complexity in `control.json`.** Mitigation: additive field, documented schema, `read_token` optional so old readers ignore it.
 
 ---
