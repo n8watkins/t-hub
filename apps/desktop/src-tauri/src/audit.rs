@@ -250,6 +250,15 @@ impl AuditLog {
             None => true,
         };
         if need_open {
+            if let Some(report) = self.initialize_checkpoint(guard, key)? {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "audit integrity verification failed with {} break(s)",
+                        report.breaks.len()
+                    ),
+                ));
+            }
             let report =
                 verify_with_checkpoint(&self.dir, &self.head_path, key, self.checkpoint_for(guard));
             if !report.ok() {
@@ -388,13 +397,52 @@ impl AuditLog {
         let generation = checkpoint
             .map(|checkpoint| checkpoint.generation + 1)
             .unwrap_or(1);
-        let value = head_anchor_value(key, generation, &entries);
+        self.write_manifest(key, generation, &entries)
+    }
+
+    fn initialize_checkpoint(
+        &self,
+        guard: &mut Inner,
+        key: &[u8],
+    ) -> std::io::Result<Option<VerifyReport>> {
+        if self.checkpoint_for(guard).is_some() {
+            return Ok(None);
+        }
+
+        let anchor = read_head_anchor(&self.head_path, key)?;
+        let allow_unanchored_legacy = anchor.is_none();
+        let report = verify_core_mode(
+            &self.dir,
+            &self.head_path,
+            key,
+            None,
+            allow_unanchored_legacy,
+        );
+        if !report.ok() {
+            return Ok(Some(report));
+        }
+
+        let entries = match anchor {
+            Some(anchor) => anchor.entries,
+            None => legacy_manifest_entries(&self.dir, key)?,
+        };
+        let checkpoint = self.write_manifest(key, 1, &entries)?;
+        self.store_checkpoint(guard, checkpoint)?;
+        Ok(None)
+    }
+
+    fn write_manifest(
+        &self,
+        key: &[u8],
+        generation: u64,
+        entries: &BTreeMap<String, Value>,
+    ) -> std::io::Result<HeadCheckpoint> {
+        let value = head_anchor_value(key, generation, entries);
         let manifest_mac = value["mac"]
             .as_str()
             .expect("head manifest MAC is a string")
             .to_string();
-        let body = serde_json::to_vec(&value)?;
-        write_private_atomic(&self.head_path, &body)?;
+        write_private_atomic(&self.head_path, &serde_json::to_vec(&value)?)?;
         Ok(HeadCheckpoint {
             generation,
             manifest_mac,
@@ -405,12 +453,24 @@ impl AuditLog {
     pub fn verify_self(&self) -> VerifyReport {
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let report = match self.key_for(&mut guard) {
-            Ok(key) => verify_with_checkpoint(
-                &self.dir,
-                &self.head_path,
-                &key,
-                self.checkpoint_for(&guard),
-            ),
+            Ok(key) => match self.initialize_checkpoint(&mut guard, &key) {
+                Ok(Some(report)) => report,
+                Ok(None) => verify_with_checkpoint(
+                    &self.dir,
+                    &self.head_path,
+                    &key,
+                    self.checkpoint_for(&guard),
+                ),
+                Err(error) => VerifyReport {
+                    breaks: vec![ChainBreak {
+                        file: self.head_path.display().to_string(),
+                        line: 0,
+                        kind: BreakKind::HeadTampered,
+                        detail: format!("cannot initialize the audit head anchor: {error}"),
+                    }],
+                    ..VerifyReport::default()
+                },
+            },
             Err(error) => VerifyReport {
                 breaks: vec![ChainBreak {
                     file: self.key_path.display().to_string(),
@@ -639,6 +699,16 @@ fn verify_core(
     key: &[u8],
     checkpoint: Option<&HeadCheckpoint>,
 ) -> VerifyReport {
+    verify_core_mode(dir, head_path, key, checkpoint, false)
+}
+
+fn verify_core_mode(
+    dir: &Path,
+    head_path: &Path,
+    key: &[u8],
+    checkpoint: Option<&HeadCheckpoint>,
+    allow_unanchored_legacy: bool,
+) -> VerifyReport {
     let mut report = VerifyReport::default();
     let anchor = match read_head_anchor(head_path, key) {
         Ok(anchor) => anchor,
@@ -711,7 +781,14 @@ fn verify_core(
     for (date, path) in files {
         seen_dates.insert(date.clone());
         report.files += 1;
-        verify_file(&date, &path, head, key, &mut report);
+        verify_file(
+            &date,
+            &path,
+            head,
+            key,
+            allow_unanchored_legacy,
+            &mut report,
+        );
     }
 
     if let Some(head) = head {
@@ -733,6 +810,7 @@ fn verify_file(
     path: &Path,
     head: Option<&BTreeMap<String, Value>>,
     key: &[u8],
+    allow_unanchored_legacy: bool,
     report: &mut VerifyReport,
 ) {
     let name = path
@@ -851,10 +929,7 @@ fn verify_file(
         last_hash = stored;
     }
 
-    let Some(head) = head else {
-        return;
-    };
-    match head.get(date) {
+    match head.and_then(|head| head.get(date)) {
         Some(entry) => verify_head_entry(date, &name, entry, count, &last_hash, key, report),
         None if v2_count > 0 => report.breaks.push(ChainBreak {
             file: name,
@@ -862,7 +937,13 @@ fn verify_file(
             kind: BreakKind::HeadMissing,
             detail: "keyed records exist without a head anchor entry".into(),
         }),
-        None => {}
+        None if allow_unanchored_legacy => {}
+        None => report.breaks.push(ChainBreak {
+            file: name,
+            line: 0,
+            kind: BreakKind::HeadMissing,
+            detail: "legacy records exist without a head anchor entry".into(),
+        }),
     }
 }
 
@@ -1236,6 +1317,37 @@ fn last_hash_and_count(path: &Path) -> std::io::Result<(String, u64)> {
         last = Some(hash.to_string());
     }
     Ok((last.unwrap_or_default(), count))
+}
+
+fn legacy_manifest_entries(dir: &Path, key: &[u8]) -> std::io::Result<BTreeMap<String, Value>> {
+    let mut entries = BTreeMap::new();
+    let directory = match std::fs::read_dir(dir) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(entries),
+        Err(error) => return Err(error),
+    };
+    for entry in directory {
+        let path = entry?.path();
+        let Some(date) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("control-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        let (last, count) = last_hash_and_count(&path)?;
+        let entry_mac = head_entry_mac(key, date, count, &last);
+        entries.insert(
+            date.to_string(),
+            json!({
+                "count": count,
+                "last": last,
+                "mac": entry_mac,
+            }),
+        );
+    }
+    Ok(entries)
 }
 
 fn read_head_anchor(path: &Path, key: &[u8]) -> std::io::Result<Option<HeadAnchor>> {
@@ -1959,42 +2071,55 @@ mod tests {
     }
 
     #[test]
-    fn valid_legacy_records_are_accepted_but_downgrade_tampering_is_not() {
+    fn legacy_records_are_migrated_and_new_unanchored_files_are_rejected() {
         let dir = temp_dir("legacy");
         clean(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let date = chrono::Local::now().format("%Y%m%d").to_string();
-        let path = dir.join(format!("control-{date}.jsonl"));
-        let mut legacy = json!({
-            "ts": "2026-01-01T00:00:00Z",
+        for date in ["20260101", "20260102"] {
+            let mut legacy = json!({
+                "ts": format!("{date}T00:00:00Z"),
+                "command": "close_terminal",
+                "decision": "allowed",
+                "prev": "",
+                "args": {"sessionId": date},
+            });
+            let body = serde_json::to_vec(&legacy).unwrap();
+            legacy["hash"] = json!(hex(&Sha256::digest(&body)));
+            std::fs::write(
+                dir.join(format!("control-{date}.jsonl")),
+                format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+            )
+            .unwrap();
+        }
+
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let report = log.verify_self();
+        assert!(report.ok(), "{:?}", report.breaks);
+        assert_eq!(report.legacy, 2);
+        let head: Value =
+            serde_json::from_str(&std::fs::read_to_string(head_path_for(&dir)).unwrap()).unwrap();
+        assert_eq!(head["entries"].as_object().unwrap().len(), 2);
+
+        let mut injected = json!({
+            "ts": "2026-01-03T00:00:00Z",
             "command": "close_terminal",
             "decision": "allowed",
             "prev": "",
-            "args": {"sessionId": "legacy"},
+            "args": {"sessionId": "injected"},
         });
-        let body = serde_json::to_vec(&legacy).unwrap();
-        legacy["hash"] = json!(hex(&Sha256::digest(&body)));
+        let body = serde_json::to_vec(&injected).unwrap();
+        injected["hash"] = json!(hex(&Sha256::digest(&body)));
         std::fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+            dir.join("control-20260103.jsonl"),
+            format!("{}\n", serde_json::to_string(&injected).unwrap()),
         )
         .unwrap();
 
-        let report = verify(&dir, TEST_KEY);
-        assert!(report.ok(), "{:?}", report.breaks);
-        assert_eq!(report.legacy, 1);
-
-        legacy["decision"] = json!("refused");
-        std::fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
-        )
-        .unwrap();
-        let report = verify(&dir, TEST_KEY);
+        let report = log.verify_self();
         assert!(report
             .breaks
             .iter()
-            .any(|audit_break| audit_break.kind == BreakKind::BadMac));
+            .any(|audit_break| audit_break.kind == BreakKind::HeadMissing));
         clean(&dir);
     }
 
