@@ -84,14 +84,32 @@ pub fn audit_key_path() -> PathBuf {
 }
 
 fn head_path_for(dir: &Path) -> PathBuf {
-    dir.with_extension("head.json")
+    append_path_suffix(dir, ".head.json")
 }
 
 fn key_path_for(dir: &Path) -> PathBuf {
-    dir.with_extension("key.json")
+    append_path_suffix(dir, ".key.json")
 }
 
 fn journal_path_for(key_path: &Path) -> PathBuf {
+    append_path_suffix(key_path, ".txn.json")
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn legacy_head_path_for(dir: &Path) -> PathBuf {
+    dir.with_extension("head.json")
+}
+
+fn legacy_key_path_for(dir: &Path) -> PathBuf {
+    dir.with_extension("key.json")
+}
+
+fn legacy_journal_path_for(key_path: &Path) -> PathBuf {
     key_path.with_extension("txn.json")
 }
 
@@ -128,6 +146,7 @@ struct Inner {
     count: u64,
     verified_files: Option<BTreeMap<String, VerifiedAuditFile>>,
     key_state: Option<Result<KeyState, String>>,
+    state_paths_migrated: bool,
     poisoned: Option<String>,
     verification_cache: Option<(Instant, VerifyReport)>,
 }
@@ -253,6 +272,7 @@ impl AuditLog {
                 count: 0,
                 verified_files: None,
                 key_state: None,
+                state_paths_migrated: false,
                 poisoned: None,
                 verification_cache: None,
             }),
@@ -276,6 +296,7 @@ impl AuditLog {
                 count: 0,
                 verified_files: None,
                 key_state: None,
+                state_paths_migrated: false,
                 poisoned: None,
                 verification_cache: None,
             }),
@@ -556,6 +577,10 @@ impl AuditLog {
     }
 
     fn key_for(&self, guard: &mut Inner) -> std::io::Result<Vec<u8>> {
+        if !guard.state_paths_migrated {
+            self.migrate_legacy_state_paths()?;
+            guard.state_paths_migrated = true;
+        }
         if guard.key_state.is_none() {
             guard.key_state = Some(
                 load_or_create_audit_key(&self.key_path, self.provided_key.as_deref())
@@ -573,6 +598,21 @@ impl AuditLog {
                 error.clone(),
             )),
         }
+    }
+
+    fn migrate_legacy_state_paths(&self) -> std::io::Result<()> {
+        migrate_legacy_file(&legacy_head_path_for(&self.dir), &self.head_path)?;
+        let legacy_key_path = if self.key_path == key_path_for(&self.dir) {
+            let legacy_key_path = legacy_key_path_for(&self.dir);
+            migrate_legacy_file(&legacy_key_path, &self.key_path)?;
+            legacy_key_path
+        } else {
+            self.key_path.clone()
+        };
+        migrate_legacy_file(
+            &legacy_journal_path_for(&legacy_key_path),
+            &self.journal_path,
+        )
     }
 
     fn checkpoint_for<'a>(&self, guard: &'a Inner) -> Option<&'a HeadCheckpoint> {
@@ -2166,6 +2206,27 @@ fn write_private_create_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn migrate_legacy_file(legacy_path: &Path, path: &Path) -> std::io::Result<()> {
+    if legacy_path == path {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let body = match std::fs::read(legacy_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match write_private_create_new(path, &body) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     create_dir_all_durable(parent)?;
@@ -2628,6 +2689,53 @@ mod tests {
     }
 
     const TEST_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn derived_state_paths_preserve_existing_extensions() {
+        let base = temp_dir("state-paths");
+        let dev = base.join("audit.dev");
+        let prod = base.join("audit.prod");
+
+        assert_eq!(
+            head_path_for(&dev),
+            append_path_suffix(&dev, ".head.json")
+        );
+        assert_eq!(key_path_for(&dev), append_path_suffix(&dev, ".key.json"));
+        assert_ne!(head_path_for(&dev), head_path_for(&prod));
+        assert_ne!(key_path_for(&dev), key_path_for(&prod));
+
+        let dev_key = base.join("audit.dev.key");
+        let prod_key = base.join("audit.prod.key");
+        assert_ne!(journal_path_for(&dev_key), journal_path_for(&prod_key));
+        assert_eq!(
+            journal_path_for(&dev_key),
+            append_path_suffix(&dev_key, ".txn.json")
+        );
+    }
+
+    #[test]
+    fn state_paths_migrate_legacy_files_before_use() {
+        let base = temp_dir("state-migration");
+        let dir = base.join("audit.dev");
+        let head = legacy_head_path_for(&dir);
+        let key = legacy_key_path_for(&dir);
+        let journal = legacy_journal_path_for(&key);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&head, b"head").unwrap();
+        std::fs::write(&key, b"key").unwrap();
+        std::fs::write(&journal, b"journal").unwrap();
+
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.migrate_legacy_state_paths().unwrap();
+
+        assert_eq!(std::fs::read(head_path_for(&dir)).unwrap(), b"head");
+        assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), b"key");
+        assert_eq!(
+            std::fs::read(journal_path_for(&key_path_for(&dir))).unwrap(),
+            b"journal"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn send_text_content_is_redacted() {
