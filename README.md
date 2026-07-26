@@ -2,7 +2,7 @@
 
 T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
-## Status - post-Powder agent-session candidate (v0.3.106)
+## Status - post-Powder agent-session candidate
 
 The current product is a local agent-session cockpit for Codex and Claude.
 Durable Captain and agent records, checkpoints, lifecycle events, cursor-based recovery, and the CLI/MCP control channel are the active coordination surface.
@@ -85,7 +85,7 @@ Then `pnpm tauri dev` (a window opens through WSLg).
 ## Roadmap & docs
 
 - **[docs/POST-POWDER-ROADMAP.md](./docs/POST-POWDER-ROADMAP.md)** - the authoritative agent-session roadmap and acceptance gates.
-- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the bounded release smoke procedure for Windows and WSL.
+- **[docs/AGENT-SESSION-SMOKE-0.3.106.md](./docs/AGENT-SESSION-SMOKE-0.3.106.md)** - the historical bounded smoke procedure for the 0.3.106 Windows and WSL release.
 
 - **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the active stabilization program, CI target, security workstreams, and measurable Alpha/Beta/Stable release gates.
 - **[docs/PLAN.md](./docs/PLAN.md)** — the original phased plan (0.5 → 2.0). Most of the 0.5 supervision track has since shipped; kept as the design-rationale record.
