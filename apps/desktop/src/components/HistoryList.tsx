@@ -25,8 +25,8 @@ const TERMINAL_SESSION_STATUSES = new Set<SessionStatusEvent["status"]>([
   "expired",
   "unknown",
 ]);
-const HISTORY_STARTUP_DELAY_MS = import.meta.env.MODE === "test" ? 0 : 5_000;
-const HISTORY_RETRY_DELAY_MS = import.meta.env.MODE === "test" ? 0 : 3_000;
+const HISTORY_STARTUP_DELAY_MS = import.meta.env.PROD ? 5_000 : 0;
+const HISTORY_RETRY_DELAY_MS = import.meta.env.PROD ? 3_000 : 0;
 
 export interface HistoryListProps {
   onCount?: (count: number) => void;
