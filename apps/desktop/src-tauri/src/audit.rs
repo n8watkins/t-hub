@@ -32,11 +32,11 @@
 //! The live mirror of refusals onto the event fanout lives in `control.rs` (it
 //! owns the fanout); this module owns only the durable record.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
@@ -156,6 +156,44 @@ struct AuditFileStamp {
     #[cfg(not(any(unix, windows)))]
     modified: Option<std::time::SystemTime>,
 }
+
+impl AuditFileStamp {
+    fn is_exact_append_of(&self, previous: &Self, appended_len: u64) -> bool {
+        self.same_file(previous)
+            && previous
+                .len
+                .checked_add(appended_len)
+                .is_some_and(|expected_len| self.len == expected_len)
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            self.volume == other.volume && self.file_id == other.file_id
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = other;
+            true
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryStamp {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+static DURABLE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, DirectoryStamp>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeadCheckpoint {
@@ -393,6 +431,13 @@ impl AuditLog {
         let pending =
             self.prepare_commit(key, self.checkpoint_for(guard), date, count, &hash, &line)?;
         self.write_pending_commit(key, &pending)?;
+        let path = self.dir.join(format!("control-{date}.jsonl"));
+        let previous_stamp = guard
+            .verified_files
+            .as_ref()
+            .expect("audit files snapshotted before opening the writer")
+            .get(date)
+            .cloned();
 
         if let Some(path) = opening_path {
             create_dir_all_durable(&self.dir)?;
@@ -404,18 +449,29 @@ impl AuditLog {
         writer.write_all(b"\n")?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
+        let writer_stamp = audit_file_stamp_for_file(writer.get_ref())?;
+        let path_stamp = audit_file_stamp(&path)?;
+        let appended_len = u64::try_from(line.len())
+            .ok()
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| std::io::Error::other("audit record length overflow"))?;
+        validate_append_transition(
+            previous_stamp.as_ref(),
+            &writer_stamp,
+            &path_stamp,
+            appended_len,
+        )?;
 
         write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
         self.store_checkpoint(guard, pending.checkpoint)?;
         remove_durable(&self.journal_path)?;
         guard.count = count;
         guard.prev_hash = hash;
-        let stamp = audit_file_stamp(&self.dir.join(format!("control-{date}.jsonl")))?;
         guard
             .verified_files
             .as_mut()
             .expect("audit files snapshotted before opening the writer")
-            .insert(date.to_string(), stamp);
+            .insert(date.to_string(), writer_stamp);
         guard.verification_cache = None;
         Ok(())
     }
@@ -820,13 +876,48 @@ fn audit_file_stamp(path: &Path) -> std::io::Result<AuditFileStamp> {
     }
     #[cfg(windows)]
     {
+        let file = File::open(path)?;
+        audit_file_stamp_for_file(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(AuditFileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn audit_file_stamp_for_file(file: &File) -> std::io::Result<AuditFileStamp> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit writer does not reference a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(AuditFileStamp {
+            len: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(windows)]
+    {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Storage::FileSystem::{
             FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
         };
 
-        let file = File::open(path)?;
         let handle = HANDLE(file.as_raw_handle());
         let mut basic = FILE_BASIC_INFO::default();
         let mut identity = FILE_ID_INFO::default();
@@ -860,6 +951,26 @@ fn audit_file_stamp(path: &Path) -> std::io::Result<AuditFileStamp> {
             len: metadata.len(),
             modified: metadata.modified().ok(),
         })
+    }
+}
+
+fn validate_append_transition(
+    previous: Option<&AuditFileStamp>,
+    writer: &AuditFileStamp,
+    path: &AuditFileStamp,
+    appended_len: u64,
+) -> std::io::Result<()> {
+    let transition_valid = match previous {
+        Some(previous) => writer.is_exact_append_of(previous, appended_len),
+        None => writer.len == appended_len,
+    };
+    if transition_valid && path == writer {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file did not make the expected append transition",
+        ))
     }
 }
 
@@ -1807,16 +1918,34 @@ fn remove_durable(path: &Path) -> std::io::Result<()> {
 }
 
 fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let cache = DURABLE_DIRECTORIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    create_dir_all_durable_cached(path, &mut cache)
+}
+
+fn create_dir_all_durable_cached(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, DirectoryStamp>,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    if parent != path {
-        create_dir_all_durable(parent)?;
-    }
-
     match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return sync_parent(parent),
+        Ok(metadata) if metadata.is_dir() => {
+            let stamp = directory_stamp(&metadata);
+            if cache.get(path) == Some(&stamp) {
+                return Ok(());
+            }
+            if parent != path {
+                create_dir_all_durable_cached(parent, cache)?;
+            }
+            sync_parent(parent)?;
+            cache.insert(path.to_path_buf(), stamp);
+            return Ok(());
+        }
         Ok(_) => {
             return Err(std::io::Error::new(
                 ErrorKind::AlreadyExists,
@@ -1827,16 +1956,47 @@ fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
         Err(error) => return Err(error),
     }
 
+    if parent != path {
+        create_dir_all_durable_cached(parent, cache)?;
+    }
+
     match std::fs::create_dir(path) {
-        Ok(()) => sync_parent(parent),
+        Ok(()) => {
+            sync_parent(parent)?;
+            cache.insert(
+                path.to_path_buf(),
+                directory_stamp(&std::fs::metadata(path)?),
+            );
+            Ok(())
+        }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            if std::fs::metadata(path)?.is_dir() {
-                sync_parent(parent)
+            let metadata = std::fs::metadata(path)?;
+            if metadata.is_dir() {
+                sync_parent(parent)?;
+                cache.insert(path.to_path_buf(), directory_stamp(&metadata));
+                Ok(())
             } else {
                 Err(error)
             }
         }
         Err(error) => Err(error),
+    }
+}
+
+fn directory_stamp(metadata: &std::fs::Metadata) -> DirectoryStamp {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        DirectoryStamp {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        DirectoryStamp {
+            modified: metadata.modified().ok(),
+        }
     }
 }
 
@@ -2617,6 +2777,39 @@ mod tests {
     }
 
     #[test]
+    fn append_transition_rejects_a_replaced_live_path() {
+        let dir = temp_dir("replaced-live-path");
+        clean(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-20260725.jsonl");
+        std::fs::write(&path, b"first\n").unwrap();
+        let previous = audit_file_stamp(&path).unwrap();
+
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"second\n").unwrap();
+        writer.sync_data().unwrap();
+        let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
+        assert!(validate_append_transition(
+            Some(&previous),
+            &writer_stamp,
+            &audit_file_stamp(&path).unwrap(),
+            7,
+        )
+        .is_ok());
+        drop(writer);
+
+        std::fs::rename(&path, dir.join("displaced.jsonl")).unwrap();
+        std::fs::write(&path, vec![b'x'; writer_stamp.len as usize]).unwrap();
+        let replacement_stamp = audit_file_stamp(&path).unwrap();
+        assert_eq!(replacement_stamp.len, writer_stamp.len);
+        assert!(
+            validate_append_transition(Some(&previous), &writer_stamp, &replacement_stamp, 7,)
+                .is_err()
+        );
+        clean(&dir);
+    }
+
+    #[test]
     fn missing_head_is_detected_for_keyed_records() {
         let dir = temp_dir("missing-head");
         clean(&dir);
@@ -3045,6 +3238,31 @@ mod tests {
 
         assert_eq!(state.key, TEST_KEY);
         assert!(path.is_file());
+        clean(&root);
+    }
+
+    #[test]
+    fn durable_directory_cache_refreshes_changed_identities() {
+        let root = temp_dir("durable-directory-cache");
+        clean(&root);
+        let path = root.join("profile").join("state");
+        std::fs::create_dir_all(&path).unwrap();
+        let actual = directory_stamp(&std::fs::metadata(&path).unwrap());
+        let mut cache = HashMap::new();
+        #[cfg(unix)]
+        cache.insert(
+            path.clone(),
+            DirectoryStamp {
+                device: actual.device.wrapping_add(1),
+                inode: actual.inode.wrapping_add(1),
+            },
+        );
+        #[cfg(not(unix))]
+        cache.insert(path.clone(), DirectoryStamp { modified: None });
+
+        create_dir_all_durable_cached(&path, &mut cache).unwrap();
+
+        assert_eq!(cache.get(&path), Some(&actual));
         clean(&root);
     }
 
