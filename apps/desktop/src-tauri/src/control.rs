@@ -6012,8 +6012,8 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 
     // A process-changing command must have a durable authorization record before
     // its side effect begins.
-    // If the keyed log, external manifest/checkpoint, or integrity state is unavailable,
-    // release any idempotency reservation and refuse the command.
+    // If the keyed log, authenticated manifest/checkpoint, or integrity state is
+    // unavailable, release any idempotency reservation and refuse the command.
     if tier == CommandTier::ProcessChanging {
         if let Err(audit_error) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
             governor_admission.rollback();
