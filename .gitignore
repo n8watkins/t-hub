@@ -36,6 +36,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.log
+/CLAUDE.md
 
 # Local packaged-runtime performance captures. Keep the directory available for
 # benchmark output without committing machine-specific measurements.

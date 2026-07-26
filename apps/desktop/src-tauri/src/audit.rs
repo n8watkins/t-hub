@@ -124,9 +124,37 @@ struct Inner {
     writer: Option<(String, BufWriter<File>)>,
     prev_hash: String,
     count: u64,
+    verified_files: Option<BTreeMap<String, AuditFileStamp>>,
     key_state: Option<Result<KeyState, String>>,
     poisoned: Option<String>,
     verification_cache: Option<(Instant, VerifyReport)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuditFileStamp {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+    #[cfg(windows)]
+    changed: i64,
+    #[cfg(windows)]
+    modified: i64,
+    #[cfg(not(any(unix, windows)))]
+    modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +205,7 @@ impl AuditLog {
                 writer: None,
                 prev_hash: String::new(),
                 count: 0,
+                verified_files: None,
                 key_state: None,
                 poisoned: None,
                 verification_cache: None,
@@ -199,6 +228,7 @@ impl AuditLog {
                 writer: None,
                 prev_hash: String::new(),
                 count: 0,
+                verified_files: None,
                 key_state: None,
                 poisoned: None,
                 verification_cache: None,
@@ -313,6 +343,7 @@ impl AuditLog {
                     ),
                 ));
             }
+            guard.verified_files = Some(audit_file_snapshot(&self.dir)?);
             let path = self.dir.join(format!("control-{date}.jsonl"));
             let (seed, count) = last_hash_and_count(&path)?;
             guard.prev_hash = seed;
@@ -320,7 +351,7 @@ impl AuditLog {
             Some(path)
         } else {
             if tier == "process-changing" && decision == "allowed" {
-                self.validate_live_writer(guard, key)?;
+                self.validate_audit_state(guard, key)?;
             }
             None
         };
@@ -379,33 +410,32 @@ impl AuditLog {
         remove_durable(&self.journal_path)?;
         guard.count = count;
         guard.prev_hash = hash;
+        let stamp = audit_file_stamp(&self.dir.join(format!("control-{date}.jsonl")))?;
+        guard
+            .verified_files
+            .as_mut()
+            .expect("audit files snapshotted before opening the writer")
+            .insert(date.to_string(), stamp);
         guard.verification_cache = None;
         Ok(())
     }
 
-    fn validate_live_writer(&self, guard: &Inner, key: &[u8]) -> std::io::Result<()> {
+    fn validate_audit_state(&self, guard: &Inner, key: &[u8]) -> std::io::Result<()> {
         let Some((date, _)) = &guard.writer else {
             return Ok(());
         };
         let anchor = read_head_anchor(&self.head_path, key)?;
         validate_checkpoint(anchor.as_ref(), self.checkpoint_for(guard))?;
-        let mut report = VerifyReport::default();
-        let path = self.dir.join(format!("control-{date}.jsonl"));
-        verify_file(
-            date,
-            &path,
-            anchor.as_ref().map(|anchor| &anchor.entries),
-            key,
-            false,
-            &mut report,
-        );
-        if !report.ok() {
+        let expected_files = guard.verified_files.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "audit file metadata was not captured during integrity verification",
+            )
+        })?;
+        if audit_file_snapshot(&self.dir)? != *expected_files {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                format!(
-                    "live audit file integrity verification failed with {} break(s)",
-                    report.breaks.len()
-                ),
+                "audit files changed after integrity verification",
             ));
         }
         let entry = anchor
@@ -547,6 +577,7 @@ impl AuditLog {
         }
         remove_durable(&self.journal_path)?;
         guard.writer = None;
+        guard.verified_files = None;
         guard.verification_cache = None;
         Ok(())
     }
@@ -738,6 +769,97 @@ fn redact_args(command: &str, args: &Value) -> Value {
         // send_keys, close_terminal, and the Organization commands carry only
         // non-sensitive identifiers / key names - log them verbatim.
         _ => args.clone(),
+    }
+}
+
+fn audit_file_snapshot(dir: &Path) -> std::io::Result<BTreeMap<String, AuditFileStamp>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(date) = name
+            .strip_prefix("control-")
+            .and_then(|value| value.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        files.insert(date.to_string(), audit_file_stamp(&path)?);
+    }
+    Ok(files)
+}
+
+fn audit_file_stamp(path: &Path) -> std::io::Result<AuditFileStamp> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("audit path is not a regular file: {}", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(AuditFileStamp {
+            len: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO, FILE_ID_INFO,
+        };
+
+        let file = File::open(path)?;
+        let handle = HANDLE(file.as_raw_handle());
+        let mut basic = FILE_BASIC_INFO::default();
+        let mut identity = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                std::ptr::from_mut(&mut basic).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+            .map_err(std::io::Error::other)?;
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                std::ptr::from_mut(&mut identity).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        Ok(AuditFileStamp {
+            len: metadata.len(),
+            volume: identity.VolumeSerialNumber,
+            file_id: identity.FileId.Identifier,
+            changed: basic.ChangeTime,
+            modified: basic.LastWriteTime,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(AuditFileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
     }
 }
 
@@ -2404,12 +2526,60 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("live audit file integrity verification failed"),
+                    .contains("audit files changed after integrity verification"),
                 "{tamper}: {error}"
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
             clean(&dir);
         }
+    }
+
+    #[test]
+    fn live_process_authorization_rejects_historical_day_tampering() {
+        let dir = temp_dir("live-historical-day");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let mut guard = log.inner.lock().unwrap();
+        for date in ["20260724", "20260725"] {
+            log.record_locked(
+                &mut guard,
+                TEST_KEY,
+                date,
+                &format!("{date}T00:00:00Z"),
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": date}),
+                meta(),
+            )
+            .unwrap();
+        }
+        let historical_path = dir.join("control-20260724.jsonl");
+        let content = std::fs::read_to_string(&historical_path).unwrap();
+        std::fs::write(
+            &historical_path,
+            content.replace("\"sessionId\":\"20260724\"", "\"sessionId\":\"tampered\""),
+        )
+        .unwrap();
+
+        let error = log
+            .record_locked(
+                &mut guard,
+                TEST_KEY,
+                "20260725",
+                "20260725T00:00:01Z",
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "second"}),
+                meta(),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("audit files changed after integrity verification"));
+        drop(guard);
+        clean(&dir);
     }
 
     #[test]
