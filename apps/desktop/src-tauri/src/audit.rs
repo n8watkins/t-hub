@@ -319,6 +319,9 @@ impl AuditLog {
             guard.count = count;
             Some(path)
         } else {
+            if tier == "process-changing" && decision == "allowed" {
+                self.validate_live_writer(guard, key)?;
+            }
             None
         };
 
@@ -377,6 +380,51 @@ impl AuditLog {
         guard.count = count;
         guard.prev_hash = hash;
         guard.verification_cache = None;
+        Ok(())
+    }
+
+    fn validate_live_writer(&self, guard: &Inner, key: &[u8]) -> std::io::Result<()> {
+        let Some((date, _)) = &guard.writer else {
+            return Ok(());
+        };
+        let anchor = read_head_anchor(&self.head_path, key)?;
+        validate_checkpoint(anchor.as_ref(), self.checkpoint_for(guard))?;
+        let mut report = VerifyReport::default();
+        let path = self.dir.join(format!("control-{date}.jsonl"));
+        verify_file(
+            date,
+            &path,
+            anchor.as_ref().map(|anchor| &anchor.entries),
+            key,
+            false,
+            &mut report,
+        );
+        if !report.ok() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "live audit file integrity verification failed with {} break(s)",
+                    report.breaks.len()
+                ),
+            ));
+        }
+        let entry = anchor
+            .as_ref()
+            .and_then(|anchor| anchor.entries.get(date))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "live audit file is absent from the head anchor",
+                )
+            })?;
+        if entry.get("count").and_then(Value::as_u64) != Some(guard.count)
+            || entry.get("last").and_then(Value::as_str) != Some(guard.prev_hash.as_str())
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "live audit writer state does not match the durable head anchor",
+            ));
+        }
         Ok(())
     }
 
@@ -1398,18 +1446,10 @@ fn recover_record_append(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    let mut file = open_private_append(path)?;
     file.set_len(complete_len as u64)?;
     file.write_all(&complete_line)?;
     file.sync_data()?;
-    set_owner_only(path)?;
     Ok(())
 }
 
@@ -2322,6 +2362,54 @@ mod tests {
         assert!(error.to_string().contains("manifest MAC"));
         drop(guard);
         clean(&dir);
+    }
+
+    #[test]
+    fn live_process_authorization_rejects_modified_or_truncated_day_file() {
+        for tamper in ["modified", "truncated"] {
+            let dir = temp_dir(&format!("live-day-{tamper}"));
+            clean(&dir);
+            let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+            log.try_record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "first"}),
+                meta(),
+            )
+            .unwrap();
+            let path = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let original = std::fs::read_to_string(&path).unwrap();
+            let damaged = if tamper == "modified" {
+                original.replace("\"sessionId\":\"first\"", "\"sessionId\":\"other\"")
+            } else {
+                String::new()
+            };
+            std::fs::write(&path, &damaged).unwrap();
+
+            let error = log
+                .try_record(
+                    "close_terminal",
+                    "process-changing",
+                    "allowed",
+                    &json!({"sessionId": "second"}),
+                    meta(),
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("live audit file integrity verification failed"),
+                "{tamper}: {error}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
+            clean(&dir);
+        }
     }
 
     #[test]
