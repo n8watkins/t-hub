@@ -119,6 +119,9 @@ pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 pub const CORTANA_CODEX_TOOL_APPROVAL_OVERRIDE: &str =
     "mcp_servers.t-hub.tools.cortana_bootstrap.approval_mode=\"approve\"";
 const WSL_OBSERVATION_SHELL: &str = "/bin/sh";
+// Interactive login-shell startup can cold-load user tooling and WSL state.
+// Keep the probe bounded while leaving enough headroom for a loaded host.
+const LAUNCH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(any(windows, test))]
 fn wsl_observation_command() -> Command {
@@ -1498,9 +1501,12 @@ esac
             .arg(login_shell_override.unwrap_or_default());
         command
     };
-    let output =
-        crate::bounded_exec::output_with_timeout_and_limit(command, Duration::from_secs(2), 8192)
-            .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
+    let output = crate::bounded_exec::output_with_timeout_and_limit(
+        command,
+        LAUNCH_RESOLUTION_TIMEOUT,
+        8192,
+    )
+    .map_err(|_| LaunchAttestationError::UntrustedLaunchCommand)?;
     if !output.status.success() {
         return Err(LaunchAttestationError::UntrustedLaunchCommand);
     }
@@ -2576,7 +2582,9 @@ mod tests {
             {
                 continue;
             }
-            resolve_launch_executable_with_shell(provider, Some(shell)).unwrap();
+            resolve_launch_executable_with_shell(provider, Some(shell)).unwrap_or_else(|error| {
+                panic!("launch resolution failed through {shell}: {error}")
+            });
             tested.push(shell);
         }
         assert!(tested.iter().any(|shell| shell.ends_with("/bash")));
