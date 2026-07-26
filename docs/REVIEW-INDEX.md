@@ -39,6 +39,7 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 - [SMOKE-TEST.md](./SMOKE-TEST.md) is a useful regression checklist, but version-specific assertions must be checked against the current phased plan before use.
 - [AGENT-SESSION-SMOKE-0.3.106.md](./AGENT-SESSION-SMOKE-0.3.106.md) is a historical version-specific release smoke procedure.
   Use [PACKAGE-5-LIVE-ACCEPTANCE.md](./PACKAGE-5-LIVE-ACCEPTANCE.md) and [PACKAGE-6-PERFORMANCE-CLOSURE.md](./PACKAGE-6-PERFORMANCE-CLOSURE.md) for the current candidate's release and performance evidence.
+- [AUDIT-INTEGRITY-REVIEW-2026-07-26.md](./AUDIT-INTEGRITY-REVIEW-2026-07-26.md) records the fourteen audit-integrity gaps found while validating PR #80, their implemented corrections, regression evidence, and the accepted external rollback boundary.
 
 ## Historical Reviews and Shipped Plans
 
