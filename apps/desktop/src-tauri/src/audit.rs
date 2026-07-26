@@ -311,29 +311,34 @@ impl AuditLog {
     /// Verify this audit directory and its external head with the configured key.
     pub fn verify_self(&self) -> VerifyReport {
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let key = match self.key_for(&mut guard) {
-            Ok(key) => key,
-            Err(error) => {
-                return VerifyReport {
-                    breaks: vec![ChainBreak {
-                        file: self
-                            .key_path
-                            .as_deref()
-                            .unwrap_or_else(|| Path::new("<in-memory-key>"))
-                            .display()
-                            .to_string(),
-                        line: 0,
-                        kind: BreakKind::KeyUnavailable,
-                        detail: error.to_string(),
-                    }],
-                    ..VerifyReport::default()
-                };
-            }
+        let report = match self.key_for(&mut guard) {
+            Ok(key) => verify(&self.dir, &key),
+            Err(error) => VerifyReport {
+                breaks: vec![ChainBreak {
+                    file: self
+                        .key_path
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("<in-memory-key>"))
+                        .display()
+                        .to_string(),
+                    line: 0,
+                    kind: BreakKind::KeyUnavailable,
+                    detail: error.to_string(),
+                }],
+                ..VerifyReport::default()
+            },
         };
-        verify(&self.dir, &key)
+        if !report.ok() {
+            guard.writer = None;
+            guard.poisoned = Some(format!(
+                "integrity verification found {} break(s)",
+                report.breaks.len()
+            ));
+        }
+        report
     }
 
-    /// Verify at startup, report failures, and quarantine future audit writes.
+    /// Verify at startup and report failures.
     /// Read-only control remains available so operators can query the report.
     pub fn startup_integrity_check(&self) -> VerifyReport {
         let report = self.verify_self();
@@ -353,11 +358,6 @@ impl AuditLog {
                     audit_break.detail
                 );
             }
-            let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            guard.poisoned = Some(format!(
-                "startup integrity verification found {} break(s)",
-                report.breaks.len()
-            ));
         } else if report.legacy > 0 {
             eprintln!(
                 "t-hub-audit: integrity OK; {} valid legacy pre-v2 record(s) are unverifiable by the keyed scheme",
@@ -833,15 +833,25 @@ fn decode_audit_key(path: &Path, raw: &str) -> std::io::Result<Vec<u8>> {
 }
 
 fn open_private_append(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    let mut create_options = OpenOptions::new();
+    create_options.create_new(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        create_options.mode(0o600);
     }
-    let file = options.open(path)?;
+    let (file, created) = match create_options.open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            (OpenOptions::new().append(true).open(path)?, false)
+        }
+        Err(error) => return Err(error),
+    };
     set_owner_only(path)?;
+    if created {
+        file.sync_all()?;
+        sync_parent(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    }
     Ok(file)
 }
 
@@ -1333,6 +1343,46 @@ mod tests {
         let report = restarted.startup_integrity_check();
         assert!(!report.ok());
         let error = restarted
+            .try_record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "c"}),
+                meta(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("audit sink is quarantined"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn on_demand_tamper_check_quarantines_future_writes() {
+        let dir = temp_dir("on-demand-quarantine");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "a"}),
+            meta(),
+        );
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            content.replace("\"sessionId\":\"a\"", "\"sessionId\":\"b\""),
+        )
+        .unwrap();
+
+        let report = log.verify_self();
+        assert!(!report.ok());
+        let error = log
             .try_record(
                 "close_terminal",
                 "process-changing",
