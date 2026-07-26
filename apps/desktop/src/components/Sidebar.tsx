@@ -194,11 +194,11 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
           titlebar's LEFT cluster (see Titlebar.tsx LeftChrome), so the sidebar
           starts straight at its content and reclaims that vertical space. */}
 
-      {/* Body: two stacked sections - Workspaces (EVERY tab + its terminals; the
-          one navigation surface now) and provider-neutral History. Each grows and scrolls internally; the whole body scrolls as
-          a safety net on a short window. The old separate "Projects" section is
-          gone — a workspace's terminals live under it in Workspaces. */}
-      <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
+      {/* Body: Workspaces owns the flexible middle and scrolls internally, while
+          provider-neutral History stays visible at the bottom. The old shared
+          scrollbar let a long workspace list push the History header and rows
+          below the viewport, making an intact catalog look missing. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {/* Agents - the fleet hierarchy: the orchestrator (top) over the pinned
             captains, above Workspaces (command view over terrain view). Clicking
             an agent navigates to the reserved Captains workspace tab and focuses
@@ -239,7 +239,9 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
         <Section
           title="Workspaces"
           count={workspaceCount}
-          className="border-b"
+          className="min-h-0 flex-1 border-b"
+          fillBody
+          bodyClassName="th-scroll h-full min-h-0 overflow-y-auto"
           leading={
             onToggleSidebar ? (
               <button
@@ -293,7 +295,7 @@ function SidebarFull({ width, onToggleSidebar }: FullProps) {
         <Section
           title="History"
           count={historyCount}
-          className="border-b"
+          className="shrink-0 border-b"
           collapsible
           storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
@@ -884,6 +886,7 @@ function Section({
   storageKey,
   bodyClassName,
   bodyStyle,
+  fillBody = false,
   leading,
   action,
 }: {
@@ -899,6 +902,9 @@ function Section({
    *  scrolling region so a long list can't consume the whole sidebar. */
   bodyClassName?: string;
   bodyStyle?: React.CSSProperties;
+  /** Let the body consume the section's remaining height. Used by Workspaces so
+   *  its list scrolls without pushing the following History section offscreen. */
+  fillBody?: boolean;
   /** Optional control rendered before the title (non-collapsible sections only),
    *  e.g. the sidebar collapse toggle next to "Workspaces". */
   leading?: React.ReactNode;
@@ -944,7 +950,7 @@ function Section({
       {/* Animate open/close by transitioning the grid row 0fr↔1fr; the body
           stays mounted and the inner wrapper clips it as it collapses. */}
       <div
-        className="grid"
+        className={fillBody ? "grid min-h-0 flex-1" : "grid"}
         style={{
           gridTemplateRows: isOpen ? "1fr" : "0fr",
           transition: "grid-template-rows 200ms ease",

@@ -73,16 +73,18 @@ async function installTauriMock(page: Page): Promise<void> {
             };
           }
           if (args?.command === "history_list") {
-            return {
-              schemaVersion: 1,
-              generatedAt: new Date(0).toISOString(),
-              revision: "browser-fixture",
-              entries: [],
-              count: 0,
-              total: 0,
-              truncated: false,
-              sources: [],
-            };
+            return (
+              host.__BROWSER_HISTORY__ ?? {
+                schemaVersion: 1,
+                generatedAt: new Date(0).toISOString(),
+                revision: "browser-fixture",
+                entries: [],
+                count: 0,
+                total: 0,
+                truncated: false,
+                sources: [],
+              }
+            );
           }
           if (args?.command === "list_tabs") {
             return { seq: 0, activeTabId: null, tabs: [] };
@@ -434,6 +436,107 @@ test("measures all visible chrome across 1, 2, 4, 8, and 16 tile grids", async (
     await assertHeadersAreUsable(page, count);
     await screenshot(page, testInfo, `grid-${count}.png`);
   }
+});
+
+test("keeps History visible beside a long, cleanable workspace list", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 1100, height: 720 });
+  await page.addInitScript(() => {
+    const actions = {
+      focus: { status: "unavailable", reason: "Conversation is closed." },
+      resume: { status: "supported", reason: null },
+      recover: { status: "unavailable", reason: "Not required." },
+      archive: { status: "supported", reason: null },
+      unarchive: { status: "unavailable", reason: "Conversation is active." },
+    };
+    (
+      window as typeof window & { __BROWSER_HISTORY__?: unknown }
+    ).__BROWSER_HISTORY__ = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      revision: "sidebar-history-fixture",
+      entries: Array.from({ length: 4 }, (_, index) => ({
+        historyId: `history-${index}`,
+        harness: index % 2 === 0 ? "codex" : "claude",
+        provider: index % 2 === 0 ? "codex" : "claude",
+        providerSessionId: `provider-${index}`,
+        conversationId: `conversation-${index}`,
+        cwd: `/home/natkins/projects/history-${index}`,
+        projectId: null,
+        projectName: `History project ${index + 1}`,
+        captainId: null,
+        role: null,
+        workspaceId: null,
+        worktreeId: null,
+        branch: null,
+        label: `History E2E ${index + 1}`,
+        lastText: "A resumable browser fixture",
+        startedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+        continuityState: "resumable",
+        actions,
+      })),
+      count: 4,
+      total: 4,
+      truncated: false,
+      sources: [
+        { harness: "claude", status: "ready", reason: null },
+        { harness: "codex", status: "ready", reason: null },
+      ],
+    };
+  });
+  await installTauriMock(page);
+  await page.goto("/");
+  await expect(page.locator("body")).not.toHaveText("");
+
+  await page.evaluate(async () => {
+    const { CAPTAINS_TAB_ID, CAPTAINS_TAB_NAME, useWorkspace } =
+      await import("/src/store/workspace.ts");
+    const workspaces = Array.from({ length: 14 }, (_, index) => ({
+      id: `sidebar-work-${index}`,
+      name: `Workspace ${index + 1}`,
+      kind: "work" as const,
+      order: [],
+    }));
+    useWorkspace.setState({
+      tabs: [
+        ...workspaces,
+        {
+          id: CAPTAINS_TAB_ID,
+          name: CAPTAINS_TAB_NAME,
+          kind: "captain",
+          order: [],
+        },
+      ],
+      activeTabId: "sidebar-work-0",
+      focusedId: null,
+      terminals: {},
+      poppedOutTabs: [],
+    });
+  });
+
+  await expect(page.getByText("History E2E 1", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Close 13 empty workspaces" }),
+  ).toBeVisible();
+  const firstWorkspace = page.locator('[data-th-ws-row="sidebar-work-0"]');
+  const workspaceScroller = firstWorkspace
+    .locator("xpath=ancestor::section[1]")
+    .locator(".th-scroll");
+  await expect(firstWorkspace).toBeVisible();
+  expect(
+    await workspaceScroller.evaluate(
+      (element) => element.scrollHeight > element.clientHeight,
+    ),
+  ).toBe(true);
+
+  await page
+    .getByRole("button", { name: "Close 13 empty workspaces" })
+    .click();
+  await expect(page.locator("[data-th-ws-row]")).toHaveCount(1);
+  await expect(page.getByText("History E2E 1", { exact: true })).toBeVisible();
+  await screenshot(page, testInfo, "sidebar-history-visible.png");
 });
 
 test("renders deterministic identity, Git, status, and context variants", async ({

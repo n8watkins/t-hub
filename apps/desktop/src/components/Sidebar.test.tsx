@@ -115,6 +115,30 @@ describe("Sidebar History cap", () => {
     // The capped wrapper is the one holding the History list body.
     expect(capped!.querySelector('[data-testid="history-list"]')).toBeTruthy();
   });
+
+  it("keeps History outside the independently scrolling workspace list", () => {
+    useWorkspace.setState({
+      tabs: [
+        { id: "t1", name: "Workspace 1", order: ["cap00001"] },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          id: `empty-${index}`,
+          name: `Empty ${index}`,
+          order: [],
+        })),
+      ],
+    });
+    const { getByTestId } = render(<Sidebar mode="full" />);
+    const workspaces = getByTestId("workspaces-list");
+    const history = getByTestId("history-list");
+    const workspaceSection = workspaces.closest("section");
+    const historySection = history.closest("section");
+
+    expect(workspaceSection?.className).toContain("flex-1");
+    expect(workspaceSection?.className).toContain("min-h-0");
+    expect(workspaces.parentElement?.className).toContain("overflow-y-auto");
+    expect(historySection?.className).toContain("shrink-0");
+    expect(workspaces.parentElement?.contains(history)).toBe(false);
+  });
 });
 
 describe("Sidebar empty-workspace cleanup", () => {
