@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -124,7 +124,7 @@ struct Inner {
     writer: Option<(String, BufWriter<File>)>,
     prev_hash: String,
     count: u64,
-    verified_files: Option<BTreeMap<String, AuditFileStamp>>,
+    verified_files: Option<BTreeMap<String, VerifiedAuditFile>>,
     key_state: Option<Result<KeyState, String>>,
     poisoned: Option<String>,
     verification_cache: Option<(Instant, VerifyReport)>,
@@ -155,6 +155,12 @@ struct AuditFileStamp {
     modified: i64,
     #[cfg(not(any(unix, windows)))]
     modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedAuditFile {
+    stamp: AuditFileStamp,
+    content_hash: [u8; 32],
 }
 
 impl AuditFileStamp {
@@ -370,6 +376,7 @@ impl AuditLog {
                     ),
                 ));
             }
+            let before_verification = audit_file_snapshot(&self.dir)?;
             let report =
                 verify_with_checkpoint(&self.dir, &self.head_path, key, self.checkpoint_for(guard));
             if !report.ok() {
@@ -381,7 +388,14 @@ impl AuditLog {
                     ),
                 ));
             }
-            guard.verified_files = Some(audit_file_snapshot(&self.dir)?);
+            let verified_files = verified_audit_file_snapshot(&self.dir)?;
+            if verified_file_stamps(&verified_files) != before_verification {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "audit files changed during integrity verification",
+                ));
+            }
+            guard.verified_files = Some(verified_files);
             let path = self.dir.join(format!("control-{date}.jsonl"));
             let (seed, count) = last_hash_and_count(&path)?;
             guard.prev_hash = seed;
@@ -451,15 +465,12 @@ impl AuditLog {
         writer.get_ref().sync_data()?;
         let writer_stamp = audit_file_stamp_for_file(writer.get_ref())?;
         let path_stamp = audit_file_stamp(&path)?;
-        let appended_len = u64::try_from(line.len())
-            .ok()
-            .and_then(|len| len.checked_add(1))
-            .ok_or_else(|| std::io::Error::other("audit record length overflow"))?;
-        validate_append_transition(
+        let verified_file = validate_append_transition(
             previous_stamp.as_ref(),
             &writer_stamp,
             &path_stamp,
-            appended_len,
+            &path,
+            format!("{line}\n").as_bytes(),
         )?;
 
         write_private_atomic(&self.head_path, &serde_json::to_vec(&pending.head)?)?;
@@ -471,7 +482,7 @@ impl AuditLog {
             .verified_files
             .as_mut()
             .expect("audit files snapshotted before opening the writer")
-            .insert(date.to_string(), writer_stamp);
+            .insert(date.to_string(), verified_file);
         guard.verification_cache = None;
         Ok(())
     }
@@ -488,7 +499,7 @@ impl AuditLog {
                 "audit file metadata was not captured during integrity verification",
             )
         })?;
-        if audit_file_snapshot(&self.dir)? != *expected_files {
+        if audit_file_snapshot(&self.dir)? != verified_file_stamps(expected_files) {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "audit files changed after integrity verification",
@@ -852,6 +863,78 @@ fn audit_file_snapshot(dir: &Path) -> std::io::Result<BTreeMap<String, AuditFile
     Ok(files)
 }
 
+fn verified_audit_file_snapshot(
+    dir: &Path,
+) -> std::io::Result<BTreeMap<String, VerifiedAuditFile>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(date) = name
+            .strip_prefix("control-")
+            .and_then(|value| value.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        files.insert(date.to_string(), verified_audit_file(&path)?);
+    }
+    Ok(files)
+}
+
+fn verified_file_stamps(
+    files: &BTreeMap<String, VerifiedAuditFile>,
+) -> BTreeMap<String, AuditFileStamp> {
+    files
+        .iter()
+        .map(|(date, file)| (date.clone(), file.stamp.clone()))
+        .collect()
+}
+
+fn verified_audit_file(path: &Path) -> std::io::Result<VerifiedAuditFile> {
+    let path_stamp_before = audit_file_stamp(path)?;
+    let mut file = File::open(path)?;
+    let file_stamp_before = audit_file_stamp_for_file(&file)?;
+    if path_stamp_before != file_stamp_before {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit file changed while capturing authenticated content",
+        ));
+    }
+    let content_hash = hash_reader(&mut file)?;
+    let file_stamp_after = audit_file_stamp_for_file(&file)?;
+    let path_stamp_after = audit_file_stamp(path)?;
+    if file_stamp_after != file_stamp_before || path_stamp_after != file_stamp_before {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit file changed while capturing authenticated content",
+        ));
+    }
+    Ok(VerifiedAuditFile {
+        stamp: file_stamp_after,
+        content_hash,
+    })
+}
+
+fn hash_reader(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 fn audit_file_stamp(path: &Path) -> std::io::Result<AuditFileStamp> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -955,23 +1038,85 @@ fn audit_file_stamp_for_file(file: &File) -> std::io::Result<AuditFileStamp> {
 }
 
 fn validate_append_transition(
-    previous: Option<&AuditFileStamp>,
+    previous: Option<&VerifiedAuditFile>,
     writer: &AuditFileStamp,
     path: &AuditFileStamp,
-    appended_len: u64,
-) -> std::io::Result<()> {
+    audit_path: &Path,
+    appended: &[u8],
+) -> std::io::Result<VerifiedAuditFile> {
+    let appended_len = u64::try_from(appended.len())
+        .map_err(|_| std::io::Error::other("audit record length overflow"))?;
     let transition_valid = match previous {
-        Some(previous) => writer.is_exact_append_of(previous, appended_len),
+        Some(previous) => writer.is_exact_append_of(&previous.stamp, appended_len),
         None => writer.len == appended_len,
     };
-    if transition_valid && path == writer {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
+    if !transition_valid || path != writer {
+        return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "live audit file did not make the expected append transition",
-        ))
+        ));
     }
+
+    let mut file = File::open(audit_path)?;
+    if audit_file_stamp_for_file(&file)? != *writer {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file changed before append validation",
+        ));
+    }
+    let previous_len = previous.map_or(0, |previous| previous.stamp.len);
+    let mut prefix_hasher = Sha256::new();
+    let mut remaining = previous_len;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded audit read size fits usize");
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "live audit file ended inside its authenticated prefix",
+            ));
+        }
+        prefix_hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let mut full_hasher = prefix_hasher.clone();
+    let prefix_hash: [u8; 32] = prefix_hasher.finalize().into();
+    if previous.is_some_and(|previous| previous.content_hash != prefix_hash) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file authenticated prefix changed before append",
+        ));
+    }
+    let mut actual_append = vec![0_u8; appended.len()];
+    file.read_exact(&mut actual_append)?;
+    if actual_append != appended {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file does not contain the expected appended record",
+        ));
+    }
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file contains data after the expected append",
+        ));
+    }
+    full_hasher.update(appended);
+    let file_stamp_after = audit_file_stamp_for_file(&file)?;
+    let path_stamp_after = audit_file_stamp(audit_path)?;
+    if file_stamp_after != *writer || path_stamp_after != *writer {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file changed during append validation",
+        ));
+    }
+    Ok(VerifiedAuditFile {
+        stamp: file_stamp_after,
+        content_hash: full_hasher.finalize().into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1376,15 @@ fn verify_file(
             return;
         }
     };
+    if !content.is_empty() && !content.ends_with('\n') {
+        report.breaks.push(ChainBreak {
+            file: name,
+            line: content.lines().count(),
+            kind: BreakKind::Truncated,
+            detail: "nonempty audit file does not end with a newline".into(),
+        });
+        return;
+    }
 
     let mut prev = String::new();
     let mut count = 0_u64;
@@ -2529,6 +2683,39 @@ mod tests {
     }
 
     #[test]
+    fn missing_terminal_newline_is_detected_as_truncation() {
+        let dir = temp_dir("missing-terminal-newline");
+        clean(&dir);
+        {
+            let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+            log.record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "first"}),
+                meta(),
+            );
+        }
+
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut content = std::fs::read(&path).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        std::fs::write(&path, content).unwrap();
+
+        let report = verify(&dir, TEST_KEY);
+        assert!(report.breaks.iter().any(|audit_break| {
+            audit_break.kind == BreakKind::Truncated
+                && audit_break.detail.contains("does not end with a newline")
+        }));
+        clean(&dir);
+    }
+
+    #[test]
     fn whole_day_removal_is_detected_by_head_manifest() {
         let dir = temp_dir("whole-day-truncation");
         clean(&dir);
@@ -2783,7 +2970,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("control-20260725.jsonl");
         std::fs::write(&path, b"first\n").unwrap();
-        let previous = audit_file_stamp(&path).unwrap();
+        let previous = verified_audit_file(&path).unwrap();
 
         let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
         writer.write_all(b"second\n").unwrap();
@@ -2793,7 +2980,8 @@ mod tests {
             Some(&previous),
             &writer_stamp,
             &audit_file_stamp(&path).unwrap(),
-            7,
+            &path,
+            b"second\n",
         )
         .is_ok());
         drop(writer);
@@ -2802,10 +2990,41 @@ mod tests {
         std::fs::write(&path, vec![b'x'; writer_stamp.len as usize]).unwrap();
         let replacement_stamp = audit_file_stamp(&path).unwrap();
         assert_eq!(replacement_stamp.len, writer_stamp.len);
-        assert!(
-            validate_append_transition(Some(&previous), &writer_stamp, &replacement_stamp, 7,)
-                .is_err()
-        );
+        assert!(validate_append_transition(
+            Some(&previous),
+            &writer_stamp,
+            &replacement_stamp,
+            &path,
+            b"second\n",
+        )
+        .is_err());
+        clean(&dir);
+    }
+
+    #[test]
+    fn append_transition_rejects_same_length_prefix_tampering() {
+        let dir = temp_dir("modified-live-prefix");
+        clean(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-20260725.jsonl");
+        std::fs::write(&path, b"first\n").unwrap();
+        let previous = verified_audit_file(&path).unwrap();
+
+        std::fs::write(&path, b"other\n").unwrap();
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"second\n").unwrap();
+        writer.sync_data().unwrap();
+        let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
+
+        let error = validate_append_transition(
+            Some(&previous),
+            &writer_stamp,
+            &audit_file_stamp(&path).unwrap(),
+            &path,
+            b"second\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("authenticated prefix changed"));
         clean(&dir);
     }
 
