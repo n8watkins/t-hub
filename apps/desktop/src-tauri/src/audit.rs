@@ -228,7 +228,7 @@ struct HeadCheckpoint {
     manifest_mac: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct KeyState {
     key: Vec<u8>,
     sealed_key: String,
@@ -581,7 +581,16 @@ impl AuditLog {
             self.migrate_legacy_state_paths()?;
             guard.state_paths_migrated = true;
         }
-        if guard.key_state.is_none() {
+        if let Some(Ok(expected)) = guard.key_state.as_ref() {
+            let raw = std::fs::read_to_string(&self.key_path)?;
+            let persistent = decode_audit_key(&self.key_path, &raw, self.provided_key.as_deref())?;
+            if &persistent != expected {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "persistent audit key state changed after it was loaded",
+                ));
+            }
+        } else if guard.key_state.is_none() {
             guard.key_state = Some(
                 load_or_create_audit_key(&self.key_path, self.provided_key.as_deref())
                     .map_err(|error| error.to_string()),
@@ -601,18 +610,120 @@ impl AuditLog {
     }
 
     fn migrate_legacy_state_paths(&self) -> std::io::Result<()> {
-        migrate_legacy_file(&legacy_head_path_for(&self.dir), &self.head_path)?;
+        let legacy_head_path = legacy_head_path_for(&self.dir);
         let legacy_key_path = if self.key_path == key_path_for(&self.dir) {
-            let legacy_key_path = legacy_key_path_for(&self.dir);
-            migrate_legacy_file(&legacy_key_path, &self.key_path)?;
-            legacy_key_path
+            legacy_key_path_for(&self.dir)
         } else {
             self.key_path.clone()
         };
-        migrate_legacy_file(
-            &legacy_journal_path_for(&legacy_key_path),
-            &self.journal_path,
-        )
+        let legacy_journal_path = legacy_journal_path_for(&legacy_key_path);
+        let migrations = [
+            (&legacy_head_path, &self.head_path),
+            (&legacy_key_path, &self.key_path),
+            (&legacy_journal_path, &self.journal_path),
+        ];
+        let sources_exist = migrations
+            .iter()
+            .map(|(source, destination)| source != destination && source.exists())
+            .collect::<Vec<_>>();
+        if !sources_exist.iter().any(|exists| *exists) {
+            return Ok(());
+        }
+        let destinations_complete = migrations
+            .iter()
+            .zip(&sources_exist)
+            .all(|((_, destination), source_exists)| !source_exists || destination.exists());
+        if destinations_complete {
+            let raw = std::fs::read_to_string(&self.key_path).map_err(|error| {
+                legacy_migration_error(&format!(
+                    "the migrated key state at {} cannot be read: {error}",
+                    self.key_path.display()
+                ))
+            })?;
+            let state = decode_audit_key(&self.key_path, &raw, self.provided_key.as_deref())
+                .map_err(|error| {
+                    legacy_migration_error(&format!(
+                        "the migrated key state at {} is invalid: {error}",
+                        self.key_path.display()
+                    ))
+                })?;
+            let report = verify_with_checkpoint(
+                &self.dir,
+                &self.head_path,
+                &state.key,
+                state.checkpoint.as_ref(),
+            );
+            if report.ok() {
+                return Ok(());
+            }
+            return Err(legacy_migration_error(&format!(
+                "the migrated destination state does not authenticate {} ({} integrity break(s))",
+                self.dir.display(),
+                report.breaks.len()
+            )));
+        }
+        if legacy_journal_path != self.journal_path && legacy_journal_path.exists() {
+            return Err(legacy_migration_error(
+                "a pending legacy transaction must be resolved by the previous version",
+            ));
+        }
+
+        let raw = std::fs::read_to_string(&legacy_key_path).map_err(|error| {
+            legacy_migration_error(&format!(
+                "the legacy key state at {} cannot be read: {error}",
+                legacy_key_path.display()
+            ))
+        })?;
+        let state = decode_audit_key(&legacy_key_path, &raw, self.provided_key.as_deref())
+            .map_err(|error| {
+                legacy_migration_error(&format!(
+                    "the legacy key state at {} is invalid: {error}",
+                    legacy_key_path.display()
+                ))
+            })?;
+        let report = verify_with_checkpoint(
+            &self.dir,
+            &legacy_head_path,
+            &state.key,
+            state.checkpoint.as_ref(),
+        );
+        if !report.ok() {
+            return Err(legacy_migration_error(&format!(
+                "the legacy state does not authenticate {} ({} integrity break(s))",
+                self.dir.display(),
+                report.breaks.len()
+            )));
+        }
+
+        let mut claimants = Vec::new();
+        for candidate in legacy_migration_candidates(&self.dir, &legacy_head_path)? {
+            let report = verify_with_checkpoint(
+                &candidate,
+                &legacy_head_path,
+                &state.key,
+                state.checkpoint.as_ref(),
+            );
+            if report.ok() {
+                claimants.push(candidate);
+            }
+        }
+        if claimants.len() != 1 || claimants.first() != Some(&self.dir) {
+            return Err(legacy_migration_error(&format!(
+                "legacy state ownership is ambiguous across: {}",
+                claimants
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        for ((source, destination), source_exists) in migrations.into_iter().zip(sources_exist) {
+            if source_exists {
+                migrate_legacy_file(source, destination)?;
+            }
+        }
+        Ok(())
     }
 
     fn checkpoint_for<'a>(&self, guard: &'a Inner) -> Option<&'a HeadCheckpoint> {
@@ -628,6 +739,7 @@ impl AuditLog {
         guard: &mut Inner,
         checkpoint: HeadCheckpoint,
     ) -> std::io::Result<()> {
+        self.key_for(guard)?;
         let state = guard
             .key_state
             .as_mut()
@@ -2211,7 +2323,15 @@ fn migrate_legacy_file(legacy_path: &Path, path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     match std::fs::symlink_metadata(path) {
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            if std::fs::read(path)? == std::fs::read(legacy_path)? {
+                return Ok(());
+            }
+            return Err(legacy_migration_error(&format!(
+                "destination {} already contains different state",
+                path.display()
+            )));
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -2225,6 +2345,38 @@ fn migrate_legacy_file(legacy_path: &Path, path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn legacy_migration_candidates(
+    dir: &Path,
+    legacy_head_path: &Path,
+) -> std::io::Result<BTreeSet<PathBuf>> {
+    let mut candidates = BTreeSet::from([dir.to_path_buf()]);
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidates),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let candidate = entry.path();
+            if legacy_head_path_for(&candidate) == legacy_head_path {
+                candidates.insert(candidate);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn legacy_migration_error(detail: &str) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "audit state migration refused: {detail}; legacy files were preserved, remove ambiguity or restart the previous version to repair them"
+        ),
+    )
 }
 
 fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
@@ -2696,10 +2848,7 @@ mod tests {
         let dev = base.join("audit.dev");
         let prod = base.join("audit.prod");
 
-        assert_eq!(
-            head_path_for(&dev),
-            append_path_suffix(&dev, ".head.json")
-        );
+        assert_eq!(head_path_for(&dev), append_path_suffix(&dev, ".head.json"));
         assert_eq!(key_path_for(&dev), append_path_suffix(&dev, ".key.json"));
         assert_ne!(head_path_for(&dev), head_path_for(&prod));
         assert_ne!(key_path_for(&dev), key_path_for(&prod));
@@ -2717,23 +2866,80 @@ mod tests {
     fn state_paths_migrate_legacy_files_before_use() {
         let base = temp_dir("state-migration");
         let dir = base.join("audit.dev");
-        let head = legacy_head_path_for(&dir);
-        let key = legacy_key_path_for(&dir);
-        let journal = legacy_journal_path_for(&key);
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(&head, b"head").unwrap();
-        std::fs::write(&key, b"key").unwrap();
-        std::fs::write(&journal, b"journal").unwrap();
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "owned"}),
+            meta(),
+        )
+        .unwrap();
+        drop(log);
+        let head = std::fs::read(head_path_for(&dir)).unwrap();
+        let key = std::fs::read(key_path_for(&dir)).unwrap();
+        std::fs::write(legacy_head_path_for(&dir), &head).unwrap();
+        std::fs::write(legacy_key_path_for(&dir), &key).unwrap();
+        std::fs::remove_file(head_path_for(&dir)).unwrap();
+        std::fs::remove_file(key_path_for(&dir)).unwrap();
 
         let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
         log.migrate_legacy_state_paths().unwrap();
 
-        assert_eq!(std::fs::read(head_path_for(&dir)).unwrap(), b"head");
-        assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), b"key");
-        assert_eq!(
-            std::fs::read(journal_path_for(&key_path_for(&dir))).unwrap(),
-            b"journal"
-        );
+        assert_eq!(std::fs::read(head_path_for(&dir)).unwrap(), head);
+        assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), key);
+        assert!(legacy_head_path_for(&dir).exists());
+        assert!(legacy_key_path_for(&dir).exists());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "after-migration"}),
+            meta(),
+        )
+        .unwrap();
+        drop(log);
+        let restarted = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        assert!(restarted.verify_self().ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn state_path_migration_rejects_ambiguous_legacy_ownership() {
+        let base = temp_dir("ambiguous-state-migration");
+        let dev = base.join("audit.dev");
+        let prod = base.join("audit.prod");
+        let log = AuditLog::with_key(dev.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "shared"}),
+            meta(),
+        )
+        .unwrap();
+        drop(log);
+        std::fs::create_dir_all(&prod).unwrap();
+        let file_name = std::fs::read_dir(&dev)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        std::fs::copy(dev.join(&file_name), prod.join(file_name)).unwrap();
+        std::fs::rename(head_path_for(&dev), legacy_head_path_for(&dev)).unwrap();
+        std::fs::rename(key_path_for(&dev), legacy_key_path_for(&dev)).unwrap();
+
+        let log = AuditLog::with_key(dev.clone(), TEST_KEY.to_vec());
+        let error = log.migrate_legacy_state_paths().unwrap_err();
+
+        assert!(error.to_string().contains("ownership is ambiguous"));
+        assert!(error.to_string().contains(&dev.display().to_string()));
+        assert!(error.to_string().contains(&prod.display().to_string()));
+        assert!(legacy_head_path_for(&dev).exists());
+        assert!(legacy_key_path_for(&dev).exists());
+        assert!(!head_path_for(&dev).exists());
+        assert!(!key_path_for(&dev).exists());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -3027,6 +3233,110 @@ mod tests {
             audit_break.kind == BreakKind::HeadTampered
                 && audit_break.detail.contains("protected checkpoint")
         }));
+        clean(&dir);
+    }
+
+    #[test]
+    fn live_write_rejects_deleted_persistent_key_state() {
+        let dir = temp_dir("live-key-deletion");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        )
+        .unwrap();
+        std::fs::remove_file(key_path_for(&dir)).unwrap();
+
+        let error = log
+            .try_record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "second"}),
+                meta(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(!key_path_for(&dir).exists());
+        assert_eq!(read_lines(&dir).len(), 1);
+        clean(&dir);
+    }
+
+    #[test]
+    fn live_write_rejects_corrupted_persistent_key_state() {
+        let dir = temp_dir("live-key-corruption");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        )
+        .unwrap();
+        std::fs::write(key_path_for(&dir), b"corrupted").unwrap();
+
+        let error = log
+            .try_record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "second"}),
+                meta(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), b"corrupted");
+        assert_eq!(read_lines(&dir).len(), 1);
+        clean(&dir);
+    }
+
+    #[test]
+    fn live_write_rejects_rolled_back_persistent_checkpoint() {
+        let dir = temp_dir("live-key-rollback");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        )
+        .unwrap();
+        let old_state = std::fs::read(key_path_for(&dir)).unwrap();
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "second"}),
+            meta(),
+        )
+        .unwrap();
+        std::fs::write(key_path_for(&dir), &old_state).unwrap();
+
+        let error = log
+            .try_record(
+                "close_terminal",
+                "process-changing",
+                "allowed",
+                &json!({"sessionId": "third"}),
+                meta(),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("persistent audit key state changed"));
+        assert_eq!(std::fs::read(key_path_for(&dir)).unwrap(), old_state);
+        assert_eq!(read_lines(&dir).len(), 2);
         clean(&dir);
     }
 
