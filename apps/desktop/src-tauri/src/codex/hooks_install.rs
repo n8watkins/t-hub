@@ -112,6 +112,7 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
     }
     #[cfg(windows)]
     {
+        let _ = agent_bin;
         let distro = wsl_distro();
         let home = wsl_home(&distro)?;
         Ok(RuntimePaths {
@@ -151,22 +152,9 @@ pub fn codex_home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("could not resolve Codex home"))
 }
 
-#[cfg(windows)]
-pub fn codex_home() -> Result<PathBuf> {
-    let distro = wsl_distro();
-    let home = wsl_home(&distro)?;
-    wsl_posix_to_unc(&distro, &format!("{home}/.codex"))
-}
-
 #[cfg(unix)]
 pub fn requirements_path() -> PathBuf {
     PathBuf::from("/etc/codex/requirements.toml")
-}
-
-#[cfg(windows)]
-pub fn requirements_path() -> PathBuf {
-    wsl_posix_to_unc(&wsl_distro(), "/etc/codex/requirements.toml")
-        .expect("the fixed Codex requirements path is a valid POSIX path")
 }
 
 #[cfg(windows)]

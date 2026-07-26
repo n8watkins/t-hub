@@ -1439,6 +1439,7 @@ finally:
         os.close(descriptor)
 "##;
 
+#[cfg(unix)]
 const KNOWN_PYTHON_CANDIDATES: [&str; 2] = ["/usr/bin/python3", "/bin/python3"];
 
 #[cfg(unix)]
@@ -2016,7 +2017,7 @@ finally:
     os.close(directory)
 "##;
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 const WINDOWS_MANAGED_CGROUP_HELPERS_PER_EFFECT: usize = 1;
 
 #[cfg(any(windows, test))]

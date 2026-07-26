@@ -4,17 +4,22 @@
 //! Process reservation, durable identity, bounded output, endpoint ownership,
 //! and cleanup remain the caller's responsibility.
 
+#[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::Path;
 
 use parking_lot::Mutex;
 
-use super::endpoint::{ListenerOwnership, ManagedRunIdentity};
+#[cfg(target_os = "linux")]
+use super::endpoint::ListenerOwnership;
+#[cfg(any(target_os = "linux", test))]
+use super::endpoint::ManagedRunIdentity;
 use super::model::{PreviewPackageManager, PreviewTarget, PreviewTargetKind};
 use super::supervisor::prepare_confined_supervised_preview_command;
 pub(crate) use super::supervisor::{prepare_supervised_preview_command, PreparedPreviewCommand};
 
 const MAX_MANAGED_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_PROC_STAT_BYTES: u64 = 4096;
 
 #[derive(Default)]
