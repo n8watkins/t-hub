@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1073,7 +1073,25 @@ fn validate_append_transition(
         ));
     }
     let previous_len = previous.map_or(0, |previous| previous.stamp.len);
-    file.seek(SeekFrom::Start(previous_len))?;
+    let mut authenticated_prefix = Sha256::new();
+    {
+        let mut prefix = (&mut file).take(previous_len);
+        std::io::copy(&mut prefix, &mut authenticated_prefix)?;
+        if prefix.limit() != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "live audit file is shorter than its authenticated prefix",
+            ));
+        }
+    }
+    if previous.is_some_and(|previous| {
+        authenticated_prefix.finalize() != previous.content_hasher.clone().finalize()
+    }) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "live audit file authenticated prefix changed during append",
+        ));
+    }
     let mut actual_append = vec![0_u8; appended.len()];
     file.read_exact(&mut actual_append)?;
     if actual_append != appended {
@@ -3031,6 +3049,36 @@ mod tests {
         let writer = OpenOptions::new().append(true).open(&path).unwrap();
         let error = validate_pre_append_state(Some(&previous), &writer, &path).unwrap_err();
         assert!(error.to_string().contains("changed before append"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn append_transition_rejects_prefix_tampering_after_pre_append_validation() {
+        let dir = temp_dir("modified-prefix-during-append");
+        clean(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-20260725.jsonl");
+        std::fs::write(&path, b"first\n").unwrap();
+        let previous = verified_audit_file(&path).unwrap();
+        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        validate_pre_append_state(Some(&previous), &writer, &path).unwrap();
+
+        std::fs::write(&path, b"other\n").unwrap();
+        writer.write_all(b"second\n").unwrap();
+        writer.sync_data().unwrap();
+        let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
+        let error = validate_append_transition(
+            Some(&previous),
+            &writer_stamp,
+            &audit_file_stamp(&path).unwrap(),
+            &path,
+            b"second\n",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("authenticated prefix changed during append"));
         clean(&dir);
     }
 
