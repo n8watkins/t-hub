@@ -433,6 +433,11 @@ int main(int argc, char **argv) {
         if (argc >= 3) write_marker(argv[2]);
         for (;;) sleep(1);
     }
+    if (argc >= 2 && strcmp(argv[1], "same-group") == 0) {
+        if (argc < 4) return 19;
+        execl(argv[3], "codex", "changed", argv[2], (char *)0);
+        return 20;
+    }
     if (argc < 3) return 2;
     signal(SIGTTOU, SIG_IGN);
     if (setpgid(0, 0) != 0 && errno != EACCES && getpgrp() != getpid()) return 8;
@@ -16662,7 +16667,7 @@ fn delayed_node_wrapper_attestation_case(trusted_child: bool) {
     let child_marker = script_dir.join("child-start");
     let child_spawn = if trusted_child {
         format!(
-            "spawn({}, ['foreign-first', {}, {}], {{ stdio: 'inherit' }});",
+            "spawn({}, ['same-group', {}, {}], {{ stdio: 'inherit' }});",
             serde_json::to_string(&executable).unwrap(),
             serde_json::to_string(&child_marker).unwrap(),
             serde_json::to_string(&trusted_native).unwrap(),
@@ -16843,18 +16848,30 @@ fn delayed_node_wrapper_attestation_case(trusted_child: bool) {
         &fake
     };
     let child_exe = std::fs::metadata(child_executable).unwrap();
-    loop {
+    if trusted_child {
         let effect = tmux::observe_session_effect_identity(&target).unwrap();
         let foreground_exe =
             std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
-        if foreground_exe.dev() == child_exe.dev() && foreground_exe.ino() == child_exe.ino() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "delayed provider child never became the foreground generation"
+        assert_eq!(foreground_exe.dev(), expected.executable.device);
+        assert_eq!(foreground_exe.ino(), expected.executable.inode);
+        assert_ne!(
+            (foreground_exe.dev(), foreground_exe.ino()),
+            (child_exe.dev(), child_exe.ino())
         );
-        std::thread::sleep(Duration::from_millis(20));
+    } else {
+        loop {
+            let effect = tmux::observe_session_effect_identity(&target).unwrap();
+            let foreground_exe =
+                std::fs::metadata(format!("/proc/{}/exe", effect.foreground_pid)).unwrap();
+            if foreground_exe.dev() == child_exe.dev() && foreground_exe.ino() == child_exe.ino() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delayed provider child never became the foreground generation"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     let child_observation = crate::harness::observe_scoped_harness_process(
         &target,
