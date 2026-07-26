@@ -21793,6 +21793,8 @@ fn socket_process_change_is_refused_before_side_effect_when_audit_sink_fails() {
         std::thread::sleep(Duration::from_millis(25));
     }
     let side_effect_happened = sentinel.exists();
+    println!("CONTROL_RESPONSE {response}");
+    println!("SIDE_EFFECT_SENTINEL_EXISTS {side_effect_happened}");
 
     let _ = tmux::kill_session(&target);
     let _ = std::fs::remove_file(&sentinel);
@@ -23921,6 +23923,10 @@ fn audit_verify_reports_live_integrity_to_a_read_token() {
         dispatch_authenticated(&ctx, req("read-audit-verify", "audit_verify", json!({})));
     assert!(response.ok);
     let report = response.result.unwrap();
+    println!(
+        "AUDIT_VERIFY_RESPONSE {}",
+        json!({"ok": true, "result": report})
+    );
     assert_eq!(report["ok"], true);
     assert_eq!(report["records"], 1);
     assert_eq!(report["breaks"], json!([]));

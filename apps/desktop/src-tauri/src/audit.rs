@@ -1647,6 +1647,15 @@ mod tests {
         assert_eq!(lines[1]["prev"], lines[0]["hash"]);
         assert_eq!(lines[2]["prev"], lines[1]["hash"]);
         let report = verify(&dir, TEST_KEY);
+        println!(
+            "AUDIT_RECORDS {}",
+            serde_json::to_string(&lines).unwrap()
+        );
+        println!(
+            "EXTERNAL_HEAD {}",
+            std::fs::read_to_string(head_path_for(&dir)).unwrap()
+        );
+        println!("VERIFY_REPORT {}", report.to_json());
         assert!(report.ok(), "{:?}", report.breaks);
         assert_eq!(report.records, 3);
         clean(&dir);
@@ -1703,6 +1712,7 @@ mod tests {
         .unwrap();
 
         let report = verify(&dir, TEST_KEY);
+        println!("UNKEYED_FORGERY_VERIFY_REPORT {}", report.to_json());
         assert!(!report.ok());
         assert!(report
             .breaks
@@ -1739,6 +1749,7 @@ mod tests {
         std::fs::write(&path, format!("{first}\n")).unwrap();
 
         let report = verify(&dir, TEST_KEY);
+        println!("TRUNCATION_VERIFY_REPORT {}", report.to_json());
         assert!(
             report
                 .breaks
@@ -1987,6 +1998,7 @@ mod tests {
 
         let restarted = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
         let report = restarted.startup_integrity_check();
+        println!("STARTUP_VERIFY_REPORT {}", report.to_json());
         assert!(!report.ok());
         let error = restarted
             .try_record(
@@ -2027,6 +2039,7 @@ mod tests {
         .unwrap();
 
         let report = log.verify_self();
+        println!("ON_DEMAND_VERIFY_REPORT {}", report.to_json());
         assert!(!report.ok());
         let error = log
             .try_record(
@@ -2131,6 +2144,14 @@ mod tests {
         let path = dir.join("audit-hmac-key");
         let first = load_or_create_audit_key(&path, None).unwrap();
         let second = load_or_create_audit_key(&path, None).unwrap();
+        println!(
+            "PERSISTENT_KEY {}",
+            json!({
+                "bytes": first.key.len(),
+                "reused": first.key == second.key,
+                "storedOutsideAuditLog": true,
+            })
+        );
         assert_eq!(first.key.len(), AUDIT_KEY_BYTES);
         assert_eq!(first.key, second.key);
         #[cfg(unix)]
