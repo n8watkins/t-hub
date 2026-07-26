@@ -2323,6 +2323,27 @@ pub(crate) struct SpawnAdmissionGuard<'a> {
     _capacity: crate::governor::CapacityReport,
 }
 
+enum GovernorAdmission<'a> {
+    None,
+    Spawn {
+        _guard: SpawnAdmissionGuard<'a>,
+        governor: &'a crate::governor::SpawnGovernor,
+    },
+    Destructive {
+        governor: &'a crate::governor::SpawnGovernor,
+    },
+}
+
+impl GovernorAdmission<'_> {
+    fn rollback(self) {
+        match self {
+            Self::None => {}
+            Self::Spawn { governor, .. } => governor.refund_spawn(),
+            Self::Destructive { governor } => governor.refund_destructive(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -3035,6 +3056,15 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
         .ok();
 
     Ok(handshake)
+}
+
+pub fn recover_pending_fleet_operations_after_audit_check(ctx: &ControlContext) -> bool {
+    if !ctx.audit.startup_integrity_check().ok() {
+        eprintln!("t-hub-audit: startup recovery skipped because audit integrity is unavailable");
+        return false;
+    }
+    recover_pending_fleet_operations(ctx);
+    true
 }
 
 /// Resolve the optional REMOTE bind address (M2b), or `None` to stay loopback-only.
@@ -5297,13 +5327,13 @@ fn governor_gate<'a>(
     args: &Value,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
-) -> Result<Option<SpawnAdmissionGuard<'a>>, crate::governor::Refusal> {
+) -> Result<GovernorAdmission<'a>, crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
         // start_agent owns the same admission guard inside its implementation so
         // direct test/internal calls cannot bypass the atomic check. Cortana only
         // reserves when reconciliation actually needs a replacement runtime.
-        "start_agent" | "reconcile_cortana" => Ok(None),
+        "start_agent" | "reconcile_cortana" => Ok(GovernorAdmission::None),
         // A durable delegated administrator reaches only the maintenance-only
         // create_worktree handler, which cannot create a tab, identity, terminal,
         // capability, or Crew record. Do not consume or require spawn evidence for
@@ -5313,7 +5343,7 @@ fn governor_gate<'a>(
             if caller
                 .is_some_and(|identity| has_delegated_admin_history(ctx, &identity.session_id)) =>
         {
-            Ok(None)
+            Ok(GovernorAdmission::None)
         }
         "spawn_terminal" | "create_worktree" | "add_worktree_workspace" => {
             let purpose = requested_spawn_purpose(command, args, caller, trusted_internal)?;
@@ -5321,13 +5351,28 @@ fn governor_gate<'a>(
                 arg_str(args, "_providerHarness").is_some()
                     || arg_str(args, "providerIntent").is_some(),
             );
-            admit_spawn(ctx, purpose, requested_provider_lanes, None).map(Some)
+            admit_spawn(ctx, purpose, requested_provider_lanes, None).map(|guard| {
+                GovernorAdmission::Spawn {
+                    _guard: guard,
+                    governor: &ctx.governor,
+                }
+            })
         }
-        "close_terminal" => ctx.governor.check_destructive(now).map(|()| None),
+        "close_terminal" => {
+            ctx.governor
+                .check_destructive(now)
+                .map(|()| GovernorAdmission::Destructive {
+                    governor: &ctx.governor,
+                })
+        }
         "send_keys" if keys_are_kill_style(args) => {
-            ctx.governor.check_destructive(now).map(|()| None)
+            ctx.governor
+                .check_destructive(now)
+                .map(|()| GovernorAdmission::Destructive {
+                    governor: &ctx.governor,
+                })
         }
-        _ => Ok(None),
+        _ => Ok(GovernorAdmission::None),
     }
 }
 
@@ -5878,7 +5923,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         req.command.as_str(),
         "create_worktree" | "add_worktree_workspace"
     );
-    let _spawn_admission =
+    let governor_admission =
         if tier == CommandTier::ProcessChanging || spawn_producing_organization_command {
             match governor_gate(
                 ctx,
@@ -5911,7 +5956,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                 }
             }
         } else {
-            None
+            GovernorAdmission::None
         };
 
     // A process-changing command must have a durable authorization record before
@@ -5920,6 +5965,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // release any idempotency reservation and refuse the command.
     if tier == CommandTier::ProcessChanging {
         if let Err(audit_error) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
+            governor_admission.rollback();
             if let Some(id) = &request_id {
                 ctx.requests.cancel_reserved(
                     id,

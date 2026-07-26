@@ -438,6 +438,10 @@ impl TokenBucket {
             false
         }
     }
+
+    fn give_back(&mut self) {
+        self.tokens = (self.tokens + 1.0).min(self.capacity);
+    }
 }
 
 /// The fleet spawn governor. Cloneable-by-`Arc` and shared across every
@@ -964,6 +968,14 @@ impl SpawnGovernor {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn refund_spawn(&self) {
+        self.spawn.lock().unwrap().give_back();
+    }
+
+    pub(crate) fn refund_destructive(&self) {
+        self.destructive.lock().unwrap().give_back();
     }
 }
 

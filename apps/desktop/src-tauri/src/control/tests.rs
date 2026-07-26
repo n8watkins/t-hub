@@ -21851,6 +21851,83 @@ fn audit_refusal_releases_idempotency_reservation_for_retry() {
 }
 
 #[test]
+fn audit_refusal_refunds_governor_admission() {
+    let broken_sink = || {
+        let sink_parent = std::env::temp_dir().join(format!(
+            "t-hub-audit-governor-failure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&sink_parent, b"not a directory").unwrap();
+        sink_parent
+    };
+
+    let spawn_sink = broken_sink();
+    let spawn_ctx = test_ctx("audit-spawn-refund")
+        .with_governor(Arc::new(SpawnGovernor::new(128, 0.0, 1.0)))
+        .with_audit(Arc::new(AuditLog::new(spawn_sink.join("audit"))));
+    let response = dispatch_authenticated(
+        &spawn_ctx,
+        req(
+            "audit-spawn-refund",
+            "spawn_terminal",
+            json!({"cwd": "/tmp"}),
+        ),
+    );
+    assert!(response
+        .error
+        .unwrap_or_default()
+        .contains("audit sink unavailable"));
+    assert!(
+        admit_spawn(&spawn_ctx, SpawnPurpose::Ordinary, 0, None).is_ok(),
+        "an audit refusal consumed the sole spawn-rate token"
+    );
+    let _ = std::fs::remove_file(&spawn_sink);
+
+    let destructive_sink = broken_sink();
+    let destructive_ctx = test_ctx("audit-destructive-refund")
+        .with_audit(Arc::new(AuditLog::new(destructive_sink.join("audit"))));
+    let response = dispatch_authenticated(
+        &destructive_ctx,
+        req(
+            "audit-destructive-refund",
+            "send_keys",
+            json!({"sessionId": "ghost", "keys": ["C-C"]}),
+        ),
+    );
+    assert!(response
+        .error
+        .unwrap_or_default()
+        .contains("audit sink unavailable"));
+    for _ in 0..crate::governor::DESTRUCTIVE_BURST as usize {
+        assert!(
+            destructive_ctx
+                .governor
+                .check_destructive(std::time::Instant::now())
+                .is_ok(),
+            "an audit refusal consumed destructive-rate quota"
+        );
+    }
+    let _ = std::fs::remove_file(&destructive_sink);
+}
+
+#[test]
+fn audit_integrity_failure_skips_startup_recovery() {
+    let sink_parent = std::env::temp_dir().join(format!(
+        "t-hub-audit-startup-recovery-failure-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&sink_parent, b"not a directory").unwrap();
+    let ctx = test_ctx("audit-startup-recovery")
+        .with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
+
+    assert!(
+        !recover_pending_fleet_operations_after_audit_check(&ctx),
+        "startup recovery ran without a successful integrity check"
+    );
+    let _ = std::fs::remove_file(&sink_parent);
+}
+
+#[test]
 fn spawn_rate_limit_refuses_with_exact_message_and_audits() {
     // Burst 1: the first spawn spends the only token; the second is refused with
     // the exact §5 message and recorded as `refused-rate`.

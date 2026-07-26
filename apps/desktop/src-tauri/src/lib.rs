@@ -379,7 +379,7 @@ fn start_control_listener(
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz)
         .with_delegated_admin(delegated_admin);
-    control::recover_pending_fleet_operations(&ctx);
+    control::recover_pending_fleet_operations_after_audit_check(&ctx);
     // The local webview spawn command shares the exact same admission lock and
     // capacity evidence as the control listener. Keeping a cloned context as
     // managed state prevents the UI path from racing or bypassing fleet reserves.
