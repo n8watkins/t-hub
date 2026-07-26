@@ -2,7 +2,7 @@
 //! This implements the durable audit requirements in
 //! `docs/SOCKET-AUTH-DESIGN.md` section 6.
 //!
-//! Gives the aspirational `"audited": true` flag a real sink.
+//! Provides the real sink behind the `"audited": true` contract.
 //! Organization-tier commands and authenticated governor refusals are recorded
 //! best-effort, while ProcessChanging authorization must be recorded durably
 //! before dispatch.
