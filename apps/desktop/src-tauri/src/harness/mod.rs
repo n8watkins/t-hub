@@ -1029,7 +1029,12 @@ observed_pid=$foreground_pid
 if [ "$trusted_child_device:$trusted_child_inode" != "0:0" ]; then
     trusted_child_pid=
     for candidate_pid in $(ps -eo pid=,pgid= | awk -v expected="$foreground_pid" '$2 == expected { print $1 }'); do
-        set -- $(stat -Lc '%d %i' "/proc/$candidate_pid/exe")
+        candidate_exe="/proc/$candidate_pid/exe"
+        candidate_identity=$(stat -Lc '%d %i' "$candidate_exe" 2>/dev/null) || {
+            [ ! -e "$candidate_exe" ] && continue
+            exit 23
+        }
+        set -- $candidate_identity
         [ "$#" -eq 2 ]
         case "$1:$2" in *[!0-9:]*) exit 23;; esac
         if [ "$1:$2" = "$trusted_child_device:$trusted_child_inode" ]; then
@@ -3378,6 +3383,8 @@ mod tests {
             .unwrap();
         assert!(syntax.success());
         assert!(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT.contains("pinned_processes"));
+        assert!(ATOMIC_SCOPED_HARNESS_OBSERVATION_SCRIPT
+            .contains("[ ! -e \"$candidate_exe\" ] && continue"));
 
         let (foreground, scoped) =
             parse_atomic_scoped_harness_observation(&atomic_scoped_harness_fixture()).unwrap();
