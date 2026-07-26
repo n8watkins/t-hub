@@ -83,4 +83,36 @@ describe("workspace restart reconciliation", () => {
       { id: CAPTAINS_TAB_ID, tileIds: ["active"] },
     ]);
   });
+
+  it("prunes a tabless persisted Captain at the authoritative startup boundary", () => {
+    seed([
+      { id: "work", name: "Workspace", order: ["work-live"] },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: CAPTAINS_TAB_NAME,
+        order: ["active"],
+      },
+    ]);
+
+    useWorkspace.getState().adoptRegistry([
+      { id: "work", name: "Workspace", kind: "work", tileIds: ["work-live"] },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: CAPTAINS_TAB_NAME,
+        kind: "captain",
+        tileIds: ["active"],
+      },
+    ]);
+    useCaptain
+      .getState()
+      .adoptCaptainsRegistry([], { authoritativeStartup: true });
+
+    expect(useCaptain.getState().captainIds).toEqual([]);
+    expect(useCaptain.getState().activeCaptainId).toBeNull();
+    expect(useCaptain.getState().orchestratorId).toBeNull();
+    expect(JSON.parse(localStorage.getItem("t-hub.captain.v2")!)).toMatchObject({
+      captainIds: [],
+      orchestratorId: null,
+    });
+  });
 });

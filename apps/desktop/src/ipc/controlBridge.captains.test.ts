@@ -243,5 +243,7 @@ describe("bootstrapCaptains", () => {
     expect(
       controlRequests.some((r) => r.command === "claim_captain"),
     ).toBe(false);
+    expect(useCaptain.getState().captainIds).toEqual([]);
+    expect(useCaptain.getState().activeCaptainId).toBeNull();
   });
 });

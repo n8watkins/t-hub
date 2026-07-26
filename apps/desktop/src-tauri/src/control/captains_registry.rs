@@ -1686,11 +1686,10 @@ impl CaptainsRegistry {
             workspace.tile_ids.retain(|tile| !gone.contains(tile));
         }
         for captain in &mut current.captains {
-            if captain.role != FleetRole::Cortana
-                && captain
-                    .terminal_id
-                    .as_ref()
-                    .is_some_and(|terminal| gone.contains(terminal))
+            if captain
+                .terminal_id
+                .as_ref()
+                .is_some_and(|terminal| gone.contains(terminal))
             {
                 captain.state = ClaimState::Orphaned { since: now };
                 captain.terminal_id = None;

@@ -6155,6 +6155,57 @@ fn startup_prune_reconciles_gone_managed_tiles_and_preserves_live_crew() {
 }
 
 #[test]
+fn startup_prune_orphans_a_gone_cortana_before_projection() {
+    let path = captains_tmp("startup-gone-cortana-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .claim(
+            "cortana-gone",
+            None,
+            FleetRole::Cortana,
+            None,
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.prune_gone_workspace_tiles(|_| false).unwrap(),
+        vec!["cortana-gone".to_string()]
+    );
+    let snapshot = registry.snapshot();
+    let cortana = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .unwrap();
+    assert!(matches!(cortana.state, ClaimState::Orphaned { .. }));
+    assert!(cortana.terminal_id.is_none());
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let cortana = restarted
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| captain.role == FleetRole::Cortana)
+        .unwrap();
+    assert!(matches!(cortana.state, ClaimState::Orphaned { .. }));
+    assert!(cortana.terminal_id.is_none());
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn startup_prune_preserves_cleanup_recovery_without_restoring_crew_tile() {
     let path = captains_tmp("startup-cleanup-pending-tile-prune");
     let source = powder_lifecycle_registry(None);

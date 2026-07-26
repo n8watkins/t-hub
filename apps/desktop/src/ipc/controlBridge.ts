@@ -221,7 +221,10 @@ let captainsBootstrapping = false;
  *  captain store (records missing arrays coerce to empty - the store renders
  *  from whatever the server sent). Returns true when adopted. Exported for the
  *  reconciliation tests (the seq guard + the A1 empty guard). */
-export function adoptCaptainsSnapshot(sync: unknown): boolean {
+export function adoptCaptainsSnapshot(
+  sync: unknown,
+  options?: { authoritativeStartup?: boolean },
+): boolean {
   if (!sync || typeof sync !== "object") return false;
   const { seq, captains } = sync as { seq?: unknown; captains?: unknown };
   if (typeof seq !== "number" || !Array.isArray(captains)) return false;
@@ -299,7 +302,7 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
       state: r.state,
     });
   }
-  useCaptain.getState().adoptCaptainsRegistry(records);
+  useCaptain.getState().adoptCaptainsRegistry(records, options);
   return true;
 }
 
@@ -572,7 +575,7 @@ export async function bootstrapCaptains(): Promise<void> {
     const finalRes = missing.length
       ? ((await controlRequest("list_captains")) as typeof res)
       : res;
-    adoptCaptainsSnapshot(finalRes);
+    adoptCaptainsSnapshot(finalRes, { authoritativeStartup: true });
   } catch {
     // Not under Tauri or the control channel is down - locally persisted
     // designations stand until a sync_captains forward arrives.
