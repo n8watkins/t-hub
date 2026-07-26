@@ -15,7 +15,7 @@ mod tmux;
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
 pub mod agent_session; // Powder-independent durable agent-session contract
-mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
+mod audit; // keyed, locally checkpointed control-socket audit log (socket-gate Phase 1)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
@@ -342,7 +342,7 @@ fn start_control_listener(
 
     // item-3 §2.1.1 piece 3+4: ONE shared audit sink for BOTH the control server and
     // the Tauri UI spawn path (`commands::spawn_terminal`), so a UI control-spawn
-    // appends to the SAME hash-chained log rather than a second writer that would
+    // appends to the SAME keyed audit chain rather than a second writer that would
     // fork the chain. Managed on the app so `commands` can record against it.
     let audit = std::sync::Arc::new(crate::audit::AuditLog::from_env());
     {
@@ -379,7 +379,7 @@ fn start_control_listener(
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz)
         .with_delegated_admin(delegated_admin);
-    control::recover_pending_fleet_operations(&ctx);
+    control::recover_pending_fleet_operations_after_audit_check(&ctx);
     // The local webview spawn command shares the exact same admission lock and
     // capacity evidence as the control listener. Keeping a cloned context as
     // managed state prevents the UI path from racing or bypassing fleet reserves.
@@ -448,6 +448,10 @@ fn devbuild_env_defaults(dev_home: &std::path::Path) -> Vec<(&'static str, std::
         ),
         ("T_HUB_INBOX_DIR", dev_home.join("inbox").into_os_string()),
         ("T_HUB_AUDIT_DIR", dev_home.join("audit").into_os_string()),
+        (
+            "T_HUB_AUDIT_KEY_FILE",
+            dev_home.join("audit-key.json").into_os_string(),
+        ),
         (
             "T_HUB_SERVER_KEY_FILE",
             dev_home.join("server-key").into_os_string(),
@@ -525,6 +529,7 @@ mod devbuild_isolation_tests {
             "T_HUB_DELEGATED_ADMIN_FILE",
             "T_HUB_INBOX_DIR",
             "T_HUB_AUDIT_DIR",
+            "T_HUB_AUDIT_KEY_FILE",
             "T_HUB_SERVER_KEY_FILE",
             "T_HUB_SERVER_READ_KEY_FILE",
             "T_HUB_VOICE_FILE",

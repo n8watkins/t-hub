@@ -467,6 +467,11 @@ impl EventFanout {
         id
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_test_subscriber(&self, writer: TcpStream) -> u64 {
+        self.register(writer)
+    }
+
     /// Drop a subscriber by id (called when its connection closes cleanly). A
     /// subscriber whose socket errors mid-stream is also pruned lazily by the next
     /// [`emit_event`](Self::emit_event), so this is the prompt path, not the only one.
@@ -2323,6 +2328,27 @@ pub(crate) struct SpawnAdmissionGuard<'a> {
     _capacity: crate::governor::CapacityReport,
 }
 
+enum GovernorAdmission<'a> {
+    None,
+    Spawn {
+        _guard: Box<SpawnAdmissionGuard<'a>>,
+        governor: &'a crate::governor::SpawnGovernor,
+    },
+    Destructive {
+        governor: &'a crate::governor::SpawnGovernor,
+    },
+}
+
+impl GovernorAdmission<'_> {
+    fn rollback(self) {
+        match self {
+            Self::None => {}
+            Self::Spawn { governor, .. } => governor.refund_spawn(),
+            Self::Destructive { governor } => governor.refund_destructive(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -2501,6 +2527,45 @@ impl ControlContext {
         provider_lanes: usize,
     ) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
         admit_spawn(self, SpawnPurpose::Ordinary, provider_lanes, None)
+    }
+
+    pub(crate) fn authorize_ui_spawn(
+        &self,
+        provider_lanes: usize,
+        args: &Value,
+    ) -> Result<SpawnAdmissionGuard<'_>, String> {
+        let admission = self
+            .admit_ui_spawn(provider_lanes)
+            .map_err(|refusal| refusal.message)?;
+        if let Err(audit_error) = self.audit.try_record(
+            "spawn_terminal",
+            CommandTier::ProcessChanging.label(),
+            "allowed",
+            args,
+            AuditMeta {
+                peer: "loopback",
+                token_tier: "control",
+                session: None,
+                spawned_by: None,
+                error: None,
+            },
+        ) {
+            self.governor.refund_spawn();
+            eprintln!(
+                "t-hub-audit: refusing Tauri UI spawn because the audit sink is unavailable: {audit_error}"
+            );
+            let message = "refused: audit sink unavailable; 'spawn_terminal' was not executed";
+            self.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": "spawn_terminal",
+                    "decision": "refused-audit",
+                    "error": message,
+                }),
+            );
+            return Err(message.into());
+        }
+        Ok(admission)
     }
 }
 
@@ -2977,6 +3042,19 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     };
     write_handshake(&handshake)?;
 
+    let integrity = ctx.audit.startup_integrity_check();
+    if !integrity.ok() {
+        ctx.fanout.emit_event(
+            "control://audit",
+            &json!({
+                "event": "integrity-check-failed",
+                "breaks": integrity.breaks.len(),
+                "records": integrity.records,
+                "files": integrity.files,
+            }),
+        );
+    }
+
     // Opt-in ADDITIONAL bind for REMOTE access (server-split M2b). GATED — default
     // OFF, so the §8 loopback-only boundary holds unless explicitly enabled. When
     // set, a second listener serves the same dispatch; `handle_conn` restricts peers
@@ -3022,6 +3100,15 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
         .ok();
 
     Ok(handshake)
+}
+
+pub fn recover_pending_fleet_operations_after_audit_check(ctx: &ControlContext) -> bool {
+    if !ctx.audit.startup_integrity_check().ok() {
+        eprintln!("t-hub-audit: startup recovery skipped because audit integrity is unavailable");
+        return false;
+    }
+    recover_pending_fleet_operations(ctx);
+    true
 }
 
 /// Resolve the optional REMOTE bind address (M2b), or `None` to stay loopback-only.
@@ -5089,7 +5176,7 @@ pub(crate) fn crew_credential_withholding_env() -> Vec<(String, String)> {
     env
 }
 
-/// Emit a hash-chained audit record for a control-capability spawn (item-3 §2.1.1
+/// Emit a keyed audit record for a control-capability spawn (item-3 §2.1.1
 /// piece 4: "a control-spawn is never silent"). A distinct `control-spawn` decision
 /// with `tokenTier: control` so a log review enumerates exactly who was elevated and
 /// by whom (the `spawnedBy` meta). Read-tier spawns (the least-privilege default) are
@@ -5284,13 +5371,13 @@ fn governor_gate<'a>(
     args: &Value,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
-) -> Result<Option<SpawnAdmissionGuard<'a>>, crate::governor::Refusal> {
+) -> Result<GovernorAdmission<'a>, crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
         // start_agent owns the same admission guard inside its implementation so
         // direct test/internal calls cannot bypass the atomic check. Cortana only
         // reserves when reconciliation actually needs a replacement runtime.
-        "start_agent" | "reconcile_cortana" => Ok(None),
+        "start_agent" | "reconcile_cortana" => Ok(GovernorAdmission::None),
         // A durable delegated administrator reaches only the maintenance-only
         // create_worktree handler, which cannot create a tab, identity, terminal,
         // capability, or Crew record. Do not consume or require spawn evidence for
@@ -5300,7 +5387,7 @@ fn governor_gate<'a>(
             if caller
                 .is_some_and(|identity| has_delegated_admin_history(ctx, &identity.session_id)) =>
         {
-            Ok(None)
+            Ok(GovernorAdmission::None)
         }
         "spawn_terminal" | "create_worktree" | "add_worktree_workspace" => {
             let purpose = requested_spawn_purpose(command, args, caller, trusted_internal)?;
@@ -5308,13 +5395,28 @@ fn governor_gate<'a>(
                 arg_str(args, "_providerHarness").is_some()
                     || arg_str(args, "providerIntent").is_some(),
             );
-            admit_spawn(ctx, purpose, requested_provider_lanes, None).map(Some)
+            admit_spawn(ctx, purpose, requested_provider_lanes, None).map(|guard| {
+                GovernorAdmission::Spawn {
+                    _guard: Box::new(guard),
+                    governor: &ctx.governor,
+                }
+            })
         }
-        "close_terminal" => ctx.governor.check_destructive(now).map(|()| None),
+        "close_terminal" => {
+            ctx.governor
+                .check_destructive(now)
+                .map(|()| GovernorAdmission::Destructive {
+                    governor: &ctx.governor,
+                })
+        }
         "send_keys" if keys_are_kill_style(args) => {
-            ctx.governor.check_destructive(now).map(|()| None)
+            ctx.governor
+                .check_destructive(now)
+                .map(|()| GovernorAdmission::Destructive {
+                    governor: &ctx.governor,
+                })
         }
-        _ => Ok(None),
+        _ => Ok(GovernorAdmission::None),
     }
 }
 
@@ -5480,6 +5582,27 @@ fn audit_command(
     decision: &str,
     error: Option<&str>,
 ) {
+    if decision.starts_with("refused-")
+        && !ctx.governor.admit_refusal_audit(std::time::Instant::now())
+    {
+        return;
+    }
+    if let Err(audit_error) = try_audit_command(ctx, req, tier, cap, decision, error) {
+        eprintln!(
+            "t-hub-audit: failed to write audit record for '{}': {audit_error}",
+            req.command
+        );
+    }
+}
+
+fn try_audit_command(
+    ctx: &ControlContext,
+    req: &ControlRequest,
+    tier: CommandTier,
+    cap: Capability,
+    decision: &str,
+    error: Option<&str>,
+) -> std::io::Result<()> {
     let session = req
         .args
         .get("sessionId")
@@ -5490,7 +5613,7 @@ fn audit_command(
         .get("spawnedBy")
         .or_else(|| req.args.get("spawned_by"))
         .and_then(|v| v.as_str());
-    ctx.audit.record(
+    ctx.audit.try_record(
         &req.command,
         tier.label(),
         decision,
@@ -5507,7 +5630,7 @@ fn audit_command(
             spawned_by,
             error,
         },
-    );
+    )
 }
 
 /// Resolve capability, gate + audit, then dispatch. A bad token is rejected before
@@ -5517,8 +5640,10 @@ fn audit_command(
 /// command's [`required_tier`] must be covered by that capability, else refuse
 /// `refused-authz` and audit it; (3) for ProcessChanging the fleet governor runs
 /// (Phase 1, refuse-past-ceiling); (4) dispatch. Every Organization/ProcessChanging
-/// command - allowed or refused - lands in the audit log with its `tokenTier`, and
-/// a refusal is mirrored live onto the event fanout.
+/// command is offered to the audit log with its `tokenTier`, and a refusal is
+/// mirrored live onto the event fanout.
+/// ProcessChanging authorization is durably recorded before dispatch; other
+/// records remain best-effort.
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
     // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
     // token carried on the request (`req.session`), if any. IDENTIFICATION only
@@ -5699,6 +5824,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
     }
 
+    if req.command == "audit_verify" {
+        return ControlResponse::ok(ctx.audit.verify_self_cached().to_json());
+    }
+
     if matches!(req.command.as_str(), "spawn_terminal" | "create_worktree") {
         if let Err(error) = enforce_public_spawn_contract(
             &req.command,
@@ -5845,7 +5974,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         req.command.as_str(),
         "create_worktree" | "add_worktree_workspace"
     );
-    let _spawn_admission =
+    let governor_admission =
         if tier == CommandTier::ProcessChanging || spawn_producing_organization_command {
             match governor_gate(
                 ctx,
@@ -5878,8 +6007,41 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                 }
             }
         } else {
-            None
+            GovernorAdmission::None
         };
+
+    // A process-changing command must have a durable authorization record before
+    // its side effect begins.
+    // If the keyed log, authenticated manifest/checkpoint, or integrity state is
+    // unavailable, release any idempotency reservation and refuse the command.
+    if tier == CommandTier::ProcessChanging {
+        if let Err(audit_error) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
+            governor_admission.rollback();
+            if let Some(id) = &request_id {
+                ctx.requests.cancel_reserved(
+                    id,
+                    request_reservation.expect("reserved id reaches audit gate"),
+                );
+            }
+            eprintln!(
+                "t-hub-audit: refusing process-changing command '{}' because the audit sink is unavailable: {audit_error}",
+                req.command
+            );
+            let message = format!(
+                "refused: audit sink unavailable; '{}' was not executed",
+                req.command
+            );
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": "refused-audit",
+                    "error": message.as_str(),
+                }),
+            );
+            return ControlResponse::err(message);
+        }
+    }
 
     // Dispatch, then record the outcome under the requestId (if any) so a later
     // retry replays exactly this result. `finish` returns the outcome back. The caller
@@ -5922,9 +6084,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         Err(e) => ControlResponse::err(e),
     };
 
-    // Audit every Organization + ProcessChanging command on the allowed path,
-    // capturing the dispatch outcome. Read-tier commands are not audited.
-    if tier != CommandTier::Read {
+    // Organization commands remain best-effort and are recorded after dispatch so
+    // their downstream outcome is available.
+    // Process-changing authorization was durably recorded before dispatch above.
+    if tier == CommandTier::Organization {
         let err = if response.ok {
             None
         } else {
@@ -11868,7 +12031,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_provider_capacity(
+    pub(crate) fn with_provider_capacity(
         mut self,
         provider_capacity: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
     ) -> Self {
@@ -11895,7 +12058,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_provider_live_sessions(
+    pub(crate) fn with_provider_live_sessions(
         mut self,
         provider_live_sessions: impl Fn(&[String]) -> Result<usize, String> + Send + Sync + 'static,
     ) -> Self {
@@ -11904,7 +12067,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_live_sessions(
+    pub(crate) fn with_live_sessions(
         mut self,
         live_sessions: impl Fn() -> Result<Vec<String>, String> + Send + Sync + 'static,
     ) -> Self {

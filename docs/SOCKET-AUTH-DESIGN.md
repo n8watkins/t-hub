@@ -1,6 +1,6 @@
 # Control-Socket Authorization Design
 
-Status: DESIGN - awaiting captain + general review. Do NOT implement until the go is given.
+Status: ACTIVE REFERENCE - phases 1 through 3 are implemented; the optional phase 3 extensions remain open.
 Author: crew `socket-gate` (ship t-hub-native).
 Scope: server-side authorization tier, fleet spawn budget, audit trail, and migration for the T-Hub control socket.
 
@@ -8,14 +8,14 @@ Scope: server-side authorization tier, fleet spawn budget, audit trail, and migr
 
 ## 1. Threat model
 
-### What the socket is
+### What the socket was before this design
 
 The control socket (`apps/desktop/src-tauri/src/control.rs`) is a newline-delimited-JSON (NDJSON) request/response channel.
 It binds `127.0.0.1:0` (ephemeral loopback port) by default, with an opt-in Tailscale remote bind (`T_HUB_BIND_TAILSCALE=1` / `T_HUB_CONTROL_BIND`) gated OFF by default (`control.rs:1137`, `1152-1208`).
 Every session in the fleet - crews, captains, the orchestrator, the MCP server, and the probe scripts - reaches the app through this one socket.
 It is the substrate the whole org model runs on: spawning crews, typing into them, and killing them all flow through here.
 
-### The one credential today
+### The original single credential
 
 A single per-launch UUID token (`ControlContext.token`, `control.rs:1034`) gates every command.
 It is minted by `control::persistent_key()` (`control.rs:1089`) or overridden by `T_HUB_CONTROL_TOKEN` (`lib.rs:256`), and published to `~/.t-hub/control.json` (mode 0600 on unix, `control.rs:1113-1127`).
@@ -24,21 +24,22 @@ Authentication is a single constant-time compare in `dispatch_authenticated()` (
 There is exactly one authorization state: **you have the token, or you do not.**
 A holder of the token can `spawn_terminal`, `send_text`, `send_keys`, and `close_terminal` (`control.rs:1918-1921`) with no server-side confirmation, no budget, and no rate limit.
 
-### The critical gap
+### The original critical gap
 
 `confirmationRequired` is a **client-side MCP annotation only** (`t-hub-mcp/src/tools.rs:84`).
 It decorates the tool description a well-behaved MCP client shows; it is never checked by the server.
 Any raw-socket caller that read the token from `~/.t-hub/control.json` bypasses the annotation entirely and gets full spawn/type/kill power.
-The response bodies claim `"audited": true` (`control.rs:3216-3235`, `3269`, `3305`, `3343`) but **no audit sink exists** - the flag is aspirational.
+At the time of this design, response bodies claimed `"audited": true` without an audit sink.
+Section 6 owns the implemented audit contract.
 
-### Adversary and the attack we must stop
+### Adversary and the attack that motivated this design
 
 The realistic adversary is not an outsider without the token.
 It is a **legitimate, permissionless token-holder induced by prompt injection**.
 The orchestrator (and crews) routinely read untrusted content - web pages, terminal output, git diffs, tool results - any of which can carry an injection payload.
-A payload that says "spawn 200 sessions" or "close every terminal" would, today, execute fleet-wide with no human checkpoint and no ceiling, because the token-holder is trusted absolutely.
+A payload that said "spawn 200 sessions" or "close every terminal" could execute fleet-wide with no human checkpoint or ceiling because the token-holder was trusted absolutely.
 
-Two distinct harms:
+The design addressed two distinct harms:
 
 1. **Blast radius / runaway** - unbounded `spawn_terminal` (resource exhaustion, fork-bomb-by-agent) or unbounded `close_terminal` (fleet wipe). No cap exists.
 2. **Privilege breadth** - every session that can read (monitoring, a crew tailing logs) also holds full kill power, because there is only one token. The injection surface and the dangerous capability are held by the same credential.
@@ -58,7 +59,7 @@ The goal is narrower and achievable: **bound the blast radius of injection-drive
 
 ---
 
-## 2. Current architecture (verified map)
+## 2. Pre-implementation architecture (historical baseline)
 
 | Concern | Where | Notes |
 | --- | --- | --- |
@@ -82,7 +83,7 @@ Two facts drive the whole design:
 
 ---
 
-## 3. Recommended gate: capability-scoped tokens that descend the spawn tree
+## 3. Implemented gate: capability-scoped tokens that descend the spawn tree
 
 ### The idea
 
@@ -186,19 +187,29 @@ Keep the bad-token message byte-for-byte identical to today (`unauthorized: bad 
 
 ## 6. Audit trail with teeth
 
-The `"audited": true` flag is currently a lie; give it a sink.
+The `"audited": true` flag requires a real enforcement-backed sink.
 
-- **What**: an append-only JSONL log at `~/.t-hub/audit/control-YYYYMMDD.jsonl` (0600), one line per Organization/Organization-destructive/ProcessChanging command AND per refusal.
-- **Fields**: `ts`, `command`, `tier`, `decision` (`allowed` | `refused-authz` | `refused-cap` | `refused-rate` | `refused-ceiling`), `sessionId`/`target`, `spawnedBy`, `peer` (`loopback` | tailnet-ip), `tokenTier` (`read` | `control`), and a **redacted** args summary. For `send_text`, log `text` length + a hash, NOT the literal content (it can carry secrets/prompts). For `send_keys`, log the key names (they are not sensitive and are exactly what we want to see for kill patterns).
+- **What**: append-only JSONL logs at `~/.t-hub/audit/control-YYYYMMDD.jsonl`, with bounded `control-YYYYMMDD-NNNNNN.jsonl` continuation segments (0600).
+  Organization outcomes are recorded best-effort, ProcessChanging authorization is recorded before dispatch, and authenticated refusals are recorded best-effort through a bounded refusal-audit rate limit.
+- **Fields**: `ts`, `command`, `tier`, `decision` (`allowed` or a specific `refused-*` gate outcome), `phase` for pre-dispatch authorization, `sessionId`/`target`, `spawnedBy`, `peer` (`loopback` | tailnet-ip), `tokenTier` (`read` | `control`), and a **redacted** args summary.
+  For `send_text`, log `text` length + a hash, not the literal content because it can carry secrets or prompts.
+  For `send_keys`, log the key names because they are the kill-pattern signal.
 - **Teeth, concretely**:
   1. It is the **enforcement input**, not just a record - the governor's counters and the rate buckets are the same data the log captures, so "what the log says happened" and "what the gate allowed" cannot diverge.
-  2. **Tamper-evident**: chain each line with a running hash of the previous line, so a truncation or edit is detectable.
+  2. **Keyed tamper evidence**: authenticate each version 2 record and its previous-record link with HMAC-SHA256 under a persistent key stored outside the log directory.
+     The key state lives at `~/.t-hub/audit-hmac-key`; Windows seals the key with current-user DPAPI, while Unix relies on owner-only `0600` permissions and therefore does not protect against a same-user attacker who can read the key.
+     Anchor every day's record count and final hash in the authenticated `~/.t-hub/audit.head.json` manifest, and commit the latest manifest generation in the protected key state, so tail truncation, whole-day removal, and signed manifest rollback are detectable.
+     Verify the chain at startup and through the read-tier `audit_verify` command.
   3. **Live signal**: mirror refusals (and optionally spawns) onto the existing event fanout (`control.rs:999`) so the captain overlay can surface fleet pressure and denials as they happen.
-- **Where**: write from `dispatch_authenticated` after the decision, so allowed and refused paths both land. Batch/fsync to avoid per-command sync cost; a small buffered writer behind a mutex is enough at fleet command rates.
+  4. **Fail closed**: durably sync the record, head manifest, and protected checkpoint before a ProcessChanging side effect.
+     Refuse the command and release its idempotency reservation if that durable write fails.
+     Skip startup fleet-operation recovery when the startup integrity check fails.
+- **Where**: write ProcessChanging authorization from `dispatch_authenticated` before dispatch.
+  Keep Organization records best-effort after dispatch so their downstream outcome is available.
 
 ---
 
-## 7. Migration
+## 7. Historical migration
 
 The design is deliberately staged so nothing breaks on day one.
 
@@ -213,24 +224,24 @@ The design is deliberately staged so nothing breaks on day one.
 1. **Phase 1 (budget + audit)**: no token change at all. Existing single token keeps full power. Callers are untouched. Only new behavior is *refusal past a ceiling*, which within normal orchestration is never hit. Ship first.
 2. **Phase 2 (tiering, backward-compatible)**: mint `read_token` in addition to the existing token; treat the **existing `token` field in `control.json` as the `control_token`** (full power) for now. Add a new `read_token` field to `control.json`. Every current caller that reads `token` keeps full power - zero breakage. New read-only consumers are pointed at `read_token`.
 3. **Phase 2b (least-privilege adoption)**: teach the app to inject `T_HUB_CONTROL_TOKEN=<control_token>` into the sessions it elevates (orchestrator, captains) at spawn time - the env channel already exists on both ends (`lib.rs:256`, `control_client.rs:66`). Crews it spawns for pure work get `read_token` unless the captain elevates them. `spawnedBy` can now be sanity-checked against whether the caller even holds control-tier.
-4. **Phase 3 (hardening flip, config-gated, default OFF)**: stop publishing `control_token` to `control.json` (publish only `read_token` there); require the control capability to arrive via env down the spawn tree. This is the step that actually closes the "scrape control.json -> full power" hole, so it is gated behind a config flag and rolled out once Phase 2b adoption is verified across probes, MCP, and the app. Provide a documented migration note for any external script that assumed `control.json.token` was omnipotent.
+4. **Phase 3 (hardening flip)**: stop publishing `control_token` to `control.json` (publish only `read_token` there); require a scoped control capability to arrive through an authenticated lease or trusted in-process channel.
+   This closes the "scrape control.json -> full power" hole and is now the permanent behavior.
 
 At every phase, `T_HUB_CONTROL_TOKEN` remains the universal override for test harnesses and the dev proof.
 
 ---
 
-## 8. Phased delivery
+## 8. Historical phased delivery
 
 | Phase | Content | Safety | Breaks anything? |
 | --- | --- | --- | --- |
 | **1** | Fleet spawn budget + rate/destructive limits + audit-log-with-teeth. | Additive; refuse-past-ceiling only. | No (within normal orchestration bursts). |
 | **2** | Capability-scoped tokens; table-driven `required_tier` gate at `dispatch_authenticated`; publish `read_token`; existing token stays full-power. | Backward-compatible. | No. |
 | **2b** | App injects `control_token` via env into elevated sessions; new read consumers use `read_token`; audit `tokenTier`. | Opt-in least-privilege. | No. |
-| **3** | Config-gated flip: `control.json` publishes read-only; control capability only via the spawn tree. Optional narrow elevated-confirm for destructive-beyond-budget. Optional per-captain identity tokens at `claim_captain`. | The real hardening; gated OFF by default. | Only for callers assuming `control.json.token` is omnipotent - documented + migrated in 2b. |
+| **3** | `control.json` publishes read-only; control capability is acquired through a scoped lease or trusted in-process channel. Optional narrow elevated-confirm for destructive-beyond-budget. | The permanent hardening boundary. | Callers that assumed `control.json.token` was omnipotent must use the authenticated capability flow. |
 
-Ship 1 immediately (it is the blast-radius cap and stands alone).
-Land 2 + 2b together so tiering and least-privilege adoption move as one.
-Hold 3 behind a flag until adoption is proven.
+The core delivery sequence is complete.
+The narrow elevated-confirm extension remains optional.
 
 ---
 
@@ -239,10 +250,10 @@ Hold 3 behind a flag until adoption is proven.
 - **Budget too tight breaks legitimate fan-out.** The org model fans out 3-6 children/level, sometimes several levels near-simultaneously. Mitigation: burst >= 8, sustained 20/min, all env-overridable; log near-limit; size from real captain/general behavior before shipping, and watch the audit log during rollout.
 - **Concurrent-count drift** (sessions dying without `close_terminal`). Mitigation: derive concurrent from the authoritative session/tab registry and reconcile on every spawn, never a free-running counter.
 - **Timing leak from multi-token compare.** Mitigation: constant-time compare against every candidate token, no early return; derive tier from the matched one.
-- **Tier flip breaks probes/external scripts** that assumed `control.json.token` = omnipotent. Mitigation: Phase 3 is config-gated and default OFF; `token` stays full-power through Phase 2; documented migration note; `T_HUB_CONTROL_TOKEN` override always available.
+- **Tier flip breaks probes/external scripts** that assumed `control.json.token` = omnipotent. Mitigation: ambient discovery is intentionally read-only; privileged callers use authenticated scoped leases or the trusted in-process credential channel.
 - **Elevated-confirm breaking autonomy** if scoped too broadly. Mitigation: it is Phase 3 and narrow - only destructive-beyond-budget, never the common in-budget spawn path.
 - **Same-user ceiling.** None of this defeats an attacker with code-exec as the user (they can read env/process memory of an elevated session). Documented as accepted (§1); the win is bounding injection-driven blast radius and enforcing least privilege on the read surface.
-- **Audit log growth / write cost.** Mitigation: daily rotation, buffered/fsync-batched writes, 0600; hash-chain adds one hash per line, negligible at command rates.
+- **Audit log growth / write cost.** Mitigation: daily rotation and owner-only files bound growth and exposure; each ProcessChanging authorization intentionally pays for a record sync plus atomic manifest and checkpoint replacement before dispatch.
 - **Two-token complexity in `control.json`.** Mitigation: additive field, documented schema, `read_token` optional so old readers ignore it.
 
 ---
