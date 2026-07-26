@@ -5539,9 +5539,7 @@ fn audit_command(
     error: Option<&str>,
 ) {
     if decision.starts_with("refused-")
-        && !ctx
-            .governor
-            .admit_refusal_audit(std::time::Instant::now())
+        && !ctx.governor.admit_refusal_audit(std::time::Instant::now())
     {
         return;
     }

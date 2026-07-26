@@ -23054,11 +23054,9 @@ fn refusal_audit_rate_limit_bounds_durable_writes() {
 
     let records = read_audit(&dir);
     assert_eq!(records.len(), crate::governor::REFUSAL_AUDIT_BURST);
-    assert!(
-        records
-            .iter()
-            .all(|record| record["decision"] == "refused-authz")
-    );
+    assert!(records
+        .iter()
+        .all(|record| record["decision"] == "refused-authz"));
     clean_audit(&dir);
 }
 
