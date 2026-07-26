@@ -2087,7 +2087,7 @@ fn recover_record_append(path: &Path, line: &str) -> std::io::Result<()> {
         .split(|byte| *byte == b'\n')
         .rev()
         .find(|candidate| !candidate.is_empty())
-        .map(|candidate| serde_json::from_slice::<Value>(candidate))
+        .map(serde_json::from_slice::<Value>)
         .transpose()?
         .and_then(|record| {
             record
