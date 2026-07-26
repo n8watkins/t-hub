@@ -23026,6 +23026,43 @@ fn read_token_reads_but_cannot_spawn_or_kill() {
 }
 
 #[test]
+fn refusal_audit_rate_limit_bounds_durable_writes() {
+    let dir = std::env::temp_dir().join(format!(
+        "t-hub-refusal-audit-rate-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    clean_audit(&dir);
+    let ctx = test_ctx("refusal-rate").with_audit(Arc::new(AuditLog::new(dir.clone())));
+    let attempts = crate::governor::REFUSAL_AUDIT_BURST + 5;
+
+    for _ in 0..attempts {
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "read-refusal-rate",
+                "send_text",
+                json!({"sessionId": "x", "text": "y"}),
+            ),
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "unauthorized: 'send_text' requires the control capability (this token is read-only)"
+            )
+        );
+    }
+
+    let records = read_audit(&dir);
+    assert_eq!(records.len(), crate::governor::REFUSAL_AUDIT_BURST);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["decision"] == "refused-authz")
+    );
+    clean_audit(&dir);
+}
+
+#[test]
 fn control_token_command_audits_token_tier_control() {
     let dir = std::env::temp_dir().join("t-hub-p2-ctltier");
     clean_audit(&dir);

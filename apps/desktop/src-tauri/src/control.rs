@@ -5538,6 +5538,13 @@ fn audit_command(
     decision: &str,
     error: Option<&str>,
 ) {
+    if decision.starts_with("refused-")
+        && !ctx
+            .governor
+            .admit_refusal_audit(std::time::Instant::now())
+    {
+        return;
+    }
     if let Err(audit_error) = try_audit_command(ctx, req, tier, cap, decision, error) {
         eprintln!(
             "t-hub-audit: failed to write audit record for '{}': {audit_error}",

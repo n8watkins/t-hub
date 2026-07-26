@@ -53,6 +53,8 @@ pub const DEFAULT_SPAWN_BURST: f64 = 8.0;
 pub const DESTRUCTIVE_RATE_PER_MIN: f64 = 15.0;
 /// Destructive-command burst, the token-bucket capacity (not env-overridable).
 pub const DESTRUCTIVE_BURST: f64 = 10.0;
+pub(crate) const REFUSAL_AUDIT_RATE_PER_MIN: f64 = 30.0;
+pub(crate) const REFUSAL_AUDIT_BURST: usize = 10;
 
 /// Why a process-changing command was refused. Carries the machine-readable
 /// error string (`docs/SOCKET-AUTH-DESIGN.md` §5) and a short decision code the
@@ -452,6 +454,7 @@ pub struct SpawnGovernor {
     reservations: ReservationPolicy,
     spawn: Mutex<TokenBucket>,
     destructive: Mutex<TokenBucket>,
+    refusal_audit: Mutex<TokenBucket>,
     spawn_rate_per_min: f64,
     destructive_rate_per_min: f64,
 }
@@ -468,6 +471,10 @@ impl SpawnGovernor {
                 DESTRUCTIVE_BURST,
                 DESTRUCTIVE_RATE_PER_MIN,
             )),
+            refusal_audit: Mutex::new(TokenBucket::new(
+                REFUSAL_AUDIT_BURST as f64,
+                REFUSAL_AUDIT_RATE_PER_MIN,
+            )),
             spawn_rate_per_min,
             destructive_rate_per_min: DESTRUCTIVE_RATE_PER_MIN,
         }
@@ -481,6 +488,10 @@ impl SpawnGovernor {
         let rate = env_f64("T_HUB_SPAWN_RATE", DEFAULT_SPAWN_RATE_PER_MIN);
         let burst = env_f64("T_HUB_SPAWN_BURST", DEFAULT_SPAWN_BURST);
         Self::new(max, rate, burst)
+    }
+
+    pub(crate) fn admit_refusal_audit(&self, now: Instant) -> bool {
+        self.refusal_audit.lock().unwrap().try_take(now)
     }
 
     /// The effective concurrent-session cap after clamping (diagnostics / tests).
