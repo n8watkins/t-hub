@@ -458,6 +458,7 @@ impl ControlProc {
             .env("T_HUB_MCP_POWDER_STATE_FILE", powder_state_file)
             .env("T_HUB_TMUX_SOCKET", tmux_socket)
             .env("T_HUB_INBOX_DIR", temp_dir.join("inbox"))
+            .env("HOME", temp_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
