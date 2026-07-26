@@ -11,7 +11,9 @@
 //! Each version 2 line is authenticated with HMAC-SHA256 under a persistent key
 //! stored outside the log directory.
 //! A separately authenticated head manifest anchors every day's count and final
-//! hash, which makes tail and whole-day truncation detectable.
+//! hash, while the protected key state commits to the latest head generation.
+//! This makes tail truncation, whole-day removal, and signed head rollback
+//! detectable.
 //! Process-changing commands use [`AuditLog::try_record`] before dispatch and are
 //! refused when the authorization record cannot be made durable.
 //! On Windows the key is DPAPI-sealed for the current user.
@@ -40,7 +42,9 @@ use sha2::{Digest, Sha256};
 type HmacSha256 = Hmac<Sha256>;
 
 const AUDIT_FORMAT_VERSION: u64 = 2;
-const HEAD_FORMAT_VERSION: u64 = 1;
+const HEAD_FORMAT_VERSION: u64 = 2;
+const LEGACY_HEAD_FORMAT_VERSION: u64 = 1;
+const KEY_STATE_FORMAT_VERSION: u64 = 1;
 const AUDIT_KEY_BYTES: usize = 32;
 
 fn home_dir() -> PathBuf {
@@ -72,6 +76,10 @@ fn head_path_for(dir: &Path) -> PathBuf {
     dir.with_extension("head.json")
 }
 
+fn key_path_for(dir: &Path) -> PathBuf {
+    dir.with_extension("key.json")
+}
+
 #[cfg(test)]
 pub(crate) fn head_path_for_test(dir: &Path) -> PathBuf {
     head_path_for(dir)
@@ -83,7 +91,8 @@ pub(crate) fn head_path_for_test(dir: &Path) -> PathBuf {
 pub struct AuditLog {
     dir: PathBuf,
     head_path: PathBuf,
-    key_path: Option<PathBuf>,
+    key_path: PathBuf,
+    provided_key: Option<Vec<u8>>,
     inner: Mutex<Inner>,
 }
 
@@ -91,8 +100,27 @@ struct Inner {
     writer: Option<(String, BufWriter<File>)>,
     prev_hash: String,
     count: u64,
-    key: Option<Result<Vec<u8>, String>>,
+    key_state: Option<Result<KeyState, String>>,
     poisoned: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeadCheckpoint {
+    generation: u64,
+    manifest_mac: String,
+}
+
+#[derive(Clone)]
+struct KeyState {
+    key: Vec<u8>,
+    sealed_key: String,
+    checkpoint: Option<HeadCheckpoint>,
+}
+
+struct HeadAnchor {
+    generation: u64,
+    entries: BTreeMap<String, Value>,
+    manifest_mac: String,
 }
 
 impl AuditLog {
@@ -107,14 +135,15 @@ impl AuditLog {
     pub fn with_key(dir: PathBuf, key: Vec<u8>) -> Self {
         let head_path = head_path_for(&dir);
         Self {
+            key_path: key_path_for(&dir),
             dir,
             head_path,
-            key_path: None,
+            provided_key: Some(key),
             inner: Mutex::new(Inner {
                 writer: None,
                 prev_hash: String::new(),
                 count: 0,
-                key: Some(Ok(key)),
+                key_state: None,
                 poisoned: None,
             }),
         }
@@ -127,12 +156,13 @@ impl AuditLog {
         Self {
             head_path: head_path_for(&dir),
             dir,
-            key_path: Some(audit_key_path()),
+            key_path: audit_key_path(),
+            provided_key: None,
             inner: Mutex::new(Inner {
                 writer: None,
                 prev_hash: String::new(),
                 count: 0,
-                key: None,
+                key_state: None,
                 poisoned: None,
             }),
         }
@@ -208,12 +238,20 @@ impl AuditLog {
         args: &Value,
         meta: AuditMeta,
     ) -> std::io::Result<()> {
+        let configured_key = self.key_for(guard)?;
+        if !ct_eq(&configured_key, key) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "configured audit key does not match the requested key",
+            ));
+        }
         let need_open = match &guard.writer {
             Some((open_date, _)) => open_date != date,
             None => true,
         };
         if need_open {
-            let report = verify(&self.dir, key);
+            let report =
+                verify_with_checkpoint(&self.dir, &self.head_path, key, self.checkpoint_for(guard));
             if !report.ok() {
                 return Err(std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -272,22 +310,26 @@ impl AuditLog {
         writer.get_ref().sync_data()?;
 
         let count = guard.count + 1;
-        self.write_head(key, date, count, &hash)?;
+        let checkpoint = self.write_head(key, self.checkpoint_for(guard), date, count, &hash)?;
+        self.store_checkpoint(guard, checkpoint)?;
         guard.count = count;
         guard.prev_hash = hash;
         Ok(())
     }
 
     fn key_for(&self, guard: &mut Inner) -> std::io::Result<Vec<u8>> {
-        if guard.key.is_none() {
-            let path = self
-                .key_path
-                .as_deref()
-                .expect("a persistent AuditLog has a key path");
-            guard.key = Some(load_or_create_audit_key(path).map_err(|error| error.to_string()));
+        if guard.key_state.is_none() {
+            guard.key_state = Some(
+                load_or_create_audit_key(&self.key_path, self.provided_key.as_deref())
+                    .map_err(|error| error.to_string()),
+            );
         }
-        match guard.key.as_ref().expect("key initialized above") {
-            Ok(key) => Ok(key.clone()),
+        match guard
+            .key_state
+            .as_ref()
+            .expect("key state initialized above")
+        {
+            Ok(state) => Ok(state.key.clone()),
             Err(error) => Err(std::io::Error::new(
                 ErrorKind::PermissionDenied,
                 error.clone(),
@@ -295,8 +337,46 @@ impl AuditLog {
         }
     }
 
-    fn write_head(&self, key: &[u8], date: &str, count: u64, last: &str) -> std::io::Result<()> {
-        let mut entries = read_head_entries(&self.head_path, key)?;
+    fn checkpoint_for<'a>(&self, guard: &'a Inner) -> Option<&'a HeadCheckpoint> {
+        guard
+            .key_state
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .and_then(|state| state.checkpoint.as_ref())
+    }
+
+    fn store_checkpoint(
+        &self,
+        guard: &mut Inner,
+        checkpoint: HeadCheckpoint,
+    ) -> std::io::Result<()> {
+        let state = guard
+            .key_state
+            .as_mut()
+            .and_then(|state| state.as_mut().ok())
+            .expect("key state initialized before writing the head");
+        let previous = state.checkpoint.replace(checkpoint);
+        if let Err(error) = write_key_state(&self.key_path, state) {
+            state.checkpoint = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn write_head(
+        &self,
+        key: &[u8],
+        checkpoint: Option<&HeadCheckpoint>,
+        date: &str,
+        count: u64,
+        last: &str,
+    ) -> std::io::Result<HeadCheckpoint> {
+        let anchor = read_head_anchor(&self.head_path, key)?;
+        validate_checkpoint(anchor.as_ref(), checkpoint)?;
+        let mut entries = anchor
+            .as_ref()
+            .map(|anchor| anchor.entries.clone())
+            .unwrap_or_default();
         entries.insert(
             date.to_string(),
             json!({
@@ -305,23 +385,35 @@ impl AuditLog {
                 "mac": head_entry_mac(key, date, count, last),
             }),
         );
-        let body = serde_json::to_vec(&head_anchor_value(key, &entries))?;
-        write_private_atomic(&self.head_path, &body)
+        let generation = checkpoint
+            .map(|checkpoint| checkpoint.generation + 1)
+            .unwrap_or(1);
+        let value = head_anchor_value(key, generation, &entries);
+        let manifest_mac = value["mac"]
+            .as_str()
+            .expect("head manifest MAC is a string")
+            .to_string();
+        let body = serde_json::to_vec(&value)?;
+        write_private_atomic(&self.head_path, &body)?;
+        Ok(HeadCheckpoint {
+            generation,
+            manifest_mac,
+        })
     }
 
     /// Verify this audit directory and its external head with the configured key.
     pub fn verify_self(&self) -> VerifyReport {
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let report = match self.key_for(&mut guard) {
-            Ok(key) => verify(&self.dir, &key),
+            Ok(key) => verify_with_checkpoint(
+                &self.dir,
+                &self.head_path,
+                &key,
+                self.checkpoint_for(&guard),
+            ),
             Err(error) => VerifyReport {
                 breaks: vec![ChainBreak {
-                    file: self
-                        .key_path
-                        .as_deref()
-                        .unwrap_or_else(|| Path::new("<in-memory-key>"))
-                        .display()
-                        .to_string(),
+                    file: self.key_path.display().to_string(),
                     line: 0,
                     kind: BreakKind::KeyUnavailable,
                     detail: error.to_string(),
@@ -491,14 +583,65 @@ impl BreakKind {
     }
 }
 
+#[cfg(test)]
 pub fn verify(dir: &Path, key: &[u8]) -> VerifyReport {
-    verify_with_head(dir, &head_path_for(dir), key)
+    let key_path = key_path_for(dir);
+    let checkpoint = match std::fs::read_to_string(&key_path) {
+        Ok(raw) => match decode_audit_key(&key_path, &raw, Some(key)) {
+            Ok(state) => state.checkpoint,
+            Err(error) => {
+                return VerifyReport {
+                    breaks: vec![ChainBreak {
+                        file: key_path.display().to_string(),
+                        line: 0,
+                        kind: BreakKind::KeyUnavailable,
+                        detail: error.to_string(),
+                    }],
+                    ..VerifyReport::default()
+                };
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            return VerifyReport {
+                breaks: vec![ChainBreak {
+                    file: key_path.display().to_string(),
+                    line: 0,
+                    kind: BreakKind::KeyUnavailable,
+                    detail: error.to_string(),
+                }],
+                ..VerifyReport::default()
+            };
+        }
+    };
+    verify_with_checkpoint(dir, &head_path_for(dir), key, checkpoint.as_ref())
 }
 
 pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyReport {
+    verify_core(dir, head_path, key, None)
+}
+
+fn verify_with_checkpoint(
+    dir: &Path,
+    head_path: &Path,
+    key: &[u8],
+    checkpoint: Option<&HeadCheckpoint>,
+) -> VerifyReport {
+    if checkpoint.is_none() {
+        return verify_with_head(dir, head_path, key);
+    }
+    verify_core(dir, head_path, key, checkpoint)
+}
+
+fn verify_core(
+    dir: &Path,
+    head_path: &Path,
+    key: &[u8],
+    checkpoint: Option<&HeadCheckpoint>,
+) -> VerifyReport {
     let mut report = VerifyReport::default();
-    let head = match read_head_entries(head_path, key) {
-        Ok(head) => Some(head),
+    let anchor = match read_head_anchor(head_path, key) {
+        Ok(anchor) => anchor,
         Err(error) => {
             report.breaks.push(ChainBreak {
                 file: head_path.display().to_string(),
@@ -509,6 +652,19 @@ pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyRepor
             None
         }
     };
+    if let Err(error) = validate_checkpoint(anchor.as_ref(), checkpoint) {
+        report.breaks.push(ChainBreak {
+            file: head_path.display().to_string(),
+            line: 0,
+            kind: if anchor.is_none() {
+                BreakKind::HeadMissing
+            } else {
+                BreakKind::HeadTampered
+            },
+            detail: error.to_string(),
+        });
+    }
+    let head = anchor.as_ref().map(|anchor| &anchor.entries);
 
     let mut files = Vec::new();
     match std::fs::read_dir(dir) {
@@ -555,10 +711,10 @@ pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyRepor
     for (date, path) in files {
         seen_dates.insert(date.clone());
         report.files += 1;
-        verify_file(&date, &path, head.as_ref(), key, &mut report);
+        verify_file(&date, &path, head, key, &mut report);
     }
 
-    if let Some(head) = &head {
+    if let Some(head) = head {
         for date in head.keys().filter(|date| !seen_dates.contains(*date)) {
             report.breaks.push(ChainBreak {
                 file: format!("control-{date}.jsonl"),
@@ -782,22 +938,28 @@ fn random_key() -> Vec<u8> {
     key
 }
 
-fn load_or_create_audit_key(path: &Path) -> std::io::Result<Vec<u8>> {
+fn load_or_create_audit_key(path: &Path, provided_key: Option<&[u8]>) -> std::io::Result<KeyState> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => decode_audit_key(path, &raw),
+        Ok(raw) => decode_audit_key(path, &raw, provided_key),
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            let key = random_key();
+            let key = provided_key.map_or_else(random_key, <[u8]>::to_vec);
             let sealed = crate::secret_seal::seal_str(&hex(&key));
             if crate::secret_seal::sealing_active() && !crate::secret_seal::is_sealed(&sealed) {
                 return Err(std::io::Error::other(
                     "DPAPI failed to seal the new audit key",
                 ));
             }
-            match write_private_create_new(path, sealed.as_bytes()) {
-                Ok(()) => Ok(key),
+            let state = KeyState {
+                key,
+                sealed_key: sealed,
+                checkpoint: None,
+            };
+            let body = serde_json::to_vec(&key_state_value(&state))?;
+            match write_private_create_new(path, &body) {
+                Ok(()) => Ok(state),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     let raw = std::fs::read_to_string(path)?;
-                    decode_audit_key(path, &raw)
+                    decode_audit_key(path, &raw, provided_key)
                 }
                 Err(error) => Err(error),
             }
@@ -806,9 +968,39 @@ fn load_or_create_audit_key(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn decode_audit_key(path: &Path, raw: &str) -> std::io::Result<Vec<u8>> {
+fn decode_audit_key(
+    path: &Path,
+    raw: &str,
+    provided_key: Option<&[u8]>,
+) -> std::io::Result<KeyState> {
     set_owner_only(path)?;
-    let unsealed = crate::secret_seal::unseal_str(raw).ok_or_else(|| {
+    let parsed = serde_json::from_str::<Value>(raw).ok();
+    let (sealed_key, checkpoint) = if let Some(object) = parsed.as_ref().and_then(Value::as_object)
+    {
+        if object.get("v").and_then(Value::as_u64) != Some(KEY_STATE_FORMAT_VERSION) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "audit key state has an unsupported format",
+            ));
+        }
+        let sealed_key = object
+            .get("sealedKey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidData, "audit key state has no sealed key")
+            })?
+            .to_string();
+        (
+            sealed_key,
+            object
+                .get("checkpoint")
+                .filter(|checkpoint| !checkpoint.is_null())
+                .cloned(),
+        )
+    } else {
+        (raw.trim().to_string(), None)
+    };
+    let unsealed = crate::secret_seal::unseal_str(&sealed_key).ok_or_else(|| {
         std::io::Error::new(
             ErrorKind::InvalidData,
             format!("audit key at {} cannot be unsealed", path.display()),
@@ -830,7 +1022,77 @@ fn decode_audit_key(path: &Path, raw: &str) -> std::io::Result<Vec<u8>> {
             ),
         ));
     }
-    Ok(key)
+    if provided_key.is_some_and(|provided| !ct_eq(provided, &key)) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "audit key at {} does not match the configured key",
+                path.display()
+            ),
+        ));
+    }
+    let checkpoint = checkpoint
+        .map(|checkpoint| decode_checkpoint(&checkpoint, &key))
+        .transpose()?;
+    Ok(KeyState {
+        key,
+        sealed_key,
+        checkpoint,
+    })
+}
+
+fn write_key_state(path: &Path, state: &KeyState) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&key_state_value(state))?;
+    write_private_atomic(path, &body)
+}
+
+fn key_state_value(state: &KeyState) -> Value {
+    json!({
+        "v": KEY_STATE_FORMAT_VERSION,
+        "sealedKey": state.sealed_key,
+        "checkpoint": state.checkpoint.as_ref().map(|checkpoint| json!({
+            "generation": checkpoint.generation,
+            "manifestMac": checkpoint.manifest_mac,
+            "mac": checkpoint_mac(
+                &state.key,
+                checkpoint.generation,
+                &checkpoint.manifest_mac,
+            ),
+        })),
+    })
+}
+
+fn decode_checkpoint(value: &Value, key: &[u8]) -> std::io::Result<HeadCheckpoint> {
+    let generation = value
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "audit checkpoint has no generation")
+        })?;
+    let manifest_mac = value
+        .get("manifestMac")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "audit checkpoint has no manifest MAC",
+            )
+        })?
+        .to_string();
+    let stored_mac = value.get("mac").and_then(Value::as_str).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "audit checkpoint has no MAC")
+    })?;
+    let expected_mac = checkpoint_mac(key, generation, &manifest_mac);
+    if !ct_eq(stored_mac.as_bytes(), expected_mac.as_bytes()) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "audit checkpoint MAC does not verify",
+        ));
+    }
+    Ok(HeadCheckpoint {
+        generation,
+        manifest_mac,
+    })
 }
 
 fn open_private_append(path: &Path) -> std::io::Result<File> {
@@ -976,20 +1238,36 @@ fn last_hash_and_count(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((last.unwrap_or_default(), count))
 }
 
-fn read_head_entries(path: &Path, key: &[u8]) -> std::io::Result<BTreeMap<String, Value>> {
+fn read_head_anchor(path: &Path, key: &[u8]) -> std::io::Result<Option<HeadAnchor>> {
     let body = match std::fs::read_to_string(path) {
         Ok(body) => body,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let anchor = serde_json::from_str::<Value>(&body)?;
     let object = anchor.as_object().ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "head anchor is not a JSON object")
     })?;
-    if object.len() != 3 || object.get("v").and_then(Value::as_u64) != Some(HEAD_FORMAT_VERSION) {
+    let version = object.get("v").and_then(Value::as_u64);
+    let generation = match version {
+        Some(HEAD_FORMAT_VERSION) if object.len() == 4 => object
+            .get("generation")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidData, "head anchor has no generation")
+            })?,
+        Some(LEGACY_HEAD_FORMAT_VERSION) if object.len() == 3 => 0,
+        _ => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "head anchor has an unsupported format",
+            ));
+        }
+    };
+    if generation == 0 && version == Some(HEAD_FORMAT_VERSION) {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "head anchor has an unsupported format",
+            "head anchor generation must be positive",
         ));
     }
     let entries = object
@@ -1007,31 +1285,90 @@ fn read_head_entries(path: &Path, key: &[u8]) -> std::io::Result<BTreeMap<String
     let stored_mac = object.get("mac").and_then(Value::as_str).ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "head anchor has no manifest MAC")
     })?;
-    let expected_mac = head_manifest_mac(key, &entries);
+    let expected_mac = head_manifest_mac(key, version.unwrap(), generation, &entries);
     if !ct_eq(stored_mac.as_bytes(), expected_mac.as_bytes()) {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "head anchor manifest MAC does not verify",
         ));
     }
-    Ok(entries)
+    Ok(Some(HeadAnchor {
+        generation,
+        entries,
+        manifest_mac: stored_mac.to_string(),
+    }))
 }
 
-fn head_anchor_value(key: &[u8], entries: &BTreeMap<String, Value>) -> Value {
+fn validate_checkpoint(
+    anchor: Option<&HeadAnchor>,
+    checkpoint: Option<&HeadCheckpoint>,
+) -> std::io::Result<()> {
+    match (anchor, checkpoint) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "the protected audit checkpoint exists but the head anchor is missing",
+        )),
+        (Some(anchor), None) if anchor.generation == 0 => Ok(()),
+        (Some(_), None) => Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "the versioned head anchor has no protected audit checkpoint",
+        )),
+        (Some(anchor), Some(checkpoint))
+            if anchor.generation == checkpoint.generation
+                && ct_eq(
+                    anchor.manifest_mac.as_bytes(),
+                    checkpoint.manifest_mac.as_bytes(),
+                ) =>
+        {
+            Ok(())
+        }
+        (Some(anchor), Some(checkpoint)) => Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "head anchor generation {} does not match protected checkpoint generation {}",
+                anchor.generation, checkpoint.generation
+            ),
+        )),
+    }
+}
+
+fn head_anchor_value(key: &[u8], generation: u64, entries: &BTreeMap<String, Value>) -> Value {
     json!({
         "v": HEAD_FORMAT_VERSION,
+        "generation": generation,
         "entries": entries,
-        "mac": head_manifest_mac(key, entries),
+        "mac": head_manifest_mac(key, HEAD_FORMAT_VERSION, generation, entries),
     })
 }
 
-fn head_manifest_mac(key: &[u8], entries: &BTreeMap<String, Value>) -> String {
-    let body = serde_json::to_vec(&json!({
-        "v": HEAD_FORMAT_VERSION,
-        "entries": entries,
-    }))
+fn head_manifest_mac(
+    key: &[u8],
+    version: u64,
+    generation: u64,
+    entries: &BTreeMap<String, Value>,
+) -> String {
+    let body = if version == LEGACY_HEAD_FORMAT_VERSION {
+        serde_json::to_vec(&json!({
+            "v": version,
+            "entries": entries,
+        }))
+    } else {
+        serde_json::to_vec(&json!({
+            "v": version,
+            "generation": generation,
+            "entries": entries,
+        }))
+    }
     .expect("head manifest is serializable");
     hex(&mac(key, &body))
+}
+
+fn checkpoint_mac(key: &[u8], generation: u64, manifest_mac: &str) -> String {
+    hex(&mac(
+        key,
+        format!("checkpoint|{generation}|{manifest_mac}").as_bytes(),
+    ))
 }
 
 fn head_entry_mac(key: &[u8], date: &str, count: u64, last: &str) -> String {
@@ -1100,6 +1437,7 @@ mod tests {
     fn clean(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_file(head_path_for(dir));
+        let _ = std::fs::remove_file(key_path_for(dir));
     }
 
     fn meta() -> AuditMeta<'static> {
@@ -1334,6 +1672,76 @@ mod tests {
             .breaks
             .iter()
             .any(|audit_break| audit_break.kind == BreakKind::HeadTampered));
+        clean(&dir);
+    }
+
+    #[test]
+    fn signed_head_rollback_is_detected_by_protected_checkpoint() {
+        let dir = temp_dir("signed-head-rollback");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        )
+        .unwrap();
+        let old_head = std::fs::read(head_path_for(&dir)).unwrap();
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "second"}),
+            meta(),
+        )
+        .unwrap();
+
+        let log_path = dir.join(format!(
+            "control-{}.jsonl",
+            chrono::Local::now().format("%Y%m%d")
+        ));
+        let first_line = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        std::fs::write(&log_path, format!("{first_line}\n")).unwrap();
+        std::fs::write(head_path_for(&dir), old_head).unwrap();
+
+        let restarted = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let report = restarted.verify_self();
+        assert!(report.breaks.iter().any(|audit_break| {
+            audit_break.kind == BreakKind::HeadTampered
+                && audit_break.detail.contains("protected checkpoint")
+        }));
+        clean(&dir);
+    }
+
+    #[test]
+    fn deleting_all_audit_files_is_detected_by_protected_checkpoint() {
+        let dir = temp_dir("complete-deletion");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.try_record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "first"}),
+            meta(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(head_path_for(&dir)).unwrap();
+
+        let restarted = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        let report = restarted.verify_self();
+        assert!(report
+            .breaks
+            .iter()
+            .any(|audit_break| audit_break.kind == BreakKind::HeadMissing));
         clean(&dir);
     }
 
@@ -1596,10 +2004,10 @@ mod tests {
         clean(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("audit-hmac-key");
-        let first = load_or_create_audit_key(&path).unwrap();
-        let second = load_or_create_audit_key(&path).unwrap();
-        assert_eq!(first.len(), AUDIT_KEY_BYTES);
-        assert_eq!(first, second);
+        let first = load_or_create_audit_key(&path, None).unwrap();
+        let second = load_or_create_audit_key(&path, None).unwrap();
+        assert_eq!(first.key.len(), AUDIT_KEY_BYTES);
+        assert_eq!(first.key, second.key);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
