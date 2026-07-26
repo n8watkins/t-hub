@@ -33,7 +33,11 @@
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 import { loadPersisted, savePersisted } from "../lib/persist";
-import { useWorkspace, registerCaptainRegistry } from "./workspace";
+import {
+  useWorkspace,
+  registerAgentPresentation,
+  registerCaptainRegistry,
+} from "./workspace";
 
 const PERSIST_KEY = "t-hub.captain.v2";
 
@@ -523,13 +527,14 @@ export function agentOrder(
   return out;
 }
 
-// Give the workspace store a synchronous read of the agent id set so its
-// adoptRegistry can keep an externally-claimed captain's tile alive through a
-// server tab sync even when the server does not report that tile as a live
-// work-tab tile. captain.ts already imports the workspace store, so registering
-// here (rather than the workspace store importing us) avoids a static import
-// cycle - the same reason forgetCaptain is invoked via a dynamic import there.
-registerCaptainRegistry(() => agentOrder(useCaptain.getState()));
+// Give the workspace store two deliberately different views:
+//   1. backend claims are authoritative liveness during a server tab adoption;
+//   2. local pins/orchestrator are presentation protection during a workspace
+//      close or a registry-less boot.
+// Mixing these used to let a retired local pin survive the authoritative startup
+// snapshot and poison every full-layout report with its dead terminal ID.
+registerCaptainRegistry(() => Object.keys(useCaptain.getState().claims));
+registerAgentPresentation(() => agentOrder(useCaptain.getState()));
 
 /**
  * Lifecycle cleanup: when a terminal is killed/removed, unpin it if it was a

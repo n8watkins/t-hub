@@ -24,6 +24,7 @@ import {
   useWorkspace,
   CAPTAINS_TAB_ID,
   CAPTAINS_TAB_NAME,
+  registerAgentPresentation,
   registerCaptainRegistry,
 } from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
@@ -42,10 +43,12 @@ beforeEach(() => {
   killTerminal.mockReset();
   killTerminal.mockResolvedValue(undefined);
   registerCaptainRegistry(() => []);
+  registerAgentPresentation(() => []);
 });
 
 afterEach(() => {
   registerCaptainRegistry(() => []);
+  registerAgentPresentation(() => []);
 });
 
 describe("closeWorkspace protects a registered captain from the reap", () => {
@@ -53,7 +56,7 @@ describe("closeWorkspace protects a registered captain from the reap", () => {
     // "cap" is a registered captain that ended up in a WORK tab (the mis-placement
     // vector); "b" is a genuine work session alongside it. A second work tab exists
     // so the close is permitted by the last-work-tab guard.
-    registerCaptainRegistry(() => ["cap"]);
+    registerAgentPresentation(() => ["cap"]);
     useWorkspace.setState({
       tabs: [
         { id: "t1", name: "Workspace 1", order: ["a"] },

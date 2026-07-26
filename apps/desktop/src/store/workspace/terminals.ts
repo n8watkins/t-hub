@@ -24,7 +24,7 @@ export const createTerminalsSlice = (
   WorkspaceState,
   "setTerminals" | "updateTerminalsMeta" | "adoptTerminal" | "updateState"
 > => {
-  const { persist, captainRegistryIds, satelliteTab: SATELLITE_TAB } = deps;
+  const { persist, agentPresentationIds, satelliteTab: SATELLITE_TAB } = deps;
 
   return {
     setTerminals: (list) => {
@@ -39,7 +39,7 @@ export const createTerminalsSlice = (
       // Before adoption, retain the legacy liveness pruning used to repair a
       // persisted local-only layout.
       const placed = new Set<TerminalId>();
-      const registeredCaptains = new Set(captainRegistryIds());
+      const registeredCaptains = new Set(agentPresentationIds());
       const recoveredFromCaptain: TerminalId[] = [];
       const nextTabs = tabs.map((t) => {
         let order = registryAdopted

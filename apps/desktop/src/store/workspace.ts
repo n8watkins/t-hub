@@ -221,22 +221,30 @@ function forgetTerminalLabels(id: TerminalId): void {
   });
 }
 
-/** A synchronous read of the authoritative AGENT id set (the orchestrator plus
- *  every pinned/claimed captain), registered by the captain store. captain.ts
- *  imports THIS store, so it registers its accessor here rather than us importing
- *  it back - keeping the workspace store free of a static captain-store cycle
- *  (mirrors the dynamic-import `forgetCaptain` call). adoptRegistry uses it as a
- *  liveness fallback: an externally claimed captain (e.g. one the orchestrator
- *  claimed over the control socket) whose tile the server does not report as a
- *  live work-tab tile is still an authoritative captain and must not be dropped.
- *  Defaults to empty until the captain store loads, so any pre-registration sync
- *  falls back cleanly to the plain serverTileIds liveness. */
+/** A synchronous read of the server-backed AGENT id set, registered by the
+ *  captain store. captain.ts imports THIS store, so it registers its accessor
+ *  here rather than us importing it back - keeping the workspace store free of a
+ *  static captain-store cycle. adoptRegistry uses this as its only non-tab
+ *  liveness fallback: a presentation-only local pin must never resurrect a
+ *  retired backend identity during restart reconciliation. */
 let captainRegistryIds: () => Iterable<TerminalId> = () => [];
 
-/** Register the captain store's agent-id accessor (see {@link captainRegistryIds}).
- *  Called once by captain.ts at module load. */
+/** Local presentation IDs remain useful for protective UX: a workspace close
+ *  moves a pinned agent instead of killing it, and registry-less boot recovery
+ *  keeps its tile in Captain Workspace. They are deliberately separate from
+ *  authoritative liveness because local pins can outlive their processes. */
+let agentPresentationIds: () => Iterable<TerminalId> = () => [];
+
+/** Register the captain store's server-backed claim accessor. */
 export function registerCaptainRegistry(fn: () => Iterable<TerminalId>): void {
   captainRegistryIds = fn;
+}
+
+/** Register the captain store's local presentation/protection accessor. */
+export function registerAgentPresentation(
+  fn: () => Iterable<TerminalId>,
+): void {
+  agentPresentationIds = fn;
 }
 
 /**
@@ -386,6 +394,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     cleanupTileSideState,
     killOldSessionWithRetry,
     captainRegistryIds: () => captainRegistryIds(),
+    agentPresentationIds: () => agentPresentationIds(),
     satelliteTab: SATELLITE_TAB,
     recallInFlight,
   };

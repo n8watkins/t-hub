@@ -23,9 +23,9 @@ import type { TabReport, TerminalInfo, TerminalId, TerminalState } from "../../i
  *   - not closeable (closeTab/closeWorkspace refuse it).
  * Its `order` is the authoritative record of which tiles are placed as agents,
  * which is how placement survives a server registry sync. adoptRegistry consults
- * the captain registry ONLY as a liveness fallback (see {@link captainRegistryIds}),
- * via an accessor the captain store registers - so this store keeps NO static
- * dependency on the captain store.
+ * the authoritative Captain claims ONLY as a liveness fallback (see
+ * {@link SliceDeps.captainRegistryIds}), via an accessor the captain store
+ * registers - so this store keeps NO static dependency on the captain store.
  */
 export const CAPTAINS_TAB_ID = "captains-reserved";
 export const CAPTAINS_TAB_NAME = "Captain Workspace";
@@ -470,8 +470,10 @@ export interface SliceDeps {
     id: TerminalId,
     killTerminal: (id: TerminalId) => Promise<void>,
   ) => Promise<void>;
-  /** A synchronous read of the authoritative AGENT id set (registered by captain.ts). */
+  /** Server-backed Captain/Cortana terminal IDs used as authoritative liveness. */
   captainRegistryIds: () => Iterable<TerminalId>;
+  /** Local presentation IDs protected during pre-registry recovery and workspace close. */
+  agentPresentationIds: () => Iterable<TerminalId>;
   /** The tab id this window was opened to render in isolation, or null (main window). */
   satelliteTab: string | null;
   /** In-flight recall guard (#7), keyed by sessionId. */

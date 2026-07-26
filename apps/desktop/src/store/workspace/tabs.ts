@@ -41,7 +41,7 @@ export const createTabsSlice = (
   | "setDropTab"
   | "setDropTile"
 > => {
-  const { persist, activeTab, cleanupTileSideState, captainRegistryIds } = deps;
+  const { persist, activeTab, cleanupTileSideState, agentPresentationIds } = deps;
 
   return {
     addTab: () => {
@@ -119,7 +119,7 @@ export const createTabsSlice = (
       // instead, and kill only the genuine work sessions. (The precise UX - silent
       // re-place vs. a confirm prompt - is flagged for the general's ratification;
       // the protective default ships now.)
-      const registeredCaptains = new Set(captainRegistryIds());
+      const registeredCaptains = new Set(agentPresentationIds());
       const captainsHere = target.order.filter((tid) => registeredCaptains.has(tid));
       for (const tid of captainsHere) get().moveTileToCaptainsTab(tid);
       const ids = target.order.filter((tid) => !registeredCaptains.has(tid));
