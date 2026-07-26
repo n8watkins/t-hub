@@ -444,6 +444,11 @@ int main(int argc, char **argv) {
     if (tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) return 9;
     const char *mode = argv[1];
     const char *marker = argv[2];
+    if (strcmp(mode, "busy") == 0) {
+        volatile unsigned long counter = 0;
+        write_marker(marker);
+        for (;;) counter++;
+    }
     if (strcmp(mode, "foreign-first") == 0) {
         if (argc < 4) return 15;
         execl(argv[3], "codex", "changed", marker, (char *)0);
@@ -16360,6 +16365,25 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
             "foreign first provider never reached a stable rejected state"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    tmux::retire_managed_runtime(&target, &owner).unwrap();
+
+    // A live provider changes the CPU accounting fields in /proc/<pid>/stat.
+    // Attestation must pin immutable identity and topology fields rather than
+    // treating those volatile counters as evidence of process substitution.
+    let (target, marker, owner) = start("busy", true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "busy Harness did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let baseline = wait_observed(&target, &owner);
+    for _ in 0..8 {
+        assert_eq!(
+            observe(&target, &owner).unwrap(),
+            baseline,
+            "CPU activity changed the attested Harness identity"
+        );
     }
     tmux::retire_managed_runtime(&target, &owner).unwrap();
 

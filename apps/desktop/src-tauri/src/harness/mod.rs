@@ -1131,15 +1131,21 @@ for expected in "$@"; do
     case "$process_cmdline_size" in ''|*[!0-9]*|0) exit 57;; esac
     [ "$process_cmdline_size" -le 65536 ]
     stat_after=$(cat "/proc/$pid/stat")
-    [ "$stat_after" = "$stat_before" ]
+    rest=${stat_after##*) }
+    set -- $rest
+    [ "$#" -ge 20 ]
+    [ "$2" = "$parent_pid" ]
+    [ "$3" = "$process_group_id" ]
+    [ "$4" = "$process_session_id" ]
+    [ "${20}" = "$observed_start" ]
     set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
     [ "$#" -eq 2 ]
     [ "$1" = "$process_device" ]
     [ "$2" = "$process_inode" ]
     if [ -z "$pinned_processes" ]; then
-        pinned_processes="$pid:$observed_start:$process_device:$process_inode"
+        pinned_processes="$pid:$observed_start:$process_device:$process_inode:$parent_pid:$process_group_id:$process_session_id"
     else
-        pinned_processes="$pinned_processes,$pid:$observed_start:$process_device:$process_inode"
+        pinned_processes="$pinned_processes,$pid:$observed_start:$process_device:$process_inode:$parent_pid:$process_group_id:$process_session_id"
     fi
     printf 'THPI1\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$pid" "$parent_pid" "$observed_start" "$process_group_id" "$process_session_id" \
@@ -1159,15 +1165,21 @@ for expected in "$@"; do
     IFS=:
     set -- $expected
     IFS=$old_ifs
-    [ "$#" -eq 4 ]
+    [ "$#" -eq 7 ]
     pid=$1
     expected_start=$2
     expected_device=$3
     expected_inode=$4
+    expected_parent=$5
+    expected_group=$6
+    expected_session=$7
     process_stat=$(cat "/proc/$pid/stat")
     rest=${process_stat##*) }
     set -- $rest
     [ "$#" -ge 20 ]
+    [ "$2" = "$expected_parent" ]
+    [ "$3" = "$expected_group" ]
+    [ "$4" = "$expected_session" ]
     [ "${20}" = "$expected_start" ]
     set -- $(stat -Lc '%d %i' "/proc/$pid/exe")
     [ "$#" -eq 2 ]
