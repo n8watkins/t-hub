@@ -31,7 +31,7 @@ pub enum TerminalState {
     Error,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnOptions {
     pub cwd: Option<String>,
@@ -290,6 +290,18 @@ fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
     pane_command(opts.shell.as_deref(), opts.startup_command.as_deref())
 }
 
+fn run_authorized_ui_spawn<T>(
+    admission_context: &crate::control::ControlContext,
+    opts: &SpawnOptions,
+    provider_lanes: usize,
+    spawn: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let args = serde_json::to_value(opts)
+        .map_err(|error| format!("spawn_terminal: audit arguments are invalid: {error}"))?;
+    let _admission = admission_context.authorize_ui_spawn(provider_lanes, &args)?;
+    spawn()
+}
+
 /// The `resolve_pane_command` core over bare parts, shared with the control
 /// channel's `spawn_terminal` (T-B: the socket spawn carries the same optional
 /// `startupCommand`, so the native client's resume flow rides one wrap).
@@ -329,95 +341,99 @@ pub fn spawn_terminal(
     if provider_intent.is_some_and(|value| !matches!(value, "codex" | "claude")) {
         return Err("providerIntent must be 'codex' or 'claude'".into());
     }
-    let _admission = admission_context
-        .admit_ui_spawn(usize::from(provider_intent.is_some()))
-        .map_err(|refusal| refusal.message)?;
-    // The terminal id IS the tmux session's own suffix, so the id is stable and
-    // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
-    // after a reload (which strips `th_` off the session name), and the
-    // `attach_terminal`/`kill_terminal` reconstructions. If id and session name
-    // disagree, a reloaded tile renders under an id that has no record in the
-    // store and its dot falls back to the amber "starting" placeholder forever
-    // (bug #16). Using the session suffix as the id keeps them in lockstep.
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let id = suffix[..8].to_string();
-    let tmux_session = format!("th_{id}");
-    let cwd = resolve_cwd(&opts);
-    let title = resolve_title(&opts);
+    run_authorized_ui_spawn(
+        &admission_context,
+        &opts,
+        usize::from(provider_intent.is_some()),
+        || {
+            // The terminal id IS the tmux session's own suffix, so the id is stable and
+            // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
+            // after a reload (which strips `th_` off the session name), and the
+            // `attach_terminal`/`kill_terminal` reconstructions. If id and session name
+            // disagree, a reloaded tile renders under an id that has no record in the
+            // store and its dot falls back to the amber "starting" placeholder forever
+            // (bug #16). Using the session suffix as the id keeps them in lockstep.
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let id = suffix[..8].to_string();
+            let tmux_session = format!("th_{id}");
+            let cwd = resolve_cwd(&opts);
+            let title = resolve_title(&opts);
 
-    // Create the detached tmux session that backs this terminal. With
-    // `command == None` tmux launches the user's login shell (the "Shell" preset
-    // / today's default). A `shell` preset becomes the pane's program verbatim; a
-    // `startupCommand` ("+" presets: Claude / Resume Claude / Custom…) is run
-    // inside a login shell the pane execs back into (see `resolve_pane_command`).
-    let command = resolve_pane_command(&opts);
-    // UI spawns are always Crew. Stable discovery plus durable identity is passed,
-    // while rotating credentials are scrubbed.
-    let (mut elevation, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
-    if let Some(provider) = provider_intent {
-        elevation.push((
-            "T_HUB_PROVIDER_SESSION".to_string(),
-            format!("pending:{provider}"),
-        ));
-    }
-    if let Err(error) =
-        tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
-    {
-        let mut rollback_error = None;
-        if let (Some(store), Some(identity)) = (
-            app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
-            minted_identity.as_ref(),
-        ) {
-            rollback_error = store.retire(&identity.id).err();
-        }
-        return Err(match rollback_error {
-            Some(rollback) => format!(
+            // Create the detached tmux session that backs this terminal. With
+            // `command == None` tmux launches the user's login shell (the "Shell" preset
+            // / today's default). A `shell` preset becomes the pane's program verbatim; a
+            // `startupCommand` ("+" presets: Claude / Resume Claude / Custom…) is run
+            // inside a login shell the pane execs back into (see `resolve_pane_command`).
+            let command = resolve_pane_command(&opts);
+            // UI spawns are always Crew. Stable discovery plus durable identity is passed,
+            // while rotating credentials are scrubbed.
+            let (mut elevation, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
+            if let Some(provider) = provider_intent {
+                elevation.push((
+                    "T_HUB_PROVIDER_SESSION".to_string(),
+                    format!("pending:{provider}"),
+                ));
+            }
+            if let Err(error) =
+                tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
+            {
+                let mut rollback_error = None;
+                if let (Some(store), Some(identity)) = (
+                    app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
+                    minted_identity.as_ref(),
+                ) {
+                    rollback_error = store.retire(&identity.id).err();
+                }
+                return Err(match rollback_error {
+                    Some(rollback) => format!(
                 "failed to create tmux session: {error}; identity rollback also failed: {rollback}"
             ),
-            None => format!("failed to create tmux session: {error}"),
-        });
-    }
-    if let (Some(store), Some(identity)) = (
-        app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
-        minted_identity.as_ref(),
-    ) {
-        if let Err(error) = store.bind_tile(&identity.id, &id) {
-            let _ = tmux::kill_session_tree(&tmux_session);
-            let rollback = store.retire(&identity.id);
-            return Err(format!(
+                    None => format!("failed to create tmux session: {error}"),
+                });
+            }
+            if let (Some(store), Some(identity)) = (
+                app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
+                minted_identity.as_ref(),
+            ) {
+                if let Err(error) = store.bind_tile(&identity.id, &id) {
+                    let _ = tmux::kill_session_tree(&tmux_session);
+                    let rollback = store.retire(&identity.id);
+                    return Err(format!(
                 "failed to persist terminal identity binding; the terminal was rolled back: {error}{}",
                 rollback
                     .err()
                     .map(|rollback| format!("; identity rollback also failed: {rollback}"))
                     .unwrap_or_default()
             ));
-        }
-    }
+                }
+            }
 
-    // Server-split M2a: spawn NO local PTY here. The detached tmux session is now
-    // ready; the frontend's mount flow calls `attach_terminal`, which opens a
-    // `RemotePty` against the control socket and begins streaming. (Previously this
-    // spawned an in-process `pty::spawn_attach_client` into the TerminalManager —
-    // that step moved to `attach_terminal` over the wire.)
-    //
-    // The Live state event is still emitted here so the freshly-created tile flips
-    // out of its "starting" placeholder immediately, exactly as before; the
-    // subsequent `attach_terminal` re-emits Live idempotently once it's streaming.
-    let _ = app.emit(
-        events::STATE,
-        &StateEvent {
-            id: id.clone(),
-            state: TerminalState::Live,
+            // Server-split M2a: spawn NO local PTY here. The detached tmux session is now
+            // ready; the frontend's mount flow calls `attach_terminal`, which opens a
+            // `RemotePty` against the control socket and begins streaming. (Previously this
+            // spawned an in-process `pty::spawn_attach_client` into the TerminalManager —
+            // that step moved to `attach_terminal` over the wire.)
+            //
+            // The Live state event is still emitted here so the freshly-created tile flips
+            // out of its "starting" placeholder immediately, exactly as before; the
+            // subsequent `attach_terminal` re-emits Live idempotently once it's streaming.
+            let _ = app.emit(
+                events::STATE,
+                &StateEvent {
+                    id: id.clone(),
+                    state: TerminalState::Live,
+                },
+            );
+
+            Ok(TerminalInfo {
+                id,
+                tmux_session,
+                cwd,
+                title,
+                state: TerminalState::Live,
+            })
         },
-    );
-
-    Ok(TerminalInfo {
-        id,
-        tmux_session,
-        cwd,
-        title,
-        state: TerminalState::Live,
-    })
+    )
 }
 
 #[tauri::command]
@@ -1046,6 +1062,8 @@ fn select_terminal_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     #[test]
     fn remote_reuse_rejects_health_changes_and_resize_failures() {
@@ -1064,6 +1082,103 @@ mod tests {
 
     fn candidate(id: &str, session: &str) -> (String, String) {
         (id.to_string(), session.to_string())
+    }
+
+    fn ui_spawn_test_context(
+        audit: Arc<crate::audit::AuditLog>,
+        fanout: Arc<crate::control::EventFanout>,
+    ) -> crate::control::ControlContext {
+        let supervisor = Arc::new(StdMutex::new(crate::supervision::Supervisor::new()));
+        let visitor_supervisor = supervisor.clone();
+        let visitor: Arc<dyn Fn(&mut dyn FnMut(&crate::supervision::Supervisor)) + Send + Sync> =
+            Arc::new(move |f: &mut dyn FnMut(&crate::supervision::Supervisor)| {
+                f(&visitor_supervisor.lock().unwrap());
+            });
+        crate::control::ControlContext::new(
+            Arc::new(crate::claude::StatusBridge::new()),
+            visitor,
+            "ui-spawn-test".into(),
+        )
+        .with_audit(audit)
+        .with_event_fanout(fanout)
+        .with_live_sessions(|| Ok(Vec::new()))
+        .with_provider_capacity(|| Ok(8))
+        .with_provider_live_sessions(|_| Ok(0))
+    }
+
+    #[test]
+    fn ui_spawn_audit_failure_prevents_identity_and_tmux_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-ui-spawn-audit-failure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked_parent = root.join("blocked");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let fanout = Arc::new(crate::control::EventFanout::new());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let (subscriber, _) = listener.accept().unwrap();
+        fanout.register_test_subscriber(subscriber);
+        let context = ui_spawn_test_context(
+            Arc::new(crate::audit::AuditLog::new(blocked_parent.join("audit"))),
+            fanout,
+        );
+        let identities = crate::identity::IdentityStore::ephemeral();
+        let tmux_session = format!(
+            "th_ui_audit_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let effects_ran = Cell::new(false);
+        let opts = SpawnOptions {
+            cwd: Some("/tmp".into()),
+            shell: None,
+            name: Some("Audit refusal".into()),
+            startup_command: None,
+            provider_intent: None,
+            capability: None,
+        };
+
+        let result = run_authorized_ui_spawn(&context, &opts, 0, || {
+            effects_ran.set(true);
+            identities.mint_for(crate::identity::Role::Crew, None)?;
+            tmux::new_session_with_env(&tmux_session, "/tmp", None, &[])
+                .map_err(|error| error.to_string())
+        });
+
+        assert_eq!(
+            result.unwrap_err(),
+            "refused: audit sink unavailable; 'spawn_terminal' was not executed"
+        );
+        assert!(!effects_ran.get());
+        assert!(identities.is_empty());
+        assert!(tmux::list_sessions()
+            .unwrap_or_default()
+            .iter()
+            .all(|session| session != &tmux_session));
+        let retry = context.admit_ui_spawn(0);
+        assert!(retry.is_ok(), "failed audit authorization spent admission");
+        drop(retry);
+        let mut refusal_signal = String::new();
+        std::io::BufReader::new(client)
+            .read_line(&mut refusal_signal)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&refusal_signal).unwrap(),
+            serde_json::json!({
+                "event": "control://governor",
+                "payload": {
+                    "command": "spawn_terminal",
+                    "decision": "refused-audit",
+                    "error": "refused: audit sink unavailable; 'spawn_terminal' was not executed",
+                },
+            })
+        );
+        std::fs::remove_file(blocked_parent).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     fn sample_terminal_snapshot() -> t_hub_protocol::TerminalSnapshot {

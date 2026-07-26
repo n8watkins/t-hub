@@ -467,6 +467,11 @@ impl EventFanout {
         id
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_test_subscriber(&self, writer: TcpStream) -> u64 {
+        self.register(writer)
+    }
+
     /// Drop a subscriber by id (called when its connection closes cleanly). A
     /// subscriber whose socket errors mid-stream is also pruned lazily by the next
     /// [`emit_event`](Self::emit_event), so this is the prompt path, not the only one.
@@ -2522,6 +2527,45 @@ impl ControlContext {
         provider_lanes: usize,
     ) -> Result<SpawnAdmissionGuard<'_>, crate::governor::Refusal> {
         admit_spawn(self, SpawnPurpose::Ordinary, provider_lanes, None)
+    }
+
+    pub(crate) fn authorize_ui_spawn(
+        &self,
+        provider_lanes: usize,
+        args: &Value,
+    ) -> Result<SpawnAdmissionGuard<'_>, String> {
+        let admission = self
+            .admit_ui_spawn(provider_lanes)
+            .map_err(|refusal| refusal.message)?;
+        if let Err(audit_error) = self.audit.try_record(
+            "spawn_terminal",
+            CommandTier::ProcessChanging.label(),
+            "allowed",
+            args,
+            AuditMeta {
+                peer: "loopback",
+                token_tier: "control",
+                session: None,
+                spawned_by: None,
+                error: None,
+            },
+        ) {
+            self.governor.refund_spawn();
+            eprintln!(
+                "t-hub-audit: refusing Tauri UI spawn because the audit sink is unavailable: {audit_error}"
+            );
+            let message = "refused: audit sink unavailable; 'spawn_terminal' was not executed";
+            self.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": "spawn_terminal",
+                    "decision": "refused-audit",
+                    "error": message,
+                }),
+            );
+            return Err(message.into());
+        }
+        Ok(admission)
     }
 }
 
@@ -11987,7 +12031,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_provider_capacity(
+    pub(crate) fn with_provider_capacity(
         mut self,
         provider_capacity: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
     ) -> Self {
@@ -12014,7 +12058,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_provider_live_sessions(
+    pub(crate) fn with_provider_live_sessions(
         mut self,
         provider_live_sessions: impl Fn(&[String]) -> Result<usize, String> + Send + Sync + 'static,
     ) -> Self {
@@ -12023,7 +12067,7 @@ impl ControlContext {
     }
 
     #[cfg(test)]
-    fn with_live_sessions(
+    pub(crate) fn with_live_sessions(
         mut self,
         live_sessions: impl Fn() -> Result<Vec<String>, String> + Send + Sync + 'static,
     ) -> Self {
