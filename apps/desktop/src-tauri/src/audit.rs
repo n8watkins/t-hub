@@ -1807,8 +1807,16 @@ fn remove_durable(path: &Path) -> std::io::Result<()> {
 }
 
 fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent != path {
+        create_dir_all_durable(parent)?;
+    }
+
     match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(metadata) if metadata.is_dir() => return sync_parent(parent),
         Ok(_) => {
             return Err(std::io::Error::new(
                 ErrorKind::AlreadyExists,
@@ -1817,14 +1825,6 @@ fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
-    }
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if parent != path {
-        create_dir_all_durable(parent)?;
     }
 
     match std::fs::create_dir(path) {
@@ -3041,6 +3041,7 @@ mod tests {
         let path = root.join("profile").join("state").join("audit-hmac-key");
 
         let state = load_or_create_audit_key(&path, Some(TEST_KEY)).unwrap();
+        create_dir_all_durable(path.parent().unwrap()).unwrap();
 
         assert_eq!(state.key, TEST_KEY);
         assert!(path.is_file());
