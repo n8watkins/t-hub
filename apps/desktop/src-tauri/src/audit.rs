@@ -291,7 +291,8 @@ impl AuditLog {
             Some((open_date, _)) => open_date != date,
             None => true,
         };
-        if need_open {
+        let opening_path = if need_open {
+            guard.writer = None;
             if let Some(report) = self.initialize_checkpoint(guard, key)? {
                 return Err(std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -312,14 +313,14 @@ impl AuditLog {
                     ),
                 ));
             }
-            std::fs::create_dir_all(&self.dir)?;
             let path = self.dir.join(format!("control-{date}.jsonl"));
             let (seed, count) = last_hash_and_count(&path)?;
-            let file = open_private_append(&path)?;
             guard.prev_hash = seed;
             guard.count = count;
-            guard.writer = Some((date.to_string(), BufWriter::new(file)));
-        }
+            Some(path)
+        } else {
+            None
+        };
 
         let mut record = json!({
             "v": AUDIT_FORMAT_VERSION,
@@ -359,6 +360,11 @@ impl AuditLog {
             self.prepare_commit(key, self.checkpoint_for(guard), date, count, &hash, &line)?;
         self.write_pending_commit(key, &pending)?;
 
+        if let Some(path) = opening_path {
+            std::fs::create_dir_all(&self.dir)?;
+            let file = open_private_append(&path)?;
+            guard.writer = Some((date.to_string(), BufWriter::new(file)));
+        }
         let (_, writer) = guard.writer.as_mut().expect("writer opened above");
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
@@ -595,15 +601,14 @@ impl AuditLog {
                 ..VerifyReport::default()
             },
         };
-        if report.ok() {
-            guard.verification_cache = Some((Instant::now(), report.clone()));
-        } else {
+        if !report.ok() {
             guard.writer = None;
             guard.poisoned = Some(format!(
                 "integrity verification found {} break(s)",
                 report.breaks.len()
             ));
         }
+        guard.verification_cache = Some((Instant::now(), report.clone()));
         report
     }
 
@@ -2440,6 +2445,7 @@ mod tests {
         drop(log);
 
         for (tag, staged_log, staged_head) in [
+            ("before-record", old_log.clone(), old_head.clone()),
             ("record", new_log.clone(), old_head.clone()),
             (
                 "partial-record",
@@ -2505,6 +2511,38 @@ mod tests {
 
         assert!(log.verify_self_cached().ok());
         assert!(!log.verify_self().ok());
+        clean(&dir);
+    }
+
+    #[test]
+    fn failed_verification_is_cached() {
+        let dir = temp_dir("failed-verify-cache");
+        clean(&dir);
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.record(
+            "close_terminal",
+            "process-changing",
+            "allowed",
+            &json!({"sessionId": "a"}),
+            meta(),
+        );
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            original.replace("\"sessionId\":\"a\"", "\"sessionId\":\"b\""),
+        )
+        .unwrap();
+
+        assert!(!log.verify_self_cached().ok());
+        std::fs::write(&path, original).unwrap();
+        assert!(!log.verify_self_cached().ok());
+        assert!(log.verify_self().ok());
         clean(&dir);
     }
 
