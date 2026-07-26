@@ -2255,6 +2255,18 @@ fn same_managed_tmux_generation(
 pub(crate) fn observe_session_effect_identity(
     name: &str,
 ) -> Result<SessionEffectIdentity, TmuxError> {
+    #[cfg(test)]
+    {
+        let mut pending = OBSERVE_SESSION_EFFECT_FAILURE.lock().unwrap();
+        if pending.as_deref() == Some(name) {
+            pending.take();
+            return Err(TmuxError {
+                op: "observe-session-effect",
+                code: Some(41),
+                message: "exact session effect identity is unavailable or ambiguous".into(),
+            });
+        }
+    }
     exact_effect_target(name)?;
     let socket = validated_socket_name()?;
     let mut command = exact_effect_command()?;
@@ -2282,6 +2294,15 @@ pub(crate) fn observe_session_effect_identity(
 
 #[cfg(test)]
 type ExactEffectHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static OBSERVE_SESSION_EFFECT_FAILURE: LazyLock<std::sync::Mutex<Option<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn fail_next_session_effect_observation(name: &str) {
+    *OBSERVE_SESSION_EFFECT_FAILURE.lock().unwrap() = Some(name.to_string());
+}
 
 #[cfg(test)]
 static BEFORE_EXACT_EFFECT_HOOK: LazyLock<std::sync::Mutex<Option<(String, ExactEffectHook)>>> =
@@ -2478,7 +2499,17 @@ pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
         if session_liveness(name) == SessionLiveness::Gone {
             return Ok(());
         }
-        let identity = observe_session_effect_identity(name)?;
+        let identity = match observe_session_effect_identity(name) {
+            Ok(identity) => identity,
+            Err(error) => {
+                last_error = Some(error);
+                if session_liveness(name) != SessionLiveness::Alive {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
         match kill_session_tree_exact(name, identity) {
             Ok(()) => {
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3287,6 +3318,21 @@ mod tests {
         );
         assert!(parse_pane_generation("$0|0|@0|%0|456").is_none());
         assert!(parse_pane_generation("$0|123|@0|%0|0").is_none());
+    }
+
+    #[test]
+    fn legacy_tree_retirement_retries_a_transient_identity_observation_failure() {
+        if !tmux_available() {
+            eprintln!("legacy tree retirement retry test skipped: tmux unavailable");
+            return;
+        }
+        let session = TestSession::new();
+        new_session_with_env(&session.name, "/tmp", Some("sleep 60"), &[]).unwrap();
+        fail_next_session_effect_observation(&session.name);
+
+        kill_session_tree(&session.name).unwrap();
+
+        assert_eq!(session_liveness(&session.name), SessionLiveness::Gone);
     }
 
     #[test]
