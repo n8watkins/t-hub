@@ -16137,7 +16137,13 @@ fn scoped_harness_attestation_rejects_live_process_substitution_and_allows_tool_
         loop {
             match observe(target, owner) {
                 Ok(observed) if &observed != baseline => break Ok(observed),
-                Err(error) => break Err(error),
+                Err(error @ crate::harness::LaunchAttestationError::ExpectedProvenanceMismatch) => {
+                    break Err(error);
+                }
+                Err(error) => assert!(
+                    Instant::now() < deadline,
+                    "Harness identity did not settle after a process transition: {error:?}"
+                ),
                 _ => {}
             }
             assert!(Instant::now() < deadline, "Harness identity did not change");
