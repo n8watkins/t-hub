@@ -188,7 +188,7 @@ Keep the bad-token message byte-for-byte identical to today (`unauthorized: bad 
 
 The `"audited": true` flag requires a real enforcement-backed sink.
 
-- **What**: an append-only JSONL log at `~/.t-hub/audit/control-YYYYMMDD.jsonl` (0600), one line per Organization/Organization-destructive/ProcessChanging command AND per refusal.
+- **What**: append-only JSONL logs at `~/.t-hub/audit/control-YYYYMMDD.jsonl`, with bounded `control-YYYYMMDD-NNNNNN.jsonl` continuation segments (0600), one line per Organization/Organization-destructive/ProcessChanging command AND per refusal.
 - **Fields**: `ts`, `command`, `tier`, `decision` (`allowed` | `refused-authz` | `refused-cap` | `refused-rate` | `refused-ceiling`), `phase` for pre-dispatch authorization, `sessionId`/`target`, `spawnedBy`, `peer` (`loopback` | tailnet-ip), `tokenTier` (`read` | `control`), and a **redacted** args summary.
   For `send_text`, log `text` length + a hash, not the literal content because it can carry secrets or prompts.
   For `send_keys`, log the key names because they are the kill-pattern signal.

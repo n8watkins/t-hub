@@ -6,8 +6,8 @@
 //! Organization-tier commands and authenticated governor refusals are recorded
 //! best-effort, while ProcessChanging authorization must be recorded durably
 //! before dispatch.
-//! Records are JSON lines in `~/.t-hub/audit/control-YYYYMMDD.jsonl` (mode `0600`
-//! on Unix).
+//! Records are JSON lines in `~/.t-hub/audit/control-YYYYMMDD.jsonl` and bounded
+//! `control-YYYYMMDD-NNNNNN.jsonl` continuation segments (mode `0600` on Unix).
 //! Read-tier commands are not logged because they are not process-affecting and
 //! would drown the signal.
 //!
@@ -53,6 +53,7 @@ const KEY_STATE_FORMAT_VERSION: u64 = 1;
 const COMMIT_JOURNAL_FORMAT_VERSION: u64 = 1;
 const AUDIT_KEY_BYTES: usize = 32;
 const VERIFY_CACHE_TTL: Duration = Duration::from_secs(5);
+const AUDIT_SEGMENT_MAX_BYTES: u64 = 1024 * 1024;
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -362,11 +363,13 @@ impl AuditLog {
                 "configured audit key does not match the requested key",
             ));
         }
-        let need_open = match &guard.writer {
-            Some((open_date, _)) => open_date != date,
-            None => true,
-        };
-        let opening_path = if need_open {
+        let open_file_id = guard.writer.as_ref().and_then(|(file_id, _)| {
+            let verified = guard.verified_files.as_ref()?.get(file_id)?;
+            (audit_file_id_matches_day(file_id, date)
+                && verified.stamp.len < AUDIT_SEGMENT_MAX_BYTES)
+                .then(|| file_id.clone())
+        });
+        let opening = if open_file_id.is_none() {
             guard.writer = None;
             if let Some(report) = self.initialize_checkpoint(guard, key)? {
                 return Err(std::io::Error::new(
@@ -397,17 +400,29 @@ impl AuditLog {
                 ));
             }
             guard.verified_files = Some(verified_files);
-            let path = self.dir.join(format!("control-{date}.jsonl"));
+            let file_id = active_audit_file_id(
+                date,
+                guard
+                    .verified_files
+                    .as_ref()
+                    .expect("audit files snapshotted before opening the writer"),
+            )?;
+            let path = self.dir.join(format!("control-{file_id}.jsonl"));
             let (seed, count) = last_hash_and_count(&path)?;
             guard.prev_hash = seed;
             guard.count = count;
-            Some(path)
+            Some((file_id, path))
         } else {
             if tier == "process-changing" && decision == "allowed" {
                 self.validate_audit_state(guard, key)?;
             }
             None
         };
+        let file_id = opening
+            .as_ref()
+            .map(|(file_id, _)| file_id.clone())
+            .or(open_file_id)
+            .expect("an audit file is selected before writing");
 
         let mut record = json!({
             "v": AUDIT_FORMAT_VERSION,
@@ -443,21 +458,27 @@ impl AuditLog {
         let line = serde_json::to_string(&record)?;
 
         let count = guard.count + 1;
-        let pending =
-            self.prepare_commit(key, self.checkpoint_for(guard), date, count, &hash, &line)?;
+        let pending = self.prepare_commit(
+            key,
+            self.checkpoint_for(guard),
+            &file_id,
+            count,
+            &hash,
+            &line,
+        )?;
         self.write_pending_commit(key, &pending)?;
-        let path = self.dir.join(format!("control-{date}.jsonl"));
+        let path = self.dir.join(format!("control-{file_id}.jsonl"));
         let previous_stamp = guard
             .verified_files
             .as_ref()
             .expect("audit files snapshotted before opening the writer")
-            .get(date)
+            .get(&file_id)
             .cloned();
 
-        if let Some(path) = opening_path {
+        if let Some((_, path)) = opening {
             create_dir_all_durable(&self.dir)?;
             let file = open_private_append(&path)?;
-            guard.writer = Some((date.to_string(), BufWriter::new(file)));
+            guard.writer = Some((file_id.clone(), BufWriter::new(file)));
         }
         let (_, writer) = guard.writer.as_mut().expect("writer opened above");
         writer.get_ref().try_lock_exclusive()?;
@@ -471,6 +492,7 @@ impl AuditLog {
             let path_stamp = audit_file_stamp(&path)?;
             validate_append_transition(
                 previous_stamp.as_ref(),
+                writer.get_ref(),
                 &writer_stamp,
                 &path_stamp,
                 &path,
@@ -490,7 +512,7 @@ impl AuditLog {
             .verified_files
             .as_mut()
             .expect("audit files snapshotted before opening the writer")
-            .insert(date.to_string(), verified_file);
+            .insert(file_id, verified_file);
         guard.verification_cache = None;
         Ok(())
     }
@@ -906,6 +928,42 @@ fn verified_file_stamps(
         .collect()
 }
 
+fn audit_file_id_matches_day(file_id: &str, day: &str) -> bool {
+    file_id == day
+        || file_id
+            .strip_prefix(day)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|suffix| {
+                suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
+fn active_audit_file_id(
+    day: &str,
+    files: &BTreeMap<String, VerifiedAuditFile>,
+) -> std::io::Result<String> {
+    let Some((file_id, file)) = files
+        .iter()
+        .rev()
+        .find(|(file_id, _)| audit_file_id_matches_day(file_id, day))
+    else {
+        return Ok(day.to_string());
+    };
+    if file.stamp.len < AUDIT_SEGMENT_MAX_BYTES {
+        return Ok(file_id.clone());
+    }
+    let next = if file_id == day {
+        1
+    } else {
+        file_id[day.len() + 1..]
+            .parse::<u32>()
+            .map_err(|_| std::io::Error::other("invalid audit segment number"))?
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("audit segment number overflow"))?
+    };
+    Ok(format!("{day}-{next:06}"))
+}
+
 fn verified_audit_file(path: &Path) -> std::io::Result<VerifiedAuditFile> {
     let path_stamp_before = audit_file_stamp(path)?;
     let mut file = File::open(path)?;
@@ -1047,6 +1105,7 @@ fn audit_file_stamp_for_file(file: &File) -> std::io::Result<AuditFileStamp> {
 
 fn validate_append_transition(
     previous: Option<&VerifiedAuditFile>,
+    file: &File,
     writer: &AuditFileStamp,
     path: &AuditFileStamp,
     audit_path: &Path,
@@ -1065,25 +1124,14 @@ fn validate_append_transition(
         ));
     }
 
-    let mut file = File::open(audit_path)?;
-    if audit_file_stamp_for_file(&file)? != *writer {
+    if audit_file_stamp_for_file(file)? != *writer {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "live audit file changed before append validation",
         ));
     }
     let previous_len = previous.map_or(0, |previous| previous.stamp.len);
-    let mut authenticated_prefix = Sha256::new();
-    {
-        let mut prefix = (&mut file).take(previous_len);
-        std::io::copy(&mut prefix, &mut authenticated_prefix)?;
-        if prefix.limit() != 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "live audit file is shorter than its authenticated prefix",
-            ));
-        }
-    }
+    let authenticated_prefix = hash_file_range(file, 0, previous_len)?;
     if previous.is_some_and(|previous| {
         authenticated_prefix.finalize() != previous.content_hasher.clone().finalize()
     }) {
@@ -1093,25 +1141,18 @@ fn validate_append_transition(
         ));
     }
     let mut actual_append = vec![0_u8; appended.len()];
-    file.read_exact(&mut actual_append)?;
+    read_exact_at(file, &mut actual_append, previous_len)?;
     if actual_append != appended {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "live audit file does not contain the expected appended record",
         ));
     }
-    let mut trailing = [0_u8; 1];
-    if file.read(&mut trailing)? != 0 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            "live audit file contains data after the expected append",
-        ));
-    }
     let mut content_hasher = previous
         .map(|previous| previous.content_hasher.clone())
         .unwrap_or_default();
     content_hasher.update(appended);
-    let file_stamp_after = audit_file_stamp_for_file(&file)?;
+    let file_stamp_after = audit_file_stamp_for_file(file)?;
     let path_stamp_after = audit_file_stamp(audit_path)?;
     if file_stamp_after != *writer || path_stamp_after != *writer {
         return Err(std::io::Error::new(
@@ -1123,6 +1164,53 @@ fn validate_append_transition(
         stamp: file_stamp_after,
         content_hasher,
     })
+}
+
+fn hash_file_range(file: &File, offset: u64, len: u64) -> std::io::Result<Sha256> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read = 0_u64;
+    while read < len {
+        let remaining = usize::try_from((len - read).min(buffer.len() as u64))
+            .expect("bounded audit hash buffer length fits usize");
+        read_exact_at(file, &mut buffer[..remaining], offset + read)?;
+        hasher.update(&buffer[..remaining]);
+        read += remaining as u64;
+    }
+    Ok(hasher)
+}
+
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        #[cfg(unix)]
+        let read = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(buffer, offset)?
+        };
+        #[cfg(windows)]
+        let read = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(buffer, offset)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let read = {
+            use std::io::{Seek, SeekFrom};
+            let mut cloned = file.try_clone()?;
+            cloned.seek(SeekFrom::Start(offset))?;
+            cloned.read(buffer)?
+        };
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "audit file is shorter than its authenticated range",
+            ));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("audit file offset overflow"))?;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
 }
 
 fn validate_pre_append_state(
@@ -1690,7 +1778,12 @@ fn read_pending_commit(path: &Path, key: &[u8]) -> std::io::Result<Option<Pendin
             let date = record
                 .get("date")
                 .and_then(Value::as_str)
-                .filter(|date| date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()))
+                .filter(|date| {
+                    let day = &date[..date.len().min(8)];
+                    day.len() == 8
+                        && day.bytes().all(|byte| byte.is_ascii_digit())
+                        && audit_file_id_matches_day(date, day)
+                })
                 .ok_or_else(|| {
                     std::io::Error::new(
                         ErrorKind::InvalidData,
@@ -2034,7 +2127,7 @@ fn decode_checkpoint(value: &Value, key: &[u8]) -> std::io::Result<HeadCheckpoin
 
 fn open_private_append(path: &Path) -> std::io::Result<File> {
     let mut create_options = OpenOptions::new();
-    create_options.create_new(true).append(true);
+    create_options.create_new(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -2042,9 +2135,10 @@ fn open_private_append(path: &Path) -> std::io::Result<File> {
     }
     let (file, created) = match create_options.open(path) {
         Ok(file) => (file, true),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            (OpenOptions::new().append(true).open(path)?, false)
-        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => (
+            OpenOptions::new().read(true).append(true).open(path)?,
+            false,
+        ),
         Err(error) => return Err(error),
     };
     set_owner_only(path)?;
@@ -3003,12 +3097,17 @@ mod tests {
         std::fs::write(&path, b"first\n").unwrap();
         let previous = verified_audit_file(&path).unwrap();
 
-        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut writer = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         writer.write_all(b"second\n").unwrap();
         writer.sync_data().unwrap();
         let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
         assert!(validate_append_transition(
             Some(&previous),
+            &writer,
             &writer_stamp,
             &audit_file_stamp(&path).unwrap(),
             &path,
@@ -3021,12 +3120,19 @@ mod tests {
         }));
         drop(writer);
 
-        std::fs::rename(&path, dir.join("displaced.jsonl")).unwrap();
+        let displaced = dir.join("displaced.jsonl");
+        std::fs::rename(&path, &displaced).unwrap();
+        let writer = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(displaced)
+            .unwrap();
         std::fs::write(&path, vec![b'x'; writer_stamp.len as usize]).unwrap();
         let replacement_stamp = audit_file_stamp(&path).unwrap();
         assert_eq!(replacement_stamp.len, writer_stamp.len);
         assert!(validate_append_transition(
             Some(&previous),
+            &writer,
             &writer_stamp,
             &replacement_stamp,
             &path,
@@ -3046,7 +3152,11 @@ mod tests {
         let previous = verified_audit_file(&path).unwrap();
 
         std::fs::write(&path, b"other\n").unwrap();
-        let writer = OpenOptions::new().append(true).open(&path).unwrap();
+        let writer = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         let error = validate_pre_append_state(Some(&previous), &writer, &path).unwrap_err();
         assert!(error.to_string().contains("changed before append"));
         clean(&dir);
@@ -3060,7 +3170,11 @@ mod tests {
         let path = dir.join("control-20260725.jsonl");
         std::fs::write(&path, b"first\n").unwrap();
         let previous = verified_audit_file(&path).unwrap();
-        let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut writer = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         validate_pre_append_state(Some(&previous), &writer, &path).unwrap();
 
         std::fs::write(&path, b"other\n").unwrap();
@@ -3069,6 +3183,7 @@ mod tests {
         let writer_stamp = audit_file_stamp_for_file(&writer).unwrap();
         let error = validate_append_transition(
             Some(&previous),
+            &writer,
             &writer_stamp,
             &audit_file_stamp(&path).unwrap(),
             &path,
@@ -3079,6 +3194,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("authenticated prefix changed during append"));
+        clean(&dir);
+    }
+
+    #[test]
+    fn full_audit_files_advance_to_bounded_segments() {
+        let dir = temp_dir("bounded-segments");
+        clean(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_path = dir.join("control-20260725.jsonl");
+        std::fs::write(&first_path, vec![b'x'; AUDIT_SEGMENT_MAX_BYTES as usize]).unwrap();
+        let first = verified_audit_file(&first_path).unwrap();
+        let mut files = BTreeMap::from([("20260725".to_string(), first)]);
+
+        assert_eq!(
+            active_audit_file_id("20260725", &files).unwrap(),
+            "20260725-000001"
+        );
+
+        let second_path = dir.join("control-20260725-000001.jsonl");
+        std::fs::write(&second_path, b"x").unwrap();
+        files.insert(
+            "20260725-000001".to_string(),
+            verified_audit_file(&second_path).unwrap(),
+        );
+        assert_eq!(
+            active_audit_file_id("20260725", &files).unwrap(),
+            "20260725-000001"
+        );
         clean(&dir);
     }
 
