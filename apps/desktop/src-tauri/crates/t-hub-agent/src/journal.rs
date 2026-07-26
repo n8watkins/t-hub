@@ -1334,7 +1334,10 @@ mod tests {
     #[test]
     fn concurrent_short_lived_writers_allocate_one_monotonic_sequence() {
         const WRITERS: usize = 8;
-        const ENTRIES_PER_WRITER: usize = 32;
+        // Every append performs the full journal, head, and directory durability
+        // barriers. Keep this concurrent burst inside the production five-second
+        // hook budget while still forcing repeated lock handoffs between handles.
+        const ENTRIES_PER_WRITER: usize = 8;
 
         let dir = temp_dir("concurrent-writers");
         let writers = (0..WRITERS)
