@@ -5971,7 +5971,7 @@ fn force_close_with_ambiguous_rehome_persists_needs_assignment_and_rolls_back_on
 }
 
 #[test]
-fn startup_prune_removes_gone_unmanaged_tiles_before_workspace_projection() {
+fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
     let path = captains_tmp("startup-workspace-tile-prune");
     let registry = CaptainsRegistry::load(path.clone());
     registry
@@ -5992,20 +5992,32 @@ fn startup_prune_removes_gone_unmanaged_tiles_before_workspace_projection() {
     let before = serde_json::to_value(registry.snapshot()).unwrap();
     registry.fail_next_persist("startup workspace prune persistence failure");
     let error = registry
-        .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
+        .prune_gone_workspace_tiles(|tile| tile == "live-a")
         .unwrap_err();
     assert!(error.contains("startup workspace prune persistence failure"));
     assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), before);
-
+    let rolled_back_projection = registry.workspace_projection();
     assert_eq!(
-        registry
-            .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
-            .unwrap(),
-        vec!["gone-a".to_string(), "gone-b".to_string()]
+        rolled_back_projection
+            .iter()
+            .find(|workspace| workspace.id == "work-a")
+            .unwrap()
+            .tile_ids,
+        vec!["live-a"]
     );
+    assert!(rolled_back_projection
+        .iter()
+        .find(|workspace| workspace.id == "work-b")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    registry
+        .rename_workspace("work-a", "Work A renamed")
+        .unwrap();
     let committed_seq = registry.snapshot().seq;
     assert!(registry
-        .prune_gone_unmanaged_workspace_tiles(|tile| tile == "live-a")
+        .prune_gone_workspace_tiles(|tile| tile == "live-a")
         .unwrap()
         .is_empty());
     assert_eq!(registry.snapshot().seq, committed_seq);
@@ -6026,6 +6038,188 @@ fn startup_prune_removes_gone_unmanaged_tiles_before_workspace_projection() {
     assert!(projection
         .iter()
         .find(|workspace| workspace.id == "work-b")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_prune_reconciles_gone_managed_tiles_and_preserves_live_crew() {
+    let path = captains_tmp("startup-managed-workspace-tile-prune");
+    let registry = CaptainsRegistry::load(path.clone());
+    registry
+        .upsert_project(ProjectRecord {
+            project_id: "project-startup-prune".into(),
+            name: "Startup prune".into(),
+            repo_root: "/tmp/startup-prune".into(),
+            root_path: None,
+            vcs_capability: None,
+            git_main_root: None,
+            remote_url: None,
+            default_branch: None,
+            powder: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    registry
+        .claim_test("captain-gone", Some("startup-ship"), vec![])
+        .unwrap();
+    registry
+        .bind_ship_context(
+            "startup-ship",
+            "project-startup-prune",
+            "Reconcile startup",
+            "codex",
+        )
+        .unwrap();
+    let captain = registry.snapshot().captains[0].clone();
+    registry
+        .create_workspace(
+            "work-managed",
+            "Managed work",
+            Some(&FleetWorkspaceOwner {
+                project_id: captain.project_id.clone().unwrap(),
+                assignment_id: captain.assignment_id.clone(),
+                ship_slug: captain.ship_slug.clone(),
+            }),
+        )
+        .unwrap();
+    for crew in ["crew-gone", "crew-live"] {
+        registry.record_crew("captain-gone", crew).unwrap();
+        registry.move_workspace_tile(crew, "work-managed").unwrap();
+    }
+
+    assert_eq!(
+        registry
+            .prune_gone_workspace_tiles(|tile| tile == "crew-live")
+            .unwrap(),
+        vec!["captain-gone".to_string(), "crew-gone".to_string()]
+    );
+    let snapshot = registry.snapshot();
+    let captain = &snapshot.captains[0];
+    assert!(captain.terminal_id.is_none());
+    assert!(matches!(captain.state, ClaimState::Orphaned { .. }));
+    let gone = captain
+        .crew
+        .iter()
+        .find(|crew| crew.terminal_id == "crew-gone")
+        .unwrap();
+    assert!(matches!(gone.state, CrewState::Removed { .. }));
+    assert!(gone.workspace_tab_id.is_none());
+    let live = captain
+        .crew
+        .iter()
+        .find(|crew| crew.terminal_id == "crew-live")
+        .unwrap();
+    assert!(matches!(live.state, CrewState::Orphaned { .. }));
+    assert_eq!(live.workspace_tab_id.as_deref(), Some("work-managed"));
+    let projection = registry.workspace_projection();
+    assert!(projection
+        .iter()
+        .find(|workspace| workspace.id == CAPTAIN_WORKSPACE_ID)
+        .unwrap()
+        .tile_ids
+        .is_empty());
+    assert_eq!(
+        projection
+            .iter()
+            .find(|workspace| workspace.id == "work-managed")
+            .unwrap()
+            .tile_ids,
+        vec!["crew-live"]
+    );
+
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    assert_eq!(
+        restarted
+            .workspace_projection()
+            .iter()
+            .find(|workspace| workspace.id == "work-managed")
+            .unwrap()
+            .tile_ids,
+        vec!["crew-live"]
+    );
+
+    let _ = std::fs::remove_file(path.with_extension("json.bak"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_prune_preserves_cleanup_recovery_without_restoring_crew_tile() {
+    let path = captains_tmp("startup-cleanup-pending-tile-prune");
+    let source = powder_lifecycle_registry(None);
+    let mut snapshot = source.snapshot();
+    snapshot.captains[0].workspace_tab_ids = vec!["work-recovery".into()];
+    let crew = &mut snapshot.captains[0].crew[0];
+    crew.workspace_tab_id = Some("work-recovery".into());
+    crew.state = CrewState::CleanupPending { since: 1 };
+    let work = crew.powder_work.as_mut().unwrap();
+    work.dispatch_release_recovery = true;
+    snapshot
+        .pending_dispatch_releases
+        .push(PendingDispatchRelease {
+            crew_session_id: crew.terminal_id.clone(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "profile-that-does-not-exist-for-control-tests".into(),
+            connection_endpoint_identity: format!("hmac-sha256:{}", "0".repeat(64)),
+            repository: "t-hub".into(),
+            card_id: work.card_id.clone(),
+            run_id: work.run_id.clone(),
+            agent: work.agent.clone().unwrap(),
+            operation_id: "startup-prune-release".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        });
+    snapshot.workspaces =
+        CaptainsRegistry::reconcile_durable_workspaces(&snapshot.captains, snapshot.workspaces);
+    snapshot.seq = snapshot.seq.saturating_add(1);
+    CaptainsRegistry::validate_snapshot(&snapshot).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    let registry = CaptainsRegistry::load(path.clone());
+    assert_eq!(
+        registry
+            .prune_gone_workspace_tiles(|tile| tile == "captain-powder")
+            .unwrap(),
+        vec!["crew-powder".to_string()]
+    );
+    let committed = registry.snapshot();
+    let crew = &committed.captains[0].crew[0];
+    assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+    assert!(crew.workspace_tab_id.is_none());
+    assert_eq!(committed.pending_dispatch_releases.len(), 1);
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+
+    registry
+        .rename_workspace("work-recovery", "Recovery renamed")
+        .unwrap();
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
+        .unwrap()
+        .tile_ids
+        .is_empty());
+    drop(registry);
+    let restarted = CaptainsRegistry::load(path.clone());
+    let crew = &restarted.snapshot().captains[0].crew[0];
+    assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+    assert!(crew.workspace_tab_id.is_none());
+    assert!(restarted
+        .workspace_projection()
+        .iter()
+        .find(|workspace| workspace.id == "work-recovery")
         .unwrap()
         .tile_ids
         .is_empty());

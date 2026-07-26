@@ -741,8 +741,8 @@ pub fn run() {
             // app restarts.
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
-            // Reconcile ordinary workspace placements against one definitive
-            // tmux snapshot before the durable projection becomes authoritative.
+            // Reconcile workspace placements against one definitive tmux snapshot
+            // before the durable projection becomes authoritative.
             // An unavailable tmux server is indeterminate, so preserve every
             // placement and let the next restart retry instead of guessing.
             let startup_live_sessions = tmux::list_sessions();
@@ -752,7 +752,7 @@ pub fn run() {
                         .iter()
                         .cloned()
                         .collect::<std::collections::HashSet<_>>();
-                    match captains_registry.prune_gone_unmanaged_workspace_tiles(|tile| {
+                    match captains_registry.prune_gone_workspace_tiles(|tile| {
                         live.contains(&tmux::target_for_id(tile))
                     }) {
                         Ok(pruned) if !pruned.is_empty() => eprintln!(
