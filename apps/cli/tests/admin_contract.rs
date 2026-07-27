@@ -68,6 +68,26 @@ fn cleanup_requires_exact_approval_and_confirmation_before_discovery() {
 }
 
 #[test]
+fn worktree_cleanup_requires_confirmation_before_discovery() {
+    let output = cli(&[
+        "admin",
+        "cleanup-worktree",
+        "/tmp/worktree-1",
+        "--approval",
+        "approval-1",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(5));
+    let response = envelope(&output);
+    assert_eq!(response["command"], "admin cleanup-worktree");
+    assert_eq!(response["error"]["kind"], "gated");
+    assert_eq!(
+        response["error"]["message"],
+        "th admin cleanup-worktree requires --confirm before endpoint discovery or mutation"
+    );
+}
+
+#[test]
 fn role_and_operation_inputs_are_strict() {
     let output = cli(&[
         "admin",
@@ -156,6 +176,29 @@ fn exact_session_approval_and_cleanup_are_forwarded_without_authority_expansion(
     assert_eq!(request["args"]["sessionId"], "crew-1");
     assert_eq!(request["args"]["approvalId"], "approval-1");
     assert_eq!(request["args"]["force"], false);
+}
+
+#[test]
+fn exact_worktree_cleanup_is_forwarded_without_source_removal_flags() {
+    let (output, request) = cli_with_server(&[
+        "admin",
+        "cleanup-worktree",
+        "/tmp/worktree-1",
+        "--approval",
+        "approval-1",
+        "--confirm",
+        "--json",
+    ]);
+    assert!(output.status.success());
+    assert_eq!(request["command"], "cleanup_worktree_artifacts");
+    assert_eq!(
+        request["args"],
+        serde_json::json!({
+            "worktreePath": "/tmp/worktree-1",
+            "approvalId": "approval-1",
+            "confirm": true,
+        })
+    );
 }
 
 #[test]

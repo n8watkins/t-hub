@@ -36,6 +36,7 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         "approve-session" => approve_session(&args[1..]),
         "approve-worktree" => approve_worktree(&args[1..]),
         "cleanup-session" => cleanup_session(&args[1..]),
+        "cleanup-worktree" => cleanup_worktree(&args[1..]),
         "maintain-session" => maintain_session(&args[1..]),
         "recover-resource" => execute_resource_operation(
             "admin recover-resource",
@@ -51,10 +52,10 @@ pub fn run(args: &[String]) -> Result<(), CliError> {
         ),
         "maintain-fleet-resource" => maintain_fleet_resource(&args[1..]),
         "" => Err(CliError::usage(
-            "usage: th admin <list|appoint|revoke|approve-session|approve-worktree|cleanup-session|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource> ...",
+            "usage: th admin <list|appoint|revoke|approve-session|approve-worktree|cleanup-session|cleanup-worktree|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource> ...",
         )),
         other => Err(CliError::usage(format!(
-            "unknown admin subcommand '{other}' (expected list|appoint|revoke|approve-session|approve-worktree|cleanup-session|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource)"
+            "unknown admin subcommand '{other}' (expected list|appoint|revoke|approve-session|approve-worktree|cleanup-session|cleanup-worktree|maintain-session|recover-resource|prepare-retirement|maintain-fleet-resource)"
         ))),
     }
 }
@@ -68,6 +69,7 @@ revoke <grantId> [--reason TEXT]                      revoke a grant and its act
 approve-session <grantId> <sessionId>                 approve one exact session cleanup\n\
 approve-worktree <grantId> <path> --ship SLUG         approve one exact worktree cleanup\n\
 cleanup-session <sessionId> --approval ID --confirm   consume approval and close the session\n\
+cleanup-worktree <path> --approval ID --confirm      reclaim exact Cargo targets in a linked worktree\n\
 maintain-session <sessionId>                          maintain one exact live session\n\
 recover-resource <KIND> <VALUE>                       reconcile or prepare recovery\n\
 prepare-retirement <KIND> <VALUE>                     prepare a fail-closed retirement plan\n\
@@ -195,6 +197,31 @@ fn cleanup_session(args: &[String]) -> Result<(), CliError> {
             "sessionId": session_id,
             "approvalId": approval_id,
             "force": flags.booleans.contains("--force"),
+        }),
+        &flags,
+    )
+}
+
+fn cleanup_worktree(args: &[String]) -> Result<(), CliError> {
+    let flags = StrictFlags::parse(args, &["--approval"], &["--confirm", "--json"])?;
+    flags.require_positionals(
+        1,
+        "th admin cleanup-worktree <path> --approval <id> --confirm [--json]",
+    )?;
+    if !flags.booleans.contains("--confirm") {
+        return Err(CliError::gated(
+            "th admin cleanup-worktree requires --confirm before endpoint discovery or mutation",
+        ));
+    }
+    let worktree_path = positional(&flags, 0, "admin cleanup-worktree", "<path>")?;
+    let approval_id = required(&flags, "--approval", "admin cleanup-worktree")?;
+    call_and_render(
+        "admin cleanup-worktree",
+        "cleanup_worktree_artifacts",
+        json!({
+            "worktreePath": worktree_path,
+            "approvalId": approval_id,
+            "confirm": true,
         }),
         &flags,
     )

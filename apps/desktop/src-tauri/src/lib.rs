@@ -60,6 +60,7 @@ mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS prox
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 #[cfg(any(windows, test))]
 mod wsl; // Shared Windows-to-WSL command construction.
+pub mod worktree_coordinator; // durable Cargo-cleanup reservations and activity admission
 
 use agent::AgentBridge;
 use claude::StatusBridge;
@@ -301,6 +302,7 @@ fn start_control_listener(
     inbox: std::sync::Arc<inbox::Inbox>,
     authz: std::sync::Arc<authz::AuthzStore>,
     delegated_admin: std::sync::Arc<delegated_admin::DelegatedAdminStore>,
+    worktrees: std::sync::Arc<worktree_coordinator::WorktreeCoordinator>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -402,7 +404,8 @@ fn start_control_listener(
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz)
-        .with_delegated_admin(delegated_admin);
+        .with_delegated_admin(delegated_admin)
+        .with_worktree_coordinator(worktrees.clone());
     control::recover_pending_fleet_operations_after_audit_check(&ctx);
     // The local webview spawn command shares the exact same admission lock and
     // capacity evidence as the control listener. Keeping a cloned context as
@@ -418,6 +421,7 @@ fn start_control_listener(
                 h.addr,
                 control::handshake_path().display()
             );
+            worktrees.recover_pending();
             Some(h)
         }
         Err(e) => {
@@ -898,6 +902,13 @@ pub fn run() {
                     ))
                 })?,
             );
+            let worktree_coordinator = std::sync::Arc::new(
+                worktree_coordinator::WorktreeCoordinator::load_default().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "durable worktree retirement state could not be loaded safely: {error}"
+                    ))
+                })?,
+            );
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
@@ -969,6 +980,7 @@ pub fn run() {
                 inbox,
                 authz_store,
                 delegated_admin_store,
+                worktree_coordinator,
             ) {
                 control_client::install(app.handle(), &handshake);
             }

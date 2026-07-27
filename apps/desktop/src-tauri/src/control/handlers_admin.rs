@@ -1077,6 +1077,156 @@ pub(super) fn execute_admin_operation(
     result
 }
 
+pub(super) fn cleanup_worktree_artifacts(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "cleanup_worktree_artifacts",
+        &["worktreePath", "approvalId", "confirm"],
+    )?;
+    require_socket_identity(caller, trusted_internal, "cleanup_worktree_artifacts")?;
+    let caller = caller
+        .ok_or("cleanup_worktree_artifacts requires the exact delegated Crew session identity")?;
+    if args.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return Err(
+            "cleanup_worktree_artifacts requires explicit confirmation before mutation".into(),
+        );
+    }
+    let requested_path = arg_str(args, "worktreePath")
+        .filter(|path| !path.trim().is_empty())
+        .ok_or("cleanup_worktree_artifacts requires a non-empty worktreePath")?;
+    let approval_id = arg_str(args, "approvalId")
+        .filter(|approval_id| !approval_id.trim().is_empty())
+        .ok_or("cleanup_worktree_artifacts requires an exact approvalId")?;
+    ctx.worktrees.require_provider_configured()?;
+
+    let target = resolve_admin_worktree_target(ctx, &requested_path)?;
+    let path = match &target.resource {
+        AdminExecutionResource::Worktree(path) => path.clone(),
+        _ => return Err("cleanup_worktree_artifacts requires an exact worktree target".into()),
+    };
+    require_registered_git_capability(ctx, "cleanup_worktree_artifacts", &path)?;
+    let capture = crate::worktree_coordinator::inspect_cleanup_candidate(&path)?;
+    if !capture.is_linked {
+        return Err("cleanup_worktree_artifacts refuses the primary worktree".into());
+    }
+    if capture.dirty {
+        return Err("cleanup_worktree_artifacts requires a clean worktree".into());
+    }
+    if !capture.merged {
+        return Err(
+            "cleanup_worktree_artifacts requires HEAD to be merged into origin's default branch"
+                .into(),
+        );
+    }
+    let leased_sessions = tmux::pane_info()
+        .map_err(|error| format!("cleanup_worktree_artifacts lease inspection failed: {error}"))?
+        .into_iter()
+        .filter(|pane| {
+            pane.cwd == path
+                || pane
+                    .cwd
+                    .strip_prefix(&path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .map(|pane| pane.session)
+        .collect::<Vec<_>>();
+    if !leased_sessions.is_empty() {
+        return Err(format!(
+            "cleanup_worktree_artifacts refuses worktree '{path}' because live sessions are present: {}",
+            leased_sessions.join(", ")
+        ));
+    }
+
+    let grant = ctx
+        .delegated_admin
+        .grants_for_actor(&caller.session_id)
+        .into_iter()
+        .find(|grant| grant.state.is_active())
+        .ok_or("delegated admin: caller has no active administrative grant")?;
+    let supervisor = current_delegating_supervisor(ctx, &grant);
+    let actor = current_admin_actor(ctx, &grant);
+    let consumed_approval = ctx
+        .delegated_admin
+        .consume_exact_approval(
+            &approval_id,
+            &crate::delegated_admin::AdminActor {
+                identity_id: caller.session_id.clone(),
+                session_tile: caller.tile.clone(),
+                ..actor
+            },
+            &supervisor,
+            crate::delegated_admin::AdminOperation::CleanupWorktree,
+            &target.authorization_target,
+        )
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    let evidence_id = {
+        let body = serde_json::to_vec(&json!({
+            "target": target.authorization_target,
+            "worktree": capture.worktree,
+            "targets": capture.targets,
+            "dirty": capture.dirty,
+            "merged": capture.merged,
+            "isLinked": capture.is_linked,
+        }))
+        .expect("worktree cleanup evidence is serializable");
+        format!("sha256:{:x}", Sha256::digest(body))
+    };
+    let audit = authorize_delegated_admin(
+        ctx,
+        caller,
+        crate::delegated_admin::AdminOperation::CleanupWorktree,
+        target.authorization_target.clone(),
+        crate::delegated_admin::AdminSafeguards {
+            authoritative_ownership_verified: true,
+            consumed_approval: Some(consumed_approval),
+            worktree_safety: Some(crate::delegated_admin::WorktreeSafetyEvidence {
+                evidence_id,
+                target_fingerprint: target.authorization_target.fingerprint(),
+                removable: true,
+            }),
+        },
+    )?;
+    revalidate_admin_execution_target(ctx, &audit, &target)?;
+
+    let request_path = ctx.worktrees.next_request_path();
+    let request_path = request_path.to_string_lossy().into_owned();
+    let target_count = capture.targets.len();
+    let record = ctx
+        .worktrees
+        .begin_retirement(&path, &request_path)
+        .map_err(|error| error.to_string())?;
+    let result: Result<Value, String> = (|| {
+        ctx.worktrees
+            .write_provider_request(&record, capture)
+            .map_err(|error| error.to_string())?;
+        ctx.worktrees.start_provider_worker(record.clone())?;
+        Ok(json!({
+            "accepted": "cleanup_worktree_artifacts",
+            "operation": "cleanupWorktree",
+            "target": target.authorization_target,
+            "retirementReservation": crate::worktree_coordinator::RetirementReservation::from(&record),
+            "targetCount": target_count,
+            "delegatedAdmin": audit,
+            "audited": true,
+            "sourceRemovalPerformed": false,
+        }))
+    })();
+    if let Err(error) = &result {
+        let _ = ctx.worktrees.transition(
+            &record.operation_id,
+            crate::worktree_coordinator::RetirementState::Failed,
+            Some(error.clone()),
+        );
+    }
+    record_delegated_admin_execution_outcome(ctx, &audit, &result);
+    result
+}
+
 pub(super) fn authorize_delegated_admin(
     ctx: &ControlContext,
     caller: &ResolvedIdentity,
