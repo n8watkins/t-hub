@@ -197,8 +197,12 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         surfaceLayoutSyncFailure((repaired as { error: string }).error);
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
-      if (!repaired.error && repaired.stale && Array.isArray(repaired.tabs)) {
-        adoptAuthoritativeTabs(repaired.tabs);
+      if (!repaired.error) {
+        const authoritativeTabs =
+          repaired.stale && Array.isArray(repaired.tabs)
+            ? repaired.tabs
+            : repairedTabs;
+        adoptAuthoritativeTabs(authoritativeTabs);
       }
       return;
     }

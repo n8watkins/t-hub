@@ -82,10 +82,16 @@ describe("workspace registry bootstrap", () => {
 
     await bootstrapWorkspaceTabs();
 
-    expect(useWorkspace.getState().tabs.map((tab) => tab.id)).toEqual([
-      "work-1",
-      CAPTAINS_TAB_ID,
+    expect(
+      useWorkspace.getState().tabs.map((tab) => ({
+        id: tab.id,
+        tileIds: tab.order,
+      })),
+    ).toEqual([
+      { id: "work-1", tileIds: ["term-live"] },
+      { id: CAPTAINS_TAB_ID, tileIds: ["captain-live"] },
     ]);
+    expect(useWorkspace.getState().registryAdopted).toBe(true);
     expect(invoke).toHaveBeenCalledWith(
       "report_workspace_tabs",
       expect.objectContaining({
