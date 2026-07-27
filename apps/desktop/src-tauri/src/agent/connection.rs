@@ -545,11 +545,10 @@ mod transport_tests {
     /// by both the `--hook` ingest processes and the `--stdio` agent the bridge
     /// spawns. Skips when the binary isn't built (so CI never fails spuriously).
     ///
-    /// Exercises BOTH emit paths:
-    ///   - **replay**: hooks fired *before* connect → bridge replays the journal
-    ///     on handshake → each replayed entry emits.
-    ///   - **live tail**: a hook fired *after* connect → agent's tail thread
-    ///     streams it → bridge consumes it → emits.
+    /// Exercises both journal paths:
+    ///   - **replay**: hooks fired before connect are replayed into one bounded
+    ///     supervision snapshot without forwarding historical journal events.
+    ///   - **live tail**: a hook fired after connect is streamed and emitted.
     #[test]
     fn live_emit_demo_hook_sequence_to_supervision_tree() {
         use parking_lot::Mutex as PMutex;
@@ -665,16 +664,17 @@ mod transport_tests {
             *rec.events.lock()
         );
 
-        // Also: agent://journal must have been emitted for the replayed entries.
+        // Historical journal events stay silent during replay. The bounded
+        // supervision snapshot above is the observable replay result.
         let journal_emits = rec
             .events
             .lock()
             .iter()
             .filter(|(ch, _)| ch == super::super::emit::EVT_JOURNAL)
             .count();
-        assert!(
-            journal_emits >= 4,
-            "expected >=4 journal emits, got {journal_emits}"
+        assert_eq!(
+            journal_emits, 0,
+            "replay must suppress historical journal emits"
         );
 
         eprintln!("live_emit_demo: replay path emitted waitingOnSubagents ✓");
@@ -703,6 +703,19 @@ mod transport_tests {
             "live tail path must stream SubagentStop and emit completed; got {:?}",
             *rec.events.lock()
         );
+        let journal_events = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::super::emit::EVT_JOURNAL)
+            .map(|(_, payload)| payload.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal_events.len(),
+            1,
+            "live tail path must emit exactly one journal event"
+        );
+        assert_eq!(journal_events[0]["replayed"], false);
         eprintln!("live_emit_demo: live tail path emitted completed ✓");
 
         bridge.disconnect();
