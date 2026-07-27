@@ -106,10 +106,10 @@ name over the loopback channel:
 | `th status [<session>]` | `list_terminals`+`get_status`, or `get_status`+`supervision_tree` | fleet table, or one session + its tree |
 | `th send <session> <text…>` | `send_text` | `--no-enter` to skip the trailing Enter |
 | `th spawn <cwd>` | `spawn_terminal` | opens a generic user shell; supervisor agent assignments must use `th agents start` |
-| `th worktree ls [repoRoot]` | local git + `list_terminals` | lifecycle table: BRANCH / DIRTY / MERGED / LEASED |
-| `th worktree new <repoRoot> <branch>` | `create_worktree` (or local git when recycling) | opens a generic shell; use `th agents start` afterward for a supervised assignment; `--path P` (defaults under `.claude/worktrees/`), `--tab T`, `--fresh` to skip pool reuse |
-| `th worktree rm <repoRoot> <path>` | `remove_worktree` | `--force` |
-| `th worktree prune [repoRoot]` | local git + `list_terminals`/`close_terminal` | dry-run by default; `--yes` executes, `--force` includes unmerged |
+| `th worktree ls [repoRoot]` | local git + `list_terminals` + `list_worktrees` | lifecycle table: BRANCH / DIRTY / MERGED / LEASED; JSON includes backend cleanup reservations |
+| `th worktree new <repoRoot> <branch>` | `create_worktree` | opens a generic shell; use `th agents start` afterward for a supervised assignment; `--path P` defaults under `.claude/worktrees/`; `--tab T` names the tab |
+| `th worktree rm <repoRoot> <path>` | `remove_worktree` | currently suspended by the backend safety gate |
+| `th worktree prune [repoRoot]` | local git + `list_terminals` | reporting only; `--yes` is refused; `--force` includes unmerged candidates in the report |
 | `th tabs` | `list_tabs` | |
 | `th health` | `wsl_health` | |
 | `th events` | `__subscribe_events` | streams the event bus until Ctrl-C |
@@ -125,34 +125,37 @@ The captain's staffing loop creates a worktree per crew task and reaps it after 
 `th worktree ls / prune / new` automate that lifecycle.
 
 Git facts (worktrees, dirtiness, merge state) are read **locally** - `th` runs `git` directly, since the repo is on this filesystem.
-The control socket is only consulted for **lease** data: which live T-Hub session is rooted in which worktree.
+The control socket is consulted for **lease** data and backend-owned Cargo cleanup reservations.
 Lease discovery is layered: `list_terminals` cwds first, then pane paths straight off the `t-hub` tmux socket (`$T_HUB_TMUX_SOCKET` to override) for older app builds or when the app is down.
+Reservation discovery has no local fallback, so it is available only while the backend can answer `list_worktrees`.
 A session leases the *deepest* worktree containing its pane's current path, so a crew session inside `.claude/worktrees/x` does not also lease the repo root above it.
 Note the granularity: `pane_current_path` tracks where the pane currently *is*, so a session that `cd`-ed elsewhere temporarily drops its lease.
 
 ### `th worktree ls [repoRoot]`
 
-One row per worktree: PATH, BRANCH, DIRTY (uncommitted change count), MERGED (branch fully merged into the default branch), LEASED (the live session id rooted there).
-`repoRoot` defaults to the current directory's repo; `--json` adds the no-force prune verdict (`prunable` + `reason`) per worktree.
+One row per worktree: PATH, BRANCH, DIRTY (uncommitted change count), MERGED (branch fully merged into origin's default branch), LEASED (the live session id rooted there).
+`repoRoot` defaults to the current directory's repo.
+`--json` adds the no-force prune verdict (`prunable` + `reason`) and nullable `retirementReservation` data per worktree.
+See [the CLI contract](../../docs/cli-contract.md) for the guarded Cargo cleanup workflow that owns those reservations.
 
 ### `th worktree prune [repoRoot]`
 
-Reaps worktrees that are **merged AND clean AND unleased**: closes any dead session over the socket, `git worktree remove`, then deletes the branch.
-Safety rules, in doctrine order (these mirror the captain's never-reap-unlanded rules):
+Reports worktrees that appear **merged AND clean AND unleased** without removing worktrees, closing sessions, or deleting branches.
+Execution remains suspended until the authoritative worktree safety service can prove ownership, retention, and exact-target removability.
+Reporting rules, in doctrine order:
 
-- **dry-run by default** - `--yes` executes the printed plan;
+- output is always a dry-run report, and `--yes` is refused before endpoint discovery;
 - a **dirty** worktree is never removed, no flag overrides that;
 - a **leased** worktree is hands-off, no flag overrides that;
-- an **unmerged** branch is only reaped with `--force`, and the plan prints exactly which commits would be lost (`REAP*` rows);
+- an **unmerged** branch is included as a forced candidate only with `--force`, and the plan prints exactly which commits would be lost (`REAP*` rows);
 - every skip prints the protecting reason;
-- if lease state cannot be verified (no control socket *and* no tmux), prune **refuses to run** rather than guess.
+- if lease state cannot be verified (no control socket *and* no tmux), prune **refuses to report a plan** rather than guess.
 
-### Pool reuse on `th worktree new`
+### `th worktree new`
 
-If an existing pool worktree (under `.claude/worktrees/`) is clean, unleased, and its branch is merged - i.e. it would be safe to prune - `th worktree new` **recycles it in place** instead of growing the pool: `git worktree move` to the new branch's slot name, switch to the new branch (based at the repo root's HEAD), and retire the old merged branch.
-In-place reuse preserves ignored build artifacts (`target/`, `node_modules/`), which is the point of a pool.
-`--fresh` opts out; with `--path` the choice is pinned to that exact path.
-The fresh `create_worktree` server path (which also opens a tab + terminal in the app) remains the fallback whenever no safe candidate exists.
+`th worktree new` always delegates creation to the backend and does not recycle an existing worktree.
+Without `--path`, it derives a new path under `<repoRoot>/.claude/worktrees/` from the branch leaf.
+An active Cargo cleanup reservation covering the requested path blocks creation before Git or runtime state is created.
 
 ## Agent ergonomics
 
