@@ -40,52 +40,45 @@ applied to the attention queue and the tree badges in the sidebar.
 
 ## Installing `t-hub-agent` (required for the bridge to connect)
 
-The core launches the agent over stdio. On **Windows** it runs inside WSL via
-`wsl.exe -d <distro> -- t-hub-agent --stdio`; on a **unix dev box** it spawns
-`t-hub-agent --stdio` directly. Either way the binary must be resolvable, or
-you can point at it explicitly with **`T_HUB_AGENT_BIN`** (overrides argv[0]).
+The core launches the agent over stdio.
+Packaged **Windows** builds carry the exact x86-64 Linux helper built from the same source tree as the desktop executable.
+Before connecting, packaged startup validates that resource, atomically installs it as `~/.local/bin/t-hub-agent` in the configured WSL distro when needed, verifies the installed SHA-256 digest, and launches that exact path.
+If deployment or verification fails, the bridge stays disconnected instead of falling back to another `t-hub-agent` on `PATH`.
+The explicit **`T_HUB_AGENT_BIN`** developer override bypasses packaged deployment and is spawned verbatim with the agent arguments.
+On a **unix dev box**, the bridge spawns `t-hub-agent --stdio` directly unless that override is set.
 
-### Build it
+### Packaged Windows build
 
-```sh
-cargo build --manifest-path src-tauri/Cargo.toml -p t-hub-agent
-# → src-tauri/target/debug/t-hub-agent
-```
-
-### Windows path: install into the WSL distro (so `wsl.exe … t-hub-agent` finds it)
-
-The agent runs **inside** the distro, so install the Linux build onto the
-distro's `PATH`. From the WSL distro shell:
-
-```sh
-# Build the linux binary inside WSL (or copy a prebuilt one in), then:
-install -m 0755 src-tauri/target/debug/t-hub-agent ~/.local/bin/t-hub-agent
-#   ~/.local/bin is on PATH in a default Ubuntu login shell. /usr/local/bin
-#   (sudo) also works and is visible to non-login `wsl.exe -- …` invocations.
-command -v t-hub-agent     # must print a path
-t-hub-agent --version      # t-hub-agent 0.5.x
-```
-
-If `~/.local/bin` is not on the non-interactive `wsl.exe` `PATH`, prefer
-`/usr/local/bin`, or set the escape hatch on the Windows side:
+`pnpm tauri build` runs the release resource preparation automatically.
+On Windows, the preparation step builds `t-hub-agent` inside WSL with an isolated Cargo target directory, validates the ELF artifact, and copies it into the Tauri resources before packaging.
+For an externally built Linux helper, set `T_HUB_AGENT_RESOURCE_SOURCE` to its path before invoking the package build.
 
 ```powershell
-setx T_HUB_AGENT_BIN "wsl.exe"   # not typical; usually just install on PATH
+$env:T_HUB_AGENT_RESOURCE_SOURCE = "C:\path\to\t-hub-agent"
+pnpm tauri build
 ```
 
-The distro is `Ubuntu-24.04` by default; override with the `T_HUB_DISTRO` env
-var (read in `lib.rs::default_distro`).
+The distro is `Ubuntu-24.04` by default.
+Override it with `T_HUB_DISTRO`, which is read by `lib.rs::default_distro`.
+The packaged bridge launches through `wsl.exe` but does not depend on the distro's `PATH`:
+
+```text
+wsl.exe -d <distro> --cd ~ -e bash -lc \
+  "exec $HOME/.local/bin/t-hub-agent --stdio"
+```
 
 ### Dev box (this repo, run inside WSL/Linux directly)
 
 ```sh
+cd apps/desktop
+cargo build --manifest-path src-tauri/Cargo.toml -p t-hub-agent
 install -m 0755 src-tauri/target/debug/t-hub-agent ~/.local/bin/t-hub-agent
 command -v t-hub-agent      # /home/<you>/.local/bin/t-hub-agent
 ```
 
-Now `pnpm tauri dev` will connect: the bridge spawns `t-hub-agent --stdio`,
-handshakes (Hello/Ready), replays the journal, and goes `live`. Escape hatch for
-a one-off without touching PATH:
+Now `pnpm tauri dev` will connect.
+The bridge spawns `t-hub-agent --stdio`, handshakes (`Hello`/`Ready`), replays the journal, and goes live.
+Use the developer override for a one-off without touching `PATH`:
 
 ```sh
 T_HUB_AGENT_BIN=$PWD/src-tauri/target/debug/t-hub-agent pnpm tauri dev

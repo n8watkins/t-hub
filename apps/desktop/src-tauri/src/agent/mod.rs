@@ -404,8 +404,9 @@ impl AgentBridge {
     /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
     /// state to `Live`.
     ///
-    /// The `T_HUB_AGENT_BIN` env var overrides argv[0] for tests / dev
-    /// (see [`connection::spawn_child`]).
+    /// The `T_HUB_AGENT_BIN` developer escape hatch bypasses the packaged WSL
+    /// launch on Windows and overrides the child program on unix
+    /// (see [`launch_argv`] and [`connection::spawn_child`]).
     pub fn connect(&self, distro: &str) -> Result<(), String> {
         self.connect_with_timeouts(
             distro,
@@ -544,8 +545,7 @@ impl AgentBridge {
             }
 
             // Wait for ReplayComplete (30 s — replay can be large).
-            if replay_done_rx.recv_timeout(replay_timeout).is_err() && journal_flow.cancel()
-            {
+            if replay_done_rx.recv_timeout(replay_timeout).is_err() && journal_flow.cancel() {
                 return Err(self.fail_connection(
                     &handles,
                     &journal_flow,

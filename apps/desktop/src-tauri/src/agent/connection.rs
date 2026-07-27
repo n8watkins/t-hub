@@ -31,10 +31,11 @@
 //!
 //! ## T_HUB_AGENT_BIN escape hatch
 //!
-//! When the env var `T_HUB_AGENT_BIN` is set, its value overrides argv[0]
-//! from [`super::launch_argv`]. This lets developers and tests point at a
-//! freshly built binary (e.g. `target/debug/t-hub-agent`) without altering
-//! `launch_argv` or PATH.
+//! On Windows, [`super::launch_argv`] consumes `T_HUB_AGENT_BIN` and returns a
+//! direct agent invocation instead of the packaged WSL launch. On unix and in
+//! tests, [`spawn_child`] also honors the value as an argv[0] override. This
+//! lets developers and tests point at a freshly built binary (for example,
+//! `target/debug/t-hub-agent`) without changing `PATH`.
 //!
 //! ## Channel / Priority note
 //!
@@ -251,10 +252,12 @@ pub(crate) fn write_frame(w: &mut impl Write, frame: &CoreFrame) -> std::io::Res
 
 /// Resolve the program to exec and the remaining arguments from `argv`.
 ///
-/// If the env var `T_HUB_AGENT_BIN` is set, its value replaces `argv[0]`
-/// (the bare `t-hub-agent` or `wsl.exe` that `launch_argv` returns). This
-/// lets tests and developers point at a freshly built binary without touching
-/// PATH or `launch_argv`:
+/// If `T_HUB_AGENT_BIN` is set, its value replaces `argv[0]`.
+/// Windows [`super::launch_argv`] has already reduced an override to the direct
+/// agent argument shape, while this fallback also supports unix development and
+/// tests.
+/// This lets tests and developers point at a freshly built binary without
+/// touching `PATH`:
 ///
 /// ```sh
 /// T_HUB_AGENT_BIN=/path/to/target/debug/t-hub-agent cargo test
@@ -281,10 +284,9 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()); // agent diagnostics go to core's stderr
 
-    // On Windows `program` is `wsl.exe` (from `launch_argv`); without
-    // CREATE_NO_WINDOW that raw spawn flashes a console (CMD) window. Gate behind
-    // cfg(windows) so the unix dev build (which spawns t-hub-agent directly) is
-    // unaffected.
+    // On Windows the default `program` is `wsl.exe`; a developer override may
+    // instead name a native wrapper or helper. Keep either child hidden.
+    // Gate behind cfg(windows) so the unix dev build is unaffected.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
