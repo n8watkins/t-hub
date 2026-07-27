@@ -71,6 +71,8 @@ let lastSeq = 0;
 let adoptingRegistry = false;
 let layoutSyncFailed = false;
 const STARTUP_RECONCILIATION_RETRY_MS = 1_000;
+const WORKSPACE_REGISTRY_BASELINE_KEY =
+  "t-hub.workspace.registry-baseline.v1";
 
 function surfaceLayoutSyncFailure(error: unknown): void {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
@@ -97,7 +99,9 @@ function adoptSync(args: ControlApply["args"]): boolean {
   if (typeof seq !== "number" || !Array.isArray(tabs)) return false;
   if (!hasWorkWorkspace(tabs as TabReport[])) return true;
   lastSeq = seq;
-  adoptAuthoritativeTabs(tabs as TabReport[]);
+  if (adoptAuthoritativeTabs(tabs as TabReport[])) {
+    persistAcknowledgedWorkspaceSnapshot(tabs as TabReport[], seq);
+  }
   return true;
 }
 
@@ -121,12 +125,93 @@ interface StartupWorkspaceDelta {
   localTabs: TabReport[];
 }
 
+interface AcknowledgedWorkspaceSnapshot {
+  version: 1;
+  seq: number;
+  tabs: TabReport[];
+}
+
 function workspaceRegistrySnapshot(): WorkspaceRegistrySnapshot {
   const { tabs, activeTabId } = useWorkspace.getState();
   return {
     tabs: tabReports(tabs),
     activeTabId,
   };
+}
+
+function validAcknowledgedTabs(value: unknown): value is TabReport[] {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  const tabIds = new Set<string>();
+  const tileIds = new Set<string>();
+  for (const tab of value) {
+    if (!tab || typeof tab !== "object") return false;
+    const candidate = tab as Partial<TabReport>;
+    if (
+      typeof candidate.id !== "string" ||
+      candidate.id.length === 0 ||
+      typeof candidate.name !== "string" ||
+      !Array.isArray(candidate.tileIds) ||
+      !candidate.tileIds.every((id) => typeof id === "string") ||
+      (candidate.kind !== undefined &&
+        candidate.kind !== "work" &&
+        candidate.kind !== "captain") ||
+      tabIds.has(candidate.id)
+    ) {
+      return false;
+    }
+    tabIds.add(candidate.id);
+    for (const id of candidate.tileIds) {
+      if (tileIds.has(id)) return false;
+      tileIds.add(id);
+    }
+  }
+  return true;
+}
+
+export function loadAcknowledgedWorkspaceSnapshot():
+  | AcknowledgedWorkspaceSnapshot
+  | undefined {
+  if (typeof localStorage === "undefined") return undefined;
+  try {
+    const value = JSON.parse(
+      localStorage.getItem(WORKSPACE_REGISTRY_BASELINE_KEY) ?? "",
+    ) as Partial<AcknowledgedWorkspaceSnapshot>;
+    if (
+      value.version !== 1 ||
+      !Number.isSafeInteger(value.seq) ||
+      (value.seq ?? -1) < 0 ||
+      !validAcknowledgedTabs(value.tabs)
+    ) {
+      return undefined;
+    }
+    return {
+      version: 1,
+      seq: value.seq,
+      tabs: value.tabs.map((tab) => ({ ...tab, tileIds: [...tab.tileIds] })),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function persistAcknowledgedWorkspaceSnapshot(
+  tabs: TabReport[],
+  seq: number,
+): void {
+  if (
+    typeof localStorage === "undefined" ||
+    !Number.isSafeInteger(seq) ||
+    seq < 0 ||
+    !validAcknowledgedTabs(tabs)
+  ) {
+    return;
+  }
+  try {
+    localStorage.setItem(
+      WORKSPACE_REGISTRY_BASELINE_KEY,
+      JSON.stringify({ version: 1, seq, tabs }),
+    );
+  } catch {}
 }
 
 function longestCommonSubsequence(left: string[], right: string[]): Set<string> {
@@ -363,7 +448,7 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * control request is still in flight.
  */
 export async function bootstrapWorkspaceTabs(
-  reconcileTabs: (tabs: TabReport[]) => TabReport[] = (tabs) => tabs,
+  reconcileTabs: (tabs: TabReport[], seq: number) => TabReport[] = (tabs) => tabs,
 ): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
@@ -413,6 +498,7 @@ export async function bootstrapWorkspaceTabs(
           ...tab,
           tileIds: tab.tileIds.filter((terminalId) => liveTerminalIds.has(terminalId)),
         })),
+        res.seq,
       );
       const repaired = await reportWorkspaceTabs(
         repairTabs,
@@ -425,12 +511,12 @@ export async function bootstrapWorkspaceTabs(
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
       if (repaired.stale && Array.isArray(repaired.tabs)) {
-        return adoptAuthoritativeTabs(reconcileTabs(repaired.tabs));
+        return adoptAuthoritativeTabs(reconcileTabs(repaired.tabs, repaired.seq));
       }
       return adoptAuthoritativeTabs(repairTabs);
     }
 
-    return adoptAuthoritativeTabs(reconcileTabs(serverTabs));
+    return adoptAuthoritativeTabs(reconcileTabs(serverTabs, res.seq));
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     if (!isRetryableControlError(error)) {
@@ -868,11 +954,13 @@ function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
-  const startupBaseline = workspaceRegistrySnapshot();
+  const startupLocal = workspaceRegistrySnapshot();
+  const acknowledgedStartup = loadAcknowledgedWorkspaceSnapshot();
+  let startupBaselineValidated = false;
   const startupDeltas: StartupWorkspaceDelta[] = [
     {
-      baselineTabs: startupBaseline.tabs,
-      localTabs: startupBaseline.tabs,
+      baselineTabs: acknowledgedStartup?.tabs ?? startupLocal.tabs,
+      localTabs: startupLocal.tabs,
     },
   ];
 
@@ -912,8 +1000,18 @@ function startTabReporter(): void {
               });
               pending = true;
             }
-          } else if (startupDeltas.length > 0 && !pending) {
-            startupDeltas.length = 0;
+          } else {
+            persistAcknowledgedWorkspaceSnapshot(payload, res.seq);
+            if (startupDeltas.length > 0) {
+              const currentTabs = workspaceRegistrySnapshot().tabs;
+              startupDeltas.length = 0;
+              if (pending) {
+                startupDeltas.push({
+                  baselineTabs: payload,
+                  localTabs: currentTabs,
+                });
+              }
+            }
           }
         }
       })
@@ -948,9 +1046,15 @@ function startTabReporter(): void {
   // after that same workspace boundary, so a persisted pin cannot validate
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
-    void bootstrapWorkspaceTabs((tabs) =>
-      rebaseStartupWorkspaceDeltas(tabs, startupDeltas),
-    ).then((authoritative) => {
+    void bootstrapWorkspaceTabs((tabs, seq) => {
+      if (!startupBaselineValidated) {
+        if (acknowledgedStartup && acknowledgedStartup.seq > seq) {
+          startupDeltas[0].baselineTabs = startupLocal.tabs;
+        }
+        startupBaselineValidated = true;
+      }
+      return rebaseStartupWorkspaceDeltas(tabs, startupDeltas);
+    }).then((authoritative) => {
       if (!authoritative) {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;

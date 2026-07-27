@@ -24,6 +24,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import {
   bootstrapWorkspaceTabs,
+  loadAcknowledgedWorkspaceSnapshot,
+  persistAcknowledgedWorkspaceSnapshot,
   rebaseStartupWorkspaceDeltas,
   rebaseStartupWorkspaceTabs,
 } from "./controlBridge";
@@ -45,6 +47,7 @@ function seed(tabs: WorkspaceTab[]): void {
 }
 
 beforeEach(() => {
+  localStorage.clear();
   controlRequest.mockReset();
   invoke.mockReset();
   notify.mockReset();
@@ -406,6 +409,52 @@ describe("workspace registry bootstrap", () => {
     expect(secondRebased.find((tab) => tab.id === "work-1")).toMatchObject({
       name: "Renamed locally",
       tileIds: ["term-existing", "term-new", "term-remote"],
+    });
+  });
+
+  it("rebases a persisted unacknowledged layout from its acknowledged snapshot", () => {
+    const acknowledged = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+    persistAcknowledgedWorkspaceSnapshot(acknowledged, 7);
+    const local = acknowledged.map((tab) =>
+      tab.id === "work-1"
+        ? {
+            ...tab,
+            name: "Renamed before restart",
+            tileIds: [...tab.tileIds, "term-new"],
+          }
+        : tab,
+    );
+    const baseline = loadAcknowledgedWorkspaceSnapshot();
+
+    const rebased = rebaseStartupWorkspaceDeltas(
+      [
+        {
+          ...acknowledged[0],
+          name: "Stale backend name",
+          tileIds: ["term-existing"],
+        },
+        acknowledged[1],
+      ],
+      [{ baselineTabs: baseline!.tabs, localTabs: local }],
+    );
+
+    expect(baseline?.seq).toBe(7);
+    expect(rebased.find((tab) => tab.id === "work-1")).toMatchObject({
+      name: "Renamed before restart",
+      tileIds: ["term-existing", "term-new"],
     });
   });
 
