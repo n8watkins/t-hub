@@ -524,8 +524,7 @@ export function startControlBridge(): void {
     // `listen` rejects when not running under Tauri — safe to ignore.
   });
 
-  startTabReporter();
-  startCaptainsBootstrap();
+  startCaptainsBootstrap(startTabReporter());
 }
 
 /**
@@ -584,8 +583,15 @@ export async function bootstrapCaptains(): Promise<void> {
   }
 }
 
-function startCaptainsBootstrap(): void {
-  void bootstrapCaptains();
+export async function bootstrapCaptainsAfterWorkspace(
+  workspaceBootstrap: Promise<void>,
+): Promise<void> {
+  await workspaceBootstrap;
+  await bootstrapCaptains();
+}
+
+function startCaptainsBootstrap(workspaceBootstrap: Promise<void>): void {
+  void bootstrapCaptainsAfterWorkspace(workspaceBootstrap);
 }
 
 /** Test-only: reset the captains reconciliation singletons between cases (this
@@ -609,7 +615,7 @@ export function __setCaptainsBootstrappingForTest(v: boolean): void {
  * returned authoritative snapshot is adopted - the rare concurrent local change
  * loses to the server, by design. Failures (e.g. not under Tauri) are swallowed.
  */
-function startTabReporter(): void {
+function startTabReporter(): Promise<void> {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
@@ -664,10 +670,12 @@ function startTabReporter(): void {
   });
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
-  void bootstrapWorkspaceTabs().finally(() => {
+  const workspaceBootstrap = bootstrapWorkspaceTabs();
+  void workspaceBootstrap.finally(() => {
     bootstrapping = false;
     report();
   });
+  return workspaceBootstrap;
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).
