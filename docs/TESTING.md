@@ -13,8 +13,8 @@ T-Hub has layered local test profiles so normal iteration does not pay the cost 
 | `pnpm test:browser` | Production bundle and Playwright | Under 1 minute |
 | `pnpm test:contracts` | Portable repository, voice-gate, performance, and skill contracts | About 30 seconds |
 | `pnpm test:host-contracts` | Real Codex and Claude provisioning and installation contracts | About 7 minutes |
-| `pnpm test:process` | Real control and tmux process lifecycle tests | About 8 minutes |
-| `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 8 to 9 minutes |
+| `pnpm test:process` | Real control and tmux process lifecycle tests | About 4 to 5 minutes |
+| `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 4 to 5 minutes |
 
 Run a focused test first when changing one behavior.
 Then choose the narrowest profile that crosses the boundaries affected by the change.
@@ -53,6 +53,7 @@ The contract scripts use isolated temporary homes and do not mutate the operator
 The process profile runs only `control::tests` and `tmux::tests`.
 Those modules exercise real process, socket, shell, systemd, and tmux lifecycle behavior.
 They share isolated infrastructure and serialize ownership transitions, which is why they dominate runtime.
+The canonical Rust gate runs the standard targets before the process modules so unrelated tests do not contend for that shared infrastructure.
 
 Run the process profile after changes to control dispatch, terminal ownership, tmux, history resume, supervision, or process evidence.
 
@@ -82,8 +83,10 @@ The native Windows installer build, installation, launch, hook, voice, and state
 
 On the WSL development host on July 27, 2026, the normal profile completed in 25.38 seconds.
 The standard Rust lane completed in 49.74 seconds, so the parallel standard profile is expected to remain close to one minute.
-The complete Rust workspace took about 8 minutes.
-The complete local profile is therefore expected to finish in about 8 to 9 minutes because its independent lanes run concurrently.
+The process profile completed in 4 minutes 42 seconds.
+The earlier monolithic Rust workspace invocation took about 8 minutes because unrelated targets contended with the process harness.
+The partitioned complete Rust gate completed in 4 minutes 8 seconds.
+The complete local profile is therefore expected to finish in about 4 to 5 minutes because its independent product lanes run concurrently and its Rust classes run sequentially.
 
 Cold builds can take longer because Cargo must compile and link every native Tauri test target.
 The slow Rust cost comes from real process and tmux lifecycle coverage rather than obsolete unit-test volume.

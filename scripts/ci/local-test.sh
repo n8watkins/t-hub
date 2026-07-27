@@ -57,32 +57,15 @@ rust_fast() {
 }
 
 rust_standard() {
-  cargo build \
-    --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
-    -p t-hub-mcp &&
-    cargo test \
-      --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
-      --workspace \
-      -- \
-      --skip control::tests \
-      --skip tmux::tests
+  "$ROOT/apps/desktop/scripts/workspace_gate.sh" standard
 }
 
 rust_process() {
-  cargo test \
-    --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
-    -p t-hub \
-    --lib \
-    control::tests &&
-    cargo test \
-      --manifest-path "$ROOT/apps/desktop/src-tauri/Cargo.toml" \
-      -p t-hub \
-      --lib \
-      tmux::tests
+  "$ROOT/apps/desktop/scripts/workspace_gate.sh" process
 }
 
 rust_full() {
-  "$ROOT/apps/desktop/scripts/workspace_gate.sh"
+  "$ROOT/apps/desktop/scripts/workspace_gate.sh" full
 }
 
 cli_tests() {
@@ -149,7 +132,7 @@ EOF
       ;;
     standard)
       cat <<'EOF'
-rust: cargo build -p t-hub-mcp, then cargo test --workspace -- --skip control::tests --skip tmux::tests
+rust: apps/desktop/scripts/workspace_gate.sh standard
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
 frontend-unit: pnpm --filter t-hub-desktop test
@@ -157,7 +140,7 @@ EOF
       ;;
     backend)
       cat <<'EOF'
-rust: cargo build -p t-hub-mcp, then cargo test --workspace -- --skip control::tests --skip tmux::tests
+rust: apps/desktop/scripts/workspace_gate.sh standard
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 EOF
       ;;
@@ -175,7 +158,7 @@ EOF
       ;;
     process)
       cat <<'EOF'
-rust-process: cargo test -p t-hub --lib control::tests, then tmux::tests
+rust-process: apps/desktop/scripts/workspace_gate.sh process
 EOF
       ;;
     contracts)
@@ -190,7 +173,7 @@ EOF
       ;;
     full)
       cat <<'EOF'
-rust: apps/desktop/scripts/workspace_gate.sh
+rust: apps/desktop/scripts/workspace_gate.sh full
 cli: cargo test --manifest-path apps/cli/Cargo.toml --locked
 frontend-typecheck: pnpm --filter t-hub-desktop typecheck
 frontend-unit: pnpm --filter t-hub-desktop test

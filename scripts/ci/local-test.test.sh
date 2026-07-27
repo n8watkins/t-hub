@@ -15,16 +15,10 @@ if grep -Fq "frontend-product" <<<"$fast_plan"; then
 fi
 
 standard_plan="$(bash "$SCRIPT" standard --plan)"
-grep -Fq "cargo build -p t-hub-mcp" <<<"$standard_plan"
-grep -Fq -- "--skip control::tests" <<<"$standard_plan"
-grep -Fq -- "--skip tmux::tests" <<<"$standard_plan"
-if grep -Fq -- "--workspace --lib" <<<"$standard_plan"; then
-  echo "standard plan must cover binary and integration targets" >&2
-  exit 1
-fi
+grep -Fq "workspace_gate.sh standard" <<<"$standard_plan"
 
 backend_plan="$(bash "$SCRIPT" backend --plan)"
-grep -Fq "cargo build -p t-hub-mcp" <<<"$backend_plan"
+grep -Fq "workspace_gate.sh standard" <<<"$backend_plan"
 if grep -Fq "frontend-" <<<"$backend_plan"; then
   echo "backend plan must not run frontend lanes" >&2
   exit 1
@@ -45,8 +39,7 @@ grep -Fq "build:bundle" <<<"$browser_plan"
 grep -Fq "test:browser" <<<"$browser_plan"
 
 process_plan="$(bash "$SCRIPT" process --plan)"
-grep -Fq "control::tests" <<<"$process_plan"
-grep -Fq "tmux::tests" <<<"$process_plan"
+grep -Fq "workspace_gate.sh process" <<<"$process_plan"
 
 contracts_plan="$(bash "$SCRIPT" contracts --plan)"
 grep -Fq "voice gate" <<<"$contracts_plan"
@@ -58,7 +51,7 @@ grep -Fq "Claude provisioning" <<<"$host_contracts_plan"
 grep -Fq "Codex installation" <<<"$host_contracts_plan"
 
 full_plan="$(bash "$SCRIPT" full --plan)"
-grep -Fq "workspace_gate.sh" <<<"$full_plan"
+grep -Fq "workspace_gate.sh full" <<<"$full_plan"
 grep -Fq "frontend-product" <<<"$full_plan"
 grep -Fq "build:bundle" <<<"$full_plan"
 grep -Fq "voice gate" <<<"$full_plan"
@@ -80,5 +73,25 @@ grep -Fq "@anthropic-ai/claude-code@2.1.220" "$WORKFLOW"
 grep -Fq "bash scripts/captain/ensure-thub-codex.test.sh" "$WORKFLOW"
 grep -Fq "bash scripts/captain/ensure-thub-claude.test.sh" "$WORKFLOW"
 grep -Fq "bash scripts/captain/install-thub-codex.test.sh" "$WORKFLOW"
+
+workspace_gate="$ROOT/apps/desktop/scripts/workspace_gate.sh"
+standard_rust_plan="$(bash "$workspace_gate" standard --plan)"
+grep -Fq "cargo build -p t-hub-mcp" <<<"$standard_rust_plan"
+grep -Fq -- "--skip control::tests" <<<"$standard_rust_plan"
+grep -Fq -- "--skip tmux::tests" <<<"$standard_rust_plan"
+
+process_rust_plan="$(bash "$workspace_gate" process --plan)"
+grep -Fq "control::tests" <<<"$process_rust_plan"
+grep -Fq "tmux::tests" <<<"$process_rust_plan"
+
+full_rust_plan="$(bash "$workspace_gate" full --plan)"
+grep -Fq "cargo build -p t-hub-mcp" <<<"$full_rust_plan"
+grep -Fq "control::tests" <<<"$full_rust_plan"
+grep -Fq "tmux::tests" <<<"$full_rust_plan"
+
+if bash "$workspace_gate" obsolete --plan >/dev/null 2>&1; then
+  echo "unknown Rust workspace profiles must fail" >&2
+  exit 1
+fi
 
 echo "local test profile contract passed"
