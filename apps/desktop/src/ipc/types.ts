@@ -76,8 +76,8 @@ export const Commands = {
   /** Stop: terminate the tmux session and its process. */
   killTerminal: "kill_terminal",
   listTerminals: "list_terminals",
-  /** Report the live workspace-tab layout up to the core's addressable tab
-   *  registry (TASK C / #22), so the control/MCP `list_tabs` mirrors the UI. */
+  /** Report a user-originated workspace-layout change to the core's addressable
+   *  live projection (TASK C / #22) after startup liveness reconciliation. */
   reportWorkspaceTabs: "report_workspace_tabs",
 } as const;
 
@@ -93,9 +93,9 @@ export interface TabReport {
 
 /**
  * The core's answer to a `report_workspace_tabs` up-sync (headless-org). The
- * SERVER tab registry is authoritative: a report based on a stale revision
+ * SERVER live projection is authoritative: a report based on a stale revision
  * (`baseSeq` older than a server-side mutation the UI has not applied yet) is
- * rejected with `stale: true` plus the authoritative snapshot to adopt.
+ * rejected with `stale: true` plus the authoritative snapshot to rebase.
  */
 export interface TabReportResult {
   seq: number;

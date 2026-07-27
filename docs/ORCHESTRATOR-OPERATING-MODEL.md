@@ -18,6 +18,7 @@ Replacing Cortana's runtime must preserve its identity, durable checkpoints, and
 T-Hub maintains exactly one durable Cortana identity with at most one authoritative active runtime.
 Desktop startup calls one idempotent backend reconciliation operation rather than adopting whichever terminal happens to be visible.
 Concurrent startup attempts use a stable operation identity and serialize against the same durable record.
+An identical reconciliation request already in flight remains pending: the desktop keeps polling or retrying that operation identity instead of double-applying recovery or presenting an indeterminate timeout as a failure.
 Recovery preserves Cortana's identity and checkpoints while replacing a missing terminal or Harness runtime at a later generation.
 When several candidates exist, reconciliation accepts only one deterministic authoritative generation and safely retires only older trusted duplicates.
 Equal highest generations, foreign identities, uncertain liveness, and untrusted live candidates fail closed into a visible degraded recovery state.

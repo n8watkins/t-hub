@@ -131,7 +131,7 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `supervision_tree` | Read | allowed | orchestrator→subagent tree for a `sessionId` |
 | `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
 | `search_files` | Read | allowed | fuzzy file-index search (names + metadata only, never contents) |
-| `list_tabs` | Read | allowed | the live workspace tabs (`{id, name, tileIds}`) from the core's addressable tab registry — the frontend reports its layout up so this mirrors the UI |
+| `list_tabs` | Read | allowed | the liveness-reconciled workspace projection (`{id, name, tileIds}`) from the core's addressable tab registry; later user-originated layout reports keep the projection current |
 | `list_captains` | Read | allowed | the claimed captains (`{shipSlug, captainSessionId, workspaceTabIds, crew}` + revision) from the server captains registry — the one source of truth the UI and MCP share |
 | `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
 | `list_fleet_watches` | Read | allowed | the armed orchestrator wakes (who gets woken, for which sessions + states) from the fleet-watch registry |
