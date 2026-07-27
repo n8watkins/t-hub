@@ -2,7 +2,7 @@
   "name": "t-hub",
   "private": true,
   "version": "0.0.0",
-  "description": "T-Hub monorepo by n8builds. apps/desktop = the Tauri terminal cockpit for supervising Claude Code sessions in WSL2; apps/site = the marketing site. Promo videos live as assets outside the repo.",
+  "description": "T-Hub monorepo by n8builds. apps/desktop = the Tauri terminal cockpit for supervising Codex and Claude coding-agent sessions in WSL2; apps/site = the marketing site. Promo videos live as assets outside the repo.",
   "scripts": {
     "dev": "pnpm --filter t-hub-desktop dev",
     "build": "pnpm --filter t-hub-desktop build",

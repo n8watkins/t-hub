@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.3.140",
   "type": "module",
-  "description": "T-Hub — terminal-first command center for supervising many persistent Claude Code sessions in WSL2.",
+  "description": "T-Hub - terminal-first command center for supervising many persistent Codex and Claude coding-agent sessions in WSL2.",
   "scripts": {
     "dev": "vite",
     "dev:browser-test": "vite --host 127.0.0.1 --port 4180",
