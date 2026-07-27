@@ -35,7 +35,7 @@ fn response_timeout_for_command(command: &str) -> Duration {
     match command {
         "reconcile_cortana" => CORTANA_RECONCILIATION_TIMEOUT,
         "commission_captain" | "dispatch_crew" | "history_list" | "history_resume"
-        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        | "list_tabs" | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
 }
@@ -3207,6 +3207,10 @@ mod tests {
         );
         assert_eq!(
             response_timeout_for_command("history_list"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("list_tabs"),
             LONG_ORCHESTRATION_TIMEOUT
         );
         assert!(timeout_message("history_resume", 1, "read").contains("120s"));
