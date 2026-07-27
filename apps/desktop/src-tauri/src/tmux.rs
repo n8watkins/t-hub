@@ -3074,6 +3074,31 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 mod tests {
     use super::*;
 
+    /// The path to use when re-executing this test binary to run one of the
+    /// subprocess helpers below.
+    ///
+    /// `std::env::current_exe()` reports the path the binary was *launched*
+    /// from. A concurrent `cargo` build against the same target directory can
+    /// replace or unlink that path while the test is still running, after which
+    /// spawning it fails with `ENOENT` and the test fails for a reason that has
+    /// nothing to do with what it covers. On Linux `/proc/self/exe` is a
+    /// kernel-resolved handle to this process's own image and stays executable
+    /// across that replacement, so prefer it and fall back to `current_exe()`
+    /// wherever it is unavailable.
+    fn test_binary_path() -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            // Stat the link itself, not its target: once the original binary is
+            // unlinked the target no longer resolves, but the magic symlink is
+            // still there and still executable.
+            let proc_self_exe = std::path::Path::new("/proc/self/exe");
+            if proc_self_exe.symlink_metadata().is_ok() {
+                return proc_self_exe.to_path_buf();
+            }
+        }
+        std::env::current_exe().expect("locating this test binary to re-exec a subprocess helper")
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_path_shims_cannot_intercept_systemd_helpers() {
@@ -3108,7 +3133,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let original_path = std::env::var("PATH").unwrap_or_default();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(test_binary_path())
             .args([
                 "--exact",
                 "tmux::tests::managed_path_shims_cannot_intercept_systemd_helpers",
@@ -3350,7 +3375,7 @@ mod tests {
             "line\nbreak".to_string(),
             "-option-like".to_string(),
         ];
-        let test_binary = std::env::current_exe().unwrap();
+        let test_binary = test_binary_path();
         for value in hostile {
             let output = Command::new(&test_binary)
                 .args([
