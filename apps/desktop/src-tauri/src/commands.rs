@@ -322,14 +322,14 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
     // Claude" bug). `-i` forces ~/.zshrc to load, so the command resolves exactly
     // as when typed by hand. Verified in a clean env (no inherited PATH).
     //
-    // NO DOUBLE QUOTES in this string. On Windows every tmux call is spawned via
-    // `wsl.exe -e tmux <argv>` (tmux.rs `tmux()`), and Rust's Windows `Command`
-    // arg-serializer backslash-escapes any embedded `"` into `\"`; wsl.exe's
-    // command-line parsing then mangles those `\"` sequences and DROPS this trailing
-    // command entirely, so tmux launches a bare login shell and the `startupCommand`
-    // (e.g. `claude --resume <uuid>`) never runs -- the "spawn booted to bare zsh"
-    // bug (captain log 0024/0025). Every other tmux script in this codebase that
-    // survives the wsl.exe round-trip uses SINGLE quotes only (see tmux.rs
+    // NO DOUBLE QUOTES in the generated wrapping syntax. On Windows every tmux
+    // call is spawned via `wsl.exe -e tmux <argv>` (tmux.rs `tmux()`), and Rust's
+    // Windows `Command` arg-serializer backslash-escapes any embedded `"` into
+    // `\"`; wsl.exe's command-line parsing then mangles those `\"` sequences and
+    // DROPS this trailing command entirely, so tmux launches a bare login shell and
+    // the `startupCommand` (e.g. `claude --resume <uuid>`) never runs -- the
+    // "spawn booted to bare zsh" bug (captain log 0024/0025). Every other tmux
+    // script in this codebase that survives the wsl.exe round-trip uses SINGLE quotes only (see tmux.rs
     // `list_sessions`/`kill_session_tree` notes); we match that here. `$SHELL` is a
     // bare path with no spaces, so leaving `${SHELL:-/bin/sh}` unquoted is safe, and
     // the interactive-login `-i` argument stays single-quoted via `sh_single_quote`.
@@ -1427,9 +1427,7 @@ mod tests {
     #[test]
     fn pane_command_has_no_double_quotes() {
         // Realistic startup commands (the "+" presets + `claude --resume <uuid>`);
-        // none contain a `"` of their own, so the wrap must not introduce one. A
-        // user "Custom…" command that itself contains `"` is a separate, pre-existing
-        // concern and out of scope for this invariant.
+        // none contain a `"` of their own, so the wrap must not introduce one.
         for startup in [
             "claude",
             "claude --resume 138adaa9-35a7-4fa6-909d-3e0d8adeef29",
@@ -1448,7 +1446,8 @@ mod tests {
     /// the `sh -c` round trip via the `'\''` idiom.
     #[test]
     fn pane_command_quotes_embedded_quotes() {
-        let cmd = pane_command(None, Some("echo 'hi there'")).unwrap();
+        let cmd = pane_command(None, Some("echo 'hi there' \"and here\"")).unwrap();
         assert!(cmd.contains("echo '\\''hi there'\\''"), "got: {cmd}");
+        assert!(cmd.contains("\"and here\""), "got: {cmd}");
     }
 }

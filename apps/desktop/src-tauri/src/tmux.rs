@@ -18,6 +18,9 @@ use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+#[cfg(any(windows, test))]
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 use crate::bounded_exec::{output_with_timeout, output_with_timeout_and_limit};
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
@@ -798,12 +801,25 @@ fn session_env_with_agent_journal(
     effective
 }
 
+#[cfg(any(windows, test))]
+fn windows_safe_pane_command(command: &str) -> String {
+    let encoded = STANDARD.encode(command);
+    format!(
+        "p=$(mktemp) || exit; trap 'rm -f $p' EXIT HUP INT TERM; printf %s {encoded} | base64 -d >$p || exit; ${{SHELL:-/bin/sh}} $p"
+    )
+}
+
 pub fn new_session_with_env(
     name: &str,
     cwd: &str,
     command: Option<&str>,
     env: &[(String, String)],
 ) -> Result<(), TmuxError> {
+    #[cfg(windows)]
+    let windows_command = command.map(windows_safe_pane_command);
+    #[cfg(windows)]
+    let command = windows_command.as_deref();
+
     // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
     // default is empty so the pane starts in wsl.exe's launch dir rather than an
     // invalid Windows path.
@@ -3073,6 +3089,20 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_command_windows_transport_preserves_arbitrary_quotes() {
+        let command = "printf '%s\\n' \"double quoted\" 'single quoted' \"$HOME\"";
+        let transported = windows_safe_pane_command(command);
+        let encoded = transported
+            .split_once("printf %s ")
+            .and_then(|(_, suffix)| suffix.split_once(" | base64 -d"))
+            .map(|(encoded, _)| encoded)
+            .unwrap();
+
+        assert!(!transported.contains('"'));
+        assert_eq!(STANDARD.decode(encoded).unwrap(), command.as_bytes());
+    }
 
     /// The path to use when re-executing this test binary to run one of the
     /// subprocess helpers below.
