@@ -1196,8 +1196,13 @@ mod tests {
     fn executable(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("bin").join("t-hub-agent");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
+        let staging = path.with_file_name(".t-hub-agent.fixture");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(
             b"#!/bin/sh\n\
               if [ \"$1\" = \"--capabilities-json\" ]; then\n\
                 printf '%s\\n' '{\"schemaVersion\":1,\"agentVersion\":\"test\",\"capabilities\":[\"codex-native-hooks-v1\"]}'\n\
@@ -1206,10 +1211,35 @@ mod tests {
               exit 2\n",
         )
         .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::rename(staging, &path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut ready = false;
+            for _ in 0..50 {
+                match std::process::Command::new(&path)
+                    .arg("--capabilities-json")
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        ready = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(output) => panic!(
+                        "capability fixture exited with {:?}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(error) => panic!("capability fixture failed to start: {error}"),
+                }
+            }
+            assert!(ready, "capability fixture remained busy after publication");
         }
         path
     }
