@@ -234,12 +234,12 @@ pub struct RetirementCleanupCapture {
     pub is_linked: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RetirementCleanupRequest {
     schema_version: u32,
     operation_id: String,
-    project: &'static str,
+    project: String,
     worktree: CapturedWorktreeIdentity,
     targets: Vec<CapturedPathIdentity>,
     allow_unmerged: bool,
@@ -309,7 +309,30 @@ impl std::error::Error for WorktreeCoordinatorError {}
 pub struct WorktreeCoordinator {
     path: Option<PathBuf>,
     inner: Mutex<WorktreeRetirementSnapshot>,
+    admissions: Mutex<BTreeMap<String, usize>>,
     workers: Mutex<BTreeSet<String>>,
+}
+
+pub struct WorktreeAdmissionGuard<'a> {
+    coordinator: &'a WorktreeCoordinator,
+    path: String,
+}
+
+impl Drop for WorktreeAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let mut admissions = self
+            .coordinator
+            .admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = admissions.get_mut(&self.path).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            admissions.remove(&self.path);
+        }
+    }
 }
 
 impl WorktreeCoordinator {
@@ -336,6 +359,7 @@ impl WorktreeCoordinator {
         Ok(Self {
             path: Some(path),
             inner: Mutex::new(snapshot),
+            admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
         })
     }
@@ -348,6 +372,7 @@ impl WorktreeCoordinator {
         Self {
             path: None,
             inner: Mutex::new(WorktreeRetirementSnapshot::default()),
+            admissions: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(BTreeSet::new()),
         }
     }
@@ -387,11 +412,23 @@ impl WorktreeCoordinator {
             ));
         }
 
+        let admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut snapshot = self.lock();
         if let Some(record) = matching_active_retirement(&snapshot, &worktree_path) {
             return Err(WorktreeCoordinatorError::Conflict(format!(
                 "worktree '{}' already has active retirement reservation '{}'",
                 record.worktree_path, record.operation_id
+            )));
+        }
+        if admissions
+            .keys()
+            .any(|candidate_path| path_within(candidate_path, &worktree_path))
+        {
+            return Err(WorktreeCoordinatorError::Conflict(format!(
+                "worktree '{worktree_path}' has activity being admitted"
             )));
         }
         let previous = snapshot.clone();
@@ -467,7 +504,7 @@ impl WorktreeCoordinator {
         let request = RetirementCleanupRequest {
             schema_version: SCHEMA_VERSION,
             operation_id: record.operation_id.clone(),
-            project: "t-hub",
+            project: "t-hub".into(),
             worktree: capture.worktree,
             targets: capture.targets,
             allow_unmerged: false,
@@ -533,13 +570,17 @@ impl WorktreeCoordinator {
             if !Path::new(&record.request_path).is_file() {
                 return missing_request_completion(&record);
             }
+            let request = match read_provider_request(&record) {
+                Ok(request) => request,
+                Err(error) => return ProviderCompletion::RecoveryRequired(error),
+            };
             if let Err(error) = self.transition(&operation_id, RetirementState::Running, None) {
                 return ProviderCompletion::RecoveryRequired(format!(
                     "could not persist the running provider state: {error}"
                 ));
             }
             match run_provider(&record.request_path) {
-                Ok(output) => classify_provider_output(&output),
+                Ok(output) => classify_provider_output(&output, &request.targets),
                 Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
         })();
@@ -584,32 +625,61 @@ impl WorktreeCoordinator {
             .map(RetirementReservation::from)
     }
 
-    pub fn ensure_available(&self, candidate_path: &str, operation: &str) -> Result<(), String> {
+    pub fn admit_activity(
+        &self,
+        candidate_path: &str,
+        operation: &str,
+    ) -> Result<WorktreeAdmissionGuard<'_>, String> {
         let candidate_path = normalize_path(candidate_path);
+        let mut admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = self.lock();
-        let Some(record) = matching_active_retirement(&snapshot, &candidate_path) else {
-            return Ok(());
-        };
-        Err(format!(
-            "{operation}: worktree '{}' is reserved for Cargo cleanup by operation '{}'",
-            record.worktree_path, record.operation_id
-        ))
+        if let Some(record) = matching_active_retirement(&snapshot, &candidate_path) {
+            return Err(format!(
+                "{operation}: worktree '{}' is reserved for Cargo cleanup by operation '{}'",
+                record.worktree_path, record.operation_id
+            ));
+        }
+        *admissions.entry(candidate_path.clone()).or_default() += 1;
+        Ok(WorktreeAdmissionGuard {
+            coordinator: self,
+            path: candidate_path,
+        })
     }
 }
 
 fn missing_request_completion(record: &WorktreeRetirement) -> ProviderCompletion {
-    let error = format!(
+    ProviderCompletion::RecoveryRequired(format!(
         "durable provider request is missing: {}",
         record.request_path
-    );
-    if record.state == RetirementState::Reserved {
-        ProviderCompletion::Failed(error)
-    } else {
-        ProviderCompletion::RecoveryRequired(error)
-    }
+    ))
 }
 
-fn classify_provider_output(output: &std::process::Output) -> ProviderCompletion {
+fn read_provider_request(record: &WorktreeRetirement) -> Result<RetirementCleanupRequest, String> {
+    let request: RetirementCleanupRequest = serde_json::from_slice(
+        &std::fs::read(&record.request_path)
+            .map_err(|error| format!("could not read durable provider request: {error}"))?,
+    )
+    .map_err(|error| format!("durable provider request is invalid: {error}"))?;
+    if request.schema_version != SCHEMA_VERSION
+        || request.operation_id != record.operation_id
+        || request.project != "t-hub"
+        || request.worktree.path != record.worktree_path
+        || request.targets.is_empty()
+        || request.allow_unmerged
+        || !request.inventory_complete
+    {
+        return Err("durable provider request does not match its retirement reservation".into());
+    }
+    Ok(request)
+}
+
+fn classify_provider_output(
+    output: &std::process::Output,
+    expected_targets: &[CapturedPathIdentity],
+) -> ProviderCompletion {
     let exit = output
         .status
         .code()
@@ -625,6 +695,29 @@ fn classify_provider_output(output: &std::process::Output) -> ProviderCompletion
             ));
         }
     };
+    let expected_inventory = expected_targets
+        .iter()
+        .map(path_identity)
+        .collect::<BTreeSet<_>>();
+    let reported_inventory = report
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|actions| {
+            actions
+                .iter()
+                .map(|action| {
+                    let identity = action.get("target").unwrap_or(action);
+                    serde_json::from_value::<CapturedPathIdentity>(identity.clone())
+                        .ok()
+                        .map(|identity| path_identity(&identity))
+                })
+                .collect::<Option<BTreeSet<_>>>()
+        });
+    if reported_inventory.as_ref() != Some(&expected_inventory) {
+        return ProviderCompletion::RecoveryRequired(
+            "rust-storage returned a report without the complete target inventory".into(),
+        );
+    }
 
     if output.status.success() {
         return if report.get("complete").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -639,7 +732,6 @@ fn classify_provider_output(output: &std::process::Output) -> ProviderCompletion
     let clean_refusal = report
         .get("actions")
         .and_then(serde_json::Value::as_array)
-        .filter(|actions| !actions.is_empty())
         .is_some_and(|actions| {
             actions.iter().all(|action| {
                 action.get("status").and_then(serde_json::Value::as_str) == Some("refused")
@@ -661,6 +753,14 @@ fn classify_provider_output(output: &std::process::Output) -> ProviderCompletion
     } else {
         ProviderCompletion::RecoveryRequired(error)
     }
+}
+
+fn path_identity(identity: &CapturedPathIdentity) -> (String, u64, u64) {
+    (
+        normalize_path(&identity.path),
+        identity.device,
+        identity.inode,
+    )
 }
 
 fn bounded_last_error(error: &str) -> String {
@@ -952,9 +1052,9 @@ mod tests {
             let record = coordinator
                 .begin_retirement("/repo/worktrees/clean", "/requests/one.json")
                 .unwrap();
-            coordinator
-                .ensure_available("/repo/worktrees/clean/apps/cli", "spawn_terminal")
-                .unwrap_err();
+            assert!(coordinator
+                .admit_activity("/repo/worktrees/clean/apps/cli", "spawn_terminal")
+                .is_err());
             record.operation_id
         };
 
@@ -980,7 +1080,25 @@ mod tests {
             .reservation_for("/repo/worktrees/clean")
             .is_none());
         coordinator
-            .ensure_available("/repo/worktrees/clean/apps/cli", "start_agent")
+            .admit_activity("/repo/worktrees/clean/apps/cli", "start_agent")
+            .unwrap();
+    }
+
+    #[test]
+    fn admitted_activity_blocks_retirement_until_runtime_creation_finishes() {
+        let coordinator = WorktreeCoordinator::ephemeral();
+        let admission = coordinator
+            .admit_activity("/repo/worktrees/clean/apps/cli", "spawn_terminal")
+            .unwrap();
+
+        assert!(matches!(
+            coordinator.begin_retirement("/repo/worktrees/clean", "/requests/while-admitted.json"),
+            Err(WorktreeCoordinatorError::Conflict(_))
+        ));
+
+        drop(admission);
+        coordinator
+            .begin_retirement("/repo/worktrees/clean", "/requests/after-admission.json")
             .unwrap();
     }
 
@@ -1131,12 +1249,18 @@ mod tests {
 
     #[test]
     fn clean_provider_refusal_releases_the_reservation_as_failed() {
+        let target = CapturedPathIdentity {
+            path: "/repo/worktree/apps/cli/target".into(),
+            device: 7,
+            inode: 12,
+        };
         let output = provider_output(
             false,
             5,
             serde_json::json!({
                 "complete": false,
                 "actions": [{
+                    "target": target.clone(),
                     "status": "refused",
                     "recoveryState": "original",
                     "quarantinePath": null,
@@ -1145,22 +1269,16 @@ mod tests {
         );
 
         assert!(matches!(
-            classify_provider_output(&output),
+            classify_provider_output(&output, &[target]),
             ProviderCompletion::Failed(_)
         ));
     }
 
     #[test]
-    fn missing_running_request_requires_recovery() {
-        let mut record = WorktreeCoordinator::ephemeral()
+    fn missing_reserved_request_requires_recovery() {
+        let record = WorktreeCoordinator::ephemeral()
             .begin_retirement("/repo/worktree", "/missing/request.json")
             .unwrap();
-        assert!(matches!(
-            missing_request_completion(&record),
-            ProviderCompletion::Failed(_)
-        ));
-
-        record.state = RetirementState::Running;
         assert!(matches!(
             missing_request_completion(&record),
             ProviderCompletion::RecoveryRequired(_)
@@ -1169,12 +1287,18 @@ mod tests {
 
     #[test]
     fn quarantined_provider_refusal_requires_recovery() {
+        let target = CapturedPathIdentity {
+            path: "/repo/worktree/apps/cli/target".into(),
+            device: 7,
+            inode: 12,
+        };
         let output = provider_output(
             false,
             5,
             serde_json::json!({
                 "complete": false,
                 "actions": [{
+                    "target": target.clone(),
                     "status": "refused",
                     "recoveryState": "quarantined",
                     "quarantinePath": "/repo/worktree/apps/cli/.target-quarantine",
@@ -1183,24 +1307,39 @@ mod tests {
         );
 
         assert!(matches!(
-            classify_provider_output(&output),
+            classify_provider_output(&output, &[target]),
             ProviderCompletion::RecoveryRequired(_)
         ));
     }
 
     #[test]
-    fn incomplete_success_requires_recovery() {
+    fn incomplete_provider_inventory_requires_recovery() {
+        let first = CapturedPathIdentity {
+            path: "/repo/worktree/apps/cli/target".into(),
+            device: 7,
+            inode: 12,
+        };
+        let second = CapturedPathIdentity {
+            path: "/repo/worktree/apps/desktop/src-tauri/target".into(),
+            device: 7,
+            inode: 13,
+        };
         let output = provider_output(
-            true,
-            0,
+            false,
+            5,
             serde_json::json!({
                 "complete": false,
-                "actions": [],
+                "actions": [{
+                    "target": first.clone(),
+                    "status": "refused",
+                    "recoveryState": "original",
+                    "quarantinePath": null,
+                }],
             }),
         );
 
         assert!(matches!(
-            classify_provider_output(&output),
+            classify_provider_output(&output, &[first, second]),
             ProviderCompletion::RecoveryRequired(_)
         ));
     }

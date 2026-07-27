@@ -1219,7 +1219,7 @@ pub(super) fn cleanup_worktree_artifacts(
     if let Err(error) = &result {
         let _ = ctx.worktrees.transition(
             &record.operation_id,
-            crate::worktree_coordinator::RetirementState::Failed,
+            crate::worktree_coordinator::RetirementState::RecoveryRequired,
             Some(error.clone()),
         );
     }
