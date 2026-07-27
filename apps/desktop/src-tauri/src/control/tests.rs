@@ -1502,6 +1502,19 @@ fn control_dispatch_waits_for_startup_workspace_reconciliation() {
 }
 
 #[test]
+fn history_loading_does_not_wait_for_workspace_reconciliation() {
+    let tabs = Arc::new(TabRegistry::new_reconciling());
+    let ctx = test_ctx("startup-history").with_tab_registry(tabs);
+
+    let result = dispatch(&ctx, "history_list", &json!({"limit": 10}));
+
+    assert!(
+        result.is_ok(),
+        "history list was blocked or failed: {result:?}"
+    );
+}
+
+#[test]
 fn owned_create_state_rollback_removes_worktree_and_new_tab() {
     let (base, repo, worktree) = scratch_repo_with_worktree();
     let ctx = test_ctx("t");

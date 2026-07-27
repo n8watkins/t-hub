@@ -79,7 +79,7 @@ function surfaceLayoutSyncFailure(error: unknown): void {
   notify(
     "error",
     "Workspace sync failed",
-    "Your local layout is still available. Restart T-Hub to retry synchronization.",
+    "Your local layout is still available. T-Hub will retry synchronization automatically.",
   );
 }
 
@@ -214,6 +214,20 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
     surfaceLayoutSyncFailure(error);
     return false;
   }
+}
+
+const WORKSPACE_BOOTSTRAP_RETRY_MAX_MS = 30_000;
+
+export async function bootstrapWorkspaceTabsUntilReady(
+  wait: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => window.setTimeout(resolve, milliseconds)),
+): Promise<true> {
+  let retryDelay = 1_000;
+  while (!(await bootstrapWorkspaceTabs())) {
+    await wait(retryDelay);
+    retryDelay = Math.min(retryDelay * 2, WORKSPACE_BOOTSTRAP_RETRY_MAX_MS);
+  }
+  return true;
 }
 
 // The last captains-registry revision this window adopted. Guards against a
@@ -681,9 +695,8 @@ function startTabReporter(): Promise<boolean> {
   });
   // Read the authoritative registry before the first report so a cold webview
   // cannot overwrite server-side workspaces with its boot-time local snapshot.
-  const workspaceBootstrap = bootstrapWorkspaceTabs();
-  void workspaceBootstrap.then((ready) => {
-    if (!ready) return;
+  const workspaceBootstrap = bootstrapWorkspaceTabsUntilReady();
+  void workspaceBootstrap.then(() => {
     bootstrapping = false;
     report();
   });

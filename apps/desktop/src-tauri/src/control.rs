@@ -6502,7 +6502,9 @@ fn dispatch_with_caller(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
-    ctx.tabs.wait_for_startup();
+    if !matches!(command, "history_list" | "invalidate_history_cache") {
+        ctx.tabs.wait_for_startup();
+    }
     enforce_delegated_admin_command(ctx, caller, command)?;
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------

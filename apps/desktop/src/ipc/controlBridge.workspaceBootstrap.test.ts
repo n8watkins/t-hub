@@ -15,7 +15,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
 }));
 
-import { bootstrapWorkspaceTabs } from "./controlBridge";
+import {
+  bootstrapWorkspaceTabs,
+  bootstrapWorkspaceTabsUntilReady,
+} from "./controlBridge";
 import {
   CAPTAINS_TAB_ID,
   useWorkspace,
@@ -125,6 +128,32 @@ describe("workspace registry bootstrap", () => {
       "report_workspace_tabs",
       expect.anything(),
     );
+  });
+
+  it("retries an indeterminate bootstrap until the registry is authoritative", async () => {
+    seed([{ id: "work-1", name: "Workspace 1", order: ["term-local"] }]);
+    controlRequest
+      .mockRejectedValueOnce(new Error("control channel unavailable"))
+      .mockResolvedValueOnce({
+        seq: 3,
+        activeTabId: "work-live",
+        tabs: [{ id: "work-live", name: "Live Workspace", tileIds: ["term-live"] }],
+      });
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await expect(bootstrapWorkspaceTabsUntilReady(wait)).resolves.toBe(true);
+
+    expect(wait).toHaveBeenCalledWith(1_000);
+    expect(controlRequest).toHaveBeenCalledTimes(2);
+    expect(
+      useWorkspace.getState().tabs.map((tab) => ({
+        id: tab.id,
+        tileIds: tab.order,
+      })),
+    ).toEqual([
+      { id: "work-live", tileIds: ["term-live"] },
+      { id: CAPTAINS_TAB_ID, tileIds: [] },
+    ]);
   });
 
   it("adopts an existing server work layout before reporting", async () => {

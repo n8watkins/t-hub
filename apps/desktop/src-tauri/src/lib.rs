@@ -143,6 +143,30 @@ fn spawn_agent_connect(state: &AppState) {
         .ok();
 }
 
+const STARTUP_RECONCILIATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn acquire_startup_live_sessions(
+    mut list_sessions: impl FnMut() -> Result<Vec<String>, tmux::TmuxError>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Vec<String> {
+    let mut retry_delay = std::time::Duration::from_secs(1);
+    loop {
+        match list_sessions() {
+            Ok(sessions) => return sessions,
+            Err(error) => {
+                eprintln!(
+                    "t-hub-workspaces: startup tmux session list is unavailable; retrying in {}s: {error}",
+                    retry_delay.as_secs()
+                );
+                wait(retry_delay);
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(STARTUP_RECONCILIATION_RETRY_MAX);
+            }
+        }
+    }
+}
+
 /// Best-effort, off-the-main-path startup reconcile of Claude hooks. Mirrors
 /// [`spawn_agent_connect`]: a detached `std::thread` so app launch is never
 /// blocked on the WSL hop / settings.json write, and any error is swallowed +
@@ -773,8 +797,7 @@ pub fn run() {
             // Fleet Workspace identity is durable in the same registry as its
             // Captain/Assignment owner. TabRegistry is only the live projection
             // cache and is seeded before the listener or UI can call list_tabs.
-            let tab_registry =
-                std::sync::Arc::new(control::TabRegistry::new_reconciling());
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new_reconciling());
             app.manage(tab_registry.clone());
             // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
             // dead session (captain or crew) from the registry - the UI kills tiles
@@ -908,68 +931,45 @@ pub fn run() {
             let reconciliation_tabs = tab_registry.clone();
             let reconciliation_captains = captains_registry.clone();
             let reconciliation_identities = identity_store.clone();
-            if let Err(error) = std::thread::Builder::new()
-                .name("t-hub-startup-reconcile".into())
-                .spawn(move || {
-                    let startup_live_sessions = tmux::list_sessions();
-                    match startup_live_sessions.as_ref() {
-                        Ok(sessions) => {
-                            let live = sessions
-                                .iter()
-                                .cloned()
-                                .collect::<std::collections::HashSet<_>>();
-                            match reconciliation_captains.prune_gone_workspace_tiles(|tile| {
-                                live.contains(&tmux::target_for_id(tile))
-                            }) {
-                                Ok(pruned) if !pruned.is_empty() => eprintln!(
-                                    "t-hub-workspaces: load-time prune removed {} gone terminal placement{}",
-                                    pruned.len(),
-                                    if pruned.len() == 1 { "" } else { "s" }
-                                ),
-                                Err(error) => eprintln!(
-                                    "t-hub-workspaces: load-time prune was rolled back after \
-                                     persistence failed: {error}"
-                                ),
-                                _ => {}
-                            }
-                        }
-                        Err(error) => eprintln!(
-                            "t-hub-workspaces: load-time prune SKIPPED because the tmux session list \
-                             is unavailable: {error}"
-                        ),
-                    }
-                    reconciliation_tabs.replace(reconciliation_captains.workspace_projection());
-                    reconciliation_tabs.finish_startup();
-                    match startup_live_sessions {
-                        Ok(live) => {
-                            let live = live.into_iter().collect::<std::collections::HashSet<_>>();
-                            match reconciliation_identities.prune_dead_generation(
-                                &identity_prune_generation,
-                                |tile| live.contains(&tmux::target_for_id(tile)),
-                            ) {
-                                Ok(pruned) if pruned > 0 => eprintln!(
-                                    "t-hub-identity: load-time prune retired {pruned} dead/unbound \
-                                     identit{} (session gone without a clean close)",
-                                    if pruned == 1 { "y" } else { "ies" }
-                                ),
-                                Err(error) => eprintln!(
-                                    "t-hub-identity: load-time prune was rolled back after \
-                                     persistence failed: {error}"
-                                ),
-                                _ => {}
-                            }
-                        }
-                        Err(error) => eprintln!(
-                            "t-hub-identity: load-time prune SKIPPED - tmux session list \
-                             unavailable (indeterminate, not pruning): {error}"
-                        ),
-                    }
-                })
-            {
-                eprintln!("t-hub-workspaces: failed to start startup reconciliation: {error}");
-                tab_registry.replace(captains_registry.workspace_projection());
-                tab_registry.finish_startup();
-            }
+            tauri::async_runtime::spawn_blocking(move || {
+                let startup_live_sessions =
+                    acquire_startup_live_sessions(tmux::list_sessions, std::thread::sleep);
+                let live = startup_live_sessions
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+                match reconciliation_captains
+                    .prune_gone_workspace_tiles(|tile| live.contains(&tmux::target_for_id(tile)))
+                {
+                    Ok(pruned) if !pruned.is_empty() => eprintln!(
+                        "t-hub-workspaces: load-time prune removed {} gone terminal placement{}",
+                        pruned.len(),
+                        if pruned.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(error) => eprintln!(
+                        "t-hub-workspaces: load-time prune was rolled back after \
+                         persistence failed: {error}"
+                    ),
+                    _ => {}
+                }
+                reconciliation_tabs.replace(reconciliation_captains.workspace_projection());
+                reconciliation_tabs.finish_startup();
+                match reconciliation_identities
+                    .prune_dead_generation(&identity_prune_generation, |tile| {
+                        live.contains(&tmux::target_for_id(tile))
+                    }) {
+                    Ok(pruned) if pruned > 0 => eprintln!(
+                        "t-hub-identity: load-time prune retired {pruned} dead/unbound \
+                         identit{} (session gone without a clean close)",
+                        if pruned == 1 { "y" } else { "ies" }
+                    ),
+                    Err(error) => eprintln!(
+                        "t-hub-identity: load-time prune was rolled back after \
+                         persistence failed: {error}"
+                    ),
+                    _ => {}
+                }
+            });
             // Install the system-tray icon + menu (#17). A tray build failure is
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
@@ -1146,7 +1146,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod control_start_tests {
-    use super::explicit_control_token_for_start;
+    use super::{acquire_startup_live_sessions, explicit_control_token_for_start};
 
     #[test]
     fn pending_legacy_quarantine_refuses_an_unrotatable_explicit_control_token() {
@@ -1159,5 +1159,35 @@ mod control_start_tests {
             Some("fixed-token".into())
         );
         assert_eq!(explicit_control_token_for_start(true, None).unwrap(), None);
+    }
+
+    #[test]
+    fn startup_live_session_acquisition_retries_before_publishing() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let sessions = acquire_startup_live_sessions(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(crate::tmux::TmuxError {
+                        op: "list-sessions",
+                        code: None,
+                        message: "WSL unavailable".into(),
+                    })
+                } else {
+                    Ok(vec!["th_live".into()])
+                }
+            },
+            |duration| waits.push(duration),
+        );
+
+        assert_eq!(sessions, vec!["th_live"]);
+        assert_eq!(
+            waits,
+            vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            ]
+        );
     }
 }
