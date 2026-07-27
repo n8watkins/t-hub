@@ -686,6 +686,34 @@ impl AgentBridge {
         error
     }
 
+    fn fail_reader_transport(&self, journal_flow: &Arc<ReaderJournalFlow>, error: &str) {
+        let handles = {
+            let mut transport = self.inner.transport.lock();
+            if transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.journal_flow, journal_flow))
+            {
+                transport.take()
+            } else {
+                None
+            }
+        };
+        let Some(handles) = handles else {
+            return;
+        };
+
+        handles.journal_flow.retire();
+        handles.pending.lock().clear();
+        {
+            let mut child = handles.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(handles.reader.lock().take());
+        self.set_state(ConnectionState::Failed);
+        eprintln!("agent-bridge: live transport failed closed: {error}");
+    }
+
     /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
     /// leak the old reader thread or orphan in-flight senders. Safe to call when
     /// already disconnected (it's a no-op then). Used by [`reconnect`](Self::reconnect)
@@ -1724,6 +1752,84 @@ while IFS= read -r _; do :; done
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn replay_only_frame_after_completion_fails_the_live_transport() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-late-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("late-replay-agent");
+        let pid_file = temp_dir.join("pid");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$T_HUB_TEST_PID_FILE"
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"verified-session","event_type":"user_prompt_submit","payload":{{"session_id":"verified-session","prompt":"Verified"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":1}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":1}}'
+sleep 0.1
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"injected-session","event_type":"user_prompt_submit","payload":{{"session_id":"injected-session","prompt":"Must not commit"}}}},"replayed":true}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let pid_file_env = TestEnvVar::set("T_HUB_TEST_PID_FILE", &pid_file);
+        let bridge = AgentBridge::new();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while bridge.state() == ConnectionState::Live && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let state = bridge.state();
+        let cursor = bridge.journal_cursor();
+        let injected = bridge
+            .with_supervisor(|supervisor| supervisor.tree("injected-session"))
+            .is_some();
+        let has_transport = bridge.inner.transport.lock().is_some();
+        if has_transport {
+            bridge.disconnect();
+        }
+        drop(pid_file_env);
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(state, ConnectionState::Failed);
+        assert_eq!(cursor, 1);
+        assert!(!injected);
+        assert!(!has_transport);
+        assert!(
+            !std::path::Path::new("/proc").join(pid.trim()).exists(),
+            "protocol-violating helper process {pid} survived transport failure"
+        );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn protocol_mismatch_terminates_helper_and_fails_connection() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2112,9 +2218,12 @@ while IFS= read -r _; do :; done
         let env_lock = AGENT_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let journal = tempfile::tempdir().expect("create private agent journal");
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &agent_bin);
+        let journal_env = TestEnvVar::set("T_HUB_AGENT_JOURNAL_DIR", journal.path());
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("real agent must connect");
+        drop(journal_env);
         drop(agent_bin_env);
         drop(env_lock);
         let info = bridge
@@ -2455,47 +2564,51 @@ while IFS= read -r _; do :; done
         let journal_flow = ReaderJournalFlow::new();
         journal_flow.begin_replay(0);
 
-        journal_flow.ingest(
-            &bridge,
-            3,
-            EventJournalEntry {
-                seq: 3,
-                timestamp_ms: 3,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Live title"
-                }),
-                result: None,
-            },
-            false,
-        );
-        journal_flow.ingest(
-            &bridge,
-            1,
-            EventJournalEntry {
-                seq: 1,
-                timestamp_ms: 1,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Recovered title"
-                }),
-                result: None,
-            },
-            true,
-        );
+        journal_flow
+            .ingest(
+                &bridge,
+                3,
+                EventJournalEntry {
+                    seq: 3,
+                    timestamp_ms: 3,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Live title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
 
         assert_eq!(bridge.journal_cursor(), 0);
         assert!(rec.events.lock().is_empty());
 
-        journal_flow.observe_replay_boundary(1);
+        journal_flow.observe_replay_boundary(1).unwrap();
         assert_eq!(journal_flow.finish_replay(1), Ok(1));
         journal_flow.complete_replay(&bridge, 1).unwrap();
 
@@ -2520,51 +2633,55 @@ while IFS= read -r _; do :; done
         let journal_flow = ReaderJournalFlow::new();
         journal_flow.begin_replay(0);
 
-        journal_flow.ingest(
-            &bridge,
-            1,
-            EventJournalEntry {
-                seq: 1,
-                timestamp_ms: 1,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Recovered title"
-                }),
-                result: None,
-            },
-            true,
-        );
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
         assert_eq!(bridge.journal_cursor(), 0);
         assert!(rec.events.lock().is_empty());
 
-        journal_flow.ingest(
-            &bridge,
-            2,
-            EventJournalEntry {
-                seq: 2,
-                timestamp_ms: 2,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Live title"
-                }),
-                result: None,
-            },
-            false,
-        );
+        journal_flow
+            .ingest(
+                &bridge,
+                2,
+                EventJournalEntry {
+                    seq: 2,
+                    timestamp_ms: 2,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Live title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
         assert_eq!(bridge.journal_cursor(), 0);
         assert!(bridge
             .with_supervisor(|supervisor| supervisor.tree("session-1"))
             .is_none());
 
-        journal_flow.observe_replay_boundary(1);
+        journal_flow.observe_replay_boundary(1).unwrap();
         assert_eq!(journal_flow.finish_replay(1), Ok(1));
         journal_flow.complete_replay(&bridge, 1).unwrap();
 
@@ -2589,24 +2706,26 @@ while IFS= read -r _; do :; done
         journal_flow.begin_replay(0);
         bridge.set_state(ConnectionState::Replaying);
 
-        journal_flow.ingest(
-            &bridge,
-            1,
-            EventJournalEntry {
-                seq: 1,
-                timestamp_ms: 1,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Recovered title"
-                }),
-                result: None,
-            },
-            true,
-        );
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Recovered title"
+                    }),
+                    result: None,
+                },
+                true,
+            )
+            .unwrap();
 
         assert!(journal_flow.cancel());
         bridge.set_state(ConnectionState::Failed);
@@ -2630,7 +2749,7 @@ while IFS= read -r _; do :; done
         let journal_flow = ReaderJournalFlow::new();
         journal_flow.begin_replay(0);
 
-        journal_flow.observe_replay_boundary(0);
+        journal_flow.observe_replay_boundary(0).unwrap();
         assert_eq!(journal_flow.finish_replay(0), Ok(0));
         journal_flow.complete_replay(&bridge, 0).unwrap();
 
@@ -2645,24 +2764,26 @@ while IFS= read -r _; do :; done
         journal_flow.complete_without_replay(&bridge);
         journal_flow.retire();
 
-        journal_flow.ingest(
-            &bridge,
-            1,
-            EventJournalEntry {
-                seq: 1,
-                timestamp_ms: 1,
-                source: JournalSource::Agent,
-                event_id: None,
-                entity_id: Some("session-1".to_string()),
-                event_type: JournalEventType::UserPromptSubmit,
-                payload: serde_json::json!({
-                    "session_id": "session-1",
-                    "prompt": "Superseded title"
-                }),
-                result: None,
-            },
-            false,
-        );
+        journal_flow
+            .ingest(
+                &bridge,
+                1,
+                EventJournalEntry {
+                    seq: 1,
+                    timestamp_ms: 1,
+                    source: JournalSource::Agent,
+                    event_id: None,
+                    entity_id: Some("session-1".to_string()),
+                    event_type: JournalEventType::UserPromptSubmit,
+                    payload: serde_json::json!({
+                        "session_id": "session-1",
+                        "prompt": "Superseded title"
+                    }),
+                    result: None,
+                },
+                false,
+            )
+            .unwrap();
 
         assert_eq!(bridge.journal_cursor(), 0);
         assert!(bridge
