@@ -664,9 +664,12 @@ mod transport_tests {
         let env_lock = AGENT_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let journal = tempfile::tempdir().expect("create private agent journal");
         let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &bin_path);
+        let journal_env = TestEnvVar::set("T_HUB_AGENT_JOURNAL_DIR", journal.path());
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("connect() must succeed");
+        drop(journal_env);
         drop(agent_bin_env);
         drop(env_lock);
 
