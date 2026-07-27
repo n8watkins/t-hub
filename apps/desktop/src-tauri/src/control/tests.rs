@@ -22410,8 +22410,13 @@ fn audit_refusal_releases_idempotency_reservation_for_retry() {
     let _ = std::fs::remove_dir_all(&sink_parent);
     let _ = std::fs::remove_file(&sink_parent);
     std::fs::write(&sink_parent, b"not a directory").unwrap();
-    let ctx =
-        test_ctx("audit-retry").with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
+    // Stub the live-session evidence. The spawn path gathers it by shelling out
+    // to tmux BEFORE the audit gate, so a tmux server that is unreachable (a
+    // loaded CI runner, a hostile socket name) refuses the request as
+    // `refused-evidence` and this test never reaches the gate it covers.
+    let ctx = test_ctx("audit-retry")
+        .with_live_sessions(|| Ok(Vec::new()))
+        .with_audit(Arc::new(AuditLog::new(sink_parent.join("audit"))));
     let request = || {
         req(
             "audit-retry",
@@ -22449,7 +22454,12 @@ fn audit_refusal_refunds_governor_admission() {
     };
 
     let spawn_sink = broken_sink();
+    // Stub the live-session evidence: both the dispatch below and the
+    // `admit_spawn` refund check gather it from tmux before the audit gate, so
+    // an unreachable tmux server refuses as `refused-evidence` and hides the
+    // gate behaviour this test covers.
     let spawn_ctx = test_ctx("audit-spawn-refund")
+        .with_live_sessions(|| Ok(Vec::new()))
         .with_governor(Arc::new(SpawnGovernor::new(128, 0.0, 1.0)))
         .with_audit(Arc::new(AuditLog::new(spawn_sink.join("audit"))));
     let response = dispatch_authenticated(

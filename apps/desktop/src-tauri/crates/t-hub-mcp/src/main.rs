@@ -21,9 +21,9 @@
 mod control_client;
 mod protocol;
 mod server;
-mod tools;
 
 use std::io::Write;
+use t_hub_mcp::tools;
 
 fn main() {
     let mode = parse_args();

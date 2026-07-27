@@ -53,3 +53,19 @@ describe("Tauri build variant configuration", () => {
     expect(development.mainBinaryName).not.toMatch(/\.exe$/i);
   });
 });
+
+describe("release helper build configuration", () => {
+  it("disables host Rust wrappers for direct Linux and WSL builds", () => {
+    const script = readFileSync(
+      resolve(process.cwd(), "scripts/prepare-agent-resource.mjs"),
+      "utf8",
+    );
+    const linuxBuild = script.slice(
+      script.indexOf("function buildOnLinux()"),
+      script.indexOf("mkdirSync(dirname(resourcePath)"),
+    );
+
+    expect(linuxBuild).toContain('RUSTC_WRAPPER: ""');
+    expect(linuxBuild).toContain('CARGO_BUILD_RUSTC_WRAPPER: ""');
+  });
+});

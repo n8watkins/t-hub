@@ -29,7 +29,8 @@ The catalog includes `start_agent`, `list_agents`, `get_agent`, `agent_checkpoin
 Retired Powder tools are not advertised.
 - **~58 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
 - **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL).
-Run the focused agent-session gates before release, then the complete Rust, CLI, MCP, frontend, formatting, Clippy, and zero-network gates.
+Run `pnpm test` for the fast local profile, `pnpm test:standard` for the approximately one-minute cross-target profile, and `pnpm test:full` for the complete process and browser profile.
+See [docs/TESTING.md](./docs/TESTING.md) for backend, frontend, browser, contract, host-contract, and process-only commands, measured costs, and release guidance.
 
 ## Repository layout
 
