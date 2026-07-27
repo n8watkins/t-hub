@@ -458,7 +458,7 @@ pub fn worktrees(
     );
 }
 
-/// One line of the `th worktree prune` plan: what happens to one worktree, why.
+/// One line of the reporting-only `th worktree prune` plan: the candidate action and why.
 pub struct PruneRow {
     /// "REAP", "REAP*" (forced past an unmerged branch), or "SKIP".
     pub action: String,
