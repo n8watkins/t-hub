@@ -14,7 +14,7 @@ T-Hub has layered local test profiles so normal iteration does not pay the cost 
 | `pnpm test:contracts` | Portable repository, voice-gate, performance, and skill contracts | About 30 seconds |
 | `pnpm test:host-contracts` | Real Codex and Claude provisioning and installation contracts | About 7 minutes |
 | `pnpm test:process` | Real control and tmux process lifecycle tests | About 4 to 5 minutes |
-| `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 4 to 5 minutes |
+| `pnpm test:full` | Complete Rust, CLI, frontend, browser, bundle, and portable contracts | About 4 to 6 minutes |
 
 Run a focused test first when changing one behavior.
 Then choose the narrowest profile that crosses the boundaries affected by the change.
@@ -86,7 +86,8 @@ The standard Rust lane completed in 49.74 seconds, so the parallel standard prof
 The process profile completed in 4 minutes 42 seconds.
 The earlier monolithic Rust workspace invocation took about 8 minutes because unrelated targets contended with the process harness.
 The partitioned complete Rust gate completed in 4 minutes 8 seconds.
-The complete local profile is therefore expected to finish in about 4 to 5 minutes because its independent product lanes run concurrently and its Rust classes run sequentially.
+The exact complete local profile completed in 6 minutes 2 seconds in a later run.
+The complete local profile is therefore expected to finish in about 4 to 6 minutes because its independent product lanes run concurrently and its Rust classes run sequentially.
 
 Cold builds can take longer because Cargo must compile and link every native Tauri test target.
 The slow Rust cost comes from real process and tmux lifecycle coverage rather than obsolete unit-test volume.
