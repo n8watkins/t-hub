@@ -54,7 +54,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use parking_lot::Mutex;
@@ -533,6 +533,18 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(8);
 /// Flush a pending batch the moment it reaches this many DECODED bytes, so a
 /// firehose stays responsive (and memory bounded) even within one window.
 const MAX_BATCH_BYTES: usize = 256 * 1024;
+/// Minimum spacing between terminal-output events across the whole process.
+///
+/// `AppHandle::emit` queues work onto the Windows host event loop without
+/// backpressure. A continuous PTY firehose could therefore enqueue roughly 100
+/// quarter-megabyte events per second, starving the window pump for 5-20 seconds
+/// even though each reader already coalesced its own socket frames. Reserving one
+/// process-wide slot every 20 ms keeps the host below that measured saturation
+/// point and naturally backpressures the reader sockets. The first event after an
+/// idle period remains immediate, so normal typing does not inherit a fixed delay.
+const OUTPUT_EMIT_PERIOD: Duration = Duration::from_millis(20);
+static NEXT_OUTPUT_EMIT: std::sync::LazyLock<StdMutex<Instant>> =
+    std::sync::LazyLock::new(|| StdMutex::new(Instant::now()));
 /// Raw socket read size. A single read can carry several NDJSON frames, which the
 /// loop parses out of its own accumulation buffer.
 const RECV_BUF: usize = 16 * 1024;
@@ -609,6 +621,24 @@ fn emit_batch(authority: &GenerationAuthority, batch: &mut Vec<u8>) {
     authority.dispatch(ReaderEvent::Output(std::mem::take(batch)));
 }
 
+fn reserve_output_emit_delay(now: Instant, next_slot: &mut Instant, period: Duration) -> Duration {
+    let slot = (*next_slot).max(now);
+    *next_slot = slot + period;
+    slot.saturating_duration_since(now)
+}
+
+fn throttle_output_emit() {
+    let delay = {
+        let mut next_slot = NEXT_OUTPUT_EMIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reserve_output_emit_delay(Instant::now(), &mut next_slot, OUTPUT_EMIT_PERIOD)
+    };
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
 /// The attach stream ended — an explicit `{"exit"}` frame, or EOF/error on the
 /// socket. Neither PROVES the pane's process exited: the server-side attach
 /// client also exits on a detach (`tmux detach-client`), and the connection also
@@ -649,6 +679,7 @@ fn prepare_stream_end(id: &str, code: Option<i32>) -> PreparedStreamEnd {
 fn emit_reader_event(app: &AppHandle, id: &str, event: ReaderEvent) {
     match event {
         ReaderEvent::Output(bytes) => {
+            throttle_output_emit();
             let payload = OutputEvent {
                 id: id.to_string(),
                 base64: STANDARD.encode(bytes),
@@ -981,6 +1012,28 @@ mod tests {
         }
         assert_eq!(batch, b"foobar");
         assert_eq!(STANDARD.encode(&batch), STANDARD.encode(b"foobar"));
+    }
+
+    #[test]
+    fn output_emit_slots_are_process_wide_and_idle_output_is_immediate() {
+        let start = Instant::now();
+        let mut next_slot = start;
+        assert_eq!(
+            reserve_output_emit_delay(start, &mut next_slot, OUTPUT_EMIT_PERIOD),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reserve_output_emit_delay(start, &mut next_slot, OUTPUT_EMIT_PERIOD),
+            OUTPUT_EMIT_PERIOD
+        );
+        assert_eq!(
+            reserve_output_emit_delay(
+                start + OUTPUT_EMIT_PERIOD * 3,
+                &mut next_slot,
+                OUTPUT_EMIT_PERIOD,
+            ),
+            Duration::ZERO
+        );
     }
 
     #[test]
