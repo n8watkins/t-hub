@@ -617,7 +617,7 @@ fn rediscover_durable_supervisor_with_timeout(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (run_id, expected);
+        let _ = (run_id, expected, timeout);
         Ok(RuntimeRediscovery::Ambiguous)
     }
 }

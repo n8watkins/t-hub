@@ -918,11 +918,10 @@ for expected in "$@"; do
     printf '\n'
 done
 "#;
-    let mut command = Command::new("sh");
     #[cfg(windows)]
-    {
-        command = wsl_observation_command();
-    }
+    let mut command = wsl_observation_command();
+    #[cfg(unix)]
+    let mut command = Command::new("sh");
     command
         .arg("-c")
         .arg(SCRIPT)
