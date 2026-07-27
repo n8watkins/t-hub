@@ -1470,6 +1470,20 @@ fn cortana_inconclusive_observations_never_enter_quarantine_branch() {
     );
     assert!(is_retryable_error(&indeterminate_error));
 
+    for code in [83, 84] {
+        let retirement_evidence = crate::tmux::TmuxError {
+            op: "retire-prepared-managed-runtime",
+            code: Some(code),
+            io_kind: Some(std::io::ErrorKind::WouldBlock),
+            message: "prepared managed unit was unverifiable".into(),
+        };
+        let retirement_error = cortana_tmux_observation_error(
+            "exact prepared owner cleanup failed",
+            retirement_evidence,
+        );
+        assert!(ControlResponse::err(retirement_error).retryable);
+    }
+
     let unreadable_error = cortana_harness_observation_error(
         "active Cortana Harness attestation failed",
         crate::harness::LaunchAttestationError::UnreadableEvidence,

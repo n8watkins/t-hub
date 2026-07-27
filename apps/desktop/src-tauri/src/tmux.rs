@@ -308,6 +308,39 @@ impl TmuxError {
     }
 }
 
+fn managed_helper_failure(
+    op: &'static str,
+    code: Option<i32>,
+    message: impl Into<String>,
+) -> TmuxError {
+    TmuxError {
+        op,
+        code,
+        io_kind: matches!(code, Some(83 | 84)).then_some(std::io::ErrorKind::WouldBlock),
+        message: message.into(),
+    }
+}
+
+fn incomplete_managed_retirement(liveness: SessionLiveness) -> TmuxError {
+    let (io_kind, message) = match liveness {
+        SessionLiveness::Unknown => (
+            Some(std::io::ErrorKind::WouldBlock),
+            "managed cgroup emptied but exact tmux generation liveness is indeterminate",
+        ),
+        SessionLiveness::Alive => (
+            None,
+            "managed cgroup emptied but the exact tmux generation did not retire",
+        ),
+        SessionLiveness::Gone => unreachable!("gone managed retirement is complete"),
+    };
+    TmuxError {
+        op: "retire-managed-runtime",
+        code: None,
+        io_kind,
+        message: message.into(),
+    }
+}
+
 /// The identity of exactly one tmux pane at one instant.
 ///
 /// This is crate-private launch evidence, not a public control-plane value.
@@ -2259,12 +2292,11 @@ pub(crate) fn retire_prepared_managed_runtime(
     if output.status.success() && output.stderr.is_empty() {
         Ok(())
     } else {
-        Err(TmuxError {
-            op: "retire-prepared-managed-runtime",
-            code: output.status.code(),
-            io_kind: None,
-            message: "prepared managed unit was populated, reused, or unverifiable".into(),
-        })
+        Err(managed_helper_failure(
+            "retire-prepared-managed-runtime",
+            output.status.code(),
+            "prepared managed unit was populated, reused, or unverifiable",
+        ))
     }
 }
 
@@ -2540,27 +2572,23 @@ pub(crate) fn retire_managed_runtime(
                 message: format!("managed cgroup retirement failed: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "retire-managed-runtime",
-            code: output.status.code(),
-            io_kind: None,
-            message: "managed owner changed or cgroup freeze/kill did not complete".into(),
-        });
+        return Err(managed_helper_failure(
+            "retire-managed-runtime",
+            output.status.code(),
+            "managed owner changed or cgroup freeze/kill did not complete",
+        ));
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         match session_liveness(name) {
             SessionLiveness::Gone => return Ok(()),
-            SessionLiveness::Unknown => break,
+            SessionLiveness::Unknown => {
+                return Err(incomplete_managed_retirement(SessionLiveness::Unknown));
+            }
             SessionLiveness::Alive => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    Err(TmuxError {
-        op: "retire-managed-runtime",
-        code: None,
-        io_kind: None,
-        message: "managed cgroup emptied but the exact tmux generation did not retire".into(),
-    })
+    Err(incomplete_managed_retirement(SessionLiveness::Alive))
 }
 
 /// Best-effort retirement for a legacy pane through enumerated pidfds.
@@ -3592,6 +3620,37 @@ while True:
 
         retire_prepared_managed_runtime(&launch).unwrap();
         retire_prepared_managed_runtime(&launch).unwrap();
+    }
+
+    #[test]
+    fn managed_retirement_preserves_only_inconclusive_helper_failures() {
+        for code in [83, 84] {
+            let error = managed_helper_failure(
+                "retire-prepared-managed-runtime",
+                Some(code),
+                "unreadable helper evidence",
+            );
+            assert!(error.is_retryable_observation(), "helper exit {code}");
+        }
+
+        for code in [76, 78, 79, 120] {
+            let error = managed_helper_failure(
+                "retire-managed-runtime",
+                Some(code),
+                "definitive ownership failure",
+            );
+            assert!(!error.is_retryable_observation(), "helper exit {code}");
+        }
+    }
+
+    #[test]
+    fn managed_retirement_unknown_completion_is_retryable_but_alive_is_not() {
+        assert!(
+            incomplete_managed_retirement(SessionLiveness::Unknown).is_retryable_observation()
+        );
+        assert!(
+            !incomplete_managed_retirement(SessionLiveness::Alive).is_retryable_observation()
+        );
     }
 
     #[cfg(unix)]
