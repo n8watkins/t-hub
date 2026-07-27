@@ -1004,6 +1004,17 @@ export function TerminalView({
                   needsReattach = true;
                   return;
                 }
+                await waitForTerminalDetach(terminalId);
+                if (disposed) return;
+                if (!useWorkspace.getState().terminals[terminalId]) {
+                  reconnecting = false;
+                  return;
+                }
+                if (!shouldKeepOutputAttached()) {
+                  reconnecting = false;
+                  needsReattach = true;
+                  return;
+                }
                 if (!(await sessionAlive())) {
                   if (!disposed) declareExited();
                   reconnecting = false;
