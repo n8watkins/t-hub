@@ -1677,19 +1677,19 @@ impl CaptainsRegistry {
             .collect()
     }
 
-    pub fn reconciliation_seq(&self) -> u64 {
-        self.lock().seq
+    pub fn startup_workspace_reconciliation_basis(&self) -> Vec<FleetWorkspaceRecord> {
+        self.lock().workspaces.clone()
     }
 
     pub fn reconcile_startup_workspace_tiles(
         &self,
-        expected_seq: u64,
+        expected_workspaces: &[FleetWorkspaceRecord],
         is_live: impl Fn(&str) -> bool,
         publish: impl FnOnce(Vec<TabRecord>),
     ) -> Result<Option<Vec<String>>, String> {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut current = self.lock();
-        if current.seq != expected_seq {
+        if current.workspaces != expected_workspaces {
             return Ok(None);
         }
         let previous = current.clone();

@@ -6174,12 +6174,12 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
 }
 
 #[test]
-fn startup_reconciliation_retries_when_registry_changes_after_liveness_snapshot() {
+fn startup_reconciliation_retries_when_workspaces_change_after_liveness_snapshot() {
     let registry = CaptainsRegistry::new();
     registry
         .claim_test("old-live", Some("old-live-ship"), vec![])
         .unwrap();
-    let stale_seq = registry.reconciliation_seq();
+    let stale_basis = registry.startup_workspace_reconciliation_basis();
     registry
         .claim_test("new-live", Some("new-live-ship"), vec![])
         .unwrap();
@@ -6188,7 +6188,7 @@ fn startup_reconciliation_retries_when_registry_changes_after_liveness_snapshot(
     assert_eq!(
         registry
             .reconcile_startup_workspace_tiles(
-                stale_seq,
+                &stale_basis,
                 |tile| tile == "old-live",
                 |_| published.store(true, Ordering::Release),
             )
@@ -6202,12 +6202,43 @@ fn startup_reconciliation_retries_when_registry_changes_after_liveness_snapshot(
         .flat_map(|workspace| workspace.tile_ids.iter())
         .any(|tile| tile == "new-live"));
 
-    let current_seq = registry.reconciliation_seq();
+    let current_basis = registry.startup_workspace_reconciliation_basis();
     assert_eq!(
         registry
             .reconcile_startup_workspace_tiles(
-                current_seq,
+                &current_basis,
                 |tile| matches!(tile, "old-live" | "new-live"),
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        Some(Vec::new())
+    );
+    assert!(published.load(Ordering::Acquire));
+}
+
+#[test]
+fn startup_reconciliation_ignores_unrelated_registry_changes() {
+    let registry = CaptainsRegistry::new();
+    registry
+        .claim_test("captain-live", Some("live-ship"), vec![])
+        .unwrap();
+    let basis = registry.startup_workspace_reconciliation_basis();
+    registry
+        .checkpoint(
+            Some("captain-live"),
+            None,
+            None,
+            None,
+            Some("active checkpoint"),
+        )
+        .unwrap();
+
+    let published = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                &basis,
+                |tile| tile == "captain-live",
                 |_| published.store(true, Ordering::Release),
             )
             .unwrap(),

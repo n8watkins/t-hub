@@ -796,7 +796,8 @@ pub fn run() {
                 tauri::async_runtime::spawn_blocking(move || {
                     let mut retry_delay = std::time::Duration::from_millis(250);
                     loop {
-                        let reconciliation_seq = captains_registry.reconciliation_seq();
+                        let reconciliation_basis =
+                            captains_registry.startup_workspace_reconciliation_basis();
                         let sessions = match tmux::list_sessions() {
                             Ok(sessions) => sessions,
                             Err(error) => {
@@ -815,7 +816,7 @@ pub fn run() {
                             .into_iter()
                             .collect::<std::collections::HashSet<_>>();
                         let reconciliation = captains_registry.reconcile_startup_workspace_tiles(
-                            reconciliation_seq,
+                            &reconciliation_basis,
                             |tile| live.contains(&tmux::target_for_id(tile)),
                             |projection| tab_registry.publish_startup(projection),
                         );
