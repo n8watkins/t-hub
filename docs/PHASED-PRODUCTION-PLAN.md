@@ -1066,7 +1066,7 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 13. Verify Claude and Codex header identity persistence across Refresh, remount, restart, and exact conversation resume.
 14. Fail visibly when a Harness cannot prove a needs-input transition rather than silently claiming voice parity.
 15. Reconcile Cortana startup through one stable operation identity and preserve its durable identity and checkpoints when the terminal, Harness, or application is replaced.
-16. Serialize concurrent startup attempts, select one authoritative generation, quarantine duplicates, and fail closed in a visible degraded state when identity is uncertain.
+16. Serialize concurrent startup attempts, select one authoritative generation, quarantine only definitive trusted lower-generation duplicates without deleting their tmux sessions, and preserve uncertain candidates in a visible degraded state.
 17. Reserve runtime-governor capacity for Cortana, standing administrators, and recovery.
 18. Keep Cortana on bounded authoritative summaries and delegate multi-step investigation and administrative execution to Fleet Admin Crew.
 19. Persist role scope, delegating identity, grant generation, revocation state, permitted operations, and dual audit attribution for delegated administrators.

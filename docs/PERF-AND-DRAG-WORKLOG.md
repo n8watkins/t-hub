@@ -247,10 +247,12 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       NOT run its JS on the main thread — the main-thread cost is the per-emit tao
       user-event DISPATCH + marshaling the payload string across the WebView2 IPC
       boundary, not executing the JS. This weakens "JS storm" theories.
-    - 🎯 **LIVE SUSPECT (plausible-contributor, medium): emit-dispatch VOLUME.** Each
+    - 🎯 **HISTORICAL SUSPECT (plausible-contributor, medium): emit-dispatch VOLUME.** Each
       `app.emit` from a reader thread posts its OWN tao user-event (unbounded mpsc,
-      no backpressure on the release eval path). No CROSS-terminal coalescing
-      (`remote_pty.rs` batches per-terminal only); control events are serialized
+      with no backpressure in the audited release path). Current source retains
+      per-terminal coalescing and adds one process-wide terminal-output reservation
+      every 20 ms, which backpressures reader sockets under multi-terminal load.
+      Control events are serialized
       TWICE (`control_client.rs:245`); a forwarder RECONNECT can flush a backlog as a
       tight emit burst. A transient alignment of bursts (multi-terminal token streams +
       TUI repaint + control stream + reconnect) can saturate the main-thread user-event
