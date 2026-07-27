@@ -1,6 +1,6 @@
 # T-Hub
 
-T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
+T-Hub is a **terminal-first command center for running and supervising many persistent Codex and Claude coding-agent sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
 ## Status - post-Powder agent-session candidate
 
@@ -14,7 +14,9 @@ Legacy Powder registry fields remain readable as inert compatibility data.
   The Workspaces header offers a trash action only when empty workspaces can be closed safely; it never kills or detaches a session and always preserves at least one work workspace.
   History remains visible below the independently scrolling workspace list so active and resumable conversations stay available.
 - **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
-- **Agent supervision:** a `t-hub-agent` sidecar + Claude Code hooks feed a journal/statusline spine — context + cost readout, autocontinue, supervision tree. Hooks install consent-gated from **Settings → Hooks** and self-heal on startup.
+- **Agent supervision:** a `t-hub-agent` sidecar plus provider lifecycle hooks feed the journal and supervision tree, while the Claude statusline supplies context and cost readouts.
+  Claude and Codex hook installation is consent-gated in **Settings → Hooks**.
+  Claude entries self-heal on startup; the Codex panel preserves unrelated configuration, warns about other hook sources that can duplicate events, and directs trust or enablement changes through Codex's own `/hooks` review.
 - **Git worktree workflow:** `Ctrl+B w` creates a worktree tab from a branch name (with a repo picker when the focused tile isn't in a repo), landing it as a sibling `<repo>-worktrees/<branch>`; `Ctrl+B c` opens a plain tab and `Ctrl+B l` lists/re-opens existing worktrees.
 - **Rebindable hybrid keymap:** direct hotkeys + a tmux-style `Ctrl+B` prefix tier + a `Ctrl+K` fuzzy command palette — all bindings are user-editable from Settings and persist.
 - **Event→action rules engine:** user-configurable rules fire when a supervised session's FR-012 status transitions (optionally from a specific prior status) and run one action — notify, type text, spawn, restart, or run a command in the session.
