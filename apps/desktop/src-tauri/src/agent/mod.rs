@@ -25,7 +25,7 @@ pub(crate) use install::bundled_agent_path;
 #[cfg(windows)]
 pub(crate) use install::deploy_bundled_agent;
 #[cfg(any(windows, test))]
-pub(crate) use install::DeployOutcome;
+pub(crate) use install::{DeployOutcome, DeployedAgent};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,20 +54,22 @@ use emit::{
 ///
 /// ## Windows agent resolution
 ///
-/// The bundled `t-hub-agent` is installed to `~/.local/bin/t-hub-agent`
-/// inside the distro. The packaged app deploys and hash-verifies that exact
-/// path before connecting. Launching a bare `t-hub-agent` through `PATH` could
-/// select an older helper elsewhere in the user's profile, so the bridge
-/// executes the installed path directly:
+/// The bundled `t-hub-agent` is installed to
+/// `~/.local/lib/t-hub/agents/<sha256>/t-hub-agent` inside the distro.
+/// The packaged app deploys and hash-verifies that exact versioned path before
+/// connecting.
+/// Different packaged builds therefore cannot replace one another's verified
+/// helper while running side by side.
+/// The bridge executes the verified path directly without a shell or `PATH`
+/// lookup:
 ///
 /// ```text
-/// wsl.exe -d <distro> --cd ~ -e bash -lc \
-///     "exec $HOME/.local/bin/t-hub-agent --stdio"
+/// wsl.exe -d <distro> --cd ~ -e \
+///     /home/<user>/.local/lib/t-hub/agents/<sha256>/t-hub-agent --stdio
 /// ```
 ///
-/// `exec` replaces the shell with the agent so there is no extra process in the
-/// tree and stdio is wired straight through. `$HOME` is expanded by WSL's bash,
-/// keeping the native Windows process independent of the distro home path.
+/// `wsl.exe -e` executes the exact helper so stdio is wired straight through
+/// and no mutable shell expansion can change the attested executable.
 ///
 /// The `T_HUB_AGENT_BIN` escape hatch is honored on unix, Windows dev builds,
 /// and in tests. It bypasses the login-shell hop entirely: when set, its value
@@ -87,7 +89,11 @@ fn direct_agent_argv(program: &str, journal_dir: Option<&str>) -> Vec<String> {
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
+fn windows_agent_argv(
+    distro: &str,
+    verified_agent: &str,
+    journal_dir: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "wsl.exe".to_string(),
         "-d".to_string(),
@@ -95,25 +101,18 @@ fn windows_agent_argv(distro: &str, journal_dir: Option<&str>) -> Vec<String> {
         "--cd".to_string(),
         "~".to_string(),
         "-e".to_string(),
-        "bash".to_string(),
-        "-lc".to_string(),
+        verified_agent.to_string(),
     ];
     if let Some(dir) = journal_dir {
-        // The value is passed as a positional argument rather than interpolated
-        // into shell source, so spaces and shell metacharacters remain inert.
-        argv.extend([
-            "exec $HOME/.local/bin/t-hub-agent --journal-dir \"$1\" --stdio".to_string(),
-            "t-hub-agent".to_string(),
-            dir.to_string(),
-        ]);
-    } else {
-        argv.push("exec $HOME/.local/bin/t-hub-agent --stdio".to_string());
+        argv.push("--journal-dir".to_string());
+        argv.push(dir.to_string());
     }
+    argv.push("--stdio".to_string());
     argv
 }
 
 #[allow(dead_code)]
-pub fn launch_argv(distro: &str) -> Vec<String> {
+pub fn launch_argv(distro: &str, verified_agent: Option<&str>) -> Result<Vec<String>, String> {
     let journal_dir = std::env::var("T_HUB_AGENT_JOURNAL_DIR")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -123,18 +122,23 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         // wsl.exe / login-shell hop). This keeps the override usable on Windows
         // where it would otherwise be misapplied as wsl.exe's argv[0].
         if let Some(bin) = agent_bin_override() {
-            return direct_agent_argv(&bin, journal_dir.as_deref());
+            return Ok(direct_agent_argv(&bin, journal_dir.as_deref()));
         }
-        // Launch the exact path that packaged startup deployed and verified.
-        // `-e` makes wsl.exe exec bash directly; a bare `--` routes the command
-        // through the user's default login shell instead.
-        windows_agent_argv(distro, journal_dir.as_deref())
+        let verified_agent = verified_agent.ok_or_else(|| {
+            "verified digest-versioned WSL helper path is unavailable".to_string()
+        })?;
+        Ok(windows_agent_argv(
+            distro,
+            verified_agent,
+            journal_dir.as_deref(),
+        ))
     }
     #[cfg(unix)]
     {
         let _ = distro; // distro is irrelevant when launching directly.
         let _ = journal_dir; // inherited env resolves a relative path against HOME.
-        direct_agent_argv("t-hub-agent", None)
+        let _ = verified_agent;
+        Ok(direct_agent_argv("t-hub-agent", None))
     }
 }
 
@@ -331,7 +335,7 @@ impl AgentBridge {
     }
 
     #[cfg(windows)]
-    pub(crate) fn deploy_packaged_agent(&self, distro: &str) -> Result<DeployOutcome, String> {
+    pub(crate) fn deploy_packaged_agent(&self, distro: &str) -> Result<DeployedAgent, String> {
         let resource = self
             .inner
             .bundled_agent
@@ -462,13 +466,21 @@ impl AgentBridge {
         }
 
         #[cfg(windows)]
-        if agent_bin_override().is_none() {
+        let verified_agent = if agent_bin_override().is_none() {
             match self.deploy_packaged_agent(distro) {
-                Ok(DeployOutcome::AlreadyCurrent) => {
-                    eprintln!("t-hub: bundled WSL helper verified");
-                }
-                Ok(DeployOutcome::Installed) => {
-                    eprintln!("t-hub: installed and verified bundled WSL helper");
+                Ok(deployed) => {
+                    match deployed.outcome {
+                        DeployOutcome::AlreadyCurrent => {
+                            eprintln!("t-hub: bundled WSL helper verified ({})", deployed.wsl_path);
+                        }
+                        DeployOutcome::Installed => {
+                            eprintln!(
+                                "t-hub: installed and verified bundled WSL helper ({})",
+                                deployed.wsl_path
+                            );
+                        }
+                    }
+                    Some(deployed.wsl_path)
                 }
                 Err(error) => {
                     self.set_state(ConnectionState::Failed);
@@ -478,10 +490,20 @@ impl AgentBridge {
                     ));
                 }
             }
-        }
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let verified_agent: Option<String> = None;
 
         // Build argv and spawn child.
-        let argv = launch_argv(distro);
+        let argv = match launch_argv(distro, verified_agent.as_deref()) {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.set_state(ConnectionState::Failed);
+                return Err(error);
+            }
+        };
         let mut child = match spawn_child(argv) {
             Ok(child) => child,
             Err(error) => {
@@ -1514,14 +1536,15 @@ mod tests {
     fn launch_argv_shape() {
         #[cfg(unix)]
         {
-            let argv = launch_argv("Ubuntu-24.04");
+            let argv = launch_argv("Ubuntu-24.04", None).unwrap();
             assert_eq!(argv, vec!["t-hub-agent", "--stdio"]);
         }
         #[cfg(windows)]
         {
             // Default Windows path: execute the deployed helper directly.
             std::env::remove_var("T_HUB_AGENT_BIN");
-            let argv = launch_argv("Ubuntu-24.04");
+            let verified = "/home/natkins/.local/lib/t-hub/agents/0123456789abcdef/t-hub-agent";
+            let argv = launch_argv("Ubuntu-24.04", Some(verified)).unwrap();
             assert_eq!(
                 argv,
                 vec![
@@ -1531,15 +1554,14 @@ mod tests {
                     "--cd",
                     "~",
                     "-e",
-                    "bash",
-                    "-lc",
-                    "exec $HOME/.local/bin/t-hub-agent --stdio",
+                    verified,
+                    "--stdio",
                 ]
             );
 
             // Escape hatch: T_HUB_AGENT_BIN is spawned verbatim (no wsl.exe).
             std::env::set_var("T_HUB_AGENT_BIN", "C:/tmp/t-hub-agent.exe");
-            let argv = launch_argv("Ubuntu-24.04");
+            let argv = launch_argv("Ubuntu-24.04", None).unwrap();
             assert_eq!(argv, vec!["C:/tmp/t-hub-agent.exe", "--stdio"]);
             std::env::remove_var("T_HUB_AGENT_BIN");
         }
@@ -1556,8 +1578,9 @@ mod tests {
                 "--stdio",
             ]
         );
+        let verified = "/home/natkins/.local/lib/t-hub/agents/0123456789abcdef/t-hub-agent";
         assert_eq!(
-            windows_agent_argv("Ubuntu-24.04", Some(".t-hub-dev/journal dir")),
+            windows_agent_argv("Ubuntu-24.04", verified, Some(".t-hub-dev/journal dir")),
             vec![
                 "wsl.exe",
                 "-d",
@@ -1565,11 +1588,10 @@ mod tests {
                 "--cd",
                 "~",
                 "-e",
-                "bash",
-                "-lc",
-                "exec $HOME/.local/bin/t-hub-agent --journal-dir \"$1\" --stdio",
-                "t-hub-agent",
+                verified,
+                "--journal-dir",
                 ".t-hub-dev/journal dir",
+                "--stdio",
             ]
         );
     }

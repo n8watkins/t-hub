@@ -114,8 +114,8 @@ fn default_distro() -> String {
 fn prepare_packaged_agent(
     has_developer_override: bool,
     bundled_agent: Option<&std::path::Path>,
-    deploy: impl FnOnce(&std::path::Path) -> Result<agent::DeployOutcome, String>,
-) -> Result<Option<(std::path::PathBuf, agent::DeployOutcome)>, String> {
+    deploy: impl FnOnce(&std::path::Path) -> Result<agent::DeployedAgent, String>,
+) -> Result<Option<(std::path::PathBuf, agent::DeployedAgent)>, String> {
     if has_developer_override {
         return Ok(None);
     }
@@ -149,18 +149,23 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
                     },
                 ) {
                     Ok(None) => {}
-                    Ok(Some((resource, agent::DeployOutcome::AlreadyCurrent))) => {
-                        eprintln!(
-                            "t-hub: bundled WSL helper already current ({})",
-                            resource.display()
-                        );
-                    }
-                    Ok(Some((resource, agent::DeployOutcome::Installed))) => {
-                        eprintln!(
-                            "t-hub: installed bundled WSL helper ({})",
-                            resource.display()
-                        );
-                    }
+                    Ok(Some((resource, deployed))) => match deployed.outcome {
+                        agent::DeployOutcome::AlreadyCurrent => {
+                            eprintln!(
+                                "t-hub: bundled WSL helper already current (resource={}, \
+                                     installed={})",
+                                resource.display(),
+                                deployed.wsl_path
+                            );
+                        }
+                        agent::DeployOutcome::Installed => {
+                            eprintln!(
+                                "t-hub: installed bundled WSL helper (resource={}, installed={})",
+                                resource.display(),
+                                deployed.wsl_path
+                            );
+                        }
+                    },
                     Err(error) => {
                         eprintln!(
                             "t-hub: bundled WSL helper deployment failed; refusing to connect \
@@ -173,23 +178,14 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
             #[cfg(not(windows))]
             let _ = bundled_agent;
 
-            // Log the resolved launch argv up front so a missing/unresolvable
-            // agent binary is diagnosable from the core's stderr. On Windows
-            // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
-            // $HOME/.local/bin/t-hub-agent --stdio"` form. `-e` execs real bash,
-            // not the default login shell; see agent::launch_argv. The
-            // Dev-build T_HUB_AGENT_BIN overrides remain verbatim. Packaged
-            // Windows builds ignore the override and require the verified helper.
-            // On unix it is a direct spawn.
-            let argv = agent::launch_argv(&distro);
-            eprintln!("t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}");
+            eprintln!("t-hub: connecting agent bridge (distro={distro:?})");
             if let Err(e) = bridge.connect(&distro) {
                 // A failure here never aborts startup: the bridge degrades to a
                 // Failed/Disconnected state the sidebar renders.
                 eprintln!(
                     "t-hub: agent bridge connect failed: {e} \
-                     (is the verified helper executable at ~/.local/bin/t-hub-agent \
-                     inside the distro, or is a supported developer override set?)"
+                     (is the digest-versioned helper executable inside the distro, \
+                     or is a supported developer override set?)"
                 );
             }
         })
@@ -199,7 +195,7 @@ fn spawn_agent_connect(state: &AppState, bundled_agent: Option<std::path::PathBu
 #[cfg(test)]
 mod packaged_agent_startup_tests {
     use super::prepare_packaged_agent;
-    use crate::agent::DeployOutcome;
+    use crate::agent::{DeployOutcome, DeployedAgent};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -234,8 +230,13 @@ mod packaged_agent_startup_tests {
     fn packaged_startup_preserves_the_verified_resource_and_outcome() {
         let resource = Path::new("C:/Program Files/T-Hub/resources/t-hub-agent");
         for expected in [DeployOutcome::AlreadyCurrent, DeployOutcome::Installed] {
-            let outcome = prepare_packaged_agent(false, Some(resource), |_| Ok(expected)).unwrap();
-            assert_eq!(outcome, Some((PathBuf::from(resource), expected)));
+            let deployed = DeployedAgent {
+                outcome: expected,
+                wsl_path: "/home/natkins/.local/lib/t-hub/agents/digest/t-hub-agent".into(),
+            };
+            let outcome =
+                prepare_packaged_agent(false, Some(resource), |_| Ok(deployed.clone())).unwrap();
+            assert_eq!(outcome, Some((PathBuf::from(resource), deployed)));
         }
     }
 }
@@ -251,18 +252,40 @@ mod packaged_agent_startup_tests {
 /// `termhub` build), it migrates them to the current marker + resolved agent
 /// path. The outcome is summarized via `diag::diag_log`.
 #[cfg(not(feature = "devbuild"))]
-fn spawn_reconcile_managed_hooks() {
+fn spawn_reconcile_managed_hooks(state: &AppState) {
+    #[cfg(windows)]
+    let bridge = state.agent.clone();
+    #[cfg(windows)]
+    let distro = default_distro();
+    #[cfg(not(windows))]
+    let _ = state;
     std::thread::Builder::new()
         .name("t-hub-claude-reconcile".into())
-        .spawn(|| match claude::install::reconcile_managed_hooks() {
-            Ok(()) => diag::diag_log(
-                "claude/reconcile: startup reconcile ok (migrated managed hooks if any; \
-                 no-op when none were installed)"
-                    .to_string(),
-            ),
-            Err(e) => diag::diag_log(format!(
-                "claude/reconcile: startup reconcile failed (non-fatal, launch continues): {e}"
-            )),
+        .spawn(move || {
+            #[cfg(windows)]
+            let agent_bin = match bridge.deploy_packaged_agent(&distro) {
+                Ok(deployed) => deployed.wsl_path,
+                Err(error) => {
+                    diag::diag_log(format!(
+                        "claude/reconcile: verified helper deployment failed \
+                         (non-fatal, launch continues): {error}"
+                    ));
+                    return;
+                }
+            };
+            #[cfg(not(windows))]
+            let agent_bin = "t-hub-agent".to_string();
+
+            match claude::install::reconcile_managed_hooks(&agent_bin) {
+                Ok(()) => diag::diag_log(
+                    "claude/reconcile: startup reconcile ok (migrated managed hooks if any; \
+                     no-op when none were installed)"
+                        .to_string(),
+                ),
+                Err(e) => diag::diag_log(format!(
+                    "claude/reconcile: startup reconcile failed (non-fatal, launch continues): {e}"
+                )),
+            }
         })
         .ok();
 }
@@ -830,7 +853,7 @@ pub fn run() {
             // managed exists (no silent new consent). Detached + error-swallowed so
             // it can never block or abort launch (a WSL hop / file write runs here).
             #[cfg(not(feature = "devbuild"))]
-            spawn_reconcile_managed_hooks();
+            spawn_reconcile_managed_hooks(&state);
             #[cfg(feature = "devbuild")]
             diag::diag_log(
                 "claude_hooks: startup reconciliation disabled for isolated devbuild".to_string(),

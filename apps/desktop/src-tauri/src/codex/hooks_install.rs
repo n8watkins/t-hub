@@ -124,9 +124,10 @@ pub struct RuntimePaths {
     pub hooks_state_path: String,
 }
 
-pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
+pub fn runtime_paths(agent_bin: &str, packaged_agent_bin: Option<&str>) -> Result<RuntimePaths> {
     #[cfg(unix)]
     {
+        let _ = packaged_agent_bin;
         let codex_home = codex_home()?;
         let hooks_state_path = codex_home.join("hooks.json").display().to_string();
         Ok(RuntimePaths {
@@ -139,13 +140,36 @@ pub fn runtime_paths(agent_bin: &str) -> Result<RuntimePaths> {
     #[cfg(windows)]
     {
         let _ = agent_bin;
+        let packaged_agent_bin = packaged_agent_bin
+            .context("verified digest-versioned WSL helper path is unavailable")?;
+        validate_canonical_absolute_posix(packaged_agent_bin)?;
         let distro = wsl_distro();
         let home = wsl_home(&distro)?;
         let runtime_codex_home = format!("{home}/.codex");
         Ok(RuntimePaths {
             codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
             requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
-            agent_bin: PathBuf::from(deployed_wsl_agent_bin(&home)?),
+            agent_bin: PathBuf::from(packaged_agent_bin),
+            hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
+        })
+    }
+}
+
+pub fn runtime_paths_for_uninstall(agent_bin: &str) -> Result<RuntimePaths> {
+    #[cfg(unix)]
+    {
+        runtime_paths(agent_bin, None)
+    }
+    #[cfg(windows)]
+    {
+        let _ = agent_bin;
+        let distro = wsl_distro();
+        let home = wsl_home(&distro)?;
+        let runtime_codex_home = format!("{home}/.codex");
+        Ok(RuntimePaths {
+            codex_home: wsl_posix_to_unc(&distro, &runtime_codex_home)?,
+            requirements_path: wsl_posix_to_unc(&distro, "/etc/codex/requirements.toml")?,
+            agent_bin: PathBuf::from("/.t-hub-uninstall/t-hub-agent"),
             hooks_state_path: format!("{runtime_codex_home}/hooks.json"),
         })
     }
@@ -200,12 +224,6 @@ fn resolve_unix_agent_bin_from(
     supplied
 }
 
-#[cfg(any(windows, test))]
-fn deployed_wsl_agent_bin(home: &str) -> Result<String> {
-    validate_canonical_absolute_posix(home)?;
-    Ok(format!("{home}/.local/bin/t-hub-agent"))
-}
-
 #[cfg(windows)]
 pub fn host_project_path(path: &str) -> Result<PathBuf> {
     host_project_path_for_distro(path, &wsl_distro())
@@ -252,15 +270,6 @@ fn normalize_wsl_home(output: &[u8]) -> Result<String> {
         bail!("WSL home is not an absolute POSIX path");
     }
     Ok(home)
-}
-
-#[cfg(any(windows, test))]
-fn normalize_wsl_executable(output: &[u8]) -> Result<String> {
-    let path = normalize_single_wsl_path_output(output)?;
-    if path.len() <= 1 {
-        bail!("WSL t-hub-agent path is not an absolute POSIX path");
-    }
-    Ok(path)
 }
 
 #[cfg(any(windows, test))]
@@ -336,10 +345,10 @@ fn wsl_home(distro: &str) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
+fn verify_wsl_agent_bin(distro: &str, agent_bin: &str) -> Result<()> {
     use std::os::windows::process::CommandExt;
 
-    let agent_bin = deployed_wsl_agent_bin(&wsl_home(distro)?)?;
+    validate_canonical_absolute_posix(agent_bin)?;
     let mut command = std::process::Command::new("wsl.exe");
     command
         .arg("-d")
@@ -349,7 +358,7 @@ fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
         .arg("-c")
         .arg("test -x \"$1\"")
         .arg("t-hub-agent")
-        .arg(&agent_bin)
+        .arg(agent_bin)
         .creation_flags(0x0800_0000);
     let output =
         crate::bounded_exec::output_with_timeout(command, crate::bounded_exec::WSL_PROBE_TIMEOUT)
@@ -362,7 +371,7 @@ fn resolve_wsl_agent_bin(distro: &str) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(agent_bin)
+    Ok(())
 }
 
 struct ConfigLock {
@@ -844,7 +853,7 @@ fn executable_ok(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let expected = path.to_string_lossy();
-        return resolve_wsl_agent_bin(&wsl_distro()).is_ok_and(|actual| actual == expected);
+        return verify_wsl_agent_bin(&wsl_distro(), &expected).is_ok();
     }
     #[cfg(not(windows))]
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -1676,7 +1685,9 @@ mod tests {
         let home = normalize_wsl_home(b"/home/natkins").unwrap();
         let codex_home = wsl_posix_to_unc(distro, &format!("{home}/.codex")).unwrap();
         let requirements = wsl_posix_to_unc(distro, "/etc/codex/requirements.toml").unwrap();
-        let agent = normalize_wsl_executable(b"/home/natkins/.local/bin/t-hub-agent\r\n").unwrap();
+        let digest = "a".repeat(64);
+        let agent_path = format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent\r\n");
+        let agent = normalize_single_wsl_path_output(agent_path.as_bytes()).unwrap();
         let project = host_project_path_for_distro("/home/natkins/project", distro).unwrap();
         let hooks_state_path = format!("{home}/.codex/hooks.json");
 
@@ -1694,18 +1705,24 @@ mod tests {
             project.to_string_lossy(),
             r"\\wsl.localhost\Ubuntu-24.04\home\natkins\project"
         );
-        assert_eq!(agent, "/home/natkins/.local/bin/t-hub-agent");
+        assert_eq!(
+            agent,
+            format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent")
+        );
         let command = managed_command(Path::new(&agent), "Stop");
-        assert!(command.starts_with("'/home/natkins/.local/bin/t-hub-agent' "));
+        assert!(command.starts_with(&format!(
+            "'/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent' "
+        )));
         assert!(!command.contains(r"\\wsl"));
         assert!(!command.contains("C:\\"));
     }
 
     #[test]
-    fn windows_runtime_agent_path_is_deterministic_without_path_lookup() {
-        let resolved = deployed_wsl_agent_bin("/home/natkins").unwrap();
-        assert_eq!(resolved, "/home/natkins/.local/bin/t-hub-agent");
-        assert!(deployed_wsl_agent_bin("relative/home").is_err());
+    fn windows_runtime_agent_path_accepts_only_canonical_absolute_input() {
+        let digest = "a".repeat(64);
+        let resolved = format!("/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent");
+        assert!(validate_canonical_absolute_posix(&resolved).is_ok());
+        assert!(validate_canonical_absolute_posix("relative/home").is_err());
     }
 
     #[test]
@@ -1715,11 +1732,13 @@ mod tests {
         assert!(normalize_wsl_home(b"/home\\..\\root").is_err());
         assert!(normalize_wsl_home(b"/home/natkins\n/root").is_err());
         assert!(normalize_wsl_home(b"/home/natkins\0").is_err());
-        assert!(normalize_wsl_executable(b"t-hub-agent").is_err());
-        assert!(normalize_wsl_executable(b"/home/natkins/../bin/t-hub-agent").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\n/root/bin/evil").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\revil").is_err());
-        assert!(normalize_wsl_executable(b"/home/bin/t-hub-agent\0").is_err());
+        assert!(normalize_single_wsl_path_output(b"t-hub-agent").is_err());
+        assert!(normalize_single_wsl_path_output(b"/home/natkins/../bin/t-hub-agent").is_err());
+        assert!(
+            normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\n/root/bin/evil").is_err()
+        );
+        assert!(normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\revil").is_err());
+        assert!(normalize_single_wsl_path_output(b"/home/bin/t-hub-agent\0").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", r"C:\Users\natha").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", "/home/../root").is_err());
         assert!(wsl_posix_to_unc("Ubuntu-24.04", "/a\\..\\b").is_err());

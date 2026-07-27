@@ -2,8 +2,8 @@
 //!
 //! The Windows package carries the exact Linux `t-hub-agent` built from the
 //! same source tree as the desktop executable. Before the bridge connects, the
-//! helper is hash-compared with `~/.local/bin/t-hub-agent` in the configured
-//! distro and atomically replaced when it differs.
+//! helper is hash-compared with a digest-versioned executable in the configured
+//! distro and atomically installed when it is absent or damaged.
 
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,28 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
 const INSTALLED_DIGEST_SCRIPT: &str = r#"
 set -eu
-target="$HOME/.local/bin/t-hub-agent"
+expected=$1
+install_root="$HOME/.local/lib/t-hub/agents"
+install_dir="$install_root/$expected"
+target="$install_dir/t-hub-agent"
+for directory in \
+  "$HOME/.local" \
+  "$HOME/.local/lib" \
+  "$HOME/.local/lib/t-hub" \
+  "$install_root" \
+  "$install_dir"
+do
+  if [ -L "$directory" ]; then
+    printf '%s\n' "helper install path cannot contain a symbolic-link directory" >&2
+    exit 18
+  fi
+done
 if [ ! -L "$target" ] && [ -f "$target" ] && [ -x "$target" ]; then
   digest=$(sha256sum -- "$target")
-  printf '%s\n' "${digest%% *}"
+  digest=${digest%% *}
+  if [ "$digest" = "$expected" ]; then
+    printf '%s\n%s\n' "$digest" "$target"
+  fi
 fi
 "#;
 
@@ -44,9 +62,10 @@ const INSTALL_SCRIPT: &str = r#"
 set -eu
 source_path=$1
 expected=$2
-install_dir="$HOME/.local/bin"
+install_root="$HOME/.local/lib/t-hub/agents"
+install_dir="$install_root/$expected"
 target="$install_dir/t-hub-agent"
-stage="$install_dir/.t-hub-agent.t-hub-stage-$$"
+stage="$install_dir/.t-hub-agent-stage-$$"
 
 cleanup() {
   rm -f -- "$stage"
@@ -60,7 +79,31 @@ if [ "$source_digest" != "$expected" ]; then
   exit 12
 fi
 
+for directory in \
+  "$HOME/.local" \
+  "$HOME/.local/lib" \
+  "$HOME/.local/lib/t-hub" \
+  "$install_root" \
+  "$install_dir"
+do
+  if [ -L "$directory" ]; then
+    printf '%s\n' "helper install path cannot contain a symbolic-link directory" >&2
+    exit 16
+  fi
+done
 mkdir -p -- "$install_dir"
+for directory in \
+  "$HOME/.local" \
+  "$HOME/.local/lib" \
+  "$HOME/.local/lib/t-hub" \
+  "$install_root" \
+  "$install_dir"
+do
+  if [ -L "$directory" ]; then
+    printf '%s\n' "helper install path gained a symbolic-link directory" >&2
+    exit 17
+  fi
+done
 cp -- "$source_path" "$stage"
 chmod 0755 "$stage"
 
@@ -84,7 +127,7 @@ if [ -L "$target" ] || [ ! -f "$target" ] || [ ! -x "$target" ]; then
   printf '%s\n' "installed helper is not an executable regular file" >&2
   exit 15
 fi
-printf '%s\n' "$final_digest"
+printf '%s\n%s\n' "$final_digest" "$target"
 "#;
 
 #[cfg(any(windows, test))]
@@ -92,6 +135,13 @@ printf '%s\n' "$final_digest"
 pub(crate) enum DeployOutcome {
     AlreadyCurrent,
     Installed,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeployedAgent {
+    pub(crate) outcome: DeployOutcome,
+    pub(crate) wsl_path: String,
 }
 
 pub(crate) fn bundled_agent_path(resource_dir: &Path) -> PathBuf {
@@ -149,17 +199,41 @@ impl std::io::Write for DigestWriter<'_> {
 }
 
 #[cfg(any(windows, test))]
-fn normalized_digest(stdout: &[u8]) -> Result<Option<String>> {
+fn normalized_deployment(stdout: &[u8], expected_digest: &str) -> Result<Option<String>> {
     let value = std::str::from_utf8(stdout)
-        .context("WSL helper digest output was not UTF-8")?
+        .context("WSL helper deployment output was not UTF-8")?
         .trim();
     if value.is_empty() {
         return Ok(None);
     }
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("WSL helper digest output was malformed");
+    let mut lines = value.lines();
+    let digest = lines.next().unwrap_or_default();
+    let path = lines.next().unwrap_or_default();
+    if lines.next().is_some()
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("WSL helper deployment output was malformed");
     }
-    Ok(Some(value.to_ascii_lowercase()))
+    let digest = digest.to_ascii_lowercase();
+    if digest != expected_digest {
+        bail!("WSL helper deployment reported an unexpected digest");
+    }
+    let expected_suffix = format!("/.local/lib/t-hub/agents/{digest}/t-hub-agent");
+    if !path.starts_with('/')
+        || path.len() > 4096
+        || path.chars().any(|character| character.is_control())
+        || path.contains('\\')
+        || path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !path.ends_with(&expected_suffix)
+        || path.len() == expected_suffix.len()
+    {
+        bail!("WSL helper deployment reported an invalid executable path");
+    }
+    Ok(Some(path.to_string()))
 }
 
 #[cfg(windows)]
@@ -224,16 +298,17 @@ fn wsl_resource_path(distro: &str, resource: &Path) -> Result<String> {
 }
 
 #[cfg(windows)]
-pub(crate) fn deploy_bundled_agent(distro: &str, resource: &Path) -> Result<DeployOutcome> {
+pub(crate) fn deploy_bundled_agent(distro: &str, resource: &Path) -> Result<DeployedAgent> {
     let expected_digest = bundled_agent_digest(resource)?;
 
-    let installed_stdout = run_checked(
-        wsl_bash_command(distro, INSTALLED_DIGEST_SCRIPT),
-        PROBE_TIMEOUT,
-        "probing the installed WSL helper",
-    )?;
-    if normalized_digest(&installed_stdout)?.as_deref() == Some(expected_digest.as_str()) {
-        return Ok(DeployOutcome::AlreadyCurrent);
+    let mut probe = wsl_bash_command(distro, INSTALLED_DIGEST_SCRIPT);
+    probe.arg(&expected_digest);
+    let installed_stdout = run_checked(probe, PROBE_TIMEOUT, "probing the installed WSL helper")?;
+    if let Some(wsl_path) = normalized_deployment(&installed_stdout, &expected_digest)? {
+        return Ok(DeployedAgent {
+            outcome: DeployOutcome::AlreadyCurrent,
+            wsl_path,
+        });
     }
 
     let source_path = wsl_resource_path(distro, resource)?;
@@ -244,11 +319,13 @@ pub(crate) fn deploy_bundled_agent(distro: &str, resource: &Path) -> Result<Depl
         INSTALL_TIMEOUT,
         "installing the bundled WSL helper",
     )?;
-    if normalized_digest(&installed_stdout)?.as_deref() != Some(expected_digest.as_str()) {
-        bail!("installed WSL helper did not report the bundled digest");
-    }
+    let wsl_path = normalized_deployment(&installed_stdout, &expected_digest)?
+        .context("installed WSL helper did not report its verified path")?;
 
-    Ok(DeployOutcome::Installed)
+    Ok(DeployedAgent {
+        outcome: DeployOutcome::Installed,
+        wsl_path,
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -320,25 +397,83 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let installed = home.join(".local/bin/t-hub-agent");
+        let installed = home
+            .join(".local/lib/t-hub/agents")
+            .join(&expected)
+            .join("t-hub-agent");
         assert_eq!(fs::read(&installed).unwrap(), bytes);
         assert_eq!(
             fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        assert_eq!(normalized_digest(&output.stdout).unwrap(), Some(expected));
-        assert!(!home.join(".local/bin/.t-hub-agent.t-hub-stage").exists());
+        assert_eq!(
+            normalized_deployment(&output.stdout, &expected).unwrap(),
+            Some(installed.display().to_string())
+        );
+        assert!(fs::read_dir(installed.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".t-hub-agent-stage-")));
+    }
+
+    #[test]
+    fn separately_verified_helper_versions_cannot_replace_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let first_source = temp.path().join("bundled-agent-first");
+        let second_source = temp.path().join("bundled-agent-second");
+        let first_bytes = fake_elf(b"first release");
+        let second_bytes = fake_elf(b"second release");
+        let first_digest = format!("{:x}", Sha256::digest(&first_bytes));
+        let second_digest = format!("{:x}", Sha256::digest(&second_bytes));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&first_source, &first_bytes).unwrap();
+        std::fs::write(&second_source, &second_bytes).unwrap();
+
+        let install = |source: &Path, digest: &str| {
+            Command::new("bash")
+                .args([
+                    "-c",
+                    INSTALL_SCRIPT,
+                    "t-hub-agent-installer",
+                    source.to_str().unwrap(),
+                    digest,
+                ])
+                .env("HOME", &home)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let first_output = install(&first_source, &first_digest);
+        let second_output = install(&second_source, &second_digest);
+        assert!(first_output.status.success());
+        assert!(second_output.status.success());
+        let first_verified_path = normalized_deployment(&first_output.stdout, &first_digest)
+            .unwrap()
+            .unwrap();
+        let second_verified_path = normalized_deployment(&second_output.stdout, &second_digest)
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(first_verified_path, second_verified_path);
+        assert_eq!(std::fs::read(first_verified_path).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(second_verified_path).unwrap(), second_bytes);
     }
 
     #[test]
     fn install_script_preserves_the_existing_helper_on_digest_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let bin = home.join(".local/bin");
+        let expected = "0".repeat(64);
+        let install_dir = home.join(".local/lib/t-hub/agents").join(&expected);
+        let target = install_dir.join("t-hub-agent");
         let source = temp.path().join("bundled-agent");
-        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&install_dir).unwrap();
         fs::write(&source, fake_elf(b"candidate")).unwrap();
-        fs::write(bin.join("t-hub-agent"), b"existing helper").unwrap();
+        fs::write(&target, b"existing helper").unwrap();
 
         let output = Command::new("bash")
             .args([
@@ -346,7 +481,7 @@ mod tests {
                 INSTALL_SCRIPT,
                 "t-hub-agent-installer",
                 source.to_str().unwrap(),
-                &"0".repeat(64),
+                &expected,
             ])
             .env("HOME", &home)
             .stdin(Stdio::null())
@@ -354,27 +489,59 @@ mod tests {
             .unwrap();
 
         assert!(!output.status.success());
-        assert_eq!(
-            fs::read(bin.join("t-hub-agent")).unwrap(),
-            b"existing helper"
-        );
+        assert_eq!(fs::read(target).unwrap(), b"existing helper");
+    }
+
+    #[test]
+    fn install_script_refuses_symbolic_link_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let redirected = temp.path().join("redirected-agents");
+        let source = temp.path().join("bundled-agent");
+        let bytes = fake_elf(b"candidate");
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        fs::create_dir_all(home.join(".local/lib/t-hub")).unwrap();
+        fs::create_dir_all(&redirected).unwrap();
+        fs::write(&source, bytes).unwrap();
+        symlink(&redirected, home.join(".local/lib/t-hub/agents")).unwrap();
+
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                INSTALL_SCRIPT,
+                "t-hub-agent-installer",
+                source.to_str().unwrap(),
+                &expected,
+            ])
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(fs::read_dir(redirected).unwrap().next().is_none());
     }
 
     #[test]
     fn installed_probe_accepts_only_executable_regular_files() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let bin = home.join(".local/bin");
-        let target = bin.join("t-hub-agent");
         let source = temp.path().join("bundled-agent");
         let bytes = fake_elf(b"matching release");
         let expected = format!("{:x}", Sha256::digest(&bytes));
-        fs::create_dir_all(&bin).unwrap();
+        let install_dir = home.join(".local/lib/t-hub/agents").join(&expected);
+        let target = install_dir.join("t-hub-agent");
+        fs::create_dir_all(&install_dir).unwrap();
         fs::write(&target, &bytes).unwrap();
 
         let probe = || {
             Command::new("bash")
-                .args(["-c", INSTALLED_DIGEST_SCRIPT])
+                .args([
+                    "-c",
+                    INSTALLED_DIGEST_SCRIPT,
+                    "t-hub-agent-installer",
+                    &expected,
+                ])
                 .env("HOME", &home)
                 .stdin(Stdio::null())
                 .output()
@@ -382,18 +549,59 @@ mod tests {
         };
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(normalized_digest(&probe().stdout).unwrap(), None);
+        assert_eq!(
+            normalized_deployment(&probe().stdout, &expected).unwrap(),
+            None
+        );
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            normalized_digest(&probe().stdout).unwrap(),
-            Some(expected.clone())
+            normalized_deployment(&probe().stdout, &expected).unwrap(),
+            Some(target.display().to_string())
         );
 
         fs::write(&source, &bytes).unwrap();
         fs::remove_file(&target).unwrap();
         symlink(&source, &target).unwrap();
-        assert_eq!(normalized_digest(&probe().stdout).unwrap(), None);
+        assert_eq!(
+            normalized_deployment(&probe().stdout, &expected).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn deployment_output_requires_the_exact_digest_versioned_path() {
+        let digest = "a".repeat(64);
+        let valid =
+            format!("{digest}\n/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent\n");
+        assert_eq!(
+            normalized_deployment(valid.as_bytes(), &digest).unwrap(),
+            Some(format!(
+                "/home/natkins/.local/lib/t-hub/agents/{digest}/t-hub-agent"
+            ))
+        );
+        assert!(normalized_deployment(
+            format!(
+                "{digest}\n/home/natkins/.local/lib/t-hub/agents/{}/t-hub-agent\n",
+                "b".repeat(64)
+            )
+            .as_bytes(),
+            &digest
+        )
+        .is_err());
+        assert!(normalized_deployment(
+            format!(
+                "{digest}\n/home/natkins/../root/.local/lib/t-hub/agents/{digest}/t-hub-agent\n"
+            )
+            .as_bytes(),
+            &digest
+        )
+        .is_err());
+        assert!(normalized_deployment(
+            format!("{digest}\nC:\\Users\\natha\\t-hub-agent\n").as_bytes(),
+            &digest
+        )
+        .is_err());
     }
 
     #[test]

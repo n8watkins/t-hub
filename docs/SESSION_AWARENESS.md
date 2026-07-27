@@ -42,7 +42,9 @@ applied to the attention queue and the tree badges in the sidebar.
 
 The core launches the agent over stdio.
 Packaged **Windows** builds carry the exact x86-64 Linux helper built from the same source tree as the desktop executable.
-Before connecting, packaged startup validates that resource, atomically installs it as `~/.local/bin/t-hub-agent` in the configured WSL distro when needed, verifies the installed SHA-256 digest, and launches that exact path.
+Before connecting, packaged startup validates that resource and atomically installs it as `~/.local/lib/t-hub/agents/<sha256>/t-hub-agent` in the configured WSL distro when needed.
+The bridge launches that exact digest-versioned path after verifying the installed SHA-256 digest.
+Production and development packages with different helper digests can run side by side without replacing one another's verified executable.
 If deployment or verification fails, the bridge stays disconnected instead of falling back to another `t-hub-agent` on `PATH`.
 The explicit **`T_HUB_AGENT_BIN`** developer override bypasses packaged deployment and is spawned verbatim with the agent arguments on unix and Windows dev builds.
 Packaged Windows builds ignore the override and always require the bundled, verified helper.
@@ -61,11 +63,11 @@ pnpm tauri build
 
 The distro is `Ubuntu-24.04` by default.
 Override it with `T_HUB_DISTRO`, which is read by `lib.rs::default_distro`.
-The packaged bridge launches through `wsl.exe` but does not depend on the distro's `PATH`:
+The packaged bridge launches through `wsl.exe` without a shell and does not depend on the distro's `PATH`:
 
 ```text
-wsl.exe -d <distro> --cd ~ -e bash -lc \
-  "exec $HOME/.local/bin/t-hub-agent --stdio"
+wsl.exe -d <distro> --cd ~ -e \
+  /home/<user>/.local/lib/t-hub/agents/<sha256>/t-hub-agent --stdio
 ```
 
 ### Dev box (this repo, run inside WSL/Linux directly)
@@ -82,6 +84,7 @@ The bridge spawns `t-hub-agent --stdio`, handshakes (`Hello`/`Ready`), replays t
 Connection lifecycle operations are serialized, and a reconnect fully retires the current helper before starting its replacement.
 The replacement becomes live only after the protocol version matches and any required replay reaches its verified durable boundary.
 Handshake errors, timeouts, malformed frames, incomplete replay, and replacement failure terminate the candidate helper and leave the bridge failed rather than publishing partial state.
+Replay-only frames received after a verified replay commit fail the live transport without publishing their contents.
 Use the developer override for a one-off without touching `PATH`:
 
 ```sh
