@@ -182,9 +182,14 @@ export async function bootstrapWorkspaceTabs(): Promise<void> {
         useWorkspace.getState().addTab();
         repairedLocal = useWorkspace.getState();
       }
-      const { reportWorkspaceTabs } = await import("./client");
+      const { listTerminals, reportWorkspaceTabs } = await import("./client");
+      const liveIds = new Set((await listTerminals()).map((terminal) => terminal.id));
+      const repairedTabs = tabReports(repairedLocal.tabs).map((tab) => ({
+        ...tab,
+        tileIds: tab.tileIds.filter((id) => liveIds.has(id)),
+      }));
       const repaired = await reportWorkspaceTabs(
-        tabReports(repairedLocal.tabs),
+        repairedTabs,
         repairedLocal.activeTabId,
         res.seq,
       );

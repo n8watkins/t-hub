@@ -37,6 +37,9 @@ beforeEach(() => {
   controlRequest.mockReset();
   invoke.mockReset();
   invoke.mockImplementation((command: string) => {
+    if (command === "list_terminals") {
+      return Promise.resolve([]);
+    }
     if (command === "report_workspace_tabs") {
       return Promise.resolve({ seq: 2, stale: false });
     }
@@ -45,15 +48,36 @@ beforeEach(() => {
 });
 
 describe("workspace registry bootstrap", () => {
-  it("repairs a Captain-only server snapshot from the local work layout", async () => {
+  it("repairs a Captain-only snapshot with only live local terminal IDs", async () => {
     seed([
-      { id: "work-1", name: "Workspace 1", order: ["term-1"] },
-      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        order: ["term-live", "term-stale"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        order: ["captain-live", "captain-stale"],
+      },
     ]);
     controlRequest.mockResolvedValue({
       seq: 1,
       activeTabId: CAPTAINS_TAB_ID,
       tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    invoke.mockImplementation((command: string) => {
+      if (command === "list_terminals") {
+        return Promise.resolve([
+          { id: "term-live" },
+          { id: "captain-live" },
+          { id: "unplaced-live" },
+        ]);
+      }
+      if (command === "report_workspace_tabs") {
+        return Promise.resolve({ seq: 2, stale: false });
+      }
+      return Promise.reject(new Error(`unexpected invoke: ${command}`));
     });
 
     await bootstrapWorkspaceTabs();
@@ -64,7 +88,43 @@ describe("workspace registry bootstrap", () => {
     ]);
     expect(invoke).toHaveBeenCalledWith(
       "report_workspace_tabs",
-      expect.objectContaining({ baseSeq: 1 }),
+      expect.objectContaining({
+        baseSeq: 1,
+        tabs: [
+          expect.objectContaining({ id: "work-1", tileIds: ["term-live"] }),
+          expect.objectContaining({
+            id: CAPTAINS_TAB_ID,
+            tileIds: ["captain-live"],
+          }),
+        ],
+      }),
+    );
+  });
+
+  it("does not repair the registry when terminal liveness is unavailable", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-stale"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    controlRequest.mockResolvedValue({
+      seq: 1,
+      activeTabId: CAPTAINS_TAB_ID,
+      tabs: [{ id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] }],
+    });
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "report_workspace_tabs",
+        expect.anything(),
+      );
+    });
+    invoke.mockClear();
+    invoke.mockRejectedValue(new Error("terminal scan unavailable"));
+
+    await bootstrapWorkspaceTabs();
+
+    expect(invoke).not.toHaveBeenCalledWith(
+      "report_workspace_tabs",
+      expect.anything(),
     );
   });
 
