@@ -796,6 +796,7 @@ pub fn run() {
                 tauri::async_runtime::spawn_blocking(move || {
                     let mut retry_delay = std::time::Duration::from_millis(250);
                     loop {
+                        let reconciliation_seq = captains_registry.reconciliation_seq();
                         let sessions = match tmux::list_sessions() {
                             Ok(sessions) => sessions,
                             Err(error) => {
@@ -813,10 +814,14 @@ pub fn run() {
                         let live = sessions
                             .into_iter()
                             .collect::<std::collections::HashSet<_>>();
-                        match captains_registry.prune_gone_workspace_tiles(|tile| {
-                            live.contains(&tmux::target_for_id(tile))
-                        }) {
-                            Ok(pruned) if !pruned.is_empty() => eprintln!(
+                        let reconciliation = captains_registry.reconcile_startup_workspace_tiles(
+                            reconciliation_seq,
+                            |tile| live.contains(&tmux::target_for_id(tile)),
+                            |projection| tab_registry.publish_startup(projection),
+                        );
+                        match reconciliation {
+                            Ok(None) => continue,
+                            Ok(Some(pruned)) if !pruned.is_empty() => eprintln!(
                                 "t-hub-workspaces: load-time prune removed {} gone terminal \
                                  placement{}",
                                 pruned.len(),
@@ -828,7 +833,6 @@ pub fn run() {
                             ),
                             _ => {}
                         }
-                        tab_registry.replace(captains_registry.workspace_projection());
                         match identity_store.prune_dead_generation(&prune_generation, |tile| {
                             live.contains(&tmux::target_for_id(tile))
                         }) {

@@ -754,7 +754,7 @@ impl TabRegistry {
 
     /// Construct the production startup projection before terminal liveness has
     /// been observed. Reads and full-layout reports remain retryable until
-    /// [`Self::replace`] publishes the reconciled projection.
+    /// [`Self::publish_startup`] publishes the reconciled projection.
     pub fn new_pending_startup() -> Self {
         Self {
             inner: Mutex::new(RegistryInner::default()),
@@ -816,7 +816,7 @@ impl TabRegistry {
         Ok(normalized)
     }
 
-    pub fn replace(&self, tabs: Vec<TabRecord>) {
+    fn replace_inner(&self, tabs: Vec<TabRecord>, publish_startup: bool) {
         let mut g = self.lock();
         g.tabs = Self::normalize_tabs(tabs)
             .expect("internal tab fixtures must contain valid Workspace records");
@@ -828,8 +828,17 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
         }
         g.seq += 1;
-        drop(g);
-        self.startup_authoritative.store(true, Ordering::Release);
+        if publish_startup {
+            self.startup_authoritative.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn replace(&self, tabs: Vec<TabRecord>) {
+        self.replace_inner(tabs, false);
+    }
+
+    pub fn publish_startup(&self, tabs: Vec<TabRecord>) {
+        self.replace_inner(tabs, true);
     }
 
     /// A UI up-sync with optimistic-concurrency: accepted (and revision bumped)

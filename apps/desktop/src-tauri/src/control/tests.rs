@@ -801,6 +801,15 @@ fn startup_tab_authority_is_retryable_until_reconciled_projection_is_published()
         .is_some_and(|error| error.contains("startup reconciliation is still pending")));
 
     tabs.replace(vec![TabRecord {
+        id: "work-intermediate".into(),
+        name: "Intermediate".into(),
+        tile_ids: vec![],
+    }]);
+    let still_pending = dispatch_authenticated(&ctx, request());
+    assert!(!still_pending.ok);
+    assert!(still_pending.retryable);
+
+    tabs.publish_startup(vec![TabRecord {
         id: "work-ready".into(),
         name: "Ready".into(),
         tile_ids: vec!["live-terminal".into()],
@@ -6094,6 +6103,49 @@ fn startup_prune_keeps_projection_live_only_across_persistence_failure() {
 
     let _ = std::fs::remove_file(path.with_extension("json.bak"));
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn startup_reconciliation_retries_when_registry_changes_after_liveness_snapshot() {
+    let registry = CaptainsRegistry::new();
+    registry
+        .claim_test("old-live", Some("old-live-ship"), vec![])
+        .unwrap();
+    let stale_seq = registry.reconciliation_seq();
+    registry
+        .claim_test("new-live", Some("new-live-ship"), vec![])
+        .unwrap();
+
+    let published = std::sync::atomic::AtomicBool::new(false);
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                stale_seq,
+                |tile| tile == "old-live",
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(!published.load(Ordering::Acquire));
+    assert!(registry
+        .workspace_projection()
+        .iter()
+        .flat_map(|workspace| workspace.tile_ids.iter())
+        .any(|tile| tile == "new-live"));
+
+    let current_seq = registry.reconciliation_seq();
+    assert_eq!(
+        registry
+            .reconcile_startup_workspace_tiles(
+                current_seq,
+                |tile| matches!(tile, "old-live" | "new-live"),
+                |_| published.store(true, Ordering::Release),
+            )
+            .unwrap(),
+        Some(Vec::new())
+    );
+    assert!(published.load(Ordering::Acquire));
 }
 
 #[test]

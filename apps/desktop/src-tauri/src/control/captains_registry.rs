@@ -1677,6 +1677,54 @@ impl CaptainsRegistry {
             .collect()
     }
 
+    pub fn reconciliation_seq(&self) -> u64 {
+        self.lock().seq
+    }
+
+    pub fn reconcile_startup_workspace_tiles(
+        &self,
+        expected_seq: u64,
+        is_live: impl Fn(&str) -> bool,
+        publish: impl FnOnce(Vec<TabRecord>),
+    ) -> Result<Option<Vec<String>>, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if current.seq != expected_seq {
+            return Ok(None);
+        }
+        let previous = current.clone();
+        let gone = current
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tile_ids.iter())
+            .filter(|tile| !is_live(tile))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if gone.is_empty() {
+            let projection = current
+                .workspaces
+                .iter()
+                .map(FleetWorkspaceRecord::as_tab_record)
+                .collect();
+            drop(current);
+            publish(projection);
+            return Ok(Some(Vec::new()));
+        }
+        let gone = gone.into_iter().collect::<std::collections::HashSet<_>>();
+        self.workspace_projection_exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(gone.iter().cloned());
+        Self::apply_gone_workspace_tiles(&mut current, &gone);
+        current.seq = current.seq.saturating_add(1);
+        let result = self.commit_mutation(current, previous);
+        publish(self.workspace_projection());
+        result?;
+        let mut pruned = gone.into_iter().collect::<Vec<_>>();
+        pruned.sort();
+        Ok(Some(pruned))
+    }
+
     fn apply_gone_workspace_tiles(
         current: &mut CaptainsInner,
         gone: &std::collections::HashSet<String>,
