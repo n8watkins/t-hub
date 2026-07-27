@@ -152,7 +152,7 @@ impl ReaderJournalFlow {
     pub(crate) fn complete_replay(
         &self,
         bridge: &AgentBridge,
-        expected_head: u64,
+        advertised_head: u64,
     ) -> Result<(), String> {
         let mut state = self.state.lock();
         let ReaderJournalState::Replaying {
@@ -171,11 +171,12 @@ impl ReaderJournalFlow {
         if !boundary_received || !completion_received {
             return Err("replay commit requested before verified completion".to_string());
         }
-        if *verified_seq != expected_head {
+        if *verified_seq < advertised_head {
             return Err(format!(
-                "agent completed at sequence {verified_seq}, expected advertised head {expected_head}"
+                "agent completed at sequence {verified_seq}, below advertised head {advertised_head}"
             ));
         }
+        let replay_boundary = *verified_seq;
 
         let ReaderJournalState::Replaying {
             replay_entries,
@@ -189,7 +190,7 @@ impl ReaderJournalFlow {
         for buffered in sorted_entries(replay_entries) {
             bridge.consume_journal_entry_with_provenance(&buffered.entry, true);
         }
-        bridge.advance_cursor(expected_head);
+        bridge.advance_cursor(replay_boundary);
         bridge.flush_replay();
         bridge.set_state(ConnectionState::Live);
         for buffered in sorted_entries(live_entries) {

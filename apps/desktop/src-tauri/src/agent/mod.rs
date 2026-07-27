@@ -429,8 +429,8 @@ impl AgentBridge {
     /// `Ready`, verifies the exact protocol version, and if the agent's
     /// `journal_head_seq` is ahead of our cursor, sends `ReplayJournal`.
     /// Replayed state remains buffered until a durable `ReplayBoundary` and
-    /// matching `ReplayComplete` reach the advertised head, after which the
-    /// buffered entries are committed and the state becomes `Live`.
+    /// matching `ReplayComplete` reach at least the advertised head, after
+    /// which the buffered entries are committed and the state becomes `Live`.
     ///
     /// The `T_HUB_AGENT_BIN` developer escape hatch is limited to Windows dev
     /// builds and tests, and overrides the child program on unix (see
@@ -1773,6 +1773,73 @@ while IFS= read -r _; do :; done
             .unwrap();
         assert_eq!(bridge.state(), ConnectionState::Live);
         assert_eq!(bridge.journal_cursor(), 10);
+        bridge.disconnect();
+        drop(agent_bin_env);
+        drop(env_lock);
+
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_accepts_growth_after_ready_and_deduplicates_live_frames() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("t-hub-growing-replay-{unique}"));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let helper = temp_dir.join("growing-replay-agent");
+        std::fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{{"channel":"control","type":"ready","protocol_version":{PROTOCOL_VERSION},"agent_version":"test","journal_head_seq":1}}'
+IFS= read -r _
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered two"}}}},"replayed":false}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":1,"entry":{{"seq":1,"timestamp_ms":1,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered one"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":2,"entry":{{"seq":2,"timestamp_ms":2,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Recovered two"}}}},"replayed":true}}'
+printf '%s\n' '{{"channel":"events","type":"journal","seq":3,"entry":{{"seq":3,"timestamp_ms":3,"source":"agent","entity_id":"session-1","event_type":"user_prompt_submit","payload":{{"session_id":"session-1","prompt":"Live three"}}}},"replayed":false}}'
+printf '%s\n' '{{"channel":"events","type":"replay_boundary","last_seq":2}}'
+printf '%s\n' '{{"channel":"events","type":"replay_complete","last_seq":2}}'
+while IFS= read -r _; do :; done
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &helper);
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+        bridge
+            .connect_with_timeouts(
+                "ignored",
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+
+        let titles = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(channel, _)| channel == super::EVT_TITLE)
+            .map(|(_, payload)| payload["title"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["Recovered two", "Live three"]);
+        assert_eq!(bridge.state(), ConnectionState::Live);
+        assert_eq!(bridge.journal_cursor(), 3);
         bridge.disconnect();
         drop(agent_bin_env);
         drop(env_lock);
