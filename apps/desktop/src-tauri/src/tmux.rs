@@ -316,8 +316,24 @@ fn managed_helper_failure(
     TmuxError {
         op,
         code,
-        io_kind: matches!(code, Some(80 | 82 | 83 | 84 | 90 | 92))
+        io_kind: matches!(
+            code,
+            Some(77 | 80 | 82 | 83 | 84 | 90 | 92 | 94 | 100 | 101 | 118)
+        )
             .then_some(std::io::ErrorKind::WouldBlock),
+        message: message.into(),
+    }
+}
+
+fn exact_effect_observation_failure(
+    op: &'static str,
+    code: Option<i32>,
+    message: impl Into<String>,
+) -> TmuxError {
+    TmuxError {
+        op,
+        code,
+        io_kind: matches!(code, Some(41 | 43)).then_some(std::io::ErrorKind::WouldBlock),
         message: message.into(),
     }
 }
@@ -2351,12 +2367,11 @@ pub(crate) fn observe_session_effect_identity(
         let mut pending = OBSERVE_SESSION_EFFECT_FAILURE.lock().unwrap();
         if pending.as_deref() == Some(name) {
             pending.take();
-            return Err(TmuxError {
-                op: "observe-session-effect",
-                code: Some(41),
-                io_kind: None,
-                message: "exact session effect identity is unavailable or ambiguous".into(),
-            });
+            return Err(exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(41),
+                "exact session effect identity is unavailable or ambiguous",
+            ));
         }
     }
     exact_effect_target(name)?;
@@ -2372,12 +2387,11 @@ pub(crate) fn observe_session_effect_identity(
                 message: format!("failed to inspect exact session effect identity: {error}"),
             })?;
     if !output.status.success() || !output.stderr.is_empty() {
-        return Err(TmuxError {
-            op: "observe-session-effect",
-            code: output.status.code(),
-            io_kind: None,
-            message: "exact session effect identity is unavailable or ambiguous".into(),
-        });
+        return Err(exact_effect_observation_failure(
+            "observe-session-effect",
+            output.status.code(),
+            "exact session effect identity is unavailable or ambiguous",
+        ));
     }
     serde_json::from_slice(&output.stdout).map_err(|_| TmuxError {
         op: "observe-session-effect",
@@ -3623,7 +3637,7 @@ while True:
 
     #[test]
     fn cortana_retryable_managed_evidence_classifies_only_inconclusive_helpers() {
-        for code in [80, 82, 83, 84, 90, 92] {
+        for code in [77, 80, 82, 83, 84, 90, 92, 94, 100, 101, 118] {
             for op in [
                 "managed-runtime-preflight",
                 "observe-managed-runtime-owner",
@@ -3645,6 +3659,27 @@ while True:
                 let error = managed_helper_failure(op, Some(code), "definitive ownership failure");
                 assert!(!error.is_retryable_observation(), "{op} helper exit {code}");
             }
+        }
+    }
+
+    #[test]
+    fn cortana_retryable_prepared_observation_classifies_exact_effect_evidence() {
+        for code in [41, 43] {
+            let error = exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(code),
+                "unreadable exact effect evidence",
+            );
+            assert!(error.is_retryable_observation(), "helper exit {code}");
+        }
+
+        for code in [40, 42, 44, 45, 46, 47] {
+            let error = exact_effect_observation_failure(
+                "observe-session-effect",
+                Some(code),
+                "definitive exact effect failure",
+            );
+            assert!(!error.is_retryable_observation(), "helper exit {code}");
         }
     }
 

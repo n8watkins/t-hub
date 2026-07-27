@@ -1470,18 +1470,18 @@ fn cortana_retryable_managed_evidence_never_enters_quarantine_branch() {
     );
     assert!(is_retryable_error(&indeterminate_error));
 
-    for code in [80, 82, 83, 84, 90, 92] {
-        let retirement_evidence = crate::tmux::TmuxError {
+    for code in [41, 43, 77, 80, 82, 83, 84, 90, 92, 94, 100, 101, 118] {
+        let inconclusive_evidence = crate::tmux::TmuxError {
             op: "observe-managed-runtime-owner",
             code: Some(code),
             io_kind: Some(std::io::ErrorKind::WouldBlock),
             message: "managed runtime evidence was unreadable".into(),
         };
-        let retirement_error = cortana_tmux_observation_error(
+        let observation_error = cortana_tmux_observation_error(
             "prepared launch effect ownership is unverifiable",
-            retirement_evidence,
+            inconclusive_evidence,
         );
-        assert!(ControlResponse::err(retirement_error).retryable);
+        assert!(ControlResponse::err(observation_error).retryable);
     }
 
     let unreadable_error = cortana_harness_observation_error(
