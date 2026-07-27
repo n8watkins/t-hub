@@ -59,7 +59,7 @@ fn response_timeout_for_command(command: &str) -> Duration {
     match command {
         "reconcile_cortana" => CORTANA_RECONCILIATION_TIMEOUT,
         "commission_captain" | "dispatch_crew" | "history_list" | "history_resume"
-        | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
+        | "list_tabs" | "start_agent" => LONG_ORCHESTRATION_TIMEOUT,
         _ => CONTROL_DEADLINE,
     }
 }

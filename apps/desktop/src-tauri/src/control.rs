@@ -731,15 +731,61 @@ struct RegistryInner {
 ///
 /// Deliberately NOT the PRD §8 persistence layer - in-memory, per app run; the
 /// frontend still persists layout for restarts and seeds this via its first report.
-#[derive(Default)]
 pub struct TabRegistry {
     inner: Mutex<RegistryInner>,
     identity_transaction: Mutex<()>,
+    startup_ready: Mutex<bool>,
+    startup_ready_changed: Condvar,
+}
+
+impl Default for TabRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(RegistryInner::default()),
+            identity_transaction: Mutex::new(()),
+            startup_ready: Mutex::new(true),
+            startup_ready_changed: Condvar::new(),
+        }
+    }
 }
 
 impl TabRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_reconciling() -> Self {
+        Self {
+            startup_ready: Mutex::new(false),
+            ..Self::default()
+        }
+    }
+
+    pub fn startup_ready(&self) -> bool {
+        *self
+            .startup_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn wait_for_startup(&self) {
+        let ready = self
+            .startup_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(
+            self.startup_ready_changed
+                .wait_while(ready, |ready| !*ready)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    pub fn finish_startup(&self) {
+        *self
+            .startup_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.startup_ready_changed.notify_all();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryInner> {
@@ -2534,6 +2580,9 @@ impl ControlContext {
         provider_lanes: usize,
         args: &Value,
     ) -> Result<SpawnAdmissionGuard<'_>, String> {
+        if !self.tabs.startup_ready() {
+            return Err("workspace startup reconciliation is still in progress".into());
+        }
         let admission = self
             .admit_ui_spawn(provider_lanes)
             .map_err(|refusal| refusal.message)?;
@@ -6453,6 +6502,7 @@ fn dispatch_with_caller(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    ctx.tabs.wait_for_startup();
     enforce_delegated_admin_command(ctx, caller, command)?;
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------

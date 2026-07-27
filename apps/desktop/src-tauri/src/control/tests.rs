@@ -1471,6 +1471,37 @@ fn owned_empty_tab_rollback_preserves_shared_tabs() {
 }
 
 #[test]
+fn control_dispatch_waits_for_startup_workspace_reconciliation() {
+    let tabs = Arc::new(TabRegistry::new_reconciling());
+    let ctx = Arc::new(test_ctx("startup-tabs").with_tab_registry(tabs.clone()));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let dispatch_ctx = ctx.clone();
+    let dispatch_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(dispatch(&dispatch_ctx, "list_tabs", &json!({})))
+            .unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    tabs.replace(vec![TabRecord {
+        id: "live-workspace".into(),
+        name: "Live Workspace".into(),
+        tile_ids: vec!["live-terminal".into()],
+    }]);
+    tabs.finish_startup();
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("list_tabs did not resume after startup reconciliation")
+        .unwrap();
+    assert_eq!(result["tabs"][0]["tileIds"], json!(["live-terminal"]));
+    dispatch_thread.join().unwrap();
+}
+
+#[test]
 fn owned_create_state_rollback_removes_worktree_and_new_tab() {
     let (base, repo, worktree) = scratch_repo_with_worktree();
     let ctx = test_ctx("t");
