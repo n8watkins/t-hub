@@ -29,11 +29,11 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const INSTALLED_DIGEST_SCRIPT: &str = r#"
 set -eu
 target="$HOME/.local/bin/t-hub-agent"
-if [ -f "$target" ]; then
+if [ ! -L "$target" ] && [ -f "$target" ] && [ -x "$target" ]; then
   digest=$(sha256sum -- "$target")
   printf '%s\n' "${digest%% *}"
 fi
@@ -79,6 +79,10 @@ final_digest=${final_digest%% *}
 if [ "$final_digest" != "$expected" ]; then
   printf '%s\n' "installed helper digest mismatch" >&2
   exit 14
+fi
+if [ -L "$target" ] || [ ! -f "$target" ] || [ ! -x "$target" ]; then
+  printf '%s\n' "installed helper is not an executable regular file" >&2
+  exit 15
 fi
 printf '%s\n' "$final_digest"
 "#;
@@ -252,7 +256,7 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{symlink, PermissionsExt},
         process::{Command, Stdio},
     };
 
@@ -354,6 +358,42 @@ mod tests {
             fs::read(bin.join("t-hub-agent")).unwrap(),
             b"existing helper"
         );
+    }
+
+    #[test]
+    fn installed_probe_accepts_only_executable_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let bin = home.join(".local/bin");
+        let target = bin.join("t-hub-agent");
+        let source = temp.path().join("bundled-agent");
+        let bytes = fake_elf(b"matching release");
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(&target, &bytes).unwrap();
+
+        let probe = || {
+            Command::new("bash")
+                .args(["-c", INSTALLED_DIGEST_SCRIPT])
+                .env("HOME", &home)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(normalized_digest(&probe().stdout).unwrap(), None);
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            normalized_digest(&probe().stdout).unwrap(),
+            Some(expected.clone())
+        );
+
+        fs::write(&source, &bytes).unwrap();
+        fs::remove_file(&target).unwrap();
+        symlink(&source, &target).unwrap();
+        assert_eq!(normalized_digest(&probe().stdout).unwrap(), None);
     }
 
     #[test]

@@ -498,11 +498,13 @@ impl AgentBridge {
             }
         }
 
-        self.set_state(ConnectionState::Live);
-        if replayed {
-            self.flush_replay();
-        }
+        self.enter_live_state();
         Ok(())
+    }
+
+    fn enter_live_state(&self) {
+        self.set_state(ConnectionState::Live);
+        self.flush_replay();
     }
 
     /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
@@ -1820,6 +1822,46 @@ mod tests {
             status.get("session-1").unwrap().context_used_pct,
             Some(99.95)
         );
+    }
+
+    #[test]
+    fn live_boundary_flushes_replay_retained_after_cursor_catches_up() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+
+        bridge.consume_journal_entry_with_provenance(
+            &EventJournalEntry {
+                seq: 1,
+                timestamp_ms: 1,
+                source: JournalSource::Agent,
+                event_id: None,
+                entity_id: Some("session-1".to_string()),
+                event_type: JournalEventType::UserPromptSubmit,
+                payload: serde_json::json!({
+                    "session_id": "session-1",
+                    "prompt": "Recovered title"
+                }),
+                result: None,
+            },
+            true,
+        );
+
+        assert_eq!(bridge.journal_cursor(), 1);
+        assert!(rec.events.lock().is_empty());
+
+        bridge.enter_live_state();
+
+        let channels = rec
+            .events
+            .lock()
+            .iter()
+            .map(|(channel, _)| channel.clone())
+            .collect::<Vec<_>>();
+        assert!(channels.contains(&super::EVT_AGENT_STATE.to_string()));
+        assert!(channels.contains(&super::EVT_TITLE.to_string()));
+        assert!(channels.contains(&super::EVT_SESSION_STATUS.to_string()));
     }
 
     #[test]
