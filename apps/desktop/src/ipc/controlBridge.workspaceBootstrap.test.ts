@@ -15,7 +15,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockRejectedValue(new Error("not running in Tauri")),
 }));
 
-import { bootstrapWorkspaceTabs } from "./controlBridge";
+import {
+  bootstrapWorkspaceTabs,
+  rebaseStartupWorkspaceTabs,
+} from "./controlBridge";
 import {
   CAPTAINS_TAB_ID,
   useWorkspace,
@@ -229,5 +232,77 @@ describe("workspace registry bootstrap", () => {
     expect(useWorkspace.getState().tabs).not.toEqual([
       { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
     ]);
+  });
+
+  it("rebases local workspace changes before adopting the startup registry", async () => {
+    seed([
+      { id: "work-1", name: "Workspace 1", order: ["term-existing"] },
+      { id: CAPTAINS_TAB_ID, name: "Captain Workspace", order: [] },
+    ]);
+    let resolveControl: ((value: unknown) => void) | undefined;
+    controlRequest.mockReturnValue(
+      new Promise((resolve) => {
+        resolveControl = resolve;
+      }),
+    );
+    const baseline = [
+      {
+        id: "work-1",
+        name: "Workspace 1",
+        kind: "work" as const,
+        tileIds: ["term-existing"],
+      },
+      {
+        id: CAPTAINS_TAB_ID,
+        name: "Captain Workspace",
+        kind: "captain" as const,
+        tileIds: [],
+      },
+    ];
+    const bootstrap = bootstrapWorkspaceTabs((tabs) => {
+      const local = useWorkspace.getState().tabs.map((tab) => ({
+        id: tab.id,
+        name: tab.name,
+        kind: tab.kind,
+        tileIds: tab.order,
+      }));
+      return rebaseStartupWorkspaceTabs(tabs, baseline, local);
+    });
+
+    useWorkspace.getState().renameTab("work-1", "Renamed locally");
+    const addedTabId = useWorkspace.getState().addTab();
+    useWorkspace.getState().addToTab(addedTabId, {
+      id: "term-new",
+      tmuxSession: "th_term-new",
+      title: "New terminal",
+      cwd: "/tmp/project",
+      state: "live",
+    });
+    resolveControl?.({
+      seq: 4,
+      activeTabId: "work-1",
+      tabs: [
+        {
+          id: "work-1",
+          name: "Renamed remotely",
+          kind: "work",
+          tileIds: ["term-existing", "term-remote"],
+        },
+        { id: CAPTAINS_TAB_ID, name: "Captain Workspace", tileIds: [] },
+      ],
+    });
+
+    await expect(bootstrap).resolves.toBe(true);
+
+    const state = useWorkspace.getState();
+    expect(state.tabs.find((tab) => tab.id === "work-1")).toMatchObject({
+      name: "Renamed locally",
+      order: ["term-existing", "term-remote"],
+    });
+    expect(state.tabs.find((tab) => tab.id === addedTabId)?.order).toEqual([
+      "term-new",
+    ]);
+    expect(state.terminals["term-new"]).toMatchObject({ title: "New terminal" });
+    expect(state.activeTabId).toBe(addedTabId);
   });
 });

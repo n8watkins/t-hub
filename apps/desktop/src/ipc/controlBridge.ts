@@ -111,6 +111,184 @@ function tabReports(tabs: ReturnType<typeof useWorkspace.getState>["tabs"]): Tab
   }));
 }
 
+interface WorkspaceRegistrySnapshot {
+  tabs: TabReport[];
+  activeTabId: string;
+}
+
+function workspaceRegistrySnapshot(): WorkspaceRegistrySnapshot {
+  const { tabs, activeTabId } = useWorkspace.getState();
+  return {
+    tabs: tabReports(tabs),
+    activeTabId,
+  };
+}
+
+function longestCommonSubsequence(left: string[], right: string[]): Set<string> {
+  const lengths = Array.from({ length: left.length + 1 }, () =>
+    Array<number>(right.length + 1).fill(0),
+  );
+  for (let i = 1; i <= left.length; i += 1) {
+    for (let j = 1; j <= right.length; j += 1) {
+      lengths[i][j] =
+        left[i - 1] === right[j - 1]
+          ? lengths[i - 1][j - 1] + 1
+          : Math.max(lengths[i - 1][j], lengths[i][j - 1]);
+    }
+  }
+
+  const result = new Set<string>();
+  let i = left.length;
+  let j = right.length;
+  while (i > 0 && j > 0) {
+    if (left[i - 1] === right[j - 1]) {
+      result.add(left[i - 1]);
+      i -= 1;
+      j -= 1;
+    } else if (lengths[i - 1][j] >= lengths[i][j - 1]) {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  return result;
+}
+
+function insertByLocalOrder<T>(
+  items: T[],
+  item: T,
+  localOrder: string[],
+  idOf: (value: T) => string,
+): void {
+  const id = idOf(item);
+  const localIndex = localOrder.indexOf(id);
+  for (let i = localIndex - 1; i >= 0; i -= 1) {
+    const preceding = items.findIndex((value) => idOf(value) === localOrder[i]);
+    if (preceding >= 0) {
+      items.splice(preceding + 1, 0, item);
+      return;
+    }
+  }
+  for (let i = localIndex + 1; i < localOrder.length; i += 1) {
+    const following = items.findIndex((value) => idOf(value) === localOrder[i]);
+    if (following >= 0) {
+      items.splice(following, 0, item);
+      return;
+    }
+  }
+  items.push(item);
+}
+
+export function rebaseStartupWorkspaceTabs(
+  authoritativeTabs: TabReport[],
+  baselineTabs: TabReport[],
+  localTabs: TabReport[],
+): TabReport[] {
+  const baselineById = new Map(baselineTabs.map((tab) => [tab.id, tab]));
+  const localById = new Map(localTabs.map((tab) => [tab.id, tab]));
+  const removedTabIds = new Set(
+    baselineTabs.filter((tab) => !localById.has(tab.id)).map((tab) => tab.id),
+  );
+  let rebased = authoritativeTabs
+    .filter((tab) => !removedTabIds.has(tab.id))
+    .map((tab) => ({ ...tab, tileIds: [...tab.tileIds] }));
+
+  for (const local of localTabs) {
+    const baseline = baselineById.get(local.id);
+    const existingIndex = rebased.findIndex((tab) => tab.id === local.id);
+    if (!baseline && existingIndex < 0) {
+      rebased.push({ ...local, tileIds: [] });
+      continue;
+    }
+    if (!baseline) continue;
+    if (existingIndex < 0) {
+      const changedLocally =
+        local.name !== baseline.name ||
+        local.kind !== baseline.kind ||
+        local.tileIds.length !== baseline.tileIds.length ||
+        local.tileIds.some((id, index) => id !== baseline.tileIds[index]);
+      if (changedLocally) rebased.push({ ...local, tileIds: [] });
+      continue;
+    }
+    const existing = rebased[existingIndex];
+    rebased[existingIndex] = {
+      ...existing,
+      name: local.name !== baseline.name ? local.name : existing.name,
+      kind: local.kind !== baseline.kind ? local.kind : existing.kind,
+    };
+  }
+
+  const baselineTabOrder = baselineTabs
+    .map((tab) => tab.id)
+    .filter((id) => localById.has(id));
+  const localExistingTabOrder = localTabs
+    .map((tab) => tab.id)
+    .filter((id) => baselineById.has(id));
+  const stationaryTabIds = longestCommonSubsequence(
+    baselineTabOrder,
+    localExistingTabOrder,
+  );
+  const movedTabIds = new Set(
+    localTabs
+      .filter((tab) => !baselineById.has(tab.id) || !stationaryTabIds.has(tab.id))
+      .map((tab) => tab.id),
+  );
+  const movedTabs = new Map(
+    rebased.filter((tab) => movedTabIds.has(tab.id)).map((tab) => [tab.id, tab]),
+  );
+  rebased = rebased.filter((tab) => !movedTabIds.has(tab.id));
+  const localTabOrder = localTabs.map((tab) => tab.id);
+  for (const tab of localTabs) {
+    const moved = movedTabs.get(tab.id);
+    if (moved) insertByLocalOrder(rebased, moved, localTabOrder, (value) => value.id);
+  }
+
+  const baselineLocation = new Map<string, string>();
+  const localLocation = new Map<string, string>();
+  for (const tab of baselineTabs) {
+    for (const id of tab.tileIds) baselineLocation.set(id, tab.id);
+  }
+  for (const tab of localTabs) {
+    for (const id of tab.tileIds) localLocation.set(id, tab.id);
+  }
+
+  const changedTileIds = new Set<string>();
+  for (const [id, tabId] of baselineLocation) {
+    if (localLocation.get(id) !== tabId) changedTileIds.add(id);
+  }
+  for (const [id, tabId] of localLocation) {
+    if (baselineLocation.get(id) !== tabId) changedTileIds.add(id);
+  }
+  for (const local of localTabs) {
+    const baseline = baselineById.get(local.id);
+    if (!baseline) continue;
+    const baselineOrder = baseline.tileIds.filter(
+      (id) => localLocation.get(id) === local.id,
+    );
+    const localOrder = local.tileIds.filter(
+      (id) => baselineLocation.get(id) === local.id,
+    );
+    const stationaryIds = longestCommonSubsequence(baselineOrder, localOrder);
+    for (const id of localOrder) {
+      if (!stationaryIds.has(id)) changedTileIds.add(id);
+    }
+  }
+
+  for (const tab of rebased) {
+    tab.tileIds = tab.tileIds.filter((id) => !changedTileIds.has(id));
+  }
+  for (const local of localTabs) {
+    const target = rebased.find((tab) => tab.id === local.id);
+    if (!target) continue;
+    for (const id of local.tileIds) {
+      if (changedTileIds.has(id)) {
+        insertByLocalOrder(target.tileIds, id, local.tileIds, (value) => value);
+      }
+    }
+  }
+  return rebased;
+}
+
 function hasWorkWorkspace(tabs: TabReport[]): boolean {
   return tabs.some(
     (tab) => (tab.kind ?? (tab.id === "captains-reserved" ? "captain" : "work")) === "work",
@@ -141,7 +319,9 @@ function adoptAuthoritativeTabs(tabs: TabReport[]): boolean {
  * This also lets setTerminals() surface pre-existing sessions while the first
  * control request is still in flight.
  */
-export async function bootstrapWorkspaceTabs(): Promise<boolean> {
+export async function bootstrapWorkspaceTabs(
+  reconcileTabs: (tabs: TabReport[]) => TabReport[] = (tabs) => tabs,
+): Promise<boolean> {
   try {
     const res = (await controlRequest("list_tabs")) as {
       seq?: unknown;
@@ -185,10 +365,12 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
       }
       const { listTerminals, reportWorkspaceTabs } = await import("./client");
       const liveTerminalIds = new Set((await listTerminals()).map((terminal) => terminal.id));
-      const repairTabs = tabReports(repairedLocal.tabs).map((tab) => ({
-        ...tab,
-        tileIds: tab.tileIds.filter((terminalId) => liveTerminalIds.has(terminalId)),
-      }));
+      const repairTabs = reconcileTabs(
+        tabReports(repairedLocal.tabs).map((tab) => ({
+          ...tab,
+          tileIds: tab.tileIds.filter((terminalId) => liveTerminalIds.has(terminalId)),
+        })),
+      );
       const repaired = await reportWorkspaceTabs(
         repairTabs,
         repairedLocal.activeTabId,
@@ -200,12 +382,12 @@ export async function bootstrapWorkspaceTabs(): Promise<boolean> {
       }
       if (typeof repaired.seq === "number") lastSeq = repaired.seq;
       if (repaired.stale && Array.isArray(repaired.tabs)) {
-        return adoptAuthoritativeTabs(repaired.tabs);
+        return adoptAuthoritativeTabs(reconcileTabs(repaired.tabs));
       }
       return adoptAuthoritativeTabs(repairTabs);
     }
 
-    return adoptAuthoritativeTabs(serverTabs);
+    return adoptAuthoritativeTabs(reconcileTabs(serverTabs));
   } catch (error) {
     // The local layout remains usable if the control channel is unavailable.
     surfaceLayoutSyncFailure(error);
@@ -629,6 +811,8 @@ function startTabReporter(): void {
   let inFlight = false;
   let pending = false;
   let bootstrapping = true;
+  const startupBaseline = workspaceRegistrySnapshot();
+  let startupLocal = startupBaseline;
 
   const report = (): void => {
     if (adoptingRegistry) return; // never echo a server-applied snapshot back up
@@ -675,6 +859,9 @@ function startTabReporter(): void {
   // mirrors the active tab for default spawn placement + focus proofs).
   useWorkspace.subscribe((state, prev) => {
     if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId) {
+      if (bootstrapping && !adoptingRegistry) {
+        startupLocal = workspaceRegistrySnapshot();
+      }
       report();
     }
   });
@@ -685,7 +872,9 @@ function startTabReporter(): void {
   // after that same workspace boundary, so a persisted pin cannot validate
   // itself against a stale local tab during a race.
   const reconcile = (): void => {
-    void bootstrapWorkspaceTabs().then((authoritative) => {
+    void bootstrapWorkspaceTabs((tabs) =>
+      rebaseStartupWorkspaceTabs(tabs, startupBaseline.tabs, startupLocal.tabs),
+    ).then((authoritative) => {
       if (!authoritative) {
         window.setTimeout(reconcile, STARTUP_RECONCILIATION_RETRY_MS);
         return;
