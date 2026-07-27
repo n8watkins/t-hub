@@ -168,6 +168,7 @@ The supervisory workflow is active through the shared control operation catalog.
 - `th admin cleanup-worktree` requires both an exact unconsumed approval ID and `--confirm` before endpoint discovery or mutation.
 - Worktree Cargo cleanup is limited to clean, merged, linked worktrees with no live T-Hub lease and an exact non-symlink Cargo target inventory under the two T-Hub Cargo workspace roots.
 - The backend records the reservation in `~/.t-hub/worktree-retirements.json`, publishes it as nullable `retirementReservation` data through `th worktree ls --json`, and resumes interrupted provider work after restart.
+- Ambiguous provider failures remain active as `RecoveryRequired`; only a structured refusal proving every target stayed at its original path releases the reservation as failed.
 - Active cleanup reservations block matching worktree creation, terminal spawning, history resume, and agent starting.
 - Cargo cleanup removes and later rebuilds target artifacts.
 - It does not compress targets in place, remove a Git worktree, detach UI state, or delete a branch.

@@ -17,6 +17,7 @@ use std::time::Duration;
 const SCHEMA_VERSION: u32 = 1;
 const PROVIDER_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const INSPECTION_OUTPUT_LIMIT: usize = 1024 * 1024;
+const LAST_ERROR_LIMIT: usize = 8192;
 
 const INSPECTION_SCRIPT: &str = r#"
 import json
@@ -165,6 +166,13 @@ pub enum RetirementState {
     Succeeded,
     Failed,
     RecoveryRequired,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProviderCompletion {
+    Succeeded,
+    Failed(String),
+    RecoveryRequired(String),
 }
 
 impl RetirementState {
@@ -521,40 +529,37 @@ impl WorktreeCoordinator {
 
     fn run_provider_worker(self: &Arc<Self>, record: WorktreeRetirement) {
         let operation_id = record.operation_id.clone();
-        let result = (|| {
+        let completion = (|| {
             if !Path::new(&record.request_path).is_file() {
-                return Err(format!(
+                return ProviderCompletion::Failed(format!(
                     "durable provider request is missing: {}",
                     record.request_path
                 ));
             }
-            self.transition(&operation_id, RetirementState::Running, None)
-                .map_err(|error| error.to_string())?;
-            let output = run_provider(&record.request_path)?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!(
-                    "rust-storage retirement-clean exited with {}: {}",
-                    output
-                        .status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "no exit code".into()),
-                    stderr.trim()
+            if let Err(error) = self.transition(&operation_id, RetirementState::Running, None) {
+                return ProviderCompletion::RecoveryRequired(format!(
+                    "could not persist the running provider state: {error}"
                 ));
             }
-            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .map_err(|error| format!("rust-storage returned invalid JSON: {error}"))?;
-            if report.get("complete").and_then(serde_json::Value::as_bool) != Some(true) {
-                return Err("rust-storage returned success without a complete report".into());
+            match run_provider(&record.request_path) {
+                Ok(output) => classify_provider_output(&output),
+                Err(error) => ProviderCompletion::RecoveryRequired(error),
             }
-            Ok(())
         })();
-        let transition = match result {
-            Ok(()) => self.transition(&operation_id, RetirementState::Succeeded, None),
-            Err(error) => {
-                self.transition(&operation_id, RetirementState::Failed, Some(error.clone()))
+        let transition = match completion {
+            ProviderCompletion::Succeeded => {
+                self.transition(&operation_id, RetirementState::Succeeded, None)
             }
+            ProviderCompletion::Failed(error) => self.transition(
+                &operation_id,
+                RetirementState::Failed,
+                Some(bounded_last_error(&error)),
+            ),
+            ProviderCompletion::RecoveryRequired(error) => self.transition(
+                &operation_id,
+                RetirementState::RecoveryRequired,
+                Some(bounded_last_error(&error)),
+            ),
         };
         if let Err(error) = transition {
             eprintln!(
@@ -593,6 +598,64 @@ impl WorktreeCoordinator {
             record.worktree_path, record.operation_id
         ))
     }
+}
+
+fn classify_provider_output(output: &std::process::Output) -> ProviderCompletion {
+    let exit = output
+        .status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "no exit code".into());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(report) => report,
+        Err(error) => {
+            return ProviderCompletion::RecoveryRequired(format!(
+                "rust-storage retirement-clean exited with {exit} and returned invalid JSON: {error}; stderr: {}",
+                stderr.trim()
+            ));
+        }
+    };
+
+    if output.status.success() {
+        return if report.get("complete").and_then(serde_json::Value::as_bool) == Some(true) {
+            ProviderCompletion::Succeeded
+        } else {
+            ProviderCompletion::RecoveryRequired(
+                "rust-storage returned success without a complete report".into(),
+            )
+        };
+    }
+
+    let clean_refusal = report
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .filter(|actions| !actions.is_empty())
+        .is_some_and(|actions| {
+            actions.iter().all(|action| {
+                action.get("status").and_then(serde_json::Value::as_str) == Some("refused")
+                    && action
+                        .get("recoveryState")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("original")
+                    && action
+                        .get("quarantinePath")
+                        .is_none_or(serde_json::Value::is_null)
+            })
+        });
+    let error = format!(
+        "rust-storage retirement-clean exited with {exit}: {}",
+        stderr.trim()
+    );
+    if clean_refusal {
+        ProviderCompletion::Failed(error)
+    } else {
+        ProviderCompletion::RecoveryRequired(error)
+    }
+}
+
+fn bounded_last_error(error: &str) -> String {
+    error.chars().take(LAST_ERROR_LIMIT).collect()
 }
 
 fn normalize_path(path: &str) -> String {
@@ -1033,5 +1096,86 @@ mod tests {
         assert_eq!(request["project"], "t-hub");
         assert_eq!(request["allowUnmerged"], false);
         assert_eq!(request["inventoryComplete"], true);
+    }
+
+    fn provider_output(
+        success: bool,
+        code: i32,
+        report: serde_json::Value,
+    ) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(if success { 0 } else { code << 8 })
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(if success { 0 } else { code as u32 })
+        };
+        std::process::Output {
+            status,
+            stdout: serde_json::to_vec(&report).unwrap(),
+            stderr: b"provider detail".to_vec(),
+        }
+    }
+
+    #[test]
+    fn clean_provider_refusal_releases_the_reservation_as_failed() {
+        let output = provider_output(
+            false,
+            5,
+            serde_json::json!({
+                "complete": false,
+                "actions": [{
+                    "status": "refused",
+                    "recoveryState": "original",
+                    "quarantinePath": null,
+                }],
+            }),
+        );
+
+        assert!(matches!(
+            classify_provider_output(&output),
+            ProviderCompletion::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn quarantined_provider_refusal_requires_recovery() {
+        let output = provider_output(
+            false,
+            5,
+            serde_json::json!({
+                "complete": false,
+                "actions": [{
+                    "status": "refused",
+                    "recoveryState": "quarantined",
+                    "quarantinePath": "/repo/worktree/apps/cli/.target-quarantine",
+                }],
+            }),
+        );
+
+        assert!(matches!(
+            classify_provider_output(&output),
+            ProviderCompletion::RecoveryRequired(_)
+        ));
+    }
+
+    #[test]
+    fn incomplete_success_requires_recovery() {
+        let output = provider_output(
+            true,
+            0,
+            serde_json::json!({
+                "complete": false,
+                "actions": [],
+            }),
+        );
+
+        assert!(matches!(
+            classify_provider_output(&output),
+            ProviderCompletion::RecoveryRequired(_)
+        ));
     }
 }
